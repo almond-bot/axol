@@ -36,27 +36,52 @@ Examples:
     axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
     axol tune.motion --motion reach-and-place --stiffness 0.8
     axol tune.motion --motion reach-and-place --ik   # drive through the IK solver
+    axol tune.motion --motion slow_osc --arms right  # one arm only
+    axol tune.motion --motion slow_osc --controller position  # firmware loops, 400 Hz
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import logging
 import math
 import time
+from dataclasses import replace
+from typing import Any
 
 import numpy as np
 
-from ...constants import ARM_JOINTS
+from ...constants import ARM_JOINTS, Joint
 from ...robot import Axol
-from ...robot.config import AxolConfig
+from ...robot.axol import arm_limits
+from ...robot.config import (
+    CONTROLLERS,
+    FAST_IMPEDANCE_HZ,
+    IMPEDANCE_LOOP_HZ,
+    IMPEDANCE_RATES,
+    AxolConfig,
+    check_firmware_extras,
+    check_loop_hz,
+    fast_impedance_joints,
+)
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+from ...tuning.wrist_imu import WristImu, format_imu
 from ...utils.logquiet import quiet_noisy_loggers
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
+
+#: A firmware-loop joint (0xA4 / pv) this far (rad) from its command has left
+#: its target: the replay stops and returns to rest. Firmware-loop joints
+#: carry no torque telemetry for the contact watchdog, and the core has no
+#: position-deviation abort (a pushed impedance joint is normal), so nothing
+#: else catches one — right elbow on the 0xA4 planner ended 117° from its
+#: command (2026-09-22). ``tune.a4``'s own abort is the same 20°; normal lag
+#: is ~1° at the approach speed.
+_FW_DEVIATION_ABORT = math.radians(20.0)
 _PLAN_MIN_DURATION = 1.5  # s
 
 _GAIN_FIELDS = (
@@ -66,12 +91,167 @@ _GAIN_FIELDS = (
     "kd_host_hz",
     "kd_host_q",
     "j_eff",
+    "stiction_gain",
+    "stiction_load_gain",
+    "stiction_err_deg",
+    "dither_nm",
+    "dither_hz",
+    "stribeck_gain",
+    "stribeck_dfs",
+    "stribeck_load_gain",
+    "stribeck_vs",
+    "stribeck_pole",
+    # Friction model, addressed as ``joint.friction.fc`` etc. — the sliding
+    # friction feedforward is the other half of every stick-slip A/B.
+    "friction.fc",
+    "friction.k",
+    "friction.fv",
+    "friction.fo",
+    "friction.fl",
+    # Firmware position-loop gains (``firmware.*`` on JointConfig), for A/B
+    # runs of the position controller: written to the motors' ROM at enable
+    # like the config values they replace (so a run leaves them there).
+    "firmware.position_kp",
+    "firmware.position_ki",
+    "firmware.position_kd",
+    "firmware.speed_kp",
+    "firmware.speed_ki",
+    "firmware.profile_acc",
+    # MyActuator 0xA4: the position planner (0 direct / 60000) and the
+    # core's per-tick speed-cap tracking that the planner wants.
+    "firmware.planner_accel",
+    "firmware.cap_track",
+    "firmware.planner_lead_ms",
+    # MyActuator 0x73: the rated current that scales the torque feedforward
+    # (set = the joint's position command carries gravity + inertia +
+    # cogging; unset = plain 0xA4).
+    "firmware.tf_rated_current_a",
+    # The cogging ("osc") cancellation's share of the calibrated series.
+    "cogging_gain",
+    # The gravity model's per-link inertials (the body this joint drives):
+    # mass (kg) and centre of mass (m, URDF link frame) — for trying a gravity
+    # correction before committing it to calibration.
+    "mass",
+    "com.x",
+    "com.y",
+    "com.z",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
 _COLUMNS = [f"left.{j.value}" for j in ARM_JOINTS] + [
     f"right.{j.value}" for j in ARM_JOINTS
 ]
+
+
+def _parse_holds(specs: list[str]) -> dict[int, float | None]:
+    """``--hold SIDE.JOINT[=DEG]`` → ``{column: angle rad, or None}``.
+
+    ``None`` holds the joint at the motion's own first-row angle; an angle
+    must sit inside the arm's joint limits.
+    """
+    out: dict[int, float | None] = {}
+    for spec in specs:
+        name, eq, deg = spec.partition("=")
+        if name not in _COLUMNS:
+            raise SystemExit(
+                f"--hold wants SIDE.JOINT[=DEG] with an arm joint, got {spec!r}"
+            )
+        angle: float | None = None
+        if eq:
+            try:
+                angle = math.radians(float(deg))
+            except ValueError:
+                raise SystemExit(f"--hold: bad angle in {spec!r}") from None
+            side, joint = name.split(".")
+            lo, hi = arm_limits(Joint(joint), side == "left")
+            if not lo <= angle <= hi:
+                raise SystemExit(
+                    f"--hold: {name}={deg}° is outside "
+                    f"[{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]° for that arm"
+                )
+        out[_COLUMNS.index(name)] = angle
+    return out
+
+
+def _apply_holds(
+    rows: np.ndarray, holds: dict[int, float | None], first: np.ndarray
+) -> np.ndarray:
+    """A copy of ``rows`` with each held column constant (``first`` = row 0)."""
+    out = np.array(rows, dtype=float, copy=True)
+    for col, angle in holds.items():
+        out[:, col] = first[col] if angle is None else angle
+    return out
+
+
+#: A joint further than this (rad, ~3°) from the motion's first row after the
+#: approach move did not follow it, and playback must not start from there.
+_START_POSE_TOL = 0.05
+
+
+def retime_measurements(
+    t: np.ndarray, offsets: np.ndarray, actual: np.ndarray, torque: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Put cache reads back on the command clock.
+
+    ``offsets[k, i]`` is how long before log time ``t[k]`` joint ``i``'s
+    cached sample was really taken (≤ 0; ``0`` when unknown). Each column
+    is interpolated from its true sample times ``t + offsets`` back onto
+    ``t``, so the scorecard compares the target with the measurement at the
+    same instant instead of with a sample up to one core tick old — the
+    sawtooth in that age is what a 400 Hz core read at 240 Hz shows as an
+    80 Hz buzz on every joint. Duplicate samples (the same tick read twice)
+    collapse to one point; NaN columns (absent arm) pass through.
+    """
+    if len(t) < 2 or offsets.shape != actual.shape:
+        return actual, torque
+    out_a = actual.copy()
+    out_q = torque.copy()
+    for i in range(actual.shape[1]):
+        col = actual[:, i]
+        if not np.any(np.isfinite(col)) or not np.any(offsets[:, i] != 0.0):
+            continue
+        ts = t + offsets[:, i]
+        keep = np.concatenate([[True], np.diff(ts) > 0])
+        keep &= np.isfinite(col)
+        if keep.sum() < 2:
+            continue
+        out_a[:, i] = np.interp(
+            t, ts[keep], col[keep], left=col[keep][0], right=col[keep][-1]
+        )
+        tq = torque[:, i]
+        if np.any(np.isfinite(tq)):
+            kq = keep & np.isfinite(tq)
+            if kq.sum() >= 2:
+                out_q[:, i] = np.interp(
+                    t, ts[kq], tq[kq], left=tq[kq][0], right=tq[kq][-1]
+                )
+    return out_a, out_q
+
+
+def start_pose_stragglers(
+    q_now: np.ndarray,
+    q_start: np.ndarray,
+    arms: list[tuple[str, np.ndarray]],
+    tol: float = _START_POSE_TOL,
+) -> list[tuple[str, float]]:
+    """Joints not at the motion start pose: ``[(column, error_deg), ...]``.
+
+    ``arms`` lists the arms actually driven, ``(side, full-N indices)`` —
+    an arm left off with ``--arms`` reads as rest and must not be judged.
+
+    The approach move is streamed, not verified — a joint that will not
+    follow the stream (a ``--a4`` joint whose stored planner acceleration
+    is neither 0 nor 60000 barely moves, see ``tune.a4``) is silently left
+    at rest, and replaying from there scores garbage for that joint and
+    swings the others around a pose the motion never planned for.
+    """
+    out: list[tuple[str, float]] = []
+    for side, indices in arms:
+        for j, idx in zip(ARM_JOINTS, indices):
+            err = float(q_now[idx] - q_start[idx])
+            if abs(err) > tol:
+                out.append((f"{side}.{j.value}", math.degrees(err)))
+    return out
 
 
 def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]:
@@ -88,6 +268,10 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
             value = float(raw)
         except ValueError:
             raise SystemExit(f"--gain: bad value in {spec!r} (want PATH=NUMBER)")
+        # ``[side.]joint.friction.fc`` / ``joint.firmware.speed_kp``: fold the
+        # sub-field back into one token.
+        if len(parts) >= 2 and parts[-2] in ("friction", "firmware", "com"):
+            parts = parts[:-2] + [f"{parts[-2]}.{parts[-1]}"]
         if len(parts) == 3:
             sides, joint, fld = [parts[0]], parts[1], parts[2]
             if sides[0] not in ("left", "right"):
@@ -103,9 +287,60 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
                 f"--gain: unknown field {fld!r} in {spec!r} "
                 f"(one of {', '.join(_GAIN_FIELDS)})"
             )
+        if fld == "firmware.tf_rated_current_a":
+            if joint in ("wrist_2", "wrist_3"):
+                raise SystemExit(
+                    f"--gain: {fld} scales the MyActuator 0x73 feedforward; {joint} "
+                    "is a Damiao wrist"
+                )
+            if not (math.isfinite(value) and value > 0.0):
+                raise SystemExit(f"--gain {spec}: the rated current in amps, > 0")
+        if fld in (
+            "firmware.planner_accel",
+            "firmware.cap_track",
+            "firmware.planner_lead_ms",
+        ):
+            if joint in ("wrist_2", "wrist_3"):
+                raise SystemExit(
+                    f"--gain: {fld} is the MyActuator 0xA4 planner's; {joint} is a "
+                    "Damiao wrist (its profiler is firmware.profile_acc)"
+                )
+            try:
+                check_firmware_extras(
+                    value if fld == "firmware.planner_accel" else None,
+                    value if fld == "firmware.cap_track" else None,
+                    value if fld == "firmware.planner_lead_ms" else None,
+                )
+            except ValueError as exc:
+                raise SystemExit(f"--gain {spec}: {exc}") from None
         for side in sides:
             out[(side, joint, fld)] = value
     return out
+
+
+def _apply_gain_overrides(
+    config: AxolConfig, overrides: dict[tuple[str, str, str], float]
+) -> None:
+    """Set each ``(side, joint, field)`` override on ``config``, that joint only.
+
+    The ``friction`` / ``firmware`` blocks are shared instances across the
+    joints of a motor type (shoulder_1 + shoulder_2, both elbows, ...), so
+    those are replaced with this joint's own copy, never mutated in place —
+    an in-place set once carried a shoulder_1 planner override onto
+    shoulder_2 (2026-09-22).
+    """
+    for (side, joint, fld), value in overrides.items():
+        target = getattr(getattr(config, side), joint)
+        if fld.startswith("friction."):
+            target.friction = replace(target.friction, **{fld.split(".", 1)[1]: value})
+        elif fld.startswith("firmware."):
+            target.firmware = replace(target.firmware, **{fld.split(".", 1)[1]: value})
+        elif fld.startswith("com."):
+            com = list(target.com)
+            com["xyz".index(fld[-1])] = value
+            target.com = tuple(com)
+        else:
+            setattr(target, fld, value)
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -192,6 +427,114 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--no-save-run",
         action="store_true",
         help="Don't persist the run artifact (dry run)",
+    )
+    p.add_argument(
+        "--a4",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Drive this MyActuator joint with the firmware's own position loop "
+        "(0xA4 absolute position closed-loop) instead of the MIT impedance frame, "
+        "e.g. right.shoulder_1. Repeatable. The joint then has no compliance, no "
+        "host feedforward and NaN torque telemetry (contact watchdog blind on it); "
+        "everything else about the replay is unchanged, so runs compare directly.",
+    )
+    p.add_argument(
+        "--hold",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT[=DEG]",
+        help="Hold this joint steady for the replay instead of following the "
+        "motion, e.g. right.elbow (at the motion's own start angle) or "
+        "right.elbow=-75 (at that joint-frame angle, degrees; the approach goes "
+        "there). Repeatable. The joint keeps its controller and gains, commanded "
+        "to one pose, and is scored as a parked joint (buzz / chatter only). "
+        "Only the approach is collision-checked: a joint frozen while the others "
+        "move can bring links closer than the recording ever did.",
+    )
+    p.add_argument(
+        "--loop-hz",
+        type=float,
+        default=None,
+        help="Realtime-core tick rate override. Default follows the wire modes: "
+        "240 Hz all impedance, 400 Hz all firmware loops (--controller "
+        "position), 480 Hz mixed (--a4 joints every tick, impedance joints on "
+        "alternate ticks). Impedance (MIT) is commanded at 240 Hz only, so with "
+        "any arm joint on it only 240 or 480 is accepted. For A/B runs: "
+        "--controller position --loop-hz 240 separates the rate from the "
+        "controller. Above 300 Hz the core thins the bus schedule.",
+    )
+    p.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Do not record the wrist cameras' IMUs (by default each driven arm's "
+        "wrist ZED X One IMU is recorded and the run gets an 'imu' shake score: "
+        "1-15 Hz displacement p2p in mm, what the encoders cannot see).",
+    )
+    p.add_argument(
+        "--fast-impedance",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Run this impedance joint at 480 Hz — every tick of a 480 Hz core "
+        "loop, its host feedforward, damping and tracker stepped at 480 — while "
+        "every other impedance joint stays at 240 Hz on alternate ticks, e.g. "
+        "--fast-impedance right.shoulder_1 --fast-impedance right.elbow. "
+        "Repeatable. An experiment: the gains were tuned at 240.",
+    )
+    p.add_argument(
+        "--impedance-hz",
+        type=float,
+        choices=IMPEDANCE_RATES,
+        default=None,
+        help="Command rate of the MyActuator impedance joints for this run: 240 "
+        "(the config default, verified) or 480 — every tick of a 480 Hz core "
+        "loop with the Damiao wrists staying at 240 Hz on alternate ticks. An "
+        "experiment: the impedance gains, host damping and feedforward were "
+        "tuned at 240.",
+    )
+    p.add_argument(
+        "--record",
+        metavar="PREFIX",
+        default=None,
+        help="Flight-recorder prefix, as teleop's --teleop.record: the replay's "
+        "measured joints go to PREFIX_meas.npz and the realtime core's per-tick "
+        "trace (target, command, measured position, motor speed, feed-forward "
+        "terms) to PREFIX_rt.npz for `axol diag.teleop-jitter` or offline "
+        "analysis. A bare name lands in the recordings directory.",
+    )
+    p.add_argument(
+        "--controller",
+        choices=CONTROLLERS,
+        default=None,
+        help="Which control law the core runs the arms on for this run. "
+        "'impedance' (the config default) is the production MIT frame at 240 Hz "
+        "with the host feedforward; 'position' puts every joint on its motor's "
+        "own position loop (MyActuator 0xA4, Damiao position-velocity; the "
+        "firmware.* gains) streamed at 400 Hz — stiff, no host feedforward, "
+        "NaN torque on the MyActuator joints. --a4 still adds single joints "
+        "inside the impedance controller.",
+    )
+    p.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Replay the motion N times back to back in one session (default 1; "
+        "0 = until Ctrl-C): no homing in between — each pass after the first "
+        "starts with a planned move back to the start pose if the motion does "
+        "not end there. Each pass is scored and saved as its own run (label "
+        "suffixed [k/N]) and a one-line-per-pass summary closes the session; "
+        "--record captures the whole session in one trace. For soak runs and "
+        "catching an intermittent buzz.",
+    )
+    p.add_argument(
+        "--arms",
+        choices=("both", "left", "right"),
+        default="both",
+        help="Which arm(s) to bring up and drive (default: both). The other "
+        "arm's channel is left untouched, so a single-arm bench or an "
+        "unpowered arm does not block the run.",
     )
     p.add_argument(
         "--no-gripper",
@@ -412,9 +755,60 @@ async def _run(args: argparse.Namespace) -> None:
         right_stiffness=args.stiffness,
         has_gripper=not args.no_gripper,
     )
+    _apply_gain_overrides(config, overrides)
     for (side, joint, fld), value in overrides.items():
-        setattr(getattr(getattr(config, side), joint), fld, value)
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
+    for spec in args.a4:
+        parts = spec.split(".")
+        if len(parts) != 2 or parts[0] not in ("left", "right"):
+            raise SystemExit(f"--a4 wants SIDE.JOINT, got {spec!r}")
+        side, joint = parts
+        if joint not in {j.value for j in ARM_JOINTS}:
+            raise SystemExit(f"--a4: unknown joint {joint!r}")
+        getattr(getattr(config, side), joint).wire_mode = "a4"
+        print(f"  wire mode: {side}.{joint} = a4 (firmware position loop)")
+    holds = _parse_holds(args.hold)
+    if args.controller is not None:
+        config.controller = args.controller
+    if args.impedance_hz is not None:
+        config.impedance_hz = args.impedance_hz
+    for spec in args.fast_impedance:
+        parts = spec.split(".")
+        if len(parts) != 2 or parts[0] not in ("left", "right"):
+            raise SystemExit(f"--fast-impedance wants SIDE.JOINT, got {spec!r}")
+        side, joint = parts
+        if joint not in {j.value for j in ARM_JOINTS}:
+            raise SystemExit(f"--fast-impedance: unknown joint {joint!r}")
+        getattr(getattr(config, side), joint).impedance_hz = FAST_IMPEDANCE_HZ
+        print(f"  impedance rate: {side}.{joint} = {FAST_IMPEDANCE_HZ:.0f} Hz")
+    if args.repeat < 0:
+        raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
+    try:
+        # Before anything touches the bus: impedance runs at 240 Hz only.
+        check_loop_hz(config, args.loop_hz or config.loop_hz)
+    except ValueError as exc:
+        raise SystemExit(f"tune.motion: {exc}") from None
+    core_hz = args.loop_hz or config.loop_hz
+    fast = bool(fast_impedance_joints(config))
+    mixed = config.controller != "position" and core_hz > IMPEDANCE_LOOP_HZ
+    print(
+        f"  controller: {config.controller} "
+        f"({core_hz:.0f} Hz core loop"
+        + (
+            ", every joint on its firmware position loop)"
+            if config.controller == "position"
+            else (
+                f", {', '.join(fast_impedance_joints(config))} every tick, the other "
+                f"impedance joints at {IMPEDANCE_LOOP_HZ:.0f} Hz on alternate ticks)"
+                if fast
+                else (
+                    f", impedance joints on alternate ticks at {IMPEDANCE_LOOP_HZ:.0f} Hz)"
+                    if mixed
+                    else ")"
+                )
+            )
+        )
+    )
 
     # The kinematics stack plans the collision-aware approach/return moves.
     print("Loading kinematics solver (JIT compile may take a few seconds) ...")
@@ -456,13 +850,62 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"Re-solving {len(sent)} waypoints through the IK solver ...")
         sent = _ik_stream(solver, sent, to_full, stream_info)
         stream_differs = True
+    if holds:
+        # After any IK re-solve, so the solver cannot move a held joint back.
+        # The scoring reference is held the same way: the joint is scored as
+        # parked (buzz / chatter), not against the motion it no longer runs.
+        first = np.asarray(ref[0], dtype=float)
+        sent = _apply_holds(sent, holds, np.asarray(sent[0], dtype=float))
+        ref = _apply_holds(ref, holds, first)
+        for col, angle in holds.items():
+            at = (
+                f"{math.degrees(angle):+.1f}°"
+                if angle is not None
+                else f"{math.degrees(first[col]):+.1f}° (the motion's start)"
+            )
+            print(f"  hold: {_COLUMNS[col]} at {at}")
+        print(
+            "  ! held joints: only the approach is collision-checked — a frozen "
+            "joint can bring links closer than the recording did; watch the first pass"
+        )
 
     watchdog = ContactWatchdog(args.torque_threshold)
+    # Firmware-loop joints, as (side, index in the arm's 7, name), for the
+    # deviation guard in execute().
+    resolved_cfg = config.resolved()
+    fw_joints = [
+        (side, i, f"{side}.{j.value}")
+        for side in ("left", "right")
+        for i, j in enumerate(ARM_JOINTS)
+        if str(getattr(getattr(resolved_cfg, side), j.value).wire_mode).lower()
+        in ("a4", "pv")
+    ]
     log_t: list[float] = []
+    # The same samples on the absolute perf_counter clock: log_t restarts at
+    # 0 with every execute(), the wrist IMU record does not.
+    log_abs: list[float] = []
     log_target: list[np.ndarray] = []
     log_sent: list[np.ndarray] = []
     log_actual: list[np.ndarray] = []
     log_torque: list[np.ndarray] = []
+    # When each measured sample was actually taken on the wire (seconds
+    # relative to the sample's own log time, ≤ 0): the core refreshes the
+    # caches at its tick rate, this loop reads them at the motion rate, and
+    # the varying cache age between the two clocks is a sawtooth that a
+    # 400 Hz core sampled at 240 Hz turns into an 80 Hz "buzz" on every
+    # joint. Re-timing each sample removes it.
+    log_meas_offset: list[np.ndarray] = []
+    # [start, end) of each pass's samples in the logs above (--repeat).
+    passes_run: list[tuple[int, int]] = []
+
+    def _feedback_offsets(arm: Any, now_wall: float) -> np.ndarray:
+        out = np.zeros(7, dtype=np.float64)
+        for i, j in enumerate(ARM_JOINTS):
+            motor = arm.motors.get(j)
+            ts = getattr(motor, "_feedback_ts", None) if motor is not None else None
+            if ts is not None:
+                out[i] = min(0.0, ts - now_wall)
+        return out
 
     async def execute(
         axol: Axol,
@@ -493,16 +936,31 @@ async def _run(args: argparse.Namespace) -> None:
                 left=left if axol.left is not None else None,
                 right=right if axol.right is not None else None,
             )
+            for side, i, name in fw_joints:
+                arm = axol.left if side == "left" else axol.right
+                if arm is None:
+                    continue
+                cmd = float((left if side == "left" else right)[i])
+                off = float(arm.positions[i]) - cmd
+                if abs(off) > _FW_DEVIATION_ABORT:
+                    raise _Runaway(name, math.degrees(off))
             if record:
                 row_a = np.full(14, np.nan, dtype=np.float32)
                 row_tq = np.full(14, np.nan, dtype=np.float32)
+                row_off = np.zeros(14, dtype=np.float64)
+                now_wall = time.time()
                 if axol.left is not None:
                     row_a[:7] = axol.left.positions[:7]
                     row_tq[:7] = axol.left.torques[:7]
+                    row_off[:7] = _feedback_offsets(axol.left, now_wall)
                 if axol.right is not None:
                     row_a[7:] = axol.right.positions[:7]
                     row_tq[7:] = axol.right.torques[:7]
-                log_t.append(time.perf_counter() - t0)
+                    row_off[7:] = _feedback_offsets(axol.right, now_wall)
+                now = time.perf_counter()
+                log_t.append(now - t0)
+                log_abs.append(now)
+                log_meas_offset.append(row_off)
                 row_cmd = np.concatenate(
                     [q[solver.left_indices], q[solver.right_indices]]
                 ).astype(np.float32)
@@ -529,7 +987,23 @@ async def _run(args: argparse.Namespace) -> None:
     traj_playback = [to_full(row) for row in sent]
 
     # Production playback always runs through the Rust core, matching teleop.
-    robot = Axol(config=config)
+    arm_channels: dict[str, None] = {}
+    if args.arms == "right":
+        arm_channels["left_channel"] = None
+    elif args.arms == "left":
+        arm_channels["right_channel"] = None
+    robot = Axol(
+        config=config, record=args.record, loop_hz=args.loop_hz, **arm_channels
+    )
+
+    # The wrist cameras' IMUs see what the encoders cannot (backlash, flex,
+    # the gripper itself). Opened before bring-up, so a camera that is slow
+    # to open costs time while nothing moves; stopped after return to rest.
+    imu = WristImu(
+        ["left", "right"] if args.arms == "both" else [args.arms],
+        enabled=not args.no_imu,
+    )
+    imu.start()
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
@@ -541,16 +1015,80 @@ async def _run(args: argparse.Namespace) -> None:
                 if contact is not None:
                     raise _Contact(contact)
                 await asyncio.sleep(0.5)
+            driven = [
+                (side, idx)
+                for side, arm, idx in (
+                    ("left", axol.left, solver.left_indices),
+                    ("right", axol.right, solver.right_indices),
+                )
+                if arm is not None
+            ]
+            stragglers = start_pose_stragglers(snapshot(axol), q_start, driven)
+            if stragglers:
+                raise _NotAtStart(stragglers)
 
-            print(f"Replaying {motion.duration:.1f} s of motion ...")
-            contact = await execute(
-                axol,
-                traj_playback,
-                record=True,
-                refs=ref if stream_differs else None,
+            # The flight recorder captures the replay segment only, like
+            # teleop's engage→disengage — one segment for the whole session
+            # when repeating (each new segment truncates the last), so a
+            # buzz on the move back to the start is in the trace too.
+            axol.set_recording_engaged(True)
+            try:
+                passes = itertools.count() if args.repeat == 0 else range(args.repeat)
+                total = "∞" if args.repeat == 0 else str(args.repeat)
+                for k in passes:
+                    if k > 0:
+                        q_now = snapshot(axol)
+                        if float(np.max(np.abs(q_now - q_start))) > 0.02:
+                            print("Back to the motion start pose ...")
+                            contact = await execute(axol, plan(q_now, q_start))
+                            if contact is not None:
+                                raise _Contact(contact)
+                        stragglers = start_pose_stragglers(
+                            snapshot(axol), q_start, driven
+                        )
+                        if stragglers:
+                            raise _NotAtStart(stragglers)
+                    print(
+                        f"Replaying {motion.duration:.1f} s of motion"
+                        + (f" (pass {k + 1}/{total})" if args.repeat != 1 else "")
+                        + " ..."
+                    )
+                    pass_start = len(log_t)
+                    passes_run.append((pass_start, pass_start))
+                    try:
+                        contact = await execute(
+                            axol,
+                            traj_playback,
+                            record=True,
+                            refs=ref if stream_differs else None,
+                        )
+                    finally:
+                        passes_run[-1] = (pass_start, len(log_t))
+                    if contact is not None:
+                        raise _Contact(contact)
+            finally:
+                axol.set_recording_engaged(False)
+        except _NotAtStart as exc:
+            print(
+                "\n  ! not at the motion start pose after the approach — playback "
+                "skipped: "
+                + ", ".join(f"{name} {err:+.1f}° off" for name, err in exc.stragglers)
             )
-            if contact is not None:
-                raise _Contact(contact)
+            if args.a4:
+                print(
+                    "    a --a4 joint that did not follow the approach: check its stored "
+                    "planner acceleration (scripts/fw_gains.py --id <id>; 0 or 60000 "
+                    "follow a stream, anything in between barely moves) and that the "
+                    "realtime core is built from a checkout that holds a4 joints on the "
+                    "position frame (the X6-P20's 2025-07 firmware ignores 0xA4 after "
+                    "an MIT frame until reset)"
+                )
+        except _Runaway as exc:
+            print(
+                f"\n  ! {exc.joint} is {exc.deg:+.1f}° from its command on the "
+                f"firmware loop (limit {math.degrees(_FW_DEVIATION_ABORT):.0f}°) — it "
+                "has left its target; playback aborted, returning to rest"
+            )
         except _Contact as exc:
             joint, residual = exc.trip
             print(
@@ -578,14 +1116,14 @@ async def _run(args: argparse.Namespace) -> None:
                     "return-to-rest failed", exc_info=True
                 )
 
+    # A daemon subprocess: an exception out of the block above ends it with
+    # the process; here it hands over its samples.
+    imu.stop()
     if not log_t:
         print("No playback samples recorded — nothing to score.")
         return
-
-    t = np.asarray(log_t)
-    target = np.stack(log_target)
-    actual = np.stack(log_actual)
-    torque = np.stack(log_torque)
+    if not passes_run:
+        passes_run.append((0, len(log_t)))
 
     # Tracking quality is only scored for joints that actually moved (> ~1°
     # of commanded travel) — a joint parked at rest tracks meaninglessly
@@ -601,52 +1139,139 @@ async def _run(args: argparse.Namespace) -> None:
         "peak_hz",
         "amplification",
     )
-    per_joint: dict[str, dict[str, float]] = {}
-    moved: dict[str, dict[str, float]] = {}
-    for i, name in enumerate(_COLUMNS):
-        if np.isnan(actual[:, i]).all():
-            continue
-        m = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
-        if float(np.ptp(target[:, i])) >= math.radians(1.0):
-            moved[name] = m
-        else:
-            for key in _TRACKING_KEYS:
-                m[key] = math.nan
-        per_joint[name] = m
-    if not moved:
-        print("No joint moved more than 1° — nothing to score.")
-        return
 
-    _print_metrics_table(per_joint)
+    def score_pass(a: int, b: int, tag: str) -> dict[str, Any] | None:
+        """Score and save one pass's slice of the logs; its summary, or None.
 
-    worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
-    summary = {
-        "per_joint": per_joint,
-        "worst_joint": worst[0],
-        "mean_rms_err": float(np.mean([m["rms_err"] for m in moved.values()])),
-        "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
-        "completed": bool(len(log_t) >= len(sent)),
-    }
-
-    if not args.no_save_run:
-        series = {"t": t, "target": target, "actual": actual, "torque": torque}
-        if log_sent:
-            series["sent"] = np.stack(log_sent)
-        run_id = save_run(
-            "motion",
-            series,
-            summary,
-            gains={f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()},
-            params={
-                "motion": motion.name,
-                "rate": motion.rate,
-                "stiffness": args.stiffness,
-                "columns": _COLUMNS,
-                **stream_info,
-            },
-            label=args.label,
+        ``tag`` ("[k/N] ", empty for a single pass) heads the scorecard and is
+        appended to the saved run's label.
+        """
+        if b - a < 2:
+            return None
+        t = np.asarray(log_t[a:b])
+        target = np.stack(log_target[a:b])
+        actual = np.stack(log_actual[a:b])
+        torque = np.stack(log_torque[a:b])
+        actual, torque = retime_measurements(
+            t, np.stack(log_meas_offset[a:b]), actual, torque
         )
-        print(f"\nSaved tuning run {run_id} (kind=motion, motion={motion.name!r})")
+        per_joint: dict[str, dict[str, float]] = {}
+        moved: dict[str, dict[str, float]] = {}
+        for i, name in enumerate(_COLUMNS):
+            if np.isnan(actual[:, i]).all():
+                continue
+            m = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
+            if float(np.ptp(target[:, i])) >= math.radians(1.0):
+                moved[name] = m
+            else:
+                for key in _TRACKING_KEYS:
+                    m[key] = math.nan
+            per_joint[name] = m
+        if tag:
+            print(f"\n{tag.strip()}")
+        _print_metrics_table(per_joint)
+
+        summary: dict[str, Any] = {
+            "per_joint": per_joint,
+            "completed": bool(b - a >= len(sent)),
+        }
+        if moved:
+            worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
+            summary["worst_joint"] = worst[0]
+            summary["mean_rms_err"] = float(
+                np.mean([m["rms_err"] for m in moved.values()])
+            )
+            summary["mean_jitter"] = float(
+                np.mean([m["err_band_mid"] for m in moved.values()])
+            )
+        else:
+            # A hold (the ``hold`` motion): no tracking to score, but the
+            # buzz columns and the wrist IMU's floor under the running
+            # controller are the point of it.
+            print(f"{tag}No joint moved more than 1° — hold: buzz and IMU only.")
+        # The pass on the wrist IMUs' clock: its log origin is the execute()
+        # start, so the IMU series shares the run's time axis.
+        origin = log_abs[a] - log_t[a]
+        imu_metrics, imu_series = imu.run_blocks(
+            origin + float(t[0]), origin + float(t[-1]), origin
+        )
+        if imu_metrics:
+            summary["imu"] = imu_metrics
+            for line in format_imu(imu_metrics):
+                print(line)
+
+        if not args.no_save_run:
+            series = {"t": t, "target": target, "actual": actual, "torque": torque}
+            series.update(imu_series)
+            if log_sent:
+                series["sent"] = np.stack(log_sent[a:b])
+            label = " ".join(x for x in (args.label, tag.strip()) if x) or None
+            run_id = save_run(
+                "motion",
+                series,
+                summary,
+                gains={f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()},
+                params={
+                    "motion": motion.name,
+                    "rate": motion.rate,
+                    "stiffness": args.stiffness,
+                    "columns": _COLUMNS,
+                    # Joints driven on the firmware position loop (--a4) for
+                    # this run, so the dashboard can re-arm the same split.
+                    "a4": list(args.a4),
+                    # Joints held steady instead of following the motion.
+                    "hold": list(args.hold),
+                    "arms": args.arms,
+                    # The control law the whole run ran on (impedance at
+                    # 240 Hz or the firmware position loops at 400 Hz).
+                    "controller": config.controller,
+                    "loop_hz": args.loop_hz or config.loop_hz,
+                    "impedance_hz": config.impedance_hz,
+                    # Joints commanded at 480 Hz (--fast-impedance / the
+                    # config-wide 480).
+                    "fast_impedance": fast_impedance_joints(config),
+                    "record": args.record,
+                    **stream_info,
+                },
+                label=label,
+            )
+            print(f"\nSaved tuning run {run_id} (kind=motion, motion={motion.name!r})")
+        return summary
+
+    many = len(passes_run) > 1
+    summaries = [
+        score_pass(a, b, f"[{k + 1}/{len(passes_run)}] " if many else "")
+        for k, (a, b) in enumerate(passes_run)
+    ]
+    if many:
+        # One line per pass: the intermittent faults (a buzz on one pass in
+        # five) are what repeating is for.
+        print(f"\n{'─' * 78}\n  passes: worst buzz / mean jitter / worst joint")
+        for k, sm in enumerate(summaries):
+            if sm is None:
+                print(f"    [{k + 1}] too short to score")
+                continue
+            name, m = max(
+                sm["per_joint"].items(),
+                key=lambda kv: (
+                    kv[1]["buzz"] if math.isfinite(kv[1].get("buzz", math.nan)) else 0.0
+                ),
+            )
+            print(
+                f"    [{k + 1}] {math.degrees(m.get('buzz', math.nan)):.3f}° on {name} "
+                f"@ {m.get('buzz_hz', math.nan):.0f} Hz / "
+                f"{math.degrees(sm.get('mean_jitter', math.nan)):.3f}° / "
+                f"{sm.get('worst_joint', 'hold')}"
+                + ("" if sm["completed"] else "  (cut short)")
+            )
+
+
+class _Runaway(Exception):
+    """Internal: a firmware-loop joint left its target (``_FW_DEVIATION_ABORT``)."""
+
+    def __init__(self, joint: str, deg: float) -> None:
+        self.joint = joint
+        self.deg = deg
 
 
 class _Contact(Exception):
@@ -654,6 +1279,13 @@ class _Contact(Exception):
 
     def __init__(self, trip: tuple[str, float]) -> None:
         self.trip = trip
+
+
+class _NotAtStart(Exception):
+    """Internal: the approach left joints off the start pose; skip playback."""
+
+    def __init__(self, stragglers: list[tuple[str, float]]) -> None:
+        self.stragglers = stragglers
 
 
 def _load_motion_or_exit(name: str) -> ReferenceMotion:

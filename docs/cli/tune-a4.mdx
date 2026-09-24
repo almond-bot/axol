@@ -1,0 +1,58 @@
+---
+title: "tune.a4"
+description: "Tune a MyActuator joint's firmware position loop (0xA4) with a sine or constant-speed triangle."
+---
+
+Tunes the **firmware** position loop of one MyActuator joint — the controller the realtime core hands a joint to when its `wire_mode` is `a4` (see the [config reference](/cli/configuration)). Streams a sine or a constant-speed triangle target over 0xA4 at `--rate` Hz with the firmware gains, 0xA4 speed cap and planner acceleration you choose, reads the fine 0.01° position (0x92) every cycle, scores tracking and creep smoothness, and saves the run for the diagnostics dashboard (Tuning → Firmware loop). Also available from the dashboard (`axol serve`).
+
+[`tune.pid`](/cli/tune-pid) tunes the MIT impedance frame, whose gains are the host's. Under 0xA4 the whole controller is the motor's own position PI → speed PI → current loop, so the knobs here are the firmware gains (`position_kp/ki/kd`, `speed_kp/ki`, `current_kp/ki`), the speed cap, and the position planner's acceleration: **0 puts the loop in direct PI tracking of the stream, and the protocol maximum 60000 makes the planner finish each 200 Hz step inside the tick — anything in between re-plans every streamed target and the joint will not follow the wave.** On the X6-P20 elbow 60000 tracked a 3 deg/s triangle to 0.02° RMS with 4 ms lag against 0.23° / 74 ms for direct tracking, so try both. The tool writes the planner **before** the mode-switch reset: on the elbow's 2025-07 firmware a 0 written into a running position loop is silently ignored (the joint holds and executes nothing), while the same 0 applied through the reset works.
+
+The triangle is the stick-slip probe: every pass runs at one creep speed, so the behaviour is not confined to the sine's turnarounds. Compare runs on **velocity ripple** (std of measured minus commanded velocity over the commanded speed: the MIT frame's stick-slip sits near 0.8, smooth is under 0.2), **stuck windows**, the **1–4 Hz error band**, **lag** and **>10 Hz buzz**.
+
+Safety, built in:
+
+- Gains are written to **RAM** (0x31) unless `--persist`, and the pre-run values are written back when the run ends; `--keep` leaves a winner in place. Gains are written *after* homing and the mode switch, since those reset the motor and reload ROM.
+- A **buzz guard** aborts on high-frequency position motion or excess current and restores the previous gains at once. Start every sweep from the stock values in small steps: shoulder_1 at 3× stock `speed_kp` vibrated immediately.
+- The joint holds position stiffly in this mode and pushes back against contact up to motor torque. Keep the workspace clear and the e-stop in reach.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Arm side (required) |
+| `--channel IFACE` | SocketCAN interface override |
+| `--joint JOINT` | Any arm joint with a firmware position loop: the MyActuator `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1` on 0xA4, or the Damiao `wrist_2`, `wrist_3` on their position-velocity mode (required) |
+| `--mode sine\|triangle` | Wave shape (default: `triangle`) |
+| `--center DEG` | Centre, joint-frame degrees (default: midpoint of the safe range) |
+| `--amp DEG` | Half-travel, degrees (default: 10) |
+| `--freq HZ` | Sine frequency (default: 0.3) |
+| `--speed DPS` | Triangle pass speed, deg/s (default: 3) |
+| `--duration S` | Seconds of wave (default: 12) |
+| `--rate HZ` | Command rate (default: 400, the rate the realtime core streams a4 joints at; tune at the rate you will run — the step size is the excitation, and 200 Hz put an audible staircase on the shoulder at 12 deg/s that 400 removed) |
+| `--cap DPS` | 0xA4 speed cap (default: 60) |
+| `--dm-acc RAD_S2` | Damiao wrists (`wrist_2`, `wrist_3`) only: the position-velocity profiler's ACC and −DEC registers for the run, restored afterwards unless `--keep` (`--persist` stores them). The Damiao loop is the same cascade with its gains in RAM registers (`position_kp`/`position_ki` = KP_APR/KI_APR, `speed_kp`/`speed_ki` = KP_ASR/KI_ASR, no kd or current gains) behind an always-on trapezoidal profiler; each 0x100 command answers with the feedback frame, so position is 16-bit and the "current" columns carry torque in Nm. The wrists were found at 2 rad/s² (~115 °/s²) |
+| `--pose JOINT=DEG` | Hold another joint at this joint-frame angle during the run, repeatable, overriding the sweep's own clearance pose for that joint (same rules as [`tune.pid`](/cli/tune-pid): inside the arm's limits, shoulder_2 outboard only). A firmware loop that is well damped with the arm hanging can oscillate with it extended — right shoulder_2 did, held 10° outboard with shoulder_1 raised and the elbow bent during a shoulder_3 sweep — so tune the worst-case pose too. Every held joint is sampled round-robin during the wave (one 0x92 read per tick) and scored: drift from its hold, peak-to-peak, std and dominant frequency, printed and saved under `metrics.held` |
+| `--cap-track K` | Per-command cap = `K × |commanded speed|`, floored at `--cap-floor`, never above `--cap` (default: 0 = fixed cap). With `--accel 60000` a fixed cap lets the planner burst through each 200 Hz step at the cap and idle the rest of the tick — 4× the current spread on the elbow, 68–82 Hz velocity content; `1.1`–`1.2` keeps the joint moving continuously at about the commanded speed. Ignored (with a warning) when the planner is at 0: under direct tracking the cap is a hard limit on the PI output and would only throttle the loop |
+| `--cap-floor DPS` | Lowest cap `--cap-track` may set, so a stationary or reversing target still corrects (default: 1) |
+| `--accel DPS/S` | Planner acceleration for the run, written to ROM before the mode-switch reset and restored afterwards unless `--keep`. `0` = direct PI tracking; `60000` = step-follow (see above); values in between will not follow a stream |
+| `--position-kp`, `--position-ki`, `--position-kd`, `--speed-kp`, `--speed-ki`, `--current-kp`, `--current-ki` | Firmware gains for the run (default: leave as is). The tool prints the motor's live values at start; the dashboard tab shows them next to each field and seeds its sliders there |
+| `--persist` | Write gains to ROM instead of RAM |
+| `--keep` | Leave the run's gains and planner acceleration in the motor |
+| `--buzz-abort DEG` | Abort past this >10 Hz position motion, degrees RMS over 0.1 s (default: 0.3; 0 off) |
+| `--iq-abort A` | Abort past this reply current (default: 30; 0 off). A loaded X8 shoulder draws ~10 A just holding gravity at −55°, so keep this above the pose's static current |
+| `--tf-probe PCT` | Instead of the wave: hold the joint at `--center` on **0x73** (protocol V4.4 position control with torque feed-forward) and step the feed-forward 0 / +PCT / 0 / −PCT % of rated current, 0.25 s each for 8 s. The q-axis current jump at each step — read from the reply to the first frame carrying it, before the loops react — is the current 1% buys, so it prints the motor's rated current: the `firmware.tf_rated_current_a` the realtime core scales its 0x73 feed-forward with. `5` is a gentle ~1 Nm on a shoulder. V4.4 firmware only; run with `--accel 0` |
+| `--no-imu` | Skip the wrist IMU (recorded by default: the run gets an `imu` shake score — 1–15 Hz displacement p2p in mm at the gripper, see [`tune.motion`](/cli/tune-motion)) |
+| `--save-run` | Persist the run artifact |
+| `--label TEXT`, `--group ID` | Note and sweep id stored on the run |
+
+```bash
+axol tune.a4 --r --joint shoulder_1 --center -35 --amp 10 --mode triangle --speed 3 --accel 0 --save-run
+axol tune.a4 --r --joint shoulder_1 --accel 0 --speed-kp 0.05 --speed-ki 0.0005 --save-run --label "skp 0.05"
+axol tune.a4 --r --joint shoulder_1 --mode sine --freq 0.3 --accel 0 --position-kp 0.02 --save-run
+```
+
+<Note>
+  A winning set does not have to be persisted from here. The robot config carries per-joint `firmware.*` gains (see the [config reference](/cli/configuration)); `enable()` compares them with the motor's ROM while the joint is still disabled and writes only what differs. The X8-P20 shoulders ship configured with `position_kp 0.3`, `position_kd 0.1`, `speed_kp 0.1`, `speed_ki 1e-5` from these sweeps.
+</Note>
+
+<Warning>
+  A joint left with planner acceleration 0 executes any stored position target at the speed cap the moment it wakes. `tune.a4` restores the stored acceleration unless you pass `--keep`; if you keep it, do not drive that joint with any other position command until you have set it back.
+</Warning>

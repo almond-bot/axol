@@ -25,15 +25,16 @@ import math
 from ..motor import ControlMode, Joint, Motor
 from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import (
-    MyActuatorMotor,
     _MA_KD_MAX,
     _MA_KP_MAX,
     _MA_V_MAX,
+    MyActuatorMotor,
 )
 from ..robot.axol import (
     EITHER_STOP_JOINTS,
     closer_end_stop,
     end_stop_offset_from_position,
+    fixed_stop_wrap_correction,
 )
 
 
@@ -43,20 +44,52 @@ class JointFrameMotor:
     Construct via :func:`joint_frame_motors`, which resolves the per-joint
     motor→joint offset. Only the calls the tuners use are exposed; add
     passthroughs as needed.
+
+    **Boot wrap.** A fixed-stop joint's multi-turn reading can come back
+    exactly ±360° off after any MyActuator 0x76 reset — which every tuner
+    issues through ``set_control_mode`` — because the motor re-derives it
+    within ±180° of the single-turn zero, and the right elbow at rest sits
+    34° from that boundary. Commanding the joint frame through a fixed
+    offset against a wrapped reading sends the motor a full turn: right
+    elbow, 2026-09-22, into its hard stop at 40 Nm until its stall
+    protection tripped. Every :meth:`get_position` therefore re-derives the
+    wrap with :func:`fixed_stop_wrap_correction` (the production bring-up's
+    check) and folds it into :attr:`frame_offset`, which every command uses.
+    Read before you command — :func:`~almond_axol.cli.tune.friction._ramp_verified`
+    does — and a wrapped reading is corrected instead of chased.
     """
 
-    def __init__(self, motor: Motor, offset: float) -> None:
+    def __init__(
+        self, motor: Motor, offset: float, is_left: bool | None = None
+    ) -> None:
         self.motor = motor
         self.offset = offset
+        self._is_left = is_left
+        #: ±2π correction the last read said the motor frame needs (0 if none).
+        self.wrap = 0.0
 
     @property
     def joint(self) -> Joint:
         return self.motor.joint
 
     @property
+    def frame_offset(self) -> float:
+        """motor→joint offset including the current boot-wrap correction."""
+        return self.offset + self.wrap
+
+    def _refresh_wrap(self, motor_pos: float) -> None:
+        if (
+            self._is_left is None
+            or self.joint in EITHER_STOP_JOINTS
+            or self.joint == Joint.GRIPPER
+        ):
+            return
+        self.wrap = fixed_stop_wrap_correction(self.joint, self._is_left, motor_pos)
+
+    @property
     def position(self) -> float:
         """Latest cached position (rad, joint frame)."""
-        return self.motor.position + self.offset
+        return self.motor.position + self.frame_offset
 
     @property
     def torque(self) -> float:
@@ -69,18 +102,24 @@ class JointFrameMotor:
         return self.motor.feedback_ts
 
     async def get_position(self) -> float:
-        """Current position (rad, joint frame)."""
-        return await self.motor.get_position() + self.offset
+        """Current position (rad, joint frame), re-deriving the boot wrap.
+
+        Raises ``MotorError`` (from :func:`fixed_stop_wrap_correction`) when
+        the reading fits no plausible band — the zero is unset or stale.
+        """
+        motor_pos = await self.motor.get_position()
+        self._refresh_wrap(motor_pos)
+        return motor_pos + self.frame_offset
 
     async def set_impedance(
         self, p_des: float, v_des: float, kp: float, kd: float, t_ff: float
     ) -> None:
         """Impedance command with ``p_des`` in the joint frame."""
-        await self.motor.set_impedance(p_des - self.offset, v_des, kp, kd, t_ff)
+        await self.motor.set_impedance(p_des - self.frame_offset, v_des, kp, kd, t_ff)
 
     async def set_position_velocity(self, position: float, max_speed: float) -> None:
         """Position-velocity command with ``position`` in the joint frame."""
-        await self.motor.set_position_velocity(position - self.offset, max_speed)
+        await self.motor.set_position_velocity(position - self.frame_offset, max_speed)
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         await self.motor.set_control_mode(mode)
@@ -125,7 +164,7 @@ class JointFrameMotor:
             motor_id=driver._motor_id,
             differentiate=differentiate,
             rate_hz=rate_hz,
-            offset=self.offset,
+            offset=self.frame_offset,
             kp=kp,
             kd=kd,
             ranges=ranges,
@@ -155,5 +194,9 @@ async def joint_frame_motors(
             )
         else:
             offset = closer_end_stop(j, is_left)[0]
-        wrapped[j] = JointFrameMotor(m, offset)
+        jm = JointFrameMotor(m, offset, is_left)
+        # Read once now: derives the boot wrap (and refuses an unset zero)
+        # before any tuner commands the joint.
+        await jm.get_position()
+        wrapped[j] = jm
     return wrapped

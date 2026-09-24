@@ -105,7 +105,118 @@ impl BandPass {
 pub const FRICTION_FF_K_MAX: f64 = 100.0;
 
 pub fn friction(v: f64, fc: f64, k: f64, fv: f64, fo: f64) -> f64 {
-    fc * (0.1 * k.min(FRICTION_FF_K_MAX) * v).tanh() + fv * v + fo
+    fc * coulomb_unit(v, k) + fv * v + fo
+}
+
+/// Saturation of the Coulomb feedforward in `[-1, 1]` — `coulomb_unit` in
+/// `almond_axol.robot.control`, with the same `FRICTION_FF_K_MAX` cap.
+pub fn coulomb_unit(v: f64, k: f64) -> f64 {
+    (0.1 * k.min(FRICTION_FF_K_MAX) * v).tanh()
+}
+
+/// Peak stiction push (Nm) — `stiction_amplitude` in
+/// `almond_axol.robot.control`: `gain·fc + load_gain·|gravity|`. Gear
+/// friction follows the transmitted torque (right shoulder_1 broke away at
+/// 0.66 Nm at rest, 2-3.3 Nm under 10-15 Nm of gravity), so the push tracks
+/// the gravity feedforward the joint carries this tick.
+pub fn stiction_amplitude(fc: f64, gain: f64, load_gain: f64, gravity: f64) -> f64 {
+    gain * fc + load_gain * gravity.abs()
+}
+
+/// Measured speed (rad/s) the stiction push fades over —
+/// `STICTION_FADE_VEL` in `almond_axol.robot.control` (~1.4 LSB of the
+/// motor-reported velocity).
+pub const STICTION_FADE_VEL: f64 = 0.03;
+
+/// Error-sign Coulomb compensation — `stiction_compensation` in
+/// `almond_axol.robot.control`:
+/// `amp·tanh(err/err_scale)·(1 − tanh(|v_meas|/STICTION_FADE_VEL))`. Pushes
+/// toward the target (`err = q_des − q_meas`) while the joint is stuck, and
+/// is gone as soon as the joint measurably slides — it must never drive the
+/// slip phase (fading on the *commanded* velocity did, and turned the
+/// stairs into a 2 Hz limit cycle). `amp == 0` is exactly zero.
+pub fn stiction(err: f64, v_meas: f64, amp: f64, err_scale: f64) -> f64 {
+    if amp == 0.0 {
+        return 0.0;
+    }
+    let fade = 1.0 - (v_meas.abs() / STICTION_FADE_VEL).tanh();
+    amp * (err / err_scale.max(1e-9)).tanh() * fade
+}
+
+/// Speed (rad/s) over which the Stribeck term passes through zero —
+/// `STRIBECK_V0` in `almond_axol.robot.control`.
+pub const STRIBECK_V0: f64 = 0.02;
+
+/// Excess of low-speed over sliding friction this tick, Nm —
+/// `stribeck_amplitude` in `almond_axol.robot.control`:
+/// `gain·(dfs + load_gain·|gravity|)`.
+pub fn stribeck_amplitude(gain: f64, dfs: f64, load_gain: f64, gravity: f64) -> f64 {
+    gain * (dfs + load_gain * gravity.abs())
+}
+
+/// Friction cancellation on *measured* velocity — `stribeck_excess` in
+/// `almond_axol.robot.control`: `amp·exp(−(v/v_s)²)·tanh(v/STRIBECK_V0)`.
+/// Follows the measured velocity with the measured friction curve's shape,
+/// so a joint that speeds up sees the feedforward fall by what the real
+/// friction falls and the velocity-weakening slope (negative damping — the
+/// engine of the 2 Hz stick-slip) is flattened. Zero at rest.
+pub fn stribeck_excess(v_meas: f64, amp: f64, v_s: f64) -> f64 {
+    if amp == 0.0 || v_s <= 0.0 {
+        return 0.0;
+    }
+    amp * (-(v_meas / v_s).powi(2)).exp() * (v_meas / STRIBECK_V0).tanh()
+}
+
+/// Per-slot phase offset of the torque dither, the golden angle π(3 − √5) —
+/// `DITHER_PHASE_STAGGER` in `almond_axol.robot.control`.
+pub const DITHER_PHASE_STAGGER: f64 = 2.399_963_229_728_653;
+
+/// Advance a torque-dither oscillator one step — `dither_step` in
+/// `almond_axol.robot.control`. Returns the torque; `phase` is advanced in
+/// place. `nm == 0` is exactly zero and leaves the phase alone.
+pub fn dither_step(phase: &mut f64, nm: f64, hz: f64, dt: f64) -> f64 {
+    if nm == 0.0 || hz <= 0.0 {
+        return 0.0;
+    }
+    *phase = (*phase + 2.0 * std::f64::consts::PI * hz * dt) % (2.0 * std::f64::consts::PI);
+    nm * phase.sin()
+}
+
+/// One harmonic of a joint's position-periodic torque (cogging / gear mesh)
+/// in the motor frame: `a·cos(w·q) + b·sin(w·q)` Nm, `w` in rad⁻¹ (2πk over
+/// the period). The Python side fits the joint-frame series
+/// (`almond_axol.tuning.cogging`), shifts it by the joint offset and scales
+/// it by the joint's `cogging_gain` before it reaches the core, so the core
+/// only evaluates it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CogTerm {
+    pub w: f64,
+    pub a: f64,
+    pub b: f64,
+}
+
+/// The torque to add to cancel a joint's measured position-periodic torque
+/// at motor-frame position `q` — the "osc cancellation" feedforward. The
+/// right shoulder_1's 1.81° / 0.905° ripple is what it was built for: in slow
+/// motion (2–5 deg/s) those bumps land at 1–6 Hz and were ~70% of the tool
+/// tip's vertical shake (2026-09-23). Empty series → 0.
+pub fn cogging(terms: &[CogTerm], q: f64) -> f64 {
+    terms
+        .iter()
+        .map(|t| t.a * (t.w * q).cos() + t.b * (t.w * q).sin())
+        .sum()
+}
+
+/// Seconds the 0x73 torque feedforward takes to fade in when a joint starts
+/// taking it (and after every stretch without it). The firmware's speed
+/// integrator was carrying gravity before; a step of the whole gravity
+/// torque would kick the joint until the integrator unwound. Ramping it in
+/// hands the load over gradually.
+pub const TF_RAMP_S: f64 = 1.0;
+
+/// Advance a 0x73 feedforward fade-in: `ramp` rises by `dt / TF_RAMP_S` to 1.
+pub fn tf_ramp_step(ramp: f64, dt: f64) -> f64 {
+    (ramp + dt.max(0.0) / TF_RAMP_S).min(1.0)
 }
 
 /// Velocity/acceleration-limited target tracker — the per-joint
@@ -577,6 +688,143 @@ mod tests {
 
     /// Golden values from `almond_axol.robot.control.compute_friction`
     /// with fc=0.6, k=250 (above the cap), fv=0.15, fo=0.02.
+    /// Reference vectors from `almond_axol.robot.control.stribeck_excess`
+    /// (amp = 1, v_s = 0.1): `(v_meas, want)`.
+    #[test]
+    fn stribeck_matches_python() {
+        let golden = [
+            (-0.3, -0.00012340980408665668),
+            (-0.1, -0.36784603928630505),
+            (-0.05, -0.7683759879897785),
+            (-0.02, -0.7317316219624262),
+            (0.0, 0.0),
+            (0.01, 0.4575190147179108),
+            (0.02, 0.7317316219624262),
+            (0.05, 0.7683759879897785),
+            (0.1, 0.36784603928630505),
+            (0.2, 0.018315638813231488),
+        ];
+        for (v, want) in golden {
+            let got = stribeck_excess(v, 1.0, 0.1);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "stribeck({v}): got {got:e}, want {want:e}"
+            );
+        }
+        assert_eq!(stribeck_excess(0.05, 0.0, 0.1), 0.0);
+        assert!((stribeck_amplitude(1.0, 0.3, 0.1, -12.0) - 1.5).abs() < 1e-12);
+        assert_eq!(stribeck_amplitude(0.0, 0.3, 0.1, 12.0), 0.0);
+    }
+
+    /// The cogging series is a plain Fourier sum in the motor frame: zero
+    /// with no terms, and each harmonic's cos/sin coefficient read back at
+    /// the quarter points of its period.
+    #[test]
+    fn cogging_sums_its_harmonics() {
+        assert_eq!(cogging(&[], 1.0), 0.0);
+        let period = 1.81_f64.to_radians();
+        let terms = [
+            CogTerm {
+                w: 2.0 * std::f64::consts::PI / period,
+                a: 0.3,
+                b: -0.1,
+            },
+            CogTerm {
+                w: 4.0 * std::f64::consts::PI / period,
+                a: 0.0,
+                b: 0.2,
+            },
+        ];
+        assert!((cogging(&terms, 0.0) - 0.3).abs() < 1e-12);
+        // A quarter of the fundamental: cos → 0, sin → 1; the second harmonic
+        // is at half its period, sin → 0.
+        assert!((cogging(&terms, period / 4.0) + 0.1).abs() < 1e-9);
+        // Periodic in the fundamental.
+        let q = 0.37;
+        assert!((cogging(&terms, q) - cogging(&terms, q + 3.0 * period)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tf_ramp_fades_in_over_its_time_and_saturates() {
+        let mut r = 0.0;
+        for _ in 0..240 {
+            r = tf_ramp_step(r, TF_RAMP_S / 480.0);
+        }
+        assert!((r - 0.5).abs() < 1e-9);
+        for _ in 0..1000 {
+            r = tf_ramp_step(r, 0.01);
+        }
+        assert_eq!(r, 1.0);
+        assert_eq!(tf_ramp_step(0.25, -1.0), 0.25);
+    }
+
+    /// Reference vectors from `almond_axol.robot.control.dither_step`:
+    /// 1.5 Nm at 60 Hz stepped at 240 Hz, slots 0 and 1.
+    #[test]
+    fn dither_matches_python() {
+        let golden: [(usize, [f64; 4]); 2] = [
+            (
+                0,
+                [1.5, 8.498308346471969e-16, -1.5, -1.6996616692943939e-15],
+            ),
+            (
+                1,
+                [
+                    -1.1060533171174791,
+                    -1.0132354413922864,
+                    1.106053317117479,
+                    1.0132354413922875,
+                ],
+            ),
+        ];
+        for (slot, want) in golden {
+            let mut phase = slot as f64 * DITHER_PHASE_STAGGER;
+            for (k, w) in want.iter().enumerate() {
+                let got = dither_step(&mut phase, 1.5, 60.0, 1.0 / 240.0);
+                assert!(
+                    (got - w).abs() < 1e-12,
+                    "slot {slot} k {k}: got {got:e}, want {w:e}"
+                );
+            }
+        }
+        let mut phase = 1.0;
+        assert_eq!(dither_step(&mut phase, 0.0, 60.0, 0.01), 0.0);
+        assert_eq!(phase, 1.0);
+    }
+
+    /// Reference vectors from `almond_axol.robot.control.stiction_compensation`
+    /// (amp = 0.36, err_scale = 0.1°): `(err, v_meas, want)`.
+    #[test]
+    fn stiction_matches_python() {
+        let scale = 0.0017453292519943296_f64;
+        let golden = [
+            (-0.02, 0.0, -0.3599999999198255),
+            (-0.002, 0.0, -0.29390273095808195),
+            (-0.0005, 0.0, -0.10040068111546155),
+            (0.0, 0.0, 0.0),
+            (0.0005, 0.0, 0.10040068111546155),
+            (0.002, 0.0, 0.29390273095808195),
+            (0.02, 0.0, 0.3599999999198255),
+            (0.02, 0.022, 0.1349638509268763),
+            (0.02, -0.044, 0.03638171680139523),
+            (0.02, 0.15, 3.268646545848154e-05),
+        ];
+        for (err, v, want) in golden {
+            let amp = stiction_amplitude(0.6, 0.6, 0.0, 0.0);
+            let got = stiction(err, v, amp, scale);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "stiction({err}, v={v}): got {got:e}, want {want:e}"
+            );
+        }
+        // Off by default: a zero amplitude is exactly 0.
+        assert_eq!(stiction_amplitude(0.6, 0.0, 0.0, 12.0), 0.0);
+        assert_eq!(stiction(0.02, 0.0, 0.0, scale), 0.0);
+        // The push follows |gravity|: 0.39 Nm at rest, 2.79 Nm under 12 Nm.
+        assert!((stiction_amplitude(1.3, 0.3, 0.2, -12.0) - 2.79).abs() < 1e-12);
+        assert!((stiction_amplitude(1.3, 0.3, 0.2, 0.0) - 0.39).abs() < 1e-12);
+    }
+
     #[test]
     fn friction_matches_python() {
         let golden = [

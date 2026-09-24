@@ -17,6 +17,7 @@ from .battery import BatteryStatus, battery_percent, estimate_battery
 from .config import (
     ArmConfig,
     AxolConfig,
+    FirmwareGains,
     FrictionParams,
     JointConfig,
     PositionForceConfig,
@@ -39,6 +40,7 @@ __all__ = [
     "Jelly",
     "JellyConfig",
     "detect_jelly",
+    "FirmwareGains",
     "BatteryStatus",
     "battery_percent",
     "estimate_battery",

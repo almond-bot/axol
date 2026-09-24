@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import struct
+from collections.abc import Mapping
 from typing import Callable
 
 import can
@@ -51,6 +52,9 @@ _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
 # driver tells the two formats apart at runtime.
 _MA_READ_GAINS = 0x30
 _MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+# Settle after a 0x32 write before the read-back: the flash commit is not
+# instant, and a read that races it returns the old value.
+_MA_ROM_SETTLE_S = 0.3
 
 # Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
 _MA_PID_IDX = {
@@ -62,7 +66,15 @@ _MA_PID_IDX = {
     "position_ki": 0x08,
     "position_kd": 0x09,
 }
+
+
+def _gain_matches(stored: float, wanted: float) -> bool:
+    """``stored`` is ``wanted`` up to float32 rounding of the wire value."""
+    return abs(stored - wanted) <= 1e-6 * max(1.0, abs(wanted))
+
+
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
+_MA_READ_ACCELERATION = 0x42  # read one acceleration type; int32 dps/s in bytes 4-7
 
 # Configuration-parameter access. These two commands are absent from MyActuator's
 # published protocol (V4.4) — they were recovered from the vendor setup software,
@@ -457,18 +469,106 @@ class MyActuatorMotor(MotorDriver):
     async def get_firmware_version(self) -> int | None:
         return await self._read_firmware_version()
 
+    async def get_planner_acceleration(self) -> tuple[int, int]:
+        """The position planner's stored ``(acceleration, deceleration)`` in
+        dps/s (0x42 types 0x00 / 0x01).
+
+        0 puts the position loop (0xA4) in direct PI tracking of each new
+        target, which a streamed trajectory needs; any other value makes the
+        firmware plan a velocity profile to every target and a 200 Hz stream
+        then never gets going. Note that a joint left at 0 executes a stored
+        target at its speed cap the moment it wakes.
+        """
+        out: list[int] = []
+        for kind in (_MA_ACC_POS_PLAN, _MA_DEC_POS_PLAN):
+            resp = await self._request(
+                bytes([_MA_READ_ACCELERATION, kind, 0, 0, 0, 0, 0, 0])
+            )
+            out.append(int(struct.unpack_from("<i", resp, 4)[0]))
+        return out[0], out[1]
+
+    async def firmware_gain_mismatches(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """``{name: (running, wanted)}`` for each of ``wanted`` that differs.
+
+        Reads only (0x30 gains, 0x42 planner), so it works on a motor that is
+        enabled and holding — the values its running loop uses. A gain the
+        firmware cannot report (pre-V4.2 indexed format) is left out.
+        """
+        wanted = dict(wanted)
+        out: dict[str, tuple[float, float]] = {}
+        planner = wanted.pop("planner_accel", None)
+        if planner is not None:
+            # Acceleration only: it selects the loop, and the deceleration
+            # has a firmware floor (see _ensure_planner_acceleration).
+            acc, _dec = await self.get_planner_acceleration()
+            if acc != int(round(planner)):
+                out["planner_accel"] = (float(acc), float(planner))
+        for name, value in wanted.items():
+            have = await self._read_gain_indexed(_MA_PID_IDX[name])
+            if have is not None and not _gain_matches(have, value):
+                out[name] = (have, float(value))
+        return out
+
+    async def _ensure_planner_acceleration(
+        self, value: int
+    ) -> tuple[float, float] | None:
+        """Set the position planner's acceleration to ``value`` if it differs.
+
+        The acceleration is what selects the loop (0 = direct tracking,
+        60000 = the planner). The deceleration is written the same, but not
+        required to match: the X8-P20's 2026042402 firmware keeps its own
+        floor of 10 dps/s and reads back ``0/10`` after a 0 — requiring 0
+        there made every enable fail to apply shoulder_1 / shoulder_2's
+        firmware gains (2026-09-22).
+
+        Returns ``(before, after)`` acceleration when written, else None. The
+        caller resets the motor afterwards: on the X6-P20's 2025070202
+        firmware a 0 written into a running position loop is ignored until
+        the reset (non-zero values apply live on every firmware seen).
+        """
+        acc, _dec = await self.get_planner_acceleration()
+        if acc == value:
+            return None
+        for kind in (_MA_ACC_POS_PLAN, _MA_DEC_POS_PLAN):
+            await self._request(
+                bytes([_MA_SET_ACCELERATION, kind, 0, 0])
+                + struct.pack("<I", max(0, value))
+            )
+            await asyncio.sleep(_MA_ROM_SETTLE_S)
+        after, after_dec = await self.get_planner_acceleration()
+        if after != value:
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x}: wrote planner accel/decel "
+                f"{value} but the motor reads back {after}/{after_dec}"
+            )
+        return float(acc), float(after)
+
     async def get_model(self) -> str | None:
         return await self._read_model()
 
     async def disable(self) -> None:
         await self._request(self._cmd(_MA_SHUTDOWN))
 
+    async def reset(self) -> None:
+        """0x76 system reset and the settle the motor needs before it answers.
+
+        Reboots the motor: torque drops, RAM state (0x31 gains) is lost, and
+        the ROM parameters — loop gains written with 0x32, the planner
+        acceleration — are (re)loaded. On the X6-P20's 2025070202 firmware a
+        0x32 write does not reach the running loop without this: the right
+        elbow provisioned at enable and streamed straight after held its
+        pose through a whole replay (2026-09-21), and tracked once rebooted.
+        """
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(_MA_RESET_SETTLE_S)
+
     async def set_control_mode(self, mode: ControlMode) -> None:
         # MyActuator has no persistent control mode register; the active mode is
         # determined by which command is sent. Reset the motor to clear internal
         # state so it comes back ready for the next command type.
-        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(_MA_RESET_SETTLE_S)
+        await self.reset()
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command
@@ -614,6 +714,63 @@ class MyActuatorMotor(MotorDriver):
                 )
             values[name] = value
         return MotorGains(**values)
+
+    async def ensure_rom_gains(
+        self, wanted: Mapping[str, float]
+    ) -> dict[str, tuple[float, float]]:
+        """Bring the named firmware loop gains to ``wanted`` in ROM (0x32).
+
+        ``wanted`` maps parameter names (keys of ``_MA_PID_IDX``) to values,
+        plus ``planner_accel``: the 0xA4 position planner's acceleration and
+        deceleration (dps/s, 0x43 — RAM and ROM in one command), written raw
+        so 0 (direct tracking) is reachable; :meth:`set_acceleration` clamps
+        to its 100 dps/s floor.
+        Each gain is read first and written only when it differs beyond
+        float32 rounding, so a provisioned motor costs reads only and the
+        flash is written once per change. Every write is read back.
+
+        Returns ``{name: (before, after)}`` for the gains that were written.
+
+        The motor must be **disabled**: the firmware commits a 0x32 write to
+        ROM only in that state (protocol V4.4 §2.3) and silently keeps the
+        old value otherwise, which the read-back turns into a
+        :class:`MotorError`. Pre-V4.2 firmware (bulk uint8 gains) is refused
+        with a :class:`MotorError` rather than written.
+        """
+        wanted = dict(wanted)
+        planner = wanted.pop("planner_accel", None)
+        unknown = set(wanted) - set(_MA_PID_IDX)
+        if unknown:
+            raise ValueError(f"unknown firmware gain(s) {sorted(unknown)}")
+        changed: dict[str, tuple[float, float]] = {}
+        if planner is not None:
+            moved = await self._ensure_planner_acceleration(int(round(planner)))
+            if moved is not None:
+                changed["planner_accel"] = moved
+        for name, value in wanted.items():
+            index = _MA_PID_IDX[name]
+            before = await self._read_gain_indexed(index)
+            if before is None:
+                raise MotorError(
+                    f"MyActuator motor {self._motor_id:#04x}: firmware predates the "
+                    f"indexed gain format (protocol V4.2); cannot set {name}"
+                )
+            if _gain_matches(before, value):
+                continue
+            await self._request(
+                bytes([_MA_WRITE_GAINS_ROM, index, 0, 0])
+                + struct.pack("<f", float(value))
+            )
+            await asyncio.sleep(_MA_ROM_SETTLE_S)
+            after = await self._read_gain_indexed(index)
+            if after is None or not _gain_matches(after, value):
+                raise MotorError(
+                    f"MyActuator motor {self._motor_id:#04x}: wrote {name}={value:g} "
+                    f"to ROM but the motor reads back {after}; ROM writes only take "
+                    "while the motor is disabled"
+                )
+            changed[name] = (before, after)
+        return changed
 
     async def set_gains(self, gains: MotorGains) -> None:
         # Command 0x32 writes directly to ROM — no separate store step needed.

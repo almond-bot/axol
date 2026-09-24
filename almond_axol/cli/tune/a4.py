@@ -1,0 +1,1628 @@
+"""
+axol tune.a4
+
+Tune a MyActuator joint's **firmware position loop** (0xA4 absolute position
+closed-loop) — the loop the realtime core drives when a joint's
+``wire_mode`` is ``a4``. Streams a sine or constant-speed triangle target at
+``--rate`` Hz with the firmware gains, speed cap and planner acceleration you
+choose, reads the fine 0.01° position (0x92) every cycle, scores tracking and
+smoothness, and saves the run for the diagnostics dashboard.
+
+Planner acceleration: ``0`` is the documented direct-tracking mode, and the
+protocol maximum ``60000`` makes the planner finish each 200 Hz step inside
+the tick — on the X6-P20 elbow the latter tracked a 3 deg/s triangle to
+0.02° RMS with 4 ms lag against 0.23° / 74 ms for direct tracking. Values in
+between re-plan every target and the joint barely moves. The value is
+written *before* the mode-switch reset: on the elbow's 2025070202 firmware
+a 0 written into a running position loop is silently ignored (the joint
+holds and executes nothing), while the same 0 applied through the reset
+works; non-zero values apply live on every firmware seen.
+
+Why a separate tool: ``tune.pid`` tunes the MIT impedance frame, whose gains
+live in the host. Under 0xA4 the whole controller is the motor's own
+position PI → speed PI → current loop, so the knobs are the firmware gains
+(``position_kp/ki/kd``, ``speed_kp/ki``, ``current_kp/ki``), the 0xA4 speed
+cap, and the position planner's acceleration (0 = direct PI tracking of the
+stream; anything else re-plans every target and will not follow a stream).
+
+Safety:
+
+* Gains are written to **RAM** (0x31) unless ``--persist`` is given, and the
+  pre-run values are written back when the run ends (``--keep`` skips that
+  so a winner stays). The tuning flows reset a motor when they switch its
+  control mode, which also reloads ROM gains — so the gains are written
+  *after* the mode switch and homing, right before the wave.
+* A buzz guard watches the fine position for high-frequency motion and the
+  reply current; past ``--buzz-abort`` degrees of >10 Hz content or
+  ``--iq-abort`` amps it restores the previous gains at once, holds, and
+  ends the run. Size the current limit for the pose: a loaded X8 shoulder
+  draws ~10 A holding gravity alone at -55°. Shoulder_1 at speed_kp 0.1 (3× stock) vibrated immediately
+  on 2026-09-18; start every sweep from the stock values in small steps.
+* The joint under test holds position stiffly in this mode and will push
+  back against contact up to motor torque. Keep the workspace clear.
+
+Examples:
+    axol tune.a4 --r --joint shoulder_1 --center -35 --amp 10 --mode triangle --speed 3
+    axol tune.a4 --r --joint shoulder_1 --mode sine --freq 0.3 --speed-kp 0.05 --speed-ki 0.0005
+    axol tune.a4 --r --joint shoulder_1 --accel 0 --position-kp 0.02 --save-run --label "pkp 0.02"
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import math
+import struct
+import time
+from collections import deque
+from typing import Any
+
+import numpy as np
+
+from ...constants import ARM_JOINTS, Joint
+from ...motor import CanBus, ControlMode, Motor, MotorError
+from ...motor.damiao import DamiaoMotor
+from ...motor.myactuator import _MA_FW_V44_VERSION, _MA_PID_IDX, MyActuatorMotor
+from ...robot.axol import arm_limits
+from ...robot.config import position_wire_mode
+from ...tuning import (
+    JointFrameMotor,
+    joint_frame_motors,
+    log_to_series,
+    ramp_stages,
+    safe_limits,
+    save_run,
+    sine_metrics,
+    sweep_safety,
+)
+from ...tuning.runner import LiveStream, report_achieved_rate
+from ...tuning.wrist_imu import WristImu, format_imu
+from ..motor import add_side_and_channel_arguments, resolve_channel
+from .friction import _home_all, _ramp_verified, _safe_torque_off, rest_target
+
+_MA_POS_CONTROL = 0xA4
+_MA_TF_CONTROL = 0x73  # V4.4: position control with torque feedforward
+_MA_MULTI_TURN_ANGLE = 0x92
+_MA_STATUS2 = 0x9C  # temperature, iq (0.01 A), speed (dps), angle
+_MA_READ_ACCEL = 0x42
+_MA_WRITE_ACCEL = 0x43
+_MA_READ_GAIN = 0x30
+_MA_WRITE_GAIN_RAM = 0x31
+_MA_WRITE_GAIN_ROM = 0x32
+_FLASH_SETTLE_S = 0.3
+
+#: Planner acceleration (dps/s, the protocol maximum) at which the firmware
+#: completes each 200 Hz step's plan inside the tick, so a re-planning
+#: position loop follows the stream instead of stalling on it. On the right
+#: elbow (X6-P20) this tracked a 3 deg/s triangle to 0.02° RMS with 4 ms lag
+#: — better than direct tracking (accel 0: 0.23°, 74 ms) — while 5000 dps/s
+#: never finished a plan before the next target and the joint barely moved.
+_ACCEL_STEP_FOLLOW = 60000
+
+# Damiao (the wrists): the position-velocity mode is the same three-loop
+# cascade with the gains in RAM registers (0x55 writes take effect at once,
+# 0xAA stores them) — KP_APR / KI_APR position, KP_ASR / KI_ASR velocity —
+# and its own trapezoidal profiler whose ACC / DEC registers (rad/s², DEC
+# negative) shape every streamed target. Each 0x100+ID command (p_des,
+# v_des cap, both float32 LE) is answered with the MIT feedback frame, so
+# position comes back at 16 bits over ±PMAX (0.022° at 12.5 rad), no paired
+# read needed. Register 0x50 (p_m) is the float position for held joints.
+_DM_GAIN_REGS = {"speed_kp": 25, "speed_ki": 26, "position_kp": 27, "position_ki": 28}
+_DM_REG_ACC = 4
+_DM_REG_DEC = 5
+_DM_REG_PM = 80
+_DM_REPLY_TIMEOUT_S = 0.02
+
+GAIN_NAMES: tuple[str, ...] = tuple(_MA_PID_IDX)
+
+#: A joint held on its own firmware position loop while another joint runs
+#: the wave should not move; past this (rad, ~1°) it let go or sagged.
+_HOLD_DRIFT_TOL = math.radians(1.0)
+
+#: Position error (rad) past which the wave is abandoned — the loop is not
+#: following at all (planner in profiled mode, or a runaway).
+_ERR_ABORT = math.radians(20.0)
+#: Window (s) the buzz guard evaluates high-frequency motion over.
+_BUZZ_WINDOW_S = 0.1
+
+
+# ---------------------------------------------------------------------------
+# Pure pieces (unit-tested)
+# ---------------------------------------------------------------------------
+
+
+def waveform(
+    mode: str,
+    center: float,
+    amp: float,
+    duration: float,
+    rate: float,
+    *,
+    freq: float = 0.5,
+    speed: float = 0.05,
+) -> list[tuple[float, float, float]]:
+    """``(t, target, v_cmd)`` samples of a sine (``freq`` Hz) or a constant-speed
+    triangle (``speed`` rad/s, ``amp`` half-travel) about ``center`` (rad).
+
+    Both start at ``center`` with zero velocity so the first command is the
+    hold pose the joint was ramped to. The triangle is the stick-slip probe:
+    the whole pass runs at one speed, so creep behaviour is not confined to
+    the sine's turnarounds.
+    """
+    n = max(1, math.ceil(duration * rate))
+    out: list[tuple[float, float, float]] = []
+    if mode == "sine":
+        w = 2.0 * math.pi * freed(freq)
+        for k in range(n):
+            t = k / rate
+            out.append((t, center + amp * math.sin(w * t), amp * w * math.cos(w * t)))
+        return out
+    if mode != "triangle":
+        raise ValueError(f"unknown mode {mode!r}")
+    v = abs(speed)
+    if v <= 0.0 or amp <= 0.0:
+        return [(k / rate, center, 0.0) for k in range(n)]
+    # Triangle: centre → +amp → −amp → +amp …, each leg at constant speed.
+    for k in range(n):
+        t = k / rate
+        s = v * t  # distance travelled along the zig-zag
+        # Fold onto a 4·amp period: 0..amp up, amp..3amp down, 3amp..4amp up.
+        phase = math.fmod(s, 4.0 * amp)
+        if phase < amp:
+            q, vs = center + phase, +v
+        elif phase < 3.0 * amp:
+            q, vs = center + amp - (phase - amp), -v
+        else:
+            q, vs = center - amp + (phase - 3.0 * amp), +v
+        out.append((t, q, vs))
+    return out
+
+
+def freed(freq: float) -> float:
+    """Positive frequency (a zero or negative request becomes a hold)."""
+    return max(freq, 0.0)
+
+
+class BuzzGuard:
+    """Abort detector: high-frequency position motion or excess current.
+
+    Feed one ``(position rad, iq A)`` sample per cycle. High-frequency motion
+    is the RMS of the position about its mean over the last
+    :data:`_BUZZ_WINDOW_S`; a commanded wave contributes little to that at
+    creep speeds, a limit cycle or resonance a lot.
+    """
+
+    def __init__(self, rate: float, buzz_rad: float, iq_abort: float) -> None:
+        self._n = max(4, int(round(_BUZZ_WINDOW_S * rate)))
+        self._pos: deque[float] = deque(maxlen=self._n)
+        self.buzz_rad = buzz_rad
+        self.iq_abort = iq_abort
+        self.peak_buzz = 0.0
+        self.peak_iq = 0.0
+
+    def feed(self, pos: float, iq: float) -> str | None:
+        self._pos.append(pos)
+        self.peak_iq = max(self.peak_iq, abs(iq))
+        if self.iq_abort > 0.0 and abs(iq) > self.iq_abort:
+            return f"current {iq:+.2f} A past the {self.iq_abort:g} A limit"
+        if len(self._pos) < self._n:
+            return None
+        arr = np.asarray(self._pos)
+        # Remove the wave itself (a straight line over 0.1 s) before scoring.
+        x = np.arange(self._n)
+        coef = np.polyfit(x, arr, 1)
+        resid = arr - np.polyval(coef, x)
+        buzz = float(np.sqrt(np.mean(resid * resid)))
+        self.peak_buzz = max(self.peak_buzz, buzz)
+        if self.buzz_rad > 0.0 and buzz > self.buzz_rad:
+            return f"{math.degrees(buzz):.2f}° of high-frequency motion (limit {math.degrees(self.buzz_rad):.2f}°)"
+        return None
+
+
+def a4_metrics(log: list[dict], rate: float) -> dict[str, Any]:
+    """Score a firmware-loop run: the sine scorecard plus creep smoothness."""
+    m: dict[str, Any] = sine_metrics(log)
+    if len(log) < 20:
+        return m
+    t = np.array([r["t"] for r in log])
+    target = np.array([r["target"] for r in log])
+    actual = np.array([r["actual"] for r in log])
+    v_cmd = np.array([r["v_cmd"] for r in log])
+    iq = np.array([r["iq"] for r in log])
+    dt = float(np.median(np.diff(t))) if len(t) > 1 else 1.0 / rate
+    err = actual - target
+    # Lag: how far behind the command the joint runs, from the error while
+    # moving (error against the direction of travel over the speed). Works
+    # for a ramp or triangle, where a correlation shift would be swallowed
+    # by an offset, and for a sine, where the sign flips each half-cycle.
+    moving_now = np.abs(v_cmd) > 0.02
+    if moving_now.any():
+        behind = float(np.mean(-err[moving_now] * np.sign(v_cmd[moving_now])))
+        m["lag_ms"] = behind / float(np.mean(np.abs(v_cmd[moving_now]))) * 1000.0
+    else:
+        m["lag_ms"] = math.nan
+    # 1-4 Hz band of the error (the stick-slip band).
+    e = err - err.mean()
+    n = len(e)
+    F = np.abs(np.fft.rfft(e * np.hanning(n))) ** 2
+    f = np.fft.rfftfreq(n, dt)
+    tot = float(F.sum())
+    m["band_1_4"] = (
+        float(math.sqrt(F[(f >= 1) & (f <= 4)].sum() / tot) * e.std())
+        if tot > 0
+        else 0.0
+    )
+    # Velocity ripple relative to the command, and stuck windows, while the
+    # command is actually moving.
+    win = max(2, int(round(0.05 / dt)))
+    kern = np.ones(win) / win
+    v_meas = np.convolve(np.gradient(actual, t), kern, mode="same")
+    moving = np.abs(v_cmd) > 0.02
+    v_ref = float(np.mean(np.abs(v_cmd[moving]))) if moving.any() else 0.0
+    m["v_ripple"] = (
+        float(np.std((v_meas - v_cmd)[moving]) / v_ref) if v_ref > 0 else math.nan
+    )
+    nwin = len(actual) // win
+    if nwin and moving.any():
+        blocks = actual[: nwin * win].reshape(nwin, win)
+        mv_blocks = moving[: nwin * win].reshape(nwin, win).all(axis=1)
+        travel = np.abs(blocks[:, -1] - blocks[:, 0])
+        m["stuck_frac"] = (
+            float(np.mean(travel[mv_blocks] < math.radians(0.03)))
+            if mv_blocks.any()
+            else math.nan
+        )
+    else:
+        m["stuck_frac"] = math.nan
+    # >10 Hz position content: buzz/resonance.
+    m["buzz"] = float(math.sqrt(F[f >= 10].sum() / tot) * e.std()) if tot > 0 else 0.0
+    m["iq_rms"] = float(np.sqrt(np.nanmean(iq * iq)))
+    m["iq_max"] = float(np.nanmax(np.abs(iq)))
+    # Current *variation* — what the operator feels. The mean current is the
+    # gravity hold and says nothing about smoothness; its spread does, and
+    # the 3-8 Hz band of it is the position loop's own mode (~5 Hz on the
+    # X8-P20 shoulders), the shudder a 12 deg/s triangle's reversals kick up
+    # (1.9 A at position_kp 0.7 against 0.2 A at 3 deg/s) that neither the
+    # >10 Hz position "buzz" nor the >20 Hz current band track.
+    iq_c = iq - np.nanmean(iq)
+    m["iq_sd"] = float(np.nanstd(iq))
+    Fi = np.abs(np.fft.rfft(np.nan_to_num(iq_c) * np.hanning(n))) ** 2
+    tot_i = float(Fi.sum())
+    m["iq_mode"] = (
+        float(math.sqrt(Fi[(f >= 3) & (f <= 8)].sum() / tot_i) * m["iq_sd"])
+        if tot_i > 0
+        else 0.0
+    )
+    return m
+
+
+# ---------------------------------------------------------------------------
+# Motor access
+# ---------------------------------------------------------------------------
+
+
+def parse_pose(
+    specs: list[str] | None, joint: Joint, is_left: bool
+) -> dict[Joint, float]:
+    """``--pose JOINT=DEG`` flags → joint-frame hold targets (rad), validated.
+
+    Same rules as ``tune.pid``: known arm joint, not the test joint, inside
+    the arm's limits, shoulder_2 outboard only (the base is inboard), and
+    wrist_2's inboard half only with the elbow bent ≥ 30°.
+
+    Why a pose here at all: a firmware position loop that is well damped
+    with the arm hanging can go underdamped with the arm extended — the
+    reflected inertia about shoulder_2 is several times larger with
+    shoulder_1 raised and the elbow bent — and right shoulder_2 was seen
+    oscillating on exactly that hold during a shoulder_3 sweep
+    (2026-09-22). Tune the worst-case pose, not just the rest pose.
+    """
+    side = "left" if is_left else "right"
+    pose: dict[Joint, float] = {}
+    for spec in specs or []:
+        name, _, deg = spec.partition("=")
+        try:
+            pj = Joint(name)
+        except ValueError:
+            raise SystemExit(f"--pose: unknown joint {name!r}") from None
+        if pj == joint:
+            raise SystemExit(f"--pose: {name} is the test joint")
+        if pj not in ARM_JOINTS:
+            raise SystemExit(f"--pose: {name} is not an arm joint")
+        try:
+            rad = math.radians(float(deg))
+        except ValueError:
+            raise SystemExit(
+                f"--pose: bad angle in {spec!r} (want JOINT=DEG)"
+            ) from None
+        lo, hi = arm_limits(pj, is_left)
+        if not (lo <= rad <= hi):
+            raise SystemExit(
+                f"--pose: {name}={deg}° is outside "
+                f"[{math.degrees(lo):.0f}, {math.degrees(hi):.0f}]° for the {side} arm"
+            )
+        pose[pj] = rad
+    s2 = pose.get(Joint.SHOULDER_2)
+    s2_out = -1.0 if is_left else 1.0
+    if s2 is not None and s2 * s2_out < 0:
+        raise SystemExit(
+            f"--pose: shoulder_2 must stay outboard "
+            f"({'negative' if s2_out < 0 else 'positive'} on the {side} arm) — "
+            "the robot base is inboard"
+        )
+    w2 = pose.get(Joint.WRIST_2)
+    w2_out = 1.0 if is_left else -1.0
+    if w2 is not None and w2 * w2_out < 0:
+        elbow_pose = pose.get(Joint.ELBOW)
+        if elbow_pose is None or abs(elbow_pose) < math.radians(30.0):
+            raise SystemExit(
+                "--pose: wrist_2 posed in its inboard half meets the base with the "
+                "elbow straight — pose the elbow bent too, e.g. --pose elbow=75"
+            )
+    return pose
+
+
+def parse_held_gains(
+    specs: list[str] | None, joint: Joint, is_left: bool
+) -> dict[Joint, dict[str, float]]:
+    """``--held-gain [SIDE.]JOINT.GAIN=VALUE`` flags → RAM gains per held joint.
+
+    A ring every held joint shares is fed by the held joints' own firmware
+    loops (see :func:`ring_power`), which ``--position-kp`` etc. cannot
+    reach: those set the test joint only. The side may be omitted but must
+    match the run's arm when given; the joint must be another arm joint, and
+    the gain one its motor's loop has (a Damiao wrist: position/speed kp/ki
+    only). Checked before any motor is enabled.
+    """
+    side = "left" if is_left else "right"
+    known = set(GAIN_NAMES)
+    out: dict[Joint, dict[str, float]] = {}
+    for spec in specs or []:
+        name, eq, value = spec.partition("=")
+        parts = name.split(".")
+        if not eq or len(parts) not in (2, 3):
+            raise SystemExit(
+                f"--held-gain: {spec!r} is not [SIDE.]JOINT.GAIN=VALUE "
+                "(e.g. shoulder_2.position_kp=0.5)"
+            )
+        if len(parts) == 3:
+            if parts[0] != side:
+                raise SystemExit(
+                    f"--held-gain: {spec!r} names the {parts[0]} arm; this run is {side}"
+                )
+            parts = parts[1:]
+        jname, gain = parts
+        try:
+            hj = Joint(jname)
+        except ValueError:
+            raise SystemExit(f"--held-gain: unknown joint {jname!r}") from None
+        if hj not in ARM_JOINTS:
+            raise SystemExit(f"--held-gain: {jname} is not an arm joint")
+        if hj == joint:
+            raise SystemExit(
+                f"--held-gain: {jname} is the test joint — set its gains with "
+                f"--{gain.replace('_', '-')}"
+            )
+        if gain not in known:
+            raise SystemExit(
+                f"--held-gain: unknown gain {gain!r} (one of {', '.join(GAIN_NAMES)})"
+            )
+        if position_wire_mode(hj) == "pv" and gain not in _DM_GAIN_REGS:
+            raise SystemExit(
+                f"--held-gain: {jname} is a Damiao motor: its loop has "
+                f"{', '.join(_DM_GAIN_REGS)} only (not {gain})"
+            )
+        try:
+            out.setdefault(hj, {})[gain] = float(value)
+        except ValueError:
+            raise SystemExit(f"--held-gain: bad value in {spec!r}") from None
+    return out
+
+
+def held_summary(
+    held_log: dict[str, list[tuple[float, float]]], holds: dict[str, float]
+) -> dict[str, dict[str, float]]:
+    """Score each held joint's motion during the wave.
+
+    Per joint (degrees): ``drift`` = mean position minus its hold, ``p2p``
+    = peak-to-peak excursion, ``std`` = standard deviation, ``hz`` =
+    dominant frequency of that motion (NaN below ~1 s of samples). A held
+    joint sits on its own firmware position loop: std above a few
+    hundredths of a degree with a clear ``hz`` is the loop oscillating in
+    that pose; a large ``drift`` with little ``std`` is a joint that let go.
+    """
+    out: dict[str, dict[str, float]] = {}
+    for name, samples in held_log.items():
+        if len(samples) < 4:
+            continue
+        t = np.array([a for a, _ in samples])
+        q = np.degrees(np.array([b for _, b in samples]))
+        hold = math.degrees(holds.get(name, 0.0))
+        row = {
+            "drift": float(q.mean() - hold),
+            "p2p": float(np.ptp(q)),
+            "std": float(q.std()),
+            "hz": math.nan,
+        }
+        if t[-1] - t[0] > 1.0:
+            fs = (len(t) - 1) / (t[-1] - t[0])
+            tu = np.arange(t[0], t[-1], 1.0 / fs)
+            x = np.interp(tu, t, q)
+            x = x - x.mean()
+            F = np.abs(np.fft.rfft(x * np.hanning(len(x))))
+            f = np.fft.rfftfreq(len(x), 1.0 / fs)
+            m = f >= 0.5
+            if m.any() and F[m].max() > 0:
+                row["hz"] = float(f[m][int(np.argmax(F[m]))])
+        out[name] = row
+    return out
+
+
+#: Half-width (Hz) of the band around the ring frequency that
+#: :func:`ring_power` keeps: wide enough for a ring that wanders a few tenths
+#: of a hertz over the run, narrow enough to leave the wave itself (the
+#: triangle's fundamental is well under 1 Hz) and gravity's DC out.
+_RING_HALF_BAND_HZ = 0.75
+
+
+def _band(t: np.ndarray, x: np.ndarray, lo: float, hi: float, fs: float) -> np.ndarray:
+    """``x`` resampled onto a uniform ``fs`` grid and band-passed to [lo, hi]."""
+    tu = np.arange(t[0], t[-1], 1.0 / fs)
+    xu = np.interp(tu, t, x)
+    X = np.fft.rfft(xu - xu.mean())
+    f = np.fft.rfftfreq(len(xu), 1.0 / fs)
+    X[(f < lo) | (f > hi)] = 0.0
+    return np.fft.irfft(X, len(xu))
+
+
+def ring_power(
+    dyn: dict[str, list[tuple[float, float, float]]], ring_hz: float
+) -> dict[str, dict[str, float]]:
+    """Which joint feeds a shared ring: each joint's power at ``ring_hz``.
+
+    ``dyn`` maps a joint to ``[(t, velocity rad/s, torque Nm), ...]``. Both
+    signals are band-passed to ``ring_hz`` ± :data:`_RING_HALF_BAND_HZ` and
+    ``power_w`` is the mean of their product — the mechanical power that
+    joint's motor puts into the ring. In a ring every joint shares, the one
+    whose loop drives it (torque in phase with velocity) shows positive
+    power; the joints being shaken by it only absorb (negative). ``cos_phi``
+    is that phase as a correlation (+1 pure drive, -1 pure damping, ~0 a
+    spring), ``vel_amp`` / ``tau_amp`` the ring's amplitude in each signal.
+    Joints with under ~2 s of samples, or sampled too slowly to resolve the
+    band, are left out.
+    """
+    lo, hi = ring_hz - _RING_HALF_BAND_HZ, ring_hz + _RING_HALF_BAND_HZ
+    out: dict[str, dict[str, float]] = {}
+    for name, samples in dyn.items():
+        if len(samples) < 16:
+            continue
+        t = np.array([a for a, _, _ in samples])
+        if t[-1] - t[0] < 2.0:
+            continue
+        fs = (len(t) - 1) / (t[-1] - t[0])
+        if hi >= fs / 2:
+            continue
+        w = _band(t, np.array([b for _, b, _ in samples]), lo, hi, fs)
+        tau = _band(t, np.array([c for _, _, c in samples]), lo, hi, fs)
+        sw, st = float(w.std()), float(tau.std())
+        power = float(np.mean(w * tau))
+        out[name] = {
+            "power_w": power,
+            "cos_phi": power / (sw * st) if sw > 0 and st > 0 else math.nan,
+            "vel_amp": math.sqrt(2.0) * sw,
+            "tau_amp": math.sqrt(2.0) * st,
+        }
+    return out
+
+
+def ring_hz(held_scores: dict[str, dict[str, float]]) -> float | None:
+    """The shared ring's frequency: the most-moving oscillating held joint's."""
+    ringing = [
+        r for r in held_scores.values() if r["std"] > 0.05 and r["hz"] == r["hz"]
+    ]
+    if not ringing:
+        return None
+    return max(ringing, key=lambda r: r["std"])["hz"]
+
+
+def held_series(
+    held_log: dict[str, list[tuple[float, float]]],
+    held_dyn: dict[str, list[tuple[float, float, float]]],
+) -> dict[str, np.ndarray]:
+    """The held joints' raw samples as run series, one key set per joint.
+
+    ``held_<joint>_pos_t`` / ``_pos`` (rad, joint frame) and ``_dyn_t`` /
+    ``_vel`` (rad/s) / ``_tau`` (Nm). Each joint has its own time base — the
+    reads are round-robin — so these are not aligned with the wave's ``t``.
+    """
+    out: dict[str, np.ndarray] = {}
+    for name, samples in held_log.items():
+        if samples:
+            out[f"held_{name}_pos_t"] = np.array([a for a, _ in samples])
+            out[f"held_{name}_pos"] = np.array([b for _, b in samples])
+    for name, samples in held_dyn.items():
+        if samples:
+            out[f"held_{name}_dyn_t"] = np.array([a for a, _, _ in samples])
+            out[f"held_{name}_vel"] = np.array([b for _, b, _ in samples])
+            out[f"held_{name}_tau"] = np.array([c for _, _, c in samples])
+    return out
+
+
+def _a4_frame(position_rad: float, cap_dps: float) -> bytes:
+    cap = int(max(0.0, min(65535.0, round(cap_dps))))
+    return (
+        bytes([_MA_POS_CONTROL, 0x00])
+        + struct.pack("<H", cap)
+        + struct.pack("<i", int(round(position_rad * 18000.0 / math.pi)))
+    )
+
+
+def _tf_frame(position_rad: float, cap_dps: float, ff_pct: float) -> bytes:
+    """0x73 (protocol V4.4): the 0xA4 frame with an int8 torque feedforward in
+    1% of rated current in byte 1."""
+    ff = int(max(-128, min(127, round(ff_pct))))
+    return bytes([_MA_TF_CONTROL, ff & 0xFF]) + _a4_frame(position_rad, cap_dps)[2:]
+
+
+#: The ``--tf-probe`` square wave: feedforward 0, +P, 0, -P % for this long each.
+TF_PROBE_HALF_S = 0.25
+
+
+def tf_probe_ff(t: float, pct: float) -> float:
+    """The probe's feedforward (% rated current) at ``t`` seconds in."""
+    return (0.0, pct, 0.0, -pct)[int(t / TF_PROBE_HALF_S) % 4]
+
+
+def tf_step_estimate(samples: list[tuple[float, float, float]]) -> dict[str, float]:
+    """Amps of q-axis current per 1% of rated current, from a probe's
+    ``(t, ff_pct, iq_A)`` samples.
+
+    At each feedforward switch the firmware adds the new current at once
+    (its current loop runs at kHz), while the position and speed PIs answer
+    only once the joint has moved: the reply to the first frame carrying the
+    new feedforward (sent back within a fraction of a millisecond) against
+    the mean of the few before the switch, over the jump in percent, is the
+    current one percent buys. Later samples are already unwinding under the
+    loops, so only that first one is used. The median over every switch
+    rejects the odd step a control-loop transient spoiled.
+
+    Returns ``{"amps_per_pct", "spread", "edges"}`` — the spread is the
+    interquartile range across switches; ``amps_per_pct`` is NaN with no
+    usable switch.
+    """
+    ratios = []
+    for i in range(6, len(samples)):
+        d_ff = samples[i][1] - samples[i - 1][1]
+        if d_ff == 0 or samples[i - 1][1] != samples[i - 6][1]:
+            continue
+        before = float(np.mean([s[2] for s in samples[i - 5 : i]]))
+        after = samples[i][2]
+        ratios.append((after - before) / d_ff)
+    if not ratios:
+        return {"amps_per_pct": math.nan, "spread": math.nan, "edges": 0}
+    q1, med, q3 = np.percentile(ratios, [25, 50, 75])
+    return {"amps_per_pct": float(med), "spread": float(q3 - q1), "edges": len(ratios)}
+
+
+async def _tf_probe(
+    driver: MyActuatorMotor,
+    motor: JointFrameMotor,
+    pose: float,
+    cap_dps: float,
+    rate: float,
+    pct: float,
+    seconds: float = 8.0,
+) -> list[tuple[float, float, float]]:
+    """Hold ``pose`` on 0x73 with the ``tf_probe_ff`` square wave; returns
+    ``(t, ff_pct, iq_A)`` per reply."""
+    target = pose - motor.frame_offset
+    period = 1.0 / rate
+    out: list[tuple[float, float, float]] = []
+    t0 = time.perf_counter()
+    deadline = t0
+    for k in range(int(seconds * rate)):
+        deadline += period
+        ff = tf_probe_ff(k * period, pct)
+        resp = await driver._request(_tf_frame(target, cap_dps, ff))
+        iq, _speed = _decode_a4_reply(resp)
+        out.append((time.perf_counter() - t0, ff, iq))
+        await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+    return out
+
+
+def speed_cap(
+    v_cmd_rad_s: float, cap_dps: float, track: float, floor_dps: float
+) -> float:
+    """The 0xA4 speed cap (deg/s) for one streamed sample.
+
+    ``track <= 0``: the fixed ``cap_dps``. Otherwise the cap follows the
+    commanded speed — ``track × |v_cmd|``, floored at ``floor_dps`` so a
+    stationary or reversing target can still be corrected, and never above
+    ``cap_dps``.
+
+    Why: with the planner at its maximum (60000 dps/s) and a fixed 60 dps
+    cap, each 200 Hz target is a 0.015° step at 3 deg/s that the planner
+    covers in ~0.5 ms at the cap and then idles for the remaining 4.5 ms —
+    the joint moves in bursts at twenty times the commanded speed with a
+    5 % duty cycle. On the right elbow that was 0.019° RMS tracking with
+    four times the current spread of direct tracking (1.28 A vs 0.33 A,
+    0.76 A above 20 Hz, 68–82 Hz velocity content). A cap of ~1.1–1.2× the
+    commanded speed lets the planner run continuously at about that speed
+    and arrive just before the next target instead.
+    """
+    if track <= 0.0:
+        return cap_dps
+    want = track * abs(math.degrees(v_cmd_rad_s))
+    return min(cap_dps, max(floor_dps, want))
+
+
+def _decode_a4_reply(resp: bytes) -> tuple[float, float]:
+    """(iq A, speed rad/s) from a 0xA4 reply."""
+    iq = struct.unpack_from("<h", resp, 2)[0] * 0.01
+    speed = math.radians(struct.unpack_from("<h", resp, 4)[0])
+    return iq, speed
+
+
+async def _read_gains(driver: MyActuatorMotor | DamiaoMotor) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if isinstance(driver, DamiaoMotor):
+        for name, rid in _DM_GAIN_REGS.items():
+            out[name] = float(await driver._read_register(rid))
+        return out
+    for name, index in _MA_PID_IDX.items():
+        resp = await driver._request(bytes([_MA_READ_GAIN, index, 0, 0, 0, 0, 0, 0]))
+        out[name] = float(struct.unpack_from("<f", resp, 4)[0])
+    return out
+
+
+async def _write_gains(
+    driver: MyActuatorMotor | DamiaoMotor, gains: dict[str, float], persist: bool
+) -> None:
+    if isinstance(driver, DamiaoMotor):
+        # RAM registers take effect immediately; 0xAA stores them all.
+        for name, value in gains.items():
+            await driver._write_register(_DM_GAIN_REGS[name], float(value))
+            await asyncio.sleep(0.02)
+        if persist:
+            await driver._store_parameters()
+            await asyncio.sleep(_FLASH_SETTLE_S)
+        return
+    cmd = _MA_WRITE_GAIN_ROM if persist else _MA_WRITE_GAIN_RAM
+    for name, value in gains.items():
+        await driver._request(
+            bytes([cmd, _MA_PID_IDX[name], 0, 0]) + struct.pack("<f", float(value))
+        )
+        await asyncio.sleep(_FLASH_SETTLE_S if persist else 0.02)
+
+
+def dm_frame(position_rad: float, cap_dps: float) -> bytes:
+    """The Damiao position-velocity command: ``(p_des rad, v_des rad/s)`` LE."""
+    return struct.pack("<ff", float(position_rad), math.radians(max(0.0, cap_dps)))
+
+
+async def _dm_read_ramps(driver: DamiaoMotor) -> tuple[float, float]:
+    return (
+        float(await driver._read_register(_DM_REG_ACC)),
+        float(await driver._read_register(_DM_REG_DEC)),
+    )
+
+
+async def _dm_write_ramps(
+    driver: DamiaoMotor, acc: float, dec: float, persist: bool
+) -> tuple[float, float]:
+    await driver._write_register(_DM_REG_ACC, float(acc))
+    await asyncio.sleep(0.02)
+    await driver._write_register(_DM_REG_DEC, float(dec))
+    await asyncio.sleep(0.02)
+    if persist:
+        await driver._store_parameters()
+        await asyncio.sleep(_FLASH_SETTLE_S)
+    return await _dm_read_ramps(driver)
+
+
+async def _read_accel(driver: MyActuatorMotor) -> tuple[int, int]:
+    out = []
+    for kind in (0x00, 0x01):
+        resp = await driver._request(bytes([_MA_READ_ACCEL, kind, 0, 0, 0, 0, 0, 0]))
+        out.append(int(struct.unpack_from("<i", resp, 4)[0]))
+    return out[0], out[1]
+
+
+async def _write_accel(driver: MyActuatorMotor, acc: int, dec: int) -> tuple[int, int]:
+    for kind, value in ((0x00, acc), (0x01, dec)):
+        await driver._request(
+            bytes([_MA_WRITE_ACCEL, kind, 0, 0]) + struct.pack("<I", int(max(0, value)))
+        )
+        await asyncio.sleep(_FLASH_SETTLE_S)
+    return await _read_accel(driver)
+
+
+async def _stream(
+    motor: JointFrameMotor,
+    driver: MyActuatorMotor | DamiaoMotor,
+    samples: list[tuple[float, float, float]],
+    cap_dps: float,
+    rate: float,
+    guard: BuzzGuard,
+    live: LiveStream,
+    cap_track: float = 0.0,
+    cap_floor_dps: float = 1.0,
+    lead_s: float = 0.0,
+    held: dict[Joint, JointFrameMotor] | None = None,
+) -> tuple[
+    list[dict],
+    str | None,
+    dict[str, list[tuple[float, float]]],
+    dict[str, list[tuple[float, float, float]]],
+]:
+    """Stream the wave; returns the log, the abort reason (if any), and the
+    held joints' samples, one read of one held joint per tick after the
+    wave's own round trips. Turns alternate between a position read (0x92 /
+    Damiao p_m) into ``{joint: [(t, position_rad), ...]}`` and a velocity +
+    torque read (0x9C / Damiao 0xCC feedback) into ``{joint: [(t, vel_rad_s,
+    torque_nm), ...]}``, so each held joint gets each at ``rate / (2 *
+    len(held))`` Hz — ~33 Hz on a full arm at 400 Hz, ample for the few-Hz
+    rings the held table and :func:`ring_power` look for."""
+    offset = motor.frame_offset
+    period = 1.0 / rate
+    log: list[dict] = []
+    held_items = [
+        (j.value, jm.motor._driver, jm.frame_offset)
+        for j, jm in (held or {}).items()
+        if isinstance(jm.motor._driver, (MyActuatorMotor, DamiaoMotor))
+    ]
+    held_log: dict[str, list[tuple[float, float]]] = {n: [] for n, _, _ in held_items}
+    held_dyn: dict[str, list[tuple[float, float, float]]] = {
+        n: [] for n, _, _ in held_items
+    }
+    is_dm = isinstance(driver, DamiaoMotor)
+    loop = asyncio.get_running_loop()
+    t0 = time.perf_counter()
+    deadline = t0
+    for k, (_t_nominal, target, v_cmd) in enumerate(samples):
+        deadline += period
+        cap = speed_cap(v_cmd, cap_dps, cap_track, cap_floor_dps)
+        # The commanded target, led along the wave's velocity (--lead-ms); the
+        # log keeps the true target, so the run scores against the wave.
+        sent = target + v_cmd * lead_s
+        if is_dm:
+            # One 0x100 command, one feedback frame back: position (16-bit),
+            # velocity and torque. Torque fills the ``iq`` channel, in Nm.
+            fut = loop.create_future()
+            driver._feedback_waiters.append(fut)
+            await driver._raw_send(
+                dm_frame(sent - offset, cap), 0x100 + driver._motor_id
+            )
+            try:
+                fb = await asyncio.wait_for(fut, _DM_REPLY_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                fb = driver._feedback
+            if fb is None:
+                raise MotorError(f"Damiao motor {driver._motor_id:#04x}: no feedback")
+            pos, iq, speed = fb.position + offset, fb.torque, fb.velocity
+        else:
+            resp = await driver._request(_a4_frame(sent - offset, cap))
+            iq, speed = _decode_a4_reply(resp)
+            fine = await driver._request(
+                bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+            )
+            pos = (
+                struct.unpack_from("<i", fine, 4)[0] * (0.01 * math.pi / 180.0) + offset
+            )
+        now = time.perf_counter() - t0
+        if held_items:
+            slot = k % (2 * len(held_items))
+            name, hdrv, hoff = held_items[slot % len(held_items)]
+            try:
+                if slot >= len(held_items):
+                    # The dynamics turn: velocity and torque from one reply,
+                    # so the two are simultaneous for the power product.
+                    if isinstance(hdrv, DamiaoMotor):
+                        fb = await hdrv._request_feedback(
+                            timeout=_DM_REPLY_TIMEOUT_S, attempts=1
+                        )
+                        held_dyn[name].append((now, fb.velocity, fb.torque))
+                    else:
+                        st = await hdrv._request(
+                            bytes([_MA_STATUS2, 0, 0, 0, 0, 0, 0, 0])
+                        )
+                        # Own names: iq/speed are the driven joint's, read
+                        # below by the log and the buzz guard.
+                        h_iq = struct.unpack_from("<h", st, 2)[0] * 0.01
+                        h_speed = math.radians(struct.unpack_from("<h", st, 4)[0])
+                        held_dyn[name].append((now, h_speed, h_iq * hdrv._kt))
+                else:
+                    if isinstance(hdrv, DamiaoMotor):
+                        hp = float(
+                            await hdrv._read_register(
+                                _DM_REG_PM, timeout=_DM_REPLY_TIMEOUT_S, attempts=1
+                            )
+                        )
+                    else:
+                        hf = await hdrv._request(
+                            bytes([_MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0])
+                        )
+                        hp = struct.unpack_from("<i", hf, 4)[0] * (
+                            0.01 * math.pi / 180.0
+                        )
+                    held_log[name].append((now, hp + hoff))
+            except MotorError:
+                pass
+        log.append(
+            {
+                "t": now,
+                "target": target,
+                "actual": pos,
+                "error": pos - target,
+                "torque": math.nan,
+                "speed": speed,
+                "iq": iq,
+                "v_cmd": v_cmd,
+            }
+        )
+        live.add(now, target, pos)
+        reason = guard.feed(pos, iq)
+        if reason is None and abs(pos - target) > _ERR_ABORT:
+            reason = f"tracking error {math.degrees(pos - target):+.1f}° — the loop is not following"
+        if reason is not None:
+            return log, reason, held_log, held_dyn
+        await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+    return log, None, held_log, held_dyn
+
+
+async def _hold(
+    driver: MyActuatorMotor | DamiaoMotor,
+    motor: JointFrameMotor,
+    pose: float,
+    cap_dps: float,
+    seconds: float,
+) -> None:
+    period = 0.01
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        if isinstance(driver, DamiaoMotor):
+            await driver._raw_send(
+                dm_frame(pose - motor.frame_offset, cap_dps), 0x100 + driver._motor_id
+            )
+        else:
+            await driver._request(_a4_frame(pose - motor.frame_offset, cap_dps))
+        await asyncio.sleep(period)
+
+
+async def _report_tf_probe(
+    driver: MyActuatorMotor | DamiaoMotor,
+    motor: JointFrameMotor,
+    joint: Joint,
+    pose: float,
+    args: argparse.Namespace,
+) -> None:
+    """Run ``--tf-probe`` at the held pose and print the rated current it
+    implies (the ``firmware.tf_rated_current_a`` to configure)."""
+    if not isinstance(driver, MyActuatorMotor):
+        print(f"  ! --tf-probe: {joint.value} is not a MyActuator motor")
+        return
+    version = driver._fw_version or await driver._read_firmware_version()
+    if version < _MA_FW_V44_VERSION:
+        print(
+            f"  ! --tf-probe: firmware {version} predates 0x73 (protocol V4.4, "
+            f"VersionDate {_MA_FW_V44_VERSION} or later) — this joint stays on 0xA4"
+        )
+        return
+    pct = float(args.tf_probe)
+    print(
+        f"  0x73 probe: holding {math.degrees(pose):+.1f}° with feedforward "
+        f"0 / +{pct:g} / 0 / -{pct:g} % rated current, {TF_PROBE_HALF_S:g} s each ..."
+    )
+    samples = await _tf_probe(driver, motor, pose, args.cap, args.rate, pct)
+    await _hold(driver, motor, pose, args.cap, 0.3)
+    est = tf_step_estimate(samples)
+    if not est["edges"] or not math.isfinite(est["amps_per_pct"]):
+        print("  ! no usable feedforward switch in the probe — nothing to estimate")
+        return
+    if est["amps_per_pct"] <= 0.0:
+        print(
+            f"  ! +1% feedforward moved iq by {est['amps_per_pct']:+.4f} A — not the "
+            "positive step 0x73 is documented to give. Do not enable the core's 0x73 "
+            "feedforward on this joint until that is understood (a sign flip would "
+            "double the gravity load instead of carrying it)."
+        )
+        return
+    kt = float(driver._kt)
+    rated = 100.0 * est["amps_per_pct"]
+    print(f"\n{'─' * 66}")
+    print(
+        f"  iq per 1% feedforward: {est['amps_per_pct']:.4f} A "
+        f"(IQR {est['spread']:.4f} over {est['edges']} switches)"
+    )
+    print(
+        f"  → rated current ≈ {rated:.2f} A; with kt {kt:g} Nm/A that is "
+        f"{kt * est['amps_per_pct']:.4f} Nm per %"
+    )
+    print(
+        f"  configure: firmware.tf_rated_current_a = {rated:.2f} (or its datasheet "
+        f"value) — e.g. tune.motion --gain {joint.value}.firmware.tf_rated_current_a="
+        f"{rated:.2f}"
+    )
+    print(f"{'─' * 66}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``tune.a4`` subcommand."""
+    p = subparsers.add_parser(
+        "tune.a4",
+        help="Tune a MyActuator joint's firmware position loop (0xA4) with a sine or triangle.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    add_side_and_channel_arguments(p)
+    p.add_argument(
+        "--joint",
+        required=True,
+        choices=[j.value for j in ARM_JOINTS],
+        help="Joint to drive (MyActuator joints: shoulder_1 … wrist_1)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["sine", "triangle"],
+        default="triangle",
+        help="Wave shape: sine (--freq) or constant-speed triangle (--speed) (default: triangle)",
+    )
+    p.add_argument(
+        "--center",
+        type=float,
+        default=None,
+        help="Centre, joint-frame degrees (default: joint midpoint of the safe range)",
+    )
+    p.add_argument(
+        "--amp", type=float, default=10.0, help="Half-travel, degrees (default: 10)"
+    )
+    p.add_argument(
+        "--freq", type=float, default=0.3, help="[sine] frequency, Hz (default: 0.3)"
+    )
+    p.add_argument(
+        "--speed",
+        type=float,
+        default=3.0,
+        help="[triangle] pass speed, deg/s (default: 3)",
+    )
+    p.add_argument(
+        "--duration", type=float, default=12.0, help="Seconds of wave (default: 12)"
+    )
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=400.0,
+        help="Command rate, Hz (default: 400 — the realtime core's a4 stream rate; 200 Hz put an audible target staircase on the X8-P20 shoulder at 12 deg/s that 400 removed)",
+    )
+    p.add_argument(
+        "--cap", type=float, default=60.0, help="0xA4 speed cap, deg/s (default: 60)"
+    )
+    p.add_argument(
+        "--dm-acc",
+        type=float,
+        default=None,
+        help="Damiao wrists only: the position-velocity profiler's ACC (and -DEC), rad/s², "
+        "written to the registers for the run and restored afterwards unless --keep "
+        "(--persist stores them). The wrists were found at 2 rad/s² (~115 deg/s²), far "
+        "too slow to follow a streamed target.",
+    )
+    p.add_argument(
+        "--pose",
+        action="append",
+        default=None,
+        metavar="JOINT=DEG",
+        help="Hold another joint at this joint-frame angle (degrees) during the run, "
+        "e.g. --pose shoulder_1=-90 --pose elbow=-75 (repeatable; overrides the sweep's "
+        "own clearance pose for that joint). A firmware loop that is well damped with "
+        "the arm hanging can oscillate with it extended — right shoulder_2 did, held "
+        "during a shoulder_3 sweep — so tune the worst-case pose too. Posed joints "
+        "return to rest afterwards.",
+    )
+    p.add_argument(
+        "--held-gain",
+        action="append",
+        default=None,
+        metavar="[SIDE.]JOINT.GAIN=VALUE",
+        help="Set a *held* joint's firmware loop gain for the run, in RAM, "
+        "restored afterwards (unless --keep), e.g. --held-gain "
+        "shoulder_2.position_kp=0.5 --held-gain wrist_2.position_kp=200 "
+        "(repeatable). The held joints' loops are what feed a ring they all "
+        "share — the power table names them — and the per-gain flags only reach "
+        "the test joint. Written after the mode switch, like the test joint's "
+        "(the reset reloads ROM). Damiao wrists take position/speed kp/ki only",
+    )
+    p.add_argument(
+        "--cap-track",
+        type=float,
+        default=0.0,
+        help="Make the per-command speed cap follow the wave: cap = this × |commanded "
+        "speed| (floored at --cap-floor, never above --cap). 0 (default) = fixed --cap. "
+        f"With --accel {_ACCEL_STEP_FOLLOW} a fixed cap lets the planner burst through "
+        "each 200 Hz step at the cap and idle the rest of the tick (4x the current "
+        "spread on the elbow); 1.1-1.2 keeps it moving continuously at about the "
+        "commanded speed.",
+    )
+    p.add_argument(
+        "--cap-floor",
+        type=float,
+        default=1.0,
+        help="Lowest cap --cap-track may set, deg/s, so a stationary or reversing "
+        "target can still be corrected (default: 1)",
+    )
+    p.add_argument(
+        "--lead-ms",
+        type=float,
+        default=0.0,
+        help="Send each command's target this far ahead along the commanded velocity "
+        "(target + v_cmd × lead); the run is still scored against the true wave. With "
+        f"--accel {_ACCEL_STEP_FOLLOW} the planner plans to *stop* at each target, so at "
+        "a fixed command rate it cannot average more than ~accel × tick / 4 (≈31 deg/s at "
+        "480 Hz) whatever the cap; a target a few ms ahead is never reached within the "
+        "tick, so it cruises at the cap instead. 0 (default) = no lead.",
+    )
+    p.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="Do not record the wrist camera's IMU (recorded by default: the run "
+        "gets an 'imu' shake score — 1-15 Hz displacement p2p in mm at the gripper).",
+    )
+    p.add_argument(
+        "--tf-probe",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help="Instead of the wave: hold the joint at --center on 0x73 (protocol "
+        "V4.4 position control with torque feedforward) and step the feedforward "
+        f"0 / +PCT / 0 / -PCT %% of rated current ({TF_PROBE_HALF_S:g} s each, 8 s) — "
+        "the q-axis current jump at each step, before the loop reacts, measures "
+        "the current 1%% buys, i.e. the motor's rated current: the "
+        "firmware.tf_rated_current_a the realtime core scales its 0x73 "
+        "feedforward with. 5 is a gentle ~1 Nm on a shoulder. MyActuator V4.4 "
+        "firmware only; run it with --accel 0.",
+    )
+    p.add_argument(
+        "--accel",
+        type=int,
+        default=None,
+        help="Position-planner acceleration (dps/s) for the run, written to ROM before the "
+        "mode-switch reset and restored afterwards unless --keep; default: leave the stored "
+        f"value. 0 = direct PI tracking of the stream; {_ACCEL_STEP_FOLLOW} (the protocol "
+        "maximum) = the planner completes each 200 Hz step within the tick, which tracked the "
+        "X6-P20 elbow better than 0 (0.02° vs 0.23° RMS). Anything in between re-plans every "
+        "target and will not follow the wave.",
+    )
+    for name in GAIN_NAMES:
+        p.add_argument(
+            f"--{name.replace('_', '-')}",
+            dest=name,
+            type=float,
+            default=None,
+            help=f"Firmware {name} for this run (default: leave as is)",
+        )
+    p.add_argument(
+        "--persist",
+        action="store_true",
+        help="Write gains to ROM (0x32) instead of RAM (0x31)",
+    )
+    p.add_argument(
+        "--keep",
+        action="store_true",
+        help="Leave the run's gains and planner acceleration in the motor afterwards",
+    )
+    p.add_argument(
+        "--buzz-abort",
+        type=float,
+        default=0.3,
+        help="Abort past this much >10 Hz position motion, degrees RMS over 0.1 s (default: 0.3; 0 off)",
+    )
+    p.add_argument(
+        "--iq-abort",
+        type=float,
+        default=30.0,
+        help="Abort past this reply current, amps (default: 30; 0 off). A loaded X8 "
+        "shoulder draws ~10 A just holding gravity at -55°, so keep this well above "
+        "the pose's static current",
+    )
+    p.add_argument(
+        "--save-run",
+        action="store_true",
+        help="Persist the run for the diagnostics dashboard",
+    )
+    p.add_argument("--label", default=None, help="Free-form note stored on the run")
+    p.add_argument(
+        "--group", default=None, help="Shared id linking the runs of one sweep"
+    )
+    p.set_defaults(func=run)
+
+
+def run(args: argparse.Namespace) -> None:
+    asyncio.run(_run(args))
+
+
+async def _run(args: argparse.Namespace) -> None:
+    joint = Joint(args.joint)
+    is_left = args.l
+    side = "left" if is_left else "right"
+    lo, hi = safe_limits(joint, is_left)
+    amp = math.radians(args.amp)
+    center = math.radians(args.center) if args.center is not None else (lo + hi) / 2.0
+    margin = math.radians(2.0)
+    if not (lo + margin <= center - amp and center + amp <= hi - margin):
+        raise SystemExit(
+            f"{joint.value}: {math.degrees(center - amp):+.1f}..{math.degrees(center + amp):+.1f}° "
+            f"is outside the safe range [{math.degrees(lo) + 2:.1f}, {math.degrees(hi) - 2:.1f}]°"
+        )
+    requested = {
+        n: getattr(args, n) for n in GAIN_NAMES if getattr(args, n) is not None
+    }
+    held_gains = parse_held_gains(args.held_gain, joint, is_left)
+    if not 0.0 <= args.lead_ms <= 50.0:
+        raise SystemExit("--lead-ms must be within 0..50")
+    samples = waveform(
+        args.mode,
+        center,
+        amp,
+        args.duration,
+        args.rate,
+        freq=args.freq,
+        speed=math.radians(args.speed),
+    )
+    # A led target runs ahead of the wave by up to v_max × lead; keep that
+    # inside the 2° range margin checked above.
+    lead_reach = max(abs(v) for _, _, v in samples) * args.lead_ms / 1e3
+    if lead_reach > math.radians(1.0):
+        raise SystemExit(
+            f"--lead-ms {args.lead_ms:g} leads the target up to "
+            f"{math.degrees(lead_reach):.2f}° past the wave (max 1°): lower the lead "
+            "or the speed"
+        )
+    print(f"\ntune.a4 — {side} {joint.value}: firmware position loop (0xA4)")
+    print(
+        f"  {args.mode} about {math.degrees(center):+.1f}° ±{args.amp:g}°, "
+        + (f"{args.freq:g} Hz" if args.mode == "sine" else f"{args.speed:g} deg/s")
+        + f", {args.duration:g} s at {args.rate:g} Hz, speed cap {args.cap:g} dps"
+        + (
+            f" tracking {args.cap_track:g}× commanded speed (floor {args.cap_floor:g}"
+            ", planner permitting)"
+            if args.cap_track > 0
+            else ""
+        )
+        + (f", targets led {args.lead_ms:g} ms" if args.lead_ms else "")
+    )
+
+    channel = resolve_channel(args)
+    # The wrist camera's IMU: opened before the motors, stopped after them.
+    imu = WristImu([side], enabled=not args.no_imu and args.tf_probe is None)
+    imu.start()
+    stream_origin: float | None = None
+    async with CanBus(channel) as bus:
+        raw = {j: Motor(bus, j) for j in ARM_JOINTS}
+        await asyncio.gather(*[m.enable() for m in raw.values()])
+        driver = raw[joint]._driver
+        if not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
+            raise SystemExit(f"{joint.value} has no firmware position loop to tune")
+        is_dm = isinstance(driver, DamiaoMotor)
+        if is_dm:
+            unsupported = sorted(set(requested) - set(_DM_GAIN_REGS))
+            if unsupported:
+                raise SystemExit(
+                    f"{joint.value} is a Damiao motor: its loop has "
+                    f"{', '.join(_DM_GAIN_REGS)} only (not {', '.join(unsupported)})"
+                )
+            if args.accel is not None:
+                raise SystemExit(
+                    f"{joint.value} is a Damiao motor: its profiler is ACC/DEC in rad/s² — "
+                    "use --dm-acc, not --accel"
+                )
+        elif args.dm_acc is not None:
+            raise SystemExit(
+                f"--dm-acc is for the Damiao wrists; {joint.value} takes --accel"
+            )
+        before_gains: dict[str, float] | None = None
+        before_accel: tuple[int, int] | None = None
+        before_ramps: tuple[float, float] | None = None
+        log: list[dict] = []
+        reason: str | None = None
+        used_gains: dict[str, float] = {}
+        accel_used: tuple[int, int] | None = None
+        ramps_used: tuple[float, float] | None = None
+        held_scores: dict[str, dict[str, float]] = {}
+        held_log: dict[str, list[tuple[float, float]]] = {}
+        held_dyn: dict[str, list[tuple[float, float, float]]] = {}
+        ring_at: float | None = None
+        ring_scores: dict[str, dict[str, float]] = {}
+        # Held joints' gains as found (restored at the end) and as run.
+        held_before: dict[Joint, dict[str, float]] = {}
+        held_used: dict[str, dict[str, float]] = {}
+        current_label = "torque" if is_dm else "current"
+        current_unit = "Nm" if is_dm else "A"
+
+        # Planner acceleration goes in *before* the mode switch below: that
+        # switch is a 0x76 reset, and the reset is what makes a planner value
+        # of 0 take effect. On the X6-P20 elbow (firmware 2025070202) a 0
+        # written into a running position loop is ignored — the joint held
+        # its target and executed nothing for a whole run (2026-09-21) while
+        # the same 0 stored before the reset gave the documented direct
+        # tracking. Non-zero values do apply live on that firmware (5000 →
+        # 60000 took effect mid-session); the X8-P20 shoulders (2026042402)
+        # apply 0 live as well. Writing first is right for every one of them.
+        cap_track = args.cap_track
+        if is_dm:
+            # Damiao: the profiler is always on (ACC in (0, fmax), DEC < 0),
+            # registers in RAM, no reset needed for them to take effect. A
+            # stored 2 rad/s² (the wrists as found) is ~115 deg/s² — far too
+            # slow to follow a streamed target; the sweep says what does.
+            stored_ramps = await _dm_read_ramps(driver)
+            print(
+                f"  profiler ACC/DEC stored: {stored_ramps[0]:g}/{stored_ramps[1]:g} rad/s²"
+            )
+            if args.dm_acc is not None and (stored_ramps[0], -stored_ramps[1]) != (
+                args.dm_acc,
+                args.dm_acc,
+            ):
+                before_ramps = stored_ramps
+                ramps_used = await _dm_write_ramps(
+                    driver, args.dm_acc, -abs(args.dm_acc), args.persist
+                )
+                print(
+                    f"  profiler ACC/DEC {stored_ramps[0]:g}/{stored_ramps[1]:g} → "
+                    f"{ramps_used[0]:g}/{ramps_used[1]:g} rad/s²"
+                )
+            else:
+                ramps_used = stored_ramps
+        else:
+            stored_accel = await _read_accel(driver)
+            print(
+                f"  planner accel/decel stored: {stored_accel[0]}/{stored_accel[1]} dps/s"
+            )
+            if args.accel is not None and stored_accel != (args.accel, args.accel):
+                before_accel = stored_accel
+                accel_used = await _write_accel(driver, args.accel, args.accel)
+                print(
+                    f"  planner accel/decel {stored_accel[0]}/{stored_accel[1]} → {accel_used[0]}/{accel_used[1]} dps/s"
+                )
+            else:
+                accel_used = stored_accel
+            if accel_used[0] not in (0, _ACCEL_STEP_FOLLOW):
+                print(
+                    f"  ! planner acceleration is {accel_used[0]} dps/s: the firmware re-plans "
+                    "every streamed target and will not follow the wave — pass --accel 0 "
+                    f"(direct PI tracking) or --accel {_ACCEL_STEP_FOLLOW} (planner completes "
+                    "each step within the tick)"
+                )
+
+        if accel_used is not None and accel_used[0] == 0 and cap_track > 0:
+            # Under direct tracking the cap is a hard limit on the PI output:
+            # pinned near the commanded speed the loop can never catch up
+            # (right elbow, pKp 0.5, cap-track 1.1: 1.8° RMS, 480 ms lag).
+            # The knob exists for the planner's per-tick bursts, which
+            # direct tracking does not have.
+            print(
+                f"  ! --cap-track {cap_track:g} ignored: the planner is at 0 (direct "
+                "PI tracking), where the cap would only throttle the loop"
+            )
+            cap_track = 0.0
+
+        motors = await joint_frame_motors(raw, is_left)
+        await asyncio.gather(
+            *[
+                m.set_control_mode(ControlMode.POSITION_VELOCITY)
+                for m in motors.values()
+            ]
+        )
+        motor = motors[joint]
+        try:
+            print("  Homing all joints to rest ...")
+            await _home_all(motors)
+            other_targets, _lo, _hi, notes = sweep_safety(joint, is_left)
+            for note in notes:
+                print(f"  {note}")
+            pose = parse_pose(args.pose, joint, is_left)
+            if pose:
+                other_targets.update(pose)
+                print(
+                    "  Posing "
+                    + ", ".join(
+                        f"{j.value} at {math.degrees(q):+.0f}°" for j, q in pose.items()
+                    )
+                )
+            for stage in ramp_stages(other_targets):
+                await _ramp_verified(motors, stage)
+            print(f"  Ramping {joint.value} to {math.degrees(center):+.1f}° ...")
+            await _ramp_verified(motors, {joint: center})
+            await asyncio.sleep(0.3)
+
+            # Gains are written here, after the mode switch and homing: RAM
+            # gains (0x31) do not survive the reset those perform.
+            stock = await _read_gains(driver)
+            used_gains = {**stock, **requested}
+            if requested:
+                before_gains = stock
+                await _write_gains(driver, requested, args.persist)
+                used_gains = await _read_gains(driver)
+                for n in requested:
+                    flag = (
+                        ""
+                        if abs(used_gains[n] - requested[n])
+                        <= 1e-6 * max(1.0, abs(requested[n]))
+                        else "  (! not accepted)"
+                    )
+                    print(f"  {n:12s} {stock[n]:.6g} → {used_gains[n]:.6g}{flag}")
+            else:
+                print("  gains: " + ", ".join(f"{n}={v:.6g}" for n, v in stock.items()))
+            for hj, hgains in held_gains.items():
+                hdrv = raw[hj]._driver
+                found = await _read_gains(hdrv)
+                held_before[hj] = {n: found[n] for n in hgains}
+                await _write_gains(hdrv, hgains, False)
+                got = await _read_gains(hdrv)
+                held_used[hj.value] = {n: got[n] for n in hgains}
+                for n, want in hgains.items():
+                    flag = (
+                        ""
+                        if abs(got[n] - want) <= 1e-6 * max(1.0, abs(want))
+                        else "  (! not accepted)"
+                    )
+                    print(
+                        f"  held {hj.value}.{n:12s} {found[n]:.6g} → {got[n]:.6g}{flag}"
+                    )
+
+            if args.tf_probe is not None:
+                await _report_tf_probe(driver, motor, joint, center, args)
+                return
+            guard = BuzzGuard(args.rate, math.radians(args.buzz_abort), args.iq_abort)
+            live = LiveStream("sine", joint)
+            print("  Running ...")
+            stream_origin = time.perf_counter()
+            log, reason, held_log, held_dyn = await _stream(
+                motor,
+                driver,
+                samples,
+                args.cap,
+                args.rate,
+                guard,
+                live,
+                cap_track=cap_track,
+                cap_floor_dps=args.cap_floor,
+                lead_s=args.lead_ms / 1e3,
+                held={j: jm for j, jm in motors.items() if j != joint},
+            )
+            live.flush()
+            held_scores = held_summary(
+                held_log,
+                {
+                    j.value: other_targets.get(
+                        j, rest_target(j, getattr(jm, "_is_left", None))
+                    )
+                    for j, jm in motors.items()
+                },
+            )
+            if held_scores:
+                print(
+                    "  held joints during the wave (drift / p2p / std / dominant Hz):"
+                )
+                for name, r in held_scores.items():
+                    flag = (
+                        "  <-- oscillating"
+                        if r["std"] > 0.05 and r["hz"] == r["hz"]
+                        else ""
+                    )
+                    print(
+                        f"    {name:12s} {r['drift']:+6.2f}° / {r['p2p']:5.2f}° / {r['std']:5.3f}° / "
+                        + (f"{r['hz']:4.1f} Hz" if r["hz"] == r["hz"] else "   — ")
+                        + flag
+                    )
+            ring_at = ring_hz(held_scores) if held_scores else None
+            if ring_at is not None:
+                # The joint under test is in the ring too: its own echo
+                # carries speed and current (Damiao: torque) every tick.
+                kt = 1.0 if is_dm else float(driver._kt)
+                dyn = {
+                    f"{joint.value} (driven)": [
+                        (r["t"], r["speed"], r["iq"] * kt) for r in log
+                    ],
+                    **held_dyn,
+                }
+                ring_scores = ring_power(dyn, ring_at)
+                if ring_scores:
+                    print(
+                        f"  power into the {ring_at:.1f} Hz ring (W; + feeds it, "
+                        "- absorbs it) / phase corr / velocity ° s⁻¹ / torque Nm:"
+                    )
+                    ranked = sorted(
+                        ring_scores.items(), key=lambda kv: -kv[1]["power_w"]
+                    )
+                    for i, (name, r) in enumerate(ranked):
+                        mark = (
+                            "  <-- feeds the ring"
+                            if i == 0 and r["power_w"] > 0
+                            else ""
+                        )
+                        print(
+                            f"    {name:20s} {r['power_w']:+8.4f} / {r['cos_phi']:+5.2f} / "
+                            f"{math.degrees(r['vel_amp']):6.2f} / {r['tau_amp']:6.3f}{mark}"
+                        )
+            # The other joints were parked on their own 0xA4 loops and then
+            # received no frames for the whole wave. Say so if any let go:
+            # the elbow was found several degrees off rest across runs
+            # (2026-09-22), and a motor with the communication-interruption
+            # protection (0xB3) armed cuts its output when the bus goes quiet
+            # on it — exactly a wave on another joint.
+            drifted: list[str] = []
+            for j, jm in motors.items():
+                if j == joint:
+                    continue
+                hold = other_targets.get(
+                    j, rest_target(j, getattr(jm, "_is_left", None))
+                )
+                try:
+                    pos = await jm.get_position()
+                except MotorError:
+                    drifted.append(f"{j.value} (no position reply)")
+                    continue
+                if abs(pos - hold) > _HOLD_DRIFT_TOL:
+                    drifted.append(
+                        f"{j.value} {math.degrees(pos - hold):+.1f}° off its "
+                        f"{math.degrees(hold):+.0f}° hold"
+                    )
+            if drifted:
+                print(
+                    "  ! held joints moved during the wave: "
+                    + ", ".join(drifted)
+                    + " — a joint that lets go while another is streamed points at "
+                    "its communication-interruption protection (0xB3: output cut "
+                    "after N ms without a frame); the tuner sends held joints "
+                    "nothing during the wave"
+                )
+            if reason is not None:
+                print(f"\n  ! aborted: {reason}")
+                if before_gains is not None:
+                    await _write_gains(driver, before_gains, args.persist)
+                    print("  previous gains restored")
+                    before_gains = None
+            # The raw 0xA4 stream never fills the driver's position cache;
+            # read the joint explicitly before holding it where it stopped.
+            here = await motor.get_position()
+            await _hold(driver, motor, here, args.cap, 0.5)
+            report_achieved_rate(log, args.rate)
+        except KeyboardInterrupt:
+            print("\n  Interrupted.")
+        finally:
+            print("  Returning to rest ...")
+            # Home *before* restoring the firmware gains: the run's gains are
+            # the stiffer set, and the stock position loop has been seen to
+            # stall short of rest on a gravity-loaded elbow. The planner is
+            # restored first only when the run left it at 0, because a
+            # direct-tracking joint would otherwise execute the homing target
+            # at the speed cap.
+            homed = False
+            try:
+                if (
+                    before_accel is not None
+                    and not args.keep
+                    and accel_used
+                    and accel_used[0] == 0
+                ):
+                    got = await _write_accel(driver, before_accel[0], before_accel[1])
+                    print(f"  planner accel/decel restored to {got[0]}/{got[1]} dps/s")
+                    before_accel = None
+                await _ramp_verified(motors, {joint: 0.0})
+                await _home_all(motors)
+                homed = True
+            except Exception as exc:  # noqa: BLE001 - reported below, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            try:
+                if before_gains is not None and not args.keep:
+                    await _write_gains(driver, before_gains, args.persist)
+                    print("  previous gains restored")
+                elif before_gains is not None:
+                    print("  gains kept (--keep)")
+                for hj, prev in held_before.items():
+                    if args.keep:
+                        print(f"  held {hj.value} gains kept (--keep)")
+                        continue
+                    await _write_gains(raw[hj]._driver, prev, False)
+                    print(f"  held {hj.value} gains restored")
+                if (
+                    before_ramps is not None
+                    and not args.keep
+                    and isinstance(driver, DamiaoMotor)
+                ):
+                    got = await _dm_write_ramps(
+                        driver, before_ramps[0], before_ramps[1], args.persist
+                    )
+                    print(
+                        f"  profiler ACC/DEC restored to {got[0]:g}/{got[1]:g} rad/s²"
+                    )
+                elif before_ramps is not None and ramps_used is not None:
+                    print(
+                        f"  profiler left at {ramps_used[0]:g}/{ramps_used[1]:g} rad/s² (--keep)"
+                    )
+                if before_accel is not None and not args.keep:
+                    got = await _write_accel(driver, before_accel[0], before_accel[1])
+                    print(f"  planner accel/decel restored to {got[0]}/{got[1]} dps/s")
+                elif before_accel is not None and args.keep:
+                    print(
+                        f"  planner left at {accel_used[0]}/{accel_used[1]} dps/s (--keep) — a direct-tracking joint executes a stored target on wake"
+                    )
+            except Exception as exc:  # noqa: BLE001 - report, then keep tearing down
+                print(f"  ! restore failed: {exc}")
+            if not homed:
+                print("  (torque-off will be refused unless every joint is at rest)")
+            await _safe_torque_off(motors, raw)
+
+    imu.stop()
+    if len(log) < 20:
+        print("\nToo few samples to score.")
+        return
+    metrics = a4_metrics(log, args.rate)
+    metrics["aborted"] = reason is not None
+    imu_metrics: dict[str, dict[str, float]] = {}
+    imu_series: dict[str, np.ndarray] = {}
+    if stream_origin is not None:
+        imu_metrics, imu_series = imu.run_blocks(
+            stream_origin, stream_origin + float(log[-1]["t"]), stream_origin
+        )
+    if imu_metrics:
+        metrics["imu"] = imu_metrics
+    if held_scores:
+        metrics["held"] = held_scores
+    if ring_scores:
+        metrics["ring"] = {"hz": ring_at, "joints": ring_scores}
+    print(f"\n{'─' * 66}")
+    print(
+        f"  tracking RMS {math.degrees(metrics['rms']):.3f}°   max {math.degrees(metrics['max']):.3f}°   lag {metrics['lag_ms']:.0f} ms"
+    )
+    print(
+        f"  1-4 Hz band {math.degrees(metrics['band_1_4']):.3f}°   >10 Hz buzz {math.degrees(metrics['buzz']):.3f}°"
+    )
+    print(
+        f"  velocity ripple {metrics['v_ripple']:.2f} (MIT stick-slip ≈ 0.8, smooth < 0.2)   stuck windows {metrics['stuck_frac']:.2f}"
+    )
+    print(
+        f"  {current_label} RMS {metrics['iq_rms']:.2f} {current_unit}   "
+        f"peak {metrics['iq_max']:.2f} {current_unit}   "
+        f"spread {metrics['iq_sd']:.2f} {current_unit}   "
+        f"3-8 Hz mode {metrics['iq_mode']:.2f} {current_unit}   loop {metrics['hz']:.0f} Hz"
+    )
+    for line in format_imu(imu_metrics):
+        print(line)
+    print(f"{'─' * 66}")
+    if args.save_run:
+        params = {
+            "wire": "a4",
+            "mode": args.mode,
+            "center_deg": math.degrees(center),
+            "amp_deg": args.amp,
+            "freq_hz": args.freq if args.mode == "sine" else None,
+            "speed_dps": args.speed if args.mode == "triangle" else None,
+            "duration_s": args.duration,
+            "rate_hz": args.rate,
+            "cap_dps": args.cap,
+            "cap_track": cap_track,
+            "cap_floor_dps": args.cap_floor,
+            "lead_ms": args.lead_ms,
+            "accel": list(accel_used) if accel_used else None,
+            "vendor": "damiao" if is_dm else "myactuator",
+            "dm_acc": list(ramps_used) if ramps_used else None,
+            "persist": args.persist,
+            "pose": args.pose or None,
+            "held_gains": held_used or None,
+        }
+        run_id = save_run(
+            "sine",
+            {**log_to_series(log), **held_series(held_log, held_dyn), **imu_series},
+            metrics,
+            side=side,
+            joint=joint.value,
+            gains=used_gains,
+            params=params,
+            label=args.label,
+            group=args.group,
+        )
+        print(f"\nSaved tuning run {run_id} (kind=sine, wire=a4)")

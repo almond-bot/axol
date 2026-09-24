@@ -47,6 +47,7 @@ from ..constants import (
     CAN_LEFT,
     CAN_MANTIS_LEFT,
     CAN_MANTIS_RIGHT,
+    CAN_RESET_SCRIPT,
     CAN_RIGHT,
 )
 from .rtprio import operator_user
@@ -92,10 +93,10 @@ def purge_commands() -> list[str]:
     """Every command line the realtime core runs to purge a poisoned queue.
 
     Two callers, one grant: the realtime core's ``purge_tx_queue``
-    (``rust/axol-rt/src/safety.rs``) runs the bring-up script, falling back
-    to a per-interface down/up pair, and the bring-up backstop
-    (``almond_axol.cli.can.setup.purge_stale_tx``) runs the same script,
-    falling back to the full configure sequence.
+    (``rust/axol-rt/src/safety.rs``) runs the arm hub's USB reset script,
+    else the bring-up script, falling back to a per-interface down/up pair,
+    and the bring-up backstop (``almond_axol.cli.can.setup.purge_stale_tx``)
+    runs the same scripts, falling back to the full configure sequence.
 
     Imported lazily: ``cli.can.setup`` is a heavy import and this is the only
     thing needed from it.
@@ -103,7 +104,10 @@ def purge_commands() -> list[str]:
     from ..cli.can.setup import _BITRATE, _TXQUEUELEN
 
     commands = [
-        f"{bash} {CAN_BRINGUP_SCRIPT}"
+        f"{bash} {script}"
+        # The reset script first: the core prefers it for the arm hub, whose
+        # firmware keeps frames a flap of the bring-up script cannot reach.
+        for script in (CAN_RESET_SCRIPT, CAN_BRINGUP_SCRIPT)
         for bash in _program_paths("bash", ("/usr/bin/bash", "/bin/bash"))
     ]
     for ip in _program_paths("ip", ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip")):

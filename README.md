@@ -191,6 +191,8 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
+- [`tune.breakaway`](https://docs.almond.bot/cli/tune-breakaway)
+- [`tune.a4`](https://docs.almond.bot/cli/tune-a4)
 - [`tune.gravity`](https://docs.almond.bot/cli/tune-gravity)
 - [`tune.factory`](https://docs.almond.bot/cli/tune-factory)
 - [`calibration.pull`](https://docs.almond.bot/cli/tune-factory#calibration-pull)

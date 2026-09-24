@@ -5,6 +5,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::can::CanSock;
+use crate::filter::CogTerm;
 use crate::proto;
 use crate::safety::purge_tx_queue;
 use crate::txn;
@@ -40,12 +41,106 @@ pub struct MotorSpec {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    /// Error-sign stiction compensation (`filter::stiction`): gain as a
+    /// fraction of `fc`, and the error (rad) it saturates at. Zero gain is
+    /// the production law; zero for the gripper.
+    pub stiction_gain: f64,
+    pub stiction_err: f64,
+    /// Load-proportional stiction push, Nm per Nm of gravity feedforward.
+    pub stiction_load_gain: f64,
+    /// Torque dither (`filter::dither_step`): peak Nm (0 off) and frequency.
+    pub dither_nm: f64,
+    pub dither_hz: f64,
+    /// Command frame for tracked ticks (MyActuator joints only).
+    pub wire: WireMode,
+    /// Stribeck cancellation on measured velocity (`filter::stribeck_excess`):
+    /// gain, zero-load excess (Nm), excess per Nm of gravity, 1/e speed.
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    /// Load-proportional Coulomb friction, Nm per Nm of gravity feedforward:
+    /// the tracked-mode friction term uses `fc + fl·|t_ff|`.
+    pub fl: f64,
+    /// Low-pass pole (rad/s) of the measured velocity the Stribeck term
+    /// follows; `<= 0` falls back to the control derivative pole.
+    pub stribeck_pole: f64,
+    /// 0xA4 joints with the firmware planner on (planner acceleration
+    /// 60000, written by the Python side at enable): each tick's speed cap
+    /// is this multiple of the commanded speed (floor `A4_CAP_FLOOR_DPS`),
+    /// so the planner moves continuously instead of bursting through each
+    /// step at a fixed cap. `<= 0` keeps the fixed cap (direct tracking).
+    pub cap_track: f64,
+    /// 0xA4 target lead (s): each command's target is sent this far ahead
+    /// along the tracker velocity, so the planner cruises through its step
+    /// instead of reaching the target and stopping for the rest of it.
+    pub lead_s: f64,
+    /// 0x73 torque feedforward scale for an a4 joint: output-shaft Nm per 1%
+    /// of the motor's rated current (the Python side's `kt × rated A / 100`).
+    /// `> 0` sends the position command as 0x73 carrying the host
+    /// feedforward, where the firmware supports it (protocol V4.4,
+    /// `proto::MA_FW_V44`); `0` keeps plain 0xA4.
+    pub tf_nm_per_pct: f64,
+    /// This joint's impedance command rate (Hz): `FAST_IMPEDANCE_HZ` (480) to
+    /// command it every tick of a 480 Hz loop, 240 for the half-rate lane, 0
+    /// to follow the config-wide `impedance_hz`. Only meaningful on MIT.
+    pub mit_hz: f64,
+    /// Position-periodic torque to cancel (`filter::cogging`), motor frame,
+    /// already scaled by the joint's gain. Empty = none. Arrives on the
+    /// second configure, after the Python side has resolved joint offsets.
+    pub cogging: Vec<CogTerm>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Vendor {
     MyActuator,
     Damiao,
+}
+
+/// Which frame a MyActuator arm joint is commanded with in tracked mode.
+/// Damiao joints, the gripper, and every limp / gravity-comp tick (kp = 0)
+/// use MIT regardless. An a4 joint's *holds* (bring-up, stalled stream) are
+/// 0xA4 too: the X6-P20's 2025070202 firmware ignores 0xA4 after an MIT
+/// frame until reset, so an a4 joint must see the position frame from its
+/// first tick (see `serve::a4_wire`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum WireMode {
+    /// The 0x400 impedance frame: the production control law.
+    Mit,
+    /// 0xA4 absolute position closed-loop: the firmware's own position PI
+    /// (and speed PI beneath it, at its kHz rate) tracks the streamed target
+    /// under a speed cap. No host feedforward reaches the motor; gravity and
+    /// friction are the firmware integrator's job. Paired with a 0x92 read
+    /// per tick for 0.01° position; the reply's torque channel is iq in
+    /// amps, so measured torque is reported as NaN on these joints.
+    A4,
+    /// Damiao position-velocity mode (0x100 + id, control-mode register 2):
+    /// the wrist firmware's own position → speed cascade (KP_APR/KP_ASR
+    /// registers, ACC/DEC ramps) tracks the streamed target under a speed
+    /// cap. The feedback frame is the MIT one, so position, velocity and
+    /// torque all come back with each command. Like `A4`, no host
+    /// feedforward reaches the motor.
+    Pv,
+}
+
+impl WireMode {
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "mit" => Some(Self::Mit),
+            "a4" => Some(Self::A4),
+            "pv" => Some(Self::Pv),
+            _ => None,
+        }
+    }
+
+    /// The Damiao control-mode register value a wrist must be in for this
+    /// wire's command frame to be acted on.
+    pub fn dm_mode(self) -> u32 {
+        match self {
+            Self::Pv => proto::DM_MODE_POS_VEL,
+            Self::Mit | Self::A4 => proto::DM_MODE_MIT,
+        }
+    }
 }
 
 /// A motor that passed bring-up prep: identified, fault-free, ranges known.
@@ -73,6 +168,41 @@ pub struct ReadyMotor {
     pub k: f64,
     pub fv: f64,
     pub fo: f64,
+    pub stiction_gain: f64,
+    pub stiction_err: f64,
+    pub stiction_load_gain: f64,
+    pub dither_nm: f64,
+    pub dither_hz: f64,
+    pub wire: WireMode,
+    pub stribeck_gain: f64,
+    pub stribeck_dfs: f64,
+    pub stribeck_load_gain: f64,
+    pub stribeck_vs: f64,
+    pub fl: f64,
+    /// See `MotorSpec::cap_track`.
+    pub cap_track: f64,
+    /// See `MotorSpec::lead_s`.
+    pub lead_s: f64,
+    /// The firmware VersionDate read at prep (MyActuator only).
+    pub fw_version: Option<u32>,
+    /// See `MotorSpec::mit_hz`.
+    pub mit_hz: f64,
+    /// `MotorSpec::tf_nm_per_pct` where the firmware takes 0x73, else 0 —
+    /// the bus loop sends 0x73 exactly when this is positive.
+    pub tf_nm_per_pct: f64,
+    /// See `MotorSpec::cogging`.
+    pub cogging: Vec<CogTerm>,
+}
+
+/// The 0x73 scale a joint actually runs: its configured one on firmware that
+/// implements 0x73 (protocol V4.4, VersionDate `proto::MA_FW_V44` or later),
+/// 0 otherwise (older firmware, an unread version, or none configured).
+pub fn tf_scale(spec_scale: f64, version: Option<u32>) -> f64 {
+    if spec_scale > 0.0 && version.is_some_and(|v| v >= proto::MA_FW_V44) {
+        spec_scale
+    } else {
+        0.0
+    }
 }
 
 /// Status-probe attempts before a silent motor fails the bring-up.
@@ -211,20 +341,56 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            stiction_gain: spec.stiction_gain,
+            stiction_err: spec.stiction_err,
+            stiction_load_gain: spec.stiction_load_gain,
+            dither_nm: spec.dither_nm,
+            dither_hz: spec.dither_hz,
+            wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
+            cap_track: spec.cap_track,
+            lead_s: spec.lead_s,
+            fw_version: version,
+            tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
+            mit_hz: spec.mit_hz,
+            cogging: spec.cogging.clone(),
         });
     }
 
     for spec in specs.iter().filter(|s| s.motor_id >= 6) {
         let id = spec.motor_id as u16;
         let mode = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
-        // Wrists run MIT (1); the gripper must already be in POSITION_FORCE
-        // (4), set by the Python side's calibration flow before arming.
-        let expected = if spec.gripper { 4.0 } else { 1.0 };
-        if mode != expected {
-            return Err(err(format!(
-                "{} (0x{id:02X}): control mode {mode} (expected {expected}) — not enabling",
-                spec.joint
-            )));
+        if spec.gripper {
+            // The gripper must already be in POSITION_FORCE (4), set by the
+            // Python side's calibration flow before arming.
+            let expected = proto::DM_MODE_POS_FORCE as f64;
+            if mode != expected {
+                return Err(err(format!(
+                    "{} (0x{id:02X}): control mode {mode} (expected {expected}) — not enabling",
+                    spec.joint
+                )));
+            }
+        } else {
+            // A wrist runs in the mode its wire wants — MIT (1) or, for
+            // `wire_mode pv`, position-velocity (2). Put it there (RAM
+            // write, effective at once) rather than refusing: a wrist left
+            // in the other mode by the previous session is the normal case
+            // when the controller choice changes between runs.
+            let wanted = spec.wire.dm_mode();
+            if mode != wanted as f64 {
+                write_dm_register(sock, id, proto::DM_REG_CTRL_MODE, wanted.to_le_bytes())?;
+                let now = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
+                if now != wanted as f64 {
+                    return Err(err(format!(
+                        "{} (0x{id:02X}): control mode {now} after asking for {wanted} — not enabling",
+                        spec.joint
+                    )));
+                }
+            }
         }
         let p_max = read_dm_register(sock, id, proto::DM_REG_PMAX)?;
         let v_max = read_dm_register(sock, id, proto::DM_REG_VMAX)?;
@@ -260,6 +426,23 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             k: spec.k,
             fv: spec.fv,
             fo: spec.fo,
+            stiction_gain: spec.stiction_gain,
+            stiction_err: spec.stiction_err,
+            stiction_load_gain: spec.stiction_load_gain,
+            dither_nm: spec.dither_nm,
+            dither_hz: spec.dither_hz,
+            wire: spec.wire,
+            stribeck_gain: spec.stribeck_gain,
+            stribeck_dfs: spec.stribeck_dfs,
+            stribeck_load_gain: spec.stribeck_load_gain,
+            stribeck_vs: spec.stribeck_vs,
+            fl: spec.fl,
+            cap_track: spec.cap_track,
+            lead_s: spec.lead_s,
+            fw_version: None,
+            tf_nm_per_pct: 0.0,
+            mit_hz: spec.mit_hz,
+            cogging: spec.cogging.clone(),
         });
     }
     Ok(motors)
@@ -288,6 +471,18 @@ pub fn read_dm_register(sock: &CanSock, motor_id: u16, rid: u8) -> io::Result<f6
     Err(io::Error::other(format!(
         "damiao 0x{motor_id:02X}: register {rid} read timed out"
     )))
+}
+
+/// Register write (RAM, 0x55). The motor does not acknowledge; callers
+/// read the register back. A short settle lets the firmware apply it before
+/// the readback.
+pub fn write_dm_register(sock: &CanSock, motor_id: u16, rid: u8, value: [u8; 4]) -> io::Result<()> {
+    sock.send(
+        proto::DM_REG_ARB,
+        &proto::dm_write_register(motor_id, rid, value),
+    )?;
+    std::thread::sleep(Duration::from_millis(5));
+    Ok(())
 }
 
 /// Enable every cold motor. Motors found holding by [`prepare`] are left
@@ -366,4 +561,22 @@ fn disable_inner(sock: &CanSock, motors: &[ReadyMotor]) -> bool {
         }
     }
     complete
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 0x73 only on protocol V4.4 firmware: the X8-P20 shoulders' 2026042402
+    /// takes it, the X6-P20 elbow's 2025070202 does not (it falls back to
+    /// plain 0xA4), and an unread version or an unset scale never sends it.
+    #[test]
+    fn tf_runs_only_on_v44_firmware_with_a_scale() {
+        assert_eq!(tf_scale(0.2, Some(2026042402)), 0.2);
+        assert_eq!(tf_scale(0.2, Some(2026090101)), 0.2);
+        assert_eq!(tf_scale(0.2, Some(2025070202)), 0.0);
+        assert_eq!(tf_scale(0.2, None), 0.0);
+        assert_eq!(tf_scale(0.0, Some(2026042402)), 0.0);
+        assert_eq!(tf_scale(-1.0, Some(2026042402)), 0.0);
+    }
 }

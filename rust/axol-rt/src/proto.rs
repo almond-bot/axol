@@ -127,6 +127,50 @@ pub fn ma_decode_version(data: &[u8; 8]) -> u32 {
     u32::from_le_bytes([data[4], data[5], data[6], data[7]])
 }
 
+/// 0xA4 absolute position closed-loop command: `[0xA4, 0, cap_lo, cap_hi,
+/// p0, p1, p2, p3]` — a uint16 output-shaft speed cap (dps) and the int32
+/// target (0.01 deg/LSB, motor frame). Sent to 0x140 + id; the reply comes
+/// on 0x240 + id (see [`ma_decode_a4_reply`]).
+pub fn ma_a4_encode(p_des: f64, cap_dps: f64) -> [u8; 8] {
+    let cap = cap_dps.clamp(0.0, u16::MAX as f64).round() as u16;
+    let pos = (p_des.to_degrees() * 100.0)
+        .round()
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+    let c = cap.to_le_bytes();
+    let p = pos.to_le_bytes();
+    [0xA4, 0x00, c[0], c[1], p[0], p[1], p[2], p[3]]
+}
+
+/// 0x73 (protocol V4.4, "TF"): the 0xA4 position command plus a feedforward
+/// torque — `[0x73, ff, cap_lo, cap_hi, p0, p1, p2, p3]`, `ff` an int8 in 1%
+/// of the motor's rated current. In direct tracking (planner acceleration
+/// 0) the firmware adds it to the current command beneath its position and
+/// speed PIs; with the planner on the protocol makes it plain 0xA4. The
+/// reply has the 0xA4 layout (`ma_decode_a4_reply`) with 0x73 in byte 0.
+pub const MA_TF_CMD: u8 = 0x73;
+
+/// Encode a 0x73 frame: [`ma_a4_encode`]'s target and cap plus `ff_pct`
+/// (percent of rated current, rounded and clamped to the int8 range).
+pub fn ma_tf_encode(p_des: f64, cap_dps: f64, ff_pct: f64) -> [u8; 8] {
+    let mut frame = ma_a4_encode(p_des, cap_dps);
+    frame[0] = MA_TF_CMD;
+    frame[1] = (ff_pct.round().clamp(-128.0, 127.0) as i8) as u8;
+    frame
+}
+
+/// The 0x92 multi-turn angle request, paired with an 0xA4 command so the
+/// host still gets 0.01 deg position (the 0xA4 reply's own angle is 1 deg).
+pub const MA_MULTI_TURN_REQUEST: [u8; 8] = [MA_MULTI_TURN_ANGLE, 0, 0, 0, 0, 0, 0, 0];
+
+/// Decode a 0xA4 (or 0xA2/0xA1 — same layout) control reply: `(iq A,
+/// speed rad/s, angle rad)`. The angle is the reply's int16 whole degrees.
+pub fn ma_decode_a4_reply(data: &[u8; 8]) -> (f64, f64, f64) {
+    let iq = i16::from_le_bytes([data[2], data[3]]) as f64 * 0.01;
+    let speed_dps = i16::from_le_bytes([data[4], data[5]]) as f64;
+    let angle_deg = i16::from_le_bytes([data[6], data[7]]) as f64;
+    (iq, speed_dps.to_radians(), angle_deg.to_radians())
+}
+
 /// Decode a 0x92 reply: multi-turn angle in radians (0.01 deg/LSB).
 pub fn ma_decode_position(data: &[u8; 8]) -> f64 {
     let raw = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
@@ -180,6 +224,36 @@ pub const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD]
 pub const DM_CLEAR_ERRORS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB];
 
 /// Damiao POSITION_FORCE command arbitration base (`0x300 + motor_id`).
+/// Damiao control-mode register values (`DM_REG_CTRL_MODE`). The motor
+/// only acts on the command frame of the mode it is in: an MIT frame is
+/// ignored in POS_VEL and vice versa, so the core switches the register
+/// (RAM write, immediate) whenever the frame it wants changes.
+pub const DM_MODE_MIT: u32 = 1;
+pub const DM_MODE_POS_VEL: u32 = 2;
+pub const DM_MODE_POS_FORCE: u32 = 4;
+
+/// Register write (`0x55`, RAM only) for `motor_id`, sent to 0x7FF. The
+/// motor does not acknowledge a write; read the register back to verify.
+pub fn dm_write_register(motor_id: u16, rid: u8, value: [u8; 4]) -> [u8; 8] {
+    let (lo, hi) = ((motor_id & 0xFF) as u8, (motor_id >> 8) as u8);
+    [lo, hi, 0x55, rid, value[0], value[1], value[2], value[3]]
+}
+
+/// Position-velocity command arbitration base (0x100 + motor id): the
+/// firmware position loop (`wire_mode pv`), gains in the KP_APR/KI_APR and
+/// KP_ASR/KI_ASR registers, ramps in ACC/DEC. Answered with the same
+/// feedback frame as MIT, so no paired read is needed.
+pub const DM_POS_VEL_ARB_BASE: u16 = 0x100;
+
+/// Encode a position-velocity command: `p_des` (rad) and the speed cap
+/// (rad/s) as two little-endian f32.
+pub fn dm_pos_vel_encode(position: f64, max_speed: f64) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&(position as f32).to_le_bytes());
+    out[4..].copy_from_slice(&(max_speed.max(0.0) as f32).to_le_bytes());
+    out
+}
+
 pub const DM_POS_FORCE_ARB_BASE: u16 = 0x300;
 
 /// Encode a Damiao POSITION_FORCE command (`<fHH>`): raw f32 target position,
@@ -294,9 +368,70 @@ pub fn mit_encode(p_des: f64, v_des: f64, kp: f64, kd: f64, t_ff: f64, r: &MitRa
 mod tests {
     use super::*;
 
+    /// Mirrors `tune.a4`'s `dm_frame`: `struct.pack("<ff", p, v)`.
+    #[test]
+    fn dm_pos_vel_frame_is_two_le_floats() {
+        let f = dm_pos_vel_encode(1.5, 9.42);
+        assert_eq!(f32::from_le_bytes([f[0], f[1], f[2], f[3]]), 1.5);
+        assert!((f32::from_le_bytes([f[4], f[5], f[6], f[7]]) - 9.42).abs() < 1e-6);
+        // A negative cap is nonsense; it encodes as no movement rather than
+        // a sign the firmware might read as "unlimited".
+        let f = dm_pos_vel_encode(0.0, -1.0);
+        assert_eq!(f32::from_le_bytes([f[4], f[5], f[6], f[7]]), 0.0);
+        assert_eq!(DM_POS_VEL_ARB_BASE + 6, 0x106);
+    }
+
+    /// The Python driver's `_write_register`: `[id_lo, id_hi, 0x55, rid] + value`.
+    #[test]
+    fn dm_register_write_matches_the_driver() {
+        assert_eq!(
+            dm_write_register(7, DM_REG_CTRL_MODE, DM_MODE_POS_VEL.to_le_bytes()),
+            [0x07, 0x00, 0x55, 10, 0x02, 0x00, 0x00, 0x00]
+        );
+    }
+
     /// Reference vector generated by the Python driver's encoder
     /// (`damiao._float_to_uint` + the IMPEDANCE frame layout) for
     /// p=1.2345, v=-0.5, kp=130, kd=3, t_ff=2.75 at Damiao default ranges.
+    /// Vendor manual §2.20 example 1: 500 dps cap, +360° target; reply 50 °C,
+    /// 1.00 A, 500 dps, +45°.
+    #[test]
+    fn a4_frames_match_the_vendor_example() {
+        assert_eq!(
+            ma_a4_encode(2.0 * std::f64::consts::PI, 500.0),
+            [0xA4, 0x00, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
+        );
+        assert_eq!(
+            ma_a4_encode(-2.0 * std::f64::consts::PI, 500.0),
+            [0xA4, 0x00, 0xF4, 0x01, 0x60, 0x73, 0xFF, 0xFF]
+        );
+        let (iq, speed, angle) =
+            ma_decode_a4_reply(&[0xA4, 0x32, 0x64, 0x00, 0xF4, 0x01, 0x2D, 0x00]);
+        assert!((iq - 1.0).abs() < 1e-9);
+        assert!((speed - 500.0_f64.to_radians()).abs() < 1e-9);
+        assert!((angle - 45.0_f64.to_radians()).abs() < 1e-9);
+        let (iq, speed, angle) =
+            ma_decode_a4_reply(&[0xA4, 0x32, 0x9C, 0xFF, 0x0C, 0xFE, 0xD3, 0xFF]);
+        assert!((iq + 1.0).abs() < 1e-9);
+        assert!((speed + 500.0_f64.to_radians()).abs() < 1e-9);
+        assert!((angle + 45.0_f64.to_radians()).abs() < 1e-9);
+    }
+
+    /// Vendor manual §2.25 (V4.4) example 1: 60% rated current feedforward,
+    /// 500 dps cap, +360° target — the 0xA4 layout with 0x73 and the int8
+    /// feedforward in byte 1.
+    #[test]
+    fn tf_frames_match_the_vendor_example() {
+        assert_eq!(
+            ma_tf_encode(2.0 * std::f64::consts::PI, 500.0, 60.0),
+            [0x73, 0x3C, 0xF4, 0x01, 0xA0, 0x8C, 0x00, 0x00]
+        );
+        // Negative feedforward is two's complement; out of range clamps.
+        assert_eq!(ma_tf_encode(0.0, 0.0, -1.4)[1], 0xFF);
+        assert_eq!(ma_tf_encode(0.0, 0.0, 300.0)[1], 127);
+        assert_eq!(ma_tf_encode(0.0, 0.0, -300.0)[1], 0x80);
+    }
+
     #[test]
     fn mit_encode_matches_python() {
         let ranges = MitRanges {

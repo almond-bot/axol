@@ -34,6 +34,8 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..motor.damiao import DamiaoMotor
+from ..motor.myactuator import MyActuatorMotor
 from ..settings import SHARED
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
@@ -45,7 +47,12 @@ from .control import (
     VEL_CUTOFF_FREQ,
     BandPass,
     Differentiator,
+    TorqueDither,
     compute_friction,
+    stiction_amplitude,
+    stiction_compensation,
+    stribeck_amplitude,
+    stribeck_excess,
 )
 from .gravity import GravityCompensator
 
@@ -149,6 +156,148 @@ async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
     return bool(results) and all(
         isinstance(result, (MotorError, can.CanOperationError)) for result in results
     )
+
+
+def _wanted_firmware(jc: object) -> dict[str, float]:
+    """The firmware parameters a bring-up should put on this joint's motor.
+
+    ``planner_accel`` only when the joint actually runs on the 0xA4 loop
+    (``wire_mode`` ``a4``): the 0xA4 stream needs it at 0 or 60000, but on an
+    impedance joint the planner shapes nothing the core sends — and every
+    single-target position move the tuners make (``tune.friction`` /
+    ``tune.breakaway`` homing, one 0xA4 target at 14 deg/s) relies on it. The
+    jelly robot's right arm, pinned to 0 by every impedance replay, went wild
+    in ``tune.breakaway``'s homing (2026-09-24): its X8 shoulders (firmware
+    2026042403) refuse a deceleration of 0 and sat at 0 / 10 dps/s.
+    """
+    firmware = getattr(jc, "firmware", None)
+    wanted = firmware.as_dict() if firmware is not None else {}
+    if str(getattr(jc, "wire_mode", "mit")).lower() != "a4":
+        wanted.pop("planner_accel", None)
+    return wanted
+
+
+async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
+    """Write the configured firmware loop gains of ``joints`` to their motors' ROM.
+
+    For each joint whose :class:`~almond_axol.robot.config.JointConfig`
+    carries set :class:`~almond_axol.robot.config.FirmwareGains`, the
+    MyActuator driver compares them with the motor's stored gains and writes
+    the ones that differ (see ``MyActuatorMotor.ensure_rom_gains``). Meant for
+    the *cold* joints of a bring-up, called while they are still disabled and
+    the bus is quiet: a MyActuator commits a ROM write only when disabled,
+    and joints found holding from a previous session are never touched.
+
+    A motor that took a write is **reset** afterwards (0x76, ~2 s): on the
+    X6-P20's 2025070202 firmware a ROM gain write does not reach the running
+    loop until the motor reboots — the right elbow provisioned here and then
+    streamed to on the firmware loop held its pose for a whole replay
+    (2026-09-21). The reset costs nothing on a provisioned motor (no write,
+    no reset) and only happens while the joint is already disabled. Callers
+    that derive anything from the motor's post-reset state (multi-turn
+    offsets) must do so after this returns.
+
+    A joint that will not take the write (pre-V4.2 firmware, no answer, or a
+    read-back mismatch) keeps its stored gains and is logged as a warning —
+    it tracks with whatever the motor holds, which is safe, just not the
+    tuned set — so one joint's firmware cannot fail the whole enable.
+    """
+    arm_config = getattr(arm, "_arm_config", None)
+    if arm_config is None:
+        # A bench or test arm built without a config carries no firmware
+        # gains to apply; there is nothing to compare the motors against.
+        return
+    side = "left" if getattr(arm, "_is_left", True) else "right"
+    for joint in joints:
+        jc = getattr(arm_config, joint.value, None)
+        wanted = _wanted_firmware(jc)
+        if not wanted:
+            continue
+        driver = getattr(arm.motors.get(joint), "_driver", None)
+        if not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
+            _logger.warning(
+                "%s.%s: firmware loop gains configured but the joint has no "
+                "firmware position loop; ignored",
+                side,
+                joint.value,
+            )
+            continue
+        try:
+            changed = await driver.ensure_rom_gains(wanted)
+        except MotorError as exc:
+            _logger.warning(
+                "%s.%s: could not apply firmware loop gains %s (%s); the motor "
+                "keeps its stored gains",
+                side,
+                joint.value,
+                wanted,
+                exc,
+            )
+            continue
+        if changed and isinstance(driver, MyActuatorMotor):
+            _logger.info(
+                "%s.%s: firmware loop gains written to ROM: %s — resetting the "
+                "motor so the loop loads them",
+                side,
+                joint.value,
+                ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
+            )
+            await driver.reset()
+        elif changed:
+            # Damiao registers take effect on write; the store persisted them.
+            _logger.info(
+                "%s.%s: firmware loop gains written and stored: %s",
+                side,
+                joint.value,
+                ", ".join(f"{n} {b:g} -> {a:g}" for n, (b, a) in changed.items()),
+            )
+
+
+async def held_firmware_gain_mismatches(
+    arm: "AxolArm", joints: Iterable[Joint]
+) -> list[str]:
+    """Why the *held* ``joints`` would not run the firmware gains configured.
+
+    :func:`apply_firmware_gains` writes only cold joints: a MyActuator takes
+    a ROM write only while disabled, and a joint found holding from a
+    previous session is attached to, never reset. Such a joint keeps running
+    whatever it holds — a cut run's test gains included — so a run that
+    changed a gain would silently not test it (right shoulder_1 kept its
+    previous speed_kp through a speed_kp sweep, 2026-09-22). This reads each
+    held joint's running gains (reads work while holding) and returns one
+    line per joint that differs; empty means every held joint matches. A
+    joint whose gains cannot be read is skipped with a warning.
+    """
+    arm_config = getattr(arm, "_arm_config", None)
+    if arm_config is None:
+        return []
+    side = "left" if getattr(arm, "_is_left", True) else "right"
+    out: list[str] = []
+    for joint in joints:
+        wanted = _wanted_firmware(getattr(arm_config, joint.value, None))
+        driver = getattr(arm.motors.get(joint), "_driver", None)
+        if not wanted or not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
+            continue
+        try:
+            differs = await driver.firmware_gain_mismatches(wanted)
+        except MotorError as exc:
+            _logger.warning(
+                "%s.%s: held joint's firmware gains could not be read (%s); "
+                "cannot confirm it runs the configured set",
+                side,
+                joint.value,
+                exc,
+            )
+            continue
+        if differs:
+            out.append(
+                f"{side}.{joint.value}: "
+                + ", ".join(
+                    f"{n} {have:g} (wanted {want:g})"
+                    for n, (have, want) in differs.items()
+                )
+            )
+    return out
 
 
 async def _rollback_newly_enabled_motors(
@@ -648,6 +797,7 @@ class AxolArm:
             for j in Joint
         ]
         self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
+        self._dither = TorqueDither(len(ARM_JOINTS))
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -1139,6 +1289,9 @@ class AxolArm:
         self, held: list[Joint], cold: list[Joint], *, hold: bool
     ) -> None:
         """Attach held motors and bring cold motors up after state is sampled."""
+        # Firmware loop gains go to ROM first, while the cold motors are still
+        # disabled — the only state a MyActuator commits a 0x32 write in.
+        await apply_firmware_gains(self, cold)
         await _await_all_hardware_actions(
             *[
                 self.motors[j].attach(
@@ -1662,6 +1815,10 @@ class AxolArm:
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
+        dither = self._dither.update(
+            [getattr(self._arm_config, j.value).dither_nm for j in ARM_JOINTS],
+            [getattr(self._arm_config, j.value).dither_hz for j in ARM_JOINTS],
+        )
         for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
@@ -1672,9 +1829,54 @@ class AxolArm:
             # phase-safe on the slow shoulder modes, so silently converting
             # excess firmware damping into it could excite the very
             # oscillation the oversized kd was meant to kill.
+            # Stiction compensation acts on the measured error (motor frame
+            # on both sides); zero until the first feedback frame is cached.
+            stiction = 0.0
+            if gains.stiction_gain != 0.0 or gains.stiction_load_gain != 0.0:
+                motor = self.motors.get(j)
+                try:
+                    q_meas = motor.position if motor is not None else None
+                    v_meas = motor.velocity if motor is not None else 0.0
+                except MotorError:
+                    q_meas = None
+                    v_meas = 0.0
+                if q_meas is not None:
+                    stiction = stiction_compensation(
+                        float(motor_targets[i]) - q_meas,
+                        v_meas,
+                        stiction_amplitude(
+                            f.fc,
+                            gains.stiction_gain,
+                            gains.stiction_load_gain,
+                            float(gravity[i]),
+                        ),
+                        math.radians(gains.stiction_err_deg),
+                    )
+            stribeck = 0.0
+            if gains.stribeck_gain != 0.0:
+                motor = self.motors.get(j)
+                try:
+                    v_now = motor.velocity if motor is not None else 0.0
+                except MotorError:
+                    v_now = 0.0
+                stribeck = stribeck_excess(
+                    v_now,
+                    stribeck_amplitude(
+                        gains.stribeck_gain,
+                        gains.stribeck_dfs,
+                        gains.stribeck_load_gain,
+                        float(gravity[i]),
+                    ),
+                    gains.stribeck_vs,
+                )
             t_ff = (
                 float(gravity[i])
-                + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + compute_friction(
+                    velocities[i], f.fc + f.fl * abs(float(gravity[i])), f.k, f.fv, f.fo
+                )
+                + stiction
+                + stribeck
+                + dither[i]
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
@@ -1852,6 +2054,7 @@ class AxolArm:
         self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
+        self._dither = TorqueDither(len(ARM_JOINTS))
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).

@@ -86,8 +86,11 @@ function sample(timing: ControlTiming, kind: TimingSeries): (number | null)[] {
 /** Adapt timing messages to the generic chart's keyed numeric-series shape. */
 function chartFrames(frames: TimingFrame[]): TelemetryFrame[] {
   return frames.map((frame) => {
+    // The loop rate the core is running (240 Hz impedance, 400 Hz position
+    // controller) comes from the observer, per frame.
+    const hz = frame.arms.left?.targetHz ?? frame.arms.right?.targetHz ?? 240
     const m: TelemetryFrame["m"] = {
-      target: [240, null, null, null, 1000 / 240, null],
+      target: [hz, null, null, null, 1000 / hz, null],
     }
     for (const side of SIDES) {
       const timing = frame.arms[side]
@@ -189,7 +192,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
               ? [
                   ...commandSeries,
                   ...feedbackSeries,
-                  { key: "target", label: "4.17 ms target", color: COLORS.target },
+                  { key: "target", label: "RT period target", color: COLORS.target },
                 ]
               : [...commandSeries, ...feedbackSeries]
 
@@ -258,7 +261,11 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
               <div className="flex items-center gap-2">
                 <h3 className="font-heading text-sm font-semibold capitalize">{side} arm</h3>
                 <Badge variant={clean ? "success" : isFresh ? "warning" : "neutral"}>
-                  {clean ? "240 Hz clean" : isFresh ? "timing issue" : "idle"}
+                  {clean && timing
+                    ? `${Math.round(timing.targetHz)} Hz clean`
+                    : isFresh
+                      ? "timing issue"
+                      : "idle"}
                 </Badge>
                 {timing && (
                   <span className="ml-auto text-[0.65rem] text-white/30">
@@ -325,7 +332,9 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">missed 240 Hz</p>
+                  <p className="text-white/35">
+                    missed {timing ? Math.round(timing.targetHz) : 240} Hz
+                  </p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {timing?.deadlineMisses ?? "–"}/s
                   </p>
@@ -362,8 +371,10 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
       />
       <p className="text-xs leading-relaxed text-white/35">
         Send batch is first-to-last arm command; full cycle continues through the final feedback.
-        “Missed 240 Hz” counts command gaps that lost one or more 4.17 ms deadlines. All values come
-        from passive kernel-timestamped evidence on the Rust-owned CAN wire.
+        “Missed N Hz” counts command gaps that lost one or more loop periods — 4.17 ms on the 240 Hz
+        impedance controller, 2.5 ms on the 400 Hz position controller; the observer infers which is
+        running. All values come from passive kernel-timestamped evidence on the Rust-owned CAN
+        wire.
       </p>
     </section>
   )

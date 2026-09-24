@@ -79,9 +79,15 @@ from ..constants import ARM_JOINTS
 from ..motor import ControlMode, Joint, Motor, MotorError, MotorGains, MotorStatus
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.axol import AxolArm, AxolHardware, _rollback_newly_enabled_motors
+from ..robot.axol import (
+    AxolArm,
+    AxolHardware,
+    _rollback_newly_enabled_motors,
+    apply_firmware_gains,
+    held_firmware_gain_mismatches,
+)
 from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
-from ..robot.config import AxolConfig
+from ..robot.config import AxolConfig, JointConfig, check_loop_hz
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
@@ -94,6 +100,26 @@ _N_ARM = len(ARM_JOINTS)
 # gravity-comp tuples Python keeps streaming. Matches
 # ``VRTeleopConfig.reset_gravity_comp_kd`` (the classic contact hold).
 _LIMP_KD = 0.25
+
+# Wire-mode tokens the core understands (``bringup::WireMode::parse``).
+_WIRE_MODES = frozenset({"mit", "a4", "pv"})
+#: The firmware-position-loop tokens and the motor ids they are valid for:
+#: ``a4`` is a MyActuator command (ids 1-5), ``pv`` a Damiao one (the
+#: wrists, 6-7). The core would refuse neither on the wire — the motor would
+#: simply ignore the frame — so the mismatch is caught here.
+_WIRE_VENDOR_IDS = {"a4": range(1, 6), "pv": range(6, 8)}
+
+
+def tf_nm_per_pct(joint: Joint, gains: JointConfig) -> float:
+    """The 0x73 feedforward scale the core takes for a joint: output-shaft Nm
+    per 1% of rated current — its torque constant times
+    ``firmware.tf_rated_current_a`` over 100 — or 0 (plain 0xA4) when the
+    rated current is unset or the joint is not a MyActuator motor."""
+    cfg = _JOINT_CONFIG[joint]
+    rated = gains.firmware.tf_rated_current_a
+    if rated is None or cfg.motor_id > 5:
+        return 0.0
+    return float(cfg.kt) * float(rated) / 100.0
 
 
 class Axol(RobotBase):
@@ -132,7 +158,7 @@ class Axol(RobotBase):
         left_joints: Iterable[Joint] | None = None,
         right_joints: Iterable[Joint] | None = None,
         *,
-        loop_hz: float = 240.0,
+        loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
@@ -166,7 +192,10 @@ class Axol(RobotBase):
         changing:
 
         Args:
-            loop_hz: Core tick rate.
+            loop_hz: Core tick rate. ``None`` (default) follows
+                ``config.controller``: 240 Hz on the impedance controller,
+                400 Hz on the firmware position controller
+                (:data:`almond_axol.robot.config.CONTROLLER_LOOP_HZ`).
             watchdog_ms: Core watchdog — how long it holds the last target
                 without a fresh one before treating the host as gone.
             max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
@@ -198,7 +227,7 @@ class Axol(RobotBase):
         cls,
         hardware: AxolHardware,
         *,
-        loop_hz: float = 240.0,
+        loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
@@ -225,13 +254,17 @@ class Axol(RobotBase):
         self,
         hardware: AxolHardware,
         *,
-        loop_hz: float,
+        loop_hz: float | None,
         watchdog_ms: float,
         max_vel: float,
         max_accel: float,
         record: str | None,
     ) -> None:
         self._robot = hardware
+        if loop_hz is None:
+            loop_hz = self._axol_config().loop_hz
+        # Impedance (MIT) joints run at 240 Hz only, whoever asked otherwise.
+        check_loop_hz(self._axol_config(), loop_hz)
         # ``_core_started``: an ``axol-rt`` process exists for this session
         # (from ``enable`` until teardown) — teardown must go through the
         # core. ``_armed``: the core holds the buses (from its ``arm`` ack
@@ -298,6 +331,10 @@ class Axol(RobotBase):
                 "enable(), or after disable()."
             )
 
+    def _axol_config(self) -> AxolConfig:
+        """The (resolved) robot config the arms were built from."""
+        return self._arms()[0][1]._config
+
     def _arms(self) -> list[tuple[int, AxolArm]]:
         out = []
         if self._robot.left is not None:
@@ -306,11 +343,37 @@ class Axol(RobotBase):
             out.append((1, self._robot.right))
         return out
 
-    def _config_text(self) -> str:
-        max_step = self._arms()[0][1]._config.max_step_rad
+    def _config_text(self, *, cogging: bool = False) -> str:
+        """The core's config.
+
+        ``cogging``: also the joints' ``cogging`` lines (position-periodic
+        torque cancellation), which need the resolved joint offsets — the
+        motor-frame series is the joint-frame one shifted by the offset — so
+        they go on the second configure, after :meth:`_enable` resolved them.
+        """
+
+        def _wire_token(mode: str, joint: Joint, motor_id: int) -> str:
+            token = str(mode).lower()
+            if token not in _WIRE_MODES:
+                raise ValueError(
+                    f"wire_mode {mode!r} is not one of {sorted(_WIRE_MODES)}"
+                )
+            ids = _WIRE_VENDOR_IDS.get(token)
+            if ids is not None and motor_id not in ids:
+                vendor = "MyActuator" if token == "a4" else "Damiao"
+                raise ValueError(
+                    f"wire_mode {token!r} is the {vendor} position loop; "
+                    f"{joint.value} (motor {motor_id}) is not a {vendor} motor — "
+                    f"use {'pv' if token == 'a4' else 'a4'}, or "
+                    "AxolConfig.controller = 'position' to pick per vendor"
+                )
+            return token
+
+        max_step = self._axol_config().max_step_rad
         lines = [
             *config_header(),
             f"loop_hz {self._loop_hz}",
+            f"impedance_hz {self._axol_config().impedance_hz}",
             f"watchdog_ms {self._watchdog_ms}",
             # Corruption defense on the core side; the Python max-step gate
             # in motion_control is the real per-command limit.
@@ -333,13 +396,62 @@ class Axol(RobotBase):
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} "
                     f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
-                    f"{f.fc} {f.k} {f.fv} {f.fo}"
+                    f"{f.fc} {f.k} {f.fv} {f.fo} "
+                    f"{gains.stiction_gain} {math.radians(gains.stiction_err_deg)} "
+                    f"{gains.stiction_load_gain} {gains.dither_nm} {gains.dither_hz} "
+                    f"{_wire_token(gains.wire_mode, j, motor_id)} "
+                    f"{gains.stribeck_gain} {gains.stribeck_dfs} "
+                    f"{gains.stribeck_load_gain} {gains.stribeck_vs} {f.fl} "
+                    f"{gains.stribeck_pole} "
+                    # 0xA4 speed-cap tracking (the planner's; 0 = fixed cap),
+                    # target lead (ms), and the 0x73 feedforward scale (0 =
+                    # plain 0xA4).
+                    f"{gains.firmware.cap_track or 0.0} "
+                    f"{gains.firmware.planner_lead_ms or 0.0} "
+                    f"{tf_nm_per_pct(j, gains)} "
+                    # This joint's impedance rate (0 = the config-wide one).
+                    f"{gains.impedance_hz or 0.0}"
                 )
+                if cogging and gains.cogging is not None and gains.cogging_gain != 0.0:
+                    offset = float(arm._joint_offsets[ARM_JOINTS.index(j)])
+                    if math.isfinite(offset):
+                        terms = gains.cogging.motor_terms(offset, gains.cogging_gain)
+                        lines.append(
+                            f"cogging {side} {iface} {motor_id} {len(terms)} "
+                            + " ".join(f"{w!r} {a!r} {b!r}" for w, a, b in terms)
+                        )
             if arm._has_gripper:
                 lines.append(
                     f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
                 )
         return "\n".join(lines) + "\n"
+
+    def _warn_wire_modes(self) -> None:
+        firmware = [
+            f"{'left' if side == 0 else 'right'}.{j.value}"
+            for side, arm in self._arms()
+            for j in ARM_JOINTS
+            if j in arm.motors
+            and str(getattr(arm._arm_config, j.value).wire_mode).lower() in ("a4", "pv")
+        ]
+        if not firmware:
+            return
+        controller = self._axol_config().controller
+        if controller == "position":
+            _logger.warning(
+                "rt: position controller — %s on the firmware position loop "
+                "at %.0f Hz: no compliance, no host feedforward, torque telemetry "
+                "NaN on the a4 joints — the contact watchdog cannot see them",
+                ", ".join(firmware),
+                self._loop_hz,
+            )
+            return
+        _logger.warning(
+            "rt: %s on the firmware position loop (wire_mode a4 / pv): no "
+            "compliance, no host feedforward, torque telemetry NaN on a4 joints "
+            "— the contact watchdog cannot see these joints",
+            ", ".join(firmware),
+        )
 
     async def enable(self, hold: bool = True) -> None:
         """Bring every motor up.
@@ -365,6 +477,7 @@ class Axol(RobotBase):
             self._require_quiet_bus("enable(hold=False)")
             await self._robot.enable(hold=False)
             return
+        self._warn_wire_modes()
         try:
             await self._enable()
         except BaseException as setup_error:
@@ -438,15 +551,40 @@ class Axol(RobotBase):
         # is still holding, so this is exactly the classic held/cold split.
         # Only the cold set is rolled back if the bring-up fails from here.
         cold: list[tuple[str, Motor]] = []
+        cold_joints: dict[int, list[Joint]] = {}
         for side, arm in self._arms():
             label = "left" if side == 0 else "right"
             flags = await arm.get_holding()
             for joint, holding in zip(arm.motors, flags):
                 if not holding:
                     cold.append((f"{label}.{joint.value}", arm.motors[joint]))
+                    cold_joints.setdefault(side, []).append(joint)
         self._enable_cold = cold
 
-        for _side, arm in self._arms():
+        # A held joint is never reset, so apply_firmware_gains cannot reach
+        # it: refuse a run whose held joints do not already run the firmware
+        # gains it asks for, rather than silently test the old ones.
+        stale: list[str] = []
+        for side, arm in self._arms():
+            held = [j for j in arm.motors if j not in cold_joints.get(side, [])]
+            stale += await held_firmware_gain_mismatches(arm, held)
+        if stale:
+            raise MotorError(
+                "joints found holding from an earlier session run different firmware "
+                "gains than this run wants — a holding motor cannot take a ROM write: "
+                + "; ".join(stale)
+                + ". Power-cycle the arm (or disable it) and run again."
+            )
+
+        for side, arm in self._arms():
+            # The configured firmware loop gains (wire_mode a4's controller)
+            # go to ROM now: the cold joints have just been reset by prep and
+            # are disabled, which is the only state a MyActuator commits a
+            # ROM write in, and the bus is quiet. Held joints are skipped. A
+            # motor that took a write is reset again so its loop loads the
+            # new gains — hence this runs *before* the offsets are resolved
+            # from the (post-reset) multi-turn reading.
+            await apply_firmware_gains(arm, cold_joints.get(side, []))
             await arm.resolve_joint_offsets()
             # Python never calls Motor.enable() in production control, so run the
             # MyActuator capability detection (position/torque decode ranges)
@@ -458,6 +596,17 @@ class Axol(RobotBase):
                     driver = arm.motors[j]._driver
                     await driver._detect_capabilities()
                     await driver._apply_low_voltage_threshold()
+
+        # The offsets are resolved: hand the core the cogging cancellation,
+        # which lives in the motor frame. Re-sending the config replaces the
+        # one the prep ran from; the bus threads start from this one at arm.
+        if any(
+            getattr(arm._arm_config, j.value).cogging is not None
+            for _side, arm in self._arms()
+            for j in ARM_JOINTS
+            if j in arm.motors
+        ):
+            await self._link.configure(self._config_text(cogging=True))
 
         # Gripper bring-up runs from Python while the bus is still quiet —
         # the exact classic flow (enable/calibrate or attach/restore) the

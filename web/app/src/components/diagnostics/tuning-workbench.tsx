@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
+import { type FirmwareVendor, jointVendor, shownForJoint } from "@/lib/firmware-loop"
 import { RunChart, type RunChartSeries } from "@/components/diagnostics/run-chart"
 import type { CommandSpec, FormValue } from "@/lib/supervisor"
 import {
@@ -20,7 +21,16 @@ import {
   type TuningRecording,
   type TuningRunData,
   type TuningRunMeta,
+  type TuningWireModes,
 } from "@/lib/tuning"
+import { fetchMotorDetails } from "@/lib/telemetry"
+import {
+  MYACTUATOR_JOINTS,
+  SIDES,
+  effectiveWireMode,
+  parseA4Tokens,
+  toggleA4Token,
+} from "@/lib/wire-mode"
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
@@ -55,7 +65,7 @@ const KNOWN_KINDS = new Set(["sine", "step", "motion", "gravity", "filter", "bui
 interface WbField {
   key: string
   label: string
-  type: "number" | "text" | "select" | "boolean" | "overrides" | "pose"
+  type: "number" | "text" | "select" | "boolean" | "overrides" | "pose" | "wire"
   options?: string[]
   /** Placeholder shown when empty; empty means "command default". */
   placeholder?: string
@@ -68,8 +78,19 @@ interface WbField {
    * and an empty box means "run with config".
    */
   gainKey?: string
+  /**
+   * Key into the selected motor's *firmware* loop gains (`position_kp`,
+   * `speed_kp`, …), read live from the motor over the idle link: the field
+   * shows that value as its baseline and an empty box runs with it.
+   */
+  fwGainKey?: string
   /** Render a slider next to the value box, over this range. */
   slider?: { min: number; max: number; step: number }
+  /**
+   * The motor vendors whose firmware loop has this knob; the field hides for
+   * a joint of any other vendor (see `lib/firmware-loop`). Unset = always.
+   */
+  vendors?: readonly FirmwareVendor[]
 }
 
 interface WbTab {
@@ -137,6 +158,74 @@ const GAIN_FIELDS: WbField[] = [
   },
 ]
 
+/**
+ * The firmware loop gains of the Firmware-loop tab. Each shows the selected
+ * motor's *live* value ("motor N", read over the idle link when arm and joint
+ * are picked); an empty box runs with the motor's value. Plain number boxes,
+ * no sliders: the two vendors' gains live on different scales (a MyActuator
+ * position_kp near 1, a Damiao KP_APR in the hundreds), so no one range fits.
+ * Fields tagged with `vendors` show only for a joint on that vendor's motor —
+ * the Damiao wrists have no position D, no exposed current loop.
+ */
+const FW_GAIN_FIELDS: WbField[] = [
+  {
+    key: "position_kp",
+    label: "position_kp",
+    type: "text",
+    fwGainKey: "position_kp",
+    hint:
+      "position loop P — lag ∝ 1/kp. MyActuator: config 1.0 (elbow 1.4), stock 0.008 " +
+      "on the X8 shoulders. Damiao KP_APR: config 400",
+  },
+  {
+    key: "position_ki",
+    label: "position_ki",
+    type: "text",
+    fwGainKey: "position_ki",
+    hint: "position loop I (Damiao KI_APR)",
+  },
+  {
+    key: "position_kd",
+    label: "position_kd",
+    type: "text",
+    fwGainKey: "position_kd",
+    vendors: ["myactuator"],
+    hint: "position loop D — measured inert in the 0xA4 loop on the X8-P20",
+  },
+  {
+    key: "speed_kp",
+    label: "speed_kp",
+    type: "text",
+    fwGainKey: "speed_kp",
+    hint:
+      "speed loop P (Damiao KP_ASR) — on MyActuator the only damping term and the " +
+      "buzz knob; 0.1 vibrated on shoulder_1 (stock 0.03)",
+  },
+  {
+    key: "speed_ki",
+    label: "speed_ki",
+    type: "text",
+    fwGainKey: "speed_ki",
+    hint: "speed loop I (Damiao KI_ASR) — what pushes through stiction",
+  },
+  {
+    key: "current_kp",
+    label: "current_kp",
+    type: "text",
+    fwGainKey: "current_kp",
+    vendors: ["myactuator"],
+    hint: "current loop P — leave unless the vendor says otherwise",
+  },
+  {
+    key: "current_ki",
+    label: "current_ki",
+    type: "text",
+    fwGainKey: "current_ki",
+    vendors: ["myactuator"],
+    hint: "current loop I",
+  },
+]
+
 const TABS: WbTab[] = [
   {
     key: "sine",
@@ -193,6 +282,15 @@ const TABS: WbTab[] = [
         type: "number",
         placeholder: "off",
       },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -245,6 +343,157 @@ const TABS: WbTab[] = [
         options: ["full", "gravity", "friction", "none"],
       },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
+    key: "a4",
+    label: "Firmware loop",
+    command: "tune.a4",
+    description:
+      "Tune a joint's own firmware position loop — 0xA4 on the MyActuator joints " +
+      "(wire_mode a4), position-velocity on the Damiao wrists (pv) — with a sine or " +
+      "a constant-speed triangle; the gain boxes follow the joint's motor. Firmware " +
+      "gains are written to RAM for the run and restored afterwards (persist " +
+      "writes ROM, keep leaves them); planner acceleration must be 0 for the " +
+      "joint to follow a stream. A buzz guard restores the previous gains on " +
+      "any high-frequency motion. Compare runs on velocity ripple (MIT " +
+      "stick-slip ≈ 0.8, smooth < 0.2), stuck windows, lag and the 1–4 Hz band. " +
+      "The joint holds stiffly and does not yield to a hand: clear the space.",
+    presets: { save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      {
+        key: "joint",
+        label: "joint",
+        type: "select",
+        options: ARM_JOINT_OPTIONS,
+      },
+      { key: "mode", label: "wave", type: "select", options: ["triangle", "sine"] },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "mid",
+        hint: "joint-frame centre (0 = rest); probe under gravity load, e.g. -35 on shoulder_1",
+      },
+      { key: "amp", label: "half-travel (°)", type: "number", placeholder: "10" },
+      {
+        key: "pose",
+        label: "pose — hold other joints (°)",
+        type: "pose",
+        hint:
+          "hold other joints at an angle during the run (overrides the sweep's own " +
+          "clearance pose for that joint). A firmware loop that is well damped with the " +
+          "arm hanging can oscillate with it extended — right shoulder_2 did, held during " +
+          "a shoulder_3 sweep — so tune the worst-case pose too; the held joints are " +
+          "sampled during the wave and scored",
+      },
+      { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
+      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
+      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "400" },
+      { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
+      {
+        key: "cap_track",
+        label: "cap tracks speed ×",
+        type: "number",
+        placeholder: "0",
+        hint:
+          "0 = fixed cap. With planner accel 60000 a fixed cap lets the planner burst " +
+          "through each 200 Hz step at the cap and idle the rest of the tick (4× the " +
+          "current spread on the elbow); 1.1–1.2 sets the per-command cap to that " +
+          "multiple of the commanded speed so the joint moves continuously",
+      },
+      {
+        key: "cap_floor",
+        label: "cap floor (°/s)",
+        type: "number",
+        placeholder: "1",
+        hint: "lowest cap the tracking cap may set, so a stationary target still corrects",
+      },
+      {
+        key: "dm_acc",
+        label: "ACC/DEC (rad/s²)",
+        type: "number",
+        placeholder: "stored",
+        vendors: ["damiao"],
+        hint:
+          "wrist_2 / wrist_3 only: the position-velocity profiler's acceleration (and " +
+          "-deceleration), written to the registers for the run and restored afterwards " +
+          "unless kept. Found at 2 rad/s² (~115 °/s²), far too slow to follow a stream",
+      },
+      {
+        key: "accel",
+        label: "planner accel (dps/s)",
+        type: "text",
+        fwGainKey: "planner_accel",
+        vendors: ["myactuator"],
+        width: "w-24",
+        hint:
+          "shows what the motor stores; 0 = direct PI tracking (required to follow the " +
+          "stream). Written for the run and restored afterwards unless kept",
+      },
+      ...FW_GAIN_FIELDS,
+      {
+        key: "held_gain",
+        label: "held joint gains",
+        type: "text",
+        width: "w-72",
+        placeholder: "shoulder_2.position_kp=0.5 wrist_2.position_kp=200",
+        hint:
+          "space-separated JOINT.GAIN=VALUE for the joints *held* during the wave, in " +
+          "RAM and restored afterwards unless kept. The held loops are what feed a ring " +
+          "they all share — the run's power table names the ones putting energy in; " +
+          "the gain boxes above set the test joint only. Damiao wrists: position/speed " +
+          "kp/ki only",
+      },
+      { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
+      {
+        key: "iq_abort",
+        label: "current abort (A)",
+        type: "number",
+        placeholder: "30",
+        hint:
+          "a loaded X8 shoulder holds ~10 A of gravity alone at -55°; keep this above the " +
+          "pose's static current",
+      },
+      {
+        key: "tf_probe",
+        label: "0x73 probe (% rated)",
+        type: "number",
+        placeholder: "off",
+        vendors: ["myactuator"],
+        hint:
+          "instead of the wave: hold the joint at center on 0x73 (position control with " +
+          "torque feedforward, V4.4 firmware) and step the feedforward 0 / +P / 0 / −P % " +
+          "of rated current — the current jump per step gives the motor's rated current, " +
+          "the firmware.tf_rated_current_a the realtime core scales its 0x73 feedforward " +
+          "with. 5 is a gentle ~1 Nm on a shoulder; planner accel must be 0",
+      },
+      { key: "persist", label: "persist gains to ROM", type: "boolean" },
+      { key: "keep", label: "keep gains + planner after run", type: "boolean" },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default the wrist ZED X One's IMU is recorded and the run gets an IMU " +
+          "shake score — 1–15 Hz displacement at the gripper, 2 s peak-to-peak in mm " +
+          "(what the joint encoders cannot see: backlash, flex)",
+      },
+
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -267,8 +516,123 @@ const TABS: WbTab[] = [
     presets: {},
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
+      {
+        key: "arms",
+        label: "arms",
+        type: "select",
+        options: ["both", "left", "right"],
+        placeholder: "both",
+        hint:
+          "which arm(s) to bring up and drive; the other arm's channel is left " +
+          "untouched, so a single-arm run does not need the other arm powered",
+      },
+      {
+        key: "controller",
+        label: "controller",
+        type: "select",
+        options: ["impedance", "position"],
+        placeholder: "impedance",
+        width: "w-40",
+        hint:
+          "impedance (240 Hz) is the production MIT frame: host gravity, " +
+          "friction, inertia and damping feed-forward around the firmware PD, " +
+          "compliant. position (400 Hz) hands every joint to its motor's own " +
+          "position loop — MyActuator 0xA4, Damiao position-velocity, the gains " +
+          "on the Firmware-loop tab — streamed at 400 Hz, where the loop's " +
+          "target staircase is gone: stiff, no host feed-forward, NaN torque " +
+          "on the MyActuator joints (contact watchdog blind there). Same " +
+          "motion, same scoring, so the two controllers compare directly.",
+      },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
+      {
+        key: "fast_impedance",
+        label: "480 Hz impedance joints",
+        type: "text",
+        width: "w-56",
+        placeholder: "right.shoulder_1 right.elbow",
+        hint:
+          "space-separated SIDE.JOINT run at 480 Hz — every tick of a 480 Hz core " +
+          "loop — while every other impedance joint stays at 240 Hz on alternate " +
+          "ticks. An experiment: the gains were tuned at 240",
+      },
+      {
+        key: "impedance_hz",
+        label: "impedance rate (Hz)",
+        type: "select",
+        options: ["240", "480"],
+        placeholder: "240",
+        hint:
+          "command rate of the MyActuator impedance joints: 240 is the verified rate; " +
+          "480 runs them every tick of a 480 Hz core loop while the Damiao wrists stay " +
+          "at 240 Hz on alternate ticks — an experiment (the gains were tuned at 240)",
+      },
+      {
+        key: "loop_hz",
+        label: "core loop (Hz)",
+        type: "number",
+        placeholder: "auto",
+        hint:
+          "realtime-core tick rate override; auto follows the wire modes (240 all " +
+          "impedance, 400 all firmware loops, 480 mixed — impedance joints on " +
+          "alternate ticks — or at impedance rate 480). With any arm joint on " +
+          "impedance only 240 or 480 is accepted (only 480 at impedance rate 480)",
+      },
+      {
+        key: "record",
+        label: "record",
+        type: "text",
+        width: "w-32",
+        placeholder: "prefix",
+        hint:
+          "flight-recorder prefix: measured joints to PREFIX_meas.npz and the " +
+          "realtime core's per-tick trace to PREFIX_rt.npz in the recordings " +
+          "directory, for diag.teleop-jitter or offline analysis",
+      },
+      {
+        key: "hold",
+        label: "hold joints steady",
+        type: "text",
+        width: "w-56",
+        placeholder: "right.elbow right.wrist_2=10",
+        hint:
+          "space-separated SIDE.JOINT[=DEG]: held at the motion's start angle (or the " +
+          "given one) instead of following it, same controller and gains, scored as " +
+          "parked. Only the approach is collision-checked — watch the first pass",
+      },
+      {
+        key: "repeat",
+        label: "repeat",
+        type: "number",
+        placeholder: "1",
+        hint:
+          "replay the motion this many times back to back (0 = until stopped), each " +
+          "pass scored and saved as its own run [k/N] — for soak runs and catching an " +
+          "intermittent buzz",
+      },
+      {
+        key: "no_imu",
+        label: "skip wrist IMU",
+        type: "boolean",
+        hint:
+          "by default each driven arm's wrist ZED X One IMU is recorded and every pass " +
+          "gets an IMU shake score — 1–15 Hz displacement at the gripper, 2 s " +
+          "peak-to-peak in mm (what the joint encoders cannot see: backlash, flex)",
+      },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
+      {
+        key: "a4",
+        label: "controller per joint — click a cell to put that joint on the firmware loop",
+        type: "wire",
+        hint:
+          "inside the impedance controller, single MyActuator joints can go on " +
+          "their 0xA4 firmware loop for this run only (--a4 side.joint), the rest " +
+          "staying on impedance — no compliance, no host feed-forward and NaN " +
+          "torque telemetry on that joint. Everything else about the replay is " +
+          "unchanged, so runs compare directly. The Damiao wrists' firmware loop " +
+          "(position-velocity) comes with the position controller above, which " +
+          "puts every joint on its firmware loop at 400 Hz. A joint already " +
+          "configured wire_mode a4 is pinned.",
+      },
       {
         key: "ik",
         label: "run as IK",
@@ -523,17 +887,186 @@ const KIND_TABS: Record<string, string> = {
   kinematics: "ik",
 }
 
+/**
+ * A `tune.a4` run: saved as kind `sine` (it shares the sine/triangle charts)
+ * but tagged `wire: "a4"` — it belongs to the Firmware-loop tab, carries the
+ * firmware gains instead of impedance gains, and is scored on creep
+ * smoothness rather than the impedance score.
+ */
+function isA4Run(meta: TuningRunMeta): boolean {
+  return meta.kind === "sine" && meta.params?.wire === "a4"
+}
+
+/** The launcher tab a saved run re-arms, or null for kinds without one. */
+function runTab(meta: TuningRunMeta): string | null {
+  if (isA4Run(meta)) return "a4"
+  return KIND_TABS[meta.kind] ?? null
+}
+
+/** What to call a run in badges: its kind, except firmware-loop runs. */
+function runKindLabel(meta: TuningRunMeta): string {
+  return isA4Run(meta) ? "a4" : meta.kind
+}
+
 /* ------------------------------------------------------------------ */
 /* Gain-override editor (Recorded motion tab)                          */
 /* ------------------------------------------------------------------ */
 
 // Matches tune.motion's --gain fields (see _GAIN_FIELDS there).
-const OVERRIDE_FIELDS = ["kp", "kd", "kd_host", "kd_host_hz", "kd_host_q", "j_eff"]
+const OVERRIDE_FIELDS = [
+  "kp",
+  "kd",
+  "kd_host",
+  "kd_host_hz",
+  "kd_host_q",
+  "j_eff",
+  "stiction_gain",
+  "stiction_load_gain",
+  "dither_nm",
+  "stribeck_gain",
+  // Share of the joint's calibrated cogging series fed forward (the "osc
+  // cancellation"; blank = no series calibrated for the joint).
+  "cogging_gain",
+  // The firmware position loop (0xA4 / pv), in effect on --a4 joints and
+  // under the position controller; written to ROM at enable.
+  "firmware.position_kp",
+  "firmware.speed_kp",
+  "firmware.speed_ki",
+  // MyActuator 0xA4 only: the planner (0 direct / 60000) and its speed-cap
+  // tracking (>= 1). The Damiao wrists' cells are disabled.
+  "firmware.planner_accel",
+  "firmware.cap_track",
+  "firmware.planner_lead_ms",
+  // MyActuator 0x73: the rated current that scales the torque feedforward
+  // (gravity + inertia + cogging) on V4.4 firmware; blank = plain 0xA4.
+  "firmware.tf_rated_current_a",
+]
+
+/**
+ * Fields whose value belongs to the selected joint — its gains (config or
+ * live motor baseline) and the joint-frame / vendor-specific wave settings —
+ * cleared when the arm or joint changes (see `setValue`).
+ */
+const PER_JOINT_KEYS = new Set(["center", "dm_acc"])
+function isPerJointField(f: WbField): boolean {
+  return f.gainKey != null || f.fwGainKey != null || PER_JOINT_KEYS.has(f.key)
+}
+
+/** Override fields that exist only on the MyActuator (0xA4) joints. */
+const MYACTUATOR_ONLY_FIELDS = new Set([
+  "firmware.planner_accel",
+  "firmware.cap_track",
+  "firmware.planner_lead_ms",
+  "firmware.tf_rated_current_a",
+])
+
+/** Grid header for an override field (`firmware.x` shortened to `fw x`). */
+function overrideLabel(field: string): string {
+  return field.startsWith("firmware.") ? `fw ${field.slice("firmware.".length)}` : field
+}
 
 /** Format a config gain for seeding/comparison (trims float32 noise). */
 function fmtGain(v: unknown): string {
   if (typeof v !== "number" || !Number.isFinite(v)) return ""
-  return String(Number(v.toFixed(3)))
+  // Four significant digits: kp 250 and speed_ki 1e-5 both survive.
+  return String(Number(v.toPrecision(4)))
+}
+
+/**
+ * Per-joint controller picker for tune.motion: one row per MyActuator joint,
+ * one cell per arm, each a two-way toggle between the MIT impedance frame
+ * and the firmware position loop (`--a4 side.joint`). Cells the robot's
+ * config already pins to `wire_mode a4` show as firmware and cannot be
+ * switched back — a run can only add `--a4` joints. Serializes to the token
+ * string the CLI takes, so the launch path and run re-arming stay generic.
+ */
+function WireModeEditor({
+  value,
+  onChange,
+  disabled,
+  configModes,
+}: {
+  value: string
+  onChange: (v: string) => void
+  disabled: boolean
+  configModes: TuningWireModes | null
+}) {
+  const picked = parseA4Tokens(value)
+  return (
+    <div className="flex flex-col gap-1.5 overflow-x-auto">
+      <table className="w-fit border-separate border-spacing-0">
+        <thead>
+          <tr>
+            <th />
+            {SIDES.map((side) => (
+              <th
+                key={side}
+                className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40"
+              >
+                {side}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {MYACTUATOR_JOINTS.map((joint) => (
+            <tr key={joint}>
+              <td className="pr-2 text-xs text-white/55">{joint}</td>
+              {SIDES.map((side) => {
+                const mode = effectiveWireMode(value, configModes, side, joint)
+                const pinned =
+                  (configModes?.[side]?.[joint] ?? "mit").toLowerCase() === "a4" &&
+                  !picked.has(`${side}.${joint}`)
+                const dirty = picked.has(`${side}.${joint}`)
+                return (
+                  <td key={side} className="p-0.5">
+                    <button
+                      type="button"
+                      disabled={disabled || pinned}
+                      title={
+                        pinned
+                          ? "wire_mode a4 in this robot's config — the run cannot put it back on impedance"
+                          : mode === "a4"
+                            ? "firmware position loop (0xA4) for this run — click for impedance"
+                            : "MIT impedance frame — click to run this joint on the firmware loop"
+                      }
+                      onClick={() => onChange(toggleA4Token(value, side, joint))}
+                      className={cn(
+                        "h-7 w-24 rounded-md border px-2 text-left font-mono text-[0.7rem] outline-none disabled:cursor-not-allowed",
+                        dirty
+                          ? "border-[#eff483]/60 bg-[#eff483]/10 text-[#eff483]"
+                          : mode === "a4"
+                            ? "border-white/10 bg-[#1c1c1c] text-white/55"
+                            : "border-white/10 bg-[#1c1c1c] text-white/70 hover:border-white/25"
+                      )}
+                    >
+                      {mode === "a4" ? "firmware" : "impedance"}
+                      {pinned && <span className="text-white/30"> · config</span>}
+                    </button>
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {picked.size > 0 && (
+        <div className="flex items-center gap-2 text-[0.65rem] text-white/40">
+          <span>
+            {picked.size} joint{picked.size === 1 ? "" : "s"} on the firmware loop this run
+          </span>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => onChange("")}
+            className="text-white/55 underline-offset-2 hover:underline disabled:opacity-40"
+          >
+            reset
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 /**
@@ -580,7 +1113,9 @@ function GainOverrideEditor({
       for (const tok of tokens.split(/\s+/).filter(Boolean)) {
         const [path = "", v = ""] = tok.split("=")
         const parts = path.split(".")
-        const key = parts.length === 3 ? `${parts[1]}.${parts[2]}` : path
+        // `side.joint.field[.sub]` and `joint.field[.sub]` both map to the
+        // side-less cell key.
+        const key = parts[0] === "left" || parts[0] === "right" ? parts.slice(1).join(".") : path
         if (key in cells) cells[key] = v
       }
       return cells
@@ -632,7 +1167,7 @@ function GainOverrideEditor({
             <th />
             {OVERRIDE_FIELDS.map((f) => (
               <th key={f} className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40">
-                {f}
+                {overrideLabel(f)}
               </th>
             ))}
           </tr>
@@ -660,9 +1195,12 @@ function GainOverrideEditor({
                           setCells((prev) => ({ ...prev, [key]: seeds[key].text }))
                         }
                       }}
-                      disabled={disabled}
+                      disabled={
+                        disabled ||
+                        (MYACTUATOR_ONLY_FIELDS.has(field) && jointVendor(joint) === "damiao")
+                      }
                       className={cn(
-                        "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                        "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40 disabled:opacity-30",
                         dirty
                           ? "border-[#eff483]/50 text-[#eff483]"
                           : "border-white/10 text-white/60"
@@ -831,6 +1369,41 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       out[key] = v
     }
   }
+  if (isA4Run(meta)) {
+    put("arm", meta.side)
+    put("joint", meta.joint)
+    put("mode", p.mode)
+    put("center", p.center_deg)
+    put("amp", p.amp_deg)
+    put("speed", p.speed_dps)
+    put("freq", p.freq_hz)
+    put("duration", p.duration_s)
+    put("rate", p.rate_hz)
+    put("cap", p.cap_dps)
+    if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_track", p.cap_track)
+    if (typeof p.cap_track === "number" && p.cap_track > 0) put("cap_floor", p.cap_floor_dps)
+    if (Array.isArray(p.accel) && typeof p.accel[0] === "number") out["accel"] = String(p.accel[0])
+    if (Array.isArray(p.dm_acc) && typeof p.dm_acc[0] === "number")
+      out["dm_acc"] = String(p.dm_acc[0])
+    if (Array.isArray(p.pose) && p.pose.length > 0) out["pose"] = p.pose.join(" ")
+    // Held joints' gains, as run: {joint: {gain: value}} → "joint.gain=value …".
+    if (p.held_gains && typeof p.held_gains === "object") {
+      const held = Object.entries(p.held_gains as Record<string, Record<string, unknown>>)
+        .flatMap(([j, gains]) =>
+          Object.entries(gains ?? {})
+            .filter(([, v]) => typeof v === "number" && Number.isFinite(v))
+            .map(([n, v]) => `${j}.${n}=${fmtFwGain(v)}`)
+        )
+        .join(" ")
+      if (held) out["held_gain"] = held
+    }
+    for (const k of ["position_kp", "position_ki", "position_kd", "speed_kp", "speed_ki"]) {
+      const v = g[k]
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = fmtFwGain(v)
+    }
+    if (p.persist === true) out["persist"] = "true"
+    return out
+  }
   switch (meta.kind) {
     case "sine":
     case "step":
@@ -854,6 +1427,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       break
     case "motion": {
       put("motion", p.motion)
+      put("controller", p.controller)
       put("stiffness", p.stiffness)
       put("noise", p.noise)
       if (p.ik === true) out["ik"] = "true"
@@ -863,6 +1437,18 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
         .map(([k, v]) => `${k}=${v}`)
         .join(" ")
       if (overrides) out["gain"] = overrides
+      if (Array.isArray(p.a4) && p.a4.length > 0) {
+        out["a4"] = p.a4.filter((t): t is string => typeof t === "string").join(" ")
+      }
+      if (Array.isArray(p.hold) && p.hold.length > 0) {
+        out["hold"] = p.hold.filter((t): t is string => typeof t === "string").join(" ")
+      }
+      if (Array.isArray(p.fast_impedance) && p.fast_impedance.length > 0) {
+        out["fast_impedance"] = p.fast_impedance
+          .filter((t): t is string => typeof t === "string")
+          .join(" ")
+      }
+      if (p.arms === "left" || p.arms === "right") out["arms"] = p.arms
       break
     }
     case "gravity":
@@ -935,6 +1521,18 @@ function parseLiveProbe(lines: string[]): LiveProbe | null {
   return probe
 }
 
+/** Firmware loop gains span 0.0001 … 1: four significant digits, no padding. */
+function fmtFwGain(v: unknown): string {
+  if (v == null || typeof v !== "number" || !Number.isFinite(v)) return "–"
+  return String(Number(v.toPrecision(4)))
+}
+
+/** The baseline a gain box falls back to: the motor's live value, or config. */
+function baselineText(f: WbField, cfg: number | null): string {
+  if (cfg == null) return f.fwGainKey ? "motor" : "config"
+  return f.fwGainKey ? fmtFwGain(cfg) : fmtNum(cfg)
+}
+
 function fmtNum(v: unknown, digits = 2): string {
   if (v == null || typeof v !== "number" || !Number.isFinite(v)) return "–"
   const a = Math.abs(v)
@@ -996,9 +1594,48 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
   return null
 }
 
+/** One side's wrist-IMU shake score (`almond_axol.tuning.wrist_imu`). */
+interface ImuScore {
+  shake_mm: number
+  shake_mm_p90: number
+  vertical_mm: number
+  vertical_mm_p90: number
+  low_mm?: number
+  high_mm?: number
+  acc_rms: number
+  gyro_rms: number | null
+  peak_hz: number
+}
+
+/** A run's `imu` metrics block, per side, or null when it recorded none. */
+function imuScores(meta: TuningRunMeta): Record<string, ImuScore> | null {
+  const block = (meta.metrics as Record<string, unknown>).imu
+  if (!block || typeof block !== "object") return null
+  const out: Record<string, ImuScore> = {}
+  for (const [side, v] of Object.entries(block as Record<string, unknown>)) {
+    if (v && typeof v === "object" && typeof (v as ImuScore).shake_mm === "number") {
+      out[side] = v as ImuScore
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null
+}
+
+/** The worst side's IMU shake (mm, 1 s peak-to-peak), for the run list. */
+function imuHeadline(meta: TuningRunMeta): string | null {
+  const s = imuScores(meta)
+  if (!s) return null
+  const worst = Math.max(...Object.values(s).map((v) => v.shake_mm))
+  return `${fmtNum(worst)} mm`
+}
+
 /** One per-joint chart: commanded vs actual position for a single joint. */
 interface JointChart {
   joint: string
+  /**
+   * Shown after the joint in the chart title: "held" for a joint the run
+   * held steady (`tune.motion --hold`), "parked" for one it never moved.
+   */
+  note?: string
   series: RunChartSeries[]
   /** Error lane (reference − output, in degrees) under the position plot. */
   sub: RunChartSeries[]
@@ -1031,10 +1668,39 @@ function errorLane(
 }
 
 /** Commanded-vs-actual charts for every joint of `arm` that actually moved. */
+/** `side.joint` columns a motion run held steady (`--hold SIDE.JOINT[=DEG]`). */
+function heldColumns(run: TuningRunData): Set<string> {
+  const hold = run.meta.params.hold
+  return new Set(
+    (Array.isArray(hold) ? hold : [])
+      .filter((h): h is string => typeof h === "string")
+      .map((h) => h.split("=")[0] ?? h)
+  )
+}
+
+/** Whether a commanded series moves less than ~1° (0.017 rad) end to end. */
+function isStationary(values: (number | null)[]): boolean {
+  let min = Infinity
+  let max = -Infinity
+  for (const v of values) {
+    if (v == null) continue
+    if (v < min) min = v
+    if (v > max) max = v
+  }
+  return max - min < 0.017
+}
+
+/**
+ * Commanded vs actual per joint for a motion run. Joints that moved come
+ * first; joints the run held steady (`--hold`) or never moved follow, noted
+ * as such — a parked joint still buzzes or sags, which is worth seeing.
+ */
 function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
   const columns = (run.meta.params.columns as string[] | undefined) ?? []
   const t = run.series.t ?? []
+  const held = heldColumns(run)
   const out: JointChart[] = []
+  const still: JointChart[] = []
   for (let i = 0; i < columns.length; i++) {
     const name = columns[i]
     if (!name?.startsWith(`${arm}.`)) continue
@@ -1042,15 +1708,7 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
     const actual = run.series[`actual/${i}`]
     const sent = run.series[`sent/${i}`]
     if (!commanded || !actual || !actual.some((v) => v != null)) continue
-    // Only joints that were actually commanded to move (> ~1° of travel).
-    let min = Infinity
-    let max = -Infinity
-    for (const v of commanded) {
-      if (v == null) continue
-      if (v < min) min = v
-      if (v > max) max = v
-    }
-    if (max - min < 0.017) continue
+    const note = held.has(name) ? "held" : isStationary(commanded) ? "parked" : undefined
     const series: RunChartSeries[] = [
       { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
     ]
@@ -1060,13 +1718,14 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
       series.push({ label: "sent", color: NOISY_COLOR, x: t, data: degSeries(sent) })
     }
     series.push({ label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) })
-    out.push({
+    ;(note ? still : out).push({
       joint: name.slice(arm.length + 1),
+      note,
       series,
       sub: errorLane(t, commanded, actual),
     })
   }
-  return out
+  return [...out, ...still]
 }
 
 /**
@@ -1428,7 +2087,10 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
   const colsA = (a.meta.params.columns as string[] | undefined) ?? []
   const colsB = (b.meta.params.columns as string[] | undefined) ?? []
   const idxB = new Map(colsB.map((n, i) => [n, i]))
+  const heldA = kind === "motion" ? heldColumns(a) : new Set<string>()
+  const heldB = kind === "motion" ? heldColumns(b) : new Set<string>()
   const out: JointChart[] = []
+  const still: JointChart[] = []
   for (let i = 0; i < colsA.length; i++) {
     const name = colsA[i]
     if (arm != null && !name?.startsWith(`${arm}.`)) continue
@@ -1438,16 +2100,21 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
     const refB = j != null ? b.series[`${refKey}/${j}`] : undefined
     const outB = j != null ? b.series[`${outKey}/${j}`] : undefined
     if (!refA || !outA || !refB || !outB) continue
-    let min = Infinity
-    let max = -Infinity
-    for (const v of refA) {
-      if (v == null) continue
-      if (v < min) min = v
-      if (v > max) max = v
-    }
-    if (max - min < 0.017) continue
-    out.push({
+    // Motion runs keep held / parked joints (after the moving ones); a filter
+    // channel that never moves has nothing to compare.
+    const stationary = isStationary(refA)
+    if (stationary && kind !== "motion") continue
+    const note =
+      kind !== "motion"
+        ? undefined
+        : heldA.has(name) || heldB.has(name)
+          ? `held (${[heldA.has(name) && "A", heldB.has(name) && "B"].filter(Boolean).join(", ")})`
+          : stationary
+            ? "parked"
+            : undefined
+    ;(note ? still : out).push({
       joint: arm != null ? name.slice(arm.length + 1) : name,
+      note,
       series: [
         { label: refLabel, color: COMMANDED_COLOR, x: tA, data: degSeries(refA) },
         { label: "A", color: ACTUAL_COLOR, x: tA, data: degSeries(outA) },
@@ -1459,7 +2126,7 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
       ],
     })
   }
-  return out
+  return [...out, ...still]
 }
 
 /** A scorecard column: which metric key, how to show it. */
@@ -1496,6 +2163,23 @@ const SINE_COLS: ScoreCol[] = [
   { key: "pos_ripple", label: "ripple", digits: 4 },
   { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
+]
+
+// tune.a4's creep-smoothness scorecard (see a4_metrics): the MIT frame's
+// stick-slip sits near 0.8 velocity ripple, smooth is under 0.2.
+const A4_COLS: ScoreCol[] = [
+  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 0.5, bad: 2.0 },
+  { key: "max", label: "max err °", deg: true, digits: 3, warn: 1.5, bad: 5 },
+  { key: "lag_ms", label: "lag ms", digits: 0, warn: 100, bad: 300 },
+  { key: "v_ripple", label: "vel ripple", digits: 2, warn: 0.3, bad: 0.8 },
+  { key: "stuck_frac", label: "stuck", digits: 2, warn: 0.05, bad: 0.3 },
+  { key: "band_1_4", label: "1–4 Hz °", deg: true, digits: 3, warn: 0.1, bad: 0.3 },
+  { key: "buzz", label: ">10 Hz buzz °", deg: true, digits: 3, warn: 0.02, bad: 0.1 },
+  { key: "iq_mode", label: "3–8 Hz mode A", digits: 2, warn: 0.5, bad: 1.0 },
+  { key: "iq_sd", label: "current spread A", digits: 2, warn: 1.3, bad: 1.8 },
+  { key: "iq_rms", label: "current RMS A", digits: 2 },
+  { key: "iq_max", label: "peak A", digits: 1 },
+  { key: "hz", label: "loop Hz", digits: 0 },
 ]
 
 const FILTER_COLS: ScoreCol[] = [
@@ -1541,6 +2225,17 @@ const STEP_COLS: ScoreCol[] = [
   { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
 ]
+
+const A4_LEGEND =
+  "firmware position loop (0xA4). tracking RMS / max / lag = how the stream was " +
+  "followed. vel ripple = std of measured minus commanded velocity over the " +
+  "commanded speed — the MIT frame's stick-slip sits near 0.8, smooth is under 0.2. " +
+  "stuck = fraction of the pass with the joint not moving. 1–4 Hz = the stick-slip " +
+  "band in the error; >10 Hz buzz = high-frequency position motion. 3–8 Hz mode = " +
+  "the position loop's own mode in the current — the shudder felt at speed (a 12 deg/s " +
+  "triangle's reversals kick it to ~1.9 A at position_kp 0.7; 0.2 A is quiet); current " +
+  "spread = all current variation, the gravity hold removed. Anything above 100 Hz is " +
+  "invisible to the 200 Hz stream, so an audible buzz can leave every column clean."
 
 const SCORE_LEGEND: Record<string, string> = {
   motion:
@@ -1625,7 +2320,13 @@ function scoreRows(
   }
   if (meta.kind === "sine" || meta.kind === "step" || meta.kind === "gravity") {
     return {
-      cols: meta.kind === "sine" ? SINE_COLS : meta.kind === "step" ? STEP_COLS : GRAVITY_COLS,
+      cols: isA4Run(meta)
+        ? A4_COLS
+        : meta.kind === "sine"
+          ? SINE_COLS
+          : meta.kind === "step"
+            ? STEP_COLS
+            : GRAVITY_COLS,
       rows: [{ joint: meta.joint ?? "joint", values: m }],
     }
   }
@@ -1858,6 +2559,11 @@ export function TuningWorkbench({
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
+  const [wireModes, setWireModes] = useState<TuningWireModes | null>(null)
+  // The selected motor's live firmware loop gains (Firmware-loop tab): read
+  // from the motor over the idle link whenever arm/joint change or a run
+  // ends, so the baselines are what the motor actually holds right now.
+  const [fwGains, setFwGains] = useState<Record<string, number | null> | null>(null)
 
   const [runs, setRuns] = useState<TuningRunMeta[]>([])
   const [loading, setLoading] = useState(false)
@@ -1903,7 +2609,10 @@ export function TuningWorkbench({
 
   const refreshGains = useCallback(() => {
     fetchTuningGains()
-      .then(({ gains }) => setGains(gains))
+      .then(({ gains, wire_modes }) => {
+        setGains(gains)
+        setWireModes(wire_modes ?? null)
+      })
       .catch(() => {})
   }, [])
 
@@ -1942,7 +2651,7 @@ export function TuningWorkbench({
     (meta: TuningRunMeta) => {
       select(meta.id)
       const form = runFormValues(meta)
-      const tabFor = KIND_TABS[meta.kind]
+      const tabFor = runTab(meta)
       if (!form || !tabFor) return
       setTabKey(tabFor)
       setValues((prev) => ({ ...prev, [tabFor]: form }))
@@ -2021,11 +2730,48 @@ export function TuningWorkbench({
 
   const setValue = useCallback(
     (key: string, v: string) => {
-      setValues((prev) => ({ ...prev, [tab.key]: { ...(prev[tab.key] ?? {}), [key]: v } }))
+      setValues((prev) => {
+        const cur = prev[tab.key] ?? {}
+        const next = { ...cur, [key]: v }
+        // A new arm or joint starts from that joint's own values: drop what
+        // was typed into the per-joint fields for the previous one, so each
+        // box falls back to the new joint's config / live-motor baseline.
+        if ((key === "arm" || key === "joint") && (cur[key] ?? "") !== v) {
+          for (const f of tab.fields) {
+            if (isPerJointField(f)) delete next[f.key]
+          }
+        }
+        return { ...prev, [tab.key]: next }
+      })
     },
-    [tab.key]
+    [tab.key, tab.fields]
   )
   const tabValues = useMemo(() => values[tab.key] ?? {}, [values, tab.key])
+
+  const fwArm = tabValues["arm"] ?? ""
+  const fwJoint = tabValues["joint"] ?? ""
+  useEffect(() => {
+    if (tabKey !== "a4" || !fwArm || !fwJoint || runningOurs) return
+    let stale = false
+    setFwGains(null)
+    fetchMotorDetails(fwArm, fwJoint.toUpperCase())
+      .then((d) => {
+        if (stale) return
+        // Loop gains plus the planner acceleration, under one lookup so the
+        // accel field gets the same "motor N" baseline as the gains.
+        setFwGains({
+          ...(d.gains ?? {}),
+          planner_accel: d.planner?.accel ?? null,
+          planner_decel: d.planner?.decel ?? null,
+        })
+      })
+      .catch(() => {
+        if (!stale) setFwGains(null)
+      })
+    return () => {
+      stale = true
+    }
+  }, [tabKey, fwArm, fwJoint, runningOurs])
 
   // Sine and step probe the same joint with the same gains, so their shared
   // fields (arm, joint, kp/kd/kd_host/…, amp, rate, …) behave as one set:
@@ -2064,6 +2810,9 @@ export function TuningWorkbench({
     if (miss.length > 0) return
     const args: Record<string, FormValue> = { ...tab.presets }
     for (const f of tab.fields) {
+      // A value typed for the other vendor's knob stays in the form (it
+      // comes back if the joint does) but is never sent: tune.a4 refuses it.
+      if (!shownForJoint(f.vendors, tabValues["joint"])) continue
       const raw = (tabValues[f.key] ?? "").trim()
       if (!raw) continue
       args[f.key] = f.type === "boolean" ? raw === "true" : raw
@@ -2077,6 +2826,10 @@ export function TuningWorkbench({
    */
   const configValue = useCallback(
     (f: WbField): number | null => {
+      if (f.fwGainKey) {
+        const v = fwGains?.[f.fwGainKey]
+        return typeof v === "number" && Number.isFinite(v) ? v : null
+      }
       if (!f.gainKey || !gains) return null
       const side = tabValues["arm"]
       const joint = tabValues["joint"]
@@ -2084,7 +2837,7 @@ export function TuningWorkbench({
       const v = gains[side]?.[joint]?.[f.gainKey]
       return typeof v === "number" && Number.isFinite(v) ? v : null
     },
-    [gains, tabValues]
+    [gains, fwGains, tabValues]
   )
 
   const meta = run?.meta ?? null
@@ -2102,7 +2855,7 @@ export function TuningWorkbench({
     return single ? [single] : []
   }, [run, arm, armed])
   const scores = meta ? scoreRows(meta, armed ? arm : null) : null
-  const legend = meta ? SCORE_LEGEND[meta.kind] : null
+  const legend = meta ? (isA4Run(meta) ? A4_LEGEND : SCORE_LEGEND[meta.kind]) : null
   const perJoint = (meta?.metrics as Record<string, unknown> | undefined)?.per_joint as
     | Record<string, Record<string, unknown>>
     | undefined
@@ -2236,122 +2989,173 @@ export function TuningWorkbench({
         <p className="max-w-3xl text-xs leading-relaxed text-white/45">{tab.description}</p>
 
         <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
-          {tab.fields.map((f) => {
-            const cfg = configValue(f)
-            return (
-              <label key={f.key} className="flex flex-col gap-1">
-                <span className="text-[0.65rem] text-white/40">
-                  {f.label}
-                  {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
-                  {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
-                </span>
-                {f.type === "overrides" ? (
-                  <GainOverrideEditor
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(v) => setValue(f.key, v)}
-                    disabled={runningOurs || busy}
-                    gains={gains}
-                  />
-                ) : f.type === "pose" ? (
-                  <PoseEditor
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(v) => setValue(f.key, v)}
-                    disabled={runningOurs || busy}
-                    excludeJoint={tabValues["joint"] ?? ""}
-                  />
-                ) : f.type === "boolean" ? (
-                  <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
-                    <input
-                      type="checkbox"
-                      checked={tabValues[f.key] === "true"}
-                      disabled={runningOurs || busy}
-                      onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
-                      className="accent-[#eff483]"
-                    />
-                    {tabValues[f.key] === "true" ? "on" : "off"}
-                  </span>
-                ) : f.type === "select" ? (
-                  <select
-                    value={tabValues[f.key] ?? ""}
-                    onChange={(e) => setValue(f.key, e.target.value)}
-                    disabled={runningOurs || busy}
-                    className={cn(
-                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
-                      f.width ?? "w-32"
-                    )}
-                  >
-                    <option value="">
-                      {tab.required.includes(f.key) ? "select…" : (f.placeholder ?? "default")}
-                    </option>
-                    {(f.key === "motion"
-                      ? motions.map((m) => ({ value: m.name, label: m.name }))
-                      : f.key === "prefix" && tab.key === "build"
-                        ? recordings.map((r) => ({
-                            value: r.name,
-                            label:
-                              `${r.name} — ` +
-                              (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
-                              (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
-                          }))
-                        : (f.options ?? []).map((o) => ({ value: o, label: o }))
-                    ).map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : f.slider ? (
-                  (() => {
-                    // The slider tracks the typed value (first number of a
-                    // sweep) and starts at the joint's config value; dragging
-                    // it fills the box, an empty box runs with config.
-                    const raw = (tabValues[f.key] ?? "").trim()
-                    const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
-                    const sliderVal = Number.isFinite(first) ? first : (cfg ?? f.slider.min)
-                    return (
-                      <span className="flex h-8 items-center gap-2">
-                        <input
-                          type="range"
-                          min={f.slider.min}
-                          max={f.slider.max}
-                          step={f.slider.step}
-                          value={sliderVal}
-                          onChange={(e) => setValue(f.key, e.target.value)}
-                          disabled={runningOurs || busy || (cfg == null && !raw)}
-                          title={f.hint}
-                          className="w-24 accent-[#eff483] disabled:opacity-40"
-                        />
-                        <input
-                          type="text"
-                          inputMode="decimal"
-                          value={tabValues[f.key] ?? ""}
-                          placeholder={cfg != null ? fmtNum(cfg) : "config"}
-                          title={f.hint}
-                          onChange={(e) => setValue(f.key, e.target.value)}
-                          disabled={runningOurs || busy}
-                          className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
-                        />
+          {tab.fields
+            .filter((f) => shownForJoint(f.vendors, tabValues["joint"]))
+            .map((f) => {
+              const cfg = configValue(f)
+              return (
+                <label
+                  key={f.key}
+                  className={cn(
+                    "flex flex-col gap-1",
+                    // Table fields take the row and scroll inside it; a flex
+                    // item's min-width would otherwise stretch it past the card.
+                    (f.type === "overrides" || f.type === "wire") && "w-full min-w-0"
+                  )}
+                >
+                  <span className="text-[0.65rem] text-white/40">
+                    {f.label}
+                    {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
+                    {cfg != null && (
+                      <span className="text-white/25">
+                        {f.fwGainKey ? " · motor " : " · config "}
+                        {baselineText(f, cfg)}
                       </span>
-                    )
-                  })()
-                ) : (
-                  <input
-                    type="text"
-                    inputMode={f.type === "number" ? "decimal" : undefined}
-                    value={tabValues[f.key] ?? ""}
-                    placeholder={f.placeholder}
-                    title={f.hint}
-                    onChange={(e) => setValue(f.key, e.target.value)}
-                    disabled={runningOurs || busy}
-                    className={cn(
-                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
-                      f.width ?? (f.type === "number" ? "w-24" : "w-28")
                     )}
-                  />
-                )}
-              </label>
-            )
-          })}
+                    {f.fwGainKey && cfg == null && fwArm && fwJoint && (
+                      <span className="text-white/25"> · motor …</span>
+                    )}
+                  </span>
+                  {f.type === "overrides" ? (
+                    <GainOverrideEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      gains={gains}
+                    />
+                  ) : f.type === "wire" ? (
+                    <WireModeEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      configModes={wireModes}
+                    />
+                  ) : f.type === "pose" ? (
+                    <PoseEditor
+                      value={tabValues[f.key] ?? ""}
+                      onChange={(v) => setValue(f.key, v)}
+                      disabled={runningOurs || busy}
+                      excludeJoint={tabValues["joint"] ?? ""}
+                    />
+                  ) : f.type === "boolean" ? (
+                    <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
+                      <input
+                        type="checkbox"
+                        checked={tabValues[f.key] === "true"}
+                        disabled={runningOurs || busy}
+                        onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
+                        className="accent-[#eff483]"
+                      />
+                      {tabValues[f.key] === "true" ? "on" : "off"}
+                    </span>
+                  ) : f.type === "select" ? (
+                    (() => {
+                      // A default that is itself one of the options (controller
+                      // "impedance", arms "both") is that option, marked, not a
+                      // separate blank entry that duplicates it; picking it
+                      // clears the field so the command keeps its default.
+                      const defaultOpt =
+                        !tab.required.includes(f.key) &&
+                        f.placeholder != null &&
+                        (f.options ?? []).includes(f.placeholder)
+                          ? f.placeholder
+                          : null
+                      return (
+                        <select
+                          value={tabValues[f.key] || defaultOpt || ""}
+                          onChange={(e) =>
+                            setValue(f.key, e.target.value === defaultOpt ? "" : e.target.value)
+                          }
+                          disabled={runningOurs || busy}
+                          className={cn(
+                            "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
+                            f.width ?? "w-32"
+                          )}
+                        >
+                          {defaultOpt == null && (
+                            <option value="">
+                              {tab.required.includes(f.key)
+                                ? "select…"
+                                : (f.placeholder ?? "default")}
+                            </option>
+                          )}
+                          {(f.key === "motion"
+                            ? motions.map((m) => ({ value: m.name, label: m.name }))
+                            : f.key === "prefix" && tab.key === "build"
+                              ? recordings.map((r) => ({
+                                  value: r.name,
+                                  label:
+                                    `${r.name} — ` +
+                                    (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
+                                    (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
+                                }))
+                              : (f.options ?? []).map((o) => ({
+                                  value: o,
+                                  label: o === defaultOpt ? `${o} (default)` : o,
+                                }))
+                          ).map((o) => (
+                            <option key={o.value} value={o.value}>
+                              {o.label}
+                            </option>
+                          ))}
+                        </select>
+                      )
+                    })()
+                  ) : f.slider ? (
+                    (() => {
+                      // The slider tracks the typed value (first number of a
+                      // sweep) and starts at the joint's config value; dragging
+                      // it fills the box, an empty box runs with config.
+                      const raw = (tabValues[f.key] ?? "").trim()
+                      const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
+                      const sliderVal = Number.isFinite(first) ? first : (cfg ?? f.slider.min)
+                      return (
+                        <span className="flex h-8 items-center gap-2">
+                          <input
+                            type="range"
+                            min={f.slider.min}
+                            max={f.slider.max}
+                            step={f.slider.step}
+                            value={sliderVal}
+                            onChange={(e) => setValue(f.key, e.target.value)}
+                            disabled={runningOurs || busy || (cfg == null && !raw)}
+                            title={f.hint}
+                            className="w-24 accent-[#eff483] disabled:opacity-40"
+                          />
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            value={tabValues[f.key] ?? ""}
+                            placeholder={baselineText(f, cfg)}
+                            title={f.hint}
+                            onChange={(e) => setValue(f.key, e.target.value)}
+                            disabled={runningOurs || busy}
+                            className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+                          />
+                        </span>
+                      )
+                    })()
+                  ) : (
+                    <input
+                      type="text"
+                      inputMode={f.type === "number" ? "decimal" : undefined}
+                      value={tabValues[f.key] ?? ""}
+                      placeholder={
+                        f.placeholder ??
+                        (f.fwGainKey || f.gainKey ? baselineText(f, cfg) : undefined)
+                      }
+                      title={f.hint}
+                      onChange={(e) => setValue(f.key, e.target.value)}
+                      disabled={runningOurs || busy}
+                      className={cn(
+                        "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                        f.width ?? (f.type === "number" ? "w-24" : "w-28")
+                      )}
+                    />
+                  )}
+                </label>
+              )
+            })}
           <div className="ml-auto">
             {runningThisTab ? (
               <Button variant="destructive" size="sm" onClick={onStop} disabled={busy}>
@@ -2507,7 +3311,7 @@ export function TuningWorkbench({
                 <RunChart
                   key={c.joint}
                   id={`cmp-chart-${c.joint}`}
-                  title={c.joint}
+                  title={c.note ? `${c.joint} · ${c.note}` : c.joint}
                   unit={c.unit ?? "°"}
                   xUnit={c.xUnit}
                   series={c.series}
@@ -2610,7 +3414,7 @@ export function TuningWorkbench({
       {/* Selected run: what it is, arm tabs, per-joint graphs, scores. */}
       {!comparing && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <Badge variant="neutral">{meta.kind}</Badge>
+          <Badge variant="neutral">{runKindLabel(meta)}</Badge>
           <span className="text-white/60">
             {meta.joint ? `${meta.side} ${meta.joint}` : ""}
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
@@ -2658,7 +3462,7 @@ export function TuningWorkbench({
             <RunChart
               key={c.joint}
               id={`joint-chart-${c.joint}`}
-              title={c.joint}
+              title={c.note ? `${c.joint} · ${c.note}` : c.joint}
               unit={c.unit ?? "°"}
               xUnit={c.xUnit}
               series={c.series}
@@ -2714,6 +3518,52 @@ export function TuningWorkbench({
               {legend} Amber cells are worth a look, red cells are failing.
             </p>
           )}
+        </Card>
+      )}
+
+      {/* Wrist IMU shake: what the joint encoders cannot see. */}
+      {!comparing && meta && imuScores(meta) && (
+        <Card className="gap-3 p-4">
+          <h3 className="font-heading text-sm font-semibold">Wrist IMU shake</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full max-w-3xl text-xs">
+              <thead>
+                <tr className="text-left text-white/40">
+                  <th className="py-1 pr-4 font-normal">side</th>
+                  <th className="py-1 pr-4 font-normal">shake p2p (mm)</th>
+                  <th className="py-1 pr-4 font-normal">p90 (mm)</th>
+                  <th className="py-1 pr-4 font-normal">vertical (mm)</th>
+                  <th className="py-1 pr-4 font-normal">1–3 Hz (mm)</th>
+                  <th className="py-1 pr-4 font-normal">3–15 Hz (mm)</th>
+                  <th className="py-1 pr-4 font-normal">accel (m/s²)</th>
+                  <th className="py-1 pr-4 font-normal">gyro (°/s)</th>
+                  <th className="py-1 pr-4 font-normal">peak (Hz)</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono tabular-nums">
+                {Object.entries(imuScores(meta) ?? {}).map(([side, v]) => (
+                  <tr key={side} className="border-t border-white/[0.06]">
+                    <td className="py-1 pr-4 font-sans text-white/55">{side}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.shake_mm)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.shake_mm_p90)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.vertical_mm)}</td>
+                    <td className="py-1 pr-4">{v.low_mm == null ? "–" : fmtNum(v.low_mm)}</td>
+                    <td className="py-1 pr-4">{v.high_mm == null ? "–" : fmtNum(v.high_mm)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.acc_rms, 3)}</td>
+                    <td className="py-1 pr-4">{v.gyro_rms == null ? "–" : fmtNum(v.gyro_rms)}</td>
+                    <td className="py-1 pr-4">{fmtNum(v.peak_hz, 1)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
+            The wrist ZED X One&apos;s IMU during the run: acceleration band-passed to 1–15 Hz
+            (above the motion, below the buzz), integrated to displacement, and scored as the median
+            2 s peak-to-peak excursion at the gripper — overall and along gravity (vertical), the
+            vertical split into 1–3 Hz (the impedance sway) and 3–15 Hz. Unlike the joint scores it
+            sees backlash, link flex and the gripper itself.
+          </p>
         </Card>
       )}
 
@@ -2796,7 +3646,7 @@ export function TuningWorkbench({
                       {cmpIdx === 0 ? "A" : "B"}
                     </span>
                   )}
-                  <Badge variant="neutral">{r.kind}</Badge>
+                  <Badge variant="neutral">{runKindLabel(r)}</Badge>
                   <span className="text-white/70">
                     {[
                       r.side,
@@ -2820,6 +3670,14 @@ export function TuningWorkbench({
                   {head && (
                     <span className="font-mono text-white/60 tabular-nums">
                       {head.label} {head.value}
+                    </span>
+                  )}
+                  {imuHeadline(r) && (
+                    <span
+                      className="font-mono text-white/60 tabular-nums"
+                      title="wrist IMU: 1–15 Hz displacement at the gripper, 2 s peak-to-peak (worst side)"
+                    >
+                      IMU {imuHeadline(r)}
                     </span>
                   )}
                   <span className="ml-auto text-white/35">{fmtWhen(r.startedAt)}</span>

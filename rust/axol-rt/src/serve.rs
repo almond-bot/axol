@@ -152,6 +152,14 @@
 //!   by the Python torque-residual `ContactWatchdog` (limp gravity-comp
 //!   hold, operator resets); a self-disabled motor just stops contributing
 //!   while the rest of the arm keeps working, as in classic mode.
+//! - **The firmware position loop is the one exception: a runaway goes
+//!   limp.** A joint on 0xA4 / 0x73 is stiff by design, so one more than
+//!   `A4_RUNAWAY_DEV_RAD` from the target it was just sent and moving
+//!   *away* faster than `A4_RUNAWAY_VEL_RAD_S`, on `A4_RUNAWAY_SAMPLES`
+//!   replies in a row, is being driven there by its own loop (right
+//!   shoulder_1 drove itself into its end stop, 2026-09-23). The session goes
+//!   limp as for a silent motor, with the runaway joint braked at the MIT
+//!   maximum kd (`A4_RUNAWAY_KD`) instead of coasting on `LIMP_KD`.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
 //!   sample suppresses host damping for that tick; bursty loss (4 of the last
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
@@ -198,7 +206,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::bringup::{self, MotorSpec, Vendor};
+use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor, WireMode};
 use crate::can::CanSock;
 use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
@@ -238,7 +246,37 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 1 (implicit; never declared): arm joints took slots in list order.
 /// - 2: slots come from the motor id (`slot = motor_id - 1`), so a bus may
 ///   carry any subset of the arm.
-const CONFIG_PROTO: u32 = 2;
+/// - 3: each `joint` line carries two more fields, the stiction
+///   compensation gain and its error scale (`filter::stiction`).
+/// - 4: plus the load-proportional stiction gain (`filter::stiction_amplitude`).
+/// - 5: plus the torque dither amplitude and frequency (`filter::dither_step`).
+/// - 6: plus the wire mode token (`mit` | `a4`, `bringup::WireMode`).
+/// - 7: plus the four Stribeck cancellation fields (`filter::stribeck_excess`).
+/// - 8: plus the load-proportional Coulomb friction `fl` (Nm per Nm of gravity).
+/// - 9: plus the Stribeck term's measured-velocity pole (rad/s).
+/// - 10: the wire token gains `pv` (Damiao position-velocity,
+///   `bringup::WireMode::Pv`); `loop_hz` above `THIN_ABOVE_HZ` thins the bus
+///   schedule (`Thinning`).
+/// - 11: impedance joints run at `IMPEDANCE_HZ` only — `loop_hz` 240, or
+///   `MIXED_LOOP_HZ` with them on alternate ticks (`Thinning::mit_lane`) —
+///   and anything else is refused. A proto-10 core given 480 would command
+///   them at 480.
+/// - 12: an optional trailing `cap_track` per joint line (`a4_speed_cap`);
+///   a proto-11 core would ignore it and run a planner joint at a fixed cap.
+/// - 13: a joint with `cap_track > 0` (the 0xA4 planner) rides the half-rate
+///   lane — 240 Hz in a 480 Hz loop, 200 Hz at 400 — where the planner
+///   follows; a proto-12 core would command it every tick, where it does not.
+/// - 14: an optional `lead_ms` after `cap_track` (`a4_target`).
+/// - 15: `impedance_hz` (240 | 480 — the MyActuator impedance joints every
+///   tick of a 480 Hz loop, wrists on the 240 Hz lane), an optional
+///   `tf_nm_per_pct` after `lead_ms` (0x73 torque feedforward), and
+///   `cogging` lines (position-periodic torque cancellation, sent on a
+///   second configure once joint offsets are known). A proto-14 core would
+///   refuse the new lines — or worse, run 480 Hz impedance at 240.
+/// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
+///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
+///   the 240 Hz lane. A proto-15 core would run them all at one rate.
+const CONFIG_PROTO: u32 = 16;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -397,21 +435,40 @@ fn configure_bus_scheduling(
 /// start-to-start period gives up an unobservable amount of wall-clock phase
 /// instead: lateness can lower the average rate briefly, but can never produce
 /// a catch-up command faster than the configured rate.
+/// `(p50, p95, max)` of the per-tick bus-busy fractions since the last stats
+/// line; NaN when no tick had a reply. Sorts in place.
+fn bus_busy_percentiles(busy: &mut [f64]) -> (f64, f64, f64) {
+    if busy.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    busy.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f64| busy[((busy.len() - 1) as f64 * q).round() as usize];
+    (at(0.5), at(0.95), busy[busy.len() - 1])
+}
+
 fn next_bus_deadline(began: Instant, period: Duration) -> Instant {
     began + period
 }
 
-/// Accept at most one reply from each motor commanded in this tick.
+/// Accept at most as many replies from each motor as it was sent commands
+/// this tick (one for MIT, two for an 0xA4 joint: the command reply and the
+/// 0x92 position read).
 ///
 /// CAN frames carry no command sequence number. The bus loop therefore drains
-/// late frames before sending and uses this per-batch set to prevent duplicate
-/// or unsolicited feedback from satisfying another motor's reply budget.
-fn mark_unique_expected_reply(expected: &[bool], seen: &mut [bool], idx: usize) -> bool {
-    if idx >= expected.len() || idx >= seen.len() || !expected[idx] || seen[idx] {
+/// late frames before sending and uses this per-batch budget to prevent
+/// duplicate or unsolicited feedback from satisfying another motor's reply
+/// budget.
+fn mark_unique_expected_reply(expected: &[u8], seen: &mut [u8], idx: usize) -> bool {
+    if idx >= expected.len() || idx >= seen.len() || seen[idx] >= expected[idx] {
         return false;
     }
-    seen[idx] = true;
+    seen[idx] += 1;
     true
+}
+
+/// Every reply the motor was budgeted for this tick arrived.
+fn reply_complete(expected: &[u8], seen: &[u8], idx: usize) -> bool {
+    expected[idx] > 0 && seen[idx] >= expected[idx]
 }
 
 /// Outcome of one feedback opportunity for one arm joint.
@@ -556,6 +613,430 @@ fn go_limp(limp: &AtomicBool, out_tx: &mpsc::Sender<Vec<u8>>, reason: &str) -> b
     true
 }
 
+/// Whether this tick's frame for a joint is the 0xA4 position command.
+///
+/// Only MyActuator joints on `wire_mode a4`, and for them on every tick that
+/// commands a position: tracked ticks *and* passthrough holds (bring-up
+/// hold, a stalled stream, Python's hold-at-measured-pose), which is any
+/// tick with a position gain. The alternative — MIT for the hold, 0xA4 once
+/// tracking starts — is what the classic design did, and it is exactly what
+/// the X6-P20's 2025070202 firmware refuses: after an MIT frame, 0xA4 is
+/// ignored until the motor is reset. The right elbow held its pose through
+/// two whole replays that way (2026-09-21) while the X8-P20 shoulders, whose
+/// 2026042402 firmware switches freely, tracked. Keeping an a4 joint on 0xA4
+/// from its first frame works on both. Limp and gravity comp (`kp == 0`)
+/// stay MIT: those exist to make the joint compliant, which the firmware
+/// position loop cannot be — so on the older firmware a joint that has been
+/// hand-guided needs a re-enable before it will track on a4 again.
+fn a4_wire(vendor: Vendor, wire: WireMode, tracked: bool, kp: f64) -> bool {
+    vendor == Vendor::MyActuator && wire == WireMode::A4 && (tracked || kp > 0.0)
+}
+
+/// Whether this tick's frame for a joint is the Damiao position-velocity
+/// command (0x100 + id): Damiao wrists on `wire_mode pv`, on every tick that
+/// commands a position — the same rule as [`a4_wire`]. Limp and gravity
+/// comp (`kp == 0`) fall back to MIT for compliance; the bus loop switches
+/// the wrist's control-mode register along with the frame, because the
+/// firmware ignores the frame of the mode it is not in.
+fn pv_wire(vendor: Vendor, wire: WireMode, tracked: bool, kp: f64) -> bool {
+    vendor == Vendor::Damiao && wire == WireMode::Pv && (tracked || kp > 0.0)
+}
+
+/// Above this loop rate the bus cannot carry every motor's frames every
+/// tick and the schedule is thinned (`Thinning`). A 1 Mbps bus moves a
+/// frame in ~0.13 ms with the USB adapters in the loop (measured: three a4
+/// joints at 240 Hz ran the bus 66-73% busy, 22 frames in ~2.9 ms). The
+/// full eight-motor tick under the position controller — five 0xA4
+/// commands with echoes, five 0x92 reads, two wrist commands, the gripper —
+/// is 26 frames, 3.4 ms: it fits a 240 Hz tick (4.17 ms), not a 400 Hz one
+/// (2.5 ms, of which `REPLY_GUARD` is reserved).
+const THIN_ABOVE_HZ: f64 = 300.0;
+
+/// The only rate an impedance (MIT) arm joint is commanded at. Its gains,
+/// feedforward and damping filters were tuned and verified at 240 Hz; on a
+/// loop mixing it with firmware-loop joints that run faster, it gets its own
+/// 240 Hz cadence inside the faster loop (`Thinning::mit_lane`), not the
+/// loop's rate — at 400 Hz with the firmware joints beside it, right
+/// shoulder_3 / wrist_1 on impedance shook the arm (2026-09-22).
+const IMPEDANCE_HZ: f64 = 240.0;
+
+/// The loop rate of a bus that mixes impedance arm joints with firmware-loop
+/// ones: twice `IMPEDANCE_HZ`, so every impedance joint lands on alternate
+/// ticks at exactly 240 Hz while the 0xA4 joints get 480 Hz (above the
+/// position controller's 400, so no audible 200 Hz staircase either).
+const MIXED_LOOP_HZ: f64 = 2.0 * IMPEDANCE_HZ;
+
+/// The fast impedance rate (`impedance_hz 480`, `tune.motion
+/// --impedance-hz 480`): the MyActuator impedance joints commanded every
+/// tick of a 480 Hz loop, their host pipeline stepped at 480, while the
+/// Damiao wrists stay on the verified 240 Hz on alternate ticks
+/// (`Thinning::mit_lane`). An experiment: the MyActuator gains, host
+/// damping and feedforward were tuned at 240, and 400 Hz impedance on right
+/// shoulder_3 / wrist_1 shook the arm once (2026-09-22) — it is opt-in and
+/// never the config default.
+const FAST_IMPEDANCE_HZ: f64 = 2.0 * IMPEDANCE_HZ;
+
+/// Whether an arm joint runs impedance at `FAST_IMPEDANCE_HZ` — every tick of
+/// a 480 Hz loop — rather than on the 240 Hz half-rate lane: its own
+/// `impedance_hz` 480, or (with none of its own) the config-wide 480, which
+/// covers the MyActuator joints only (the Damiao wrists stay at 240).
+fn fast_mit(
+    wire: WireMode,
+    gripper: bool,
+    myactuator: bool,
+    mit_hz: f64,
+    impedance_hz: f64,
+) -> bool {
+    let is = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    wire == WireMode::Mit
+        && !gripper
+        && (is(mit_hz, FAST_IMPEDANCE_HZ)
+            || (mit_hz <= 0.0 && myactuator && is(impedance_hz, FAST_IMPEDANCE_HZ)))
+}
+
+/// Refuse a loop rate an impedance arm joint cannot run at.
+///
+/// Every impedance joint runs at 240 Hz or at `FAST_IMPEDANCE_HZ` — per
+/// joint (`impedance_hz` on its joint line: 240, 480, or 0 for the
+/// config-wide `impedance_hz`). With any joint at 480 the loop must be 480
+/// (the rest on alternate ticks); otherwise 240, or `MIXED_LOOP_HZ` with the
+/// impedance joints on alternate ticks. Anything else would command a joint
+/// at a rate it was never meant to run at.
+fn check_impedance_rate(loop_hz: f64, impedance_hz: f64, specs: &[MotorSpec]) -> io::Result<()> {
+    let is = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let rate_ok = |hz: f64| is(hz, IMPEDANCE_HZ) || is(hz, FAST_IMPEDANCE_HZ);
+    if !rate_ok(impedance_hz) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: impedance_hz {impedance_hz} — impedance runs at {IMPEDANCE_HZ} Hz, or \
+                 {FAST_IMPEDANCE_HZ} Hz on the MyActuator joints (wrists staying at {IMPEDANCE_HZ})"
+            ),
+        ));
+    }
+    if let Some(s) = specs.iter().find(|s| s.mit_hz > 0.0 && !rate_ok(s.mit_hz)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: {} impedance_hz {} — {IMPEDANCE_HZ} or {FAST_IMPEDANCE_HZ} only",
+                s.joint, s.mit_hz
+            ),
+        ));
+    }
+    let fast = specs
+        .iter()
+        .find(|s| fast_mit(s.wire, s.gripper, s.motor_id <= 5, s.mit_hz, impedance_hz));
+    let allowed: &[f64] = if fast.is_some() {
+        &[FAST_IMPEDANCE_HZ]
+    } else {
+        &[IMPEDANCE_HZ, MIXED_LOOP_HZ]
+    };
+    if allowed.iter().any(|&hz| is(loop_hz, hz)) {
+        return Ok(());
+    }
+    if let Some(s) = specs.iter().find(|s| !s.gripper && s.wire == WireMode::Mit) {
+        let rule = match fast {
+            Some(f) => format!(
+                "{} runs impedance at {FAST_IMPEDANCE_HZ} Hz, so the loop is {FAST_IMPEDANCE_HZ} Hz only",
+                f.joint
+            ),
+            None => format!(
+                "impedance runs at {IMPEDANCE_HZ} Hz only (loop_hz {IMPEDANCE_HZ}, or \
+                 {MIXED_LOOP_HZ} with it on alternate ticks)"
+            ),
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: loop_hz {loop_hz} with {} on the impedance frame — {rule}",
+                s.joint
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Ticks between read-lane turns (the a4 0x92 reads and the gripper) when
+/// impedance joints run every tick at 480 Hz (at most all five MyActuator
+/// ones). Five MIT
+/// request/reply pairs plus one wrist pair is 12 frames, ~1.6 ms of the
+/// 2.08 ms tick; one more pair on every tick would leave no margin before
+/// `REPLY_GUARD`, so the lane takes a turn on one tick in this many (60 Hz
+/// for the gripper alone). An a4 joint's position is carried on its echo's
+/// speed between reads (`a4_extrapolate`), as on the thinned 400 Hz bus.
+const FAST_MIT_READ_DIV: u64 = 8;
+
+/// The bus schedule when the loop runs faster than the bus (`THIN_ABOVE_HZ`).
+///
+/// Every MyActuator command still goes out every tick — that is the point
+/// of the higher rate (the position loop's target staircase is audible at
+/// 200 Hz and gone at 400). The rest rides in two round-robin lanes of one
+/// request/reply pair per tick each, so a full tick is a fixed 14 frames
+/// (~1.8 ms, ~72% of a 2.5 ms tick):
+///
+/// - the Damiao wrists take turns being commanded (200 Hz each with two
+///   wrists; their own profiler shapes the staircase);
+/// - the 0xA4 joints take turns having their 0.01° position read (0x92)
+///   and the gripper takes a turn in the same lane (about 67 Hz each on
+///   the full arm). Between reads an a4 joint's position is carried
+///   forward from the last read on the speed its command echo reports
+///   every tick (`a4_extrapolate`).
+///
+/// On a bus that mixes impedance (MIT) arm joints with firmware-loop ones
+/// the loop runs at `MIXED_LOOP_HZ` and the impedance joints form their own
+/// lane instead: each is commanded every other tick, at exactly 240 Hz, the
+/// lane split across both phases so each tick carries half of them. Their
+/// whole host pipeline runs on those ticks only (see `bus_loop`), so they
+/// behave as the verified 240 Hz loop, interleaved.
+///
+/// Below the threshold nothing is thinned: every motor is commanded, and
+/// every a4 joint read, every tick.
+struct Thinning {
+    enabled: bool,
+    /// The half-rate lane — impedance (MIT) arm joints and 0xA4 joints on
+    /// the firmware planner — as `(motor index, phase)`: commanded on ticks
+    /// where `tick % mit_div == phase`, their host pipeline stepped at that
+    /// rate (see `bus_loop`).
+    mit_lane: Vec<(usize, u64)>,
+    /// Ticks per impedance command: 2 on a mixed bus, 1 otherwise.
+    mit_div: u64,
+    /// Motor indices of the Damiao wrists not in `mit_lane`, one commanded
+    /// per tick.
+    dm_lane: Vec<usize>,
+    /// Motor indices of the a4 joints and the gripper, one served per turn.
+    read_lane: Vec<usize>,
+    /// Ticks per read-lane turn: 1, or `FAST_MIT_READ_DIV` when the
+    /// MyActuator impedance joints take every tick at 480 Hz.
+    read_div: u64,
+    /// The gripper's motor index, when the bus has one.
+    gripper: Option<usize>,
+}
+
+impl Thinning {
+    fn plan(motors: &[ReadyMotor], loop_hz: f64, impedance_hz: f64) -> Self {
+        let enabled = loop_hz > THIN_ABOVE_HZ;
+        // Fast impedance joints (`fast_mit`) run at the loop's own 480 Hz,
+        // off the half-rate lane; every other impedance joint stays on it.
+        let at_480 = enabled && (loop_hz - FAST_IMPEDANCE_HZ).abs() < 1e-6;
+        let is_fast = |m: &ReadyMotor| {
+            at_480
+                && fast_mit(
+                    m.wire,
+                    m.gripper,
+                    m.vendor == Vendor::MyActuator,
+                    m.mit_hz,
+                    impedance_hz,
+                )
+        };
+        // The half-rate lane: impedance arm joints (the Damiao ones only at
+        // fast impedance), and 0xA4 joints on the firmware planner
+        // (`cap_track > 0`, planner acceleration 60000). The planner plans
+        // to each target and needs ~4 ms between them: on the right elbow a
+        // 50 deg/s sine tracked at 240 / 200 Hz (0.7° RMS, 13 ms) and fell
+        // 20° behind at 480 Hz (2026-09-22).
+        let mit: Vec<usize> = motors
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                !m.gripper && ((m.wire == WireMode::Mit && !is_fast(m)) || is_planner(m))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // `check_impedance_rate` has held a bus with impedance joints to 240
+        // or 480 Hz, so above the threshold this is 2 (and 2 at 400 Hz, the
+        // position controller, for planner joints: 200 Hz).
+        let mit_div = if enabled && !mit.is_empty() {
+            (loop_hz / IMPEDANCE_HZ).round().max(1.0) as u64
+        } else {
+            1
+        };
+        let mit_lane: Vec<(usize, u64)> = if mit_div > 1 {
+            mit.iter()
+                .enumerate()
+                .map(|(k, &idx)| (idx, k as u64 % mit_div))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let dm_lane = motors
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.vendor == Vendor::Damiao && !m.gripper && !mit_lane.iter().any(|(j, _)| j == i)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // Half-rate planner joints read their fine position on every one of
+        // their own commands (`a4_read`), so the round-robin read lane keeps
+        // only the every-tick a4 joints and the gripper.
+        let read_lane = motors
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.gripper
+                    || (m.vendor == Vendor::MyActuator
+                        && m.wire == WireMode::A4
+                        && !mit_lane.iter().any(|(j, _)| j == i))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let gripper = motors.iter().position(|m| m.gripper);
+        let read_div = if motors.iter().any(is_fast) {
+            FAST_MIT_READ_DIV
+        } else {
+            1
+        };
+        Self {
+            enabled,
+            mit_lane,
+            mit_div,
+            dm_lane,
+            read_lane,
+            read_div,
+            gripper,
+        }
+    }
+
+    /// The read-lane entry served on `tick`: the lane takes a turn on one
+    /// tick in `read_div`.
+    fn read_turn(&self, tick: u64) -> Option<usize> {
+        if !tick.is_multiple_of(self.read_div) {
+            return None;
+        }
+        Self::turn(&self.read_lane, tick / self.read_div)
+    }
+
+    /// The phase of a half-rate-lane joint (impedance, or 0xA4 on the
+    /// planner) on its own cadence, or `None` for a motor commanded at the
+    /// loop's rate (or its round-robin lane).
+    fn mit_phase(&self, idx: usize) -> Option<u64> {
+        self.mit_lane
+            .iter()
+            .find(|(j, _)| *j == idx)
+            .map(|(_, phase)| *phase)
+    }
+
+    fn turn(lane: &[usize], tick: u64) -> Option<usize> {
+        if lane.is_empty() {
+            None
+        } else {
+            Some(lane[(tick % lane.len() as u64) as usize])
+        }
+    }
+
+    /// Whether motor `idx` is commanded on `tick`.
+    fn commanded(&self, idx: usize, tick: u64) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if let Some(phase) = self.mit_phase(idx) {
+            return tick % self.mit_div == phase;
+        }
+        if self.dm_lane.contains(&idx) {
+            return Self::turn(&self.dm_lane, tick) == Some(idx);
+        }
+        if self.gripper == Some(idx) {
+            return self.read_turn(tick) == Some(idx);
+        }
+        true
+    }
+
+    /// Whether an a4 joint's command on `tick` is followed by its 0x92 read.
+    /// A half-rate (planner) joint reads on each of its own commands.
+    fn a4_read(&self, idx: usize, tick: u64) -> bool {
+        !self.enabled || self.mit_phase(idx).is_some() || self.read_turn(tick) == Some(idx)
+    }
+}
+
+/// An a4 joint's position between 0x92 reads: the last read (or the
+/// previous carry) advanced along the speed its 0xA4 echo reports this
+/// tick. The echo's speed is 1 dps resolution, so over a 15 ms read
+/// interval the carry is within ~0.01° of the next read — the read's own
+/// resolution — and a joint at rest (speed 0) never drifts.
+fn a4_extrapolate(anchor: (f64, Instant), speed: f64, now: Instant) -> f64 {
+    anchor.0 + speed * now.saturating_duration_since(anchor.1).as_secs_f64()
+}
+
+/// An 0xA4 joint on the firmware planner: speed-cap tracking is what the
+/// planner route sets (`FirmwareGains.cap_track` alongside planner
+/// acceleration 60000), and such a joint rides the half-rate lane.
+fn is_planner(m: &ReadyMotor) -> bool {
+    m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 && m.cap_track > 0.0
+}
+
+/// The 0xA4 target for one tick: the tracker position led `lead_s` along
+/// its velocity. On the firmware planner a target reached within the step
+/// stops the joint for the rest of it — a speed ripple at the step rate,
+/// which put ~half the right elbow's speed error at 60-120 Hz on the 240 Hz
+/// lane (2026-09-22); a target a few ms ahead keeps it cruising. 0 = none.
+fn a4_target(p_cmd: f64, v_trk: f64, lead_s: f64) -> f64 {
+    p_cmd + v_trk * lead_s
+}
+
+/// Lowest 0xA4 speed cap a tracking cap sets (dps), so a stationary target
+/// still corrects (`tune.a4 --cap-floor`'s default).
+const A4_CAP_FLOOR_DPS: f64 = 1.0;
+
+/// The 0xA4 frame's speed cap (dps) for one tick.
+///
+/// Direct PI tracking (`cap_track <= 0`, planner acceleration 0): the fixed
+/// tracker limit — there the cap is a hard limit on the PI output, and one
+/// pinned near the commanded speed never lets the loop catch up (right
+/// elbow, 2026-09-21: 1.8° RMS, 480 ms lag). With the firmware planner on
+/// (60000), a fixed cap makes it finish each step at that speed and idle the
+/// rest of the tick — 4x the current spread on the elbow — so the cap tracks
+/// `cap_track` times the commanded speed instead (`tune.a4 --cap-track`,
+/// 1.1-1.2 moved the joint continuously), never below `A4_CAP_FLOOR_DPS`
+/// nor above the tracker limit.
+fn a4_speed_cap(cap_track: f64, v_cmd: f64, max_vel: f64) -> f64 {
+    let fixed = max_vel.to_degrees();
+    if cap_track <= 0.0 {
+        return fixed;
+    }
+    (cap_track * v_cmd.abs().to_degrees()).clamp(A4_CAP_FLOOR_DPS.min(fixed), fixed)
+}
+
+/// Runaway guard on the firmware position loop (0xA4 / 0x73): position
+/// error past which a joint moving *away* from its target is running away.
+/// Normal lag is ~1° at the approach speed; right shoulder_1 on a4 with the
+/// planner at 0 in ROM drove itself to its end stop (2026-09-23).
+const A4_RUNAWAY_DEV_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
+/// ...at more than this speed away from the target (30°/s).
+const A4_RUNAWAY_VEL_RAD_S: f64 = 30.0 * std::f64::consts::PI / 180.0;
+/// ...on this many consecutive samples (~6 ms at 480 Hz), so one noisy
+/// reply cannot trip it.
+const A4_RUNAWAY_SAMPLES: u32 = 3;
+/// Firmware damping (Nm·s/rad, the MIT maximum) on the joint that ran away,
+/// once the session is limp: a limp joint's `LIMP_KD` would let a heavy
+/// shoulder coast on into its stop; this brakes it and still hand-guides.
+const A4_RUNAWAY_KD: f64 = 5.0;
+
+/// Per-joint runaway detector for the firmware position loop. Unlike the
+/// deliberately absent deviation abort on impedance joints (see Safety), a
+/// firmware-loop joint is stiff by design: moving fast *away* from its own
+/// target means the loop is driving it there — a hand pushing it would be
+/// fought, not followed — so the core takes it (and the session) limp.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunawayGuard {
+    strikes: u32,
+}
+
+impl RunawayGuard {
+    /// Feed one sample of an a4 joint; true once it has run away.
+    fn check(&mut self, meas_p: f64, meas_v: f64, target: f64) -> bool {
+        let err = meas_p - target;
+        let away = err.abs() > A4_RUNAWAY_DEV_RAD
+            && meas_v.abs() > A4_RUNAWAY_VEL_RAD_S
+            && meas_v.signum() == err.signum();
+        self.strikes = if away { self.strikes + 1 } else { 0 };
+        self.strikes >= A4_RUNAWAY_SAMPLES
+    }
+
+    fn reset(&mut self) {
+        self.strikes = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
     pub p_des: f64,
@@ -619,12 +1100,18 @@ struct TraceRow {
     friction_ff: f64,
     inertia_ff: f64,
     damping_ff: f64,
+    stiction_ff: f64,
+    dither_ff: f64,
+    stribeck_ff: f64,
     total_ff: f64,
     kd_host: f64,
     damp_w0: f64,
     damp_q: f64,
     tick_dt: f64,
     fb_dt: f64,
+    cogging_ff: f64,
+    /// The 0x73 feedforward sent, % of rated current (0 on other frames).
+    tf_pct: f64,
 }
 
 type TraceHandle = JoinHandle<io::Result<()>>;
@@ -640,7 +1127,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct"
     )?;
     Ok(out)
 }
@@ -648,7 +1135,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6}",
         r.tick,
         r.time_s,
         r.seq,
@@ -668,12 +1155,17 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.friction_ff,
         r.inertia_ff,
         r.damping_ff,
+        r.stiction_ff,
+        r.dither_ff,
+        r.stribeck_ff,
         r.total_ff,
         r.kd_host,
         r.damp_w0,
         r.damp_q,
         r.tick_dt,
         r.fb_dt,
+        r.cogging_ff,
+        r.tf_pct,
     )
 }
 
@@ -812,6 +1304,10 @@ fn start_trace_writer(
 
 struct Config {
     loop_hz: f64,
+    /// The MyActuator impedance joints' command rate: `IMPEDANCE_HZ` (the
+    /// verified 240) or `FAST_IMPEDANCE_HZ` (480, the Damiao wrists staying
+    /// on a 240 Hz lane) — see `check_impedance_rate`.
+    impedance_hz: f64,
     watchdog_ms: f64,
     max_step_rad: f64,
     /// (side, iface, specs) — side 0 = left, 1 = right.
@@ -820,6 +1316,7 @@ struct Config {
 
 fn parse_config(text: &str) -> io::Result<Config> {
     let mut loop_hz = 240.0;
+    let mut impedance_hz = IMPEDANCE_HZ;
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
@@ -862,6 +1359,56 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
             }
+            "impedance_hz" => {
+                impedance_hz = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?
+            }
+            "cogging" => {
+                // cogging <side> <iface> <motor_id> <n> (<w> <a> <b>) × n —
+                // after that joint's own line; motor frame, gain applied.
+                let side: u8 = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                let iface = f.get(2).ok_or_else(|| bad(line))?;
+                let motor_id: u8 = f
+                    .get(3)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                let n: usize = f
+                    .get(4)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                if f.len() != 5 + 3 * n {
+                    return Err(bad(line));
+                }
+                let num = |i: usize| -> io::Result<f64> {
+                    f.get(i)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| bad(line))
+                };
+                let mut terms = Vec::with_capacity(n);
+                for k in 0..n {
+                    terms.push(filter::CogTerm {
+                        w: num(5 + 3 * k)?,
+                        a: num(6 + 3 * k)?,
+                        b: num(7 + 3 * k)?,
+                    });
+                }
+                let spec = buses
+                    .iter_mut()
+                    .find(|(s, i, _)| *s == side && i == iface)
+                    .and_then(|(_, _, specs)| {
+                        specs
+                            .iter_mut()
+                            .find(|s| !s.gripper && s.motor_id == motor_id)
+                    })
+                    .ok_or_else(|| bad(line))?;
+                spec.cogging = terms;
+            }
             "watchdog_ms" => {
                 watchdog_ms = f
                     .get(1)
@@ -877,6 +1424,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
                 //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
+                //       <stiction_gain> <stiction_err> <stiction_load_gain>
+                //       <dither_nm> <dither_hz> <wire mit|a4|pv>
+                //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
+                //       <fl> <stribeck_pole> [<cap_track> [<lead_ms>
+                //       [<tf_nm_per_pct> [<impedance_hz>]]]]
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -913,6 +1465,23 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: 0.0,
                         fv: 0.0,
                         fo: 0.0,
+                        stiction_gain: 0.0,
+                        stiction_err: 0.0,
+                        stiction_load_gain: 0.0,
+                        dither_nm: 0.0,
+                        dither_hz: 0.0,
+                        wire: WireMode::Mit,
+                        stribeck_gain: 0.0,
+                        stribeck_dfs: 0.0,
+                        stribeck_load_gain: 0.0,
+                        stribeck_vs: 0.0,
+                        fl: 0.0,
+                        stribeck_pole: 0.0,
+                        cap_track: 0.0,
+                        lead_s: 0.0,
+                        tf_nm_per_pct: 0.0,
+                        mit_hz: 0.0,
+                        cogging: Vec::new(),
                     }
                 } else {
                     let motor_id: u8 = f
@@ -940,6 +1509,42 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         k: num(10)?,
                         fv: num(11)?,
                         fo: num(12)?,
+                        stiction_gain: num(13)?,
+                        stiction_err: num(14)?,
+                        stiction_load_gain: num(15)?,
+                        dither_nm: num(16)?,
+                        dither_hz: num(17)?,
+                        wire: f
+                            .get(18)
+                            .and_then(|t| WireMode::parse(t))
+                            .ok_or_else(|| bad(line))?,
+                        stribeck_gain: num(19)?,
+                        stribeck_dfs: num(20)?,
+                        stribeck_load_gain: num(21)?,
+                        stribeck_vs: num(22)?,
+                        fl: num(23)?,
+                        stribeck_pole: num(24)?,
+                        // Optional: absent = fixed 0xA4 cap (direct tracking).
+                        cap_track: match f.get(25) {
+                            Some(_) => num(25)?,
+                            None => 0.0,
+                        },
+                        // Optional: the 0xA4 target lead, ms on the wire.
+                        lead_s: match f.get(26) {
+                            Some(_) => num(26)? / 1e3,
+                            None => 0.0,
+                        },
+                        // Optional: the 0x73 feedforward scale (0 = 0xA4).
+                        tf_nm_per_pct: match f.get(27) {
+                            Some(_) => num(27)?,
+                            None => 0.0,
+                        },
+                        // Optional: this joint's impedance rate (0 = config's).
+                        mit_hz: match f.get(28) {
+                            Some(_) => num(28)?,
+                            None => 0.0,
+                        },
+                        cogging: Vec::new(),
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -969,8 +1574,12 @@ fn parse_config(text: &str) -> io::Result<Config> {
             "config: no joints",
         ));
     }
+    for (_, _, specs) in &buses {
+        check_impedance_rate(loop_hz, impedance_hz, specs)?;
+    }
     Ok(Config {
         loop_hz,
+        impedance_hz,
         watchdog_ms,
         max_step_rad,
         buses,
@@ -1085,13 +1694,21 @@ mod tests {
 
     #[test]
     fn replies_must_be_expected_and_unique() {
-        let expected = [true, true, false];
-        let mut seen = [false; 3];
+        let expected = [1u8, 2, 0];
+        let mut seen = [0u8; 3];
         assert!(mark_unique_expected_reply(&expected, &mut seen, 0));
         assert!(!mark_unique_expected_reply(&expected, &mut seen, 0));
         assert!(!mark_unique_expected_reply(&expected, &mut seen, 2));
+        // An 0xA4 joint is budgeted two replies (command echo + 0x92 read)
+        // and is only complete once both are in.
         assert!(mark_unique_expected_reply(&expected, &mut seen, 1));
-        assert_eq!(seen, [true, true, false]);
+        assert!(!reply_complete(&expected, &seen, 1));
+        assert!(mark_unique_expected_reply(&expected, &mut seen, 1));
+        assert!(reply_complete(&expected, &seen, 1));
+        assert!(!mark_unique_expected_reply(&expected, &mut seen, 1));
+        assert!(reply_complete(&expected, &seen, 0));
+        assert!(!reply_complete(&expected, &seen, 2));
+        assert_eq!(seen, [1, 2, 0]);
     }
 
     #[test]
@@ -1173,6 +1790,420 @@ mod tests {
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Steady);
         assert_eq!(consecutive.record(LATE, PERIOD), TimingVerdict::Degraded);
+    }
+
+    #[test]
+    fn bus_busy_percentiles_report_median_tail_and_peak() {
+        let mut busy = vec![0.5, 0.7, 0.6, 0.9, 0.55, 0.65, 0.6, 0.62, 0.58, 0.61, 0.95];
+        let (p50, p95, max) = bus_busy_percentiles(&mut busy);
+        assert_eq!(p50, 0.61);
+        assert_eq!(p95, 0.95);
+        assert_eq!(max, 0.95);
+        let (a, b, c) = bus_busy_percentiles(&mut []);
+        assert!(a.is_nan() && b.is_nan() && c.is_nan());
+    }
+
+    #[test]
+    fn a4_joints_stay_on_the_position_frame_through_holds_but_not_limp() {
+        use crate::bringup::{Vendor, WireMode};
+        // Tracked and holding (kp > 0) both take 0xA4 on an a4 MyActuator …
+        assert!(a4_wire(Vendor::MyActuator, WireMode::A4, true, 250.0));
+        assert!(a4_wire(Vendor::MyActuator, WireMode::A4, false, 250.0));
+        // … limp / gravity comp (kp = 0) fall back to MIT for compliance …
+        assert!(!a4_wire(Vendor::MyActuator, WireMode::A4, false, 0.0));
+        // … and nothing else ever does, whatever the tick.
+        assert!(!a4_wire(Vendor::MyActuator, WireMode::Mit, true, 250.0));
+        assert!(!a4_wire(Vendor::Damiao, WireMode::A4, true, 250.0));
+    }
+
+    #[test]
+    fn runaway_guard_trips_on_sustained_fast_motion_away_from_the_target() {
+        let d = |deg: f64| deg.to_radians();
+        let mut g = RunawayGuard::default();
+        // Shoulder_1 on a4, 2026-09-23: 8° past its target and accelerating
+        // away — trips on the third consecutive sample, not before.
+        assert!(!g.check(d(8.0), d(60.0), 0.0));
+        assert!(!g.check(d(8.5), d(80.0), 0.0));
+        assert!(g.check(d(9.0), d(100.0), 0.0));
+        // Same in the negative direction.
+        let mut g = RunawayGuard::default();
+        for _ in 0..A4_RUNAWAY_SAMPLES - 1 {
+            assert!(!g.check(d(-6.0), d(-40.0), 0.0));
+        }
+        assert!(g.check(d(-6.0), d(-40.0), 0.0));
+    }
+
+    #[test]
+    fn runaway_guard_ignores_lag_slow_drift_and_single_samples() {
+        let d = |deg: f64| deg.to_radians();
+        let mut g = RunawayGuard::default();
+        for _ in 0..10 {
+            // Lagging a fast move: far behind but moving *toward* the target.
+            assert!(!g.check(d(-10.0), d(90.0), 0.0));
+            // Past the target but slow (a settling overshoot, a hand's push).
+            assert!(!g.check(d(7.0), d(10.0), 0.0));
+            // Fast away but inside the normal-lag band.
+            assert!(!g.check(d(2.0), d(90.0), 0.0));
+        }
+        // An isolated bad reply between good ones never accumulates.
+        for _ in 0..10 {
+            assert!(!g.check(d(8.0), d(90.0), 0.0));
+            assert!(!g.check(d(0.5), d(5.0), 0.0));
+        }
+        // reset() (a tick off the position frame) clears the count.
+        g.check(d(8.0), d(90.0), 0.0);
+        g.check(d(8.0), d(90.0), 0.0);
+        g.reset();
+        assert!(!g.check(d(8.0), d(90.0), 0.0));
+    }
+
+    #[test]
+    fn pv_joints_follow_the_same_hold_rule_on_damiao_only() {
+        use crate::bringup::{Vendor, WireMode};
+        assert!(pv_wire(Vendor::Damiao, WireMode::Pv, true, 130.0));
+        assert!(pv_wire(Vendor::Damiao, WireMode::Pv, false, 130.0));
+        assert!(!pv_wire(Vendor::Damiao, WireMode::Pv, false, 0.0));
+        assert!(!pv_wire(Vendor::Damiao, WireMode::Mit, true, 130.0));
+        assert!(!pv_wire(Vendor::MyActuator, WireMode::Pv, true, 130.0));
+        assert_eq!(WireMode::Pv.dm_mode(), proto::DM_MODE_POS_VEL);
+        assert_eq!(WireMode::Mit.dm_mode(), proto::DM_MODE_MIT);
+    }
+
+    fn ready(id: u8, vendor: Vendor, wire: WireMode) -> ReadyMotor {
+        ReadyMotor {
+            id,
+            joint: format!("m{id}"),
+            vendor,
+            ranges: proto::MitRanges {
+                p_max: 12.5,
+                v_max: 30.0,
+                kp_max: 500.0,
+                kd_max: 5.0,
+                t_max: 10.0,
+            },
+            hold_pos: 0.0,
+            holding: false,
+            kp: 100.0,
+            kd: 1.0,
+            gripper: id == 8,
+            slot: id as usize - 1,
+            max_vel: 9.4,
+            max_accel: 33.0,
+            fc: 0.0,
+            k: 0.0,
+            fv: 0.0,
+            fo: 0.0,
+            stiction_gain: 0.0,
+            stiction_err: 0.0,
+            stiction_load_gain: 0.0,
+            dither_nm: 0.0,
+            dither_hz: 0.0,
+            wire,
+            stribeck_gain: 0.0,
+            stribeck_dfs: 0.0,
+            stribeck_load_gain: 0.0,
+            stribeck_vs: 0.0,
+            fl: 0.0,
+            cap_track: 0.0,
+            lead_s: 0.0,
+            fw_version: None,
+            tf_nm_per_pct: 0.0,
+            mit_hz: 0.0,
+            cogging: Vec::new(),
+        }
+    }
+
+    fn full_arm_position_controller() -> Vec<ReadyMotor> {
+        let mut v: Vec<ReadyMotor> = (1..=5)
+            .map(|id| ready(id, Vendor::MyActuator, WireMode::A4))
+            .collect();
+        v.push(ready(6, Vendor::Damiao, WireMode::Pv));
+        v.push(ready(7, Vendor::Damiao, WireMode::Pv));
+        v.push(ready(8, Vendor::Damiao, WireMode::Mit));
+        v
+    }
+
+    #[test]
+    fn thinning_is_off_at_240_hz() {
+        let motors = full_arm_position_controller();
+        let sched = Thinning::plan(&motors, 240.0, IMPEDANCE_HZ);
+        assert!(!sched.enabled);
+        for tick in 0..20 {
+            for idx in 0..motors.len() {
+                assert!(sched.commanded(idx, tick));
+                assert!(sched.a4_read(idx, tick));
+            }
+        }
+    }
+
+    #[test]
+    fn thinning_at_400_hz_is_a_fixed_fourteen_frame_tick() {
+        let motors = full_arm_position_controller();
+        let sched = Thinning::plan(&motors, 400.0, IMPEDANCE_HZ);
+        assert!(sched.enabled);
+        let mut wrist_turns = [0u32; 2];
+        let mut gripper_turns = 0u32;
+        let mut reads = [0u32; 5];
+        for tick in 0..60u64 {
+            // Frames this tick: 2 per MyActuator command (echo), 2 per 0x92
+            // read, 2 per Damiao command.
+            let mut frames = 0;
+            for idx in 0..motors.len() {
+                if !sched.commanded(idx, tick) {
+                    continue;
+                }
+                frames += 2;
+                match idx {
+                    0..=4 => {
+                        if sched.a4_read(idx, tick) {
+                            frames += 2;
+                            reads[idx] += 1;
+                        }
+                    }
+                    5 | 6 => wrist_turns[idx - 5] += 1,
+                    _ => gripper_turns += 1,
+                }
+            }
+            assert_eq!(frames, 14, "tick {tick}");
+            // MyActuator joints are never thinned.
+            for idx in 0..5 {
+                assert!(sched.commanded(idx, tick));
+            }
+        }
+        // Two wrists alternate: 200 Hz each. Five reads and the gripper share
+        // the other lane: 400/6 Hz each.
+        assert_eq!(wrist_turns, [30, 30]);
+        assert_eq!(gripper_turns, 10);
+        assert_eq!(reads, [10; 5]);
+    }
+
+    #[test]
+    fn thinning_only_reads_a4_joints_and_puts_mit_joints_on_their_own_lane() {
+        let motors = vec![
+            ready(1, Vendor::MyActuator, WireMode::Mit),
+            ready(2, Vendor::MyActuator, WireMode::A4),
+            ready(6, Vendor::Damiao, WireMode::Pv),
+        ];
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert_eq!(sched.read_lane, vec![1]);
+        assert_eq!(sched.dm_lane, vec![2]);
+        assert_eq!(sched.mit_lane, vec![(0, 0)]);
+        for tick in 0..8 {
+            // The impedance joint alternates (240 Hz); the a4 joint and the
+            // only pv wrist go every tick, and the a4 joint is read every tick.
+            assert_eq!(sched.commanded(0, tick), tick % 2 == 0);
+            assert!(sched.commanded(1, tick));
+            assert!(sched.commanded(2, tick));
+            assert!(sched.a4_read(1, tick));
+        }
+    }
+
+    /// shoulder_1 + elbow on 0xA4, the rest on impedance: the split that
+    /// shook the arm when it all ran at 400 Hz.
+    fn mixed_arm() -> Vec<ReadyMotor> {
+        vec![
+            ready(1, Vendor::MyActuator, WireMode::A4),
+            ready(2, Vendor::MyActuator, WireMode::Mit),
+            ready(3, Vendor::MyActuator, WireMode::Mit),
+            ready(4, Vendor::MyActuator, WireMode::A4),
+            ready(5, Vendor::MyActuator, WireMode::Mit),
+            ready(6, Vendor::Damiao, WireMode::Mit),
+            ready(7, Vendor::Damiao, WireMode::Mit),
+            ready(8, Vendor::Damiao, WireMode::Mit),
+        ]
+    }
+
+    #[test]
+    fn a_mixed_bus_commands_every_impedance_joint_at_exactly_240_hz() {
+        let motors = mixed_arm();
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert!(sched.enabled);
+        assert_eq!(sched.mit_div, 2);
+        // The wrists are impedance joints here, so they ride the impedance
+        // lane rather than taking turns with each other.
+        assert!(sched.dm_lane.is_empty());
+        let mit: Vec<usize> = sched.mit_lane.iter().map(|(i, _)| *i).collect();
+        assert_eq!(mit, vec![1, 2, 4, 5, 6]);
+        let mut last: [Option<u64>; 8] = [None; 8];
+        let mut worst_frames = 0;
+        for tick in 0..240u64 {
+            let mut frames = 0;
+            let mut mit_this_tick = 0;
+            for idx in 0..motors.len() {
+                if !sched.commanded(idx, tick) {
+                    continue;
+                }
+                frames += 2;
+                if let Some(prev) = last[idx] {
+                    if sched.mit_phase(idx).is_some() {
+                        // Evenly spaced: exactly every other tick, never 1 or 3.
+                        assert_eq!(tick - prev, 2, "motor {idx}");
+                    }
+                }
+                last[idx] = Some(tick);
+                if sched.mit_phase(idx).is_some() {
+                    mit_this_tick += 1;
+                }
+                if motors[idx].wire == WireMode::A4 {
+                    assert_eq!(tick - last[idx].unwrap(), 0);
+                    if sched.a4_read(idx, tick) {
+                        frames += 2;
+                    }
+                }
+            }
+            // Five impedance joints split 3 / 2 across the two phases.
+            assert!(mit_this_tick == 2 || mit_this_tick == 3);
+            // The 0xA4 joints go every tick.
+            assert!(sched.commanded(0, tick) && sched.commanded(3, tick));
+            worst_frames = worst_frames.max(frames);
+        }
+        // Fits the 480 Hz tick: 2.08 ms less the reply guard at ~0.13 ms a
+        // frame is ~14 frames.
+        assert!(worst_frames <= 14, "{worst_frames} frames");
+    }
+
+    #[test]
+    fn planner_joints_ride_the_half_rate_lane_and_read_every_own_command() {
+        // shoulder_1 on direct tracking, the elbow on the planner, the rest
+        // on impedance: the elbow alternates with the impedance joints.
+        let mut motors = mixed_arm();
+        motors[3].cap_track = 1.2; // elbow
+        let sched = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert!(sched.mit_phase(3).is_some());
+        assert!(sched.mit_phase(0).is_none()); // shoulder_1: every tick
+        assert_eq!(sched.read_lane, vec![0, 7]); // shoulder_1 + gripper only
+        let mut worst = 0;
+        let mut last = None;
+        for tick in 0..96u64 {
+            assert!(sched.commanded(0, tick));
+            let mut frames = 0;
+            for idx in 0..motors.len() {
+                if !sched.commanded(idx, tick) {
+                    continue;
+                }
+                frames += 2;
+                if motors[idx].wire == WireMode::A4 && sched.a4_read(idx, tick) {
+                    frames += 2;
+                }
+            }
+            if sched.commanded(3, tick) {
+                // Every elbow command carries its fine-position read.
+                assert!(sched.a4_read(3, tick));
+                if let Some(prev) = last {
+                    assert_eq!(tick - prev, 2); // 240 Hz, evenly spaced
+                }
+                last = Some(tick);
+            }
+            worst = worst.max(frames);
+        }
+        assert!(worst <= 14, "{worst} frames");
+        // Direct-tracking a4 joints stay out of the lane, as before.
+        assert!(Thinning::plan(&mixed_arm(), MIXED_LOOP_HZ, IMPEDANCE_HZ)
+            .mit_phase(3)
+            .is_none());
+    }
+
+    #[test]
+    fn the_position_controller_has_no_impedance_lane() {
+        let sched = Thinning::plan(&full_arm_position_controller(), 400.0, IMPEDANCE_HZ);
+        assert!(sched.mit_lane.is_empty());
+        assert_eq!(sched.mit_div, 1);
+        // An all-impedance arm at 240 Hz is not thinned at all.
+        let all_mit: Vec<ReadyMotor> = (1..=7)
+            .map(|id| {
+                ready(
+                    id,
+                    if id <= 5 {
+                        Vendor::MyActuator
+                    } else {
+                        Vendor::Damiao
+                    },
+                    WireMode::Mit,
+                )
+            })
+            .collect();
+        let sched = Thinning::plan(&all_mit, IMPEDANCE_HZ, IMPEDANCE_HZ);
+        assert!(!sched.enabled && sched.mit_lane.is_empty());
+        assert!((0..7).all(|i| sched.commanded(i, 1)));
+    }
+
+    #[test]
+    fn impedance_joints_run_at_240_hz_only() {
+        let spec = |wire: &str, gripper: bool| {
+            let text = if gripper {
+                "proto 16\ngripper 0 canL 8\n".to_string()
+            } else {
+                format!(
+                    "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                )
+            };
+            text
+        };
+        for hz in [240.0, 480.0] {
+            assert!(parse_config(&format!("loop_hz {hz}\n{}", spec("mit", false))).is_ok());
+        }
+        for hz in [200.0, 300.0, 400.0, 960.0] {
+            let err = parse_config(&format!("loop_hz {hz}\n{}", spec("mit", false)))
+                .err()
+                .expect("refused")
+                .to_string();
+            assert!(err.contains("240 Hz only"), "{err}");
+        }
+        // Firmware-loop joints, and the always-MIT gripper, are not held to it.
+        assert!(parse_config(&format!("loop_hz 400\n{}", spec("a4", false))).is_ok());
+        assert!(parse_config(&format!("loop_hz 400\n{}", spec("", true))).is_ok());
+    }
+
+    #[test]
+    fn a4_cap_tracks_commanded_speed_only_with_the_planner_on() {
+        let max_vel = 9.4; // rad/s: the tracker limit, ~539 dps
+                           // Direct tracking: always the fixed limit, whatever the speed.
+        assert_eq!(a4_speed_cap(0.0, 0.1, max_vel), max_vel.to_degrees());
+        // Planner: 1.2x the commanded speed, sign-independent ...
+        let v = 3f64.to_radians();
+        assert!((a4_speed_cap(1.2, v, max_vel) - 3.6).abs() < 1e-9);
+        assert!((a4_speed_cap(1.2, -v, max_vel) - 3.6).abs() < 1e-9);
+        // ... never below the floor (a hold still corrects) ...
+        assert_eq!(a4_speed_cap(1.2, 0.0, max_vel), A4_CAP_FLOOR_DPS);
+        // ... nor above the tracker limit.
+        assert_eq!(a4_speed_cap(1.2, 100.0, max_vel), max_vel.to_degrees());
+    }
+
+    #[test]
+    fn a4_target_leads_along_the_tracker_velocity() {
+        assert_eq!(a4_target(1.0, 2.0, 0.0), 1.0);
+        assert!((a4_target(1.0, 2.0, 0.005) - 1.01).abs() < 1e-12);
+        assert!((a4_target(1.0, -2.0, 0.005) - 0.99).abs() < 1e-12);
+        let line = "joint 0 canL elbow 4 130 5.0 9.4 33.0 0 0 0 0 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
+        let cfg = parse_config(&format!(
+            "proto {CONFIG_PROTO}\nloop_hz 400\n{line} 1.05 5\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.buses[0].2[0].lead_s, 0.005);
+        let cfg =
+            parse_config(&format!("proto {CONFIG_PROTO}\nloop_hz 400\n{line} 1.05\n")).unwrap();
+        assert_eq!(cfg.buses[0].2[0].lead_s, 0.0);
+    }
+
+    #[test]
+    fn a4_cap_track_is_an_optional_trailing_joint_field() {
+        let line = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
+        let cfg =
+            parse_config(&format!("proto {CONFIG_PROTO}\nloop_hz 400\n{line} 1.2\n")).unwrap();
+        assert_eq!(cfg.buses[0].2[0].cap_track, 1.2);
+        let cfg = parse_config(&format!("proto {CONFIG_PROTO}\nloop_hz 400\n{line}\n")).unwrap();
+        assert_eq!(cfg.buses[0].2[0].cap_track, 0.0);
+    }
+
+    #[test]
+    fn a4_carry_follows_the_echo_speed_and_holds_at_rest() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(10);
+        let p = a4_extrapolate((1.0, t0), 0.5, t1);
+        assert!((p - 1.005).abs() < 1e-9);
+        assert_eq!(a4_extrapolate((1.0, t0), 0.0, t1), 1.0);
+        // A clock that has not advanced (or ran backwards) adds nothing.
+        assert_eq!(a4_extrapolate((1.0, t1), 3.0, t0), 1.0);
     }
 
     #[test]
@@ -1340,12 +2371,12 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 2\n\
+            "proto 16\n\
              loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
-             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
+             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0 0.6 0.0017 0.2 1.5 60 a4 0.7 0.3 0.1 0.1 0.08 40\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -1360,9 +2391,73 @@ mod tests {
             (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
             (0.6, 250.0, 0.15, 0.02)
         );
+        assert_eq!((specs[0].stiction_gain, specs[0].stiction_err), (0.0, 0.0));
+        assert_eq!(
+            (specs[3].stiction_gain, specs[3].stiction_err),
+            (0.6, 0.0017)
+        );
+        assert_eq!(
+            (specs[0].stiction_load_gain, specs[3].stiction_load_gain),
+            (0.0, 0.2)
+        );
+        assert_eq!((specs[0].dither_nm, specs[0].dither_hz), (0.0, 60.0));
+        assert_eq!((specs[3].dither_nm, specs[3].dither_hz), (1.5, 60.0));
+        assert_eq!(
+            (specs[0].wire, specs[3].wire),
+            (WireMode::Mit, WireMode::A4)
+        );
+        assert_eq!(specs[0].stribeck_gain, 0.0);
+        assert_eq!(
+            (
+                specs[3].stribeck_gain,
+                specs[3].stribeck_dfs,
+                specs[3].stribeck_load_gain,
+                specs[3].stribeck_vs
+            ),
+            (0.7, 0.3, 0.1, 0.1)
+        );
+        assert_eq!((specs[0].fl, specs[3].fl), (0.0, 0.08));
+        assert_eq!(
+            (specs[0].stribeck_pole, specs[3].stribeck_pole),
+            (20.0, 40.0)
+        );
+        // An unknown wire token is a bad line, not a silent MIT.
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+        )
+        .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 2\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 16\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+        )
+        .is_err());
     }
 
     /// A bus carrying only some of the arm joints (a bench wrist assembly)
@@ -1371,9 +2466,9 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 2\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
-             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+            "proto 16\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
         )
         .unwrap();
@@ -1384,12 +2479,18 @@ mod tests {
         );
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
-        assert!(parse_config("proto 2\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
-        assert!(parse_config("proto 2\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
         assert!(parse_config(
-            "proto 2\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
-             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
+            "proto 16\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+        )
+        .is_err());
+        assert!(parse_config(
+            "proto 16\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
     }
@@ -1400,7 +2501,8 @@ mod tests {
     /// target on the max-step gate — the arms enabled and never moved.
     #[test]
     fn parse_config_requires_matching_proto() {
-        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let joint =
+            "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
         let error_of = |text: &str| match parse_config(text) {
             Ok(_) => panic!("accepted a skewed config: {text:?}"),
             Err(err) => err.to_string(),
@@ -1410,14 +2512,185 @@ mod tests {
         assert!(err.contains("no `proto` line"), "{err}");
         assert!(err.contains("axol rt.install"), "{err}");
         // A future client generation this core does not understand.
-        let err = error_of(&format!("proto 3\n{joint}"));
-        assert!(err.contains("proto 3"), "{err}");
-        assert!(err.contains("proto 2"), "{err}");
+        let err = error_of(&format!("proto 99\n{joint}"));
+        assert!(err.contains("proto 99"), "{err}");
+        assert!(err.contains("proto 16"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 16\n")).is_ok());
+    }
+
+    const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
+
+    /// The 0x73 scale is an optional field after `lead_ms`; `cogging` lines
+    /// attach their harmonics to the joint already declared on that bus.
+    #[test]
+    fn parse_config_takes_tf_scale_and_cogging_series() {
+        let cfg = parse_config(&format!(
+            "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+             joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
+             cogging 1 canR 1 2 198.9 0.3 -0.1 397.8 0 0.2\n"
+        ))
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(specs[0].tf_nm_per_pct, 0.24);
+        assert_eq!(specs[1].tf_nm_per_pct, 0.0);
+        assert_eq!(
+            specs[0].cogging,
+            vec![
+                filter::CogTerm {
+                    w: 198.9,
+                    a: 0.3,
+                    b: -0.1
+                },
+                filter::CogTerm {
+                    w: 397.8,
+                    a: 0.0,
+                    b: 0.2
+                },
+            ]
+        );
+        assert!(specs[1].cogging.is_empty());
+        // A cogging line for a joint the bus does not carry, a count that
+        // does not match its terms, or a non-finite coefficient is refused.
+        for bad in [
+            "cogging 1 canR 3 1 198.9 0.3 0\n",
+            "cogging 1 canR 1 2 198.9 0.3 0\n",
+            "cogging 1 canR 1 1 198.9 NaN 0\n",
+            "cogging 0 canR 1 1 198.9 0.3 0\n",
+        ] {
+            assert!(
+                parse_config(&format!("proto 16\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `impedance_hz 480` runs the MyActuator impedance joints at a 480 Hz
+    /// loop and nothing else; 240 keeps the verified rules; any other value
+    /// is refused.
+    #[test]
+    fn fast_impedance_needs_a_480_hz_loop() {
+        let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
+        let cfg = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
+        assert_eq!(
+            parse_config(&format!("proto 16\n{mit}"))
+                .unwrap()
+                .impedance_hz,
+            IMPEDANCE_HZ
+        );
+        let err = parse_config(&format!("proto 16\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("480 Hz only"), "{err}");
+        let err = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("impedance_hz 400"), "{err}");
+        // A bus with no impedance joint is not held to the rule.
+        assert!(parse_config(&format!(
+            "proto 16\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+        ))
+        .is_ok());
+    }
+
+    /// Per-joint fast impedance: shoulder_1 and the elbow at 480 Hz (joint
+    /// field 28), every other impedance joint on the 240 Hz lane, the loop
+    /// held to 480 by the rule.
+    #[test]
+    fn single_joints_can_run_impedance_at_480() {
+        let line = |name: &str, id: u8, hz: f64| {
+            format!(
+                "joint 1 canR {name} {id} 250 3.5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20 0 0 0 {hz}\n"
+            )
+        };
+        let text = format!(
+            "proto 16\nloop_hz 480\n{}{}{}{}",
+            line("shoulder_1", 1, 480.0),
+            line("shoulder_2", 2, 0.0),
+            line("elbow", 4, 480.0),
+            line("wrist_2", 6, 0.0),
+        );
+        let cfg = parse_config(&text).unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.mit_hz).collect::<Vec<_>>(),
+            vec![480.0, 0.0, 480.0, 0.0]
+        );
+        // The rule: a 480 Hz joint needs the 480 Hz loop.
+        let err = parse_config(&text.replace("loop_hz 480", "loop_hz 240"))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("shoulder_1 runs impedance at 480"), "{err}");
+        assert!(parse_config(&text.replace(" 480\n", " 400\n")).is_err());
+        // The schedule: shoulder_1 (0) and the elbow (2) every tick, the rest
+        // on the lane.
+        let mut motors = vec![
+            ready(1, Vendor::MyActuator, WireMode::Mit),
+            ready(2, Vendor::MyActuator, WireMode::Mit),
+            ready(4, Vendor::MyActuator, WireMode::Mit),
+            ready(6, Vendor::Damiao, WireMode::Mit),
+        ];
+        motors[0].mit_hz = 480.0;
+        motors[2].mit_hz = 480.0;
+        let sched = Thinning::plan(&motors, FAST_IMPEDANCE_HZ, IMPEDANCE_HZ);
+        assert_eq!(sched.mit_lane, vec![(1, 0), (3, 1)]);
+        for tick in 0..8u64 {
+            assert!(sched.commanded(0, tick) && sched.commanded(2, tick));
+            assert_ne!(sched.commanded(1, tick), sched.commanded(3, tick));
+        }
+        assert_eq!(sched.read_div, FAST_MIT_READ_DIV);
+        // Without a per-joint rate nothing is fast at the default 240.
+        motors[0].mit_hz = 0.0;
+        motors[2].mit_hz = 0.0;
+        let slow = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert_eq!(slow.mit_lane.len(), 4);
+        assert_eq!(slow.read_div, 1);
+    }
+
+    /// Fast impedance: the MyActuator impedance joints go every tick, the
+    /// Damiao wrists alternate at 240 Hz, and the read lane (gripper, a4
+    /// reads) takes one tick in `FAST_MIT_READ_DIV` — 12 frames a tick, 14
+    /// on the read ticks.
+    #[test]
+    fn fast_impedance_commands_myactuator_every_tick_and_wrists_at_240() {
+        let mut motors: Vec<ReadyMotor> = (1..=4)
+            .map(|id| ready(id, Vendor::MyActuator, WireMode::Mit))
+            .collect();
+        motors.push(ready(5, Vendor::MyActuator, WireMode::A4));
+        motors.push(ready(6, Vendor::Damiao, WireMode::Mit));
+        motors.push(ready(7, Vendor::Damiao, WireMode::Mit));
+        motors.push(ready(8, Vendor::Damiao, WireMode::Mit));
+        let sched = Thinning::plan(&motors, FAST_IMPEDANCE_HZ, FAST_IMPEDANCE_HZ);
+        assert_eq!(sched.mit_div, 2);
+        assert_eq!(sched.read_div, FAST_MIT_READ_DIV);
+        assert_eq!(sched.mit_lane, vec![(5, 0), (6, 1)]);
+        let mut gripper_ticks = 0;
+        let mut reads = 0;
+        for tick in 0..480u64 {
+            for idx in 0..5 {
+                assert!(sched.commanded(idx, tick), "MyActuator {idx} tick {tick}");
+            }
+            // Exactly one wrist per tick, each on alternate ticks.
+            assert_ne!(sched.commanded(5, tick), sched.commanded(6, tick));
+            gripper_ticks += sched.commanded(7, tick) as u32;
+            reads += sched.a4_read(4, tick) as u32;
+            // Never more than one read-lane pair on a tick.
+            assert!(!(sched.commanded(7, tick) && sched.a4_read(4, tick)));
+        }
+        // 480 / 8 = 60 turns a second, shared by the gripper and one a4 read.
+        assert_eq!(gripper_ticks + reads, 60);
+        assert_eq!(gripper_ticks, 30);
+        // The default rate keeps every impedance joint on the lane.
+        let slow = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
+        assert_eq!(slow.read_div, 1);
+        assert_eq!(slow.mit_lane.len(), 6);
     }
 }
 
@@ -1919,20 +3192,43 @@ fn bus_loop(
         v_meas: LpDiff,
         bp: BandPass,
         vel_meas: f64,
+        /// Slower (20 rad/s) measured-velocity estimate for the Stribeck
+        /// term: smooth enough at 0.05 rad/s that the feedforward does not
+        /// step with the encoder, ~30° behind at the 2 Hz cycle.
+        v_meas_slow: LpDiff,
+        vel_meas_slow: f64,
         last_fb: Option<Instant>,
+        /// Torque-dither oscillator phase (`filter::dither_step`), started a
+        /// golden angle apart per slot.
+        dither_phase: f64,
     }
     let mut damp: Vec<Damp> = (0..N_SLOTS)
-        .map(|_| Damp {
+        .map(|slot| Damp {
             v_cmd: LpDiff::new(CONTROL_CUTOFF),
             a_cmd: LpDiff::new(CONTROL_CUTOFF),
             v_cmd_fast: LpDiff::new(VEL_CUTOFF),
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
             vel_meas: 0.0,
+            v_meas_slow: LpDiff::new(
+                specs
+                    .iter()
+                    .find(|s| s.slot == slot && !s.gripper && s.stribeck_pole > 0.0)
+                    .map(|s| s.stribeck_pole)
+                    .unwrap_or(CONTROL_CUTOFF),
+            ),
+            vel_meas_slow: 0.0,
             last_fb: None,
+            dither_phase: slot as f64 * filter::DITHER_PHASE_STAGGER,
         })
         .collect();
     let mut prev_tick: Option<Instant> = None;
+    // Impedance joints on their own 240 Hz cadence (`Thinning::mit_lane`):
+    // when each last ran, for a time step and overrun of its own.
+    let mut own_prev: [Option<Instant>; N_SLOTS] = [None; N_SLOTS];
+    // 0x73 joints: the torque feedforward's fade-in (`filter::tf_ramp_step`),
+    // 0 whenever a tick goes out without it (limp, gravity comp).
+    let mut tf_ramp = [0.0f64; N_SLOTS];
     // Latest decoded feedback per slot, shipped to Python once per tick as
     // an `F` packet — the core is the only CAN consumer; Python fills its
     // Motor caches from these instead of passively reading the bus.
@@ -1961,6 +3257,13 @@ fn bus_loop(
     let mut ticks: u64 = 0;
     let mut watchdog_frozen = false;
     let mut next_stats = Instant::now() + Duration::from_secs(5);
+    // Bus occupancy per tick: tick start → last reply received, as a
+    // fraction of the period. This is what bounds the loop rate — at 240 Hz
+    // with three a4 joints (two request/reply pairs each) the right arm is
+    // estimated near three quarters of a 1 Mbps bus — so it is reported in
+    // the 5 s stats line to size any rate change against a measurement.
+    let mut bus_busy: Vec<f64> = Vec::with_capacity(2048);
+    let mut bus_last_reply: Option<Instant> = None;
     // TX-stall (e-stop) tracking — see `guarded_send`. A dead bus skips the
     // motor disable on the way out (nothing is powered to hear it, and the
     // freshly purged queue should stay empty).
@@ -1983,8 +3286,135 @@ fn bus_loop(
     let mut stall_probe = stall::StallProbe::open();
     // Per-tick reply bookkeeping, allocated once: the loop must not grow
     // the heap (a fresh page is a fault, see `stall::lock_memory`).
-    let mut expected = vec![false; motors.len()];
-    let mut seen = vec![false; motors.len()];
+    let mut expected = vec![0u8; motors.len()];
+    let mut seen = vec![0u8; motors.len()];
+    // 0xA4 joints: the command reply arrives before the 0x92 position read;
+    // its speed and iq are staged here until the fine position completes
+    // the sample.
+    let mut a4_stage: [(f64, f64); N_SLOTS] = [(0.0, 0.0); N_SLOTS];
+    let mut a4_follow = vec![false; motors.len()];
+    // Which motors this tick tried to command (a thinned motor's off-tick
+    // is not a missed reply; a dropped send still is).
+    let mut attempted = vec![false; motors.len()];
+    // 0xA4 joints: the last 0.01° position and when it was taken, carried
+    // forward on the echo's speed between reads (`a4_extrapolate`). Seeded
+    // from bring-up's own 0x92 read so the first echo-only tick has a base.
+    let mut a4_anchor: [Option<(f64, Instant)>; N_SLOTS] = [None; N_SLOTS];
+    // 0xA4 joints: the target this tick's position frame carried (None on
+    // a tick it went out as MIT), the runaway guard checking replies
+    // against it, and which joint (if any) tripped it.
+    let mut a4_sent: [Option<f64>; N_SLOTS] = [None; N_SLOTS];
+    let mut runaway_guard = [RunawayGuard::default(); N_SLOTS];
+    let mut ran_away = [false; N_SLOTS];
+    for m in motors.iter() {
+        if m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 {
+            a4_anchor[m.slot] = Some((m.hold_pos, Instant::now()));
+        }
+    }
+    // Damiao wrists: the control-mode register the motor is in (bring-up
+    // put it in the wire's mode). The frame the core wants can change
+    // (pv ↔ MIT across limp / gravity comp), and the register must follow
+    // it or the firmware ignores the frame.
+    let mut dm_mode: Vec<u32> = motors
+        .iter()
+        .map(|m| {
+            if m.vendor == Vendor::Damiao && !m.gripper {
+                m.wire.dm_mode()
+            } else {
+                0
+            }
+        })
+        .collect();
+    let sched = Thinning::plan(&motors, cfg.loop_hz, cfg.impedance_hz);
+    if !sched.mit_lane.is_empty() {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: {:.0} Hz loop — {} joint(s) on alternate ticks at {:.0} Hz each ({} impedance, {} on the 0xA4 planner), other firmware-loop joints every tick",
+                cfg.loop_hz,
+                sched.mit_lane.len(),
+                cfg.loop_hz / sched.mit_div as f64,
+                sched.mit_lane.iter().filter(|(i, _)| motors[*i].wire == WireMode::Mit).count(),
+                sched.mit_lane.iter().filter(|(i, _)| is_planner(&motors[*i])).count(),
+            ),
+        );
+    }
+    if sched.read_div > 1 {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: fast impedance — {} every tick at {:.0} Hz; the other impedance joints at {:.0} Hz on alternate ticks; read lane one tick in {}",
+                motors
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, m)| !m.gripper
+                        && m.wire == WireMode::Mit
+                        && sched.mit_phase(*i).is_none())
+                    .map(|(_, m)| m.joint.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                cfg.loop_hz,
+                cfg.loop_hz / sched.mit_div as f64,
+                sched.read_div,
+            ),
+        );
+    }
+    for (m, spec) in motors.iter().filter_map(|m| {
+        specs
+            .iter()
+            .find(|s| s.slot == m.slot && !s.gripper)
+            .map(|s| (m, s))
+    }) {
+        if spec.tf_nm_per_pct > 0.0 && m.wire == WireMode::A4 {
+            let text = if m.tf_nm_per_pct > 0.0 {
+                format!(
+                    "{iface}: {} on 0x73 — torque feedforward (gravity + inertia + cogging) at {:.4} Nm per % rated current, faded in over {:.1} s",
+                    m.joint,
+                    m.tf_nm_per_pct,
+                    filter::TF_RAMP_S,
+                )
+            } else {
+                format!(
+                    "{iface}: {} stays on plain 0xA4 — 0x73 needs protocol V4.4 firmware (VersionDate {} or later), this motor reports {}",
+                    m.joint,
+                    proto::MA_FW_V44,
+                    m.fw_version.map_or("no version".to_string(), |v| v.to_string()),
+                )
+            };
+            send_text(out_tx, b'L', &text);
+        }
+        if !m.cogging.is_empty() {
+            let cancels = m.wire == WireMode::Mit || m.tf_nm_per_pct > 0.0;
+            send_text(
+                out_tx,
+                b'L',
+                &format!(
+                    "{iface}: {} cogging cancellation: {} harmonic(s){}",
+                    m.joint,
+                    m.cogging.len(),
+                    if cancels {
+                        ""
+                    } else {
+                        " — NOT applied: a plain-0xA4 joint takes no feedforward (needs 0x73)"
+                    },
+                ),
+            );
+        }
+    }
+    if sched.enabled {
+        send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: {:.0} Hz loop — bus schedule thinned: {} wrist(s) take turns, {} read-lane entries (a4 position reads + gripper) take turns",
+                cfg.loop_hz,
+                sched.dm_lane.len(),
+                sched.read_lane.len(),
+            ),
+        );
+    }
     // Belt-and-braces: sends on a dead bus normally fail fast with ENOBUFS,
     // but if the socket sndbuf fills first a blocking write would hang the
     // loop; the timeout turns that into EAGAIN (treated as TX-full).
@@ -2260,9 +3690,30 @@ fn bus_loop(
 
             // Send all commands back-to-back and remember exactly which
             // motors were successfully queued in this tick.
-            expected.fill(false);
+            expected.fill(0);
+            attempted.fill(false);
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for (motor_index, m) in motors.iter().enumerate() {
+                // An impedance joint on its own 240 Hz cadence runs nothing on
+                // its off-ticks — not the tracker, derivatives, band-pass or
+                // dither — and on its own ticks steps them over its own
+                // interval, so it is the verified 240 Hz loop, interleaved.
+                // Every other motor steps at the loop's rate as before.
+                let (tick_dt, cmd_dt, overrun) = if sched.mit_phase(motor_index).is_some() {
+                    if !sched.commanded(motor_index, ticks) {
+                        continue;
+                    }
+                    let nominal = period.as_secs_f64() * sched.mit_div as f64;
+                    let dt =
+                        own_prev[m.slot].map_or(0.0, |p| began.duration_since(p).as_secs_f64());
+                    own_prev[m.slot] = Some(began);
+                    // Its own cycle slipped a whole period: the same rule the
+                    // loop applies to itself, at the joint's own rate.
+                    let own_overrun = dt >= 2.0 * nominal;
+                    (dt, if own_overrun { nominal } else { dt }, own_overrun)
+                } else {
+                    (tick_dt, cmd_dt, overrun)
+                };
                 let c = if is_limp && !m.gripper {
                     // Limp is enforced here, whatever the target says: no
                     // stiffness, firmware damping only, no host damping or
@@ -2274,7 +3725,11 @@ fn bus_loop(
                     JointCmd {
                         mode: 0.0,
                         kp: 0.0,
-                        kd: LIMP_KD,
+                        kd: if ran_away[m.slot] {
+                            A4_RUNAWAY_KD
+                        } else {
+                            LIMP_KD
+                        },
                         kd_host: 0.0,
                         j_eff: 0.0,
                         ..play[m.slot]
@@ -2283,6 +3738,7 @@ fn bus_loop(
                     play[m.slot]
                 };
                 let c = &c;
+                a4_sent[m.slot] = None;
                 let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
                     // gripper uncommanded until motion_control too). Slot
@@ -2317,65 +3773,170 @@ fn bus_loop(
                     } else {
                         c.p_des
                     };
-                    let p_cmd = if tracked {
-                        let (p, _, _) = trk[m.slot].update(p_tgt, cmd_dt);
-                        p
+                    // The tracker's own velocity: the rate of the trajectory
+                    // actually sent, for the 0xA4 cap below (0 on a hold).
+                    let (p_cmd, v_trk) = if tracked {
+                        let (p, v, _) = trk[m.slot].update(p_tgt, cmd_dt);
+                        (p, v)
                     } else {
                         trk[m.slot].seed(c.p_des);
-                        c.p_des
+                        (c.p_des, 0.0)
                     };
                     let d = &mut damp[m.slot];
-                    let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
-                        if tracked && overrun {
-                            // The gap since the last command is not a trajectory
-                            // segment the motor followed — it held. Re-prime the
-                            // derivative chains at rest here so the first tick
-                            // back carries no fictitious velocity, acceleration
-                            // (inertia torque), or band-pass energy; they ramp
-                            // in again from the next tick as tracking resumes.
-                            d.v_cmd.seed(p_cmd);
-                            d.a_cmd.seed(0.0);
-                            d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
-                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-                        } else if tracked {
-                            // Match classic AxolArm.motion_control: friction uses
-                            // the 20 rad/s low-pass position derivative, inertia
-                            // uses a second identical derivative, and damping
-                            // uses its independent 80 rad/s desired-velocity
-                            // derivative.  Only the source position/rate differ:
-                            // the core can use the trajectory it really sends.
-                            let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
-                            let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
-                            let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
-                            let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
-                            let inertia_ff = c.j_eff * a_cmd;
-                            let damp_ok = feedback_fresh[m.slot]
-                                && timing_on_time
-                                && !timing_health.degraded
-                                && !feedback_health[m.slot].degraded;
-                            let v_damp = if damp_ok {
-                                d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
-                            } else {
-                                // A missing frame makes measured velocity stale.
-                                // Reset rather than carrying band-pass energy into
-                                // the first tick after feedback recovers. While the
-                                // joint is degraded, damping stays off for the whole
-                                // stretch: re-engaging a freshly reset band-pass
-                                // every few ticks is a torque transient, not damping.
-                                d.bp.reset();
-                                0.0
-                            };
-                            (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
-                        } else {
-                            d.v_cmd.seed(p_cmd);
-                            d.a_cmd.seed(0.0);
-                            d.v_cmd_fast.seed(p_cmd);
-                            d.bp.reset();
-                            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    let (
+                        v_wire,
+                        a_cmd,
+                        v_cmd_fast,
+                        friction_ff,
+                        inertia_ff,
+                        v_damp,
+                        stiction_ff,
+                        dither_ff,
+                        stribeck_ff,
+                    ) = if tracked && overrun {
+                        // The gap since the last command is not a trajectory
+                        // segment the motor followed — it held. Re-prime the
+                        // derivative chains at rest here so the first tick
+                        // back carries no fictitious velocity, acceleration
+                        // (inertia torque), or band-pass energy; they ramp
+                        // in again from the next tick as tracking resumes.
+                        d.v_cmd.seed(p_cmd);
+                        d.a_cmd.seed(0.0);
+                        d.v_cmd_fast.seed(p_cmd);
+                        d.bp.reset();
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    } else if tracked {
+                        // Match classic AxolArm.motion_control: friction uses
+                        // the 20 rad/s low-pass position derivative, inertia
+                        // uses a second identical derivative, and damping
+                        // uses its independent 80 rad/s desired-velocity
+                        // derivative.  Only the source position/rate differ:
+                        // the core can use the trajectory it really sends.
+                        let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
+                        let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
+                        let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
+                        // Sliding friction grows with the torque the gear
+                        // meshes carry (`fl`, Nm per Nm of gravity).
+                        let fc_eff = m.fc + m.fl * c.t_ff.abs();
+                        let friction_ff = filter::friction(v_cmd, fc_eff, m.k, m.fv, m.fo);
+                        // Stiction compensation acts on the measured error
+                        // against the latest accepted feedback. It is a slow
+                        // term (it resolves a stuck joint over tens of ms),
+                        // so a one-tick-old sample is fine, but a joint with
+                        // no fresh reply this tick gets none rather than a
+                        // push computed from a stale position.
+                        let stiction_ff = match latest[m.slot] {
+                            Some((pos, vel, _, _)) if feedback_fresh[m.slot] => filter::stiction(
+                                p_cmd - pos,
+                                vel,
+                                filter::stiction_amplitude(
+                                    m.fc,
+                                    m.stiction_gain,
+                                    m.stiction_load_gain,
+                                    c.t_ff,
+                                ),
+                                m.stiction_err,
+                            ),
+                            _ => 0.0,
                         };
+                        let dither_ff = filter::dither_step(
+                            &mut d.dither_phase,
+                            m.dither_nm,
+                            m.dither_hz,
+                            tick_dt,
+                        );
+                        // Stribeck cancellation on the measured velocity —
+                        // only with a fresh sample behind it, like the
+                        // stiction push.
+                        let stribeck_ff = if feedback_fresh[m.slot] {
+                            filter::stribeck_excess(
+                                d.vel_meas_slow,
+                                filter::stribeck_amplitude(
+                                    m.stribeck_gain,
+                                    m.stribeck_dfs,
+                                    m.stribeck_load_gain,
+                                    c.t_ff,
+                                ),
+                                m.stribeck_vs,
+                            )
+                        } else {
+                            0.0
+                        };
+                        let inertia_ff = c.j_eff * a_cmd;
+                        let damp_ok = feedback_fresh[m.slot]
+                            && timing_on_time
+                            && !timing_health.degraded
+                            && !feedback_health[m.slot].degraded;
+                        let v_damp = if damp_ok {
+                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
+                        } else {
+                            // A missing frame makes measured velocity stale.
+                            // Reset rather than carrying band-pass energy into
+                            // the first tick after feedback recovers. While the
+                            // joint is degraded, damping stays off for the whole
+                            // stretch: re-engaging a freshly reset band-pass
+                            // every few ticks is a torque transient, not damping.
+                            d.bp.reset();
+                            0.0
+                        };
+                        (
+                            v_cmd,
+                            a_cmd,
+                            v_cmd_fast,
+                            friction_ff,
+                            inertia_ff,
+                            v_damp,
+                            stiction_ff,
+                            dither_ff,
+                            stribeck_ff,
+                        )
+                    } else {
+                        d.v_cmd.seed(p_cmd);
+                        d.a_cmd.seed(0.0);
+                        d.v_cmd_fast.seed(p_cmd);
+                        d.bp.reset();
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    };
                     let damping_ff = c.kd_host * v_damp;
-                    let t_ff = c.t_ff + friction_ff + inertia_ff + damping_ff;
+                    // Position-periodic torque cancellation, on tracked ticks
+                    // only, at where the joint is: the latest reply carried
+                    // one tick along its velocity. Using the tracker position
+                    // instead would put it ~70 ms behind on an a4 joint — a
+                    // third of the 0.905° ripple period at 5 deg/s.
+                    let cogging_ff = if tracked && !m.cogging.is_empty() {
+                        let q = match latest[m.slot] {
+                            Some((pos, vel, _, _)) => pos + vel * tick_dt,
+                            None => p_cmd,
+                        };
+                        filter::cogging(&m.cogging, q)
+                    } else {
+                        0.0
+                    };
+                    let t_ff = c.t_ff
+                        + friction_ff
+                        + stiction_ff
+                        + dither_ff
+                        + stribeck_ff
+                        + inertia_ff
+                        + damping_ff
+                        + cogging_ff;
+                    // The 0x73 feedforward for a firmware-loop joint that
+                    // takes it: gravity, inertia and the cogging term — not
+                    // the host damping band-pass or the friction family,
+                    // which exist for the MIT frame (the firmware's speed PI
+                    // is the damping and carries friction on this path) —
+                    // faded in over `filter::TF_RAMP_S`.
+                    let tf_on = m.tf_nm_per_pct > 0.0 && a4_wire(m.vendor, m.wire, tracked, c.kp);
+                    tf_ramp[m.slot] = if tf_on {
+                        filter::tf_ramp_step(tf_ramp[m.slot], tick_dt)
+                    } else {
+                        0.0
+                    };
+                    let tf_pct = if tf_on {
+                        tf_ramp[m.slot] * (c.t_ff + inertia_ff + cogging_ff) / m.tf_nm_per_pct
+                    } else {
+                        0.0
+                    };
                     if trace_this_tick && trace_tx.is_some() {
                         trace_pending[m.slot] = Some(TraceRow {
                             tick: ticks,
@@ -2398,23 +3959,101 @@ fn bus_loop(
                             friction_ff,
                             inertia_ff,
                             damping_ff,
+                            stiction_ff,
+                            dither_ff,
+                            stribeck_ff,
                             total_ff: t_ff,
                             kd_host: c.kd_host,
                             damp_w0: c.damp_w0,
                             damp_q: c.damp_q,
                             tick_dt,
                             fb_dt: f64::NAN,
+                            cogging_ff,
+                            tf_pct,
                         });
                     }
-                    let frame = proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges);
-                    let arb = match m.vendor {
-                        Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
-                        Vendor::Damiao => m.id as u16,
-                    };
-                    (arb, frame)
+                    if a4_wire(m.vendor, m.wire, tracked, c.kp) {
+                        // Firmware position loop: the streamed trajectory (or
+                        // the hold pose) as an absolute 0.01° target under the
+                        // tracker's own velocity limit as the speed cap — as
+                        // 0x73 with the torque feedforward where the joint
+                        // takes it, plain 0xA4 (no feedforward) otherwise. The
+                        // 0x92 read below restores fine position to the host.
+                        a4_follow[motor_index] = true;
+                        let target = a4_target(p_cmd, v_trk, m.lead_s);
+                        a4_sent[m.slot] = Some(target);
+                        let cap = a4_speed_cap(m.cap_track, v_trk, m.max_vel);
+                        (
+                            proto::MA_REQ + m.id as u16,
+                            if tf_on {
+                                proto::ma_tf_encode(target, cap, tf_pct)
+                            } else {
+                                proto::ma_a4_encode(target, cap)
+                            },
+                        )
+                    } else if pv_wire(m.vendor, m.wire, tracked, c.kp) {
+                        // Damiao firmware position loop: same target, the
+                        // tracker's velocity limit as the speed cap; the
+                        // wrist's profiler (ACC/DEC) shapes it further.
+                        (
+                            proto::DM_POS_VEL_ARB_BASE + m.id as u16,
+                            proto::dm_pos_vel_encode(p_cmd, m.max_vel),
+                        )
+                    } else {
+                        let frame = proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges);
+                        let arb = match m.vendor {
+                            Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
+                            Vendor::Damiao => m.id as u16,
+                        };
+                        (arb, frame)
+                    }
                 };
+                // The bus cannot carry every motor every tick at the
+                // higher loop rate: a thinned motor's off-tick still ran
+                // its tracker (above), it just sends nothing.
+                if !sched.commanded(motor_index, ticks) {
+                    continue;
+                }
+                // A Damiao wrist acts only on the frame of the control mode
+                // it is in. Switch the register (RAM write, immediate) on
+                // the tick the wanted frame changes — pv ↔ MIT across limp
+                // or gravity comp — before that frame goes out.
+                if dm_mode[motor_index] != 0 {
+                    let wanted = if arb == proto::DM_POS_VEL_ARB_BASE + m.id as u16 {
+                        proto::DM_MODE_POS_VEL
+                    } else {
+                        proto::DM_MODE_MIT
+                    };
+                    if wanted != dm_mode[motor_index] {
+                        let reg = proto::dm_write_register(
+                            m.id as u16,
+                            proto::DM_REG_CTRL_MODE,
+                            wanted.to_le_bytes(),
+                        );
+                        if let SendOutcome::Sent =
+                            guarded_send(&sock, proto::DM_REG_ARB, &reg, &mut enobufs_since)?
+                        {
+                            dm_mode[motor_index] = wanted;
+                            send_text(
+                                out_tx,
+                                b'L',
+                                &format!(
+                                    "{iface}: {} control mode → {} ({})",
+                                    m.joint,
+                                    wanted,
+                                    if wanted == proto::DM_MODE_POS_VEL {
+                                        "position-velocity, firmware loop"
+                                    } else {
+                                        "MIT, compliant"
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                }
+                attempted[motor_index] = true;
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
-                    SendOutcome::Sent => expected[motor_index] = true,
+                    SendOutcome::Sent => expected[motor_index] = 1,
                     SendOutcome::Dropped => {}
                     SendOutcome::Stalled => {
                         // The e-stop path: nothing has ACKed for >1 s. Stop
@@ -2453,6 +4092,26 @@ fn bus_loop(
                 }
             }
 
+            // 0xA4 joints: ask for the 0.01° multi-turn angle right behind the
+            // command so the reply pair lands inside this tick's window.
+            for (motor_index, m) in motors.iter().enumerate() {
+                if !a4_follow[motor_index] {
+                    continue;
+                }
+                a4_follow[motor_index] = false;
+                if expected[motor_index] == 0 || !sched.a4_read(motor_index, ticks) {
+                    continue;
+                }
+                if let SendOutcome::Sent = guarded_send(
+                    &sock,
+                    proto::MA_REQ + m.id as u16,
+                    &proto::MA_MULTI_TURN_REQUEST,
+                    &mut enobufs_since,
+                )? {
+                    expected[motor_index] = 2;
+                }
+            }
+
             // Collect replies. The
             // window begins when this tick actually began, not at its nominal
             // schedule point: a late wake must not discard shoulder feedback
@@ -2461,8 +4120,9 @@ fn bus_loop(
             // must end the window at `reply_deadline`, never a jiffy or two
             // later, or the overrun lands on the next tick as lateness.
             let reply_deadline = began + period.saturating_sub(REPLY_GUARD);
-            seen.fill(false);
-            let mut pending = expected.iter().filter(|&&value| value).count();
+            seen.fill(0);
+            bus_last_reply = None;
+            let mut pending: usize = expected.iter().map(|&n| n as usize).sum();
             while pending > 0 {
                 let now = Instant::now();
                 if now >= reply_deadline {
@@ -2471,6 +4131,7 @@ fn bus_loop(
                 let Some(frame) = sock.recv_timeout(reply_deadline - now)? else {
                     break;
                 };
+                bus_last_reply = Some(Instant::now());
                 let (idx, pos, vel, tau) = match frame.id {
                     id if (0x501..=0x505).contains(&id) => {
                         let motor_id = (id - 0x500) as u8;
@@ -2483,6 +4144,48 @@ fn bus_loop(
                             motors[idx].ranges.t_max,
                         );
                         (idx, pos, vel, tau)
+                    }
+                    id if (0x241..=0x245).contains(&id) => {
+                        // 0xA4 joints answer twice: the command echo (iq,
+                        // speed, whole-degree angle) is staged; the 0x92
+                        // multi-turn read completes the sample. Torque is
+                        // not available in Nm on this path (the echo carries
+                        // q-axis current), so it is reported as NaN and the
+                        // contact watchdog is blind on the joint.
+                        let motor_id = (id - 0x240) as u8;
+                        let Some(idx) = motors.iter().position(|m| m.id == motor_id) else {
+                            continue;
+                        };
+                        let slot = motors[idx].slot;
+                        match frame.data[0] {
+                            0xA4 | proto::MA_TF_CMD => {
+                                let (iq, speed, _) = proto::ma_decode_a4_reply(&frame.data);
+                                if expected[idx] >= 2 {
+                                    // A 0x92 read follows: stage, let it
+                                    // complete the sample.
+                                    if mark_unique_expected_reply(&expected, &mut seen, idx) {
+                                        pending -= 1;
+                                        a4_stage[slot] = (speed, iq);
+                                    }
+                                    continue;
+                                }
+                                // No read this tick (thinned schedule): the
+                                // echo completes the sample with the last
+                                // fine position carried on its speed.
+                                let now = Instant::now();
+                                let Some(anchor) = a4_anchor[slot] else {
+                                    continue;
+                                };
+                                let pos = a4_extrapolate(anchor, speed, now);
+                                (idx, pos, speed, f64::NAN)
+                            }
+                            proto::MA_MULTI_TURN_ANGLE => {
+                                let pos = proto::ma_decode_position(&frame.data);
+                                let (vel, _iq) = a4_stage[slot];
+                                (idx, pos, vel, f64::NAN)
+                            }
+                            _ => continue,
+                        }
                     }
                     id if (0x16..=0x18).contains(&id) => {
                         let motor_id = (id - 0x10) as u8;
@@ -2506,6 +4209,11 @@ fn bus_loop(
                 pending -= 1;
                 let recv_time = Instant::now();
                 latest[motors[idx].slot] = Some((pos, vel, tau, recv_time));
+                // Every accepted sample re-anchors the a4 carry — the 0x92
+                // read, the carried echo itself, and the MIT reply of an a4
+                // joint that is limp right now, so the carry resumes from
+                // where the joint really is when it goes back on 0xA4.
+                a4_anchor[motors[idx].slot] = Some((pos, recv_time));
                 // The gripper has no damping chain or trace row: its
                 // POSITION_FORCE reply only feeds the telemetry cache.
                 if motors[idx].gripper {
@@ -2521,6 +4229,7 @@ fn bus_loop(
                         .map_or(0.0, |p| recv_time.duration_since(p).as_secs_f64());
                     d.last_fb = Some(recv_time);
                     d.vel_meas = d.v_meas.update(pos, dt);
+                    d.vel_meas_slow = d.v_meas_slow.update(pos, dt);
                     (d.vel_meas, dt)
                 };
                 if let (Some(tx), Some(mut row)) =
@@ -2546,6 +4255,32 @@ fn bus_loop(
                 // watchdog's job (limp gravity-comp hold, as in classic
                 // mode); a self-disabled motor simply stops contributing,
                 // as it did in classic mode.
+                //
+                // The firmware position loop is the exception: stiff by
+                // design, so a joint on it moving fast *away* from the
+                // target it was just sent is being driven there by its own
+                // loop (`RunawayGuard`). Limp takes every joint off the
+                // position frame; the runaway joint gets the MIT maximum kd
+                // to brake instead of coasting into its stop.
+                let slot = motors[idx].slot;
+                match a4_sent[slot] {
+                    Some(target) => {
+                        if runaway_guard[slot].check(pos, vel, target) && !ran_away[slot] {
+                            ran_away[slot] = true;
+                            go_limp(
+                                limp,
+                                out_tx,
+                                &format!(
+                                    "{iface}: {} ran away on the firmware position loop ({:+.1}° from its target, moving away at {:+.0}°/s) — going limp, that joint braked at kd {A4_RUNAWAY_KD}",
+                                    motors[idx].joint,
+                                    (pos - target).to_degrees(),
+                                    vel.to_degrees(),
+                                ),
+                            );
+                        }
+                    }
+                    None => runaway_guard[slot].reset(),
+                }
             }
 
             // Replies still outstanding at the window's end. Counted into the
@@ -2566,9 +4301,27 @@ fn bus_loop(
                 if motor.gripper {
                     continue;
                 }
-                feedback_fresh[motor.slot] = seen[idx];
+                if !attempted[idx] {
+                    // Not this motor's tick on the thinned schedule: no
+                    // reply was owed, so none is missing, and the latest
+                    // sample stays "fresh" — it is the newest the schedule
+                    // can produce. Clearing it here would leave the
+                    // feedforwards that need a sample (stiction, Stribeck,
+                    // host damping) permanently off on a thinned MIT joint,
+                    // since every commanded tick follows an off-tick.
+                    continue;
+                }
+                let complete = reply_complete(&expected, &seen, idx);
+                feedback_fresh[motor.slot] = complete;
                 let health = &mut feedback_health[motor.slot];
-                match health.record(seen[idx], silent_limit) {
+                // Counted in the joint's own commands, so the silent limit
+                // stays `SILENT_FEEDBACK_FAULT` of wall time on the 240 Hz lane.
+                let limit = if sched.mit_phase(idx).is_some() {
+                    silent_limit.div_ceil(sched.mit_div as u32)
+                } else {
+                    silent_limit
+                };
+                match health.record(complete, limit) {
                     FeedbackVerdict::Steady => {}
                     FeedbackVerdict::Degraded => {
                         degraded_episodes += 1;
@@ -2608,7 +4361,7 @@ fn bus_loop(
                                 "{iface}: {} silent for {} consecutive ticks ({:.1} s) — motor unreachable; going limp rather than commanding it stiff and blind",
                                 motor.joint,
                                 health.consecutive_misses,
-                                health.consecutive_misses as f64 / cfg.loop_hz,
+                                health.consecutive_misses as f64 * sched.mit_phase(idx).map_or(1.0, |_| sched.mit_div as f64) / cfg.loop_hz,
                             ),
                         );
                     }
@@ -2626,16 +4379,24 @@ fn bus_loop(
                 let _ = out_tx.send(build_feedback(side, &latest, Instant::now()));
             }
 
+            if let Some(t) = bus_last_reply {
+                bus_busy.push(t.duration_since(began).as_secs_f64() / period.as_secs_f64());
+            }
             if began >= next_stats {
                 next_stats = began + Duration::from_secs(5);
+                let (busy_p50, busy_p95, busy_max) = bus_busy_percentiles(&mut bus_busy);
+                bus_busy.clear();
                 send_text(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), bus busy p50 {:.0}% p95 {:.0}% max {:.0}% of the tick, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         worst_target_age * 1e3,
                         cadence.get().unwrap_or(f64::NAN) * 1e3,
+                        busy_p50 * 100.0,
+                        busy_p95 * 100.0,
+                        busy_max * 100.0,
                         last_seq,
                     ),
                 );
