@@ -15,7 +15,12 @@ from almond_axol.motor.damiao import DamiaoMotor
 from almond_axol.motor.myactuator import _MA_PID_IDX, MyActuatorMotor
 from almond_axol.robot import FirmwareGains, JointConfig
 from almond_axol.robot.axol import apply_firmware_gains
-from almond_axol.robot.config import AxolConfig, _calibrated_joint
+from almond_axol.robot.config import (
+    _X6_ELBOW_FIRMWARE_GAINS,
+    _X8_FIRMWARE_GAINS,
+    AxolConfig,
+    _calibrated_joint,
+)
 
 _X8 = {
     "position_kp": 1.0,
@@ -27,51 +32,32 @@ _X8 = {
 
 
 class ConfigTest(unittest.TestCase):
-    def test_shoulder_1_carries_the_tuned_x8_set_shoulder_2_the_stock_one(self) -> None:
-        # Only shoulder_1 and the elbow run on 0xA4; the impedance joints are
-        # put back on their motors' factory loops (2026-09-22).
+    def test_every_myactuator_joint_carries_its_stock_set(self) -> None:
+        # The arms run impedance, where the firmware loops are inert: every
+        # joint — shoulder_1 and the elbow included — is kept on its motor's
+        # factory loop (2026-09-24). The tuned 0xA4 sets stay defined for an
+        # --a4 run to override with.
+        x8 = {
+            "position_kp": 0.008,
+            "position_kd": 0.1,
+            "speed_kp": 0.03,
+            "speed_ki": 1e-4,
+            "planner_accel": 0.0,
+        }
+        x6 = {
+            "position_kp": 0.06,
+            "position_kd": 0.5,
+            "speed_kp": 0.01,
+            "speed_ki": 1e-4,
+            "planner_accel": 0.0,
+        }
         cfg = AxolConfig()
         for arm in (cfg.left, cfg.right):
-            self.assertEqual(arm.shoulder_1.firmware.as_dict(), _X8)
-            self.assertIsNone(arm.shoulder_1.firmware.position_ki)
-            self.assertEqual(
-                arm.shoulder_2.firmware.as_dict(),
-                {
-                    "position_kp": 0.008,
-                    "position_kd": 0.1,
-                    "speed_kp": 0.03,
-                    "speed_ki": 1e-4,
-                    "planner_accel": 0.0,
-                },
-            )
-
-    def test_elbow_carries_its_own_set_on_both_arms(self) -> None:
-        cfg = AxolConfig()
-        for arm in (cfg.left, cfg.right):
-            self.assertEqual(
-                arm.elbow.firmware.as_dict(),
-                {
-                    "position_kp": 1.4,
-                    "position_kd": 0.1,
-                    "speed_kp": 0.05,
-                    "speed_ki": 1e-5,
-                    "planner_accel": 0.0,
-                },
-            )
-
-    def test_x6_roll_joints_carry_the_stock_set_on_both_arms(self) -> None:
-        cfg = AxolConfig()
-        for arm in (cfg.left, cfg.right):
-            for joint in (arm.shoulder_3, arm.wrist_1):
-                self.assertEqual(
-                    joint.firmware.as_dict(),
-                    {
-                        "position_kp": 0.06,
-                        "position_kd": 0.5,
-                        "speed_kp": 0.01,
-                        "planner_accel": 0.0,
-                    },
-                )
+            for joint in (arm.shoulder_1, arm.shoulder_2):
+                self.assertEqual(joint.firmware.as_dict(), x8)
+            for joint in (arm.shoulder_3, arm.elbow, arm.wrist_1):
+                self.assertEqual(joint.firmware.as_dict(), x6)
+        self.assertEqual(_X8_FIRMWARE_GAINS.as_dict(), _X8)
 
     def test_damiao_wrists_carry_the_stock_profiler_only(self) -> None:
         cfg = AxolConfig()
@@ -87,7 +73,9 @@ class ConfigTest(unittest.TestCase):
 
     def test_defaults_survive_the_stiffness_blend(self) -> None:
         cfg = AxolConfig(left_stiffness=0.3).resolved()
-        self.assertEqual(cfg.left.shoulder_1.firmware.as_dict(), _X8)
+        self.assertEqual(
+            cfg.left.shoulder_1.firmware, AxolConfig().left.shoulder_1.firmware
+        )
 
     def test_calibration_entry_overlays_firmware_block(self) -> None:
         base = AxolConfig().left.elbow
@@ -244,6 +232,11 @@ def _arm(
     a4: tuple[Joint, ...] = (),
 ) -> SimpleNamespace:
     cfg = AxolConfig()
+    # The apply/held tests exercise writes: give shoulder_1 and the elbow the
+    # tuned 0xA4 sets an --a4 run would bring (the config default is stock).
+    for arm in (cfg.left, cfg.right):
+        arm.shoulder_1.firmware = replace(_X8_FIRMWARE_GAINS)
+        arm.elbow.firmware = replace(_X6_ELBOW_FIRMWARE_GAINS)
     for j in a4:
         getattr(cfg.left if is_left else cfg.right, j.value).wire_mode = "a4"
     return SimpleNamespace(

@@ -624,9 +624,13 @@ _DM_WRIST_FIRMWARE_GAINS = FirmwareGains(position_kp=400.0, profile_acc=50.0)
 # Values are the ones recorded at the sweeps (stock X8-P20: position_kp
 # 0.008, speed_kp 0.03, speed_ki 1e-4, position_kd 0.1; stock X6-P20 roll:
 # position_kp 0.06, speed_kp 0.01, position_kd 0.5; Damiao wrists: KP_APR
-# 54, profiler 2 rad/s²). A stock value never recorded (the X6's speed_ki) is
-# left unset, so the motor keeps what it holds. The planner stays
-# pinned at 0: a test run's 60000 must not carry over (it reached shoulder_2).
+# 54, profiler 2 rad/s²) — every joint's since 2026-09-24, shoulder_1 and
+# the elbow included: the arms run impedance, where these loops are inert,
+# and the tuned 0xA4 sets (_X8_FIRMWARE_GAINS, _X6_ELBOW_FIRMWARE_GAINS) stay
+# defined for an --a4 run to override with. The X6 speed_ki 1e-4 was read off
+# the jelly robot's untouched left arm. The planner 0 here applies only to a
+# joint actually on wire_mode a4 (see axol._wanted_firmware); an impedance
+# joint keeps the motor's stock 5000.
 _X8_STOCK_FIRMWARE_GAINS = FirmwareGains(
     position_kp=0.008,
     position_kd=0.1,
@@ -638,6 +642,7 @@ _X6_ROLL_STOCK_FIRMWARE_GAINS = FirmwareGains(
     position_kp=0.06,
     position_kd=0.5,
     speed_kp=0.01,
+    speed_ki=1e-4,
     planner_accel=0.0,
 )
 _DM_WRIST_STOCK_FIRMWARE_GAINS = FirmwareGains(position_kp=54.0, profile_acc=2.0)
@@ -698,7 +703,7 @@ class ArmConfig:
             # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
             # mode is the impedance mode, moving with reflected inertia.
             kd_host=40.0,
-            firmware=_X8_FIRMWARE_GAINS,
+            firmware=_X8_STOCK_FIRMWARE_GAINS,
         )
     )
     shoulder_2: JointConfig = field(
@@ -751,7 +756,7 @@ class ArmConfig:
             # active at 9.55 Hz. Hardware step/replay A/Bs found that term
             # increased overshoot without removing a ring; firmware kd=5
             # settled the joint without the host-loop phase risk.
-            firmware=_X6_ELBOW_FIRMWARE_GAINS,
+            firmware=_X6_ROLL_STOCK_FIRMWARE_GAINS,
         )
     )
     wrist_1: JointConfig = field(
