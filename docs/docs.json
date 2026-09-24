@@ -50,7 +50,7 @@
           {
             "group": "Run Policy",
             "root": "operations/run-policy",
-            "pages": ["operations/run-policy-config"]
+            "pages": ["operations/run-policy-config", "operations/custom-policy"]
           },
           {
             "group": "DAgger Collection",
@@ -196,7 +196,8 @@
               "api/vr",
               "api/zed",
               "api/motor",
-              "api/lerobot"
+              "api/lerobot",
+              "api/policy"
             ]
           }
         ]

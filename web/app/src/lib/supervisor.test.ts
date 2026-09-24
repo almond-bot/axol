@@ -2,12 +2,15 @@ import { beforeEach, describe, expect, it } from "vitest"
 
 import {
   HARDWARE_PROFILE_ARG,
+  CUSTOM_POLICY_TYPE,
+  applyPolicyTypeRules,
   cameraCount,
   computeArgs,
   curatedFields,
   defaultString,
   filterSchema,
   flattenFields,
+  isCustomPolicyRun,
   isModified,
   isRobotFreeRun,
   loadLocalHardwareProfile,
@@ -149,6 +152,30 @@ describe("supervisor pure helpers", () => {
     expect(runFieldVisible("sim", "mantis")).toBe(false)
     expect(runFieldVisible("jelly_only", "mantis")).toBe(false)
     expect(runFieldVisible("repo_id", "mantis")).toBe(true)
+  })
+
+  it("requires a policy path only for LeRobot policy types", () => {
+    const field = (key: string, required: boolean): SchemaField => ({
+      kind: "field",
+      key,
+      label: key,
+      type: "text",
+      default: null,
+      required,
+    })
+    const fields = [field("policy_type", true), field("task", true), field("policy_path", false)]
+    const lerobot = applyPolicyTypeRules(fields, false)
+    expect(lerobot.find((f) => f.key === "policy_path")?.required).toBe(true)
+    const custom = applyPolicyTypeRules(fields, true)
+    const path = custom.find((f) => f.key === "policy_path")
+    expect(path?.required).toBe(false)
+    expect(path?.help).toMatch(/policy server/)
+    expect(custom.map((f) => f.key)).toEqual(["policy_type", "task", "policy_path"])
+    // Ops without a policy type are left alone.
+    const other = [field("policy_path", false)]
+    expect(applyPolicyTypeRules(other, false)).toBe(other)
+    expect(isCustomPolicyRun({ policy_type: CUSTOM_POLICY_TYPE })).toBe(true)
+    expect(isCustomPolicyRun({ policy_type: "act" })).toBe(false)
   })
 
   it("resolves curated and per-run fields with required ones first", () => {

@@ -25,15 +25,15 @@ axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up t
 
 | Flag | Default | Description |
 |---|---|---|
-| `--policy_path` | required | Policy checkpoint — a HuggingFace Hub repo id or local path (reachable from the inference server when remote). |
-| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, or `groot`. |
+| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, `groot`, or `custom` ([your own model](/operations/custom-policy)). |
+| `--policy_path` | required (optional for `custom`) | Policy checkpoint — a HuggingFace Hub repo id or local path (reachable from the inference server when remote). With `custom`, passed to your policy server as-is. |
 | `--task` | required | Task description sent to the policy and stored with recorded frames. |
-| `--device` | `cuda` | `cuda`, `cpu`, or `mps`. |
+| `--device` | `cuda` | `cuda`, `cpu`, or `mps` (LeRobot policies only). |
 | `--episode_time_s` | `120` | Maximum episode length (s). |
 | `--fps` | `30` | Control rate. Must match the training fps unless `--allow_fps_mismatch true` (a checkpoint trained on 60 fps data needs `--fps 60`). |
 | `--allow_fps_mismatch` | `false` | Start even if `fps` differs from the training fps. Experiments only. |
-| `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one locally. |
-| `--server_port` | `8765` | Inference server port. |
+| `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one locally. With `custom`, your policy server's address (`null` = this machine). |
+| `--server_port` | `8765` | Inference server port (or your custom policy server's). |
 
 ## Action chunking
 

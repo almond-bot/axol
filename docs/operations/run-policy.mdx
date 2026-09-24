@@ -21,6 +21,10 @@ flowchart LR
 
 You can launch a rollout from the **web control panel** or the **CLI** (`axol run-policy`).
 
+<Tip>
+  Not a LeRobot checkpoint? Pick policy type **`custom`** to drive the arms from your own model: it receives joints + camera frames and returns action chunks through the [`almond_axol.policy`](/api/policy) SDK. See [Run Your Own Policy](/operations/custom-policy).
+</Tip>
+
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
@@ -143,5 +147,8 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
   </Card>
   <Card title="run-policy reference" icon="terminal" href="/cli/run-policy">
     Every flag, aggregation strategy, and threading detail.
+  </Card>
+  <Card title="Run Your Own Policy" icon="code" href="/operations/custom-policy">
+    Drive the arms from a model that isn't a LeRobot checkpoint.
   </Card>
 </CardGroup>

@@ -880,15 +880,17 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Device",
                 type="select",
                 options=("cuda", "cpu", "mps"),
-                help="Device the policy runs on.",
+                help="Device the policy runs on (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.server_host",
                 label="Inference server host",
                 type="text",
                 help=(
-                    "Address of a remote `axol inference-server`. Leave unset "
-                    "to run inference locally."
+                    "Address of a remote `axol inference-server`, or of your "
+                    "own policy server for policy type `custom`. Leave unset "
+                    "to run inference locally (a custom server then runs on "
+                    "this machine)."
                 ),
                 effective_default="local — inference runs on this machine",
             ),
@@ -896,7 +898,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.server_port",
                 label="Inference server port",
                 type="number",
-                help="Port of the inference server (local or remote).",
+                help=(
+                    "Port of the inference server (local or remote), or of "
+                    "your custom policy server."
+                ),
             ),
             SettingDef(
                 key="inference.episode_time_s",

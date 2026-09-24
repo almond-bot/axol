@@ -19,8 +19,8 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 
 | Flag | Description |
 |---|---|
-| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
-| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy_path` (required) |
+| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot,custom}` | Policy architecture; must match the checkpoint at `--policy_path` (required). `custom` runs your own model behind an [`almond_axol.policy`](/api/policy) server instead — see [Run Your Own Policy](/operations/custom-policy) |
+| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required for LeRobot policy types). With `custom`, optional and passed to your server as `spec.policy_path` |
 | `--task TEXT` | Natural language task description (required) |
 | `--episode_time_s INT` | Safety cap on episode duration in seconds (default: 120). Episodes normally end on operator keypress |
 | `--fps INT` | Control loop frame rate (default: 30). Must match the fps the policy was trained on (a checkpoint trained on 60 fps data needs `--fps 60`) |
@@ -28,9 +28,9 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |
 | `--vcodec STR` | Video codec recorded for saved rollout datasets (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Only used with `--repo_id`. |
-| `--device STR` | PyTorch device for policy inference (default: `cuda`). The hosted aarch64/Jetson dependency set has CPU-only PyPI Torch 2.10; use `cpu`, remote inference, or an explicitly managed JetPack-compatible Torch + Torchvision build |
-| `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID) |
-| `--server_port INT` | Policy server port — for the localhost child process or the remote server (default: 8765) |
+| `--device STR` | PyTorch device for LeRobot policy inference (default: `cuda`; unused with `custom`). The hosted aarch64/Jetson dependency set has CPU-only PyPI Torch 2.10; use `cpu`, remote inference, or an explicitly managed JetPack-compatible Torch + Torchvision build |
+| `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID). With `--policy_type custom`, the address of your policy server (default `null` = `127.0.0.1`, nothing is spawned); a `ws://` / `wss://` URL is also accepted |
+| `--server_port INT` | Policy server port — for the localhost child process, the remote server, or your custom policy server (default: 8765) |
 | `--actions_per_chunk INT` | Number of actions returned per inference call (default: 50); capped by the policy's max action horizon |
 | `--chunk_size_threshold FLOAT` | Trigger a fresh observation when the action queue drops to this fraction of a chunk (default: 0.9) |
 | `--aggregate_fn {temporal_ensemble,weighted_average,latest_only,average,conservative}` | Action chunk aggregation strategy (default: `temporal_ensemble`, ACT Algorithm 2; gripper indices take the newest chunk). The other choices are upstream scalar blends |

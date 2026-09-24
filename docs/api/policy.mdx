@@ -1,0 +1,229 @@
+---
+title: "almond_axol.policy"
+description: "Serve your own model as an Axol policy: receive joints and camera frames, return action chunks."
+---
+
+The SDK for running a model that isn't a LeRobot checkpoint. You write a `Policy`, start it with `serve()`, and run [Run Policy](/operations/custom-policy) with policy type `custom`. The robot sends each observation (joint state, RGB camera frames and the task) to your `infer()` and executes the action chunks it returns. Execution works exactly as it does for a LeRobot checkpoint: chunk ensembling, velocity/acceleration shaping, contact stops, episode control and rollout recording.
+
+It needs only Axol's base install (numpy + websockets); LeRobot and torch are not required.
+
+```python
+from almond_axol.policy import Observation, Policy, PolicySpec, serve
+```
+
+## Quick start
+
+```python
+import numpy as np
+
+from almond_axol.policy import Observation, Policy, PolicySpec, serve
+
+
+class HoldStill(Policy):
+    """Replays the current joint state for 10 ticks — swap in your model."""
+
+    def setup(self, spec: PolicySpec) -> None:
+        # Load weights here; spec says what the robot will send and expect.
+        self.index = [spec.state_names.index(name) for name in spec.action_names]
+
+    def reset(self) -> None:
+        pass  # clear recurrent state between episodes
+
+    def infer(self, obs: Observation) -> np.ndarray:
+        # obs.state: float32 joints; obs.images["overhead"]: (H, W, 3) uint8 RGB
+        target = obs.state[self.index]
+        return np.tile(target, (10, 1))  # (T, D): one row per control tick
+
+
+serve(HoldStill(), host="0.0.0.0", port=8765)
+```
+
+A plain function works too, for stateless models:
+
+```python
+import numpy as np
+
+from almond_axol.policy import Observation, serve
+
+
+def infer(obs: Observation) -> np.ndarray:
+    return obs.state[None, :]  # a one-row chunk
+
+
+serve(infer, port=8765)
+```
+
+## `Policy`
+
+Base class for a custom policy. Override `infer`; the other methods are optional hooks.
+
+| Method | Description |
+|---|---|
+| `setup(spec)` | Called once per robot connection, before any observation. `spec` is the session's [`PolicySpec`](#policyspec). Load your model here. Raising refuses the session, and the operator sees your message. |
+| `reset()` | Called at the start of every episode. |
+| `infer(obs)` | Return an action chunk predicted from the [`Observation`](#observation). See [Action chunks](#action-chunks). |
+
+Set these class attributes to have the robot check compatibility before anything moves:
+
+| Attribute | Description |
+|---|---|
+| `action_names` | The action layout your model emits, in column order. The robot refuses to run unless its own layout matches exactly (for example, a joint-space model on a robot configured for Cartesian actions). `None` (default) accepts the robot's layout. |
+| `fps` | The control rate your model was trained at. The robot refuses a different `--fps` unless `--allow_fps_mismatch true`. `None` (default) skips the check. |
+| `name` | Shown in the robot's log when it connects. |
+
+## `Observation`
+
+What `infer` receives: one observation per inference request, sampled with the same exposure-time alignment as data collection.
+
+| Attribute | Description |
+|---|---|
+| `state` | `np.ndarray` (float32) in `PolicySpec.state_names` order. |
+| `state_names` | Names for each entry of `state`. |
+| `joints` | `state` as a `{name: value}` dict, e.g. `obs.joints["left_gripper.pos"]`. |
+| `images` | Camera name → `(height, width, 3)` uint8 **RGB** frame. |
+| `task` | The current task instruction. |
+| `timestep` | The control tick the observation was taken at. Your chunk starts executing here. |
+| `timestamp` | Unix time (seconds) the observation was taken. |
+
+## `PolicySpec`
+
+What the robot announces when it connects, passed to `Policy.setup`.
+
+| Attribute | Description |
+|---|---|
+| `state_names` | Order of `Observation.state`. |
+| `action_names` | The column order every action chunk must have. |
+| `cameras` | The cameras each observation carries (`CameraSpec` with `name` and `shape`). |
+| `camera_names` | Just the camera names. |
+| `fps` | Control rate: row `k` of a chunk runs `k / fps` seconds after its observation. |
+| `actions_per_chunk` | The most rows the robot uses from one chunk; extra rows are dropped. |
+| `task` | The task the run was started with. |
+| `policy_path` | The operator's **policy path** field, passed through unchanged (`None` when blank). Use it to choose a checkpoint if one server hosts several. |
+| `robot` | Robot type (`"axol"`). |
+
+### State and action names
+
+The names follow the robot's configuration, so you can train on a dataset recorded with [`collect-data`](/operations/data-collection) and use its `observation.state` / `action` names as-is.
+
+| Robot config | State / action names (per arm, `left_` then `right_`) |
+|---|---|
+| default (joint space) | `shoulder_1.pos`, `shoulder_2.pos`, `shoulder_3.pos`, `elbow.pos`, `wrist_1.pos`, `wrist_2.pos`, `wrist_3.pos`, `gripper.pos` — 16 dimensions |
+| `observe_cartesian: true` | `ee.x`, `ee.y`, `ee.z`, `ee.rx`, `ee.ry`, `ee.rz` (metres + rotation vector, world frame) and `gripper.pos` — 14 dimensions |
+| `observe_torques: true` | The state also carries each joint's `.torque` (actions don't) |
+
+Arm joints are radians. The gripper is normalized: `0.0` is closed and `1.0` is fully open. The gripperless SKU drops the `gripper.pos` entries.
+
+## Action chunks
+
+`infer` returns a chunk of future targets:
+
+- a `(T, D)` array-like (numpy, torch or nested lists) whose `D` columns follow `PolicySpec.action_names`;
+- a single `(D,)` action (a one-row chunk); or
+- a list of `{action_name: value}` dicts.
+
+Row `k` is the target for tick `obs.timestep + k`, which is `k / fps` seconds after the observation. The robot requests a new chunk before the current one runs out (when the queue drops to `chunk_size_threshold`), then blends overlapping chunks and shapes every command with teleop's velocity/acceleration limits. Returning more rows than `actions_per_chunk` is fine; the extra rows are dropped. Values must be finite.
+
+Inference latency doesn't need to be low. A late chunk makes the arm decelerate to a hold and ramp back out instead of jerking. Each reply must arrive within 60 seconds, and `setup` must finish within 5 minutes, or the robot stops the run.
+
+## `serve`
+
+```python
+serve(
+    policy,
+    host = "0.0.0.0",
+    port = 8765,
+)
+```
+
+Serves `policy` (a `Policy` or a callable `obs -> chunk`) until Ctrl+C. It accepts one robot at a time. An exception in your code is logged and sent back to the robot, which stops the rollout and shows the message.
+
+<Warning>
+  The protocol is unauthenticated plaintext, like the LeRobot inference server.
+  Bind `127.0.0.1` when the model runs on the robot's own machine. Otherwise,
+  keep the server on an isolated, trusted network and firewall the port so only
+  the robot's IP can connect: anyone who can reach it can impersonate the
+  policy and send arbitrary actions.
+</Warning>
+
+## `PolicyServer`
+
+The non-blocking form of `serve`: run it on a background thread, e.g. in a notebook or test.
+
+```python
+import threading
+
+from almond_axol.policy import Observation, PolicyServer
+
+
+def hold(obs: Observation):
+    return obs.state[None, :]
+
+
+server = PolicyServer(hold, host="127.0.0.1", port=0)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+print(server.port)  # the bound port (port=0 picks a free one)
+server.shutdown()
+```
+
+| Method | Description |
+|---|---|
+| `serve_forever()` | Serve until `shutdown()`. |
+| `shutdown()` | Stop serving and close the socket. |
+| `port` | The bound TCP port. |
+
+## `PolicyClient`
+
+The robot's side of the protocol. `run-policy` uses it internally. You can also use it on its own to test a policy server without a robot, e.g. from a unit test that feeds it recorded observations.
+
+```python
+import numpy as np
+
+from almond_axol.policy import CameraSpec, PolicyClient, PolicySpec
+
+spec = PolicySpec(
+    state_names=("left_shoulder_1.pos", "left_gripper.pos"),
+    action_names=("left_shoulder_1.pos", "left_gripper.pos"),
+    cameras=(CameraSpec("overhead", (360, 640, 3)),),
+    fps=30,
+    actions_per_chunk=50,
+    task="pick up the cup",
+)
+with PolicyClient("ws://127.0.0.1:8765") as client:
+    ready = client.connect(spec)
+    client.reset(1)
+    chunk = client.infer(
+        state=[0.0, 1.0],
+        images={"overhead": np.zeros((360, 640, 3), np.uint8)},
+        task="pick up the cup",
+        timestep=0,
+        timestamp=0.0,
+    )
+    print(ready.action_names, chunk.shape)
+```
+
+| Method | Description |
+|---|---|
+| `connect(spec)` | Send `hello` and return the policy's `ReadyInfo` (`action_names`, `name`, `fps`). |
+| `reset(episode)` | Mark an episode boundary. |
+| `infer(state, images, task, timestep, timestamp)` | Send one observation and return its `(T, D)` float32 chunk. |
+| `close()` | Close the connection. |
+
+A policy's `error` reply raises `PolicyRemoteError`, and a malformed message raises `PolicyProtocolError`.
+
+## Wire protocol
+
+If your model isn't in Python, implement this directly. It's a WebSocket server where every message is one **binary** frame:
+
+```
+uint32 big-endian N | N bytes UTF-8 JSON header | raw payload
+```
+
+The header's `"type"` names the message. The robot sends one request at a time and waits for exactly one reply.
+
+| Robot sends | Header fields | Policy replies |
+|---|---|---|
+| `hello` | `protocol` (`"axol-policy"`), `version` (`1`), `robot`, `fps`, `actions_per_chunk`, `task`, `state_names`, `action_names`, `cameras` (`[{name, shape: [h, w, 3]}]`), optional `policy_path` | `ready`: `action_names` (must equal the robot's), optional `name`, `fps` |
+| `reset` | `episode` | `reset_ok` |
+| `observation` | `timestep`, `timestamp`, `task`, `state` (floats, `state_names` order), `images` (`[{name, shape}]`). Payload: each image's uint8 RGB bytes in C order, concatenated in `images` order. | `actions`: `timestep` (echoes the observation's) and `shape` `[T, D]`. Payload: `T × D` little-endian float32, row-major. |
+
+Any request can instead be answered with `{"type": "error", "message": "..."}`. The robot then stops the rollout and shows the message. `almond_axol.policy.protocol` is the reference implementation, and its `encode_*` / `decode_*` functions are usable on their own.
