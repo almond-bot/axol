@@ -1167,22 +1167,28 @@ async def _run(args: argparse.Namespace) -> None:
                 for key in _TRACKING_KEYS:
                     m[key] = math.nan
             per_joint[name] = m
-        if not moved:
-            print(f"{tag}No joint moved more than 1° — nothing to score.")
-            return None
-
         if tag:
             print(f"\n{tag.strip()}")
         _print_metrics_table(per_joint)
 
-        worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
-        summary = {
+        summary: dict[str, Any] = {
             "per_joint": per_joint,
-            "worst_joint": worst[0],
-            "mean_rms_err": float(np.mean([m["rms_err"] for m in moved.values()])),
-            "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
             "completed": bool(b - a >= len(sent)),
         }
+        if moved:
+            worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
+            summary["worst_joint"] = worst[0]
+            summary["mean_rms_err"] = float(
+                np.mean([m["rms_err"] for m in moved.values()])
+            )
+            summary["mean_jitter"] = float(
+                np.mean([m["err_band_mid"] for m in moved.values()])
+            )
+        else:
+            # A hold (the ``hold`` motion): no tracking to score, but the
+            # buzz columns and the wrist IMU's floor under the running
+            # controller are the point of it.
+            print(f"{tag}No joint moved more than 1° — hold: buzz and IMU only.")
         # The pass on the wrist IMUs' clock: its log origin is the execute()
         # start, so the IMU series shares the run's time axis.
         origin = log_abs[a] - log_t[a]
@@ -1254,7 +1260,8 @@ async def _run(args: argparse.Namespace) -> None:
             print(
                 f"    [{k + 1}] {math.degrees(m.get('buzz', math.nan)):.3f}° on {name} "
                 f"@ {m.get('buzz_hz', math.nan):.0f} Hz / "
-                f"{math.degrees(sm['mean_jitter']):.3f}° / {sm['worst_joint']}"
+                f"{math.degrees(sm.get('mean_jitter', math.nan)):.3f}° / "
+                f"{sm.get('worst_joint', 'hold')}"
                 + ("" if sm["completed"] else "  (cut short)")
             )
 
