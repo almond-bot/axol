@@ -128,6 +128,13 @@ _GAIN_FIELDS = (
     "firmware.tf_rated_current_a",
     # The cogging ("osc") cancellation's share of the calibrated series.
     "cogging_gain",
+    # The gravity model's per-link inertials (the body this joint drives):
+    # mass (kg) and centre of mass (m, URDF link frame) — for trying a gravity
+    # correction before committing it to calibration.
+    "mass",
+    "com.x",
+    "com.y",
+    "com.z",
 )
 
 # Column names of a 14-wide motion row: left arm then right arm.
@@ -263,7 +270,7 @@ def _parse_gain_overrides(specs: list[str]) -> dict[tuple[str, str, str], float]
             raise SystemExit(f"--gain: bad value in {spec!r} (want PATH=NUMBER)")
         # ``[side.]joint.friction.fc`` / ``joint.firmware.speed_kp``: fold the
         # sub-field back into one token.
-        if len(parts) >= 2 and parts[-2] in ("friction", "firmware"):
+        if len(parts) >= 2 and parts[-2] in ("friction", "firmware", "com"):
             parts = parts[:-2] + [f"{parts[-2]}.{parts[-1]}"]
         if len(parts) == 3:
             sides, joint, fld = [parts[0]], parts[1], parts[2]
@@ -328,6 +335,10 @@ def _apply_gain_overrides(
             target.friction = replace(target.friction, **{fld.split(".", 1)[1]: value})
         elif fld.startswith("firmware."):
             target.firmware = replace(target.firmware, **{fld.split(".", 1)[1]: value})
+        elif fld.startswith("com."):
+            com = list(target.com)
+            com["xyz".index(fld[-1])] = value
+            target.com = tuple(com)
         else:
             setattr(target, fld, value)
 

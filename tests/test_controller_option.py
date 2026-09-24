@@ -492,6 +492,17 @@ class TuneMotionFlagTest(unittest.TestCase):
         self.assertEqual(cfg.right.shoulder_1.firmware.tf_rated_current_a, 12.0)
         self.assertIsNone(cfg.right.shoulder_2.firmware.tf_rated_current_a)
         self.assertEqual(cfg.right.shoulder_1.cogging_gain, 0.5)
+        grav = tune_motion._parse_gain_overrides(
+            ["right.shoulder_3.com.z=-0.17", "right.wrist_3.mass=0.9"]
+        )
+        cfg2 = AxolConfig()
+        tune_motion._apply_gain_overrides(cfg2, grav)
+        self.assertEqual(cfg2.right.shoulder_3.com[2], -0.17)
+        self.assertEqual(
+            cfg2.right.shoulder_3.com[:2], AxolConfig().right.shoulder_3.com[:2]
+        )
+        self.assertEqual(cfg2.left.shoulder_3.com, AxolConfig().left.shoulder_3.com)
+        self.assertEqual(cfg2.right.wrist_3.mass, 0.9)
         for spec, message in {
             "right.wrist_2.firmware.tf_rated_current_a=3": "Damiao wrist",
             "right.elbow.firmware.tf_rated_current_a=0": "> 0",
