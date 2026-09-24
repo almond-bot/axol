@@ -237,9 +237,15 @@ class EnsureRomGainsTest(unittest.IsolatedAsyncioTestCase):
 
 
 def _arm(
-    drivers: dict[Joint, object], *, is_left: bool = True, config: object = None
+    drivers: dict[Joint, object],
+    *,
+    is_left: bool = True,
+    config: object = None,
+    a4: tuple[Joint, ...] = (),
 ) -> SimpleNamespace:
     cfg = AxolConfig()
+    for j in a4:
+        getattr(cfg.left if is_left else cfg.right, j.value).wire_mode = "a4"
     return SimpleNamespace(
         _is_left=is_left,
         _arm_config=config or (cfg.left if is_left else cfg.right),
@@ -316,11 +322,33 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         # written into a running loop until the reset.
         s1 = _FakeMotor(_stock(), planner=(60000, 10))
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
-            await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+            await apply_firmware_gains(
+                _arm({Joint.SHOULDER_1: s1}, a4=(Joint.SHOULDER_1,)), [Joint.SHOULDER_1]
+            )
         self.assertEqual(s1.planner, {0: 0, 1: 0})
         self.assertEqual(s1.planner_writes, [(0, 0), (1, 0)])
         self.assertEqual(s1.resets, 1)
         self.assertTrue(any("planner_accel 60000 -> 0" in m for m in logs.output))
+
+    async def test_an_impedance_joints_planner_is_left_alone(self) -> None:
+        # The jelly robot: every impedance replay pinned the right arm's
+        # planner to 0 (X8 decel floor 10), and tune.breakaway's single-target
+        # homing then went wild (2026-09-24). On an impedance joint the
+        # planner shapes nothing the core sends: leave the stock 5000 alone,
+        # and do not count it against a held joint.
+        from almond_axol.robot.axol import held_firmware_gain_mismatches
+
+        s1 = _FakeMotor(_stock(), planner=(5000, 5000))
+        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        self.assertEqual(s1.planner, {0: 5000, 1: 5000})
+        self.assertEqual(s1.planner_writes, [])
+        s1.enabled = True
+        self.assertEqual(
+            await held_firmware_gain_mismatches(
+                _arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1]
+            ),
+            [],
+        )
 
     async def test_a_decel_floor_does_not_block_the_gains(self) -> None:
         # Right shoulder_1 as found: accel 0 (direct), decel 10 — the X8
@@ -330,7 +358,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         from almond_axol.robot.axol import held_firmware_gain_mismatches
 
         s1 = _FakeMotor(_stock(), planner=(0, 10), decel_floor=10)
-        arm = _arm({Joint.SHOULDER_1: s1})
+        arm = _arm({Joint.SHOULDER_1: s1}, a4=(Joint.SHOULDER_1,))
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
             await apply_firmware_gains(arm, [Joint.SHOULDER_1])
         self.assertTrue(any("written to ROM" in m for m in logs.output), logs.output)
@@ -343,11 +371,14 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         )
         # Coming back from the planner: accel returns to 0, decel stays at 10.
         s1 = _FakeMotor(_stock(), planner=(60000, 60000), decel_floor=10)
-        await apply_firmware_gains(_arm({Joint.SHOULDER_1: s1}), [Joint.SHOULDER_1])
+        await apply_firmware_gains(
+            _arm({Joint.SHOULDER_1: s1}, a4=(Joint.SHOULDER_1,)), [Joint.SHOULDER_1]
+        )
         self.assertEqual(s1.planner, {0: 0, 1: 10})
 
     async def test_the_planner_override_reaches_the_motor(self) -> None:
         cfg = AxolConfig()
+        cfg.left.shoulder_1.wire_mode = "a4"  # the planner is an a4 setting
         cfg.left.shoulder_1.firmware.planner_accel = 60000.0
         # Each joint owns its block: the shoulder_2 and a fresh config keep 0.
         self.assertEqual(cfg.left.shoulder_2.firmware.planner_accel, 0.0)
@@ -466,7 +497,8 @@ class HeldGainCheckTest(unittest.IsolatedAsyncioTestCase):
         # Stock gains and the planner a test run left on: not the config set.
         s1 = _FakeMotor(_stock(), enabled=True, planner=(60000, 60000))
         got = await held_firmware_gain_mismatches(
-            _arm({Joint.SHOULDER_1: s1}, is_left=False), [Joint.SHOULDER_1]
+            _arm({Joint.SHOULDER_1: s1}, is_left=False, a4=(Joint.SHOULDER_1,)),
+            [Joint.SHOULDER_1],
         )
         self.assertEqual(len(got), 1)
         self.assertTrue(got[0].startswith("right.shoulder_1: "), got)

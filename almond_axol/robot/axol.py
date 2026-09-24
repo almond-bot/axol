@@ -158,6 +158,25 @@ async def _arm_is_unpowered(arm: "AxolArm", bus: CanBus) -> bool:
     )
 
 
+def _wanted_firmware(jc: object) -> dict[str, float]:
+    """The firmware parameters a bring-up should put on this joint's motor.
+
+    ``planner_accel`` only when the joint actually runs on the 0xA4 loop
+    (``wire_mode`` ``a4``): the 0xA4 stream needs it at 0 or 60000, but on an
+    impedance joint the planner shapes nothing the core sends — and every
+    single-target position move the tuners make (``tune.friction`` /
+    ``tune.breakaway`` homing, one 0xA4 target at 14 deg/s) relies on it. The
+    jelly robot's right arm, pinned to 0 by every impedance replay, went wild
+    in ``tune.breakaway``'s homing (2026-09-24): its X8 shoulders (firmware
+    2026042403) refuse a deceleration of 0 and sat at 0 / 10 dps/s.
+    """
+    firmware = getattr(jc, "firmware", None)
+    wanted = firmware.as_dict() if firmware is not None else {}
+    if str(getattr(jc, "wire_mode", "mit")).lower() != "a4":
+        wanted.pop("planner_accel", None)
+    return wanted
+
+
 async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     """Write the configured firmware loop gains of ``joints`` to their motors' ROM.
 
@@ -191,8 +210,7 @@ async def apply_firmware_gains(arm: "AxolArm", joints: Iterable[Joint]) -> None:
     side = "left" if getattr(arm, "_is_left", True) else "right"
     for joint in joints:
         jc = getattr(arm_config, joint.value, None)
-        firmware = getattr(jc, "firmware", None)
-        wanted = firmware.as_dict() if firmware is not None else {}
+        wanted = _wanted_firmware(jc)
         if not wanted:
             continue
         driver = getattr(arm.motors.get(joint), "_driver", None)
@@ -256,8 +274,7 @@ async def held_firmware_gain_mismatches(
     side = "left" if getattr(arm, "_is_left", True) else "right"
     out: list[str] = []
     for joint in joints:
-        firmware = getattr(getattr(arm_config, joint.value, None), "firmware", None)
-        wanted = firmware.as_dict() if firmware is not None else {}
+        wanted = _wanted_firmware(getattr(arm_config, joint.value, None))
         driver = getattr(arm.motors.get(joint), "_driver", None)
         if not wanted or not isinstance(driver, (MyActuatorMotor, DamiaoMotor)):
             continue
