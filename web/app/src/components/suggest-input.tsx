@@ -86,6 +86,10 @@ export function SuggestInput({
             e.preventDefault()
             pick(shown[highlight].value)
           } else if (e.key === "Escape") {
+            // Only dismiss the list: keep the Escape from reaching a
+            // window-level handler (the setup dialog closes on Escape), so a
+            // second press is what closes the surrounding dialog.
+            e.stopPropagation()
             setOpen(false)
             setHighlight(-1)
           }
