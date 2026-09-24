@@ -32,7 +32,8 @@ import {
   type SessionInfo,
   type TrackerSourceReadiness,
 } from "@/lib/supervisor"
-import { CuratedForm, type FieldSuggestion } from "@/components/config-form"
+import { CuratedForm } from "@/components/config-form"
+import type { FieldSuggestion } from "@/components/suggest-input"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { Card, CardContent } from "@/components/ui/card"
