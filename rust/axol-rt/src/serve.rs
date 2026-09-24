@@ -152,6 +152,14 @@
 //!   by the Python torque-residual `ContactWatchdog` (limp gravity-comp
 //!   hold, operator resets); a self-disabled motor just stops contributing
 //!   while the rest of the arm keeps working, as in classic mode.
+//! - **The firmware position loop is the one exception: a runaway goes
+//!   limp.** A joint on 0xA4 / 0x73 is stiff by design, so one more than
+//!   `A4_RUNAWAY_DEV_RAD` from the target it was just sent and moving
+//!   *away* faster than `A4_RUNAWAY_VEL_RAD_S`, on `A4_RUNAWAY_SAMPLES`
+//!   replies in a row, is being driven there by its own loop (right
+//!   shoulder_1 drove itself into its end stop, 2026-09-23). The session goes
+//!   limp as for a silent motor, with the runaway joint braked at the MIT
+//!   maximum kd (`A4_RUNAWAY_KD`) instead of coasting on `LIMP_KD`.
 //! - Every command batch accepts exactly one fresh reply per motor. A missed
 //!   sample suppresses host damping for that tick; bursty loss (4 of the last
 //!   32 ticks) marks the joint *degraded* — host damping stays off until a
@@ -988,6 +996,47 @@ fn a4_speed_cap(cap_track: f64, v_cmd: f64, max_vel: f64) -> f64 {
     (cap_track * v_cmd.abs().to_degrees()).clamp(A4_CAP_FLOOR_DPS.min(fixed), fixed)
 }
 
+/// Runaway guard on the firmware position loop (0xA4 / 0x73): position
+/// error past which a joint moving *away* from its target is running away.
+/// Normal lag is ~1° at the approach speed; right shoulder_1 on a4 with the
+/// planner at 0 in ROM drove itself to its end stop (2026-09-23).
+const A4_RUNAWAY_DEV_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
+/// ...at more than this speed away from the target (30°/s).
+const A4_RUNAWAY_VEL_RAD_S: f64 = 30.0 * std::f64::consts::PI / 180.0;
+/// ...on this many consecutive samples (~6 ms at 480 Hz), so one noisy
+/// reply cannot trip it.
+const A4_RUNAWAY_SAMPLES: u32 = 3;
+/// Firmware damping (Nm·s/rad, the MIT maximum) on the joint that ran away,
+/// once the session is limp: a limp joint's `LIMP_KD` would let a heavy
+/// shoulder coast on into its stop; this brakes it and still hand-guides.
+const A4_RUNAWAY_KD: f64 = 5.0;
+
+/// Per-joint runaway detector for the firmware position loop. Unlike the
+/// deliberately absent deviation abort on impedance joints (see Safety), a
+/// firmware-loop joint is stiff by design: moving fast *away* from its own
+/// target means the loop is driving it there — a hand pushing it would be
+/// fought, not followed — so the core takes it (and the session) limp.
+#[derive(Clone, Copy, Debug, Default)]
+struct RunawayGuard {
+    strikes: u32,
+}
+
+impl RunawayGuard {
+    /// Feed one sample of an a4 joint; true once it has run away.
+    fn check(&mut self, meas_p: f64, meas_v: f64, target: f64) -> bool {
+        let err = meas_p - target;
+        let away = err.abs() > A4_RUNAWAY_DEV_RAD
+            && meas_v.abs() > A4_RUNAWAY_VEL_RAD_S
+            && meas_v.signum() == err.signum();
+        self.strikes = if away { self.strikes + 1 } else { 0 };
+        self.strikes >= A4_RUNAWAY_SAMPLES
+    }
+
+    fn reset(&mut self) {
+        self.strikes = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
     pub p_des: f64,
@@ -1765,6 +1814,47 @@ mod tests {
         // … and nothing else ever does, whatever the tick.
         assert!(!a4_wire(Vendor::MyActuator, WireMode::Mit, true, 250.0));
         assert!(!a4_wire(Vendor::Damiao, WireMode::A4, true, 250.0));
+    }
+
+    #[test]
+    fn runaway_guard_trips_on_sustained_fast_motion_away_from_the_target() {
+        let d = |deg: f64| deg.to_radians();
+        let mut g = RunawayGuard::default();
+        // Shoulder_1 on a4, 2026-09-23: 8° past its target and accelerating
+        // away — trips on the third consecutive sample, not before.
+        assert!(!g.check(d(8.0), d(60.0), 0.0));
+        assert!(!g.check(d(8.5), d(80.0), 0.0));
+        assert!(g.check(d(9.0), d(100.0), 0.0));
+        // Same in the negative direction.
+        let mut g = RunawayGuard::default();
+        for _ in 0..A4_RUNAWAY_SAMPLES - 1 {
+            assert!(!g.check(d(-6.0), d(-40.0), 0.0));
+        }
+        assert!(g.check(d(-6.0), d(-40.0), 0.0));
+    }
+
+    #[test]
+    fn runaway_guard_ignores_lag_slow_drift_and_single_samples() {
+        let d = |deg: f64| deg.to_radians();
+        let mut g = RunawayGuard::default();
+        for _ in 0..10 {
+            // Lagging a fast move: far behind but moving *toward* the target.
+            assert!(!g.check(d(-10.0), d(90.0), 0.0));
+            // Past the target but slow (a settling overshoot, a hand's push).
+            assert!(!g.check(d(7.0), d(10.0), 0.0));
+            // Fast away but inside the normal-lag band.
+            assert!(!g.check(d(2.0), d(90.0), 0.0));
+        }
+        // An isolated bad reply between good ones never accumulates.
+        for _ in 0..10 {
+            assert!(!g.check(d(8.0), d(90.0), 0.0));
+            assert!(!g.check(d(0.5), d(5.0), 0.0));
+        }
+        // reset() (a tick off the position frame) clears the count.
+        g.check(d(8.0), d(90.0), 0.0);
+        g.check(d(8.0), d(90.0), 0.0);
+        g.reset();
+        assert!(!g.check(d(8.0), d(90.0), 0.0));
     }
 
     #[test]
@@ -3210,6 +3300,12 @@ fn bus_loop(
     // forward on the echo's speed between reads (`a4_extrapolate`). Seeded
     // from bring-up's own 0x92 read so the first echo-only tick has a base.
     let mut a4_anchor: [Option<(f64, Instant)>; N_SLOTS] = [None; N_SLOTS];
+    // 0xA4 joints: the target this tick's position frame carried (None on
+    // a tick it went out as MIT), the runaway guard checking replies
+    // against it, and which joint (if any) tripped it.
+    let mut a4_sent: [Option<f64>; N_SLOTS] = [None; N_SLOTS];
+    let mut runaway_guard = [RunawayGuard::default(); N_SLOTS];
+    let mut ran_away = [false; N_SLOTS];
     for m in motors.iter() {
         if m.vendor == Vendor::MyActuator && m.wire == WireMode::A4 {
             a4_anchor[m.slot] = Some((m.hold_pos, Instant::now()));
@@ -3629,7 +3725,11 @@ fn bus_loop(
                     JointCmd {
                         mode: 0.0,
                         kp: 0.0,
-                        kd: LIMP_KD,
+                        kd: if ran_away[m.slot] {
+                            A4_RUNAWAY_KD
+                        } else {
+                            LIMP_KD
+                        },
                         kd_host: 0.0,
                         j_eff: 0.0,
                         ..play[m.slot]
@@ -3638,6 +3738,7 @@ fn bus_loop(
                     play[m.slot]
                 };
                 let c = &c;
+                a4_sent[m.slot] = None;
                 let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
                     // gripper uncommanded until motion_control too). Slot
@@ -3880,6 +3981,7 @@ fn bus_loop(
                         // 0x92 read below restores fine position to the host.
                         a4_follow[motor_index] = true;
                         let target = a4_target(p_cmd, v_trk, m.lead_s);
+                        a4_sent[m.slot] = Some(target);
                         let cap = a4_speed_cap(m.cap_track, v_trk, m.max_vel);
                         (
                             proto::MA_REQ + m.id as u16,
@@ -4153,6 +4255,32 @@ fn bus_loop(
                 // watchdog's job (limp gravity-comp hold, as in classic
                 // mode); a self-disabled motor simply stops contributing,
                 // as it did in classic mode.
+                //
+                // The firmware position loop is the exception: stiff by
+                // design, so a joint on it moving fast *away* from the
+                // target it was just sent is being driven there by its own
+                // loop (`RunawayGuard`). Limp takes every joint off the
+                // position frame; the runaway joint gets the MIT maximum kd
+                // to brake instead of coasting into its stop.
+                let slot = motors[idx].slot;
+                match a4_sent[slot] {
+                    Some(target) => {
+                        if runaway_guard[slot].check(pos, vel, target) && !ran_away[slot] {
+                            ran_away[slot] = true;
+                            go_limp(
+                                limp,
+                                out_tx,
+                                &format!(
+                                    "{iface}: {} ran away on the firmware position loop ({:+.1}° from its target, moving away at {:+.0}°/s) — going limp, that joint braked at kd {A4_RUNAWAY_KD}",
+                                    motors[idx].joint,
+                                    (pos - target).to_degrees(),
+                                    vel.to_degrees(),
+                                ),
+                            );
+                        }
+                    }
+                    None => runaway_guard[slot].reset(),
+                }
             }
 
             // Replies still outstanding at the window's end. Counted into the
