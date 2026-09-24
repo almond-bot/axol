@@ -128,6 +128,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
 - [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+- [Run Your Own Policy](https://docs.almond.bot/operations/custom-policy) — drive the arms from your own (non-LeRobot) model via the `almond_axol.policy` SDK
 - [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
 ### Mantis
@@ -211,3 +212,4 @@ Each operation can be driven from the web control panel or the CLI:
 - [`almond_axol.zed`](https://docs.almond.bot/api/zed)
 - [`almond_axol.motor`](https://docs.almond.bot/api/motor)
 - [`almond_axol.lerobot`](https://docs.almond.bot/api/lerobot)
+- [`almond_axol.policy`](https://docs.almond.bot/api/policy) — serve your own model to `run-policy`: joints + camera frames in, action chunks out

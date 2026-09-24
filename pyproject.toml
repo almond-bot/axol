@@ -38,6 +38,8 @@ dependencies = [
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
     "uvicorn[standard]>=0.42.0,<0.43",
+    # Custom policy protocol (almond_axol.policy): the sync client/server API.
+    "websockets>=13,<16",
     "yourdfpy>=0.0.60,<0.1",
     "opencv-python-headless>=4.13.0.92,<4.14",
 ]

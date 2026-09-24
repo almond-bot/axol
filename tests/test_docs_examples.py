@@ -121,6 +121,7 @@ FRAGMENT_CONTEXT: dict[str, dict[str, str | None]] = {
         "right_cam": None,
     },
     "docs/api/lerobot.mdx": {"robot": "almond_axol.lerobot.robot.AxolRobot"},
+    "docs/operations/custom-policy.mdx": {"load_my_model": None},
 }
 
 # Callables whose documented examples can run in the test process: they touch

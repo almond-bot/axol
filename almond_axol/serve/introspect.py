@@ -18,7 +18,7 @@ import json
 import re
 import types
 from dataclasses import MISSING
-from typing import Any, Union, get_args, get_origin, get_type_hints
+from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
 import draccus
 
@@ -28,22 +28,16 @@ import draccus
 from ..cli import config as _config  # noqa: F401
 
 # Leaf fields whose allowed values we know up front, keyed by the leaf segment
-# of the dotted path, so they render as dropdowns instead of free text.
+# of the dotted path, so they render as dropdowns instead of free text. A
+# dataclass field annotated with a ``Literal`` takes its options from the
+# annotation instead (see ``_literal_options``), so a command-specific choice
+# set — run-policy's ``policy_type`` accepts ``custom``, collect-dagger's does
+# not — can't drift from what draccus will actually accept.
 _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
     "mantis_source": ["quest", "lighthouse", "ultimate"],
     "dataset_resolution": ["SVGA", "HD1080", "HD1200"],
     "eyes": ["both", "left", "right"],
-    "policy_type": [
-        "act",
-        "smolvla",
-        "diffusion",
-        "tdmpc",
-        "vqbet",
-        "pi0",
-        "pi05",
-        "groot",
-    ],
     "aggregate_fn": [
         "temporal_ensemble",
         "weighted_average",
@@ -236,6 +230,32 @@ def _optional_numeric_keys(instance: Any) -> frozenset[str]:
     return frozenset(out)
 
 
+def _literal_options(instance: Any) -> dict[str, list[str]]:
+    """Dataclass field name → allowed values, for ``Literal``-annotated fields.
+
+    ``Optional[Literal[...]]`` counts too (``None`` is dropped from the
+    choices). Non-string literals are skipped; the form's select is textual.
+    """
+    if not dataclasses.is_dataclass(instance) or isinstance(instance, type):
+        return {}
+    try:
+        hints = get_type_hints(type(instance))
+    except Exception:
+        return {}
+    out: dict[str, list[str]] = {}
+    for f in dataclasses.fields(instance):
+        hint = hints.get(f.name)
+        if get_origin(hint) in (Union, types.UnionType):
+            members = [m for m in get_args(hint) if m is not type(None)]
+            hint = members[0] if len(members) == 1 else None
+        if get_origin(hint) is not Literal:
+            continue
+        values = get_args(hint)
+        if values and all(isinstance(v, str) for v in values):
+            out[f.name] = list(values)
+    return out
+
+
 def _children(
     prefix: str,
     values: dict[str, Any],
@@ -248,6 +268,7 @@ def _children(
     out: list[dict[str, Any]] = []
     is_dc = dataclasses.is_dataclass(instance)
     numeric_none = _optional_numeric_keys(instance)
+    literal_options = _literal_options(instance)
     for key, value in values.items():
         if is_dc:
             child = getattr(instance, key, None)
@@ -265,6 +286,7 @@ def _children(
                 docs.get(key),
                 dict_roots,
                 numeric_hint=key in numeric_none,
+                options=literal_options.get(key),
             )
         )
     return out
@@ -279,6 +301,7 @@ def _make_node(
     help_text: str | None,
     dict_roots: set[str],
     numeric_hint: bool = False,
+    options: list[str] | None = None,
 ) -> dict[str, Any]:
     full = f"{prefix}.{key}" if prefix else key
 
@@ -299,7 +322,8 @@ def _make_node(
         }
 
     is_required = bool(prefix == "" and key in required)
-    options = _KNOWN_OPTIONS.get(key)
+    if options is None:
+        options = _KNOWN_OPTIONS.get(key)
 
     if options is not None:
         ftype = "select"
