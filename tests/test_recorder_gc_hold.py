@@ -113,8 +113,8 @@ class RecorderGcHoldTest(unittest.TestCase):
                 side_effect=lambda: events.log.append(("pin", "background+ik")) or True,
             ),
             mock.patch(
-                "almond_axol.utils.affinity.pin_background",
-                side_effect=lambda: events.log.append(("pin", "background")) or True,
+                "almond_axol.utils.affinity.pin_recorder",
+                side_effect=lambda: events.log.append(("pin", "recorder")) or True,
             ),
             mock.patch(
                 "almond_axol.utils.stall_diag.GcHold",
@@ -185,15 +185,15 @@ class RecorderGcHoldTest(unittest.TestCase):
             [("send", "ready"), ("freeze",)],
         )
 
-    def test_imports_run_widened_then_narrow_to_background_by_default(self) -> None:
+    def test_imports_run_widened_then_narrow_to_recorder_by_default(self) -> None:
         # collect-data's recorder: the IK core only for the torch/lerobot
         # import, narrowed back before any reader thread exists (they inherit
         # the affinity) — the IK worker drives the arms from that core.
         events, _ = self._run([None])
         pins = [e[1] for e in events.log if e[0] == "pin"]
-        self.assertEqual(pins, ["background+ik", "background"])
+        self.assertEqual(pins, ["background+ik", "recorder"])
         self.assertLess(
-            events.log.index(("pin", "background")),
+            events.log.index(("pin", "recorder")),
             events.log.index(("send", "ready")),
         )
 

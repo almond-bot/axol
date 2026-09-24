@@ -149,6 +149,25 @@ class RealtimeCameraCoresTest(TestCase):
             self.assertTrue(cores.isdisjoint(groups[group]), group)
         self.assertNotIn(min(groups["relay"]), cores)
 
+    def test_larger_jetsons_add_their_extra_cores_to_the_pool(self) -> None:
+        # AGX Orin 64GB (12) and Thor T5000 (14): the middle cores join the
+        # 8-core pool except the recorder's pair; CPU0 follows the interrupt
+        # exactly as on the Orin NX.
+        for n in (12, 14):
+            extra = set(range(6, n - 4))
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                groups = affinity.core_groups()
+                steered = {affinity.can_irq_cpu()}
+            assert groups is not None
+            self.assertEqual(self._cores(n, {0}), {1, 5} | extra, n)
+            self.assertEqual(self._cores(n, None), {1, 5} | extra, n)
+            cores = self._cores(n, steered)
+            self.assertEqual(cores, {0, 1, 5} | extra, n)
+            assert cores is not None
+            for group in ("can", "realtime", "ik"):
+                self.assertTrue(cores.isdisjoint(groups[group]), (n, group))
+            self.assertNotIn(min(groups["relay"]), cores)
+
     def test_smaller_layouts_still_avoid_cpu0(self) -> None:
         # 6-7 cores: CPU0 is a CAN core, so steering never changes the pool.
         # 5 cores: CPU0 is the relay's Python core and the interrupt CPU, so
@@ -156,8 +175,23 @@ class RealtimeCameraCoresTest(TestCase):
         # CPU is free of control, CAN, relay-Python or the interrupt — no
         # FIFO camera pool at all (the Pi runs no ZED cameras).
         for n, expected in ((6, {4, 5}), (5, {2}), (4, None)):
-            for irq_cpus in (None, {0}, {n - 1}):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                steered = affinity.can_irq_cpu()
+            assert steered is not None
+            for irq_cpus in (None, {0}, {steered}):
                 self.assertEqual(self._cores(n, irq_cpus), expected, (n, irq_cpus))
+
+    def test_an_interrupt_moved_onto_a_camera_core_leaves_the_pool(self) -> None:
+        # irqbalance (or an operator) can move the CAN interrupt after
+        # jetson.setup steered it. A FIFO camera thread on that CPU stalls
+        # both arms' feedback — the 2026-09-02 fault — so the pool drops it.
+        self.assertEqual(self._cores(8, {5}), {0, 1})
+        self.assertEqual(self._cores(12, {6}), {0, 1, 5, 7})
+        self.assertEqual(self._cores(6, {5}), {4})
+        # Two controllers on two CPUs: both are left out.
+        self.assertEqual(self._cores(14, {5, 13}), {0, 1, 6, 7, 8, 9})
+        # A wide nominal mask is the unsteered default: the GIC picks CPU0.
+        self.assertEqual(self._cores(12, set(range(12))), {1, 5, 6, 7})
 
     def test_none_when_partitioning_is_not_applicable(self) -> None:
         self.assertIsNone(self._cores(2, None))
@@ -173,7 +207,7 @@ class CoreGroupsTest(TestCase):
         # bus loops as unpinned CFS threads: a 43.8 ms overrun sent the core
         # limp mid-ROM-sweep, and every >0.5 ms late tick had already gated
         # the shoulder host damping off.
-        for n in (4, 5, 6, 8, 12):
+        for n in (4, 5, 6, 8, 12, 14):
             with patch.object(affinity.os, "cpu_count", return_value=n):
                 groups = affinity.core_groups()
             assert groups is not None
@@ -185,13 +219,12 @@ class CoreGroupsTest(TestCase):
             # Control never shares with throughput work either.
             self.assertTrue(groups["realtime"].isdisjoint(groups["relay"]), n)
             self.assertTrue(groups["realtime"].isdisjoint(groups["background"]), n)
-            # No CPU is invented, and the small layouts use every one.
+            # Every CPU is assigned, none is invented. A 12-core AGX Orin
+            # used to leave 6-9 unassigned and a 14-core Thor 6-11.
             used = set().union(
                 *(groups[g] for g in ("can", "realtime", "ik", "relay", "background"))
             )
-            self.assertTrue(used <= set(range(n)), n)
-            if n <= 8:
-                self.assertEqual(used, set(range(n)), n)
+            self.assertEqual(used, set(range(n)), n)
 
     def test_pi5_layout(self) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=4):
@@ -204,9 +237,69 @@ class CoreGroupsTest(TestCase):
                 "ik": {1},
                 "relay": {0},
                 "background": {0},
+                "recorder": {0},
+                "camera": set(),
                 "irq": {0},
             },
         )
+
+    def _jetson_layout(
+        self, n: int, background: set[int], recorder: set[int], camera: set[int]
+    ) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=n):
+            groups = affinity.core_groups()
+        self.assertEqual(
+            groups,
+            {
+                "can": {n - 2, n - 1},
+                "realtime": {2},
+                "ik": {3},
+                "relay": {4, 5},
+                "background": background,
+                "recorder": recorder,
+                "camera": camera,
+                "irq": {0},
+            },
+            n,
+        )
+
+    def test_orin_nx_16gb_layout(self) -> None:
+        # Also the 8-core AGX Orin 32GB: no spare pair, so the recorder
+        # shares the background cores with the FIFO camera set.
+        self._jetson_layout(8, {0, 1}, recorder={0, 1}, camera={0, 1, 5})
+
+    def test_agx_orin_64gb_layout(self) -> None:
+        # The extra cores go to throughput work; control, IK and relay stay
+        # on the same CPUs as on the Orin NX, CAN stays on the last pair.
+        # The two below CAN are the recorder's, out of the FIFO camera pool.
+        self._jetson_layout(
+            12, {0, 1, 6, 7, 8, 9}, recorder={8, 9}, camera={0, 1, 5, 6, 7}
+        )
+
+    def test_thor_t5000_layout(self) -> None:
+        self._jetson_layout(
+            14,
+            {0, 1, 6, 7, 8, 9, 10, 11},
+            recorder={10, 11},
+            camera={0, 1, 5, 6, 7, 8, 9},
+        )
+
+    def test_dedicated_recorder_cores_never_carry_fifo_camera_work(self) -> None:
+        # On 8 cores FIFO camera threads preempt the recorder on every core
+        # it has (~5 % of each on the 2026-09-14 policy ops). Where a spare
+        # pair exists it is the recorder's alone among throughput work that
+        # may preempt it; CFS GStreamer workers may still share it.
+        for n in (12, 14):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                groups = affinity.core_groups()
+            assert groups is not None
+            self.assertEqual(len(groups["recorder"]), 2, n)
+            self.assertTrue(groups["recorder"] <= groups["background"], n)
+            self.assertTrue(groups["recorder"].isdisjoint(groups["camera"]), n)
+            for group in ("can", "realtime", "ik", "relay", "irq"):
+                self.assertTrue(
+                    groups["recorder"].isdisjoint(groups[group]), (n, group)
+                )
 
     def test_five_core_layout_keeps_a_throughput_core(self) -> None:
         with patch.object(affinity.os, "cpu_count", return_value=5):
@@ -224,7 +317,7 @@ class CoreGroupsTest(TestCase):
 
 class CanIrqCpuTest(TestCase):
     def test_is_the_highest_can_core_and_never_a_camera_core(self) -> None:
-        for n in (8, 6, 5, 4):
+        for n in (14, 12, 8, 6, 5, 4):
             with patch.object(affinity.os, "cpu_count", return_value=n):
                 groups = affinity.core_groups()
                 target = affinity.can_irq_cpu()
@@ -324,6 +417,31 @@ class BackgroundAndIkTest(TestCase):
         assert groups is not None
         self.assertEqual(self._startup_cores(8), groups["background"] | groups["ik"])
         self.assertTrue(self._startup_cores(8).isdisjoint(groups["realtime"]))
+
+    def test_dedicated_recorder_cores_replace_the_ik_loan(self) -> None:
+        # 12+ cores: the recorder's own pair has no FIFO camera work, so
+        # nothing starves the import or the policy-op steady state and the
+        # IK core stays the IK worker's.
+        for n in (12, 14):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                groups = affinity.core_groups()
+            assert groups is not None
+            self.assertEqual(self._startup_cores(n), {n - 4, n - 3}, n)
+            self.assertEqual(self._startup_cores(n), groups["recorder"], n)
+
+    def test_pin_recorder_is_background_without_a_spare_pair(self) -> None:
+        for n, expected in ((4, {0}), (6, {5}), (8, {0, 1}), (12, {8, 9})):
+            applied: list[set[int]] = []
+            with (
+                patch.object(affinity.os, "cpu_count", return_value=n),
+                patch.object(
+                    affinity.os,
+                    "sched_setaffinity",
+                    lambda pid, c: applied.append(set(c)),
+                ),
+            ):
+                self.assertTrue(affinity.pin_recorder())
+            self.assertEqual(applied, [expected], n)
 
     def test_smaller_layouts_never_touch_the_control_core(self) -> None:
         # Below 8 cores ``ik`` collapses onto the control core; the import
@@ -479,3 +597,56 @@ class ControlThreadFifoTest(TestCase):
         ):
             self.assertTrue(affinity.enter_control_thread(required=False))
         fifo.assert_called_once_with(required=False)
+
+
+class DescribeLayoutTest(TestCase):
+    def test_names_every_role_per_host(self) -> None:
+        for n, expected in (
+            (
+                14,
+                "14 cores online: CAN 12-13, control 2, IK 3, relay 4-5, "
+                "recorder 10-11, camera 0-1,5-9",
+            ),
+            (
+                4,
+                "4 cores online: CAN 2-3, control 1, IK 1, relay 0, "
+                "recorder 0, camera -",
+            ),
+            (2, "2 cores online: too few to partition, nothing is pinned"),
+        ):
+            with patch.object(affinity.os, "cpu_count", return_value=n):
+                self.assertEqual(affinity.describe_layout(), expected, n)
+
+
+class OnlineCpusTest(TestCase):
+    """The layout lands on CPUs that exist even if a mode offlines a middle one."""
+
+    def _groups(self, n: int, online: str) -> dict[str, set[int]] | None:
+        with (
+            patch.object(affinity.os, "cpu_count", return_value=n),
+            patch.object(affinity.Path, "read_text", return_value=online + "\n"),
+        ):
+            return affinity.core_groups()
+
+    def test_contiguous_online_list_is_the_plain_numbering(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=12):
+            plain = affinity.core_groups()
+        self.assertEqual(self._groups(12, "0-11"), plain)
+
+    def test_a_gap_maps_every_role_onto_online_cpus(self) -> None:
+        # 12 online out of 14, with 6-7 offline: CAN still gets the top two
+        # online CPUs and nothing names an offline one.
+        groups = self._groups(12, "0-5,8-13")
+        assert groups is not None
+        self.assertEqual(groups["can"], {12, 13})
+        self.assertEqual(groups["realtime"], {2})
+        self.assertEqual(groups["recorder"], {10, 11})
+        used = set().union(*groups.values())
+        self.assertTrue(used <= set(range(6)) | set(range(8, 14)))
+        self.assertEqual(len(used), 12)
+
+    def test_a_disagreeing_or_unreadable_list_falls_back(self) -> None:
+        with patch.object(affinity.os, "cpu_count", return_value=8):
+            plain = affinity.core_groups()
+        self.assertEqual(self._groups(8, "0-11"), plain)
+        self.assertEqual(self._groups(8, "garbage"), plain)

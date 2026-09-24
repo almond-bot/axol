@@ -88,7 +88,7 @@ Teleop and [`collect-data`](/cli/collect-data) share one **GPU-resident** video 
 
 The whole relay — camera grab/encode plus WebRTC sending — runs in a **dedicated subprocess** (`almond_axol.video.video_proc`), the same isolation pattern used for the IK solver: it keeps the camera pump off the teleop process so the control loops stay at full rate. Only SDP signaling crosses the process boundary.
 
-For low-latency encode the NVENC/VIC engine clocks must be pinned to their maximum (the default Jetson devfreq governor scales them for throughput, not latency, which roughly triples per-frame encode time). This is handled by [`axol jetson.setup`](/cli/jetson-setup), run at boot by the installer's systemd unit — not at teleop startup. If no GStreamer hardware encoder is present at all, aiortc falls back to software H.264 — `SVGA` is then the recommended resolution.
+For low-latency encode the NVENC/VIC engine clocks must be pinned to their maximum (the default Jetson devfreq governor scales them for throughput, not latency, which roughly triples per-frame encode time). This is handled by [`axol provision`](/cli/provision) (see [`jetson.setup`](/cli/jetson-setup)) and re-applied at boot by the installer's systemd unit — not at teleop startup. If no GStreamer hardware encoder is present at all, aiortc falls back to software H.264 — `SVGA` is then the recommended resolution.
 
 <a id="jelly"></a>
 

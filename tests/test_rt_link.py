@@ -60,6 +60,20 @@ class RtLinkSchedulingEnvTest(unittest.TestCase):
         self.assertEqual(env["AXOL_RT_FIFO_PRIORITY"], "20")
         self.assertEqual(env["AXOL_RT_BACKGROUND_CPUS"], "0,1")
 
+    def test_agx_orin_64gb_layout(self) -> None:
+        env = self._env(12)
+        self.assertEqual(env["AXOL_RT_CPU_LEFT"], "10")
+        self.assertEqual(env["AXOL_RT_CPU_RIGHT"], "11")
+        self.assertEqual(env["AXOL_RT_FIFO_PRIORITY"], "20")
+        self.assertEqual(env["AXOL_RT_BACKGROUND_CPUS"], "8,9")
+
+    def test_thor_t5000_layout(self) -> None:
+        env = self._env(14)
+        self.assertEqual(env["AXOL_RT_CPU_LEFT"], "12")
+        self.assertEqual(env["AXOL_RT_CPU_RIGHT"], "13")
+        self.assertEqual(env["AXOL_RT_FIFO_PRIORITY"], "20")
+        self.assertEqual(env["AXOL_RT_BACKGROUND_CPUS"], "10,11")
+
     def test_unpartitioned_host_requests_nothing(self) -> None:
         env = self._env(2)
         for key in (

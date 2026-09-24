@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterable
+from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
@@ -47,9 +48,13 @@ _logger = logging.getLogger(__name__)
 # is skipped (the groups collapse onto whatever's available).
 _MIN_CORES = 4
 
+# The kernel's online CPU list; the layout is built over these IDs.
+_CPU_ONLINE = "/sys/devices/system/cpu/online"
+
 
 def core_groups() -> dict[str, set[int]] | None:
-    """``{"can", "realtime", "ik", "relay", "background", "irq"}`` → core sets.
+    """Role → core set: ``can``, ``realtime``, ``ik``, ``relay``, ``background``,
+    ``recorder``, ``camera`` and ``irq``.
 
     Based on the machine's *physical* core count, NOT the process's current
     affinity: the control process pins itself before spawning the relay/recorder,
@@ -58,13 +63,61 @@ def core_groups() -> dict[str, set[int]] | None:
     a restricted mask). Reading the inherited mask would wrongly see only the
     realtime cores.
 
-    8+ cores: CAN 2 / Python control 1 / IK 1 / relay 2 / dataset 2. Each CAN
-    arm gets one of the final two cores, away from CPU0: the Jetson routes its
-    xHCI interrupt there, and both USB CAN adapters plus the cameras traverse
-    that controller. Dataset work gets CPUs 0-1 because it tolerates those
-    interrupts. This also avoids the old shared ``realtime`` layout where
-    camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor ticks late.
-    ``ik`` remains a dedicated core so it cannot deschedule CAN or Python.
+    The supported compute modules, by online core count:
+
+    ===========================  ==  =====  ==  ==  =====  ========  =====  =======
+    Host                         n   can    rt  ik  relay  bg        rec    camera
+    ===========================  ==  =====  ==  ==  =====  ========  =====  =======
+    Raspberry Pi 5               4   2-3    1   1   0      0         0      -
+    Orin NX 16GB, AGX Orin 32GB  8   6-7    2   3   4-5    0-1       0-1    0-1,5
+    AGX Orin 64GB / Industrial   12  10-11  2   3   4-5    0-1,6-9   8-9    0-1,5-7
+    Thor T5000                   14  12-13  2   3   4-5    0-1,6-11  10-11  0-1,5-9
+    ===========================  ==  =====  ==  ==  =====  ========  =====  =======
+
+    (``n`` = online cores, ``bg`` = ``background``, ``rec`` = ``recorder``.)
+    ``relay`` holds the relay's Python core (its lowest CPU) plus a GStreamer
+    core; ``background`` is every throughput core, where the relay's CFS
+    GStreamer pool may run (:func:`isolate_relay_cpu`). ``recorder`` is where
+    the dataset recorder and the Rust trace writers live, and ``camera`` is
+    where ``SCHED_FIFO`` camera work may (:func:`realtime_camera_cores`, which
+    also drops CPU0 while the CAN interrupt can still land there).
+
+    ``os.cpu_count()`` is the *online* count, so a Jetson in an ``nvpmodel``
+    mode that offlines cores gets the layout for what it actually has;
+    ``jetson.setup`` selects the max mode, which onlines every core. The table
+    is by position in the online list (:func:`_online_cpus`), which is the
+    CPU number itself whenever the online CPUs are ``0..n-1`` — every mode
+    seen so far offlines from the top. A mode that offlined a CPU in the
+    middle would otherwise hand CAN or control a CPU that is not there, and
+    the pin would fail.
+
+    8+ cores: CAN 2 / Python control 1 / IK 1 / relay 2 / dataset the rest.
+    Each CAN arm gets one of the final two cores, away from CPU0: the Jetson
+    routes its xHCI interrupt there, and both USB CAN adapters plus the
+    cameras traverse that controller. Dataset work gets CPUs 0-1 because it
+    tolerates those interrupts. This also avoids the old shared ``realtime``
+    layout where camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor
+    ticks late. ``ik`` remains a dedicated core so it cannot deschedule CAN or
+    Python.
+
+    On the bigger modules (AGX Orin 64GB, Thor T5000) every core past the
+    8-core layout goes to throughput work, keeping the CAN pair last and the
+    control, IK and relay cores where they are on the Orin NX. The
+    latency-critical roles keep one core each (a FIFO bus loop per arm, the
+    GIL-bound control and relay-send loops, a ~1-core IK solve); the side
+    that ran short on 8 cores is throughput. There the recorder shares every
+    background core with the FIFO camera set (the relay's capture chain and
+    the Argus daemon), and FIFO preempts CFS unconditionally, so the recorder
+    gets only what the cameras leave — ~5 % of each core on the policy ops
+    (2026-09-14), which is why :func:`pin_background_and_ik` lends it the IK
+    core. With cores to spare, the two below CAN become ``recorder`` and are
+    left out of ``camera``: no FIFO thread is ever scheduled there, so the
+    recorder's CPU is guaranteed rather than borrowed. The CFS GStreamer pool
+    may still use them — CFS shares fairly with the recorder, and the mux-only
+    recorder needs ~40 % of one core, so fencing them off entirely would idle
+    most of two CPUs. Every other extra core joins ``camera``. Before this
+    layout a 12- or 14-core host used the 8-core groups unchanged and left the
+    middle cores unassigned.
 
     ``irq`` names the CPU the kernel delivers that interrupt to by default
     (CPU0 on every Jetson seen so far). Only *CFS* work may run there: a CAN
@@ -124,17 +177,25 @@ def core_groups() -> dict[str, set[int]] | None:
         # CPU0 takes the Jetson's xHCI interrupt by default (both USB CAN
         # adapters and cameras) and is therefore a poor place for a motor
         # deadline. Put the Rust bus loops on the last two cores and leave the
-        # housekeeping CPUs to throughput-tolerant dataset work.
+        # housekeeping CPUs to throughput-tolerant dataset work. Every core
+        # between the relay and CAN (6-9 on an AGX Orin, 6-11 on a Thor
+        # T5000) is throughput work too: the latency-critical roles need one
+        # core each on every host.
         can = {n - 2, n - 1}
         rt = {2}
         ik = {3}
         relay = {4, 5}
-        bg = {0, 1}
+        bg = {0, 1} | set(range(6, n - 2))
+        # 12+ cores: the two below CAN are the recorder's, free of FIFO
+        # camera work. 8-11 cores have no spare pair; the recorder shares the
+        # background cores and borrows IK (pin_background_and_ik).
+        recorder = {n - 4, n - 3} if n >= 12 else bg
     elif n >= 6:
         can = {0, 1}
         rt = ik = {2}
         relay = {3, 4}
         bg = set(range(5, n))
+        recorder = bg
     else:
         # 4-5 cores: the bus loops get the last two cores (pinned + FIFO via
         # rt.link, exactly as on 8+), Python control/IK one core, and the
@@ -142,24 +203,85 @@ def core_groups() -> dict[str, set[int]] | None:
         # work may share — take the relay and dataset throughput work.
         can = {n - 2, n - 1}
         rt = ik = {1}
-        relay = bg = set(range(0, n - 2)) - rt
-    return {
+        relay = bg = recorder = set(range(0, n - 2)) - rt
+    # FIFO camera work: the relay's GStreamer core plus the background cores,
+    # never the relay's Python core (small layouts overlap relay and
+    # background) and never a dedicated recorder core.
+    relay_py = {min(relay)}
+    camera = (relay | bg) - relay_py
+    if recorder != bg:
+        camera -= recorder
+    ids = _online_cpus(n)
+    groups = {
         "can": can,
         "realtime": rt,
         "ik": ik,
         "relay": relay,
         "background": bg,
+        "recorder": recorder,
+        "camera": camera,
         "irq": irq,
     }
+    return {role: {ids[i] for i in cores} for role, cores in groups.items()}
+
+
+def _online_cpus(n: int) -> list[int]:
+    """The online CPU IDs, ascending; ``0..n-1`` when they can't be read.
+
+    ``n`` is ``os.cpu_count()``, which glibc reads from the same kernel list,
+    so the two agree except for a CPU changing state between the reads (or a
+    ``PYTHON_CPU_COUNT`` override); then the plain ``0..n-1`` numbering is used,
+    exactly as before this lookup existed.
+    """
+    try:
+        text = Path(_CPU_ONLINE).read_text().strip()
+        online: set[int] = set()
+        for part in text.split(","):
+            lo, _, hi = part.partition("-")
+            online.update(range(int(lo), int(hi or lo) + 1))
+    except (OSError, ValueError):
+        return list(range(n))
+    return sorted(online) if len(online) == n else list(range(n))
+
+
+def describe_layout() -> str:
+    """One line naming this host's core partition, for provisioning logs."""
+    groups = core_groups()
+    n = os.cpu_count() or 0
+    if groups is None:
+        return f"{n} cores online: too few to partition, nothing is pinned"
+    labels = (
+        ("can", "CAN"),
+        ("realtime", "control"),
+        ("ik", "IK"),
+        ("relay", "relay"),
+        ("recorder", "recorder"),
+        ("camera", "camera"),
+    )
+    parts = [f"{label} {_cpu_ranges(groups[key]) or '-'}" for key, label in labels]
+    return f"{n} cores online: " + ", ".join(parts)
+
+
+def _cpu_ranges(cores: set[int]) -> str:
+    """``{0, 1, 5, 6, 7}`` → ``"0-1,5-7"``."""
+    spans: list[list[int]] = []
+    for cpu in sorted(cores):
+        if spans and cpu == spans[-1][1] + 1:
+            spans[-1][1] = cpu
+        else:
+            spans.append([cpu, cpu])
+    return ",".join(str(lo) if lo == hi else f"{lo}-{hi}" for lo, hi in spans)
 
 
 def realtime_camera_cores() -> set[int] | None:
     """Cores where ``SCHED_FIFO`` camera work is allowed to run.
 
-    The relay's throughput cores (everything but its Python core) plus the
-    background cores — the same pool :func:`isolate_relay_cpu` gives the CFS
-    GStreamer workers — **minus** the ``irq`` CPU while the CAN adapters'
-    interrupt can still be delivered there. The capture chain the relay
+    The ``camera`` group — the relay's throughput cores (everything but its
+    Python core) plus the background cores, i.e. the pool
+    :func:`isolate_relay_cpu` gives the CFS GStreamer workers, less any
+    dedicated ``recorder`` cores (12+ core hosts, see :func:`core_groups`) —
+    **minus** the ``irq`` CPU while the CAN adapters' interrupt can still be
+    delivered there. The capture chain the relay
     elevates (:func:`prioritize_capture_threads`) and the Argus daemon
     ``jetson.setup`` elevates both live here, so neither can sit on the CPU
     the CAN replies arrive on (see :func:`core_groups`), nor land on a
@@ -167,7 +289,9 @@ def realtime_camera_cores() -> set[int] | None:
 
     Once ``jetson.setup`` has steered that interrupt onto a CAN core
     (:func:`can_irq_cpu`, checked live via ``jetson.can_irq_cpus``), the
-    ``irq`` CPU is an ordinary throughput core again and rejoins the pool.
+    ``irq`` CPU is an ordinary throughput core again and rejoins the pool; if
+    the interrupt has been moved onto a camera core instead, that core is the
+    one left out (:func:`_can_irq_cpus_to_avoid`).
     Confining the whole FIFO set — some 30 relay threads plus the Argus
     daemon — to two cores instead of three left the CFS work sharing those
     cores (the NVENC feed threads, the recorder) preempted for long
@@ -181,26 +305,29 @@ def realtime_camera_cores() -> set[int] | None:
     groups = core_groups()
     if groups is None:
         return None
-    relay = sorted(groups["relay"])
-    py_core = {relay[0]} if relay else set()
-    cores = (set(relay[1:]) | groups["background"]) - py_core
-    if _can_irq_may_land_on(groups["irq"]):
-        cores -= groups["irq"]
+    cores = set(groups["camera"]) - _can_irq_cpus_to_avoid(groups)
     return cores or None
 
 
-def _can_irq_may_land_on(cpus: set[int]) -> bool:
-    """Whether the CAN adapters' interrupt can still be delivered to ``cpus``.
+def _can_irq_cpus_to_avoid(groups: dict[str, set[int]]) -> set[int]:
+    """The CPUs the CAN adapters' interrupt is delivered to, conservatively.
 
-    ``True`` unless the interrupt's live affinity is readable *and* proves it
-    is steered elsewhere — the conservative reading, because a FIFO camera
-    thread on the interrupt's CPU stalls both arms' feedback.
+    Where it is pinned to a CPU or two (``jetson.setup``'s steering onto a CAN
+    core, or wherever ``irqbalance`` or an operator put it since), exactly
+    those. Where that is unknown (no ``/proc`` row, unreadable affinity, not a
+    Jetson) or the mask is wide (the unsteered default: the GIC then delivers
+    to CPU0), the ``irq`` CPU. A FIFO camera thread on the interrupt's CPU
+    stalls both arms' feedback, so the pool leaves it out whichever it is —
+    before, only CPU0 was ever left out, and an interrupt moved onto a camera
+    core (``irqbalance`` rebalances every 10 s) went unnoticed.
     """
     # utils.jetson imports this module at top level; import lazily.
     from .jetson import can_irq_cpus
 
     delivered = can_irq_cpus()
-    return delivered is None or bool(delivered & cpus)
+    if delivered is None or len(delivered) > len(groups["can"]):
+        return set(groups["irq"])
+    return delivered
 
 
 def can_irq_cpu() -> int | None:
@@ -267,8 +394,18 @@ def pin_relay() -> bool:
 
 
 def pin_background() -> bool:
-    """Pin the calling process to the background cores (dataset recorder + gst)."""
+    """Pin the calling process to the background (throughput) cores."""
     return _pin("background")
+
+
+def pin_recorder() -> bool:
+    """Pin the calling process to the recorder cores (dataset recorder steady state).
+
+    Two cores of its own that no ``SCHED_FIFO`` camera thread may use on 12+
+    core hosts (AGX Orin 64GB, Thor T5000); the background cores elsewhere,
+    where this is equivalent to :func:`pin_background`.
+    """
+    return _pin("recorder")
 
 
 def pin_background_and_ik() -> bool:
@@ -311,10 +448,18 @@ def pin_background_and_ik() -> bool:
     Only a dedicated IK core is borrowed: on hosts where ``ik`` collapses onto
     the control core (<8 cores) the recorder stays on ``background`` — control
     never shares a CPU with throughput work.
+
+    Nothing is borrowed where the recorder has cores of its own (12+ cores,
+    see :func:`core_groups`): no FIFO camera thread runs there, so neither the
+    import nor the policy-op steady state is starved, and this pins the
+    recorder cores — the IK core stays the IK worker's, which on
+    ``collect-dagger`` drives the operator's interventions.
     """
     groups = core_groups()
     if groups is None:
         return False
+    if groups["recorder"] != groups["background"]:
+        return _apply(groups["recorder"], "recorder")
     spare_ik = groups["ik"] - groups["realtime"]
     return _apply(groups["background"] | spare_ik, "background+ik")
 

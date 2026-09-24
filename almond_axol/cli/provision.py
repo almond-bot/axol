@@ -41,6 +41,14 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       :mod:`almond_axol.utils.rtprio`).
 * ``tracker.install`` — pinned libsurvive + Vive USB permissions for Mantis
                         Lighthouse tracking.
+* host tuning       — the per-boot runtime tuning for the host it runs on
+                      (:func:`tune_host`). On a Jetson (Orin NX, AGX Orin,
+                      Thor): the max ``nvpmodel`` mode, engine + CPU clock
+                      pins, the CAN interrupt steered onto a CAN core, and the
+                      Argus daemon made ``SCHED_FIFO`` on the camera cores
+                      (see :mod:`almond_axol.utils.jetson`). Nothing to tune on
+                      a Raspberry Pi 5 or a workstation; it still logs the
+                      core layout the loops will pin to.
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -52,9 +60,12 @@ command exit non-zero once every other step has had its chance. The hosted
 installer and post-upgrade path pass ``--require-rt`` (accepted for
 compatibility: the required control-core install already fails the command).
 
-It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
-``axol jetson.setup``, a per-boot runtime tweak owned by the systemd
-``ExecStartPre``, not an install step.
+That tuning resets on every reboot, so ``axol provision --boot`` — the
+tuning step alone, no installs and no update lock — is the systemd unit's
+``ExecStartPre`` and re-applies it at each boot. An operator never runs a
+second command: ``axol provision`` leaves the host fully set up now, and the
+unit keeps it that way. ``axol jetson.setup`` is kept as an alias of
+``--boot`` for units written by older installers.
 """
 
 from __future__ import annotations
@@ -70,12 +81,13 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb, can_purge, rtprio
+from ..utils import adb, affinity, can_purge, jetson, rtprio
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
     host_update_lock,
 )
+from ..utils.state_files import privileged_service_active
 from ..utils.sudo import prime_sudo, run_root
 from ..zed import calibration as zed_calibration
 from . import tracker_install
@@ -210,7 +222,16 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         help=(
             "Install/refresh the non-PyPI + system pieces "
             "(cameras, adb, Lighthouse tracking, board access, the operator's "
-            "real-time scheduling grant, and the axol-rt control core)."
+            "real-time scheduling grant, and the axol-rt control core), then "
+            "apply this host's real-time tuning (Jetson clocks, CAN interrupt)."
+        ),
+    )
+    parser.add_argument(
+        "--boot",
+        action="store_true",
+        help=(
+            "apply only the per-boot host tuning (Jetson clocks, CAN interrupt, "
+            "camera daemon scheduling) — the systemd unit's ExecStartPre"
         ),
     )
     parser.add_argument(
@@ -273,12 +294,36 @@ def _sudo_held_update_lock() -> Iterator[None]:
         holder.wait()
 
 
-def run(_args: object = None) -> None:
+def tune_host(*, interactive: bool = False) -> None:
+    """Apply the runtime tuning this host needs; it resets on every reboot.
+
+    Decided by what the host exposes, never by a hard-coded board list: the
+    Jetson steps self-gate on the L4T release file / Tegra devfreq nodes, the
+    clock pins on whichever engine nodes exist (Orin's ``*.nvenc``/``*.gpu``,
+    Thor's ``gpu-gpc-*``/``gpu-nvd-*``), and the interrupt / daemon placement
+    on the online core count (:func:`affinity.core_groups`). The layout is
+    logged *after* the power-mode step, which can online cores.
+    """
+    model = jetson.host_model() or "unknown board"
+    if jetson._is_jetson():
+        _logger.info("host: %s (Jetson) — applying the real-time tuning", model)
+        jetson.pin_realtime_clocks(interactive=interactive)
+    else:
+        _logger.info("host: %s — no Jetson tuning to apply", model)
+    _logger.info("core layout: %s", affinity.describe_layout())
+
+
+def run(args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
     # Surface each step's INFO outcome (what was granted/installed, or already
     # in place) so a run at a customer site is verifiable from its output alone;
     # force=True in case an imported dependency already installed a handler.
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    if getattr(args, "boot", False):
+        # Per-boot: nothing to install, nothing that rewrites the tool env, so
+        # no update lock (a boot-time ExecStartPre must never wait on one).
+        tune_host(interactive=sys.stdin.isatty())
+        return
     lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
     try:
         with lock():
@@ -347,6 +392,26 @@ def _run_locked() -> None:
     # step it is reported rather than aborting the run, and any failure makes
     # the command exit non-zero below.
     step("axol-rt realtime core (rt.install)", rt_install.run)
+    # Last, so the Argus daemon and CAN interfaces the earlier steps may have
+    # (re)installed exist, and so this run leaves the host tuned now rather
+    # than at its next boot. The same step is the unit's per-boot hook.
+    #
+    # Not from inside `axol serve` (the self-updater's post-upgrade pass and
+    # its startup heal): those can overlap a robot session, and moving the
+    # camera daemon or switching the power mode under a live session is what
+    # the boot hook exists to avoid. They need not tune anyway — the update
+    # ends in a service restart and the heal follows one, and axol.service's
+    # ExecStartPre tunes the host before serve starts every time.
+    if privileged_service_active():
+        _logger.info(
+            "host tuning: left to axol.service's ExecStartPre (runs before "
+            "serve starts, including on the restart an update ends with)"
+        )
+    else:
+        step(
+            "host tuning (Jetson clocks, CAN interrupt, camera daemon)",
+            lambda: tune_host(interactive=sys.stdin.isatty()),
+        )
 
     if failed:
         raise SystemExit(

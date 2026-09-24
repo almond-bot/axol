@@ -689,7 +689,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
             patch("almond_axol.video.shm_frames.SnapshotReader") as snapshot,
             patch.object(record_proc, "_open_dataset") as open_dataset,
@@ -729,7 +729,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
             patch.object(record_proc, "_open_dataset", return_value=dataset),
             patch.object(
@@ -960,7 +960,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_dataset_encoder"),
             patch.object(record_proc, "_open_dataset", return_value=dataset),
             patch.object(record_proc, "_EpisodeVideoVerifier", return_value=verifier),

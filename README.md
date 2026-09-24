@@ -64,13 +64,14 @@ The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separate
 axol zed.install
 ```
 
-Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once:
 
 ```bash
 axol gst.install
 axol gst.build-zed   # build the patched ZED source plugins (needs the ZED SDK)
-axol jetson.setup    # Jetson only; no-op elsewhere
 ```
+
+`axol provision` runs both of these and, on a Jetson (Orin NX, AGX Orin, Thor), also pins the NVENC/VIC/GPU and CPU clocks and steers the CAN interrupt for the real-time loops. It is the one command a host needs; the installer's systemd unit re-applies the per-boot part (`axol provision --boot`) at every boot.
 
 Before using any motor or robot commands, initialize the CAN hardware:
 
