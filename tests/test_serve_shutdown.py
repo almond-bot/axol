@@ -22,10 +22,10 @@ from almond_axol.cli.can import setup
 from almond_axol.serve import app as app_module
 from almond_axol.serve.manager import Session
 from tests.test_serve_session_reservation import (
+    _hub_state,
     _Manager,
     _Robot,
     _Runner,
-    _hub_state,
     _test_app,
 )
 

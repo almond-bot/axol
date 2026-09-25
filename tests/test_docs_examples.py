@@ -37,7 +37,6 @@ import os
 import re
 import shlex
 import tempfile
-import tomllib
 import types
 import typing
 import unittest
@@ -46,6 +45,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+import tomllib
 
 REPO = Path(__file__).resolve().parent.parent
 DOC_FILES = sorted((REPO / "docs").rglob("*.mdx")) + [REPO / "README.md"]

@@ -51,9 +51,9 @@ from ..kinematics.config import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
+from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
-from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
 
