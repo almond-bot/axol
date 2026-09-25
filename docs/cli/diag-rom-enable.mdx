@@ -3,7 +3,7 @@ title: "diag.rom-enable"
 description: "Range-of-motion soak test: sweep every joint for two hours."
 ---
 
-Enables the motors, eases to home, then loops a full range-of-motion sweep of every joint for two hours. On a full-robot run it first prompts to clamp each gripper onto an item and holds it for the duration; when the soak finishes (or on Ctrl-C) the robot returns home with the item still gripped and the motors left enabled — run [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) afterwards to release it and power down.
+Enables the motors, eases to home, then loops a range-of-motion sweep of every joint for two hours, stopping 5° short of each joint limit so the motors are never driven into the ends of travel. On a full-robot run it first prompts to clamp each gripper onto an item and holds it for the duration; when the soak finishes (or on Ctrl-C) the robot returns home with the item still gripped and the motors left enabled — run [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) afterwards to release it and power down.
 
 The arms are driven through the Rust realtime core — the same control path as [`teleop`](/cli/teleop) — so the soak exercises exactly the controller the robot ships with: the core owns the CAN buses, renders the streamed sweep at 240 Hz, and runs the host damping against fresh feedback.
 
