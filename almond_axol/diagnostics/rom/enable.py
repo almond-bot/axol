@@ -1,9 +1,9 @@
 """
 rom.enable
 
-Range of motion test for the Axol robot. Sweeps every joint through its
-range, stopping ROM_LIMIT_MARGIN (5°) short of each joint limit so the motors
-are never driven hard into the ends of travel.
+Range of motion test for the Axol robot. Sweeps every joint through its full
+range, except wrist_2 and wrist_3, which stop ROM_LIMIT_MARGIN (5°) short of
+each limit so those motors are never driven hard into the ends of travel.
 
 Enables the motors, eases to home, then prompts to close each gripper onto the
 item and loops the sweep for two hours. When the soak finishes (or on Ctrl-C)
@@ -86,7 +86,14 @@ from ...constants import (
     Joint,
 )
 from ...motor import CanBus, Motor, MotorError
-from ...robot import axol as _axol_limits
+from ...robot.axol import (
+    ELBOW_LEFT_LIMITS,
+    ELBOW_RIGHT_LIMITS,
+    SHOULDER_1_LEFT_LIMITS,
+    SHOULDER_2_LEFT_LIMITS,
+    SHOULDER_2_RIGHT_LIMITS,
+)
+from ...robot.axol import LIMITS as _AXOL_LIMITS
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
 from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
@@ -113,10 +120,12 @@ AXOL_WAYPOINT_PAUSE = 1.0  # seconds
 SOAK_DURATION = 7200  # seconds (2 hours)
 CYCLE_PAUSE = 2.0  # seconds
 
-# Every sweep stops this far inside each joint limit. Commanding the exact
-# limit parks the joint against its end of travel for the whole waypoint
-# pause, which over a two-hour soak overtorques the motors.
+# wrist_2 and wrist_3 stop this far inside each joint limit. Commanding their
+# exact limit parks the joint against its end of travel for the whole waypoint
+# pause, which over a two-hour soak overtorques those motors. Every other joint
+# still sweeps to its full limit.
 ROM_LIMIT_MARGIN = math.radians(5)  # rad
+ROM_INSET_JOINTS = frozenset({Joint.WRIST_2, Joint.WRIST_3})
 
 
 def _inset(limits: tuple[float, float]) -> tuple[float, float]:  # rad
@@ -125,13 +134,9 @@ def _inset(limits: tuple[float, float]) -> tuple[float, float]:  # rad
     return low + ROM_LIMIT_MARGIN, high - ROM_LIMIT_MARGIN
 
 
-SHOULDER_1_LEFT_LIMITS = _inset(_axol_limits.SHOULDER_1_LEFT_LIMITS)
-SHOULDER_2_LEFT_LIMITS = _inset(_axol_limits.SHOULDER_2_LEFT_LIMITS)
-SHOULDER_2_RIGHT_LIMITS = _inset(_axol_limits.SHOULDER_2_RIGHT_LIMITS)
-ELBOW_LEFT_LIMITS = _inset(_axol_limits.ELBOW_LEFT_LIMITS)
-ELBOW_RIGHT_LIMITS = _inset(_axol_limits.ELBOW_RIGHT_LIMITS)
 LIMITS: dict[Joint, tuple[float, float]] = {
-    joint: _inset(limits) for joint, limits in _axol_limits.LIMITS.items()
+    joint: _inset(limits) if joint in ROM_INSET_JOINTS else limits
+    for joint, limits in _AXOL_LIMITS.items()
 }
 
 WRIST_TEST_ELBOW_ANGLE = math.pi / 2  # rad
