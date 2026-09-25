@@ -78,7 +78,6 @@ from .myactuator import (
 from .myactuator import _uint_to_float as _ma_uint_to_float
 from .types import MotorStatus
 
-
 # The RT core's motor-facing target. Timing snapshots also use this reference
 # deliberately: the resulting missed-cycle count answers whether traffic
 # actually met the production 240 Hz bar instead of grading a loop

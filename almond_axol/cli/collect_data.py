@@ -96,6 +96,7 @@ from ..teleop_activity import TeleopActivityMarker
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag
+from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.proc_diag import SystemDiag
 from ..utils.stall_diag import (
     GcHold,
@@ -104,7 +105,6 @@ from ..utils.stall_diag import (
     install_gc_pause_logger,
     unfreeze_heap,
 )
-from ..utils.logquiet import quiet_noisy_loggers
 from .config import (
     DatasetResolution,
     LogLevel,

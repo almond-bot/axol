@@ -16,7 +16,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ACTIVITY_PATH = Path.home() / ".almond" / "teleop-control-active.json"
 
 

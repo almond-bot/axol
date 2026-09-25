@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def main_args(args: argparse.Namespace) -> None:
     """Run the selected suite over the capture and print its report."""
+    from ..teleop.recorder import resolve_or_latest
     from ..tuning import save_run
     from ..tuning.offline import (
         filtering_analysis,
@@ -96,8 +97,6 @@ def main_args(args: argparse.Namespace) -> None:
         print_wifi_report,
         wifi_analysis,
     )
-
-    from ..teleop.recorder import resolve_or_latest
 
     analyze, report = {
         "wifi": (wifi_analysis, print_wifi_report),

@@ -5,8 +5,8 @@ import struct
 import numpy as np
 import pytest
 
-from almond_axol.robot.jelly import deadzone, mix
 from almond_axol.robot.config import AxolConfig
+from almond_axol.robot.jelly import deadzone, mix
 from almond_axol.robot.lift import _decode_status
 from almond_axol.teleop.worker import (
     _quat_xyzw_to_matrix,

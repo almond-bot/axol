@@ -6,6 +6,7 @@ import sys
 
 from ..rt import install as rt_install
 from ..utils.dotenv import load_local_env
+from . import calibration as calibration_cmd
 from . import (
     mantis_latency,
     mantis_session,
@@ -16,7 +17,6 @@ from . import (
     tracker_pair,
     tracker_ultimate,
 )
-from . import calibration as calibration_cmd
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
