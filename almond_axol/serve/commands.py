@@ -94,6 +94,7 @@ class CommandDef:
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
         field_suggestions: Mapping[str, SuggestionProvider] | None = None,
+        strict_fields: tuple[str, ...] = (),
         settings_like: str | None = None,
         module: str = "almond_axol",
         section: str | None = None,
@@ -176,14 +177,28 @@ class CommandDef:
         # fetches it (``/api/commands/{id}/suggestions/{field}``) whenever the
         # op's form is editable and offers the values inside the text input —
         # typing stays free-form, so the list is a convenience, never a
-        # constraint. Providers may block on I/O (a network listing of a
-        # remote model registry); they run on a worker thread, and a failure
-        # is reported alongside an empty list rather than breaking the form.
-        # The built-in repo-id picker (``/api/datasets``) predates this and
-        # stays as it is.
+        # constraint (unless the field is also in ``strict_fields``).
+        # Providers may block on I/O (a network listing of a remote model
+        # registry); they run on a worker thread, and a failure is reported
+        # alongside an empty list rather than breaking the form. The built-in
+        # repo-id picker (``/api/datasets``) predates this and stays as it is.
         self.field_suggestions: dict[str, SuggestionProvider] = dict(
             field_suggestions or {}
         )
+        # Suggested fields whose value must be one of the suggestions — a
+        # catalog the value is looked up in, not a convenience: the panel
+        # renders them as a select over the provider's rows (no free typing),
+        # and ``check_strict_fields`` refuses a start whose value is not in
+        # the list, so an older panel's text input cannot get past it either.
+        # Emptiness is the schema's business (a required field with no value
+        # is refused by the config parse), so a blank value passes here.
+        missing_provider = [f for f in strict_fields if f not in self.field_suggestions]
+        if missing_provider:
+            raise ValueError(
+                f"{id}: strict field(s) {', '.join(missing_provider)} need a "
+                "field_suggestions provider"
+            )
+        self.strict_fields = tuple(strict_fields)
         # Borrow another op's settings targets. Settings are declared as dotted
         # config paths per op, so an op embedding the same config dataclasses
         # inherits the whole mapping instead of re-declaring it.
@@ -944,6 +959,40 @@ def field_suggestions(command_id: str, field: str) -> list[dict[str, Any]]:
     return rows
 
 
+def check_strict_fields(command_id: str, args: Mapping[str, Any]) -> None:
+    """Refuse a start whose strict per-run field holds a value off its pick list.
+
+    Runs each strict field's suggestion provider (so it may block on I/O like
+    the suggestions endpoint does — call it on a worker thread) and raises
+    ``ValueError`` naming the field, the value and the allowed values when
+    the submitted value is not one of them. A provider that fails leaves the
+    value unverifiable, which is also a refusal: strict means the list is the
+    source of truth, so a form can't get past it while the list is down.
+    Blank values pass — whether the field may be empty is the schema's call.
+    """
+    cmd = COMMANDS.get(command_id)
+    if cmd is None:
+        return
+    for field in cmd.strict_fields:
+        raw = args.get(field)
+        value = "" if raw is None else str(raw).strip()
+        if not value:
+            continue
+        try:
+            allowed = [row["value"] for row in field_suggestions(command_id, field)]
+        except Exception as exc:  # noqa: BLE001 - provider failure: refuse
+            raise ValueError(
+                f"{field}: cannot verify {value!r} against its pick list "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        if value not in allowed:
+            options = ", ".join(allowed) if allowed else "none available"
+            raise ValueError(
+                f"{field}: {value!r} is not one of the available options "
+                f"({options}); pick one from the {cmd.label} form"
+            )
+
+
 def command_specs() -> list[dict[str, Any]]:
     """Serializable specs (including the full form schema) for every command."""
     specs: list[dict[str, Any]] = []
@@ -965,6 +1014,7 @@ def command_specs() -> list[dict[str, Any]]:
             "usesCameras": cmd.uses_cameras,
             "perRunFields": list(cmd.per_run_fields),
             "suggestedFields": list(cmd.field_suggestions),
+            "strictFields": list(cmd.strict_fields),
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),

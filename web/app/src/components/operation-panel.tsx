@@ -212,6 +212,13 @@ export function OperationPanel({
     () => runFields.map((f) => f.key).filter((k) => meta.suggestedFields.includes(k)),
     [runFields, meta.suggestedFields]
   )
+  // Strict fields (CommandDef strict_fields) take only a listed value: they
+  // render as a select over the same fetched list, and Start is blocked while
+  // the stored value is not in it (the host refuses such a start too).
+  const strictKeys = useMemo(
+    () => suggestedKeys.filter((k) => meta.strictFields.includes(k)),
+    [suggestedKeys, meta.strictFields]
+  )
   // The fetched lists are tagged with the operation they were fetched for:
   // a reply landing after the operator switched panels must not attach to
   // the next op's field of the same name, and a stale entry from a previous
@@ -254,7 +261,9 @@ export function OperationPanel({
     if (hostSuggestions.op === meta.id) {
       for (const key of suggestedKeys) {
         const rows = hostSuggestions.rows[key]
-        if (rows && rows.length > 0) merged[key] = rows
+        // A strict field's select needs to tell "loaded, empty" from "not
+        // loaded yet", so its empty list is kept.
+        if (rows && (rows.length > 0 || strictKeys.includes(key))) merged[key] = rows
       }
     }
     if (wantsDatasets && datasets.length > 0) {
@@ -265,7 +274,7 @@ export function OperationPanel({
       }))
     }
     return Object.keys(merged).length > 0 ? merged : undefined
-  }, [wantsDatasets, datasets, hostSuggestions, meta.id, suggestedKeys])
+  }, [wantsDatasets, datasets, hostSuggestions, meta.id, suggestedKeys, strictKeys])
   const suggestionNotes = useMemo(() => {
     if (hostSuggestions.op !== meta.id) return []
     return suggestedKeys
@@ -274,8 +283,9 @@ export function OperationPanel({
         key,
         label: runFields.find((f) => f.key === key)?.label ?? key,
         error: hostSuggestions.errors[key],
+        strict: strictKeys.includes(key),
       }))
-  }, [suggestedKeys, hostSuggestions, meta.id, runFields])
+  }, [suggestedKeys, strictKeys, hostSuggestions, meta.id, runFields])
 
   // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
@@ -402,9 +412,17 @@ export function OperationPanel({
     )
   }
   for (const f of runFields) {
-    if (f.required) {
-      const v = settings[f.key]
-      if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
+    const v = settings[f.key]
+    const empty = v === undefined || String(v).trim() === ""
+    if (f.required && empty) {
+      blockers.push(`Set ${f.label}`)
+    } else if (!empty && strictKeys.includes(f.key)) {
+      // A strict field's stored value must be on the fetched list (a task
+      // removed from the catalog, a value typed into an older panel).
+      const rows = hostSuggestions.op === meta.id ? hostSuggestions.rows[f.key] : undefined
+      if (rows && !rows.some((r) => r.value === String(v).trim())) {
+        blockers.push(`Pick ${f.label} from the list`)
+      }
     }
   }
   // Sim models the arms, so it cannot run with them switched off (the server
@@ -492,6 +510,7 @@ export function OperationPanel({
                     <CuratedForm
                       fields={textFields}
                       suggestions={suggestions}
+                      strictKeys={strictKeys}
                       overrides={settings}
                       disabled={live}
                       onChange={onChange}
@@ -501,7 +520,9 @@ export function OperationPanel({
                   {!live &&
                     suggestionNotes.map((note) => (
                       <p key={note.key} className="text-xs leading-relaxed text-white/45">
-                        {sentenceCase(note.label)} suggestions unavailable — type the value.{" "}
+                        {note.strict
+                          ? `${sentenceCase(note.label)} options unavailable — the host cannot read its list, so this field cannot be set.`
+                          : `${sentenceCase(note.label)} suggestions unavailable — type the value.`}{" "}
                         <span className="break-words text-white/35">{note.error}</span>
                       </p>
                     ))}

@@ -71,11 +71,14 @@ function setVectorComponent(
 export function CuratedForm({
   fields,
   suggestions,
+  strictKeys,
   ...common
 }: CommonProps & {
   fields: SchemaField[]
   /** Optional suggestions per field key (e.g. datasets on disk under repo_id). */
   suggestions?: Record<string, FieldSuggestion[]>
+  /** Field keys whose value must be one of its suggestions (a select, not a text input). */
+  strictKeys?: string[]
 }) {
   if (fields.length === 0) {
     return <p className="text-sm text-white/40">No settings — just press Start.</p>
@@ -83,9 +86,72 @@ export function CuratedForm({
   return (
     <div className="flex flex-col gap-4">
       {fields.map((f) => (
-        <FieldRow key={f.key} field={f} suggestions={suggestions?.[f.key]} {...common} />
+        <FieldRow
+          key={f.key}
+          field={f}
+          suggestions={suggestions?.[f.key]}
+          strict={strictKeys?.includes(f.key) ?? false}
+          {...common}
+        />
       ))}
     </div>
+  )
+}
+
+/**
+ * A select over a host pick list for a field that takes only a listed value
+ * (CommandDef ``strict_fields``): the panel never lets free text into a
+ * catalog-backed field like a task id. Until the list has loaded the control
+ * is disabled with a placeholder; a stored value the list no longer carries
+ * is shown, marked, so the operator sees what to change (the host refuses it
+ * at Start either way).
+ */
+function StrictSelect({
+  id,
+  value,
+  required,
+  disabled,
+  suggestions,
+  onChange,
+}: {
+  id: string
+  value: string
+  required: boolean
+  disabled: boolean
+  suggestions: FieldSuggestion[] | undefined
+  onChange: (value: string) => void
+}) {
+  const loaded = suggestions !== undefined
+  const listed = loaded && suggestions.some((s) => s.value === value)
+  const stale = loaded && value !== "" && !listed
+  return (
+    <select
+      id={id}
+      value={value}
+      disabled={disabled || !loaded || suggestions.length === 0}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
+    >
+      {!loaded ? (
+        <option value={value}>Loading options…</option>
+      ) : suggestions.length === 0 ? (
+        <option value={value}>No options available</option>
+      ) : (
+        <>
+          {(required || value === "") && <option value="">Select…</option>}
+          {stale && (
+            <option value={value} className="bg-[#1a1a1a]">
+              {value} (not in the list)
+            </option>
+          )}
+          {suggestions.map((s) => (
+            <option key={s.value} value={s.value} className="bg-[#1a1a1a]">
+              {s.label ? `${s.value} — ${s.label}` : s.value}
+            </option>
+          ))}
+        </>
+      )}
+    </select>
   )
 }
 
@@ -313,6 +379,7 @@ export function FieldRow({
   field,
   showPath,
   suggestions,
+  strict = false,
   overrides,
   disabled,
   onChange,
@@ -322,6 +389,8 @@ export function FieldRow({
   showPath?: boolean
   /** Suggestions offered inside a text input (typing stays free-form). */
   suggestions?: FieldSuggestion[]
+  /** The value must be one of `suggestions`: render a select, not a text input. */
+  strict?: boolean
 }) {
   const has = field.key in overrides
   const value = has ? overrides[field.key] : undefined
@@ -417,6 +486,15 @@ export function FieldRow({
             </option>
           ))}
         </select>
+      ) : strict ? (
+        <StrictSelect
+          id={fieldId}
+          value={text}
+          required={Boolean(field.required)}
+          disabled={disabled}
+          suggestions={suggestions}
+          onChange={(v) => onChange(field.key, v)}
+        />
       ) : suggestions && suggestions.length > 0 ? (
         <SuggestInput
           id={fieldId}

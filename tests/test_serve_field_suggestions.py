@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from typing import Any
 
 import httpx
 
 from almond_axol.serve import commands
-from almond_axol.serve.commands import CommandDef, command_specs, field_suggestions
+from almond_axol.serve.commands import (
+    CommandDef,
+    check_strict_fields,
+    command_specs,
+    field_suggestions,
+)
 
 try:
     from .test_serve_session_reservation import _Manager, _Runner, _test_app
@@ -19,6 +25,12 @@ except ImportError:
     from test_serve_session_reservation import _Manager, _Runner, _test_app
 
 
+@dataclasses.dataclass
+class _SuggestConfig:
+    model_id: str = ""
+    task: str = ""
+
+
 def _command(provider: Any = None, **kwargs: Any) -> CommandDef:
     return CommandDef(
         "suggest-op",
@@ -27,7 +39,7 @@ def _command(provider: Any = None, **kwargs: Any) -> CommandDef:
         "An op with a suggested per-run field.",
         "Operate",
         "draccus",
-        lambda: None,
+        lambda: _SuggestConfig,
         per_run_fields=("model_id", "task"),
         field_suggestions={"model_id": provider} if provider is not None else None,
         **kwargs,
@@ -80,6 +92,116 @@ class FieldSuggestionsRegistryTest(unittest.TestCase):
         commands.register(_command())
         with self.assertRaises(KeyError):
             field_suggestions("suggest-op", "model_id")
+
+
+def _catalog() -> list[dict[str, Any]]:
+    return [{"value": "debur", "label": "Debur"}, {"value": "sanding", "label": None}]
+
+
+class StrictFieldsTest(unittest.TestCase):
+    """``strict_fields``: the pick list is a catalog, not a convenience."""
+
+    def setUp(self) -> None:
+        self._saved = dict(commands.COMMANDS)
+
+    def tearDown(self) -> None:
+        commands.COMMANDS.clear()
+        commands.COMMANDS.update(self._saved)
+        commands._schema_cache.pop("suggest-op", None)
+
+    def test_specs_list_the_strict_fields(self) -> None:
+        commands.register(_command(_catalog, strict_fields=("model_id",)))
+        spec = next(s for s in command_specs() if s["id"] == "suggest-op")
+        self.assertEqual(spec["suggestedFields"], ["model_id"])
+        self.assertEqual(spec["strictFields"], ["model_id"])
+        plain = next(s for s in command_specs() if s["id"] == "teleop")
+        self.assertEqual(plain["strictFields"], [])
+
+    def test_a_strict_field_needs_a_provider(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            _command(strict_fields=("model_id",))
+        self.assertIn("model_id", str(ctx.exception))
+        self.assertIn("field_suggestions", str(ctx.exception))
+
+    def test_a_listed_value_passes_and_an_unlisted_one_is_refused(self) -> None:
+        commands.register(_command(_catalog, strict_fields=("model_id",)))
+        check_strict_fields("suggest-op", {"model_id": "debur", "task": "anything"})
+        check_strict_fields("suggest-op", {"model_id": " sanding "})
+        with self.assertRaises(ValueError) as ctx:
+            check_strict_fields("suggest-op", {"model_id": "deburr"})
+        message = str(ctx.exception)
+        self.assertIn("model_id", message)
+        self.assertIn("'deburr'", message)
+        self.assertIn("debur, sanding", message)
+
+    def test_blank_and_absent_values_are_the_schemas_business(self) -> None:
+        commands.register(_command(_catalog, strict_fields=("model_id",)))
+        check_strict_fields("suggest-op", {})
+        check_strict_fields("suggest-op", {"model_id": ""})
+        check_strict_fields("suggest-op", {"model_id": None})
+
+    def test_a_failing_provider_refuses_rather_than_waves_through(self) -> None:
+        def boom() -> list[dict[str, Any]]:
+            raise RuntimeError("catalog unreadable")
+
+        commands.register(_command(boom, strict_fields=("model_id",)))
+        with self.assertRaises(ValueError) as ctx:
+            check_strict_fields("suggest-op", {"model_id": "debur"})
+        self.assertIn("cannot verify", str(ctx.exception))
+        self.assertIn("catalog unreadable", str(ctx.exception))
+
+    def test_free_form_fields_and_unknown_commands_are_left_alone(self) -> None:
+        commands.register(_command(_catalog))
+        check_strict_fields("suggest-op", {"model_id": "anything goes"})
+        check_strict_fields("no-such-op", {"model_id": "anything goes"})
+
+
+class StrictFieldsApiTest(unittest.IsolatedAsyncioTestCase):
+    """``/api/op/start`` refuses an off-list value as a form error (400)."""
+
+    def setUp(self) -> None:
+        self._saved = dict(commands.COMMANDS)
+
+    def tearDown(self) -> None:
+        commands.COMMANDS.clear()
+        commands.COMMANDS.update(self._saved)
+        commands._schema_cache.pop("suggest-op", None)
+
+    def _register(self) -> None:
+        commands.register(
+            _command(
+                _catalog,
+                strict_fields=("model_id",),
+                # An operation with nothing to survey: no CAN bus, no robot.
+                entrypoint=lambda: (lambda cfg, **_kw: None),
+                uses_can_bus=False,
+            )
+        )
+
+    async def test_an_off_list_value_is_refused_before_the_runner(self) -> None:
+        self._register()
+        runner = _Runner()
+        transport = httpx.ASGITransport(app=_test_app(_Manager(), runner))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            response = await c.post(
+                "/api/op/start",
+                json={"op": "suggest-op", "args": {"model_id": "deburr"}},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("'deburr'", response.json()["error"])
+        self.assertEqual(runner.starts, 0)
+
+    async def test_a_listed_value_starts(self) -> None:
+        self._register()
+        runner = _Runner()
+        transport = httpx.ASGITransport(app=_test_app(_Manager(), runner))
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            response = await c.post(
+                "/api/op/start",
+                json={"op": "suggest-op", "args": {"model_id": "debur"}},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(runner.starts, 1)
 
 
 class FieldSuggestionsApiTest(unittest.IsolatedAsyncioTestCase):
