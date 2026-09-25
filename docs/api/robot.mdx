@@ -218,7 +218,7 @@ Both return a `BatteryStatus`:
 |---|---|
 | `percent` | State of charge, 0–100, from the resting-voltage curve |
 | `voltage` | Pack voltage (smoothed while resting) |
-| `charging` | Rail above any resting voltage (≥ 27.6 V): a charger is connected; `percent` clamps to 100 |
+| `charging` | Rail above any resting voltage (≥ 27.1 V, clearing below 27.05 V): a charger is connected; `percent` clamps to 100 and is meaningless while charging. Early in a charge a low pack can stay under the threshold, so `False` does not rule a charger out |
 | `under_load` | Only a reading taken while the lift or wheels were moving exists, so the estimate reads low |
 
 `battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity.
