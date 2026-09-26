@@ -29,6 +29,11 @@ also runs, so the two can't drift. Its optional hardware steps are idempotent
 and self-gating; the flag makes a required RT build or capability failure block
 the restart instead of remaining warning-only.
 
+Provision runs with ``--no-reboot``: when a step only takes effect at boot (a
+new ZED Box camera driver, say) the updater *reboots the host* in place of the
+service restart, under the same idle gate, so the new driver is live when the
+panel reconnects. The startup heal does the same.
+
 The read-only ``git ls-remote --tags`` indicator is deliberately separate from
 the *destructive* reinstall: the reinstall rebuilds (and so prunes
 pyzed/PyGObject from) the env on every run, so it only runs when the operator
@@ -60,6 +65,8 @@ import time
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import Callable
+
+from ..utils import reboot
 
 _logger = logging.getLogger(__name__)
 
@@ -224,7 +231,7 @@ class SelfUpdater:
         self._error: str | None = None
         # Current step while ``state == "updating"`` so the UI can show progress
         # instead of an opaque spinner: "upgrading" | "provisioning" |
-        # "restarting" (``None`` when not updating).
+        # "restarting" | "rebooting" (``None`` when not updating).
         self._phase: str | None = None
         self._update_task: asyncio.Task[None] | None = None
         # Set when an upgrade landed but the server was busy; restart at the
@@ -238,6 +245,14 @@ class SelfUpdater:
         # at the same time.
         self._provision_started = False
         self._env_lock = asyncio.Lock()
+        # Why the last `axol provision` failed (its final output line names the
+        # failing steps), so the UI points at the real culprit rather than a
+        # generic message.
+        self._provision_failure: str | None = None
+        # Why the pending restart must be a host reboot (a provision step that
+        # only takes effect at boot); empty for a plain service restart.
+        self._reboot_reasons: list[str] = []
+        self._reboot_only = False
 
     @property
     def version(self) -> str | None:
@@ -469,8 +484,10 @@ class SelfUpdater:
             # onto the new code (pyzed/PyGObject were pruned).
             self._phase = "provisioning"
             if not await self._provision(require_rt=True):
-                self._fail("required axol-rt provisioning failed; see service logs")
+                self._fail(self._provision_failure_message())
                 return
+
+            self._reboot_reasons = reboot.pending()
 
             # The install succeeded, so the target tag is what's on disk now.
             # Deliberately don't re-read the installed version through
@@ -508,11 +525,26 @@ class SelfUpdater:
     async def _provision_on_startup(self) -> None:
         """Run the strict startup heal and surface failure in update status."""
         if await self._provision(require_rt=True):
+            reasons = reboot.pending()
+            # A concurrent update's own provision owns the reboot decision.
+            if reasons and self._state != "updating":
+                _logger.info("startup provision: reboot required (%s)", reasons)
+                self._reboot_reasons = reasons
+                # No new code to restart onto: if the reboot can't happen,
+                # restarting the service would only rerun this heal forever.
+                self._reboot_only = True
+                self._restart_pending = True
+                self._maybe_restart()
             return
         # If an update began while the startup heal held the environment lock,
         # its own strict provision pass will report the authoritative outcome.
         if self._state != "updating":
-            self._fail("required axol-rt provisioning failed; see service logs")
+            self._fail(self._provision_failure_message())
+
+    def _provision_failure_message(self) -> str:
+        """The UI error for a failed ``axol provision``, naming the failed step."""
+        detail = self._provision_failure or "no output"
+        return f"axol provision failed: {detail} (see service logs)"
 
     async def _provision(self, *, require_rt: bool = False) -> bool:
         """Provision system deps, optionally requiring a working ``axol-rt``.
@@ -528,11 +560,14 @@ class SelfUpdater:
         overlap another provision or the upgrade reinstall (both also rewrite
         the tool env).
         """
+        self._provision_failure = None
         axol = shutil.which("axol")
         if axol is None:
             _logger.warning("self-update: axol not on PATH; cannot provision")
+            self._provision_failure = "axol not on PATH"
             return False
-        command = [axol, "provision"]
+        # Never let provision reboot under us: `_maybe_restart` does, when idle.
+        command = [axol, "provision", "--no-reboot"]
         if require_rt:
             command.append("--require-rt")
         async with self._env_lock:
@@ -545,13 +580,16 @@ class SelfUpdater:
                 out, _ = await proc.communicate()
             except OSError as exc:
                 _logger.warning("self-update: could not run axol provisioning: %s", exc)
+                self._provision_failure = f"could not run axol: {exc}"
                 return False
         if proc.returncode != 0:
             tail = out.decode("utf-8", "replace").strip().splitlines()
+            # `axol provision` ends with "Provisioning failed for: <steps>. ..."
+            self._provision_failure = tail[-1] if tail else f"exit {proc.returncode}"
             _logger.warning(
                 "self-update: `axol provision` failed (%s): %s",
                 proc.returncode,
-                tail[-1] if tail else "no output",
+                self._provision_failure,
             )
             return False
         suffix = " (axol-rt verified)" if require_rt else ""
@@ -562,6 +600,20 @@ class SelfUpdater:
         if not self._is_idle():
             _logger.info("self-update: server busy; restart deferred")
             return
+        if self._reboot_reasons:
+            self._restart_pending = False
+            self._phase = "rebooting"
+            try:
+                if reboot.reboot_host(self._reboot_reasons):
+                    return
+            except Exception as exc:  # noqa: BLE001 - fall back to a restart
+                _logger.warning("self-update: reboot failed: %s", exc)
+            # Loop guard tripped or the reboot failed: the reboot is left for
+            # the operator. After an upgrade, still move onto the new code.
+            self._reboot_reasons = []
+            if self._reboot_only:
+                self._phase = None
+                return
         _logger.info("self-update: exiting for restart (systemd relaunches)")
         # Skip uvicorn's graceful shutdown: there is nothing running (is_idle)
         # and a clean, immediate exit lets systemd relaunch right away.

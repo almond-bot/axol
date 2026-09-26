@@ -95,6 +95,48 @@ def recv_with_timeout(
             return conn.recv()
 
 
+# Ceiling on the IK worker's startup (solver build, rest-pose settle, first
+# trajectory compile): well past an Orin NX's ~minute, short of forever for a
+# worker that hung. A worker that dies is caught within one poll instead.
+IK_READY_TIMEOUT_S = 300.0
+_IK_READY_POLL_S = 0.5
+
+
+def wait_for_ik_ready(
+    conn: multiprocessing.connection.Connection,
+    process: Any,
+    *,
+    timeout: float = IK_READY_TIMEOUT_S,
+    stopped: Callable[[], bool] | None = None,
+) -> tuple | None:
+    """Wait for the IK worker's ``("ready", ...)`` handshake; the one shared wait.
+
+    Every flow that starts :func:`~.worker.run_ik_worker` (teleop,
+    collect-data, the rollout reset controller) waits here, so they agree:
+    a slow-but-healthy startup always completes, a worker process that dies
+    fails at once with its exit code, a hung one times out after ``timeout``,
+    and ``stopped`` aborts the wait (returns ``None``).
+    """
+    deadline = time.monotonic() + timeout
+    while not conn.poll(_IK_READY_POLL_S):
+        if stopped is not None and stopped():
+            return None
+        if process is not None and not process.is_alive():
+            raise RuntimeError(
+                f"IK worker exited during startup (exit code {process.exitcode}); "
+                "see its log above."
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"IK worker did not become ready within {timeout:.0f}s "
+                "(solver build, rest-pose settle, and startup trajectory)."
+            )
+    msg = conn.recv()
+    if not (isinstance(msg, tuple) and msg and msg[0] == "ready"):
+        raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
+    return msg
+
+
 class VRTeleopCore:
     """Engage + smoothing + reset state machine shared by both teleop flows.
 

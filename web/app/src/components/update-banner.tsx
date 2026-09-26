@@ -10,6 +10,7 @@ const PHASE_LABEL: Record<UpdatePhase, string> = {
   upgrading: "Upgrading…",
   provisioning: "Installing deps…",
   restarting: "Restarting…",
+  rebooting: "Rebooting host…",
 }
 
 /** Release version with the conventional "v" prefix, e.g. "v0.1.2". */

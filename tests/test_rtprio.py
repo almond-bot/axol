@@ -1,5 +1,6 @@
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -50,6 +51,7 @@ class VerifySessionTest(TestCase):
             patch.object(rtprio, "_current_user", return_value="shawn"),
             patch.object(rtprio, "current_limit", return_value=0),
             patch.object(rtprio, "_limit_inherited_from", return_value="tailscaled"),
+            patch.object(rtprio, "_raise_session_limits", return_value=[]),
             self.assertLogs(rtprio._logger, level="WARNING") as logs,
         ):
             self.assertFalse(rtprio.verify_session("shawn"))
@@ -78,6 +80,86 @@ class VerifySessionTest(TestCase):
             self.assertNoLogs(rtprio._logger, level="WARNING"),
         ):
             self.assertTrue(rtprio.verify_session("shawn"))
+
+    def test_zero_limit_is_fixed_in_place_instead_of_asked_for(self) -> None:
+        # The terminal-host case: a shell under node (e.g. an IDE terminal)
+        # never runs pam_limits. Provision raises it itself.
+        with (
+            patch.object(rtprio.os, "geteuid", return_value=1000),
+            patch.object(rtprio, "_current_user", return_value="shawn"),
+            patch.object(rtprio, "current_limit", return_value=0),
+            patch.object(
+                rtprio,
+                "_raise_session_limits",
+                return_value=[(10, "bash"), (9, "node")],
+            ),
+            self.assertNoLogs(rtprio._logger, level="WARNING"),
+            self.assertLogs(rtprio._logger, level="INFO") as logs,
+        ):
+            self.assertTrue(rtprio.verify_session("shawn"))
+        message = "\n".join(logs.output)
+        self.assertIn("bash (10), node (9)", message)
+        self.assertIn("new terminals from node", message)
+
+
+def _proc_tree(tree: dict[int, tuple[str, int, int]]):
+    """A ``Path.read_text`` stand-in serving ``/proc/<pid>/{comm,status}``."""
+
+    def read_text(self: Path) -> str:
+        comm, uid, ppid = tree[int(self.parts[2])]
+        if self.parts[3] == "comm":
+            return comm + "\n"
+        return f"Name:\t{comm}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nPPid:\t{ppid}\n"
+
+    return read_text
+
+
+class RaiseSessionLimitsTest(TestCase):
+    def test_raises_owned_ancestors_and_stops_at_other_accounts(self) -> None:
+        # bash -> node -> sshd (root): the operator's own processes only.
+        tree = {10: ("bash", 1000, 11), 11: ("node", 1000, 12), 12: ("sshd", 0, 1)}
+        runs: list[list[str]] = []
+
+        def run_root(argv, **_):
+            runs.append(argv)
+            return SimpleNamespace(returncode=0)
+
+        with (
+            patch.object(rtprio.os, "getuid", return_value=1000),
+            patch.object(rtprio.os, "getppid", return_value=10),
+            patch.object(Path, "read_text", _proc_tree(tree)),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(rtprio, "prime_sudo", return_value=True),
+            patch.object(rtprio, "run_root", run_root),
+        ):
+            raised = rtprio._raise_session_limits()
+        self.assertEqual(raised, [(10, "bash"), (11, "node")])
+        ceiling = f"--rtprio={MAX_FIFO_PRIORITY}:{MAX_FIFO_PRIORITY}"
+        self.assertEqual(
+            [argv[-3:] for argv in runs],
+            [
+                ["--pid", "10", ceiling],
+                ["--pid", "11", ceiling],
+            ],
+        )
+
+    def test_stops_at_the_user_systemd_manager(self) -> None:
+        tree = {10: ("bash", 1000, 11), 11: ("systemd", 1000, 1)}
+        with (
+            patch.object(rtprio.os, "getuid", return_value=1000),
+            patch.object(rtprio.os, "getppid", return_value=10),
+            patch.object(Path, "read_text", _proc_tree(tree)),
+        ):
+            self.assertEqual(rtprio._owned_ancestors(), [(10, "bash")])
+
+    def test_without_sudo_nothing_is_raised(self) -> None:
+        with (
+            patch.object(rtprio, "_owned_ancestors", return_value=[(10, "bash")]),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(rtprio, "prime_sudo", return_value=False),
+            patch.object(rtprio, "run_root", side_effect=AssertionError),
+        ):
+            self.assertEqual(rtprio._raise_session_limits(), [])
 
 
 class LimitInheritedFromTest(TestCase):

@@ -1475,7 +1475,8 @@ export default function ControlPanel() {
   useEffect(() => {
     if (conn.state !== "ok" || !updating) return
     const target = update?.remoteVersion ?? null
-    const deadline = Date.now() + 5 * 60_000
+    // Upgrade + provision + a possible host reboot (a new camera driver).
+    const deadline = Date.now() + 10 * 60_000
     let active = true
     const t = setInterval(async () => {
       if (Date.now() > deadline) {
@@ -1508,8 +1509,9 @@ export default function ControlPanel() {
         if (target && u.version === target) window.location.reload()
       } catch {
         // Server stopped responding: it exited to relaunch (or is briefly
-        // unreachable). Show "restarting" and keep watching for it to return.
-        if (active) setUpdatePhase("restarting")
+        // unreachable). Show "restarting" (unless the host said it is
+        // rebooting) and keep watching for it to return.
+        if (active) setUpdatePhase((phase) => (phase === "rebooting" ? phase : "restarting"))
       }
     }, 2000)
     return () => {

@@ -203,7 +203,7 @@ def test_successful_update_and_provision(monkeypatch) -> None:
         assert commands[0][-1] == "almond-axol[lerobot,sim]==2.0.0"
         # The post-reinstall provision is strict: the realtime core must be
         # current before the service restarts onto the new code.
-        assert commands[1] == ("/bin/axol", "provision", "--require-rt")
+        assert commands[1] == ("/bin/axol", "provision", "--no-reboot", "--require-rt")
         assert updater._phase == "restarting"
         assert updater._restart_pending
         assert exits == [0]
@@ -234,6 +234,32 @@ def test_update_failures(monkeypatch, failure: str, message: str) -> None:
         assert updater._state == "error"
         assert message in (updater._error or "")
         assert updater._phase is None
+
+    asyncio.run(exercise())
+
+
+def test_provision_failure_names_the_failed_step(monkeypatch) -> None:
+    # A failed post-upgrade provision must surface the step `axol provision`
+    # reported, not blame axol-rt when (say) the ZED driver pin was the culprit.
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        updater._remote_tag = "v2.0.0"
+        updater._remote_version = "2.0.0"
+        tail = (
+            b"Provisioning failed for: ZED Box camera driver (zed.driver). "
+            b"See the log above, repair the host, and retry."
+        )
+
+        async def spawn(*args, **kwargs):
+            if args[1] == "provision":
+                return _AsyncProc(b"log line\n" + tail, returncode=1)
+            return _AsyncProc(b"done")
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        await updater._run_update()
+        assert updater._state == "error"
+        assert "zed.driver" in (updater._error or "")
+        assert "axol-rt" not in (updater._error or "")
 
     asyncio.run(exercise())
 
@@ -280,8 +306,85 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
         assert await updater._provision()
         assert await updater._provision(require_rt=True)
         assert commands == [
-            ("/bin/axol", "provision"),
-            ("/bin/axol", "provision", "--require-rt"),
+            ("/bin/axol", "provision", "--no-reboot"),
+            ("/bin/axol", "provision", "--no-reboot", "--require-rt"),
         ]
+
+    asyncio.run(exercise())
+
+
+def _ok_spawn(*args, **kwargs):
+    async def spawn(*a, **k):
+        return _AsyncProc(b"done")
+
+    return spawn
+
+
+@pytest.mark.parametrize(("rebooted", "exits_expected"), [(True, []), (False, [0])])
+def test_update_reboots_instead_of_restarting_when_required(
+    monkeypatch, rebooted: bool, exits_expected: list[int]
+) -> None:
+    # A new camera driver only loads at boot: the update ends in a host reboot
+    # (under the same idle gate). If the loop guard refuses it, the service
+    # still restarts onto the new code.
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        updater._remote_tag = "v2.0.0"
+        updater._remote_version = "2.0.0"
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", _ok_spawn())
+        monkeypatch.setattr(update.reboot, "pending", lambda: ["driver"])
+        calls: list[list[str]] = []
+
+        def reboot_host(reasons):
+            calls.append(reasons)
+            return rebooted
+
+        monkeypatch.setattr(update.reboot, "reboot_host", reboot_host)
+        exits: list[int] = []
+        monkeypatch.setattr(update.os, "_exit", exits.append)
+        await updater._run_update()
+        assert calls == [["driver"]]
+        assert exits == exits_expected
+        assert not updater._restart_pending
+
+    asyncio.run(exercise())
+
+
+def test_startup_heal_reboots_but_never_restart_loops(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", _ok_spawn())
+        monkeypatch.setattr(update.reboot, "pending", lambda: ["driver"])
+        calls: list[list[str]] = []
+
+        def refused(reasons):
+            calls.append(reasons)
+            return False
+
+        monkeypatch.setattr(update.reboot, "reboot_host", refused)
+        exits: list[int] = []
+        monkeypatch.setattr(update.os, "_exit", exits.append)
+        await updater._provision_on_startup()
+        # The reboot was attempted; refused, it must not fall back to a
+        # service restart (that would rerun this heal on every start).
+        assert calls == [["driver"]]
+        assert exits == []
+        assert updater._phase is None
+
+    asyncio.run(exercise())
+
+
+def test_busy_server_defers_the_reboot(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch, idle=False)
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", _ok_spawn())
+        monkeypatch.setattr(update.reboot, "pending", lambda: ["driver"])
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            update.reboot, "reboot_host", lambda reasons: calls.append(reasons)
+        )
+        await updater._provision_on_startup()
+        assert calls == []
+        assert updater._restart_pending
 
     asyncio.run(exercise())

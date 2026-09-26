@@ -13,9 +13,12 @@ On Linux this also grants the built `axol-rt` binary two narrowly scoped
 capabilities: `CAP_SYS_NICE`, used by its two CAN threads to enter their
 real-time scheduling class, and `CAP_IPC_LOCK`, which lets it lock its memory
 (`mlockall`) past the unprivileged `RLIMIT_MEMLOCK` so a page reclaimed under
-recording I/O pressure can never fault a CAN thread mid-tick. An interactive
-development install prompts for `sudo`; the production system service performs
-the step as root. The control core refuses to arm if its requested real-time
+recording I/O pressure can never fault a CAN thread mid-tick. The step escalates on
+its own: directly as root (the installer and the system service), otherwise
+through passwordless or already-cached `sudo`, or one password prompt on a
+terminal. It is skipped entirely when the binary already carries both
+capabilities, which reading needs no privilege for. Only a run with none of
+those fails, and it prints the exact `sudo setcap` command to run once. The control core refuses to arm if its requested real-time
 scheduler cannot be established, so a normal scheduler pause can never occur
 after the motors enable; a failed memory lock is only reported (the core runs
 unlocked, as every session did before it locked at all).

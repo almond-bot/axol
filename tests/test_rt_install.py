@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -238,3 +239,68 @@ class RunTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GrantRealtimeTest(unittest.TestCase):
+    """The capability grant escalates by itself instead of asking the user."""
+
+    def _getcap(self, stdout: str):
+        return subprocess.CompletedProcess(["getcap"], 0, stdout, "")
+
+    def test_getcap_formats(self) -> None:
+        binary = Path("/usr/local/bin/axol-rt")
+        for out, expected in (
+            (f"{binary} cap_ipc_lock,cap_sys_nice=ep\n", True),
+            (f"{binary} = cap_ipc_lock,cap_sys_nice+ep\n", True),
+            (f"{binary} cap_ipc_lock,cap_sys_nice=eip\n", True),
+            (f"{binary} cap_sys_nice=ep\n", False),
+            (f"{binary} cap_ipc_lock,cap_sys_nice=p\n", False),
+            ("", False),
+        ):
+            with (
+                self.subTest(out=out),
+                patch.object(install, "_find_tool", return_value="/usr/sbin/getcap"),
+                patch.object(install.subprocess, "run", return_value=self._getcap(out)),
+            ):
+                self.assertEqual(install._has_realtime_caps(binary), expected)
+
+    def test_already_granted_needs_no_root(self) -> None:
+        with (
+            patch.object(install.sys, "platform", "linux"),
+            patch.object(install, "_has_realtime_caps", return_value=True),
+            patch("almond_axol.utils.sudo.prime_sudo") as prime,
+        ):
+            install._grant_realtime(Path("/x/axol-rt"))
+        prime.assert_not_called()
+
+    def test_headless_run_uses_passwordless_sudo(self) -> None:
+        # E.g. provision spawned by a manual `axol serve`: no terminal, but
+        # sudo -n works -- it used to refuse with "run interactively".
+        with (
+            patch.object(install.sys, "platform", "linux"),
+            patch.object(install, "_has_realtime_caps", return_value=False),
+            patch.object(install, "_find_tool", return_value="/usr/sbin/setcap"),
+            patch.object(install.os, "geteuid", return_value=1000),
+            patch("almond_axol.utils.sudo.prime_sudo", return_value=True),
+            patch("almond_axol.utils.sudo.run_root") as run_root,
+        ):
+            install._grant_realtime(Path("/x/axol-rt"))
+        run_root.assert_called_once_with(
+            ["/usr/sbin/setcap", "cap_sys_nice,cap_ipc_lock=ep", "/x/axol-rt"],
+            check=True,
+        )
+
+    def test_no_way_to_escalate_names_the_exact_command(self) -> None:
+        with (
+            patch.object(install.sys, "platform", "linux"),
+            patch.object(install, "_has_realtime_caps", return_value=False),
+            patch.object(install, "_find_tool", return_value="/usr/sbin/setcap"),
+            patch.object(install.os, "geteuid", return_value=1000),
+            patch("almond_axol.utils.sudo.prime_sudo", return_value=False),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            install._grant_realtime(Path("/x/axol-rt"))
+        self.assertIn(
+            "sudo /usr/sbin/setcap cap_sys_nice,cap_ipc_lock=ep /x/axol-rt",
+            str(ctx.exception),
+        )
