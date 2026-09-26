@@ -41,7 +41,7 @@ class WholeBodyUrdfTest(unittest.TestCase):
         cls.arm = _load(urdf_path(AxolModel.MOBILE))
 
     def test_only_mobile_has_a_whole_body_model(self) -> None:
-        self.assertEqual(self.path.name, "axol_mobile_whole_body.urdf")
+        self.assertEqual(self.path.name, "axol_jelly_whole_body.urdf")
         with self.assertRaises(ValueError):
             urdf_path(AxolModel.CLASSIC, whole_body=True)
         with self.assertRaises(ValueError):
@@ -127,9 +127,11 @@ class WholeBodyCollisionTest(unittest.TestCase):
             frozenset((rc.link_names[int(i)], rc.link_names[int(j)]))
             for i, j in zip(rc.active_idx_i, rc.active_idx_j)
         }
+        # Frame-only links (camera frames, finger frames) take part in no pair.
+        solid = {n for n, r in zip(rc.link_names, np.asarray(rc.coll.radius)) if r > 0}
         arms = {
             n
-            for n in rc.link_names
+            for n in solid
             if n.startswith(("left_", "right_")) and not n.endswith(("_s2", "_s3"))
         }
         self.assertEqual(pairs, {frozenset((t, a)) for t in torso for a in arms})

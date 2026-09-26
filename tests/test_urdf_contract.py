@@ -9,6 +9,7 @@ import yourdfpy
 
 from almond_axol.constants import (
     ARM_JOINTS,
+    JELLY_SIM_URDF,
     URDF_PATH,
     AxolModel,
     Joint,
@@ -219,17 +220,17 @@ class MobileUrdfContractTest(unittest.TestCase):
             mesh.attrib["filename"].removeprefix(prefix)
             for mesh in self.root.iter("mesh")
         }
-        self.assertTrue(all(r.startswith("meshes/mobile/") for r in references))
-        # The arm and whole-body models share the directory: together they
-        # use every packaged mesh.
-        whole_body = urdf_path(AxolModel.MOBILE, whole_body=True)
-        references |= {
-            mesh.attrib["filename"].removeprefix(prefix)
-            for mesh in ElementTree.parse(whole_body).getroot().iter("mesh")
-        }
+        self.assertTrue(all(r.startswith("meshes/jelly/") for r in references))
+        # The arm, whole-body and sim models share the directory: together
+        # they use every packaged mesh (the sim model's paths are relative).
+        for other in (urdf_path(AxolModel.MOBILE, whole_body=True), JELLY_SIM_URDF):
+            references |= {
+                mesh.attrib["filename"].removeprefix(prefix)
+                for mesh in ElementTree.parse(other).getroot().iter("mesh")
+            }
         packaged = {
             p.relative_to(self.path.parent).as_posix()
-            for p in (self.path.parent / "meshes" / "mobile").glob("*.stl")
+            for p in (self.path.parent / "meshes" / "jelly").glob("*.stl")
         }
         self.assertEqual(references, packaged)
 

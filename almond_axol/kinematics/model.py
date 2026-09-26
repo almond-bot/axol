@@ -201,9 +201,12 @@ def _build_robot_collision(
     arm moves closer to the base than that known-safe reference.
     """
     link_names = [link.name for link in urdf.robot.links]
+    # Frame-only links (camera optical frames, the fingers' own frames) would
+    # otherwise enter as zero-radius capsules at their origins.
+    has_geometry = {link.name for link in urdf.robot.links if link.collisions}
 
     def is_arm(n: str) -> bool:
-        return n.startswith("left_") or n.startswith("right_")
+        return (n.startswith("left_") or n.startswith("right_")) and n in has_geometry
 
     def is_torso(n: str) -> bool:
         return n in torso

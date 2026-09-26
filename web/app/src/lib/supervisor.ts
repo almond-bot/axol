@@ -1239,7 +1239,7 @@ export type AxolModel = "classic" | "mobile"
 
 const URDF_FILES: Record<AxolModel, string> = {
   classic: "axol.urdf",
-  mobile: "axol_mobile.urdf",
+  mobile: "axol_jelly.urdf",
 }
 
 export function parseAxolModel(value: unknown): AxolModel | null {

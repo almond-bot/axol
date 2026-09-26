@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+
 from almond_axol.constants import (
     URDF_PATH,
     AxolModel,
@@ -72,7 +74,7 @@ class UrdfSelectionTest(unittest.TestCase):
     def test_each_version_has_its_own_urdf(self) -> None:
         self.assertEqual(urdf_path(), URDF_PATH)
         self.assertEqual(urdf_path("classic"), URDF_PATH)
-        self.assertEqual(urdf_path(AxolModel.MOBILE).name, "axol_mobile.urdf")
+        self.assertEqual(urdf_path(AxolModel.MOBILE).name, "axol_jelly.urdf")
         self.assertTrue(urdf_path(AxolModel.MOBILE).is_file())
 
     def test_collision_is_arm_against_body_on_both_versions(self) -> None:
@@ -87,9 +89,16 @@ class UrdfSelectionTest(unittest.TestCase):
                     frozenset((rc.link_names[int(i)], rc.link_names[int(j)]))
                     for i, j in zip(rc.active_idx_i, rc.active_idx_j)
                 }
+                # Frame-only links (camera frames, finger frames) have no
+                # geometry and take part in no pair.
+                solid = {
+                    n
+                    for n, r in zip(rc.link_names, np.asarray(rc.coll.radius))
+                    if r > 0
+                }
                 arms = {
                     n
-                    for n in rc.link_names
+                    for n in solid
                     if n.startswith(("left_", "right_"))
                     and not n.endswith(("_s2", "_s3"))
                 }
@@ -159,9 +168,11 @@ class CapsuleDistanceTest(unittest.TestCase):
                         b.replace("left_", "right_"),
                     )
                     if "left_" in a + b:
-                        # Within CAD slop: mirrored parts differ by ~0.5 mm.
+                        # Within hull tolerance: each hull is snapped to a 2 mm grid
+                        # (<= 1.7 mm per side); the bugs this guards read 22 and
+                        # 165 mm.
                         self.assertAlmostEqual(
-                            d[mirrored], value, delta=1e-3, msg=(a, b)
+                            d[mirrored], value, delta=4e-3, msg=(a, b)
                         )
 
     def test_upper_arm_guard_allows_the_rest_pose(self) -> None:
