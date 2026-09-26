@@ -216,9 +216,9 @@ Both return a `BatteryStatus`:
 
 | Field | Description |
 |---|---|
-| `percent` | State of charge, 0–100, from the resting-voltage curve |
+| `percent` | State of charge, 0–100, from the published LiFePO4 resting-voltage curve (EVE's per-cell chart, times 8). Jelly never fully rests, so it can read well below the packs' own BMS on the flat middle of the curve |
 | `voltage` | Pack voltage (smoothed while resting) |
-| `charging` | Rail above any resting voltage (≥ 27.1 V, clearing below 27.05 V): a charger is connected; `percent` clamps to 100 and is meaningless while charging. Early in a charge a low pack can stay under the threshold, so `False` does not rule a charger out |
+| `charging` | Rail above any resting voltage (≥ 27.1 V, clearing below 27.05 V): a charger is connected; `percent` reads near full and is meaningless while charging. Early in a charge a low pack can stay under the threshold, so `False` does not rule a charger out |
 | `under_load` | Only a reading taken while the lift or wheels were moving exists, so the estimate reads low |
 
 `battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity.

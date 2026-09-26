@@ -6,21 +6,23 @@ to the packs' Bluetooth BMS, so the charge is estimated from the one number
 the host can read: the 24 V rail as measured by the jelly_legs lift board
 (its ``GET_POWER`` telemetry, see :func:`almond_axol.robot.lift.decode_power`).
 
-LiFePO4 holds an almost flat voltage above ~25 % charge (the whole span
-from 25 % to full is ~0.5 V across the pack), so the estimate is only as good
-as the reading:
+LiFePO4 holds an almost flat voltage through the middle of its charge (from
+40 % to 60 % the pack moves 0.16 V), so the estimate is only as good as the
+reading:
 
 - **Rest, not load.** Current sag and charger voltage both move the rail
-  far more than a whole band of charge. The curve is the *resting*
-  (open-circuit) one; samples taken while the lift or the wheels draw
-  current are flagged ``under_load`` and never displace a resting estimate
-  (see :class:`BatteryEstimator`).
+  far more than a whole band of charge. The curve is the published
+  *resting* (open-circuit) one; samples taken while the lift or the wheels
+  draw current are flagged ``under_load`` and never displace a resting
+  estimate (see :class:`BatteryEstimator`). Jelly is never fully at rest
+  (the Jetson and holding arms always draw a little), so on the flat middle
+  of the curve the estimate can sit well below the packs' own BMS.
 - **Charging reads high.** A connected charger lifts the rail above any
   resting voltage, and the charger's 29.2 V absorption voltage is only
   reached at the very end. Measured on Jelly with this board: 27.5 V
   charging a nearly full pack, 27.0 V for the same pack full and unplugged.
   Readings at or above :data:`CHARGING_VOLTS` report ``charging`` (the
-  percentage then clamps to 100 % and means nothing); the estimator keeps
+  percentage then reads near full and means nothing); the estimator keeps
   it until the rail drops under :data:`CHARGING_CLEAR_VOLTS` so it does not
   flicker. Early in a charge, a low pack can sit under the threshold and
   read as a resting (too high) percentage: voltage alone cannot tell that
@@ -36,26 +38,36 @@ import bisect
 import math
 from dataclasses import dataclass
 
-# Resting pack voltage -> state of charge for LiTime's 24 V LiFePO4 packs,
-# from LiTime's own resting-voltage chart (0 %: 20-24 V, 25 %: 26.0-26.3 V,
-# 50 %: 26.3-26.4 V, 75 %: 26.6-26.66 V, 100 %: >= 26.66 V): each band's
-# midpoint, 0 % at the top of the empty band, 100 % at the full threshold.
-# Linear between points. Checked on Jelly against the packs' BMS: 25.69 V
-# at rest reads 20 % here, the LiTime app said 18 % (a generic 3.2 V/cell =
-# 20 % curve read 26 %).
-LIFEPO4_8S_CURVE: tuple[tuple[float, float], ...] = (
-    (24.00, 0.0),
-    (26.15, 25.0),
-    (26.35, 50.0),
-    (26.63, 75.0),
-    (26.66, 100.0),
+# Resting cell voltage -> state of charge for LiFePO4, from EVE's published
+# chart (https://www.evemall.eu/selection-guide/eve-lifepo4-state-charge-chart-discharge-curve-capacity-diagrams),
+# the standard per-cell table. LiTime's own 24 V chart is coarser (four bands)
+# and read a nearly full pack on Jelly as half empty. Linear between points.
+_LIFEPO4_CELL_CURVE: tuple[tuple[float, float], ...] = (
+    (2.50, 0.0),
+    (3.00, 10.0),
+    (3.20, 20.0),
+    (3.22, 30.0),
+    (3.25, 40.0),
+    (3.26, 50.0),
+    (3.27, 60.0),
+    (3.30, 70.0),
+    (3.32, 80.0),
+    (3.35, 90.0),
+    (3.40, 100.0),
+)
+
+# Jelly's packs are 8S: eight cells in series.
+_CELLS = 8
+
+LIFEPO4_8S_CURVE: tuple[tuple[float, float], ...] = tuple(
+    (round(volts * _CELLS, 2), percent) for volts, percent in _LIFEPO4_CELL_CURVE
 )
 
 # Two 50 Ah packs in parallel.
 CAPACITY_AH = 100.0
 
-# Just above what the board reads for a full pack at rest (27.0 V, above the
-# chart's 26.66 V: the ADC reads high and a just-charged pack settles slowly),
+# Just above what the board reads for a full pack at rest (27.0 V: the ADC
+# reads high and a just-charged pack settles slowly),
 # well under a nearly full pack on the charger (27.5 V), both measured on
 # Jelly. Kept low to catch as much of a charge as possible; the ADC noise is
 # ~10 mV, well inside the margin.
