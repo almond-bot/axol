@@ -131,39 +131,47 @@ _RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
-_urdf: dict[AxolModel, yourdfpy.URDF] = {}
-_robot: dict[AxolModel, pk.Robot] = {}
-_robot_coll: dict[AxolModel, pk.collision.RobotCollision] = {}
+# Keyed by (version, whole_body): whole-body IK has its own URDF.
+_Key = tuple[AxolModel, bool]
+_urdf: dict[_Key, yourdfpy.URDF] = {}
+_robot: dict[_Key, pk.Robot] = {}
+_robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
 
 
-def _load_urdf(model: AxolModel) -> yourdfpy.URDF:
-    if model not in _urdf:
-        path = urdf_path(model)
+def _load_urdf(key: _Key) -> yourdfpy.URDF:
+    if key not in _urdf:
+        path = urdf_path(key[0], whole_body=key[1])
         _logger.info("Loading Axol URDF (%s)...", path.name)
-        _urdf[model] = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
-    return _urdf[model]
+        _urdf[key] = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
+    return _urdf[key]
 
 
-def shared_robot(model: AxolModel | str | None = None) -> pk.Robot:
-    """The pyroki robot for ``model``'s bundled URDF, built once per process."""
-    resolved = resolve_robot_model(model)
+def shared_robot(
+    model: AxolModel | str | None = None, *, whole_body: bool = False
+) -> pk.Robot:
+    """The pyroki robot for ``model``'s bundled URDF, built once per process.
+
+    ``whole_body`` selects the mobile model whose Jelly base and lift are
+    joints too (:data:`~almond_axol.constants.BODY_JOINTS`).
+    """
+    key = (resolve_robot_model(model), whole_body)
     with _lock:
-        if resolved not in _robot:
-            _robot[resolved] = pk.Robot.from_urdf(_load_urdf(resolved))
-        return _robot[resolved]
+        if key not in _robot:
+            _robot[key] = pk.Robot.from_urdf(_load_urdf(key))
+        return _robot[key]
 
 
 def shared_robot_collision(
-    model: AxolModel | str | None = None,
+    model: AxolModel | str | None = None, *, whole_body: bool = False
 ) -> pk.collision.RobotCollision:
     """``model``'s torso<->arm collision model, built once per process."""
-    resolved = resolve_robot_model(model)
+    key = (resolve_robot_model(model), whole_body)
     with _lock:
-        if resolved not in _robot_coll:
-            _robot_coll[resolved] = _build_robot_collision(
-                _load_urdf(resolved), torso_links(resolved)
+        if key not in _robot_coll:
+            _robot_coll[key] = _build_robot_collision(
+                _load_urdf(key), torso_links(key[0], whole_body=whole_body)
             )
-        return _robot_coll[resolved]
+        return _robot_coll[key]
 
 
 def _build_robot_collision(

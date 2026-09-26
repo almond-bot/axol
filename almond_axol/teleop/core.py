@@ -145,6 +145,9 @@ class VRTeleopCore:
 
         # Raw IK solution (full URDF vector) + per-arm joint indices into it.
         self.q: np.ndarray | None = None
+        # Whole-body IK: the latest body-joint target (BODY_JOINTS order, the
+        # tail of the IK vector after the arm joints), else None.
+        self.body_q: np.ndarray | None = None
         # Host-clock capture time of the VR pose behind the latest IK target
         # (``VRFrame.t_host``). Mantis recording stamps dataset rows with this so
         # they align to when the hand was actually at the pose, not to the
@@ -752,6 +755,7 @@ class VRTeleopCore:
             if new_q is None:
                 return None
             q = np.asarray(new_q, dtype=np.float32)
+            self._note_body(q)
             if done:
                 self._hold_target(q.copy())
                 self.l_grip = l_grip
@@ -770,6 +774,7 @@ class VRTeleopCore:
             out[15] = r_grip
             return self._guard_output(out)
 
+        self._note_body(q)
         l_grip = self.l_grip
         r_grip = self.r_grip
         ema_l = self.ema_left.update(np.append(q[self.left_indices], l_grip))
@@ -794,6 +799,10 @@ class VRTeleopCore:
                 out=np.concatenate([out[:7], out[8:15]]),
             )
         return out
+
+    def _note_body(self, q: np.ndarray) -> None:
+        n_arm = len(self.left_indices) + len(self.right_indices)
+        self.body_q = q[n_arm:].copy() if q.size > n_arm else None
 
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.

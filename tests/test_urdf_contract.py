@@ -220,6 +220,13 @@ class MobileUrdfContractTest(unittest.TestCase):
             for mesh in self.root.iter("mesh")
         }
         self.assertTrue(all(r.startswith("meshes/mobile/") for r in references))
+        # The arm and whole-body models share the directory: together they
+        # use every packaged mesh.
+        whole_body = urdf_path(AxolModel.MOBILE, whole_body=True)
+        references |= {
+            mesh.attrib["filename"].removeprefix(prefix)
+            for mesh in ElementTree.parse(whole_body).getroot().iter("mesh")
+        }
         packaged = {
             p.relative_to(self.path.parent).as_posix()
             for p in (self.path.parent / "meshes" / "mobile").glob("*.stl")

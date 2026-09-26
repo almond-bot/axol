@@ -2,12 +2,12 @@
      scripts/build_mobile_urdf.py from the Onshape export; do not edit by
      hand. Arm links, joints and inertials are the classic axol.urdf's, so
      FK and gravity compensation match it exactly; joint limits and meshes
-     are the export's. Arm IK model: the base and lift are frozen, the lift
-     fully raised (its CAD pose). At that height the Jelly deck sits below
-     anything the arms can reach, so it is visual only; the arms collide
-     with the shoulder bar (s1), the lift column (base), its top plate
-     (lift_plate) and the head-camera mount (head), exactly as the classic
-     arms collide with the classic base and s1.
+     are the export's. Whole-body IK model: the Jelly base moves in the
+     plane (base_x, base_y, base_yaw about the Jelly centre) and the lift
+     lowers the torso (lift, 0 = fully raised, per stage; the second stage
+     mimics it). The world frame is the arm model's with every body joint at
+     zero. The arms collide with the shoulder bar, top plate, head camera,
+     each lift-column section and the deck (deck_0..2).
 -->
 <robot name="assembly">
     <link name="base">
@@ -28,7 +28,7 @@
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="package://assembly/meshes/mobile/base_collision.stl" scale="1 1 1" />
+                <mesh filename="package://assembly/meshes/mobile/base_whole_body_collision.stl" scale="1 1 1" />
             </geometry>
         </collision>
     </link>
@@ -780,6 +780,12 @@
                 <color rgba="0.6471 0.6471 0.6471 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/mobile/jelly_whole_body_collision.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="lift_stage">
         <visual>
@@ -791,20 +797,94 @@
                 <color rgba="0.6471 0.6471 0.6471 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/mobile/lift_stage_whole_body_collision.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
+    <link name="world" />
+    <link name="base_x_link" />
+    <link name="base_y_link" />
     <joint name="floor_0" type="fixed">
         <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
-        <parent link="root" />
+        <parent link="world" />
         <child link="floor" />
     </joint>
-    <joint name="jelly_0" type="fixed">
+    <joint name="base_x" type="prismatic">
         <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
-        <parent link="root" />
-        <child link="jelly" />
+        <parent link="world" />
+        <child link="base_x_link" />
+        <axis xyz="1 0 0" />
+        <limit lower="-10" upper="10" effort="1" velocity="1" />
     </joint>
-    <joint name="lift_stage_0" type="fixed">
-        <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
-        <parent link="root" />
+    <joint name="base_y" type="prismatic">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="base_x_link" />
+        <child link="base_y_link" />
+        <axis xyz="0 1 0" />
+        <limit lower="-10" upper="10" effort="1" velocity="1" />
+    </joint>
+    <joint name="base_yaw" type="revolute">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="base_y_link" />
+        <child link="jelly" />
+        <axis xyz="0 0 1" />
+        <limit lower="-6.28319" upper="6.28319" effort="1" velocity="1" />
+    </joint>
+    <joint name="lift" type="prismatic">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="jelly" />
         <child link="lift_stage" />
+        <axis xyz="0 0 -1" />
+        <limit lower="0" upper="0.34" effort="1" velocity="1" />
+    </joint>
+    <joint name="lift_2" type="prismatic">
+        <origin xyz="0.112228 -5.12225e-06 0.46944" rpy="0 0 0" />
+        <parent link="lift_stage" />
+        <child link="root" />
+        <axis xyz="0 0 -1" />
+        <limit lower="0" upper="0.34" effort="1" velocity="1" />
+        <mimic joint="lift" multiplier="1" offset="0" />
+    </joint>
+    <link name="deck_0">
+        <collision>
+            <origin xyz="-0.202 -6.13496e-07 0.130265" rpy="-1.5707963267948966 0 0" />
+            <geometry>
+                <cylinder radius="0.14516" length="0.606" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="deck_0_0" type="fixed">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="jelly" />
+        <child link="deck_0" />
+    </joint>
+    <link name="deck_1">
+        <collision>
+            <origin xyz="-1.40789e-07 -6.13496e-07 0.130265" rpy="-1.5707963267948966 0 0" />
+            <geometry>
+                <cylinder radius="0.14516" length="0.606" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="deck_1_0" type="fixed">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="jelly" />
+        <child link="deck_1" />
+    </joint>
+    <link name="deck_2">
+        <collision>
+            <origin xyz="0.202 -6.13496e-07 0.130265" rpy="-1.5707963267948966 0 0" />
+            <geometry>
+                <cylinder radius="0.14516" length="0.606" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="deck_2_0" type="fixed">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="jelly" />
+        <child link="deck_2" />
     </joint>
 </robot>

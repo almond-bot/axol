@@ -157,6 +157,35 @@ class KinematicsConfig:
             with it the body the arms are kept clear of and the joint limits.
             ``None`` (the default) infers it: mobile when Jelly is enabled
             (attached and not switched off), classic otherwise.
+        whole_body: Solve for the Jelly base and lift too, not just the arms
+            (mobile Axol only; implies ``robot_model="mobile"`` when that is
+            unset). The joint vector gains
+            :data:`~almond_axol.constants.BODY_JOINTS` after the 14 arm
+            joints, the world frame becomes the session's starting pose, and
+            the collision model adds the moving column sections and the deck.
+            The body only moves when the arms alone cannot hold a target
+            (it is heavily damped, see ``body_rest_weight``), and targets are
+            not reach-clamped around the shoulders since the body extends the
+            reach. ``False`` (the default) is arm IK: the base and lift are
+            fixed and only the arms move.
+        body_rest_weight: Whole-body IK: per-step damping on the body joints
+            (in place of ``rest_weight``) once they are free to move.
+        body_reach_start: Whole-body IK: distance (m) from a shoulder to its
+            hand target beyond which the body may move. Inside it (for both
+            hands) the base and lift are held by ``body_hold_weight``, so
+            ordinary work in the arms' comfortable envelope never creeps the
+            base — without the hold the arms' posture attractor would make it
+            cheaper to move the body than to keep the arms out. Set near the
+            hanging rest pose's distance (~0.70 m).
+        body_reach_band: Whole-body IK: width (m) over which the hold fades
+            out past ``body_reach_start`` (smoothstep).
+        body_hold_weight: Whole-body IK: damping that holds the body in place
+            while every target is within ``body_reach_start``.
+        base_max_delta: Whole-body IK: largest base translation per solve (m),
+            the body's counterpart of ``max_joint_delta``.
+        base_yaw_max_delta: Whole-body IK: largest base rotation per solve (rad).
+        lift_max_delta: Whole-body IK: largest lift-stage move per solve (m);
+            the lift is far slower than the arms or wheels.
     """
 
     pos_weight: float = 50.0
@@ -180,6 +209,14 @@ class KinematicsConfig:
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
     robot_model: str | None = None
+    whole_body: bool = False
+    body_rest_weight: float = 150.0
+    body_reach_start: float = 0.70
+    body_reach_band: float = 0.08
+    body_hold_weight: float = 5000.0
+    base_max_delta: float = 0.004
+    base_yaw_max_delta: float = 0.008
+    lift_max_delta: float = 0.0004
 
 
 # Solver values the Mantis profile forces (see

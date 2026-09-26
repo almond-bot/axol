@@ -1528,10 +1528,16 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                # Reset returns the arms to rest; whole-body IK's base and
+                # lift stay where they are rather than driving back to where
+                # the session started.
+                q_target = q_rest.copy()
+                n_arm = len(worker.left_indices) + len(worker.right_indices)
+                q_target[n_arm:] = q_current[n_arm:]
+                traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
-                q = traj[-1].copy() if traj else q_rest.copy()
-                conn.send(("reset_traj", q_rest.copy(), traj))
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, tuple) and msg[0] == "sync":
                 pos_l = np.asarray(msg[1], dtype=np.float32)
                 pos_r = np.asarray(msg[2], dtype=np.float32)

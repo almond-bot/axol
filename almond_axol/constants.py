@@ -85,6 +85,19 @@ _URDF_FILES: dict[AxolModel, str] = {
     AxolModel.CLASSIC: "axol.urdf",
     AxolModel.MOBILE: "axol_mobile.urdf",
 }
+# Whole-body IK model (mobile only): the same torso and arms on the Jelly's
+# planar base and lift — see BODY_JOINTS.
+_WHOLE_BODY_URDF = "axol_mobile_whole_body.urdf"
+
+BODY_JOINTS: tuple[str, ...] = ("base_x", "base_y", "base_yaw", "lift")
+"""The Jelly joints whole-body IK solves for, after the 14 arm joints.
+
+``base_x`` / ``base_y`` (m) and ``base_yaw`` (rad) move the base in the
+plane about the Jelly centre, in the world frame of the session's start;
+``lift`` (m) lowers each of the two lift stages from fully raised (0), so the
+torso drops twice that. Wheel spin is not a pose: wheel speeds follow from
+the base motion through the drive's kinematics.
+"""
 
 # Static body links the arms must not collide into, per version. pyroki fits
 # one capsule per link, so the mobile body is split into capsule-friendly
@@ -95,15 +108,47 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.CLASSIC: ("base", "s1"),
     AxolModel.MOBILE: ("base", "s1", "lift_plate", "head"),
 }
+# With the lift moving, each column section rides its own stage and the deck
+# comes within reach.
+_WHOLE_BODY_TORSO_LINKS: tuple[str, ...] = (
+    *_TORSO_LINKS[AxolModel.MOBILE],
+    "lift_stage",
+    "jelly",
+    "deck_0",
+    "deck_1",
+    "deck_2",
+)
 
 
-def urdf_path(model: AxolModel | str = AxolModel.CLASSIC) -> Path:
-    """The bundled URDF for ``model`` (meshes resolve relative to :data:`URDF_DIR`)."""
+def _check_whole_body(model: AxolModel | str) -> None:
+    if AxolModel(model) is not AxolModel.MOBILE:
+        raise ValueError(
+            "whole-body IK needs the mobile Axol (its Jelly base and lift are "
+            "the extra joints); the classic Axol has none"
+        )
+
+
+def urdf_path(
+    model: AxolModel | str = AxolModel.CLASSIC, *, whole_body: bool = False
+) -> Path:
+    """The bundled URDF for ``model`` (meshes resolve relative to :data:`URDF_DIR`).
+
+    ``whole_body`` selects the mobile model with the Jelly joints
+    (:data:`BODY_JOINTS`) instead of the arms-only one.
+    """
+    if whole_body:
+        _check_whole_body(model)
+        return URDF_DIR / _WHOLE_BODY_URDF
     return URDF_DIR / _URDF_FILES[AxolModel(model)]
 
 
-def torso_links(model: AxolModel | str = AxolModel.CLASSIC) -> tuple[str, ...]:
-    """URDF links of ``model``'s static body that arm links collide against."""
+def torso_links(
+    model: AxolModel | str = AxolModel.CLASSIC, *, whole_body: bool = False
+) -> tuple[str, ...]:
+    """URDF links of ``model``'s body that arm links collide against."""
+    if whole_body:
+        _check_whole_body(model)
+        return _WHOLE_BODY_TORSO_LINKS
     return _TORSO_LINKS[AxolModel(model)]
 
 

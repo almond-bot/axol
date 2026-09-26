@@ -124,6 +124,12 @@ class AxolVRTeleop(Teleoperator):
         jelly_cfg = detect_jelly(config.jelly)
         self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
 
+        if config.kinematics_config.whole_body:
+            raise ValueError(
+                "whole-body IK is teleop-only (axol teleop --sim): recorded "
+                "datasets carry arm joints only, so a policy could not "
+                "reproduce base or lift motion"
+            )
         # Enabling Jelly means this is the mobile Axol: the IK solver and the
         # headset overlay use its URDF unless the kinematics config names one.
         # Written back so the session's config records the version it ran.

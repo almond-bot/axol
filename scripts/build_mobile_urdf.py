@@ -1,11 +1,23 @@
 """
-Build the bundled Axol Mobile URDF from its Onshape export.
+Build the bundled Axol Mobile URDFs from their Onshape export.
 
 The Onshape export (``almond_urdf/urdf/almond_urdf.urdf`` + ``meshes/``) is a
 faithful CAD tree — ~140 links including every screw, a two-stage prismatic
 lift, prismatic gripper fingers, and link frames wherever Onshape put them.
 None of that matches what the control stack expects, so this script distils it
-into ``almond_axol/kinematics/urdf/axol_mobile.urdf``:
+into two URDFs that share one set of visual meshes:
+
+- ``axol_mobile.urdf`` — **arm IK** (the default): only the 14 arm joints
+  move; the base and lift are frozen (lift fully raised), rooted at the
+  classic torso-relative world frame.
+- ``axol_mobile_whole_body.urdf`` — **whole-body IK**: the same torso and
+  arms on top of the Jelly's planar base (``base_x`` / ``base_y`` /
+  ``base_yaw`` about the Jelly centre) and its lift (``lift``, with the
+  second stage mimicking it; 0 = fully raised, positive lowers each stage).
+  Its world frame is where the arm model's frame is with the body joints at
+  zero, so the two agree at startup.
+
+Both:
 
 - **Arms are the classic arms.** Every arm link, joint name, joint frame, axis
   and inertial is copied verbatim from ``axol.urdf``; only the joint *limits*
@@ -20,13 +32,15 @@ into ``almond_axol/kinematics/urdf/axol_mobile.urdf``:
   per colour into one decimated visual STL, and one convex hull for
   collision. Fasteners and connector bits under ``--min-part-mm`` are dropped.
 - **The body is split for capsule collision.** pyroki fits one capsule per
-  link, so the static body is kept as capsule-friendly pieces: ``s1`` (the
-  shoulder bar), ``base`` (the lift column), ``lift_plate`` (the bracket the
-  shoulder bar bolts onto) and ``head`` (the head-camera mount).
-  The Jelly deck (``jelly``) is visual only — see ``LIFT_NOTE``.
-- **The lift, fingers and wheels are frozen** at their CAD pose (lift fully
-  raised, fingers closed): the kinematic model has exactly the 14 arm
-  joints. The fingers' collision cylinder spans their full stroke.
+  link, so the body is kept as capsule-friendly pieces: ``s1`` (the shoulder
+  bar), ``lift_plate`` (the bracket it bolts onto), ``head`` (the head-camera
+  mount) and the lift column. In the arm model the column is one link
+  (``base``) and the Jelly deck is visual only (see ``ARM_NOTE``); in the
+  whole-body model each column section rides its own stage (``base``,
+  ``lift_stage``, ``jelly``) and the deck is covered by ``deck_0..2``.
+- **The fingers and wheels are frozen** (fingers closed; wheel spin is not a
+  pose — base motion is the ``base_*`` joints). The fingers' collision
+  cylinder spans their full stroke.
 
 Run (``fast-simplification`` is only needed here, not at runtime)::
 
@@ -52,6 +66,10 @@ REPO = Path(__file__).resolve().parents[1]
 URDF_DIR = REPO / "almond_axol" / "kinematics" / "urdf"
 CLASSIC_URDF = URDF_DIR / "axol.urdf"
 OUT_URDF = URDF_DIR / "axol_mobile.urdf"
+OUT_WHOLE_BODY_URDF = URDF_DIR / "axol_mobile_whole_body.urdf"
+# Travel of each planar base joint in the whole-body model (m): far beyond
+# any single session, so the joint limits never shape the solve.
+BASE_TRAVEL = 10.0
 MESH_SUBDIR = "meshes/mobile"
 PACKAGE = "package://assembly/"
 
@@ -63,7 +81,7 @@ EXPORT_JOINTS = ("s1", "s2", "s3", "e1", "w1", "w2", "w3")
 # nearest listed ancestor.
 ANCHORS: dict[str, str] = {
     "jelly_base": "jelly",
-    "jelly_stage_2_1": "base",
+    "jelly_stage_2_1": "lift_stage",
     "jelly_stage_3": "base",
     "s1": "s1",
     "part_1": "head",
@@ -96,7 +114,6 @@ ANCHORS: dict[str, str] = {
 # parent's frame).
 EXTRA_LINKS: dict[str, str] = {
     "head": "s1",
-    "jelly": "base",
     "lift_plate": "base",
     # Split off the gripper so each gets its own (much tighter) capsule.
     "left_fingers": "left_gripper",
@@ -105,19 +122,54 @@ EXTRA_LINKS: dict[str, str] = {
     "right_wrist_camera": "right_gripper",
 }
 
-# Collision-only splits of one export mesh: vertices inside the mesh-local box
-# ``(lo, hi)`` go to another link's hull instead of their own.
+# The Jelly body links: frames world-aligned at the ground under the Jelly
+# centre (the export root), in both models. In the arm model they are fixed
+# to the torso-relative root; in the whole-body model ``jelly`` is the child
+# of the planar base joints and ``lift_stage`` rides the first lift stage.
+BODY_FRAME_LINKS = ("jelly", "lift_stage")
+
+# Collision pieces: each export mesh feeds the piece named after its group,
+# unless split here by a mesh-local box ``(lo, hi)`` into the piece inside
+# and the piece outside it ("" = no collision). Each model then builds its
+# collision links from pieces (ARM_COLLISION / WHOLE_BODY_COLLISION).
 # - The top of the last lift stage is the bracket the shoulder bar bolts onto;
 #   folded into the column's hull it would inflate the column capsule from
-#   ~85 mm to ~120 mm, so it gets its own link.
+#   ~85 mm to ~120 mm, so it is its own piece (and link).
 # - The Jelly base mesh includes the fixed bottom section of the lift column,
-#   which is within reach at gripper height; it joins the column's hull while
-#   the deck itself stays visual only.
+#   which is within reach at gripper height, separate from the deck.
 _INF = np.inf
-HULL_SPLITS: dict[str, tuple[tuple[float, ...], tuple[float, ...], str]] = {
-    "Jelly_Stage_3.stl": ((-_INF, -_INF, 1.22), (_INF, _INF, _INF), "lift_plate"),
-    "Jelly_Base.stl": ((-0.041, -0.073, 0.2), (0.041, 0.073, _INF), "base"),
+_ALL = ((-_INF,) * 3, (_INF,) * 3)
+PIECE_SPLITS: dict[str, tuple[tuple[float, ...], tuple[float, ...], str, str]] = {
+    "Jelly_Stage_3.stl": (
+        (-_INF, -_INF, 1.22),
+        (_INF,) * 3,
+        "lift_plate",
+        "column_top",
+    ),
+    "Jelly_Base.stl": (
+        (-0.041, -0.073, 0.2),
+        (0.041, 0.073, _INF),
+        "column_stub",
+        "deck",
+    ),
+    "Jelly_Stage_2.stl": (*_ALL, "column_mid", ""),
+    "Wheel.stl": (*_ALL, "", ""),
 }
+
+# Collision link -> the pieces it covers. Links absent here (the arms, s1,
+# head, lift_plate) collide as their own piece.
+ARM_COLLISION: dict[str, tuple[str, ...]] = {
+    "base": ("column_top", "column_mid", "column_stub"),
+}
+WHOLE_BODY_COLLISION: dict[str, tuple[str, ...]] = {
+    "base": ("column_top",),
+    "lift_stage": ("column_mid",),
+    "jelly": ("column_stub",),
+}
+# The deck (0.6 x 0.6 m, ~0.24 m tall) as strips across the robot: one
+# capsule over the whole deck would swallow the arms; three along y stay
+# within a few cm of it.
+DECK_STRIPS = 3
 
 # Links whose collision body is an explicit cylinder along a link-frame axis
 # (0 = x) rather than a hull. pyroki fits one minimum-volume cylinder per
@@ -132,15 +184,22 @@ _CYLINDER_RPY = {0: "0 1.5707963267948966 0", 1: "-1.5707963267948966 0 0", 2: "
 # Frame at the ground under the robot (the export's root).
 FLOOR_LINK = "floor"
 
-# Links carrying a collision hull. The Jelly deck is deliberately absent.
-LIFT_NOTE = (
-    "The lift is frozen fully raised (its CAD pose). At that height the Jelly "
-    "deck sits below anything the arms can reach, so it is visual only; the "
-    "arms collide with the shoulder bar (s1), the lift column (base), its "
-    "top plate (lift_plate) and the head-camera mount (head), exactly as the "
-    "classic arms collide with the classic base and s1."
+ARM_NOTE = (
+    "Arm IK model: the base and lift are frozen, the lift fully raised (its "
+    "CAD pose). At that height the Jelly deck sits below anything the arms "
+    "can reach, so it is visual only; the arms collide with the shoulder bar "
+    "(s1), the lift column (base), its top plate (lift_plate) and the "
+    "head-camera mount (head), exactly as the classic arms collide with the "
+    "classic base and s1."
 )
-NO_COLLISION = {"jelly"}
+WHOLE_BODY_NOTE = (
+    "Whole-body IK model: the Jelly base moves in the plane (base_x, base_y, "
+    "base_yaw about the Jelly centre) and the lift lowers the torso (lift, "
+    "0 = fully raised, per stage; the second stage mimics it). The world "
+    "frame is the arm model's with every body joint at zero. The arms "
+    "collide with the shoulder bar, top plate, head camera, each lift-column "
+    "section and the deck (deck_0..2)."
+)
 
 
 def _load(path: Path) -> yourdfpy.URDF:
@@ -339,17 +398,27 @@ def build_meshes(
     tf: np.ndarray,
     min_part: float,
     visual_faces: int,
-) -> tuple[dict[str, list[tuple[str, tuple[float, ...]]]], dict[str, str]]:
+) -> tuple[
+    dict[str, list[tuple[str, tuple[float, ...]]]],
+    dict[str, tuple[str, list[np.ndarray]]],
+]:
+    """Write the shared visual meshes; return them and the collision pieces.
+
+    Pieces are ``{name: (link, [points in that link's frame])}``; each
+    model groups them into its own collision links (:func:`collisions`).
+    """
     owner = groups(export)
     _zero(classic)
-
-    def frame(link: str) -> np.ndarray:
-        return classic.get_transform(EXTRA_LINKS.get(link, link), classic.base_link)
 
     by_color: dict[tuple[str, tuple[float, ...]], list[trimesh.Trimesh]] = defaultdict(
         list
     )
-    hull_pts: dict[str, list[np.ndarray]] = defaultdict(list)
+    pieces: dict[str, tuple[str, list[np.ndarray]]] = {}
+
+    def add(piece: str, link: str, pts: np.ndarray) -> None:
+        if piece:
+            pieces.setdefault(piece, (link, []))[1].append(pts)
+
     stroke = {
         j.child: j
         for j in export.robot.joints
@@ -359,7 +428,7 @@ def build_meshes(
         target = owner.get(link_name)
         if target is None:
             continue
-        in_target = np.linalg.inv(frame(target)) @ tf
+        in_target = np.linalg.inv(link_frame(classic, tf, target)) @ tf
         for vis in link.visuals:
             mesh = _mesh(export_dir, vis.geometry.mesh.filename)
             origin = vis.origin if vis.origin is not None else np.eye(4)
@@ -370,20 +439,21 @@ def build_meshes(
                 _zero(export, **{joint.name: float(joint.limit.upper)})
                 opened = export.get_transform(link_name, export.base_link)
                 _zero(export)
-                hull_pts[target].append(
-                    trimesh.transform_points(mesh.vertices, in_target @ opened @ origin)
+                add(
+                    target,
+                    target,
+                    trimesh.transform_points(
+                        mesh.vertices, in_target @ opened @ origin
+                    ),
                 )
-            split = HULL_SPLITS.get(Path(vis.geometry.mesh.filename).name)
+            split = PIECE_SPLITS.get(Path(vis.geometry.mesh.filename).name)
             if split is None:
-                hull_pts[target].append(placed.vertices)
+                add(target, target, placed.vertices)
             else:
-                lo, hi, other = split
+                lo, hi, inside_piece, outside_piece = split
                 inside = np.all((mesh.vertices >= lo) & (mesh.vertices <= hi), axis=1)
-                hull_pts[target].append(placed.vertices[~inside])
-                to_other = np.linalg.inv(frame(other)) @ frame(target)
-                hull_pts[other].append(
-                    trimesh.transform_points(placed.vertices[inside], to_other)
-                )
+                add(inside_piece, target, placed.vertices[inside])
+                add(outside_piece, target, placed.vertices[~inside])
             if np.linalg.norm(mesh.extents) * 1e3 < min_part:
                 continue
             rgba = (0.6, 0.6, 0.6, 1.0)
@@ -404,32 +474,97 @@ def build_meshes(
         counters[target] += 1
         merged.export(URDF_DIR / MESH_SUBDIR / name)
         visuals[target].append((f"{MESH_SUBDIR}/{name}", rgba))
-    collisions: dict[str, str | tuple[float, float, np.ndarray, str]] = {}
-    for target, pts in sorted(hull_pts.items()):
-        if target in NO_COLLISION:
-            continue
-        if target in COLLISION_CYLINDERS:
-            collisions[target] = _fit_cylinder(
-                np.vstack(pts), COLLISION_CYLINDERS[target]
-            )
-            radius, length = collisions[target][:2]
+    return visuals, pieces
+
+
+def link_frame(classic: yourdfpy.URDF, tf: np.ndarray, link: str) -> np.ndarray:
+    """A bundled link's frame in the classic root frame (every joint at zero)."""
+    if link in BODY_FRAME_LINKS or link.startswith("deck_"):
+        frame = np.eye(4)
+        frame[:3, 3] = tf[:3, 3]
+        return frame
+    return classic.get_transform(EXTRA_LINKS.get(link, link), classic.base_link)
+
+
+CollisionSpec = str | tuple[float, float, np.ndarray, str]
+
+
+def collisions(
+    classic: yourdfpy.URDF,
+    tf: np.ndarray,
+    pieces: dict[str, tuple[str, list[np.ndarray]]],
+    grouping: dict[str, tuple[str, ...]],
+    *,
+    deck: bool,
+    tag: str,
+) -> dict[str, CollisionSpec]:
+    """One model's collision bodies from the shared pieces.
+
+    Hulls are written as ``<link>[_<tag>]_collision.stl``; the tag only
+    appears where a link's hull differs from the arm model's.
+    """
+    grouped = {p for ps in grouping.values() for p in ps}
+    plan: dict[str, tuple[str, ...]] = dict(grouping)
+    for piece, (link, _) in pieces.items():
+        if piece not in grouped and piece in (link, "lift_plate"):
+            plan.setdefault(piece, (piece,))
+
+    def points(link: str, names: tuple[str, ...]) -> np.ndarray:
+        dst = np.linalg.inv(link_frame(classic, tf, link))
+        return np.vstack(
+            [
+                trimesh.transform_points(
+                    np.vstack(pieces[n][1]), dst @ link_frame(classic, tf, pieces[n][0])
+                )
+                for n in names
+            ]
+        )
+
+    out: dict[str, CollisionSpec] = {}
+    for link, names in sorted(plan.items()):
+        pts = points(link, names)
+        if link in COLLISION_CYLINDERS:
+            out[link] = _fit_cylinder(pts, COLLISION_CYLINDERS[link])
+            radius, length = out[link][:2]
             print(
-                f"  {target:15s} cylinder r={radius * 1e3:5.1f} mm h={length * 1e3:5.1f} mm"
+                f"  {link:18s} cylinder r={radius * 1e3:5.1f} mm h={length * 1e3:5.1f} mm"
             )
             continue
         # Snapping to a 2 mm grid first keeps the hull to a few hundred faces
         # (<= 1.7 mm of shape error, far inside the capsule fit's slack).
-        snapped = np.unique(np.round(np.vstack(pts) / 2e-3) * 2e-3, axis=0)
+        snapped = np.unique(np.round(pts / 2e-3) * 2e-3, axis=0)
         hull = trimesh.PointCloud(snapped).convex_hull
-        name = f"{target}_collision.stl"
+        suffix = (
+            f"_{tag}" if tag and grouping.get(link) != ARM_COLLISION.get(link) else ""
+        )
+        name = f"{link}{suffix}_collision.stl"
         hull.export(URDF_DIR / MESH_SUBDIR / name)
-        collisions[target] = f"{MESH_SUBDIR}/{name}"
+        out[link] = f"{MESH_SUBDIR}/{name}"
         cyl = trimesh.bounds.minimum_cylinder(hull)
         print(
-            f"  {target:15s} hull {len(hull.faces):4d} faces, capsule r={cyl['radius'] * 1e3:5.1f} mm "
-            f"h={cyl['height'] * 1e3:5.1f} mm"
+            f"  {link:18s} hull {len(hull.faces):4d} faces, capsule "
+            f"r={cyl['radius'] * 1e3:5.1f} mm h={cyl['height'] * 1e3:5.1f} mm"
         )
-    return visuals, collisions
+    if deck:
+        # The deck mesh is a box with vertices only at its edges, so strip
+        # its bounding box rather than binning vertices.
+        pts = points("jelly", ("deck",))
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        edges = np.linspace(lo[0], hi[0], DECK_STRIPS + 1)
+        for i in range(DECK_STRIPS):
+            corners = np.array(
+                list(
+                    itertools.product(
+                        (edges[i], edges[i + 1]), (lo[1], hi[1]), (lo[2], hi[2])
+                    )
+                )
+            )
+            out[f"deck_{i}"] = _fit_cylinder(corners, 1)
+            radius, length = out[f"deck_{i}"][:2]
+            print(
+                f"  deck_{i:<13d} cylinder r={radius * 1e3:5.1f} mm h={length * 1e3:5.1f} mm"
+            )
+    return out
 
 
 def _fit_cylinder(pts: np.ndarray, axis: int) -> tuple[float, float, np.ndarray, str]:
@@ -456,38 +591,139 @@ def _fmt(v: np.ndarray) -> str:
     return " ".join(f"{x:.6g}" if abs(x) > 1e-12 else "0" for x in v)
 
 
+def _joint(
+    robot: ET.Element,
+    name: str,
+    kind: str,
+    parent: str,
+    child: str,
+    xyz: np.ndarray | None = None,
+    axis: str | None = None,
+    limits: tuple[float, float] | None = None,
+    mimic: str | None = None,
+) -> None:
+    joint = ET.SubElement(robot, "joint", name=name, type=kind)
+    ET.SubElement(
+        joint, "origin", xyz="0 0 0" if xyz is None else _fmt(xyz), rpy="0 0 0"
+    )
+    ET.SubElement(joint, "parent", link=parent)
+    ET.SubElement(joint, "child", link=child)
+    if axis is not None:
+        ET.SubElement(joint, "axis", xyz=axis)
+    if limits is not None:
+        ET.SubElement(
+            joint,
+            "limit",
+            lower=f"{limits[0]:.6g}",
+            upper=f"{limits[1]:.6g}",
+            effort="1",
+            velocity="1",
+        )
+    if mimic is not None:
+        ET.SubElement(joint, "mimic", joint=mimic, multiplier="1", offset="0")
+
+
 def write_urdf(
+    out_path: Path,
     classic_path: Path,
     visuals: dict[str, list[tuple[str, tuple[float, ...]]]],
-    collisions: dict[str, str | tuple[float, float, np.ndarray, str]],
+    collision: dict[str, CollisionSpec],
     limits: dict[str, tuple[float, float]],
-    floor: np.ndarray,
+    tf: np.ndarray,
+    *,
+    whole_body: bool,
+    lift_travel: float,
 ) -> None:
     tree = ET.parse(classic_path)
     robot = tree.getroot()
     robot.set("name", "assembly")
     links = {ln.get("name"): ln for ln in robot.findall("link")}
-    # Where the wheels meet the ground: the export's root. The world frame
-    # stays the classic one (0.86 m below the shoulders) so IK targets and
-    # recorded poses are unchanged; viewers draw their ground plane here.
-    ET.SubElement(robot, "link", name=FLOOR_LINK)
-    joint = ET.SubElement(robot, "joint", name=f"{FLOOR_LINK}_0", type="fixed")
-    ET.SubElement(joint, "origin", xyz=_fmt(floor[:3, 3]), rpy="0 0 0")
-    ET.SubElement(joint, "parent", link="root")
-    ET.SubElement(joint, "child", link=FLOOR_LINK)
+    jelly_center = tf[:3, 3]
+
+    def link(name: str) -> ET.Element:
+        links[name] = ET.SubElement(robot, "link", name=name)
+        return links[name]
+
+    # Where the wheels meet the ground (the export's root), world-fixed.
+    # Viewers draw their ground plane here; the world frame itself stays the
+    # classic one (0.86 m below the shoulders).
+    link(FLOOR_LINK)
     for name, parent in EXTRA_LINKS.items():
-        link = ET.SubElement(robot, "link", name=name)
-        joint = ET.SubElement(robot, "joint", name=f"{name}_0", type="fixed")
-        ET.SubElement(joint, "origin", xyz="0 0 0", rpy="0 0 0")
-        ET.SubElement(joint, "parent", link=parent)
-        ET.SubElement(joint, "child", link=name)
-        links[name] = link
-    for name, link in links.items():
+        link(name)
+        _joint(robot, f"{name}_0", "fixed", parent, name)
+    link("jelly")
+    link("lift_stage")
+    if not whole_body:
+        _joint(robot, f"{FLOOR_LINK}_0", "fixed", "root", FLOOR_LINK, jelly_center)
+        _joint(robot, "jelly_0", "fixed", "root", "jelly", jelly_center)
+        _joint(robot, "lift_stage_0", "fixed", "root", "lift_stage", jelly_center)
+    else:
+        # world -> planar base -> jelly -> lift -> torso root (the classic
+        # tree). At every body joint's zero, "root" sits at the world origin.
+        link("world")
+        link("base_x_link")
+        link("base_y_link")
+        _joint(robot, f"{FLOOR_LINK}_0", "fixed", "world", FLOOR_LINK, jelly_center)
+        _joint(
+            robot,
+            "base_x",
+            "prismatic",
+            "world",
+            "base_x_link",
+            jelly_center,
+            "1 0 0",
+            (-BASE_TRAVEL, BASE_TRAVEL),
+        )
+        _joint(
+            robot,
+            "base_y",
+            "prismatic",
+            "base_x_link",
+            "base_y_link",
+            None,
+            "0 1 0",
+            (-BASE_TRAVEL, BASE_TRAVEL),
+        )
+        _joint(
+            robot,
+            "base_yaw",
+            "revolute",
+            "base_y_link",
+            "jelly",
+            None,
+            "0 0 1",
+            (-2 * np.pi, 2 * np.pi),
+        )
+        _joint(
+            robot,
+            "lift",
+            "prismatic",
+            "jelly",
+            "lift_stage",
+            None,
+            "0 0 -1",
+            (0.0, lift_travel),
+        )
+        _joint(
+            robot,
+            "lift_2",
+            "prismatic",
+            "lift_stage",
+            "root",
+            -jelly_center,
+            "0 0 -1",
+            (0.0, lift_travel),
+            mimic="lift",
+        )
+        for i in range(DECK_STRIPS):
+            link(f"deck_{i}")
+            _joint(robot, f"deck_{i}_0", "fixed", "jelly", f"deck_{i}")
+    for name, element in links.items():
         for tag in ("visual", "collision"):
-            for el in link.findall(tag):
-                link.remove(el)
+            for el in element.findall(tag):
+                element.remove(el)
         for path, rgba in visuals.get(name, []):
-            vis = ET.SubElement(link, "visual")
+            vis = ET.SubElement(element, "visual")
             ET.SubElement(vis, "origin", xyz="0 0 0", rpy="0 0 0")
             geom = ET.SubElement(vis, "geometry")
             ET.SubElement(geom, "mesh", filename=PACKAGE + path, scale="1 1 1")
@@ -495,9 +731,9 @@ def write_urdf(
                 vis, "material", name="c_" + "_".join(f"{c:g}" for c in rgba)
             )
             ET.SubElement(mat, "color", rgba=" ".join(f"{c:g}" for c in rgba))
-        if name in collisions:
-            spec = collisions[name]
-            col = ET.SubElement(link, "collision")
+        if name in collision:
+            spec = collision[name]
+            col = ET.SubElement(element, "collision")
             if isinstance(spec, str):
                 ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
                 geom = ET.SubElement(col, "geometry")
@@ -521,11 +757,11 @@ def write_urdf(
         "scripts/build_mobile_urdf.py from the Onshape export; do not edit by "
         "hand. Arm links, joints and inertials are the classic axol.urdf's, so "
         "FK and gravity compensation match it exactly; joint limits and meshes "
-        "are the export's. " + LIFT_NOTE
+        "are the export's. " + (WHOLE_BODY_NOTE if whole_body else ARM_NOTE)
     )
     header = "<!-- " + textwrap.fill(note, 76, subsequent_indent="     ") + "\n-->\n"
-    OUT_URDF.write_text(header + body + "\n")
-    print(f"wrote {OUT_URDF.relative_to(REPO)}")
+    out_path.write_text(header + body + "\n")
+    print(f"wrote {out_path.relative_to(REPO)}")
 
 
 def main() -> None:
@@ -542,7 +778,10 @@ def main() -> None:
     classic = _load(CLASSIC_URDF)
     export = _load(urdfs[0])
     tf, sg = align(classic, export)
+    if not np.allclose(tf[:3, :3], np.eye(3), atol=1e-3):
+        raise SystemExit("export root is not level with the classic world frame")
     check_equivalent(classic, export, tf, sg)
+    lift_travel = check_lift(export)
     limits = export_limits(export, sg)
     for name, (lo, hi) in limits.items():
         old = classic.joint_map[name].limit
@@ -552,12 +791,52 @@ def main() -> None:
             else "  <- changed"
         )
         print(f"  {name:12s} [{lo:+.4f}, {hi:+.4f}]{mark}")
-    visuals, collisions = build_meshes(
+    visuals, pieces = build_meshes(
         export, args.export_dir, classic, tf, args.min_part_mm, args.visual_faces
     )
-    if not np.allclose(tf[:3, :3], np.eye(3), atol=1e-3):
-        raise SystemExit("export root is not level with the classic world frame")
-    write_urdf(CLASSIC_URDF, visuals, collisions, limits, tf)
+    print("arm IK collision:")
+    arm = collisions(classic, tf, pieces, ARM_COLLISION, deck=False, tag="")
+    write_urdf(
+        OUT_URDF,
+        CLASSIC_URDF,
+        visuals,
+        arm,
+        limits,
+        tf,
+        whole_body=False,
+        lift_travel=lift_travel,
+    )
+    print("whole-body IK collision:")
+    body = collisions(
+        classic, tf, pieces, WHOLE_BODY_COLLISION, deck=True, tag="whole_body"
+    )
+    write_urdf(
+        OUT_WHOLE_BODY_URDF,
+        CLASSIC_URDF,
+        visuals,
+        body,
+        limits,
+        tf,
+        whole_body=True,
+        lift_travel=lift_travel,
+    )
+
+
+def check_lift(export: yourdfpy.URDF) -> float:
+    """The export's two lift stages: same travel, both lowering along -z."""
+    stages = [export.joint_map[n] for n in ("stage_1", "stage_2")]
+    travel = {round(float(j.limit.upper), 6) for j in stages}
+    if len(travel) != 1 or any(abs(float(j.limit.lower)) > 1e-6 for j in stages):
+        raise SystemExit(f"lift stages differ: {travel}")
+    for j in stages:
+        _zero(export)
+        axis = export.get_transform(j.parent, export.base_link)[:3, :3] @ np.asarray(
+            j.origin[:3, :3] @ j.axis
+        )
+        if not np.allclose(axis, [0, 0, -1], atol=1e-6):
+            raise SystemExit(f"{j.name} does not lower along -z: {axis}")
+    print(f"lift: two stages of {travel.pop():.3f} m each, 0 = fully raised")
+    return float(stages[0].limit.upper)
 
 
 if __name__ == "__main__":

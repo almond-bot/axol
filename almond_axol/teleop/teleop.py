@@ -195,9 +195,28 @@ class VRTeleop:
 
         robot_model = resolve_robot_model(
             kinematics_config.robot_model,
-            jelly_enabled=True if jelly is not None else None,
+            jelly_enabled=(
+                True if jelly is not None or kinematics_config.whole_body else None
+            ),
         )
         kinematics_config = replace(kinematics_config, robot_model=robot_model.value)
+        # Whole-body IK solves for the Jelly base and lift too. Only the sim
+        # can follow those joints for now: driving the real wheels and lift
+        # from the IK needs odometry and a lift-height feedback path.
+        self._body_sink = None
+        if kinematics_config.whole_body:
+            if config.absolute_mode:
+                raise ValueError(
+                    "whole-body IK needs relative (Quest) teleop: absolute "
+                    "(Mantis) mode calibrates against a fixed robot base"
+                )
+            self._body_sink = getattr(robot, "set_body_joints", None)
+            if self._body_sink is None:
+                raise ValueError(
+                    "whole-body IK is sim-only for now (axol teleop --sim): "
+                    "driving the real Jelly wheels and lift from the IK is not "
+                    "implemented yet"
+                )
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -768,6 +787,7 @@ class VRTeleop:
             left, right = self.step()
             if left is not None:
                 await self._robot.motion_control(left=left, right=right)
+                self._send_body()
 
         async def _guard_gravity_step() -> None:
             await self._robot.gravity_compensate(  # type: ignore[attr-defined]
@@ -847,6 +867,7 @@ class VRTeleop:
                 if self._robot_recorder is not None:
                     self._robot_recorder(self._core.teleop_enabled)
                 await self._robot.motion_control(left=left, right=right)
+                self._send_body()
 
                 if self._rec is not None:
                     # Segment gate: record only while engaged; the disengage
@@ -988,6 +1009,11 @@ class VRTeleop:
         if out is None:
             return None, None
         return out[:8], out[8:]
+
+    def _send_body(self) -> None:
+        """Whole-body IK: hand the latest base/lift target to the sim."""
+        if self._body_sink is not None and self._core.body_q is not None:
+            self._body_sink(self._core.body_q)
 
     def _record_measured(self) -> None:
         """Append one measured-side row to the teleop recorder (hardware only).
