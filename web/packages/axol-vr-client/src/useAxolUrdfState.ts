@@ -18,6 +18,8 @@ export interface AxolUrdfBase {
  * IK solution keyed by URDF joint name.
  */
 export interface AxolUrdfState {
+  /** URDF file under the server's `/urdf` mount for this Axol version. */
+  urdf: string
   base: AxolUrdfBase | null
   joints: Record<string, number>
   engaged: boolean
@@ -79,6 +81,8 @@ export function useAxolUrdfState(
           } & Partial<AxolUrdfState>
           if (msg.type === "urdf_state") {
             stateRef.current = {
+              // Servers that predate Axol versions only ship the classic URDF.
+              urdf: msg.urdf ?? "axol.urdf",
               base: msg.base ?? null,
               joints: msg.joints ?? {},
               engaged: !!msg.engaged,

@@ -37,6 +37,7 @@ from ..constants import (
     CAN_RIGHT,
     URDF_PATH,
 )
+from ..settings import resolve_robot_model
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -2148,11 +2149,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- shared operator settings (see serve/settings.py) --------------------
 
+    def robot_model() -> str:
+        """The Axol version runs on this host would use: mobile when Jelly is on.
+
+        Derived (Jelly attached and not switched off, or an explicit
+        ``kinematics.robot_model``), so the panel's robot viewer shows the same
+        body the IK solver keeps the arms clear of.
+        """
+        try:
+            return resolve_robot_model(store=settings).value
+        except Exception:  # noqa: BLE001 - a bad value must not hide the settings
+            _logger.exception("could not resolve the Axol version; showing classic")
+            return "classic"
+
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
         """Stored shared settings + the schemas describing every category."""
         return {
             **settings.snapshot(),
+            "robotModel": robot_model(),
             "schema": settings_schema(),
             "advancedSchema": advanced_schema(),
         }
@@ -2174,7 +2189,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": "could not securely write the shared settings"},
                 status_code=500,
             )
-        return JSONResponse(snapshot)
+        # The Jelly switches (or an explicit kinematics.robot_model) may have
+        # just changed which Axol version runs.
+        return JSONResponse({**snapshot, "robotModel": robot_model()})
 
     def quest_calibration_key() -> object:
         snapshot = settings.snapshot()

@@ -20,6 +20,7 @@ import jaxlie
 import numpy as np
 
 from ..constants import (
+    AxolModel,
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
@@ -63,17 +64,20 @@ class AxolForwardKinematics:
     """Forward kinematics for the Axol end-effectors, no IK or collision model.
 
     Reuses the per-process pyroki robot (built on first use) and caches the EE
-    link and per-arm joint indices. A single warm-up call JIT-compiles the
+    link and per-arm joint indices. ``robot_model`` picks the Axol version
+    (inferred from whether Jelly is enabled when ``None``); the poses are identical across
+    versions. A single warm-up call JIT-compiles the
     forward pass so the first :meth:`ee_poses` in the observation loop isn't
     slow.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, robot_model: AxolModel | str | None = None) -> None:
         enable_persistent_compilation_cache()
         # Shared per-process robot (see .model): a KinematicsSolver in the
         # same process reuses this instance and vice versa, so the forward
-        # pass is only ever traced once.
-        self.robot = shared_robot()
+        # pass is only ever traced once. Every Axol version has the same arm
+        # chain, so the version only decides which cached robot is reused.
+        self.robot = shared_robot(robot_model)
 
         names = self.robot.links.names
         self._l_ee_idx = names.index(urdf_body_name(Joint.GRIPPER, is_left=True))

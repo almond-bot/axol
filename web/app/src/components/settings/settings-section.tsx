@@ -506,7 +506,12 @@ export function SettingsSection({
             ) : tab === "usb" ? (
               <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
             ) : tab === "pose" ? (
-              <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
+              <PosePanel
+                fields={poseFields}
+                values={draft.values}
+                onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
+              />
             ) : tab === "advanced" ? (
               <AdvancedPanel
                 sections={generalAdvancedSections}

@@ -1201,6 +1201,8 @@ export interface SettingsSnapshot {
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
+  /** The Axol version runs use (hosts that predate it only have classic). */
+  robotModel?: AxolModel
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1228,9 +1230,25 @@ export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapsh
   return { schema: [], advancedSchema: [], ...res }
 }
 
-/** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */
-export function urdfUrl(): string {
-  return apiUrl("/api/urdf/axol.urdf")
+/**
+ * Which Axol hardware version the host runs: mobile whenever Jelly is enabled
+ * (attached and not switched off in the Robot tab), classic otherwise. The
+ * host derives it and reports it with the settings as `robotModel`.
+ */
+export type AxolModel = "classic" | "mobile"
+
+const URDF_FILES: Record<AxolModel, string> = {
+  classic: "axol.urdf",
+  mobile: "axol_mobile.urdf",
+}
+
+export function parseAxolModel(value: unknown): AxolModel | null {
+  return value === "classic" || value === "mobile" ? value : null
+}
+
+/** URL of an Axol version's URDF (meshes resolve relative to it via /api/urdf/…). */
+export function urdfUrl(model: AxolModel = "classic"): string {
+  return apiUrl(`/api/urdf/${URDF_FILES[model]}`)
 }
 
 export function cameraSerials(

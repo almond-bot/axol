@@ -7,7 +7,13 @@ import threading
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..constants import (
+    ARM_JOINTS,
+    BODY_JOINTS,
+    AxolModel,
+    urdf_arm_joint_names,
+    urdf_path,
+)
 from ..utils.ports import reclaim_port
 from .base import RobotBase
 
@@ -38,6 +44,10 @@ class Sim(RobotBase):
             Defaults to the order reported by the loaded URDF.
         default_q: Initial joint configuration in radians. Defaults to zeros.
         port: Port for the viser web server.
+        robot_model: Axol version to render (``"classic"`` / ``"mobile"``);
+            inferred from whether Jelly is enabled when ``None``.
+        whole_body: Render the whole-body IK model, whose Jelly base and lift
+            move too (mobile only); drive them with :meth:`set_body_joints`.
 
     Example::
 
@@ -52,6 +62,8 @@ class Sim(RobotBase):
         joint_names: list[str] | None = None,
         default_q: np.ndarray | None = None,
         port: int = 8002,
+        robot_model: AxolModel | str | None = None,
+        whole_body: bool = False,
     ) -> None:
         """Construct the simulation.
 
@@ -62,10 +74,16 @@ class Sim(RobotBase):
                 Defaults to the hard-coded left-then-right arm order.
             default_q:   Initial joint configuration in radians; defaults to zeros.
             port:        Port for the viser web server.
+            robot_model: Axol version to render; inferred when ``None``.
+            whole_body:  Render the whole-body IK model (base and lift move).
         """
         self._joint_names = joint_names
         self._default_q = default_q
         self._port = port
+        self._robot_model = robot_model
+        self._whole_body = whole_body
+        # Whole-body: base_x, base_y, base_yaw, lift (see BODY_JOINTS).
+        self._body = np.zeros(len(BODY_JOINTS) if whole_body else 0, dtype=float)
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -146,18 +164,36 @@ class Sim(RobotBase):
         if right is not None:
             self._last_right = np.asarray(right, dtype=np.float32)
 
+        self._publish()
+
+    def set_body_joints(self, values: np.ndarray) -> None:
+        """Whole-body sim: move the Jelly base and lift.
+
+        Args:
+            values: ``(4,)`` array in :data:`~almond_axol.constants.BODY_JOINTS`
+                order — base x / y (m) and yaw (rad) in the session's starting
+                frame, then the lift (m per stage below fully raised).
+        """
+        if not self._whole_body:
+            return
+        self._body = np.asarray(values, dtype=float)[: len(BODY_JOINTS)]
+        self._publish()
+
+    def _publish(self) -> None:
         q = self._build_q()
         with self._condition:
             self._latest_q = q
             self._condition.notify()
 
     def _build_q(self) -> np.ndarray:
-        """Build the arm joint angle array (radians), left then right, no gripper."""
+        """Arm joint angles (radians), left then right, no gripper; then the
+        body joints when rendering the whole-body model."""
         n_arm = len(ARM_JOINTS)  # 7, no gripper
         return np.concatenate(
             [
                 self._last_left[:n_arm].astype(float),
                 self._last_right[:n_arm].astype(float),
+                self._body,
             ]
         )
 
@@ -170,7 +206,13 @@ class Sim(RobotBase):
         # Stopping here guarantees the in-process port is freed whenever the
         # loop exits, which is what makes the in-process restart reliable.
         try:
-            urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
+            from ..settings import resolve_robot_model
+
+            model = resolve_robot_model(
+                self._robot_model, jelly_enabled=True if self._whole_body else None
+            )
+            path = urdf_path(model, whole_body=self._whole_body)
+            urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
             viser_urdf = ViserUrdf(
                 server,
                 urdf_or_path=urdf,
@@ -182,8 +224,10 @@ class Sim(RobotBase):
             # Build the robot-side joint ordering to match _build_q's output:
             # left arm joint1-N, then right arm joint1-N.
             robot_order = (
-                self._joint_names or urdf_arm_joint_names(is_left=True)
-            ) + urdf_arm_joint_names(is_left=False)
+                (self._joint_names or urdf_arm_joint_names(is_left=True))
+                + urdf_arm_joint_names(is_left=False)
+                + (list(BODY_JOINTS) if self._whole_body else [])
+            )
 
             # Map each viser joint to its index in robot_order (-1 for any
             # unexpected movable joint outside the arm contract, which stays 0).
@@ -209,9 +253,17 @@ class Sim(RobotBase):
             )
             viser_urdf.update_cfg(_to_viser(q0))
 
-            server.scene.add_grid(
-                "/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0)
+            # The ground plane goes on the floor: the world origin on the
+            # classic Axol, the ``floor`` frame under the Jelly's wheels on
+            # the mobile one (the world frame itself stays the classic one).
+            floor = (
+                tuple(float(v) for v in urdf.get_transform("floor")[:3, 3])
+                if "floor" in urdf.link_map
+                else (0.0, 0.0, 0.0)
             )
+            # Whole-body IK drives the base around, so give it more ground.
+            size = 6.0 if self._whole_body else 2.0
+            server.scene.add_grid("/grid", width=size, height=size, position=floor)
 
             while not self._stop.is_set():
                 with self._condition:

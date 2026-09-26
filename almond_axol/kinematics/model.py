@@ -17,6 +17,11 @@ additional objects is close to free.
 
 The collision model is built lazily and separately: forward-kinematics-only
 users (observation recording) never pay for capsule fitting.
+
+Each :class:`~almond_axol.constants.AxolModel` (hardware version) has its own
+URDF and therefore its own robot and collision model; both are cached per
+version. A ``model`` of ``None`` is inferred — mobile when Jelly is enabled — by
+:func:`almond_axol.settings.resolve_robot_model`.
 """
 
 from __future__ import annotations
@@ -29,15 +34,67 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..constants import URDF_PATH
+from ..constants import AxolModel, torso_links, urdf_path
+from ..settings import resolve_robot_model
 
 _logger = logging.getLogger(__name__)
 
-_TORSO_LINKS: tuple[str, ...] = ("base", "s1")
-"""Static body links that the arms must not collide into.
 
-Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
-"""
+def _closest_segment_to_segment_points(
+    a1: jnp.ndarray, b1: jnp.ndarray, a2: jnp.ndarray, b2: jnp.ndarray
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Closest points between segments ``[a1, b1]`` and ``[a2, b2]``.
+
+    Replaces pyroki's version (see :func:`_patch_pyroki`), which is wrong
+    for (anti)parallel segments: it projects ``a2`` onto the first segment
+    and ``a1`` onto the second, so the two "closest" points do not belong to
+    each other. Two antiparallel vertical capsules side by side then read
+    their vertical offset as extra clearance — on Axol Mobile the right
+    upper arm hanging beside the lift column read 249 mm instead of 84 mm,
+    and the upper-arm guard, calibrated to that bogus home clearance, shoved
+    the right arm up and out of its rest pose. This is Ericson's routine
+    (Real-Time Collision Detection, 5.1.9): pick ``s``, derive ``t`` from it,
+    and re-derive ``s`` whenever ``t`` clamps, so the pair is always
+    consistent. Divisions are guarded so gradients stay finite.
+    """
+    eps = 1e-9
+    d1 = b1 - a1
+    d2 = b2 - a2
+    r = a1 - a2
+    a = jnp.sum(d1 * d1, axis=-1)
+    e = jnp.sum(d2 * d2, axis=-1)
+    f = jnp.sum(d2 * r, axis=-1)
+    c = jnp.sum(d1 * r, axis=-1)
+    b = jnp.sum(d1 * d2, axis=-1)
+    denom = a * e - b * b
+    general = denom > 1e-6 * jnp.maximum(a * e, eps)
+    s = jnp.where(
+        general, jnp.clip((b * f - c * e) / jnp.where(general, denom, 1.0), 0, 1), 0.0
+    )
+    t = (b * s + f) / jnp.maximum(e, eps)
+    s = jnp.where(
+        t < 0.0,
+        jnp.clip(-c / jnp.maximum(a, eps), 0.0, 1.0),
+        jnp.where(t > 1.0, jnp.clip((b - c) / jnp.maximum(a, eps), 0.0, 1.0), s),
+    )
+    t = jnp.clip(t, 0.0, 1.0)
+    return a1 + d1 * s[..., None], a2 + d2 * t[..., None]
+
+
+def _patch_pyroki() -> None:
+    """Swap in the parallel-safe segment routine for pyroki's capsule pairs.
+
+    ``capsule_capsule`` looks the helper up on the module at call (trace)
+    time, so replacing the attribute is enough. Remove once almond-pyroki
+    ships the fix (``tests/test_robot_model.py`` asserts the stock routine
+    is still wrong, and fails when it is not).
+    """
+    from pyroki.collision import _utils
+
+    _utils.closest_segment_to_segment_points = _closest_segment_to_segment_points
+
+
+_patch_pyroki()
 
 # The two shoulder links mount directly onto the torso. Their conservative
 # capsules overlap the base by construction and cannot be used as collision
@@ -74,43 +131,59 @@ _RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
-_urdf: yourdfpy.URDF | None = None
-_robot: pk.Robot | None = None
-_robot_coll: pk.collision.RobotCollision | None = None
+# Keyed by (version, whole_body): whole-body IK has its own URDF.
+_Key = tuple[AxolModel, bool]
+_urdf: dict[_Key, yourdfpy.URDF] = {}
+_robot: dict[_Key, pk.Robot] = {}
+_robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
 
 
-def _load_urdf() -> yourdfpy.URDF:
-    global _urdf
-    if _urdf is None:
-        _logger.info("Loading Axol URDF...")
-        _urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-    return _urdf
+def _load_urdf(key: _Key) -> yourdfpy.URDF:
+    if key not in _urdf:
+        path = urdf_path(key[0], whole_body=key[1])
+        _logger.info("Loading Axol URDF (%s)...", path.name)
+        _urdf[key] = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
+    return _urdf[key]
 
 
-def shared_robot() -> pk.Robot:
-    """The pyroki robot for the bundled Axol URDF, built once per process."""
-    global _robot
+def shared_robot(
+    model: AxolModel | str | None = None, *, whole_body: bool = False
+) -> pk.Robot:
+    """The pyroki robot for ``model``'s bundled URDF, built once per process.
+
+    ``whole_body`` selects the mobile model whose Jelly base and lift are
+    joints too (:data:`~almond_axol.constants.BODY_JOINTS`).
+    """
+    key = (resolve_robot_model(model), whole_body)
     with _lock:
-        if _robot is None:
-            _robot = pk.Robot.from_urdf(_load_urdf())
-        return _robot
+        if key not in _robot:
+            _robot[key] = pk.Robot.from_urdf(_load_urdf(key))
+        return _robot[key]
 
 
-def shared_robot_collision() -> pk.collision.RobotCollision:
-    """The torso<->arm collision model, built once per process."""
-    global _robot_coll
+def shared_robot_collision(
+    model: AxolModel | str | None = None, *, whole_body: bool = False
+) -> pk.collision.RobotCollision:
+    """``model``'s torso<->arm collision model, built once per process."""
+    key = (resolve_robot_model(model), whole_body)
     with _lock:
-        if _robot_coll is None:
-            _robot_coll = _build_robot_collision(_load_urdf())
-        return _robot_coll
+        if key not in _robot_coll:
+            _robot_coll[key] = _build_robot_collision(
+                _load_urdf(key), torso_links(key[0], whole_body=whole_body)
+            )
+        return _robot_coll[key]
 
 
-def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
+def _build_robot_collision(
+    urdf: yourdfpy.URDF, torso: tuple[str, ...] = torso_links()
+) -> pk.collision.RobotCollision:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
-    Each Axol arm is a serial chain attached to a static torso (``base`` +
-    ``s1``). pyroki's PCA capsule fit produces conservative single-capsule-
-    per-link shapes that always overlap at adjacent-link joint interfaces,
+    Each Axol arm is a serial chain attached to a static torso (``torso``:
+    ``base`` + ``s1`` on the classic Axol, plus the lift column's top plate
+    and the ``head`` camera mount on the mobile one — see
+    :func:`almond_axol.constants.torso_links`). pyroki's PCA capsule fit
+    produces conservative single-capsule-per-link shapes that always overlap at adjacent-link joint interfaces,
     so blanket self-collision causes persistent jitter the IK cannot
     resolve. We restrict the active pair set to the only collisions that
     actually matter: any link pair where exactly one side is the torso
@@ -133,7 +206,7 @@ def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
         return n.startswith("left_") or n.startswith("right_")
 
     def is_torso(n: str) -> bool:
-        return n in _TORSO_LINKS
+        return n in torso
 
     ignore: set[tuple[str, str]] = set()
     for i, a in enumerate(link_names):
@@ -151,6 +224,25 @@ def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
         len(rc.active_idx_i),
     )
     return rc
+
+
+_UPPER_ARM_GUARD_SLACK = 0.020
+
+
+def upper_arm_guard_floor(home_clearance: float) -> float:
+    """Hard-stop clearance for an upper arm (e1) against the body.
+
+    On the classic Axol the fitted capsules already overlap at the safe
+    straight-down pose, so the threshold is relative to it: at most 20 mm
+    closer than home. The recorded cross-body contact was 23-31 mm closer,
+    leaving about 10 mm of model-space headroom. Where the body is genuinely
+    clear at home — the Jelly lift column sits behind the mobile arms, 84 mm
+    from the upper arm — "20 mm closer than home" would forbid ordinary
+    poses (the default rest pose comes 26 mm closer), so the floor is capped
+    at zero: there the guard stops actual capsule contact. Classic floors
+    (home clearance below 20 mm) are unchanged.
+    """
+    return min(float(home_clearance) - _UPPER_ARM_GUARD_SLACK, 0.0)
 
 
 def collision_cost_params(

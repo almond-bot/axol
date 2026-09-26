@@ -41,7 +41,9 @@ from typing import Any
 
 import numpy as np
 
+from ..constants import urdf_path
 from ..robot.control import ContactWatchdog
+from ..settings import resolve_robot_model
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .recorder import make as _recorder_make
@@ -145,6 +147,9 @@ class VRTeleopCore:
         broadcast_tracking: Callback ``(enabled: bool) -> None`` that pushes the
             engage state to the headset. Safe to call before the VR server
             exists (the adapter's implementation guards that).
+        robot_model: Axol version the IK solver runs (``KinematicsConfig.
+            robot_model``); names the URDF the headset overlay loads. ``None``
+            infers it from whether Jelly is enabled.
     """
 
     def __init__(
@@ -153,8 +158,11 @@ class VRTeleopCore:
         logger: logging.Logger,
         broadcast_tracking: Callable[[bool], None],
         broadcast_json: Callable[[dict], None] | None = None,
+        robot_model: str | None = None,
     ) -> None:
         self.config = config
+        # Resolved here, not per broadcast: it may read the settings file.
+        self._urdf_file = urdf_path(resolve_robot_model(robot_model)).name
         self._logger = logger
         self._broadcast = broadcast_tracking
         # Optional generic server→headset JSON push (fire-and-forget), used in
@@ -179,6 +187,9 @@ class VRTeleopCore:
 
         # Raw IK solution (full URDF vector) + per-arm joint indices into it.
         self.q: np.ndarray | None = None
+        # Whole-body IK: the latest body-joint target (BODY_JOINTS order, the
+        # tail of the IK vector after the arm joints), else None.
+        self.body_q: np.ndarray | None = None
         # Host-clock capture time of the VR pose behind the latest IK target
         # (``VRFrame.t_host``). Mantis recording stamps dataset rows with this so
         # they align to when the hand was actually at the pose, not to the
@@ -786,6 +797,7 @@ class VRTeleopCore:
             if new_q is None:
                 return None
             q = np.asarray(new_q, dtype=np.float32)
+            self._note_body(q)
             if done:
                 self._hold_target(q.copy())
                 self.l_grip = l_grip
@@ -804,6 +816,7 @@ class VRTeleopCore:
             out[15] = r_grip
             return self._guard_output(out)
 
+        self._note_body(q)
         l_grip = self.l_grip
         r_grip = self.r_grip
         ema_l = self.ema_left.update(np.append(q[self.left_indices], l_grip))
@@ -828,6 +841,10 @@ class VRTeleopCore:
                 out=np.concatenate([out[:7], out[8:15]]),
             )
         return out
+
+    def _note_body(self, q: np.ndarray) -> None:
+        n_arm = len(self.left_indices) + len(self.right_indices)
+        self.body_q = q[n_arm:].copy() if q.size > n_arm else None
 
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.
@@ -1336,6 +1353,8 @@ class VRTeleopCore:
         self._broadcast_json(
             {
                 "type": "urdf_state",
+                # File under the server's /urdf mount for this Axol version.
+                "urdf": self._urdf_file,
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,

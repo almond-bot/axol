@@ -22,6 +22,13 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}manip_damping_boost</F> | `60.0` | Extra damping at zero manipulability. `0` disables. |
 | <F>--{prefix}limit_damping_margin</F> | `0.12` | Distance (rad) from a joint limit inside which the joint is damped while moving toward it. |
 | <F>--{prefix}elbow_fade_band</F> | `0.15` | Height (m) above the shoulder over which the elbow hint fades out. |
+| <F>--{prefix}robot_model</F> | `None` | Axol version to solve for: `classic` or `mobile` (Jelly base). Picks the URDF, so the body the arms are kept clear of and the joint limits. `None` infers it: `mobile` when Jelly is enabled (attached and not switched off), else `classic`. |
+| <F>--{prefix}whole_body</F> | `false` | Whole-body IK (mobile, teleop in sim only for now): also solve for the Jelly base (`base_x`, `base_y`, `base_yaw`) and lift (`lift`, 0 = fully raised). The body holds still while both hands are within comfortable reach and moves for targets beyond it. `false` is arm IK — only the arms move. |
+| <F>--{prefix}body_reach_start</F> | `0.70` | Whole-body: shoulder-to-target distance (m) beyond which the base and lift may move. |
+| <F>--{prefix}body_reach_band</F> | `0.08` | Whole-body: distance (m) over which the body's hold fades out past `body_reach_start`. |
+| <F>--{prefix}body_hold_weight</F> | `5000` | Whole-body: damping that holds the base and lift still inside comfortable reach. |
+| <F>--{prefix}body_rest_weight</F> | `150` | Whole-body: per-step damping on the base and lift once they may move. |
+| <F>--{prefix}base_max_delta</F> / <F>--{prefix}base_yaw_max_delta</F> / <F>--{prefix}lift_max_delta</F> | `0.004` / `0.008` / `0.0004` | Whole-body: largest base translation (m), base rotation (rad) and lift-stage move (m) per solve. |
 
 <Note>
   **Mantis mode** replaces any of these still at their default with `pos_weight 200`, `ori_weight 120`, `manipulability_weight 0`, `self_collision_margin 0.02`, `max_joint_delta 0.05`, `max_iterations 12`. A value you set explicitly still wins.
