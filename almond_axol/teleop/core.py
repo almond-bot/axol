@@ -41,7 +41,9 @@ from typing import Any
 
 import numpy as np
 
+from ..constants import urdf_path
 from ..robot.control import ContactWatchdog
+from ..settings import resolve_robot_model
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .recorder import make as _recorder_make
@@ -103,6 +105,9 @@ class VRTeleopCore:
         broadcast_tracking: Callback ``(enabled: bool) -> None`` that pushes the
             engage state to the headset. Safe to call before the VR server
             exists (the adapter's implementation guards that).
+        robot_model: Axol version the IK solver runs (``KinematicsConfig.
+            robot_model``); names the URDF the headset overlay loads. ``None``
+            infers it from whether Jelly is enabled.
     """
 
     def __init__(
@@ -111,8 +116,11 @@ class VRTeleopCore:
         logger: logging.Logger,
         broadcast_tracking: Callable[[bool], None],
         broadcast_json: Callable[[dict], None] | None = None,
+        robot_model: str | None = None,
     ) -> None:
         self.config = config
+        # Resolved here, not per broadcast: it may read the settings file.
+        self._urdf_file = urdf_path(resolve_robot_model(robot_model)).name
         self._logger = logger
         self._broadcast = broadcast_tracking
         # Optional generic server→headset JSON push (fire-and-forget), used in
@@ -1294,6 +1302,8 @@ class VRTeleopCore:
         self._broadcast_json(
             {
                 "type": "urdf_state",
+                # File under the server's /urdf mount for this Axol version.
+                "urdf": self._urdf_file,
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,

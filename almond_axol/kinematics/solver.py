@@ -28,9 +28,11 @@ import pyroki as pk
 
 from ..constants import (
     Joint,
+    torso_links,
     urdf_arm_joint_names,
     urdf_body_name,
 )
+from ..settings import resolve_robot_model
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
@@ -658,9 +660,12 @@ class KinematicsSolver:
         :meth:`ik` is fast.
 
         Args:
-            config: Cost weights and solver parameters.
+            config: Cost weights and solver parameters. ``config.robot_model``
+                picks the Axol version's URDF (mobile when Jelly is enabled if
+                ``None``).
         """
         self.config = config
+        self.robot_model = resolve_robot_model(config.robot_model)
 
         enable_persistent_compilation_cache()
 
@@ -668,8 +673,8 @@ class KinematicsSolver:
         # including pyroki's per-instance JointVar class, a static field —
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
-        self.robot = shared_robot()
-        self.robot_coll = shared_robot_collision()
+        self.robot = shared_robot(self.robot_model)
+        self.robot_coll = shared_robot_collision(self.robot_model)
         starts, widths = collision_cost_params(
             self.robot, self.robot_coll, config.self_collision_margin
         )
@@ -677,7 +682,7 @@ class KinematicsSolver:
         self._collision_ramps = jnp.asarray(widths)
         # A soft cost normally turns every arm/base pair away. Independently
         # hard-stop the physical contact pair found in the recorded cross-body
-        # run: either upper arm (e1) against base/s1. Its fitted capsule already
+        # run: either upper arm (e1) against the body. Its fitted capsule already
         # overlaps at the safe straight-down pose, so the threshold is relative
         # to that reference: at most 20 mm closer. The observed contact was
         # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
@@ -686,6 +691,7 @@ class KinematicsSolver:
             self.robot_coll.compute_self_collision_distance(self.robot, q_home)
         )
         clearance_floor = np.full_like(starts, -np.inf)
+        torso = torso_links(self.robot_model)
         for k, (i, j) in enumerate(
             zip(
                 np.asarray(self.robot_coll.active_idx_i),
@@ -694,7 +700,7 @@ class KinematicsSolver:
         ):
             a = self.robot_coll.link_names[int(i)]
             b = self.robot_coll.link_names[int(j)]
-            arm_link = b if a in ("base", "s1") else a if b in ("base", "s1") else ""
+            arm_link = b if a in torso else a if b in torso else ""
             if arm_link.endswith("_e1"):
                 clearance_floor[k] = home_distances[k] - 0.020
         self._base_clearance_floor = jnp.asarray(clearance_floor)

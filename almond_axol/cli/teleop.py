@@ -534,8 +534,17 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         await _run_jelly_only(cfg, jelly_cfg)
         return
 
+    if not cfg.sim and cfg.kinematics.robot_model is None:
+        # Enabling Jelly means this is the mobile Axol: its URDF (the body the
+        # arms are kept clear of, and its joint limits) follows this session's
+        # own Jelly decision, per-run --jelly.* switches included.
+        from ..settings import resolve_robot_model
+
+        cfg.kinematics.robot_model = resolve_robot_model(
+            jelly_enabled=jelly_cfg is not None
+        ).value
     if cfg.sim:
-        robot = Sim()
+        robot = Sim(robot_model=cfg.kinematics.robot_model)
     else:
         # The Rust realtime core is the sole hardware control backend. Python
         # owns VR/IK/model math and streams targets; Rust owns both CAN buses.

@@ -39,6 +39,8 @@ import signal
 import threading
 import time
 
+from dataclasses import replace
+
 import numpy as np
 
 from ..kinematics import KinematicsConfig
@@ -186,6 +188,16 @@ class VRTeleop:
                 vr_server_config = shared_config(
                     VRServerConfig, "teleop", "vr_server", store=store
                 )
+        # A session driving Jelly is on the mobile Axol; without one, infer it
+        # (a Sim on a Jelly host still models the mobile body). Resolved once
+        # so the IK worker and the headset overlay agree.
+        from ..settings import resolve_robot_model
+
+        robot_model = resolve_robot_model(
+            kinematics_config.robot_model,
+            jelly_enabled=True if jelly is not None else None,
+        )
+        kinematics_config = replace(kinematics_config, robot_model=robot_model.value)
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -203,7 +215,11 @@ class VRTeleop:
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config, _logger, self._broadcast_tracking, self._broadcast_json
+            config,
+            _logger,
+            self._broadcast_tracking,
+            self._broadcast_json,
+            robot_model=kinematics_config.robot_model,
         )
 
         self._parent_conn: multiprocessing.connection.Connection | None = None

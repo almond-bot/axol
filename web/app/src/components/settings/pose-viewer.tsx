@@ -13,7 +13,7 @@ import { OrbitControls } from "@react-three/drei"
 import { Box3, Group, LoadingManager, Vector3 } from "three"
 import URDFLoader, { type URDFRobot } from "urdf-loader"
 import { Loader2 } from "lucide-react"
-import { apiUrl, urdfUrl } from "@/lib/supervisor"
+import { apiUrl, urdfUrl, type AxolModel } from "@/lib/supervisor"
 
 export interface JointLimits {
   [jointName: string]: { lower: number; upper: number }
@@ -31,11 +31,14 @@ interface LoadedModel {
 export default function PoseViewer({
   jointValues,
   onLoaded,
+  robotModel = "classic",
 }: {
   /** URDF joint name -> angle (rad). */
   jointValues: Record<string, number>
   /** Reports the movable joints' limits once the URDF is in. */
   onLoaded?: (limits: JointLimits) => void
+  /** Which Axol version's URDF to show. Fixed per mount: key the viewer by it. */
+  robotModel?: AxolModel
 }) {
   const [model, setModel] = useState<LoadedModel | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -52,7 +55,7 @@ export default function PoseViewer({
     // serve host exposes that directory at /api/urdf.
     loader.packages = { assembly: apiUrl("/api/urdf") }
     let robot: URDFRobot | null = null
-    loader.load(urdfUrl(), (r) => {
+    loader.load(urdfUrl(robotModel), (r) => {
       robot = r
     })
     manager.onError = (url) => {
@@ -81,7 +84,7 @@ export default function PoseViewer({
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [robotModel])
 
   useEffect(() => {
     if (!model) return

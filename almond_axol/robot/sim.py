@@ -7,7 +7,7 @@ import threading
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..constants import ARM_JOINTS, AxolModel, urdf_arm_joint_names, urdf_path
 from ..utils.ports import reclaim_port
 from .base import RobotBase
 
@@ -38,6 +38,8 @@ class Sim(RobotBase):
             Defaults to the order reported by the loaded URDF.
         default_q: Initial joint configuration in radians. Defaults to zeros.
         port: Port for the viser web server.
+        robot_model: Axol version to render (``"classic"`` / ``"mobile"``);
+            inferred from whether Jelly is enabled when ``None``.
 
     Example::
 
@@ -52,6 +54,7 @@ class Sim(RobotBase):
         joint_names: list[str] | None = None,
         default_q: np.ndarray | None = None,
         port: int = 8002,
+        robot_model: AxolModel | str | None = None,
     ) -> None:
         """Construct the simulation.
 
@@ -62,10 +65,12 @@ class Sim(RobotBase):
                 Defaults to the hard-coded left-then-right arm order.
             default_q:   Initial joint configuration in radians; defaults to zeros.
             port:        Port for the viser web server.
+            robot_model: Axol version to render; inferred when ``None``.
         """
         self._joint_names = joint_names
         self._default_q = default_q
         self._port = port
+        self._robot_model = robot_model
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -170,7 +175,10 @@ class Sim(RobotBase):
         # Stopping here guarantees the in-process port is freed whenever the
         # loop exits, which is what makes the in-process restart reliable.
         try:
-            urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
+            from ..settings import resolve_robot_model
+
+            path = urdf_path(resolve_robot_model(self._robot_model))
+            urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
             viser_urdf = ViserUrdf(
                 server,
                 urdf_or_path=urdf,

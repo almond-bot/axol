@@ -143,6 +143,7 @@ describe("supervisor API client", () => {
     expect(api.apiUrl("/api/info")).toBe("https://robot.local:8001/api/info")
     expect(api.wsBaseUrl()).toBe("wss://robot.local:8001")
     expect(api.urdfUrl().endsWith("/api/urdf/axol.urdf")).toBe(true)
+    expect(api.urdfUrl("mobile").endsWith("/api/urdf/axol_mobile.urdf")).toBe(true)
     expect(
       api.motorFaultLabel({
         arm: "left",

@@ -151,6 +151,12 @@ class KinematicsConfig:
             at or above shoulder height — fading it out stops garbage swivel
             targets from thrashing the null space exactly where the shoulder
             nears its joint limits.
+        robot_model: Which Axol hardware version to solve for —
+            ``"classic"`` or ``"mobile"`` (see
+            :class:`~almond_axol.constants.AxolModel`). Selects the URDF, and
+            with it the body the arms are kept clear of and the joint limits.
+            ``None`` (the default) infers it: mobile when Jelly is enabled
+            (attached and not switched off), classic otherwise.
     """
 
     pos_weight: float = 50.0
@@ -173,6 +179,7 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+    robot_model: str | None = None
 
 
 # Solver values the Mantis profile forces (see
