@@ -68,7 +68,9 @@ from ...robot.config import (
 )
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
+from ...tuning.learning import LEARN_BAND, CommandLearner
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+from ...tuning.runs import load_run
 from ...tuning.wrist_imu import WristImu, format_imu
 from ...utils.logquiet import quiet_noisy_loggers
 
@@ -529,6 +531,56 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "catching an intermittent buzz.",
     )
     p.add_argument(
+        "--learn",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Iterative learning over N passes (in place of --repeat): pass 1 "
+        "runs uncorrected, and after each pass a per-joint position offset on "
+        "the streamed motion is updated from that pass's tracking error in the "
+        "--learn-band — first the error advanced by the joint's lag, then the "
+        "inverse of each joint's command-to-position response measured from "
+        "the passes themselves. A pass that comes out worse rolls back to the "
+        "best offset with the gain halved. Each pass is saved with the offset "
+        "it flew ('correction'), for --correction. The offset is specific to "
+        "this motion: it measures what each joint needed.",
+    )
+    p.add_argument(
+        "--learn-gain",
+        type=float,
+        default=0.5,
+        help="Step size of the model-based learning updates (default 0.5)",
+    )
+    p.add_argument(
+        "--learn-band",
+        type=float,
+        nargs=2,
+        default=list(LEARN_BAND),
+        metavar=("LO", "HI"),
+        help=f"Band (Hz) the learning corrects (default {LEARN_BAND[0]:g} "
+        f"{LEARN_BAND[1]:g}): the shake, above the deliberate motion and its lag",
+    )
+    p.add_argument(
+        "--learn-max-deg",
+        type=float,
+        default=1.5,
+        help="Clamp on the learned offset per joint (degrees, default 1.5)",
+    )
+    p.add_argument(
+        "--learn-joint",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Learn only these joints (repeatable; default: every joint of the "
+        "driven arms that moves at least 1° and is not --hold)",
+    )
+    p.add_argument(
+        "--correction",
+        metavar="RUN_ID",
+        help="Fly the offset a --learn run saved (that pass's 'correction') on "
+        "every pass, without learning — to check a learned correction holds up",
+    )
+    p.add_argument(
         "--arms",
         choices=("both", "left", "right"),
         default="both",
@@ -731,6 +783,76 @@ def _ik_stream(solver, sent: np.ndarray, to_full, info: dict) -> np.ndarray:
     return out
 
 
+def _learn_columns(
+    args: argparse.Namespace, ref: np.ndarray, holds: dict[int, Any]
+) -> np.ndarray:
+    """Which of the 14 columns --learn corrects: --learn-joint, or every
+    joint of the driven arms that moves at least 1° and is not held."""
+    if args.learn_joint:
+        mask = np.zeros(len(_COLUMNS), dtype=bool)
+        for spec in args.learn_joint:
+            if spec not in _COLUMNS:
+                raise SystemExit(f"--learn-joint wants SIDE.JOINT, got {spec!r}")
+            mask[_COLUMNS.index(spec)] = True
+    else:
+        mask = np.ptp(ref, axis=0) >= math.radians(1.0)
+    for i, name in enumerate(_COLUMNS):
+        side = name.split(".")[0]
+        if args.arms not in ("both", side) or i in holds:
+            mask[i] = False
+    return mask
+
+
+def _load_correction(run_id: str, n: int) -> np.ndarray:
+    """The ``correction`` a --learn pass flew, checked against this motion."""
+    loaded = load_run(run_id)
+    if loaded is None:
+        raise SystemExit(f"--correction: no tuning run {run_id!r}")
+    _, series = loaded
+    corr = series.get("correction")
+    if corr is None:
+        raise SystemExit(f"--correction: run {run_id} has no learned correction")
+    corr = np.asarray(corr, dtype=float)
+    if corr.shape != (n, len(_COLUMNS)):
+        raise SystemExit(
+            f"--correction: run {run_id}'s correction is {corr.shape}, this "
+            f"motion streams {(n, len(_COLUMNS))} — a different motion?"
+        )
+    return corr
+
+
+def _learn_step(
+    learner: CommandLearner,
+    k: int,
+    t: np.ndarray,
+    meas_offset: np.ndarray,
+    actual: np.ndarray,
+    torque: np.ndarray,
+    ref: np.ndarray,
+) -> None:
+    """Feed a finished pass to the learner and print what it did."""
+    if len(t) < learner.n:
+        print(f"  learning: pass {k + 1} cut short — offset left unchanged")
+        return
+    actual, _ = retime_measurements(t, meas_offset, actual, torque)
+    rep = learner.update(ref, actual)
+    cols = np.where(learner.columns)[0]
+    joints = "  ".join(
+        f"{_COLUMNS[i].split('.')[1]} {math.degrees(rep.band_rms[i]) * 1e3:.0f}"
+        for i in cols
+    )
+    action = {
+        "first": "first step (error advanced by the lag)",
+        "model": f"model step (gain {rep.gain:g})",
+        "rollback": f"worse than the best pass — rolled back, gain now {rep.gain:g}",
+    }[rep.step]
+    print(
+        f"  learning: pass {k + 1} band error {math.degrees(rep.total) * 1e3:.1f} mdeg "
+        f"rms [{joints}] → {action}; next offset peak "
+        f"{math.degrees(float(np.abs(learner.offset).max())):.3f}°"
+    )
+
+
 async def _run(args: argparse.Namespace) -> None:
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
@@ -783,6 +905,12 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"  impedance rate: {side}.{joint} = {FAST_IMPEDANCE_HZ:.0f} Hz")
     if args.repeat < 0:
         raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
+    if args.learn:
+        if args.learn < 2:
+            raise SystemExit("tune.motion: --learn needs at least 2 passes")
+        if args.correction:
+            raise SystemExit("tune.motion: --learn and --correction are exclusive")
+        args.repeat = args.learn
     try:
         # Before anything touches the bus: impedance runs at 240 Hz only.
         check_loop_hz(config, args.loop_hz or config.loop_hz)
@@ -868,6 +996,39 @@ async def _run(args: argparse.Namespace) -> None:
             "  ! held joints: only the approach is collision-checked — a frozen "
             "joint can bring links closer than the recording did; watch the first pass"
         )
+
+    n_wp = len(sent)
+    ref_arr = np.asarray(ref, dtype=float)
+    learner: CommandLearner | None = None
+    fixed_offset: np.ndarray | None = None
+    if args.learn:
+        columns = _learn_columns(args, ref_arr, holds)
+        if not columns.any():
+            raise SystemExit("tune.motion: --learn has no joint to learn")
+        learner = CommandLearner(
+            n_wp,
+            motion.rate,
+            columns,
+            band=(float(args.learn_band[0]), float(args.learn_band[1])),
+            gain=args.learn_gain,
+            max_rad=math.radians(args.learn_max_deg),
+        )
+        print(
+            f"  learning: {args.learn} passes on "
+            + ", ".join(_COLUMNS[i] for i in np.where(columns)[0])
+            + f" ({args.learn_band[0]:g}-{args.learn_band[1]:g} Hz, gain "
+            f"{args.learn_gain:g}, clamp {args.learn_max_deg:g}°)"
+        )
+    elif args.correction:
+        fixed_offset = _load_correction(args.correction, n_wp)
+        for col in holds:
+            fixed_offset[:, col] = 0.0
+        print(
+            f"  correction: {args.correction} (peak "
+            f"{math.degrees(float(np.abs(fixed_offset).max())):.3f}°)"
+        )
+    # The offset each pass flew, alongside passes_run.
+    pass_offsets: list[np.ndarray | None] = []
 
     watchdog = ContactWatchdog(args.torque_threshold)
     # Firmware-loop joints, as (side, index in the arm's 7, name), for the
@@ -1055,17 +1216,37 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     pass_start = len(log_t)
                     passes_run.append((pass_start, pass_start))
+                    offset = (
+                        learner.offset.copy() if learner is not None else fixed_offset
+                    )
+                    pass_offsets.append(offset)
+                    playback = traj_playback
+                    if offset is not None and np.any(offset):
+                        playback = [
+                            to_full(np.asarray(row, dtype=float) + offset[i])
+                            for i, row in enumerate(sent)
+                        ]
                     try:
                         contact = await execute(
                             axol,
-                            traj_playback,
+                            playback,
                             record=True,
-                            refs=ref if stream_differs else None,
+                            refs=ref if stream_differs or offset is not None else None,
                         )
                     finally:
                         passes_run[-1] = (pass_start, len(log_t))
                     if contact is not None:
                         raise _Contact(contact)
+                    if learner is not None and k + 1 < args.learn:
+                        _learn_step(
+                            learner,
+                            k,
+                            np.asarray(log_t[pass_start:]),
+                            np.stack(log_meas_offset[pass_start:]),
+                            np.stack(log_actual[pass_start:]),
+                            np.stack(log_torque[pass_start:]),
+                            ref_arr,
+                        )
             finally:
                 axol.set_recording_engaged(False)
         except _NotAtStart as exc:
@@ -1140,7 +1321,9 @@ async def _run(args: argparse.Namespace) -> None:
         "amplification",
     )
 
-    def score_pass(a: int, b: int, tag: str) -> dict[str, Any] | None:
+    def score_pass(
+        a: int, b: int, tag: str, pass_index: int = 0
+    ) -> dict[str, Any] | None:
         """Score and save one pass's slice of the logs; its summary, or None.
 
         ``tag`` ("[k/N] ", empty for a single pass) heads the scorecard and is
@@ -1205,6 +1388,8 @@ async def _run(args: argparse.Namespace) -> None:
             series.update(imu_series)
             if log_sent:
                 series["sent"] = np.stack(log_sent[a:b])
+            if pass_index < len(pass_offsets) and pass_offsets[pass_index] is not None:
+                series["correction"] = pass_offsets[pass_index].astype(np.float32)
             label = " ".join(x for x in (args.label, tag.strip()) if x) or None
             run_id = save_run(
                 "motion",
@@ -1240,7 +1425,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     many = len(passes_run) > 1
     summaries = [
-        score_pass(a, b, f"[{k + 1}/{len(passes_run)}] " if many else "")
+        score_pass(a, b, f"[{k + 1}/{len(passes_run)}] " if many else "", k)
         for k, (a, b) in enumerate(passes_run)
     ]
     if many:
