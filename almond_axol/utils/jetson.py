@@ -344,7 +344,7 @@ def _preferred_max_power_mode() -> tuple[str, str]:
     return _MAXN_MODE, "MAXN"
 
 
-def _set_max_power_mode(escalator: _RootEscalator) -> None:
+def _set_max_power_mode(escalator: _RootEscalator) -> bool:
     """Select the strongest configured ``nvpmodel`` power mode.
 
     Jetson-only and best-effort. MAXN SUPER is preferred when the active
@@ -354,18 +354,21 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
     governor merely holds the cores at a lower mode's max. A no-op when already
     in the selected mode (so no needless sudo prompt) or when ``nvpmodel`` is
     absent.
+
+    Returns True when the mode was recorded for the next boot and so needs a
+    reboot to take effect.
     """
     if not _is_jetson():
         _logger.debug("not a Jetson; leaving the nvpmodel power mode unchanged")
-        return
+        return False
     nvpmodel = shutil.which("nvpmodel")
     if nvpmodel is None:
         _logger.debug("nvpmodel not found; leaving the power mode unchanged")
-        return
+        return False
     max_mode, max_mode_name = _preferred_max_power_mode()
     # Skip the (root-only) switch when the selected maximum mode is active.
     if _query_power_mode(nvpmodel) == max_mode:
-        return
+        return False
     # Answer "n" to any confirmation prompt. Once the GPU golden context
     # exists (always, by the time the installer or the boot ExecStartPre gets
     # here — nvpmodel.service runs earlier in boot), switching maximum modes
@@ -382,7 +385,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             max_mode_name,
             max_mode,
         )
-        return
+        return False
     if ok or "reboot" in detail.lower():
         # Declining the reboot prompt CANCELS the switch — nvpmodel records
         # nothing, so left alone the mode would never change, on this boot or
@@ -403,6 +406,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
                 max_mode_name,
                 _NVPMODEL_STATUS,
             )
+            return True
         else:
             _logger.warning(
                 "Jetson power mode %s needs a reboot, and recording it for the "
@@ -422,6 +426,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             f": {detail}" if detail else "",
             max_mode,
         )
+    return False
 
 
 def _pin_engines(writer: _RootEscalator) -> None:
@@ -948,7 +953,7 @@ def pin_engine_clocks(*, interactive: bool = False) -> None:
     _pin_engines(_RootEscalator(interactive=interactive))
 
 
-def pin_realtime_clocks(*, interactive: bool = False) -> None:
+def pin_realtime_clocks(*, interactive: bool = False) -> bool:
     """Select the maximum power mode, pin clocks, and set the loops' scheduling.
 
     Selects MAXN SUPER when the platform configuration provides it (otherwise
@@ -969,10 +974,13 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     Invoked via ``axol provision`` (its last step) and ``axol provision
     --boot`` (the boot service), not from the teleop / collect-data / serve
     entry points.
+
+    Returns True when the power mode only takes effect after a reboot.
     """
     escalator = _RootEscalator(interactive=interactive)
-    _set_max_power_mode(escalator)
+    reboot_needed = _set_max_power_mode(escalator)
     _pin_engines(escalator)
     _pin_cpu(escalator)
     _steer_can_irq(escalator)
     _prioritize_capture_daemons(escalator)
+    return reboot_needed

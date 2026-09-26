@@ -32,6 +32,15 @@ def privileged_service_active() -> bool:
     return os.geteuid() == 0 and os.environ.get(_PRIVILEGED_SERVICE_ENV) == "1"
 
 
+def spawned_by_serve() -> bool:
+    """Whether ``axol serve`` (root or not) started this process.
+
+    Every ``axol serve`` marks its environment (see :func:`mark_privileged_service`),
+    so its children -- the self-updater's ``axol provision`` included -- inherit it.
+    """
+    return os.environ.get(_PRIVILEGED_SERVICE_ENV) == "1"
+
+
 def mark_privileged_service() -> None:
     """Mark this process and its operation children as the hosted service."""
     os.environ[_PRIVILEGED_SERVICE_ENV] = "1"
