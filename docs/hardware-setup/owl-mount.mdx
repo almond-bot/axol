@@ -1,0 +1,53 @@
+---
+title: "Axol + Owl Mount"
+description: "Fix the Owl Mount column to a table, bench, or cell, then mount Axol on it."
+---
+
+import MountAxol from "/snippets/hardware/mount-axol.mdx";
+import Power from "/snippets/hardware/power.mdx";
+
+<Frame>
+  <img src="/assets/owl_mount.png" alt="Almond Axol on the Owl Mount" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Owl Mount is a rigid **400mm 8080 aluminum T-slot column** with base brackets for **2020, 4040, and 4545** extrusion patterns. It ships with the Axol mounting plate and all table/fixture hardware. See the [mount drawing](https://www.almond.bot/resources/static_mount.pdf) for dimensions.
+
+### Tools required
+
+You'll need a hex (Allen) key for the socket head cap screws that hold Axol to the mount:
+
+| Screw | Hex key |
+|---|---|
+| M8 | 6&nbsp;mm |
+
+### Fixing the column
+
+<Steps>
+  <Step title="Position the base brackets">
+    Set the column where Axol will work, with its base brackets over the table's T-slots (or your fixture's hole pattern). Leave the column's own T-slots facing where you want to route cables.
+  </Step>
+  <Step title="Bolt the brackets down">
+    Drop T-nuts into the table slots, pass the supplied bolts through the bracket clearance holes that match your extrusion pattern, and tighten them with the 6&nbsp;mm hex key.
+  </Step>
+  <Step title="Check the column is plumb">
+    Confirm the column stands square to the table before mounting Axol. A lean here shows up as a tilt in every task.
+  </Step>
+</Steps>
+
+<MountAxol />
+
+<Power />
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
+    Mount the Camera Kit's wrist and head cameras and wire them to the compute.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the robot machine and open the web control panel.
+  </Card>
+  <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
+    Back to the setup guides for every configuration.
+  </Card>
+</CardGroup>

@@ -1,0 +1,63 @@
+---
+title: "Axol + Ox Cart"
+description: "Level the Ox Cart, set its working height with the crank, and mount Axol on it."
+---
+
+import MountAxol from "/snippets/hardware/mount-axol.mdx";
+import Power from "/snippets/hardware/power.mdx";
+
+<Frame>
+  <img src="/assets/ox_cart.png" alt="Almond Axol on the height-adjustable Ox Cart" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Ox Cart is a **height-adjustable mobile cart** with four leveling casters and a manual crank lift. It ships with the crank handle and casters fitted; see the [Ox Cart product page](https://www.almond.bot/ox-cart) for specs.
+
+### Tools required
+
+You'll need a hex (Allen) key for the socket head cap screws that hold Axol to the cart:
+
+| Screw | Hex key |
+|---|---|
+| M8 | 6&nbsp;mm |
+
+### Leveling the casters
+
+Each caster has a ratchet with a small lever arm that raises or lowers the wheel. To level the cart, flip the ratchet switch up or down on each caster and adjust it until the base sits level.
+
+### Raising and lowering the robot
+
+Adjust the robot's height with the manual lift: insert the crank into the hole at the top of the cart and turn it to raise or lower the robot.
+
+<Frame>
+  <img src="/assets/height_adjust.png" alt="Inserting the crank into the Ox Cart to adjust its height" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+<Warning>
+  Make sure the crank is inserted **all the way in** before turning it. It's easy to leave it partially seated, which can slip or damage the mechanism.
+</Warning>
+
+<Tip>
+  Crank the cart down to a comfortable lifting height before mounting Axol, then raise it to working height once the bolts are tight.
+</Tip>
+
+<MountAxol />
+
+<Power />
+
+<Tip>
+  The cart's T-slot frame is a convenient place for the power supply and compute, so everything rolls together.
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
+    Mount the Camera Kit's wrist and head cameras and wire them to the compute.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the robot machine and open the web control panel.
+  </Card>
+  <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
+    Back to the setup guides for every configuration.
+  </Card>
+</CardGroup>
