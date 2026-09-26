@@ -217,9 +217,15 @@ class Sim(RobotBase):
             )
             viser_urdf.update_cfg(_to_viser(q0))
 
-            server.scene.add_grid(
-                "/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0)
+            # The ground plane goes on the floor: the world origin on the
+            # classic Axol, the ``floor`` frame under the Jelly's wheels on
+            # the mobile one (the world frame itself stays the classic one).
+            floor = (
+                tuple(float(v) for v in urdf.get_transform("floor")[:3, 3])
+                if "floor" in urdf.link_map
+                else (0.0, 0.0, 0.0)
             )
+            server.scene.add_grid("/grid", width=2.0, height=2.0, position=floor)
 
             while not self._stop.is_set():
                 with self._condition:

@@ -24,9 +24,9 @@ into ``almond_axol/kinematics/urdf/axol_mobile.urdf``:
   shoulder bar), ``base`` (the lift column), ``lift_plate`` (the bracket the
   shoulder bar bolts onto) and ``head`` (the head-camera mount).
   The Jelly deck (``jelly``) is visual only — see ``LIFT_NOTE``.
-- **The lift and fingers are frozen** at their CAD pose (lift fully raised,
-  fingers closed — the classic gripper model is closed too): the kinematic
-  model has exactly the 14 arm joints.
+- **The lift, fingers and wheels are frozen** at their CAD pose (lift fully
+  raised, fingers closed): the kinematic model has exactly the 14 arm
+  joints. The fingers' collision cylinder spans their full stroke.
 
 Run (``fast-simplification`` is only needed here, not at runtime)::
 
@@ -118,6 +118,19 @@ HULL_SPLITS: dict[str, tuple[tuple[float, ...], tuple[float, ...], str]] = {
     "Jelly_Stage_3.stl": ((-_INF, -_INF, 1.22), (_INF, _INF, _INF), "lift_plate"),
     "Jelly_Base.stl": ((-0.041, -0.073, 0.2), (0.041, 0.073, _INF), "base"),
 }
+
+# Links whose collision body is an explicit cylinder along a link-frame axis
+# (0 = x) rather than a hull. pyroki fits one minimum-volume cylinder per
+# link, and for the near-cubic closed fingers that fit is ambiguous — mirror-
+# image hulls landed on different tilted axes, so the two hands collided
+# differently. A cylinder's fit is itself: deterministic and symmetric. It
+# runs along the jaw-opening axis and is sized over the full finger stroke,
+# so it covers the fingers open as well as closed.
+COLLISION_CYLINDERS: dict[str, int] = {"left_fingers": 0, "right_fingers": 0}
+_CYLINDER_RPY = {0: "0 1.5707963267948966 0", 1: "-1.5707963267948966 0 0", 2: "0 0 0"}
+
+# Frame at the ground under the robot (the export's root).
+FLOOR_LINK = "floor"
 
 # Links carrying a collision hull. The Jelly deck is deliberately absent.
 LIFT_NOTE = (
@@ -337,6 +350,11 @@ def build_meshes(
         list
     )
     hull_pts: dict[str, list[np.ndarray]] = defaultdict(list)
+    stroke = {
+        j.child: j
+        for j in export.robot.joints
+        if j.type == "prismatic" and "gripper" in j.name
+    }
     for link_name, link in export.link_map.items():
         target = owner.get(link_name)
         if target is None:
@@ -347,6 +365,14 @@ def build_meshes(
             origin = vis.origin if vis.origin is not None else np.eye(4)
             pose = export.get_transform(link_name, export.base_link)
             placed = mesh.copy().apply_transform(in_target @ pose @ origin)
+            if target in COLLISION_CYLINDERS and link_name in stroke:
+                joint = stroke[link_name]
+                _zero(export, **{joint.name: float(joint.limit.upper)})
+                opened = export.get_transform(link_name, export.base_link)
+                _zero(export)
+                hull_pts[target].append(
+                    trimesh.transform_points(mesh.vertices, in_target @ opened @ origin)
+                )
             split = HULL_SPLITS.get(Path(vis.geometry.mesh.filename).name)
             if split is None:
                 hull_pts[target].append(placed.vertices)
@@ -378,9 +404,18 @@ def build_meshes(
         counters[target] += 1
         merged.export(URDF_DIR / MESH_SUBDIR / name)
         visuals[target].append((f"{MESH_SUBDIR}/{name}", rgba))
-    collisions = {}
+    collisions: dict[str, str | tuple[float, float, np.ndarray, str]] = {}
     for target, pts in sorted(hull_pts.items()):
         if target in NO_COLLISION:
+            continue
+        if target in COLLISION_CYLINDERS:
+            collisions[target] = _fit_cylinder(
+                np.vstack(pts), COLLISION_CYLINDERS[target]
+            )
+            radius, length = collisions[target][:2]
+            print(
+                f"  {target:15s} cylinder r={radius * 1e3:5.1f} mm h={length * 1e3:5.1f} mm"
+            )
             continue
         # Snapping to a 2 mm grid first keeps the hull to a few hundred faces
         # (<= 1.7 mm of shape error, far inside the capsule fit's slack).
@@ -397,6 +432,26 @@ def build_meshes(
     return visuals, collisions
 
 
+def _fit_cylinder(pts: np.ndarray, axis: int) -> tuple[float, float, np.ndarray, str]:
+    """Smallest capsule along link axis ``axis`` enclosing ``pts``.
+
+    Returned as the URDF cylinder pyroki turns into that capsule: its radius,
+    its length (the capsule's straight section), its centre, and the rpy that
+    turns the cylinder's z onto ``axis``.
+    """
+    others = [i for i in range(3) if i != axis]
+    center = (pts.min(axis=0) + pts.max(axis=0)) / 2
+    rho = np.linalg.norm(pts[:, others] - center[others], axis=1)
+    radius = float(rho.max())
+    # A point beyond the straight section is covered by the hemispherical
+    # cap as long as its axial overhang is within sqrt(r^2 - rho^2).
+    overhang = np.abs(pts[:, axis] - center[axis]) - np.sqrt(
+        np.maximum(radius**2 - rho**2, 0.0)
+    )
+    half = max(float(overhang.max()), 0.0)
+    return round(radius, 5), round(2 * half, 5), center, _CYLINDER_RPY[axis]
+
+
 def _fmt(v: np.ndarray) -> str:
     return " ".join(f"{x:.6g}" if abs(x) > 1e-12 else "0" for x in v)
 
@@ -404,13 +459,22 @@ def _fmt(v: np.ndarray) -> str:
 def write_urdf(
     classic_path: Path,
     visuals: dict[str, list[tuple[str, tuple[float, ...]]]],
-    collisions: dict[str, str],
+    collisions: dict[str, str | tuple[float, float, np.ndarray, str]],
     limits: dict[str, tuple[float, float]],
+    floor: np.ndarray,
 ) -> None:
     tree = ET.parse(classic_path)
     robot = tree.getroot()
     robot.set("name", "assembly")
     links = {ln.get("name"): ln for ln in robot.findall("link")}
+    # Where the wheels meet the ground: the export's root. The world frame
+    # stays the classic one (0.86 m below the shoulders) so IK targets and
+    # recorded poses are unchanged; viewers draw their ground plane here.
+    ET.SubElement(robot, "link", name=FLOOR_LINK)
+    joint = ET.SubElement(robot, "joint", name=f"{FLOOR_LINK}_0", type="fixed")
+    ET.SubElement(joint, "origin", xyz=_fmt(floor[:3, 3]), rpy="0 0 0")
+    ET.SubElement(joint, "parent", link="root")
+    ET.SubElement(joint, "child", link=FLOOR_LINK)
     for name, parent in EXTRA_LINKS.items():
         link = ET.SubElement(robot, "link", name=name)
         joint = ET.SubElement(robot, "joint", name=f"{name}_0", type="fixed")
@@ -432,12 +496,19 @@ def write_urdf(
             )
             ET.SubElement(mat, "color", rgba=" ".join(f"{c:g}" for c in rgba))
         if name in collisions:
+            spec = collisions[name]
             col = ET.SubElement(link, "collision")
-            ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
-            geom = ET.SubElement(col, "geometry")
-            ET.SubElement(
-                geom, "mesh", filename=PACKAGE + collisions[name], scale="1 1 1"
-            )
+            if isinstance(spec, str):
+                ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
+                geom = ET.SubElement(col, "geometry")
+                ET.SubElement(geom, "mesh", filename=PACKAGE + spec, scale="1 1 1")
+            else:
+                radius, length, center, rpy = spec
+                ET.SubElement(col, "origin", xyz=_fmt(center), rpy=rpy)
+                geom = ET.SubElement(col, "geometry")
+                ET.SubElement(
+                    geom, "cylinder", radius=f"{radius:g}", length=f"{length:g}"
+                )
     for joint in robot.findall("joint"):
         lim = limits.get(joint.get("name", ""))
         if lim is not None:
@@ -484,7 +555,9 @@ def main() -> None:
     visuals, collisions = build_meshes(
         export, args.export_dir, classic, tf, args.min_part_mm, args.visual_faces
     )
-    write_urdf(CLASSIC_URDF, visuals, collisions, limits)
+    if not np.allclose(tf[:3, :3], np.eye(3), atol=1e-3):
+        raise SystemExit("export root is not level with the classic world frame")
+    write_urdf(CLASSIC_URDF, visuals, collisions, limits, tf)
 
 
 if __name__ == "__main__":

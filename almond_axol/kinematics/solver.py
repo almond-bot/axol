@@ -37,6 +37,7 @@ from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
     collision_cost_params,
+    upper_arm_guard_floor,
     shared_robot,
     shared_robot_collision,
 )
@@ -682,10 +683,8 @@ class KinematicsSolver:
         self._collision_ramps = jnp.asarray(widths)
         # A soft cost normally turns every arm/base pair away. Independently
         # hard-stop the physical contact pair found in the recorded cross-body
-        # run: either upper arm (e1) against the body. Its fitted capsule already
-        # overlaps at the safe straight-down pose, so the threshold is relative
-        # to that reference: at most 20 mm closer. The observed contact was
-        # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
+        # run: either upper arm (e1) against the body (see
+        # upper_arm_guard_floor for the threshold).
         q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
         home_distances = np.asarray(
             self.robot_coll.compute_self_collision_distance(self.robot, q_home)
@@ -702,7 +701,7 @@ class KinematicsSolver:
             b = self.robot_coll.link_names[int(j)]
             arm_link = b if a in torso else a if b in torso else ""
             if arm_link.endswith("_e1"):
-                clearance_floor[k] = home_distances[k] - 0.020
+                clearance_floor[k] = upper_arm_guard_floor(home_distances[k])
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
 

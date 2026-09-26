@@ -97,5 +97,116 @@ class UrdfSelectionTest(unittest.TestCase):
                 self.assertEqual(pairs, expected)
 
 
+def _pair_distances(model: AxolModel, q_left, q_right) -> dict[tuple[str, str], float]:
+    import jax.numpy as jnp
+    import numpy as np
+
+    from almond_axol.constants import urdf_arm_joint_names
+    from almond_axol.kinematics.model import shared_robot, shared_robot_collision
+
+    robot, rc = shared_robot(model), shared_robot_collision(model)
+    names = list(robot.joints.actuated_names)
+    q = np.zeros(len(names), dtype=np.float32)
+    joints = urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(is_left=False)
+    for name, value in zip(joints, list(q_left) + list(q_right)):
+        q[names.index(name)] = value
+    d = np.asarray(rc.compute_self_collision_distance(robot, jnp.asarray(q)))
+    return {
+        (rc.link_names[int(i)], rc.link_names[int(j)]): float(d[k])
+        for k, (i, j) in enumerate(zip(rc.active_idx_i, rc.active_idx_j))
+    }
+
+
+class CapsuleDistanceTest(unittest.TestCase):
+    def test_parallel_segments_pair_their_closest_points(self) -> None:
+        import jax.numpy as jnp
+        import numpy as np
+        from pyroki.collision import _utils
+
+        from almond_axol.kinematics import model
+
+        # Two vertical segments 0.3 m apart, pointing opposite ways and
+        # overlapping in height: the true gap is exactly 0.3 m.
+        a1, b1 = jnp.array([0.0, 0.0, 0.0]), jnp.array([0.0, 0.0, 0.34])
+        a2, b2 = jnp.array([0.3, 0.0, 0.3]), jnp.array([0.3, 0.0, -0.7])
+        c1, c2 = model._closest_segment_to_segment_points(a1, b1, a2, b2)
+        self.assertAlmostEqual(float(jnp.linalg.norm(c1 - c2)), 0.3, places=6)
+        # And it is what pyroki's capsule pairs now call.
+        self.assertIs(
+            _utils.closest_segment_to_segment_points,
+            model._closest_segment_to_segment_points,
+        )
+
+        # The stock almond-pyroki routine still gets this wrong; when this
+        # fails, the fork has the fix and model._patch_pyroki can go.
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("stock_utils", _utils.__file__)
+        stock = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(stock)
+        s1, s2 = stock.closest_segment_to_segment_points(a1, b1, a2, b2)
+        self.assertGreater(float(np.linalg.norm(s1 - s2)), 0.31)
+
+    def test_both_arms_read_the_same_clearance(self) -> None:
+        # The body is symmetric, so mirrored arms must be too; the parallel
+        # bug read the right upper arm 165 mm further from the lift column.
+        for model in AxolModel:
+            with self.subTest(model=model.value):
+                d = _pair_distances(model, [0.0] * 7, [0.0] * 7)
+                for (a, b), value in d.items():
+                    mirrored = (
+                        a.replace("left_", "right_"),
+                        b.replace("left_", "right_"),
+                    )
+                    if "left_" in a + b:
+                        # Within CAD slop: mirrored parts differ by ~0.5 mm.
+                        self.assertAlmostEqual(
+                            d[mirrored], value, delta=1e-3, msg=(a, b)
+                        )
+
+    def test_upper_arm_guard_allows_the_rest_pose(self) -> None:
+        # The solver hard-stops the upper arm at upper_arm_guard_floor
+        # (KinematicsSolver.__init__); the default rest pose must clear it.
+        from almond_axol.kinematics.model import upper_arm_guard_floor
+        from almond_axol.teleop.config import VRTeleopConfig
+
+        cfg = VRTeleopConfig()
+        for model in AxolModel:
+            with self.subTest(model=model.value):
+                home = _pair_distances(model, [0.0] * 7, [0.0] * 7)
+                rest = _pair_distances(model, cfg.rest_pose_left, cfg.rest_pose_right)
+                torso = torso_links(model)
+                for (a, b), value in rest.items():
+                    arm = b if a in torso else a
+                    if arm.endswith("_e1"):
+                        floor = upper_arm_guard_floor(home[(a, b)])
+                        self.assertGreaterEqual(value, floor, (a, b))
+                        if model is AxolModel.CLASSIC:
+                            self.assertAlmostEqual(floor, home[(a, b)] - 0.020)
+
+
+class FloorFrameTest(unittest.TestCase):
+    def test_mobile_wheels_stand_on_the_floor_frame(self) -> None:
+        import trimesh
+        import yourdfpy
+
+        path = urdf_path(AxolModel.MOBILE)
+        urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
+        floor_z = urdf.get_transform("floor")[2, 3]
+        lowest = min(
+            trimesh.load(
+                path.parent
+                / v.geometry.mesh.filename.removeprefix("package://assembly/")
+            )
+            .apply_transform(urdf.get_transform(name) @ v.origin)
+            .bounds[0, 2]
+            for name, link in urdf.link_map.items()
+            for v in link.visuals
+        )
+        self.assertAlmostEqual(lowest, floor_z, delta=0.002)
+        # The world frame is still the classic one: the floor is below it.
+        self.assertLess(floor_z, -0.4)
+
+
 if __name__ == "__main__":
     unittest.main()

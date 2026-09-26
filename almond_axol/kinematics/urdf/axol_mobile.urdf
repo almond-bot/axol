@@ -538,6 +538,12 @@
         <child link="right_w2" />
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
+    <link name="floor" />
+    <joint name="floor_0" type="fixed">
+        <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
+        <parent link="root" />
+        <child link="floor" />
+    </joint>
     <link name="head">
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
@@ -645,9 +651,9 @@
             </material>
         </visual>
         <collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-1.74523e-07 8.82889e-05 -0.10221" rpy="0 1.5707963267948966 0" />
             <geometry>
-                <mesh filename="package://assembly/meshes/mobile/left_fingers_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.05876" length="0.15216" />
             </geometry>
         </collision>
     </link>
@@ -667,9 +673,9 @@
             </material>
         </visual>
         <collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="1.58524e-09 8.29874e-05 -0.102211" rpy="0 1.5707963267948966 0" />
             <geometry>
-                <mesh filename="package://assembly/meshes/mobile/right_fingers_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.05876" length="0.15206" />
             </geometry>
         </collision>
     </link>

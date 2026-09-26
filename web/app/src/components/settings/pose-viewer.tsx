@@ -26,6 +26,9 @@ interface LoadedModel {
   center: Vector3
   /** Rough model diameter, for camera placement. */
   size: number
+  /** Where the ground plane goes (three.js coords): the URDF's `floor` frame
+   *  when it has one (Axol Mobile), else the world origin. */
+  floor: Vector3
 }
 
 export default function PoseViewer({
@@ -73,12 +76,14 @@ export default function PoseViewer({
       const box = new Box3().setFromObject(scene)
       const center = box.getCenter(new Vector3())
       const size = Math.max(box.getSize(new Vector3()).length(), 0.1)
+      const floor = new Vector3()
+      robot.links.floor?.getWorldPosition(floor)
       const limits: JointLimits = {}
       for (const [name, joint] of Object.entries(robot.joints)) {
         if (joint.jointType === "fixed") continue
         limits[name] = { lower: Number(joint.limit.lower), upper: Number(joint.limit.upper) }
       }
-      setModel({ scene, robot, center, size })
+      setModel({ scene, robot, center, size, floor })
       onLoadedRef.current?.(limits)
     }
     return () => {
@@ -120,7 +125,7 @@ export default function PoseViewer({
       <directionalLight position={[2, 4, 3]} intensity={1.6} />
       <directionalLight position={[-3, 2, -2]} intensity={0.5} />
       <primitive object={model.scene} />
-      <gridHelper args={[size * 2, 20, "#3a3a3a", "#242424"]} />
+      <gridHelper args={[size * 2, 20, "#3a3a3a", "#242424"]} position={model.floor.toArray()} />
       <OrbitControls target={center.toArray()} enableDamping makeDefault />
     </Canvas>
   )
