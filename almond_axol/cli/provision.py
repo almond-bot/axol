@@ -9,8 +9,7 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
 * ``zed.driver``    — replaces a ZED Box's (Duo or Mini) outdated factory
                       GMSL capture driver with the release pinned for the
-                      ZED SDK (takes effect on the next reboot; never reboots
-                      itself).
+                      ZED SDK (takes effect on the next reboot, see below).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * calibration cache — group-shares ``/usr/local/zed/settings`` so calibration
                       files cached by the root service stay readable from the
@@ -60,6 +59,18 @@ command exit non-zero once every other step has had its chance. The hosted
 installer and post-upgrade path pass ``--require-rt`` (accepted for
 compatibility: the required control-core install already fails the command).
 
+Some steps only take effect at boot (the ZED Box driver, a Jetson power mode
+nvpmodel will only switch across a reboot); they record why in
+:mod:`almond_axol.utils.reboot`. A clean operator run then **reboots the host**
+itself. ``--no-reboot`` leaves the reboot pending for a caller that reboots at
+its own safe point: the hosted installer (which finishes with
+``--apply-reboot``) and the ``axol serve`` self-updater (which reboots only
+while idle). A provision spawned by ``axol serve`` never reboots on its own,
+whatever its flags -- older serve builds don't pass ``--no-reboot``, and a
+reboot under a live robot session drops the arms' supervision. A failed run
+never reboots; the pending marker survives until the reboot, so the retry
+still does.
+
 That tuning resets on every reboot, so ``axol provision --boot`` — the
 tuning step alone, no installs and no update lock — is the systemd unit's
 ``ExecStartPre`` and re-applies it at each boot. An operator never runs a
@@ -81,13 +92,13 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb, affinity, can_purge, jetson, rtprio
+from ..utils import adb, affinity, can_purge, jetson, reboot, rtprio
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
     host_update_lock,
 )
-from ..utils.state_files import privileged_service_active
+from ..utils.state_files import privileged_service_active, spawned_by_serve
 from ..utils.sudo import prime_sudo, run_root
 from ..zed import calibration as zed_calibration
 from . import tracker_install
@@ -235,6 +246,22 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         ),
     )
     parser.add_argument(
+        "--no-reboot",
+        action="store_true",
+        help=(
+            "leave a required reboot pending instead of rebooting at the end "
+            "(for callers that reboot at their own safe point)"
+        ),
+    )
+    parser.add_argument(
+        "--apply-reboot",
+        action="store_true",
+        help=(
+            "provision nothing; reboot if an earlier --no-reboot run left a "
+            "reboot pending (the installer's last step)"
+        ),
+    )
+    parser.add_argument(
         "--require-rt",
         action="store_true",
         help=(
@@ -294,7 +321,7 @@ def _sudo_held_update_lock() -> Iterator[None]:
         holder.wait()
 
 
-def tune_host(*, interactive: bool = False) -> None:
+def tune_host(*, interactive: bool = False) -> bool:
     """Apply the runtime tuning this host needs; it resets on every reboot.
 
     Decided by what the host exposes, never by a hard-coded board list: the
@@ -303,14 +330,18 @@ def tune_host(*, interactive: bool = False) -> None:
     Thor's ``gpu-gpc-*``/``gpu-nvd-*``), and the interrupt / daemon placement
     on the online core count (:func:`affinity.core_groups`). The layout is
     logged *after* the power-mode step, which can online cores.
+
+    Returns True when part of the tuning (the power mode) needs a reboot.
     """
     model = jetson.host_model() or "unknown board"
+    reboot_needed = False
     if jetson._is_jetson():
         _logger.info("host: %s (Jetson) — applying the real-time tuning", model)
-        jetson.pin_realtime_clocks(interactive=interactive)
+        reboot_needed = bool(jetson.pin_realtime_clocks(interactive=interactive))
     else:
         _logger.info("host: %s — no Jetson tuning to apply", model)
     _logger.info("core layout: %s", affinity.describe_layout())
+    return reboot_needed
 
 
 def run(args: object = None) -> None:
@@ -322,7 +353,14 @@ def run(args: object = None) -> None:
     if getattr(args, "boot", False):
         # Per-boot: nothing to install, nothing that rewrites the tool env, so
         # no update lock (a boot-time ExecStartPre must never wait on one).
+        # Never reboots, and never records a reboot either: this runs at every
+        # boot, so a request here could loop the host through reboots.
         tune_host(interactive=sys.stdin.isatty())
+        return
+    # Inside `axol serve` the updater decides when a reboot is safe (idle).
+    auto_reboot = not getattr(args, "no_reboot", False) and not spawned_by_serve()
+    if getattr(args, "apply_reboot", False):
+        _reboot_if_pending(auto_reboot)
         return
     lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
     try:
@@ -330,6 +368,26 @@ def run(args: object = None) -> None:
             _run_locked()
     except HostUpdateLockError as exc:
         raise SystemExit(f"Axol provisioning could not start: {exc}") from exc
+    # After the lock is released: a clean run that left a reboot pending.
+    _reboot_if_pending(auto_reboot)
+
+
+def _reboot_if_pending(auto_reboot: bool) -> None:
+    """Reboot for pending reasons, or say that one is still required."""
+    reasons = reboot.pending()
+    if not reasons:
+        reboot.clear_attempt()
+        return
+    summary = "; ".join(reasons)
+    if not auto_reboot:
+        print(f"REBOOT REQUIRED: {summary}. Left pending for the caller.")
+        return
+    print(f"REBOOT REQUIRED: {summary}. Rebooting now.", flush=True)
+    if not reboot.reboot_host(reasons):
+        raise SystemExit(
+            f"A reboot is still required ({summary}) after the last automatic "
+            "reboot; not rebooting again. See the log above."
+        )
 
 
 def _run_locked() -> None:
@@ -408,14 +466,24 @@ def _run_locked() -> None:
             "serve starts, including on the restart an update ends with)"
         )
     else:
-        step(
-            "host tuning (Jetson clocks, CAN interrupt, camera daemon)",
-            lambda: tune_host(interactive=sys.stdin.isatty()),
-        )
+
+        def tune() -> None:
+            if tune_host(interactive=sys.stdin.isatty()):
+                reboot.request("Jetson maximum power mode")
+
+        step("host tuning (Jetson clocks, CAN interrupt, camera daemon)", tune)
 
     if failed:
+        # Never reboot a half-provisioned host; the pending marker outlives
+        # this run, so the retry reboots once everything succeeds.
+        pending = (
+            " A reboot is also pending; the successful retry performs it."
+            if reboot.pending()
+            else ""
+        )
         raise SystemExit(
             "Provisioning failed for: "
             + ", ".join(failed)
             + ". See the log above, repair the host, and retry."
+            + pending
         )

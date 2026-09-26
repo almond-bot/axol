@@ -97,45 +97,6 @@ chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- System provisioning (camera stack + adb + realtime core) -----------------
-
-# `uv tool install` handles the Python package + PyPI deps, but a few pieces it
-# can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
-# reader for the GPU-resident zedxonesrc/zedsrc camera path, built against the
-# system gobject-introspection), and our patched zedxonesrc/zedsrc plugins
-# (which stamp each frame at the true sensor-exposure instant so collected
-# images line up with joint samples), plus the required axol-rt control core.
-# `axol provision` installs all of them idempotently -- the same command the
-# `axol serve` self-updater runs after an upgrade, so there is exactly one
-# provisioning path. Each step self-gates
-# (a no-op without the ZED SDK / apt / NVENC).
-# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
-# and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
-# camera driver with the pinned release (`axol zed.driver`); the new driver
-# only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
-# in the summary below rather than rebooting the box mid-install.
-# Its last step applies the per-boot host tuning (on a Jetson: max nvpmodel
-# mode, engine + CPU clocks, CAN interrupt onto a CAN core, Argus daemon
-# SCHED_FIFO), so the box is tuned now, without a reboot or a second command;
-# the unit below re-applies it at every boot with `axol provision --boot`.
-say "Provisioning system dependencies (camera stack + adb + axol-rt + host tuning)..."
-PROVISION_LOG="$(mktemp)"
-# Most provisioning steps remain best-effort because they self-gate on
-# optional hardware. --require-rt makes the one mandatory step fail the
-# command if its build or capability setup failed.
-PROVISION_OK=1
-"${BIN_DIR}/axol" provision --require-rt 2>&1 | tee "${PROVISION_LOG}" \
-    || PROVISION_OK=0
-REBOOT_REQUIRED=0
-if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
-rm -f "${PROVISION_LOG}"
-
-[ "${PROVISION_OK}" -eq 1 ] \
-    || die "axol-rt provisioning failed. Fix the logged error, then re-run the installer."
-[ -x "${BIN_DIR}/axol-rt" ] \
-    || die "axol-rt did not end up on the shared PATH (expected ${BIN_DIR}/axol-rt)."
-say "axol-rt installed at ${BIN_DIR}/axol-rt."
-
 # -- Quest-over-USB operator access -------------------------------------------
 
 # `axol provision` writes the Oculus udev rule, which hands the headset to the
@@ -171,13 +132,27 @@ if [ -n "${DATASET_USER}" ]; then
     if [ -n "${DATASET_HOME}" ] && [ -d "${DATASET_HOME}" ]; then
         LEROBOT_HOME="${DATASET_HOME}/.cache/huggingface/lerobot"
         say "Datasets will be stored under ${LEROBOT_HOME} (user: ${DATASET_USER})."
-        mkdir -p "${LEROBOT_HOME}"
-        # Own the cache chain so the user can browse/manage datasets (episode
-        # files written by the root service stay root-owned but readable).
+        mkdir -p "${LEROBOT_HOME}/calibration"
+        # Own the cache chain so the user can browse/manage datasets.
         chown "${DATASET_USER}:" \
             "${DATASET_HOME}/.cache" \
             "${DATASET_HOME}/.cache/huggingface" \
-            "${LEROBOT_HOME}" 2>/dev/null || true
+            "${LEROBOT_HOME}" "${LEROBOT_HOME}/calibration" 2>/dev/null || true
+        # The root service runs with umask 027, so without help everything it
+        # creates in here (episodes, calibration/robots/axol) is root:root 0750
+        # and the user's own CLI hits PermissionError on it. A default ACL
+        # overrides the umask for new entries, keeping them read/write for the
+        # user whoever creates them; -R also repairs a tree an earlier root run
+        # already left behind.
+        command -v setfacl >/dev/null 2>&1 \
+            || apt-get install -y -qq acl >/dev/null 2>&1 || true
+        if command -v setfacl >/dev/null 2>&1; then
+            setfacl -R -m "u:${DATASET_USER}:rwX" -m "d:u:${DATASET_USER}:rwX" \
+                "${LEROBOT_HOME}" \
+                || say "WARNING: could not set ACLs on ${LEROBOT_HOME}; files the service writes there may not be writable by ${DATASET_USER}."
+        else
+            say "WARNING: setfacl unavailable; files the service writes under ${LEROBOT_HOME} may not be writable by ${DATASET_USER}."
+        fi
         LEROBOT_HOME_ENV="Environment=HF_LEROBOT_HOME=${LEROBOT_HOME}"
     fi
 fi
@@ -186,6 +161,13 @@ if [ -z "${LEROBOT_HOME_ENV}" ]; then
 fi
 
 # -- systemd service ----------------------------------------------------------
+
+# Written and enabled *before* provisioning, which can fail on hardware steps
+# (a changed vendor driver, say). Without the unit a failed install leaves no
+# service at all: the operator falls back to a hand-run `sudo axol serve` with
+# root's environment (datasets in root's cache), and the control panel's
+# Update button -- the way to take the fix -- is unreachable. It is started
+# after provisioning, whatever the outcome.
 
 say "Writing ${SERVICE_FILE}..."
 cat > "${SERVICE_FILE}" <<EOF
@@ -235,10 +217,47 @@ Environment=UV_TOOL_BIN_DIR=${BIN_DIR}
 WantedBy=multi-user.target
 EOF
 
-say "Enabling and starting the ${SERVICE_NAME} service..."
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
+
+# -- System provisioning (camera stack + adb + realtime core) -----------------
+
+# `uv tool install` handles the Python package + PyPI deps, but a few pieces it
+# can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
+# reader for the GPU-resident zedxonesrc/zedsrc camera path, built against the
+# system gobject-introspection), and our patched zedxonesrc/zedsrc plugins
+# (which stamp each frame at the true sensor-exposure instant so collected
+# images line up with joint samples), plus the required axol-rt control core.
+# `axol provision` installs all of them idempotently -- the same command the
+# `axol serve` self-updater runs after an upgrade, so there is exactly one
+# provisioning path. Each step self-gates
+# (a no-op without the ZED SDK / apt / NVENC).
+# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
+# and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
+# camera driver with the pinned release (`axol zed.driver`). The new driver
+# only loads at boot, so provision runs with --no-reboot here and the last
+# step of this script reboots (`axol provision --apply-reboot`).
+# Its last step applies the per-boot host tuning (on a Jetson: max nvpmodel
+# mode, engine + CPU clocks, CAN interrupt onto a CAN core, Argus daemon
+# SCHED_FIFO), so the box is tuned now, without a reboot or a second command;
+# the unit above re-applies it at every boot with `axol provision --boot`.
+say "Provisioning system dependencies (camera stack + adb + axol-rt + host tuning)..."
+# Most provisioning steps remain best-effort because they self-gate on
+# optional hardware, but any step that fails fails the command (the last line
+# names which).
+PROVISION_OK=1
+"${BIN_DIR}/axol" provision --require-rt --no-reboot || PROVISION_OK=0
+
+# Start the service either way: on a failed provision the panel still comes
+# up, shows the failing step, and can take a fixed release via Update.
+say "Starting the ${SERVICE_NAME} service..."
 systemctl restart "${SERVICE_NAME}"
+
+[ "${PROVISION_OK}" -eq 1 ] \
+    || die "Provisioning failed (see the step named above). axol serve is running, so the control panel can apply a fixed release via Update; or fix the step and re-run the installer."
+[ -x "${BIN_DIR}/axol-rt" ] \
+    || die "axol-rt did not end up on the shared PATH (expected ${BIN_DIR}/axol-rt)."
+say "axol-rt installed at ${BIN_DIR}/axol-rt."
 
 # -- done ---------------------------------------------------------------------
 
@@ -253,8 +272,14 @@ fi
 say ""
 say "  Service logs  : journalctl -u ${SERVICE_NAME} -f"
 say "  Re-run this installer anytime to upgrade."
-if [ "${REBOOT_REQUIRED}" = "1" ]; then
+
+# A step that only takes effect at boot (e.g. a new ZED Box camera driver)
+# left a reboot pending: reboot now so the box is fully set up. A no-op
+# otherwise.
+if [ -s /run/almond-axol/reboot-required ]; then
     say ""
-    say "REBOOT REQUIRED: the ZED Box camera driver was upgraded and only loads"
-    say "at boot. Reboot when convenient:  sudo reboot"
+    say "A reboot is required to finish setup. Rebooting in 10 seconds"
+    say "(this ends your SSH session; reconnect in a minute or two)..."
+    sleep 10
 fi
+"${BIN_DIR}/axol" provision --apply-reboot

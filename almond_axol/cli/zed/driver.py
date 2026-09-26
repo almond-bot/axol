@@ -21,11 +21,10 @@ ignored, because "no pin" means the SDK/driver pairing on that box is
 unmanaged.
 
 The new driver is a kernel module + device-tree update, so it only takes
-effect after a reboot. This command NEVER reboots the box itself -- it runs
-from ``axol provision`` (over the operator's SSH session during install, and
-from the running ``axol serve`` process after a self-update), where an
-in-place reboot would drop the session or kill the robot mid-use. It prints a
-reboot-required notice instead.
+effect after a reboot. This command never reboots the box itself: it records
+the need with :func:`almond_axol.utils.reboot.request`, and ``axol
+provision`` (or the installer / ``axol serve`` self-updater that ran it)
+reboots at its own safe point -- never under a live robot session.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ from ...utils.state_files import (
     secure_ensure_directory,
     secure_unlink,
 )
+from ...utils import reboot
 from ...utils.sudo import run_root
 from .download import atomic_https_download
 
@@ -72,6 +72,12 @@ class _Variant:
 _DRIVER_BASE_URL = "https://download.stereolabs.com/drivers/zedx"
 # Every pin below is the 1.4.3 release Stereolabs pairs with ZED SDK 5.4.1,
 # built for L4T 36.4 (JetPack 6.x). Bump a variant's four fields together.
+#
+# Stereolabs republishes a release in place without bumping its version: both
+# 1.4.3 debs were re-uploaded on 2026-09-18 (same Package/Version, new bytes),
+# which broke every install and self-update on a ZED Box until the pins below
+# were re-reviewed. When a mismatch is reported, re-download, check the control
+# fields, md5sums, maintainer scripts and module vermagic, then re-pin.
 _VARIANTS: tuple[_Variant, ...] = (
     _Variant(
         package="stereolabs-zedbox-duo",
@@ -82,7 +88,7 @@ _VARIANTS: tuple[_Variant, ...] = (
             f"{_DRIVER_BASE_URL}/1.4.3/R36.4/"
             "stereolabs-zedbox-duo_1.4.3-LI-MAX96712-ZEDBOX-L4T36.4.0_arm64.deb"
         ),
-        sha256="54eb75f4f3d8dc5e562a0b3bd0d373b5bb1931f1994be3c4d346d535070e2c6b",
+        sha256="703d9b20f3700b8ba1d03a52add956b1feb12d13f310c37bc1619a166a82079c",
     ),
     _Variant(
         package="stereolabs-zedbox-mini",
@@ -93,7 +99,7 @@ _VARIANTS: tuple[_Variant, ...] = (
             f"{_DRIVER_BASE_URL}/1.4.3/R36.4/"
             "stereolabs-zedbox-mini_1.4.3-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0_arm64.deb"
         ),
-        sha256="5d6751be41375cd081766b5c5f4201d58e2d2b64a610d493cd5bb282e235bf09",
+        sha256="51b9b5ac726795ea1968b0945d8136d9c1be50637c53f156e2f969cedf311cf3",
     ),
 )
 _VARIANTS_BY_PACKAGE = {variant.package: variant for variant in _VARIANTS}
@@ -350,11 +356,12 @@ def _ensure_variant(variant: _Variant, installed: str) -> bool:
         f"camera driver — upgrading to {variant.target_version}."
     )
     _upgrade(variant)
+    reboot.request(f"{variant.package} {variant.target_version} camera driver")
     print()
     print(
         f"REBOOT REQUIRED: {variant.package} {variant.target_version} is "
-        "installed but the new kernel driver only loads at boot. Reboot when "
-        "convenient (sudo reboot)."
+        "installed but the new kernel driver only loads at boot. `axol "
+        "provision` reboots for it; run standalone, reboot with: sudo reboot"
     )
     return True
 

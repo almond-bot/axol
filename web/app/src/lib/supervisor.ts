@@ -202,7 +202,7 @@ export async function fetchInfo(): Promise<ServerInfo> {
 export type UpdateState = "idle" | "updating" | "error"
 
 /** Current step while an update is applying; null when not updating. */
-export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
+export type UpdatePhase = "upgrading" | "provisioning" | "restarting" | "rebooting"
 
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
@@ -216,7 +216,7 @@ export interface UpdateStatus {
   /** Safe to restart now (no op running). */
   idle: boolean
   state: UpdateState
-  /** Step while state is "updating" (upgrading/provisioning/restarting); else null. */
+  /** Step while state is "updating" (upgrading/provisioning/restarting/rebooting); else null. */
   phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */
   error: string | null

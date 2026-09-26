@@ -219,11 +219,14 @@ class DriverVariantTests(unittest.TestCase):
             patch.object(driver, "_is_older", return_value=True),
             patch.object(driver, "_l4t_matches", return_value=True),
             patch.object(driver, "_upgrade", upgrade),
+            patch.object(driver.reboot, "request") as request,
             patch.object(driver.sys, "stdout") as stdout,
         ):
             self.assertTrue(driver.ensure_driver())
 
         upgrade.assert_called_once_with(_MINI)
+        # Recorded for provision (or the installer / updater) to reboot for.
+        request.assert_called_once_with("stereolabs-zedbox-mini 1.4.3 camera driver")
         printed = "".join(c.args[0] for c in stdout.write.call_args_list)
         self.assertIn("REBOOT REQUIRED: stereolabs-zedbox-mini 1.4.3", printed)
 

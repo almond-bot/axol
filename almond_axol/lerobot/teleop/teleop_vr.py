@@ -54,7 +54,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
-from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
+from ...teleop.core import TCPPoseSnapshot, VRTeleopCore, wait_for_ik_ready
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -376,8 +376,7 @@ class AxolVRTeleop(Teleoperator):
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, parent_conn.recv)
-        assert isinstance(msg, tuple) and msg[0] == "ready"
+        msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
         self._core.set_solution(q_init, left_indices, right_indices)
         self._core.set_initial_grips(
