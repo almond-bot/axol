@@ -118,6 +118,8 @@ Pull requests must pass the `Python` and `Web` GitHub Actions checks before merg
 ### Get Started
 
 - [Overview](https://docs.almond.bot)
+- [Hardware Overview](https://docs.almond.bot/hardware) — Axol, the Owl Mount / Ox Cart / Jelly Mobile mounts, the Camera Kit, and the Compute Kit
+- [Hardware Setup](https://docs.almond.bot/hardware-setup) — step-by-step guides for each mount (standalone, Owl Mount, Ox Cart, Jelly) and the cameras
 - [Installation](https://docs.almond.bot/installation)
 
 ### Operations
