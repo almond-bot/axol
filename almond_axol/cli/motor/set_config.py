@@ -120,7 +120,11 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 raise SystemExit("aborted")
 
-        current = await motor.read_config(param)
+        try:
+            current = await motor.read_config(param)
+        except MotorError as e:
+            print(f"\n  error: {e}")
+            raise SystemExit(1) from e
         print(f"  current: {fmt.format(current)}{unit}")
 
         if args.value is None:
