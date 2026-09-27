@@ -114,7 +114,7 @@ class CommandLearner:
     fs: float
     columns: np.ndarray
     band: tuple[float, float] = LEARN_BAND
-    gain: float = 0.5
+    gain: float = 0.7
     max_rad: float = math.radians(1.5)
     offset: np.ndarray = field(init=False)
     _history: list[tuple[np.ndarray, np.ndarray]] = field(init=False)
@@ -216,3 +216,52 @@ class CommandLearner:
         )
         g[(f < self.band[0]) | (f > self.band[1])] = 0.0
         return g
+
+
+#: Candidate feedforward terms :func:`explain_correction` tests, each a
+#: function of the commanded velocity ``v``, acceleration ``a`` and gravity
+#: load ``g`` (all per sample), named for the runtime parameter it maps to.
+def correction_terms(
+    v: np.ndarray, a: np.ndarray, g: np.ndarray | None, vs: float = 0.1
+) -> dict[str, np.ndarray]:
+    from .friction_model import coulomb_unit, stribeck_shape
+
+    terms = {
+        "coulomb (fc)": coulomb_unit(v, 100.0),
+        "stribeck excess (dfs)": stribeck_shape(v, vs),
+        "viscous (fv)": v,
+        "inertia (j_eff)": a,
+    }
+    if g is not None:
+        terms["load coulomb (fl)"] = np.abs(g) * coulomb_unit(v, 100.0)
+    return terms
+
+
+def explain_correction(
+    correction: np.ndarray,
+    stiffness: float,
+    v: np.ndarray,
+    a: np.ndarray,
+    fs: float,
+    band: tuple[float, float] = LEARN_BAND,
+    g: np.ndarray | None = None,
+) -> tuple[dict[str, float], float]:
+    """Which feedforward terms a learned position correction amounts to.
+
+    On an impedance joint a position offset ``u`` is a torque ``kp·u``
+    (``stiffness``). The learned offset is band-limited, so each candidate
+    term — a function of the commanded motion (:func:`correction_terms`) — is
+    band-limited the same way, and the learned torque is regressed on them:
+    the coefficients are what each term's parameter would have to *add* to
+    the current feedforward (Nm, Nm·s/rad, kg·m²), the R² how much of the
+    learned correction the terms explain. A low R² is a missing term.
+    """
+    torque = stiffness * np.asarray(correction, dtype=float)
+    y = band_limit(torque, fs, band)
+    terms = correction_terms(np.asarray(v, float), np.asarray(a, float), g)
+    names = list(terms)
+    X = np.stack([band_limit(terms[k], fs, band) for k in names], axis=1)
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ coef
+    r2 = 1.0 - float(np.var(resid)) / max(float(np.var(y)), 1e-18)
+    return dict(zip(names, (float(c) for c in coef))), r2

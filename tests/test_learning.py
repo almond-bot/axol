@@ -85,12 +85,40 @@ class LearnerTest(unittest.TestCase):
         self.assertTrue(rep.rolled_back)
         self.assertEqual(rep.step, "rollback")
         np.testing.assert_array_equal(learner.offset, np.zeros_like(learner.offset))
-        self.assertAlmostEqual(rep.gain, 0.25)
+        self.assertAlmostEqual(
+            rep.gain, 0.5 * CommandLearner(N, FS, columns=np.array([True])).gain
+        )
 
     def test_short_pass_is_refused(self) -> None:
         learner = CommandLearner(100, FS, columns=np.array([True]))
         with self.assertRaises(ValueError):
             learner.update(np.zeros((50, 1)), np.zeros((50, 1)))
+
+
+class ExplainTest(unittest.TestCase):
+    def test_a_learned_coulomb_and_stribeck_correction_is_recognised(self) -> None:
+        from almond_axol.tuning.friction_model import coulomb_unit, stribeck_shape
+        from almond_axol.tuning.learning import explain_correction
+
+        t = np.arange(N) / FS
+        q = np.radians(20) * np.sin(2 * math.pi * 0.15 * t)
+        v = np.gradient(q) * FS
+        a = np.gradient(v) * FS
+        kp = 450.0
+        # What the joint needed on top of its feedforward: 0.3 Nm Coulomb and
+        # 0.2 Nm Stribeck excess, learned as a position offset (torque / kp).
+        need = 0.3 * coulomb_unit(v, 100.0) + 0.2 * stribeck_shape(v, 0.1)
+        learned = band_limit(need / kp, FS, (0.7, 8.0))
+        coef, r2 = explain_correction(learned, kp, v, a, FS)
+        self.assertGreater(r2, 0.95)
+        self.assertAlmostEqual(coef["coulomb (fc)"], 0.3, delta=0.05)
+        self.assertAlmostEqual(coef["stribeck excess (dfs)"], 0.2, delta=0.05)
+        # A correction unrelated to the motion is not explained.
+        noise = (
+            band_limit(np.random.default_rng(3).standard_normal(N), FS, (1, 3)) * 1e-3
+        )
+        _, r2 = explain_correction(noise, kp, v, a, FS)
+        self.assertLess(r2, 0.1)
 
 
 class CliTest(unittest.TestCase):

@@ -30,10 +30,10 @@ The sweep is refused if it would leave the joint's range.
 
 ```bash
 axol tune.motion --motion ~/.almond/motions/chirp_right_shoulder_1.npz --arms right \
-  --hold right.wrist_2 --hold right.wrist_3 <the gains you run> --label "chirp s1"
+  --hold right.wrist_2 --hold right.wrist_3 --gain right.shoulder_1.kp=450 --label "chirp s1"
 ```
 
-Run it with the exact gains the model is for — the model belongs to that loop.
+Add the same `--gain` / `--fast-impedance` overrides you run the motion with — the model belongs to that loop.
 
 ## 3. Fit — `tune.tf`
 

@@ -200,6 +200,97 @@ class SlowWindowsTest(unittest.TestCase):
         self.assertLess(minutes, 10.0)
 
 
+class _FakeMotor:
+    """A joint that tracks its program exactly; its torque is gravity at the
+    sweep pose plus the TRUE friction curve at the programmed velocity."""
+
+    def __init__(self, load) -> None:
+        self.pos = 0.0
+        self.load = load
+        self.rng = np.random.default_rng(5)
+
+    async def get_position(self) -> float:
+        return self.pos
+
+    async def run_experiment(
+        self, kp, kd, rate_hz, samples, differentiate, feedforward
+    ):
+        rows = []
+        for sample in samples:
+            q = float(sample[0])
+            v = float(sample[3]) if len(sample) > 3 else 0.0
+            g = -self.load(q)
+            fric = (
+                math.copysign(1.0, v) * float(TRUE.halfdiff(np.array([abs(v)]), g)[0])
+                if v
+                else 0.0
+            )
+            tau = g + TRUE.fo + fric + 0.05 * self.rng.standard_normal()
+            rows.append({"actual": q, "torque": tau})
+            self.pos = q
+        return rows
+
+
+class SlowSessionTest(unittest.TestCase):
+    def test_the_slow_sweep_recovers_the_curve_it_measured(self) -> None:
+        import asyncio
+        from unittest import mock
+
+        from almond_axol.cli.tune import friction as cli
+        from almond_axol.constants import Joint
+
+        load = lambda q: abs(14.0 * math.cos(q))  # noqa: E731
+        motor = _FakeMotor(load)
+        lo, hi = math.radians(-60), math.radians(60)
+        speeds = [math.radians(v) for v in SPEEDS_DEG]
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("asyncio.sleep", mock.AsyncMock()),
+        ):
+            raw = Path(tmp) / "raw.csv"
+            rows = asyncio.run(
+                cli._identify_slow(
+                    motor,
+                    250.0,
+                    3.5,
+                    speeds,
+                    lo,
+                    hi,
+                    load,
+                    Joint.SHOULDER_1,
+                    False,
+                    raw,
+                )
+            )
+            self.assertTrue(raw.exists())
+            back = read_raw_csv([raw])
+        self.assertEqual(len(back["q"]), len(rows["q"]))
+        # Every speed made it in, the slow ones in two windows.
+        groups_per_speed = {}
+        for v, g in zip(rows["speed"], rows["group"]):
+            groups_per_speed.setdefault(round(math.degrees(v), 1), set()).add(g)
+        self.assertEqual(len(groups_per_speed[1.0]), 2)
+        self.assertEqual(len(groups_per_speed[30.0]), 1)
+        # Fit with the sample loads (the fake's gravity is not the URDF's).
+        samples = matched_samples(
+            np.asarray(rows["speed"]),
+            np.asarray(rows["direction"]),
+            np.asarray(rows["q"]),
+            np.asarray(rows["tau"]),
+            np.asarray(rows["load"]),
+            np.asarray(rows["group"]),
+        )
+        fit = fit_friction(samples)
+        for sp in SPEEDS_DEG:
+            v = math.radians(sp)
+            for g in (5.0, 13.0):
+                self.assertAlmostEqual(
+                    float(fit.halfdiff(np.array([v]), g)[0]),
+                    float(TRUE.halfdiff(np.array([v]), g)[0]),
+                    delta=0.04,
+                )
+
+
 class CalibrationTest(unittest.TestCase):
     def test_friction_fl_and_stribeck_fields_round_trip_and_apply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -548,8 +548,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--learn-gain",
         type=float,
-        default=0.5,
-        help="Step size of the model-based learning updates (default 0.5)",
+        default=0.7,
+        help="Step size of the model-based learning updates (default 0.7; "
+        "0.9 converges faster where passes repeat closely)",
     )
     p.add_argument(
         "--learn-band",
