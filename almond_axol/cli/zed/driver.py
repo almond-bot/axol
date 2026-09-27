@@ -37,12 +37,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from ...utils import reboot
 from ...utils.state_files import (
     secure_atomic_copy_file,
     secure_ensure_directory,
     secure_unlink,
 )
-from ...utils import reboot
 from ...utils.sudo import run_root
 from .download import atomic_https_download
 
