@@ -1,0 +1,58 @@
+---
+title: "tune.tf / motion.chirp"
+description: "Identify a joint's closed-loop tracking dynamics with a sine sweep, and pre-compensate known motions with the inverse."
+---
+
+The linear half of motion calibration — what Reforge's per-axis sine sweeps measure. A chirp excites one joint through the production controller; `tune.tf` turns the replay into the joint's command → position frequency response and fits
+
+`H(s) = K (1 + s/ωz) ωn² / (s² + 2ζωn s + ωn²) · e^(−sτ)`
+
+— the closed loop's natural frequency, damping, an optional zero and the delay. `tune.motion --invert` then streams a known motion through the inverse, cancelling the tracking lag and resonance.
+
+It is the smaller half on slow motion: on slow_osc only 3–9% of the 1–3 Hz shake was a linear response to the command — the rest is friction, calibrated with [`tune.friction --profile slow`](/cli/tune-friction). It dominates the error of faster motion.
+
+## 1. Build the sweep — `motion.chirp`
+
+| Flag | Description |
+|---|---|
+| `SIDE.JOINT` | The joint to excite, e.g. `right.shoulder_1` |
+| `--base MOTION` | Motion whose first pose the sweep is centred on (default `slow_osc`) |
+| `--f0` / `--f1` | Sweep band, Hz (default `0.3` / `8`) |
+| `--duration S` | Sweep length (default `60`) |
+| `--amp-deg D` | Low-frequency amplitude (default `1.5`) |
+| `--acc-max DEG_S2` | Amplitude cap by acceleration (default `200`: full amplitude to 1.8 Hz, 0.08° at 8 Hz) |
+| `--carrier DEG_S` | Ride a triangle wave of this speed over ±7.5° so the joint slides one way for seconds at a time — friction linearises around a sliding joint, where slow motion lives (default `0`) |
+| `--out PATH` | Output (default `~/.almond/motions/chirp_<side>_<joint>.npz`) |
+
+The sweep is refused if it would leave the joint's range.
+
+## 2. Replay it — `tune.motion`
+
+```bash
+axol tune.motion --motion ~/.almond/motions/chirp_right_shoulder_1.npz --arms right \
+  --hold right.wrist_2 --hold right.wrist_3 <the gains you run> --label "chirp s1"
+```
+
+Run it with the exact gains the model is for — the model belongs to that loop.
+
+## 3. Fit — `tune.tf`
+
+| Flag | Description |
+|---|---|
+| `SIDE.JOINT RUN_ID [RUN_ID ...]` | The joint and the chirp run(s) (pooled) |
+| `--f0` / `--f1` | Band to fit (default `0.3` / `8`) |
+| `--min-coherence C` | Bins below this coherence are left out (default `0.6`) |
+| `--save` | Store the model (with the run's gain overrides) in `~/.almond/tracking_models.json` |
+
+It prints the response at a few frequencies, the model, a warning when the loop is lightly damped (how much a command component at its resonance is amplified) or when the fitted resonance lies above the band the data covers, and — when the run has the wrist IMU — how coherent the wrist's vertical motion is with the command per band: where it drops, something the joint encoder does not see is moving the tool.
+
+## 4. Use it — `tune.motion --invert`
+
+Pre-compensates every modelled, moving, unheld joint of the streamed motion (frequency domain over the whole trajectory, inverse gain capped at 3× and faded to 1 above the identified band, correction tapered in and out over 0.5 s so the stream still starts and ends on the motion). Scored against the clean reference. A joint whose stored gains differ from the run's is warned about; one whose model's resonance was extrapolated is skipped.
+
+```bash
+axol motion.chirp right.shoulder_1 --carrier 3
+axol tune.motion --motion ~/.almond/motions/chirp_right_shoulder_1.npz --arms right --label "chirp s1"
+axol tune.tf right.shoulder_1 <run_id> --save
+axol tune.motion --motion slow_osc --arms right --invert --repeat 3 --label "osc inverted"
+```

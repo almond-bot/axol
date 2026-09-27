@@ -42,6 +42,7 @@ from .tune import a4 as tune_a4
 from .tune import breakaway, friction, pid, repeatability
 from .tune import gravity as tune_gravity
 from .tune import motion as tune_motion
+from .tune import tf as tune_tf
 from .zed import driver as zed_driver
 from .zed import install as zed_install
 
@@ -173,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_cmd.add_parser(subparsers)
     repeatability.add_parser(subparsers)
     tune_motion.add_parser(subparsers)
+    tune_tf.add_parser(subparsers)
     tune_filter.add_parser(subparsers)
     motion_add_parser(subparsers)
     migrate_dataset_cmd.add_parser(subparsers)

@@ -575,6 +575,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "driven arms that moves at least 1° and is not --hold)",
     )
     p.add_argument(
+        "--invert",
+        action="store_true",
+        help="Pre-compensate the streamed motion with each joint's tracking "
+        "model (axol tune.tf --save): the reference through the inverse of the "
+        "measured closed-loop response, so the lag and resonance cancel. "
+        "Joints without a model stream as before; scored against the clean "
+        "reference",
+    )
+    p.add_argument(
         "--correction",
         metavar="RUN_ID",
         help="Fly the offset a --learn run saved (that pass's 'correction') on "
@@ -780,6 +789,64 @@ def _ik_stream(solver, sent: np.ndarray, to_full, info: dict) -> np.ndarray:
         f"({info['ik_dev_max_deg']:.2f}° max) — that deviation is part of "
         "what the run scores"
     )
+    return out
+
+
+def _invert_stream(
+    sent: Any,
+    ref: Any,
+    holds: dict[int, Any],
+    overrides: dict[tuple[str, str, str], float],
+    rate: float,
+    arms: str,
+) -> np.ndarray:
+    """``sent`` with every modelled, moving, unheld joint pre-compensated
+    (``--invert``)."""
+    from ...tuning.tracking_model import (
+        TRACKING_MODELS_PATH,
+        invert_reference,
+        load_models,
+    )
+
+    models = load_models()
+    if not models:
+        raise SystemExit(
+            f"--invert: no tracking models in {TRACKING_MODELS_PATH} — "
+            "run axol motion.chirp / tune.motion / tune.tf --save first"
+        )
+    out = np.array(sent, dtype=float, copy=True)
+    ref_arr = np.asarray(ref, dtype=float)
+    current = {f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()}
+    for i, name in enumerate(_COLUMNS):
+        model = models.get(name)
+        side = name.split(".")[0]
+        if model is None or i in holds or arms not in ("both", side):
+            continue
+        if np.ptp(ref_arr[:, i]) < math.radians(1.0):
+            continue
+        if model.fn_hz > 1.2 * model.f_hi:
+            print(
+                f"  invert: {name} skipped — its model's resonance "
+                f"({model.fn_hz:.1f} Hz) is outside the band it was measured on"
+            )
+            continue
+        mine = {k: v for k, v in current.items() if k.startswith(name + ".")}
+        theirs = {
+            k: v for k, v in (model.gains or {}).items() if k.startswith(name + ".")
+        }
+        if mine != theirs:
+            print(
+                f"  ! invert: {name}'s model was measured with {theirs or 'config gains'}, "
+                f"this run has {mine or 'config gains'} — re-measure if the loop changed"
+            )
+        out[:, i] = invert_reference(out[:, i], rate, model)
+        change = np.degrees(
+            np.abs(out[:, i] - np.asarray(sent, dtype=float)[:, i]).max()
+        )
+        print(
+            f"  invert: {name} through its {model.fn_hz:.2f} Hz / ζ {model.zeta:.2f} / "
+            f"{model.tau * 1e3:.0f} ms model (peak change {change:.3f}°)"
+        )
     return out
 
 
@@ -997,6 +1064,9 @@ async def _run(args: argparse.Namespace) -> None:
             "joint can bring links closer than the recording did; watch the first pass"
         )
 
+    if args.invert:
+        sent = _invert_stream(sent, ref, holds, overrides, motion.rate, args.arms)
+        stream_differs = True
     n_wp = len(sent)
     ref_arr = np.asarray(ref, dtype=float)
     learner: CommandLearner | None = None

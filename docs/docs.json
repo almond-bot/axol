@@ -181,6 +181,7 @@
                   "cli/tune-gravity",
                   "cli/tune-factory",
                   "cli/tune-motion",
+                  "cli/tune-tf",
                   "cli/tune-filter",
                   "cli/motion-build",
                   "cli/tune-repeatability"
