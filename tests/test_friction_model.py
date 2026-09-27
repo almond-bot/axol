@@ -1,0 +1,251 @@
+"""The slow-profile friction calibration: the runtime-shaped fit, the sweep
+windows, and the calibration-file round trip of what it saves."""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+from almond_axol.robot.calibration import load_calibration, update_joint_calibration
+from almond_axol.robot.config import JointConfig, FrictionParams, _calibrated_joint
+from almond_axol.tuning.friction_model import (
+    K_MAX,
+    STRIBECK_V0,
+    FrictionFit,
+    fit_friction,
+    matched_samples,
+    read_raw_csv,
+    speed_table,
+)
+
+TRUE = FrictionFit(
+    fc=0.6,
+    fl=0.045,
+    k=K_MAX,
+    fv=0.3,
+    fo=0.1,
+    dfs=0.4,
+    ls=0.04,
+    vs=0.06,
+    rms=0.0,
+    r2=1.0,
+    n=0,
+    load_span=0.0,
+    speeds=(),
+)
+SPEEDS_DEG = (1, 2, 3, 5, 8, 15, 30)
+
+
+def _gravity(q: np.ndarray) -> np.ndarray:
+    return -14.0 * np.cos(q)  # |load| 14 Nm down to ~5 over the sweep
+
+
+def _sweep(seed: int = 1, speeds=SPEEDS_DEG, noise: float = 0.15):
+    rng = np.random.default_rng(seed)
+    cols = {"speed": [], "direction": [], "q": [], "tau": []}
+    for deg in speeds:
+        v = math.radians(deg)
+        for d in (1, -1):
+            q = np.radians(np.linspace(-60, 70, 1500))
+            g = _gravity(q)
+            tau = (
+                g
+                + TRUE.fo
+                + d * TRUE.halfdiff(np.full(len(q), v), g)
+                + noise * rng.standard_normal(len(q))
+                + 0.1 * np.sin(q * 400)  # a gear-mesh ripple the curve ignores
+            )
+            cols["speed"] += [v] * len(q)
+            cols["direction"] += [d] * len(q)
+            cols["q"] += list(q)
+            cols["tau"] += list(tau)
+    return {k: np.asarray(v) for k, v in cols.items()}
+
+
+class RuntimeShapeTest(unittest.TestCase):
+    def test_halfdiff_is_the_core_law(self) -> None:
+        # (fc + fl|g|)·tanh(0.1·min(k,100)·v) + fv·v + (dfs + ls|g|)·exp(-(v/vs)²)·tanh(v/0.02)
+        v, g = 0.05, -8.0
+        want = (
+            (0.6 + 0.045 * 8) * math.tanh(0.1 * 100 * v)
+            + 0.3 * v
+            + (0.4 + 0.04 * 8)
+            * math.exp(-((v / 0.06) ** 2))
+            * math.tanh(v / STRIBECK_V0)
+        )
+        self.assertAlmostEqual(
+            float(TRUE.halfdiff(np.array([v]), g)[0]), want, places=12
+        )
+        # A k above the runtime cap behaves as the cap.
+        capped = FrictionFit(**{**TRUE.as_dict(), "k": 742.0, "speeds": ()})
+        self.assertAlmostEqual(
+            float(capped.halfdiff(np.array([v]), g)[0]), want, places=12
+        )
+
+
+class FitTest(unittest.TestCase):
+    def test_recovers_the_curve_from_a_slow_multi_load_sweep(self) -> None:
+        d = _sweep()
+        samples = matched_samples(
+            d["speed"], d["direction"], d["q"], d["tau"], _gravity
+        )
+        fit = fit_friction(
+            samples, gravity_residual=lambda s: s.average - _gravity(s.q)
+        )
+        self.assertAlmostEqual(fit.fc, TRUE.fc, delta=0.05)
+        self.assertAlmostEqual(fit.fl, TRUE.fl, delta=0.005)
+        self.assertAlmostEqual(fit.fv, TRUE.fv, delta=0.05)
+        self.assertAlmostEqual(fit.dfs, TRUE.dfs, delta=0.06)
+        self.assertAlmostEqual(fit.ls, TRUE.ls, delta=0.006)
+        self.assertAlmostEqual(fit.vs, TRUE.vs, delta=0.01)
+        self.assertAlmostEqual(fit.fo, TRUE.fo, delta=0.02)
+        self.assertEqual(fit.k, K_MAX)
+        for row in speed_table(fit, samples):
+            self.assertAlmostEqual(row["fit_nm"], row["measured_nm"], delta=0.02)
+
+    def test_narrow_load_pins_the_load_terms(self) -> None:
+        d = _sweep()
+        flat = lambda q: np.full_like(np.asarray(q, float), 6.0)  # noqa: E731
+        samples = matched_samples(d["speed"], d["direction"], d["q"], d["tau"], flat)
+        fit = fit_friction(samples)
+        self.assertEqual((fit.fl, fit.ls), (0.0, 0.0))
+        self.assertLess(fit.load_span, 3.0)
+
+    def test_too_few_speeds_or_samples_is_refused(self) -> None:
+        d = _sweep(speeds=(3, 6))
+        samples = matched_samples(
+            d["speed"], d["direction"], d["q"], d["tau"], _gravity
+        )
+        with self.assertRaisesRegex(ValueError, "sweep speeds"):
+            fit_friction(samples)
+        with self.assertRaisesRegex(ValueError, "too few"):
+            fit_friction(samples[:5])
+
+    def test_per_sample_load_and_csv_round_trip(self) -> None:
+        d = _sweep(speeds=(2, 5, 15))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "raw.csv"
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(
+                    [
+                        "joint",
+                        "side",
+                        "pass",
+                        "v_rad_s",
+                        "direction",
+                        "q_rad",
+                        "tau_nm",
+                        "load_nm",
+                    ]
+                )
+                for s, dn, q, t in zip(d["speed"], d["direction"], d["q"], d["tau"]):
+                    w.writerow(
+                        [
+                            "shoulder_1",
+                            "right",
+                            0,
+                            s,
+                            "+" if dn > 0 else "-",
+                            q,
+                            t,
+                            abs(_gravity(q)),
+                        ]
+                    )
+            raw = read_raw_csv([path])
+        self.assertEqual(str(raw["joint"]), "shoulder_1")
+        a = matched_samples(
+            raw["speed"],
+            raw["direction"],
+            raw["q"],
+            raw["tau"],
+            raw["load"],
+            raw["group"],
+        )
+        b = matched_samples(d["speed"], d["direction"], d["q"], d["tau"], _gravity)
+        self.assertEqual(len(a), len(b))
+        np.testing.assert_allclose(
+            [s.halfdiff for s in a], [s.halfdiff for s in b], atol=1e-6
+        )
+        np.testing.assert_allclose([s.load for s in a], [s.load for s in b], rtol=0.02)
+
+
+class SlowWindowsTest(unittest.TestCase):
+    def test_slow_speeds_get_a_low_and_a_high_load_window(self) -> None:
+        from almond_axol.cli.tune.friction import slow_profile_seconds, slow_windows
+
+        load = lambda q: abs(14.0 * math.cos(q))  # noqa: E731
+        lo, hi = math.radians(-60), math.radians(70)
+        w = slow_windows(lo, hi, math.radians(1.0), load)
+        self.assertEqual(len(w), 2)
+        loads = sorted(load(0.5 * (a + b)) for a, b in w)
+        self.assertLess(loads[0], 7.0)
+        self.assertGreater(loads[1], 13.0)
+        for a, b in w:
+            self.assertGreaterEqual(a, lo - 1e-9)
+            self.assertLessEqual(b, hi + 1e-9)
+            self.assertAlmostEqual(math.degrees(b - a), 15.0, delta=0.01)
+        # Fast speeds sweep the whole range.
+        self.assertEqual(slow_windows(lo, hi, math.radians(15.0), load), [(lo, hi)])
+        minutes = (
+            slow_profile_seconds(lo, hi, [math.radians(v) for v in SPEEDS_DEG], load)
+            / 60
+        )
+        self.assertLess(minutes, 10.0)
+
+
+class CalibrationTest(unittest.TestCase):
+    def test_friction_fl_and_stribeck_fields_round_trip_and_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            update_joint_calibration(
+                "right",
+                "shoulder_1",
+                friction=TRUE.friction_params(),
+                stribeck=TRUE.stribeck_params(0.8),
+                hub_serial="hub1",
+                path=path,
+            )
+            got = load_calibration(path, expected_hub_serial="hub1")["right"][
+                "shoulder_1"
+            ]
+            self.assertEqual(got["friction"]["fl"], 0.045)
+            self.assertEqual(got["stribeck_gain"], 0.8)
+            self.assertEqual(got["stribeck_vs"], 0.06)
+            jc = JointConfig(
+                kp=1.0,
+                kd=0.1,
+                friction=FrictionParams(fc=0, k=0, fv=0, fo=0),
+                mass=1.0,
+                com=(0.0, 0.0, 0.0),
+            )
+            applied = _calibrated_joint(jc, got)
+            self.assertEqual(applied.friction.fl, 0.045)
+            self.assertEqual(applied.stribeck_dfs, 0.4)
+            self.assertEqual(applied.stribeck_load_gain, 0.04)
+            # Negative or junk stribeck values are dropped on load.
+            raw = json.loads(path.read_text())
+            raw["right"]["shoulder_1"]["stribeck_vs"] = -1
+            path.write_text(json.dumps(raw))
+            got = load_calibration(path, expected_hub_serial="hub1")["right"][
+                "shoulder_1"
+            ]
+            self.assertNotIn("stribeck_vs", got)
+            with self.assertRaises(ValueError):
+                update_joint_calibration(
+                    "right",
+                    "shoulder_1",
+                    stribeck={"bogus": 1.0},
+                    hub_serial="hub1",
+                    path=path,
+                )
+
+
+if __name__ == "__main__":
+    unittest.main()

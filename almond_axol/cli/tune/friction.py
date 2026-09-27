@@ -26,10 +26,24 @@ construction, so the values take effect for every operation on this machine
 without touching ``config.py``. Friction is motor-specific — run this per
 joint, per arm, on every robot you build.
 
+Slow profile (``--profile slow``): the calibration for slow, smooth motion.
+The default sweep speeds (7-72°/s) miss where the slow shake lives, and the
+Coulomb-plus-viscous fit cannot hold the Stribeck drop or its load
+dependence. ``--profile slow`` sweeps 1, 2, 3, 5, 8, 15 and 30°/s, the slow
+speeds (under 8°/s) in two windows — one where the joint carries the least
+gravity, one where it carries the most — and fits the realtime core's own
+friction law to all of it (:mod:`almond_axol.tuning.friction_model`):
+sliding friction ``fc + fl·|g|`` with the runtime's k cap, viscous ``fv``,
+and the low-speed excess ``dfs + ls·|g|`` over speed ``vs``. ``--save``
+stores the friction fit and the Stribeck fields (at ``--stribeck-gain``).
+``--fit-csv`` re-fits saved ``--raw-csv`` files without moving anything.
+
 Examples:
     axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
     axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
     axol tune.friction --l --joint wrist_1 --velocities 12 35 60
+    axol tune.friction --r --joint shoulder_1 --profile slow --raw-csv s1.csv --save
+    axol tune.friction --r --joint shoulder_1 --fit-csv s1.csv
 """
 
 import argparse
@@ -38,6 +52,7 @@ import csv
 import math
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -62,6 +77,9 @@ from ...utils.state_files import (
 )
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
+if TYPE_CHECKING:
+    from ...tuning.friction_model import FrictionFit, Sample
+
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
 _SWEEP_MARGIN = 0.05  # rad — don't sweep all the way to hard limits
@@ -73,6 +91,19 @@ _N_BINS = 40  # position bins for matching fwd/bwd samples
 # Default velocity sweep in deg/s (0.02, 0.05, 0.1, 0.15, 0.2 rev/s exactly).
 # The CLI speaks deg/s; the sweep internals run rad/s.
 DEFAULT_VELOCITIES_DEG = [v * 360.0 for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
+#: ``--profile slow``: down into the speeds slow motion runs at.
+SLOW_VELOCITIES_DEG = [1.0, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0]
+#: Below this speed (deg/s) a slow-profile pass sweeps two windows, not the
+#: whole range: a full range at 1°/s is minutes per direction.
+_WINDOW_BELOW_DEG = 8.0
+#: A window lasts about this long per direction (s), and spans at least
+#: ``_WINDOW_MIN_DEG`` (enough 0.5° bins to average a gear-mesh ripple out).
+_WINDOW_S = 15.0
+_WINDOW_MIN_DEG = 8.0
+#: Default share of the fitted low-speed excess the runtime cancels
+#: (``stribeck_gain``): right shoulder_1's creep ripple was lowest at 0.8
+#: (2026-09-24, round 5/6).
+DEFAULT_STRIBECK_GAIN = 0.8
 
 
 async def _ramp_to(
@@ -666,6 +697,243 @@ def _fit_load_friction(
     return max(fc0, 0.0), max(fl, 0.0), span
 
 
+def sweep_load(
+    joint: Joint, is_left: bool, other_targets: dict[Joint, float]
+) -> "Callable[[float], float]":
+    """|gravity torque| on ``joint`` at angle ``q``, the rest of the arm at
+    the sweep pose."""
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+
+    def load(q: float) -> float:
+        arm_q[test_idx] = float(q)
+        return abs(float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx]))
+
+    return load
+
+
+def slow_windows(
+    lo: float, hi: float, speed: float, load: "Callable[[float], float]"
+) -> list[tuple[float, float]]:
+    """Sweep windows ``(start, end)`` for one slow-profile speed (rad/s).
+
+    Full range at or above ``_WINDOW_BELOW_DEG``; below it, two windows of
+    ``~_WINDOW_S`` of travel centred on the least- and most-loaded angles
+    (clamped into range), so the fit sees the load dependence at every speed
+    without a full-range pass taking minutes.
+    """
+    if math.degrees(speed) >= _WINDOW_BELOW_DEG:
+        return [(lo, hi)]
+    width = max(math.radians(_WINDOW_MIN_DEG), speed * _WINDOW_S)
+    if width >= 0.5 * (hi - lo):
+        return [(lo, hi)]
+    qs = np.linspace(lo, hi, 121)
+    loads = np.array([load(float(q)) for q in qs])
+    out = []
+    for centre in (float(qs[np.argmin(loads)]), float(qs[np.argmax(loads)])):
+        start = min(max(centre - 0.5 * width, lo), hi - width)
+        out.append((start, start + width))
+    if abs(out[0][0] - out[1][0]) < 0.5 * width:
+        # Load barely varies across the range: one window is the same data.
+        out = out[:1]
+    return out
+
+
+def slow_profile_seconds(
+    lo: float, hi: float, speeds: list[float], load: "Callable[[float], float]"
+) -> float:
+    """Rough duration of a slow-profile session (s): the sweeps plus a
+    few seconds of ramp and hold around each."""
+    total = 0.0
+    for v in speeds:
+        for a, b in slow_windows(lo, hi, v, load):
+            total += 2.0 * (b - a) / v + 6.0
+    return total
+
+
+async def _identify_slow(
+    motor: JointFrameMotor,
+    kp: float,
+    kd: float,
+    speeds: list[float],
+    lo: float,
+    hi: float,
+    load: "Callable[[float], float]",
+    joint: Joint,
+    is_left: bool,
+    raw_csv: Path | None,
+) -> dict[str, list]:
+    """Run the slow-profile passes; every cruise sample, labelled."""
+    rows: dict[str, list] = {
+        "speed": [],
+        "direction": [],
+        "q": [],
+        "tau": [],
+        "group": [],
+        "load": [],
+    }
+    raw_file = raw_writer = None
+    if raw_csv is not None:
+        raw_file = secure_open_new_text(raw_csv, newline="")
+        raw_writer = csv.writer(raw_file)
+        raw_writer.writerow(
+            [
+                "joint",
+                "side",
+                "pass",
+                "v_rad_s",
+                "direction",
+                "q_rad",
+                "tau_nm",
+                "load_nm",
+            ]
+        )
+        print(f"  Dumping every cruise sample to {raw_csv}")
+    group = 0
+    try:
+        for v in speeds:
+            for start, end in slow_windows(lo, hi, v, load):
+                print(
+                    f"\n  v = {math.degrees(v):.1f} deg/s over "
+                    f"[{math.degrees(start):.1f}, {math.degrees(end):.1f}]° "
+                    f"(load {load(start):.1f}-{load(end):.1f} Nm) ..."
+                )
+                cur = await motor.get_position()
+                await _ramp_to(
+                    motor, kp, kd, start, duration=abs(start - cur) / _RAMP_SPEED + 1.0
+                )
+                await asyncio.sleep(0.3)
+                fwd = await _run_sweep_raw(motor, kp, kd, start, +v, end)
+                cur = await motor.get_position()
+                await _ramp_to(motor, kp, kd, cur, duration=2.0)
+                bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, start)
+                print(f"    fwd {len(fwd)} / bwd {len(bwd)} samples")
+                for direction, samples in (("+", fwd), ("-", bwd)):
+                    for q, tau in samples:
+                        ld = load(q)
+                        rows["speed"].append(v)
+                        rows["direction"].append(direction)
+                        rows["q"].append(q)
+                        rows["tau"].append(tau)
+                        rows["group"].append(group)
+                        rows["load"].append(ld)
+                        if raw_writer is not None:
+                            raw_writer.writerow(
+                                [
+                                    joint.value,
+                                    "left" if is_left else "right",
+                                    group,
+                                    f"{v:.6f}",
+                                    direction,
+                                    f"{q:.6f}",
+                                    f"{tau:.6f}",
+                                    f"{ld:.4f}",
+                                ]
+                            )
+                if raw_file is not None:
+                    raw_file.flush()
+                group += 1
+                await asyncio.sleep(0.2)
+    finally:
+        if raw_file is not None:
+            raw_file.close()
+    return rows
+
+
+def fit_and_report(
+    rows: dict[str, "np.ndarray | list"],
+    joint: Joint,
+    is_left: bool,
+    other_targets: dict[Joint, float],
+) -> "FrictionFit | None":
+    """Fit the runtime friction law to slow-profile samples and print the
+    per-speed scorecard. ``fo`` comes from the averages against the URDF
+    gravity model at the sweep pose; rows carrying their own load (runs
+    whose other joints were elsewhere) contribute to the friction fit only."""
+    from ...tuning.friction_model import fit_friction, matched_samples, speed_table
+
+    from dataclasses import replace
+
+    load_fn = sweep_load(joint, is_left, other_targets)
+    loads = np.asarray(rows["load"], dtype=float)
+    own = np.isfinite(loads)
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+
+    def gravity_residual(s: "Sample") -> float:
+        arm_q[test_idx] = float(s.q)
+        return s.average - float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx])
+
+    def pick(mask: np.ndarray, load: "Callable[[float], float] | np.ndarray") -> list:
+        if not mask.any():
+            return []
+        return matched_samples(
+            np.asarray(rows["speed"])[mask],
+            np.asarray(rows["direction"])[mask],
+            np.asarray(rows["q"])[mask],
+            np.asarray(rows["tau"])[mask],
+            load,
+            np.asarray(rows["group"])[mask],
+        )
+
+    # Sweep rows sit at the sweep pose (their gravity comes from the model
+    # and gives fo); rows with their own load came from elsewhere and only
+    # inform the friction curve.
+    sweep_samples = pick(~own, load_fn)
+    samples = sweep_samples + pick(own, loads[own])
+    try:
+        fit = fit_friction(samples)
+    except ValueError as exc:
+        print(f"  ! Slow-profile fit failed: {exc}")
+        return None
+    if sweep_samples:
+        fit = replace(
+            fit, fo=float(np.mean([gravity_residual(x) for x in sweep_samples]))
+        )
+    print("\n  Friction curve (runtime law), per sweep speed:")
+    print("    speed    bins   |g| Nm   measured   fit")
+    for r in speed_table(fit, samples):
+        print(
+            f"    {r['speed_deg_s']:5.1f}°/s {r['n']:5d}  {r['load_nm']:6.2f}   "
+            f"{r['measured_nm']:7.3f}   {r['fit_nm']:7.3f}"
+        )
+    print(
+        f"\n    sliding  fc = {fit.fc:.4f} Nm + fl = {fit.fl:.4f}·|g|   "
+        f"(k {fit.k:.0f}, fv {fit.fv:.4f} Nm·s/rad, fo {fit.fo:+.4f} Nm)"
+    )
+    print(
+        f"    low-speed excess dfs = {fit.dfs:.4f} Nm + ls = {fit.ls:.4f}·|g| "
+        f"over vs = {fit.vs:.4f} rad/s ({math.degrees(fit.vs):.1f}°/s)"
+    )
+    print(
+        f"    fit: {fit.n} bins over {fit.load_span:.1f} Nm of load, residual "
+        f"{fit.rms:.3f} Nm RMS (R² {fit.r2:.2f} — the rest is position-dependent "
+        "ripple, which the curve cannot hold)"
+    )
+    if fit.load_span < 3.0:
+        print("    (load terms pinned at 0: the data spans < 3 Nm of gravity load)")
+    return fit
+
+
+def save_slow_fit(fit: "FrictionFit", side: str, joint: Joint, gain: float) -> Path:
+    path = update_joint_calibration(
+        side,
+        joint.value,
+        friction=fit.friction_params(),
+        stribeck=fit.stribeck_params(gain),
+    )
+    print(f"\n  Saved friction + Stribeck (gain {gain:g}) to {path}")
+    return path
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register the ``tune.friction`` subcommand."""
     p = subparsers.add_parser(
@@ -695,9 +963,36 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--velocities",
         type=float,
         nargs="+",
-        default=DEFAULT_VELOCITIES_DEG,
+        default=None,
         metavar="DEG_S",
-        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72)",
+        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72; "
+        "--profile slow: 1 2 3 5 8 15 30)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=("standard", "slow"),
+        default="standard",
+        help="standard: full-range sweeps, Coulomb + viscous fit. slow: the "
+        "slow-motion calibration — 1-30°/s, the slow speeds in a low- and a "
+        "high-load window, fitted with the realtime core's own friction law "
+        "(sliding + load + Stribeck excess); --save stores all of it",
+    )
+    p.add_argument(
+        "--stribeck-gain",
+        type=float,
+        default=DEFAULT_STRIBECK_GAIN,
+        help="Share of the fitted low-speed excess the runtime cancels, saved "
+        f"with --profile slow (default {DEFAULT_STRIBECK_GAIN:g})",
+    )
+    p.add_argument(
+        "--fit-csv",
+        type=Path,
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help="Fit the slow-profile model to saved --raw-csv files (or "
+        "scripts/runs_to_friction_csv.py output) instead of sweeping — no "
+        "motors touched; --save still applies",
     )
     p.add_argument(
         "--lo",
@@ -784,7 +1079,26 @@ async def _run(args: argparse.Namespace) -> None:
                 label="friction CSV output",
             )
 
+    if args.velocities is None:
+        args.velocities = (
+            SLOW_VELOCITIES_DEG if args.profile == "slow" else DEFAULT_VELOCITIES_DEG
+        )
     velocities_rad = [math.radians(v) for v in args.velocities]
+
+    if args.fit_csv:
+        from ...tuning.friction_model import read_raw_csv
+
+        other_targets, _, _, _ = sweep_safety(joint, is_left)
+        data = read_raw_csv(args.fit_csv)
+        if str(data["joint"]) not in ("", joint.value):
+            raise SystemExit(f"--fit-csv holds {data['joint']}, not {joint.value}")
+        print(f"\nFitting {side_str} {joint.value} from {len(data['q'])} saved samples")
+        fit = fit_and_report(data, joint, is_left, other_targets)
+        if fit is not None and args.save:
+            save_slow_fit(fit, side_str, joint, args.stribeck_gain)
+        elif fit is not None:
+            print("\n  (re-run with --save to persist)")
+        return
 
     print(f"\nAxol friction identification — {side_str} {joint.value}")
     print(f"  Velocity sweep: {[round(v, 1) for v in args.velocities]} deg/s")
@@ -828,6 +1142,43 @@ async def _run(args: argparse.Namespace) -> None:
 
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
+
+            if args.profile == "slow":
+                lo, hi = arm_limits(joint, is_left)
+                lo = (
+                    math.radians(args.lo)
+                    if args.lo is not None
+                    else (lo_default if lo_default is not None else lo)
+                )
+                hi = (
+                    math.radians(args.hi)
+                    if args.hi is not None
+                    else (hi_default if hi_default is not None else hi)
+                )
+                lo, hi = lo + _SWEEP_MARGIN, hi - _SWEEP_MARGIN
+                load_fn = sweep_load(joint, is_left, other_targets)
+                print(
+                    f"  Slow profile: {len(velocities_rad)} speeds, about "
+                    f"{slow_profile_seconds(lo, hi, velocities_rad, load_fn) / 60:.0f} min"
+                )
+                rows = await _identify_slow(
+                    motors[joint],
+                    kp,
+                    kd,
+                    velocities_rad,
+                    lo,
+                    hi,
+                    load_fn,
+                    joint,
+                    is_left,
+                    args.raw_csv,
+                )
+                fit = fit_and_report(rows, joint, is_left, other_targets)
+                if fit is not None and args.save:
+                    save_slow_fit(fit, side_str, joint, args.stribeck_gain)
+                elif fit is not None:
+                    print("\n  (re-run with --save to persist)")
+                return
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],

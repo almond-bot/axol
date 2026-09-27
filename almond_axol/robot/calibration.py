@@ -75,7 +75,18 @@ FACTORY_CALIBRATION_PATH = Path.home() / ".almond" / "factory_calibration.json"
 _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
 _SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+# The low-speed friction curve ``tune.friction --profile slow`` fits (see
+# :mod:`almond_axol.tuning.friction_model`) and the share of it cancelled.
+_STRIBECK_FIELDS = (
+    "stribeck_gain",
+    "stribeck_dfs",
+    "stribeck_load_gain",
+    "stribeck_vs",
+    "stribeck_pole",
+)
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
+# Optional: load-proportional Coulomb friction (``FrictionParams.fl``).
+_FRICTION_OPTIONAL = ("fl",)
 # A cogging series longer than this is a fit gone wrong, not a motor.
 _COGGING_MAX_HARMONICS = 16
 
@@ -205,6 +216,10 @@ def load_calibration(
             if not isinstance(entry, dict):
                 continue
             clean: dict[str, Any] = {}
+            for field in _STRIBECK_FIELDS:
+                value = _coerce_float(entry.get(field))
+                if value is not None and math.isfinite(value) and value >= 0.0:
+                    clean[field] = value
             for field in _SCALAR_FIELDS:
                 value = _coerce_float(entry.get(field))
                 if value is not None:
@@ -252,6 +267,10 @@ def load_calibration(
             if isinstance(friction, dict):
                 fclean = {f: _coerce_float(friction.get(f)) for f in _FRICTION_FIELDS}
                 if all(v is not None for v in fclean.values()):
+                    for f in _FRICTION_OPTIONAL:
+                        extra = _coerce_float(friction.get(f))
+                        if extra is not None:
+                            fclean[f] = extra
                     clean["friction"] = fclean
                 elif any(v is not None for v in fclean.values()):
                     _logger.warning(
@@ -317,6 +336,7 @@ def update_joint_calibration(
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
     cogging: dict[str, Any] | None = None,
+    stribeck: dict[str, float] | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -326,7 +346,9 @@ def update_joint_calibration(
     damping band does not clobber a previously saved friction fit, and vice
     versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
     ``com`` is the link's fitted centre of mass (metres, URDF link frame);
-    ``cogging`` a position-periodic torque series (see the module docstring).
+    ``cogging`` a position-periodic torque series (see the module docstring);
+    ``friction`` may add ``fl``; ``stribeck`` carries any of the
+    ``stribeck_*`` fields (the low-speed friction curve and its gain).
     The document is scoped to ``hub_serial`` (auto-detected when omitted) and
     stale data for another robot is never merged into it. If an existing file
     is unscoped or belongs to another robot, it is preserved in a numbered
@@ -339,6 +361,10 @@ def update_joint_calibration(
         missing = [f for f in _FRICTION_FIELDS if f not in friction]
         if missing:
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
+    if stribeck is not None:
+        unknown = sorted(set(stribeck) - set(_STRIBECK_FIELDS))
+        if unknown:
+            raise ValueError(f"unknown stribeck fields: {', '.join(unknown)}")
     cogging_clean = None
     if cogging is not None:
         cogging_clean = clean_cogging(cogging)
@@ -414,7 +440,14 @@ def update_joint_calibration(
         if value is not None:
             entry[field] = float(value)
     if friction is not None:
-        entry["friction"] = {f: float(friction[f]) for f in _FRICTION_FIELDS}
+        entry["friction"] = {
+            f: float(friction[f])
+            for f in _FRICTION_FIELDS + _FRICTION_OPTIONAL
+            if f in friction
+        }
+    if stribeck is not None:
+        for field, value in stribeck.items():
+            entry[field] = float(value)
     if com is not None:
         if len(com) != 3:
             raise ValueError(f"com must have 3 components, got {len(com)}")
