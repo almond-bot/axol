@@ -2,6 +2,7 @@ import { useEffect, useState } from "react"
 import { AlertTriangle, CircleCheck, CircleOff, CircleX, Loader2, X } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
+import { MotorParamsPanel } from "@/components/diagnostics/motor-params"
 import { cn } from "@/lib/utils"
 import {
   JOINTS,
@@ -62,7 +63,7 @@ function Stat({ label, value, className }: { label: string; value: string; class
  * Per-motor status tiles for one arm: status (icon + label) plus labeled
  * temperature / bus voltage / position stats. A tile opens the full
  * `motor.info` readout (model, firmware, mode, gains) fetched over the idle
- * link.
+ * link and, for MyActuator motors, the configuration parameter editor.
  */
 export function MotorGrid({
   arm,
@@ -167,6 +168,9 @@ function MotorDetailsDialog({
 }) {
   const [details, setDetails] = useState<MotorDetails | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState<"details" | "params">("details")
+  const canEditParams = details?.type === "myactuator"
+  const showParams = canEditParams && tab === "params"
 
   useEffect(() => {
     let active = true
@@ -189,7 +193,13 @@ function MotorDetailsDialog({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
       onClick={onClose}
     >
-      <Card className="w-full max-w-sm gap-3 bg-[#1a1a1a] p-5" onClick={(e) => e.stopPropagation()}>
+      <Card
+        className={cn(
+          "max-h-[90vh] w-full gap-3 overflow-y-auto bg-[#1a1a1a] p-5",
+          showParams ? "max-w-5xl" : "max-w-sm"
+        )}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className="flex items-center gap-2">
           <span
             className="inline-block size-2.5 rounded-full"
@@ -208,7 +218,33 @@ function MotorDetailsDialog({
             <X />
           </Button>
         </div>
-        {error ? (
+        {canEditParams && (
+          <div role="tablist" className="flex gap-1 rounded-lg bg-white/[0.04] p-1">
+            {(
+              [
+                ["details", "Details"],
+                ["params", "Parameters"],
+              ] as const
+            ).map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                role="tab"
+                aria-selected={tab === key}
+                onClick={() => setTab(key)}
+                className={cn(
+                  "flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors",
+                  tab === key ? "bg-white/10 text-white" : "text-white/50 hover:text-white/80"
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+        {showParams ? (
+          <MotorParamsPanel arm={arm} joint={joint} />
+        ) : error ? (
           <p className="text-sm text-red-300">{error}</p>
         ) : !details ? (
           <div className="flex items-center gap-2 py-4 text-sm text-white/40">
