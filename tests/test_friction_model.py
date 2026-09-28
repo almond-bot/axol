@@ -4,6 +4,8 @@ windows, and the calibration-file round trip of what it saves."""
 from __future__ import annotations
 
 import csv
+import io
+from contextlib import redirect_stdout
 import json
 import math
 import tempfile
@@ -289,6 +291,44 @@ class SlowSessionTest(unittest.TestCase):
                     float(TRUE.halfdiff(np.array([v]), g)[0]),
                     delta=0.04,
                 )
+
+
+class ReportTest(unittest.TestCase):
+    def test_sweep_pose_rows_give_fo_and_the_excess_stays_slow(self) -> None:
+        from almond_axol.cli.tune.friction import fit_and_report, sweep_load
+        from almond_axol.constants import ARM_JOINTS, Joint
+        from almond_axol.robot.gravity import GravityCompensator
+        from almond_axol.tuning import sweep_safety
+
+        joint = Joint.SHOULDER_1
+        other, _, _, _ = sweep_safety(joint, False)
+        load = sweep_load(joint, False, other)
+        gc = GravityCompensator()
+        arm = np.zeros(7, dtype=np.float32)
+        for j, t in other.items():
+            arm[ARM_JOINTS.index(j)] = t
+        rows = {k: [] for k in ("speed", "direction", "q", "tau", "group", "load")}
+        # Friction that stays high to 15°/s and drops by 30°/s — the jelly
+        # shape that dragged a free vs out to 19°/s.
+        curve = {1: 1.3, 2: 1.3, 3: 1.28, 5: 1.3, 8: 1.33, 15: 1.2, 30: 0.82}
+        for gi, (deg, h) in enumerate(curve.items()):
+            v = math.radians(deg)
+            for d in (1, -1):
+                for q in np.radians(np.linspace(-40, 40, 400)):
+                    arm[0] = q
+                    g = float(gc.gravity_arm(arm, is_left=False)[0])
+                    rows["speed"].append(v)
+                    rows["direction"].append("+" if d > 0 else "-")
+                    rows["q"].append(q)
+                    rows["tau"].append(g + 0.1 + d * h)
+                    rows["group"].append(gi)
+                    rows["load"].append(load(q))
+        with redirect_stdout(io.StringIO()):
+            fit = fit_and_report(rows, joint, False, other)
+        self.assertIsNotNone(fit)
+        self.assertAlmostEqual(fit.fo, 0.1, delta=0.01)
+        self.assertLessEqual(fit.vs, 0.1 + 1e-9)
+        self.assertGreater(fit.fc, 0.2)
 
 
 class CalibrationTest(unittest.TestCase):

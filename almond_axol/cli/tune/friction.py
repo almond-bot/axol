@@ -860,7 +860,18 @@ def fit_and_report(
 
     load_fn = sweep_load(joint, is_left, other_targets)
     loads = np.asarray(rows["load"], dtype=float)
+    qs = np.asarray(rows["q"], dtype=float)
+    # A row with a load that is not the sweep pose's (a tune.motion run, via
+    # scripts/runs_to_friction_csv.py) was taken elsewhere: it informs the
+    # friction curve but not fo. A slow-profile sweep records its own
+    # sweep-pose load, which matches.
     own = np.isfinite(loads)
+    at_pose = own.copy()
+    if own.any():
+        check = np.where(own)[0]
+        ref_load = np.array([load_fn(float(q)) for q in qs[check]])
+        at_pose[check] = np.abs(ref_load - loads[check]) < 0.05
+    own = own & ~at_pose
     gc = GravityCompensator()
     test_idx = ARM_JOINTS.index(joint)
     arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
@@ -888,7 +899,7 @@ def fit_and_report(
     # and gives fo); rows with their own load came from elsewhere and only
     # inform the friction curve.
     sweep_samples = pick(~own, load_fn)
-    samples = sweep_samples + pick(own, loads[own])
+    samples = sweep_samples + (pick(own, loads[own]) if own.any() else [])
     try:
         fit = fit_friction(samples)
     except ValueError as exc:

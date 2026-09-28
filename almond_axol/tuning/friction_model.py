@@ -40,6 +40,13 @@ import numpy as np
 K_MAX = 100.0
 #: The runtime Stribeck term's zero-crossing speed (``STRIBECK_V0``, rad/s).
 STRIBECK_V0 = 0.02
+#: Upper bound on the fitted Stribeck speed ``vs`` (rad/s, 5.7°/s). The
+#: excess is a *low-speed* effect, and the runtime applies it on measured
+#: velocity with a sharp ``tanh(v/0.02)``: left free, jelly right
+#: shoulder_1's slow sweep (whose friction also falls from 15 to 30°/s) put
+#: the whole curve into it — vs 19°/s, Coulomb 0 — which would flip ±0.7 Nm
+#: with the velocity noise of a joint at rest.
+VS_MAX = 0.1
 #: Angle grid the forward and backward passes are matched on (rad).
 GRID_RAD = math.radians(0.5)
 
@@ -181,6 +188,7 @@ def fit_friction(
     gravity_residual: Callable[[Sample], float] | None = None,
     fit_load: bool = True,
     fit_k: bool = False,
+    vs_max: float = VS_MAX,
 ) -> FrictionFit:
     """Least-squares fit of the runtime curve to matched samples.
 
@@ -227,11 +235,11 @@ def fit_friction(
         20.0,
         20.0,
         1.0 if use_load else 1e-9,
-        math.log(1.0),
+        math.log(vs_max),
     ]
     scale = float(np.median(np.abs(h))) or 0.1
     best = None
-    for vs0 in (0.03, 0.08, 0.2):
+    for vs0 in (0.02, 0.05, 0.09):
         x0 = [scale, 0.0, K_MAX, 0.0, 0.3 * scale, 0.0, math.log(vs0)]
         x0 = np.clip(x0, lo, hi)
         res = least_squares(
