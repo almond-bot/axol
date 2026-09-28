@@ -216,6 +216,7 @@ class TipDamper:
     estimator: VerticalVelocity = field(default_factory=VerticalVelocity)
     encoder: EncoderVelocity = field(default_factory=EncoderVelocity)
     tripped: bool = field(default=False, init=False)
+    _started: float | None = field(default=None, init=False)
     _fast_since: float | None = field(default=None, init=False)
     _last_sample: float | None = field(default=None, init=False)
     _ramp_from: float | None = field(default=None, init=False)
@@ -230,6 +231,7 @@ class TipDamper:
         self.encoder.reset()
         self._last_sample = None
         self._ramp_from = now
+        self._started = now
         self.tripped = False
         self._fast_since = None
 
@@ -247,7 +249,11 @@ class TipDamper:
         """Joint torques (7,) for this tick. ``jac_z[i]`` = ∂(tool height)/∂q_i
         (m/rad) at the measured pose."""
         tau = np.zeros(7)
-        if abs(self.flex) > self.trip_speed:
+        started = self._started is not None and now - self._started >= self.ramp_s
+        # The guard waits out the ramp-in: the filters' start-up transient
+        # (larger with a lower band edge) is not a runaway, and the torque is
+        # ramped down meanwhile anyway.
+        if started and abs(self.flex) > self.trip_speed:
             if self._fast_since is None:
                 self._fast_since = now
             elif now - self._fast_since > self.trip_s:
