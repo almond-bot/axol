@@ -5,6 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { EpisodeControlSpec, PolicyState } from "@/lib/supervisor"
 import { EpisodeControls } from "./operation-panel"
 
+// operation-panel's camera feeds import the workspace
+// @almond/axol-vr-client package, which CI runs these tests before building;
+// the episode box doesn't use them.
+vi.mock("@/components/camera-feeds", () => ({ CameraFeeds: () => null }))
+
 // Lets React's act() flush updates outside a test renderer.
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
