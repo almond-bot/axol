@@ -590,7 +590,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=0.0,
         metavar="C",
         help="Damp the tool's vertical shake from the wrist IMU: a force of "
-        "-C x the IMU's band vertical velocity (N·s/m) at the tool, applied "
+        "-C x the flex velocity (N·s/m) — the IMU's band vertical velocity "
+        "less what the joint encoders account for — at the tool, applied "
         "through --imu-damp-joint by the measured-pose Jacobian (see "
         "almond_axol.tuning.imu_damping). Start at 5; the simulation damped "
         "a hidden 2 Hz mode 31/44/52%% at 5/10/20 and diverged by 80. The "
@@ -868,11 +869,17 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+def _height(solver: Any, q_full: np.ndarray, side: str) -> float:
+    """The gripper mount's height (m) at ``q_full``."""
+    left, right = solver.ee_positions(np.asarray(q_full, dtype=np.float32)[None])
+    return float((left if side == "left" else right)[0, 2])
+
+
 def _height_jacobian(
     solver: Any, q_full: np.ndarray, side: str, columns: tuple[int, ...]
-) -> np.ndarray:
-    """∂(gripper-mount height)/∂q for the arm's 7 joints (m/rad; zero outside
-    ``columns``), by central differences at ``q_full``."""
+) -> tuple[float, np.ndarray]:
+    """The gripper mount's height (m) at ``q_full`` and ∂height/∂q for the
+    arm's 7 joints (m/rad; zero outside ``columns``, central differences)."""
     h = 1e-3
     idx = solver.left_indices if side == "left" else solver.right_indices
     rows = [q_full]
@@ -886,7 +893,7 @@ def _height_jacobian(
     jac = np.zeros(7)
     for n, c in enumerate(columns):
         jac[c] = (z[1 + 2 * n] - z[2 + 2 * n]) / (2 * h)
-    return jac
+    return float(z[0]), jac
 
 
 def _clear_extra_torque(axol: Any) -> None:
@@ -1281,17 +1288,20 @@ async def _run(args: argparse.Namespace) -> None:
                 arm = axol.left if side == "left" else axol.right
                 if arm is None:
                     continue
+                q_meas = snapshot(axol)
                 if k % _JAC_EVERY == 0 or side not in jac:
-                    jac[side] = _height_jacobian(
-                        solver, snapshot(axol), side, d.columns
+                    height, jac[side] = _height_jacobian(
+                        solver, q_meas, side, d.columns
                     )
+                else:
+                    height = _height(solver, q_meas, side)
+                now = time.perf_counter()
+                d.feed_height(now, height)
                 d.feed(imu.poll(side))
-                tau = d.torque(time.perf_counter(), jac[side])
+                tau = d.torque(now, jac[side])
                 arm.extra_torque = tau
                 if record:
-                    log_damp.append(
-                        np.concatenate([[d.estimator.value, float(d.tripped)], tau])
-                    )
+                    log_damp.append(np.concatenate([[d.flex, float(d.tripped)], tau]))
             await axol.motion_control(
                 left=left if axol.left is not None else None,
                 right=right if axol.right is not None else None,
@@ -1345,7 +1355,7 @@ async def _run(args: argparse.Namespace) -> None:
         for side, d in active.items():
             if d.tripped:
                 print(
-                    f"  ! IMU damping ({side}) switched itself off: the band "
+                    f"  ! IMU damping ({side}) switched itself off: the flex "
                     f"velocity passed {d.trip_speed * 1e3:.0f} mm/s for "
                     f"{d.trip_s:g} s — lower --imu-damp"
                 )

@@ -9,7 +9,12 @@ import unittest
 import numpy as np
 from scipy.signal import butter, sosfilt
 
-from almond_axol.tuning.imu_damping import G, TipDamper, VerticalVelocity
+from almond_axol.tuning.imu_damping import (
+    G,
+    EncoderVelocity,
+    TipDamper,
+    VerticalVelocity,
+)
 
 
 def _structure(
@@ -109,6 +114,57 @@ class DamperTest(unittest.TestCase):
             acc_z = -0.001 * (2 * math.pi * 2) ** 2 * math.sin(2 * math.pi * 2 * t)
             out.append(est.update(t, np.array([0.0, 0.0, G + acc_z])))
         self.assertGreater(np.abs(out[int(5 * fs) :]).max(), 0.009)
+
+
+class FlexTest(unittest.TestCase):
+    def test_motion_the_encoders_see_is_not_flex(self) -> None:
+        # The tool follows a 0.8 Hz, 20 mm deliberate move plus a 3 Hz, 1 mm
+        # servo wobble — all visible to the encoders: the flex stays near 0
+        # while the IMU velocity alone would not.
+        # This IMU has no latency, so the encoder path is not delayed.
+        d = TipDamper(
+            gain=10.0,
+            columns=(0,),
+            trip_speed=10.0,
+            encoder=EncoderVelocity(delay_s=0.0),
+        )
+        d.start(0.0)
+        imu_v, flex = [], []
+        for i in range(int(20 * 240)):
+            t = i / 240.0
+            z = 0.02 * math.sin(2 * math.pi * 0.8 * t) + 0.001 * math.sin(
+                2 * math.pi * 3 * t
+            )
+            acc = -0.02 * (2 * math.pi * 0.8) ** 2 * math.sin(
+                2 * math.pi * 0.8 * t
+            ) - 0.001 * (2 * math.pi * 3) ** 2 * math.sin(2 * math.pi * 3 * t)
+            if i % 6 < 5:  # ~200 Hz IMU
+                d.feed(np.array([[t, 0.0, 0.0, G + acc, 0.0, 0.0, 0.0]]))
+            d.feed_height(t, z)
+            if i > 5 * 240:
+                imu_v.append(d.estimator.value)
+                flex.append(d.flex)
+        self.assertGreater(np.std(imu_v), 0.01)
+        self.assertLess(np.std(flex), 0.2 * np.std(imu_v))
+
+    def test_gyro_keeps_a_rotating_camera_from_reading_as_shake(self) -> None:
+        # A camera turning at 100°/s about a horizontal axis, not translating:
+        # the accelerometer sees gravity swing through its axes.
+        rate = math.radians(100.0)
+        fs = 200.0
+        results = {}
+        for use_gyro in (False, True):
+            est = VerticalVelocity()
+            out = []
+            for i in range(int(6 * fs)):
+                t = i / fs
+                th = 0.5 * math.sin(rate / 0.5 * t)  # swings ±29° at up to 100°/s
+                w = rate * math.cos(rate / 0.5 * t)
+                acc = G * np.array([math.sin(th), 0.0, math.cos(th)])
+                gyro = np.array([0.0, -math.degrees(w), 0.0])
+                out.append(est.update(t, acc, gyro if use_gyro else None))
+            results[use_gyro] = float(np.std(out[int(2 * fs) :]))
+        self.assertLess(results[True], 0.3 * results[False])
 
 
 if __name__ == "__main__":
