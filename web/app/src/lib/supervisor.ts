@@ -708,6 +708,8 @@ export interface PolicyState {
   /** 1-based number of the episode being recorded next/now, when the op
    *  tracks a dataset episode index (mirrors the headset HUD readout). */
   episode?: number
+  /** The dataset this session records into (the dataset preview follows it). */
+  dataset?: { repoId: string; root: string }
 }
 
 export interface OpStatus {
@@ -782,6 +784,73 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** Where one camera's frames for an episode sit inside its mp4 (seconds). */
+export interface EpisodeVideoSpan {
+  from: number
+  to: number
+}
+
+/** One saved episode, as the dataset preview lists it. */
+export interface DatasetEpisode {
+  /** LeRobot's 0-based episode_index. */
+  index: number
+  length: number
+  durationS: number
+  tasks: string[]
+  /** Keyed by camera feature (e.g. observation.images.overhead). */
+  videos: Record<string, EpisodeVideoSpan>
+}
+
+export interface DatasetEpisodes {
+  repoId: string
+  root: string
+  fps: number
+  cameras: string[]
+  /** Every task string in the dataset, in task_index order. */
+  tasks: string[]
+  episodes: DatasetEpisode[]
+  /** meta/episodes files that could not be read (a save in progress). */
+  unreadableFiles: number
+}
+
+/** A dataset's saved episodes (includes a live session's, once saved). */
+export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpisodes> {
+  const q = new URLSearchParams({ repo_id: repoId })
+  return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
+}
+
+/**
+ * URL of the mp4 holding one camera's frames for an episode. The file can
+ * hold other episodes too, so the player seeks within the listing's span; the
+ * media fragment makes the browser start and stop there by itself.
+ */
+export function datasetVideoUrl(
+  repoId: string,
+  episode: number,
+  camera: string,
+  span?: EpisodeVideoSpan
+): string {
+  const q = new URLSearchParams({ repo_id: repoId, episode: String(episode), camera })
+  const fragment = span ? `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}` : ""
+  return apiUrl(`/api/datasets/video?${q}${fragment}`)
+}
+
+/** Rename a saved episode's task (409 while a save holds the dataset). */
+export async function setEpisodeTask(
+  repoId: string,
+  episode: number,
+  task: string
+): Promise<DatasetEpisode> {
+  const res: { episode: DatasetEpisode } = await json(
+    await fetch(apiUrl(`/api/datasets/episodes/${episode}/task`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoId, task }),
+    })
+  )
+  return res.episode
 }
 
 /** One row of a per-run field's server-side pick list. */
