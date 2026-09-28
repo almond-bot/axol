@@ -2805,6 +2805,12 @@ def _run_session(
             # sustained yank. The episode is saved/discarded on this thread
             # in parallel; on a save the headset stays in SAVING (controls
             # blocked) until the write completes.
+            #
+            # The grips are blocked for the whole stretch: once the arms are
+            # home nothing streams the tracking target until the next episode
+            # loop, so a squeeze mid-save would engage invisibly and the arms
+            # would then jump to the controller the moment the save finished.
+            teleop.block_engage()
             home_future = asyncio.run_coroutine_threadsafe(
                 _return_home_loop(), robot.event_loop
             )
@@ -2822,6 +2828,8 @@ def _run_session(
                 loop_stop.set()
                 _drain_robot_future(home_future)
                 raise
+            finally:
+                teleop.unblock_engage()
             # Drain VR events fired during the return, then unblock the
             # headset for the next take.
             teleop.get_teleop_events()
