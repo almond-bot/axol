@@ -613,6 +613,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Per-joint clamp on the IMU damping torque (default 0.5 Nm)",
     )
     p.add_argument(
+        "--imu-damp-hp",
+        type=float,
+        default=1.0,
+        metavar="HZ",
+        help="Low edge of the damped band (default 1.0). The high-pass leads "
+        "by 90° at its own corner, so below ~2× this the force is more spring "
+        "than damper; 0.5 halves the lead at 2 Hz and lets ~4 mm/s of the "
+        "commanded motion through on slow_osc",
+    )
+    p.add_argument(
         "--imu-damp-alternate",
         action="store_true",
         help="IMU damping on every second pass only (passes 2, 4, ...), for "
@@ -834,7 +844,7 @@ _JAC_EVERY = 4
 
 def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
     """One :class:`TipDamper` per driven side, or none (``--imu-damp 0``)."""
-    from ...tuning.imu_damping import TipDamper
+    from ...tuning.imu_damping import EncoderVelocity, TipDamper, VerticalVelocity
 
     if args.imu_damp <= 0:
         return {}
@@ -858,12 +868,16 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 cols.append(names.index(joint))
         if cols:
             out[side] = TipDamper(
-                gain=args.imu_damp, columns=tuple(cols), max_torque=args.imu_damp_max
+                gain=args.imu_damp,
+                columns=tuple(cols),
+                max_torque=args.imu_damp_max,
+                estimator=VerticalVelocity(hp_hz=args.imu_damp_hp),
+                encoder=EncoderVelocity(hp_hz=args.imu_damp_hp),
             )
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
                 + ", ".join(names[c] for c in cols)
-                + f" (clamp {args.imu_damp_max:g} Nm"
+                + f" (clamp {args.imu_damp_max:g} Nm, band from {args.imu_damp_hp:g} Hz"
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
     return out
