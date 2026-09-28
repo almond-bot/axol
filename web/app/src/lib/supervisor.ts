@@ -826,20 +826,42 @@ export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpiso
   return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
 }
 
+/** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
+ *  `dataset_browser.preview_step`; 1 = every frame). */
+export function previewStep(datasetFps: number, previewFps: number): number {
+  if (previewFps <= 0 || datasetFps <= 0) return 1
+  return Math.max(1, Math.round(datasetFps / previewFps))
+}
+
+/** Where a player finds one camera's episode: the URL and its span in it. */
+export interface EpisodeVideoSource {
+  url: string
+  span: EpisodeVideoSpan
+}
+
 /**
- * URL of the mp4 holding one camera's frames for an episode. The file can
- * hold other episodes too, so the player seeks within the listing's span; the
- * media fragment makes the browser start and stop there by itself.
+ * One camera's episode video, as the host's player cut: just the episode
+ * (starting at 0), with the mp4's index first so it plays before it has
+ * downloaded, keeping every Nth frame for a `previewFps` below the dataset's
+ * (0 = every frame). The media fragment makes the browser stop at the end.
  */
-export function datasetVideoUrl(
+export function episodeVideoSource(
   repoId: string,
-  episode: number,
+  episode: DatasetEpisode,
   camera: string,
-  span?: EpisodeVideoSpan
-): string {
-  const q = new URLSearchParams({ repo_id: repoId, episode: String(episode), camera })
-  const fragment = span ? `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}` : ""
-  return apiUrl(`/api/datasets/video?${q}${fragment}`)
+  datasetFps: number,
+  previewFps = 0
+): EpisodeVideoSource {
+  const original = episode.videos[camera]
+  const span = { from: 0, to: original.to - original.from }
+  const q = new URLSearchParams({
+    repo_id: repoId,
+    episode: String(episode.index),
+    camera,
+    fps: String(previewFps > 0 ? previewFps : datasetFps || 1),
+  })
+  const fragment = `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}`
+  return { url: apiUrl(`/api/datasets/video?${q}${fragment}`), span }
 }
 
 /** Rename a saved episode's task (409 while a save holds the dataset). */

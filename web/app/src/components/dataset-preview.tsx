@@ -3,9 +3,10 @@ import { Loader2, Pause, Play, RefreshCw } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   ApiRequestError,
-  datasetVideoUrl,
+  episodeVideoSource,
   fetchDatasetEpisodes,
   fetchDatasets,
+  previewStep,
   setEpisodeTask,
   type DatasetEpisode,
   type DatasetEpisodes,
@@ -19,6 +20,31 @@ import { Select, SelectOption } from "@/components/ui/select"
 import { useToast } from "@/components/ui/toast"
 
 const OPEN_KEY = "datasetPreviewOpen"
+const PREVIEW_FPS_KEY = "datasetPreviewFps"
+
+/** Preview rates offered (0 = the recorded file). Axol's all-intra cameras
+ *  are ~21 Mbps each at 60 fps; four of them outrun most links, so the
+ *  default is the light cut (every 4th frame of a 60 fps dataset). */
+const PREVIEW_FPS_CHOICES = [15, 30, 0]
+const DEFAULT_PREVIEW_FPS = 15
+
+function readPreviewFps(): number {
+  try {
+    const stored = localStorage.getItem(PREVIEW_FPS_KEY)
+    const fps = stored === null ? NaN : Number(stored)
+    return PREVIEW_FPS_CHOICES.includes(fps) ? fps : DEFAULT_PREVIEW_FPS
+  } catch {
+    return DEFAULT_PREVIEW_FPS
+  }
+}
+
+function writePreviewFps(fps: number) {
+  try {
+    localStorage.setItem(PREVIEW_FPS_KEY, String(fps))
+  } catch {
+    // Blocked storage: the default applies next time.
+  }
+}
 
 function readOpen(): boolean {
   try {
@@ -79,6 +105,7 @@ export function DatasetPreview({
   const [settledKey, setSettledKey] = useState<string | null>(null)
   const [chosenEpisode, setChosenEpisode] = useState<number | null>(null)
   const [reloadNonce, setReloadNonce] = useState(0)
+  const [previewFps, setPreviewFps] = useState(readPreviewFps)
 
   // A live dataset is listed under the scanned root's repo id, which differs
   // from the session's own repo id when it records outside that root.
@@ -244,10 +271,16 @@ export function DatasetPreview({
               />
               <div className="flex min-w-0 flex-col gap-4">
                 <EpisodePlayer
-                  key={`${shown.repoId}:${episode.index}`}
+                  key={`${shown.repoId}:${episode.index}:${previewFps}`}
                   repoId={shown.repoId}
                   episode={episode}
                   cameras={shown.cameras}
+                  datasetFps={shown.fps}
+                  previewFps={previewFps}
+                  onPreviewFps={(fps) => {
+                    writePreviewFps(fps)
+                    setPreviewFps(fps)
+                  }}
                 />
                 <TaskEditor
                   key={`${shown.repoId}:${episode.index}:${episode.tasks.join("\n")}`}
@@ -300,31 +333,79 @@ function EpisodeList({
   )
 }
 
+// HTMLMediaElement.HAVE_FUTURE_DATA: enough buffered to advance playback.
+const HAVE_FUTURE_DATA = 3
+// A camera further than this from the clock is re-seeked (a few preview frames).
+const DRIFT_S = 0.25
+
 /**
  * Every camera of one episode, played in lockstep from a shared transport.
- * Each video element seeks within its own span of the (possibly shared) mp4;
- * the first camera is the clock and the others are nudged back when they
- * drift more than a frame or two.
+ * Each video element plays its own span of its source (a shared mp4 or the
+ * host's preview cut); the first camera is the clock. When any camera runs
+ * out of data or drifts, every camera pauses until they are all buffered and
+ * aligned, then all resume — instead of re-seeking the laggard every frame,
+ * which restarts its download and keeps it behind on a slow link.
  */
 function EpisodePlayer({
   repoId,
   episode,
   cameras,
+  datasetFps,
+  previewFps,
+  onPreviewFps,
 }: {
   repoId: string
   episode: DatasetEpisode
   cameras: string[]
+  datasetFps: number
+  previewFps: number
+  onPreviewFps: (fps: number) => void
 }) {
   const keys = useMemo(() => cameras.filter((k) => episode.videos[k]), [cameras, episode])
+  const sources = useMemo(
+    () =>
+      new Map(keys.map((k) => [k, episodeVideoSource(repoId, episode, k, datasetFps, previewFps)])),
+    [keys, repoId, episode, datasetFps, previewFps]
+  )
   const videos = useRef(new Map<string, HTMLVideoElement>())
+  // One stable ref callback per camera (a new function each render would
+  // detach and re-attach — and so release — the element on every render).
+  const videoRefs = useMemo(
+    () =>
+      new Map(
+        keys.map((key) => [
+          key,
+          (el: HTMLVideoElement | null) => {
+            if (!el) return
+            videos.current.set(key, el)
+            // Leaving an episode (or the card) must stop its download: a
+            // removed <video> keeps loading until its src is cleared, and on a
+            // slow link the abandoned episode's streams (and the browser's six
+            // connections per host) starve the next one.
+            return () => {
+              videos.current.delete(key)
+              el.pause()
+              el.removeAttribute("src")
+              el.load()
+            }
+          },
+        ])
+      ),
+    [keys]
+  )
   const [playing, setPlaying] = useState(false)
+  const [buffering, setBuffering] = useState(false)
   const [time, setTime] = useState(0)
   const duration = episode.durationS
+  const choices = PREVIEW_FPS_CHOICES.filter(
+    (fps) => fps === 0 || previewStep(datasetFps, fps) >= 2
+  )
 
   function each(fn: (video: HTMLVideoElement, from: number) => void) {
     for (const key of keys) {
       const video = videos.current.get(key)
-      if (video) fn(video, episode.videos[key].from)
+      const source = sources.get(key)
+      if (video && source) fn(video, source.span.from)
     }
   }
 
@@ -350,32 +431,58 @@ function EpisodePlayer({
   }
 
   // While playing, follow the clock camera: stop at the episode's end (the
-  // file may continue into the next episode) and keep the others aligned.
+  // file may continue into the next episode); hold everything while a camera
+  // buffers or realigns.
   useEffect(() => {
     if (!playing || keys.length === 0) return
     let frame = 0
+    let held = false
     const tick = () => {
-      const master = videos.current.get(keys[0])
+      const all = keys.flatMap((key) => {
+        const video = videos.current.get(key)
+        const source = sources.get(key)
+        return video && source ? [{ video, from: source.span.from }] : []
+      })
+      const master = all[0]
       if (master) {
-        const t = master.currentTime - episode.videos[keys[0]].from
-        if (t >= duration || master.ended) {
-          for (const key of keys) videos.current.get(key)?.pause()
+        const t = master.video.currentTime - master.from
+        if (t >= duration || master.video.ended) {
+          for (const { video } of all) video.pause()
           setPlaying(false)
+          setBuffering(false)
           setTime(duration)
           return
         }
-        for (const key of keys.slice(1)) {
-          const video = videos.current.get(key)
-          const target = episode.videos[key].from + t
-          if (video && Math.abs(video.currentTime - target) > 0.08) video.currentTime = target
+        const drifted = all
+          .slice(1)
+          .filter(
+            ({ video, from }) => !video.seeking && Math.abs(video.currentTime - from - t) > DRIFT_S
+          )
+        const starved = all.some(
+          ({ video }) => video.seeking || video.readyState < HAVE_FUTURE_DATA
+        )
+        if (starved || drifted.length > 0) {
+          if (!held) {
+            held = true
+            for (const { video } of all) video.pause()
+            setBuffering(true)
+          }
+          for (const { video, from } of drifted) video.currentTime = from + t
+        } else if (held) {
+          held = false
+          for (const { video } of all) void video.play().catch(() => undefined)
+          setBuffering(false)
         }
         setTime(Math.max(0, t))
       }
       frame = requestAnimationFrame(tick)
     }
     frame = requestAnimationFrame(tick)
-    return () => cancelAnimationFrame(frame)
-  }, [playing, keys, duration, episode])
+    return () => {
+      cancelAnimationFrame(frame)
+      setBuffering(false)
+    }
+  }, [playing, keys, sources, duration])
 
   if (keys.length === 0) {
     return <p className="text-sm text-white/45">This episode has no video.</p>
@@ -390,25 +497,27 @@ function EpisodePlayer({
           keys.length >= 3 && "xl:grid-cols-3"
         )}
       >
-        {keys.map((key) => (
-          <figure key={key} className="flex min-w-0 flex-col gap-1">
-            <video
-              ref={(el) => {
-                if (el) videos.current.set(key, el)
-                else videos.current.delete(key)
-              }}
-              src={datasetVideoUrl(repoId, episode.index, key, episode.videos[key])}
-              muted
-              playsInline
-              preload="metadata"
-              onLoadedMetadata={(e) => {
-                e.currentTarget.currentTime = episode.videos[key].from + time
-              }}
-              className="aspect-video w-full rounded-lg border border-white/10 bg-black object-contain"
-            />
-            <figcaption className="font-mono text-xs text-white/45">{cameraLabel(key)}</figcaption>
-          </figure>
-        ))}
+        {keys.map((key) => {
+          const source = sources.get(key)!
+          return (
+            <figure key={key} className="flex min-w-0 flex-col gap-1">
+              <video
+                ref={videoRefs.get(key)}
+                src={source.url}
+                muted
+                playsInline
+                preload="auto"
+                onLoadedMetadata={(e) => {
+                  e.currentTarget.currentTime = source.span.from + time
+                }}
+                className="aspect-video w-full rounded-lg border border-white/10 bg-black object-contain"
+              />
+              <figcaption className="font-mono text-xs text-white/45">
+                {cameraLabel(key)}
+              </figcaption>
+            </figure>
+          )
+        })}
       </div>
       <div className="flex items-center gap-3">
         <Button
@@ -426,12 +535,35 @@ function EpisodePlayer({
           step={0.01}
           value={time}
           onChange={(e) => seek(Number(e.target.value))}
-          className="flex-1 accent-[#eff483]"
+          className="min-w-0 flex-1 accent-[#eff483]"
           aria-label="Episode time"
         />
         <span className="w-24 text-right font-mono text-xs text-white/55">
-          {time.toFixed(1)} / {duration.toFixed(1)} s
+          {buffering ? (
+            <span className="inline-flex items-center gap-1">
+              <Loader2 className="size-3 animate-spin" /> buffering
+            </span>
+          ) : (
+            `${time.toFixed(1)} / ${duration.toFixed(1)} s`
+          )}
         </span>
+        {choices.length > 1 && (
+          <Select
+            value={String(choices.includes(previewFps) ? previewFps : 0)}
+            onChange={(e) => onPreviewFps(Number(e.target.value))}
+            className="h-8 w-32 shrink-0"
+            aria-label="Preview quality"
+            title="Lighter previews keep every Nth frame, so they load over slow links"
+          >
+            {choices.map((fps) => (
+              <SelectOption
+                key={fps}
+                value={String(fps)}
+                label={fps === 0 ? `Full ${datasetFps} fps` : `${fps} fps`}
+              />
+            ))}
+          </Select>
+        )}
       </div>
     </div>
   )

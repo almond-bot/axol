@@ -34,10 +34,14 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -59,6 +63,10 @@ _DEFAULT_VIDEO_PATH = (
 
 class DatasetBrowseError(Exception):
     """A request the dataset cannot answer (bad id, missing episode, …)."""
+
+
+class PreviewError(DatasetBrowseError):
+    """Cutting a preview rendition failed (the original file still plays)."""
 
 
 class DatasetBusyError(DatasetBrowseError):
@@ -309,6 +317,112 @@ def episode_video(
     raise DatasetBrowseError(f"episode {episode_index} has no {camera!r} video")
 
 
+# Lighter preview renditions (see ``preview_remux``), cached across requests.
+PREVIEW_CACHE_BYTES = 2 * 1024**3
+_PREVIEW_TIMEOUT_S = 300.0
+_preview_locks: dict[str, threading.Lock] = {}
+_preview_locks_guard = threading.Lock()
+
+
+def preview_step(dataset_fps: int, preview_fps: int) -> int:
+    """Keep every Nth frame for ``preview_fps`` (1 = every frame).
+
+    The panel computes the same rounding for its quality choices.
+    """
+    if preview_fps <= 0 or dataset_fps <= 0:
+        return 1
+    return max(1, round(dataset_fps / preview_fps))
+
+
+def preview_cache_dir() -> Path:
+    cache = os.environ.get("XDG_CACHE_HOME") or "~/.cache"
+    return Path(cache).expanduser() / "axol" / "dataset-preview"
+
+
+def _prune_preview_cache(cache: Path, keep: Path, budget: int) -> None:
+    """Drop the least recently served previews once the cache exceeds ``budget``."""
+    entries = []
+    for path in cache.glob("*.mp4"):
+        with contextlib.suppress(OSError):
+            st = path.stat()
+            entries.append((st.st_mtime, st.st_size, path))
+    total = sum(size for _, size, _ in entries)
+    for _, size, path in sorted(entries):
+        if total <= budget:
+            break
+        if path == keep:
+            continue
+        with contextlib.suppress(OSError):
+            path.unlink()
+            total -= size
+
+
+def episode_preview(
+    root: Path,
+    episode_index: int,
+    camera: str,
+    preview_fps: int,
+    *,
+    cache_dir: Path | None = None,
+) -> Path:
+    """A cached, quick-starting mp4 of one camera's episode.
+
+    The file holds only the episode's span, starting at 0, with its index
+    first, keeping every ``preview_step``-th frame (every frame when the
+    dataset records at or below ``preview_fps``, or when the source has
+    predicted frames and cannot be decimated by copying). Cut in a
+    low-priority child process (``preview_remux``), keyed on the source's
+    path, size and mtime, so a re-encoded or replaced file is cut again.
+    """
+    info = _load_info(root)
+    step = preview_step(int(info.get("fps") or 0), preview_fps)
+    src, video = episode_video(root, episode_index, camera)
+    st = src.stat()
+    key = hashlib.sha256(
+        f"{src}|{st.st_size}|{st.st_mtime_ns}|{video.from_timestamp!r}|"
+        f"{video.to_timestamp!r}|{step}".encode()
+    ).hexdigest()[:32]
+    cache = cache_dir if cache_dir is not None else preview_cache_dir()
+    target = cache / f"{key}.mp4"
+    with _preview_locks_guard:
+        lock = _preview_locks.setdefault(key, threading.Lock())
+    with lock:
+        if target.is_file():
+            with contextlib.suppress(OSError):
+                os.utime(target)  # most recently served
+            return target
+        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, tmp = tempfile.mkstemp(dir=cache, prefix=".preview.", suffix=".mp4")
+        os.close(fd)
+        try:
+            done = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "almond_axol.recording.preview_remux",
+                    str(src),
+                    tmp,
+                    repr(video.from_timestamp),
+                    repr(video.to_timestamp),
+                    str(step),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_PREVIEW_TIMEOUT_S,
+            )
+            if done.returncode != 0:
+                detail = (done.stderr.strip().splitlines() or ["no output"])[-1]
+                raise PreviewError(f"could not cut the preview: {detail}")
+            os.replace(tmp, target)
+        except subprocess.TimeoutExpired as exc:
+            raise PreviewError("cutting the preview timed out") from exc
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    _prune_preview_cache(cache, target, PREVIEW_CACHE_BYTES)
+    return target
+
+
 def _find_episode_row(root: Path, episode_index: int) -> tuple[Path, int]:
     """The ``meta/episodes`` file holding an episode and the row within it."""
     import pyarrow.parquet as pq
@@ -488,8 +602,11 @@ __all__ = [
     "EpisodeSummary",
     "EpisodeVideo",
     "MAX_TASK_LENGTH",
+    "PreviewError",
     "METADATA_LOCK_FILENAME",
     "dataset_metadata_lock",
+    "preview_step",
+    "episode_preview",
     "episode_video",
     "read_episodes",
     "reload_tasks_from_disk",

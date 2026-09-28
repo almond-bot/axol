@@ -313,7 +313,9 @@ def test_episode_controls_name_their_dataset(tmp_path: Path) -> None:
         }
 
 
-def test_preview_api_lists_streams_and_renames(tmp_path: Path) -> None:
+def test_preview_api_lists_streams_and_renames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import asyncio
 
     import httpx
@@ -326,6 +328,7 @@ def test_preview_api_lists_streams_and_renames(tmp_path: Path) -> None:
     )
 
     root = _make_dataset(tmp_path, "org/ds", ["pick", "place"], shared=True)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
     app = _test_app(_Manager(), _Runner(), settings=_Settings(str(tmp_path)))
 
     async def exercise() -> None:
@@ -350,6 +353,15 @@ def test_preview_api_lists_streams_and_renames(tmp_path: Path) -> None:
             assert video.headers["content-type"] == "video/mp4"
             assert video.content == b"\x00m"
 
+            # The player's cut: the fixture's placeholder bytes aren't an mp4,
+            # so cutting fails — reported as the host's fault, not a 404.
+            cut = await client.get(
+                "/api/datasets/video",
+                params={"repo_id": "org/ds", "episode": 1, "camera": CAM, "fps": 5},
+            )
+            assert cut.status_code == 500
+            assert "could not cut the preview" in cut.json()["error"]
+
             renamed = await client.put(
                 "/api/datasets/episodes/1/task",
                 json={"repoId": "org/ds", "task": "stack"},
@@ -368,3 +380,122 @@ def test_preview_api_lists_streams_and_renames(tmp_path: Path) -> None:
 
     asyncio.run(exercise())
     assert _task_names(root) == ["pick", "place", "stack"]
+
+
+# -- preview cuts ---------------------------------------------------------------
+
+
+def _encode(path: Path, frames: int, *, gop: int, fps: int = FPS) -> None:
+    """A small mpeg4 mp4 (always in PyAV's bundled FFmpeg); gop 1 = all-intra."""
+    from fractions import Fraction
+
+    import av
+    import numpy as np
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with av.open(str(path), "w") as out:
+        stream = out.add_stream("mpeg4", rate=fps)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.codec_context.gop_size = gop
+        stream.codec_context.max_b_frames = 0
+        for i in range(frames):
+            img = np.full((48, 64, 3), (i * 7) % 255, dtype=np.uint8)
+            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            frame.pts, frame.time_base = i, Fraction(1, fps)
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode():
+            out.mux(packet)
+
+
+def _frame_times(path: Path) -> list[float]:
+    import av
+
+    with av.open(str(path)) as c:
+        return [round(float(f.time), 3) for f in c.decode(video=0)]
+
+
+def _top_level_boxes(path: Path) -> list[str]:
+    data = path.read_bytes()
+    boxes, i = [], 0
+    while i + 8 <= len(data):
+        size = int.from_bytes(data[i : i + 4], "big")
+        boxes.append(data[i + 4 : i + 8].decode())
+        if size < 8:
+            break
+        i += size
+    return boxes
+
+
+def test_preview_keeps_every_nth_intra_frame_of_the_span(tmp_path: Path) -> None:
+    from almond_axol.recording.preview_remux import remux_preview
+
+    pytest.importorskip("av")
+    src, dst = tmp_path / "src.mp4", tmp_path / "dst.mp4"
+    _encode(src, 30, gop=1)  # 3 s at 10 fps
+
+    result = remux_preview(src, dst, 1.0, 3.0, 4)
+
+    assert result == {"frames": 5, "source_frames": 20, "decimated": True}
+    # The span, rebased to 0, every 4th frame.
+    assert _frame_times(dst) == [0.0, 0.4, 0.8, 1.2, 1.6]
+    # Index first, so a browser can start before it has the whole file.
+    boxes = _top_level_boxes(dst)
+    assert boxes.index("moov") < boxes.index("mdat")
+
+
+def test_preview_of_a_gop_source_copies_the_span_whole(tmp_path: Path) -> None:
+    from almond_axol.recording.preview_remux import remux_preview
+
+    pytest.importorskip("av")
+    src, dst = tmp_path / "src.mp4", tmp_path / "dst.mp4"
+    _encode(src, 30, gop=10)  # keyframes at 0 / 1 / 2 s, predicted frames between
+
+    result = remux_preview(src, dst, 1.0, 2.0, 4)
+
+    # Dropping predicted frames would break the ones after them.
+    assert result == {"frames": 10, "source_frames": 10, "decimated": False}
+    assert _frame_times(dst) == [round(0.1 * i, 3) for i in range(10)]
+
+
+def test_episode_preview_cuts_once_and_recuts_a_changed_source(tmp_path: Path) -> None:
+    pytest.importorskip("av")
+    from almond_axol.recording.dataset_browser import episode_preview
+
+    root = _make_dataset(tmp_path, "ds", ["pick", "place"], shared=True)
+    video = root / "videos" / CAM / "chunk-000" / "file-000.mp4"
+    _encode(video, 10, gop=1)  # episodes 0 and 1: 0.0-0.5 s and 0.5-1.0 s
+    cache = tmp_path / "cache"
+
+    first = episode_preview(root, 1, CAM, 5, cache_dir=cache)
+    assert first.parent == cache
+    assert _frame_times(first) == [0.0, 0.2, 0.4]
+    again = episode_preview(root, 1, CAM, 5, cache_dir=cache)
+    assert again == first
+    # Every frame (the dataset is at 10 fps): still the span alone, rebased.
+    assert _frame_times(episode_preview(root, 1, CAM, 30, cache_dir=cache)) == [
+        0.0,
+        0.1,
+        0.2,
+        0.3,
+        0.4,
+    ]
+
+    os.utime(video, ns=(1, 1))  # replaced / re-encoded: a new key
+    assert episode_preview(root, 1, CAM, 5, cache_dir=cache) != first
+
+
+def test_preview_cache_evicts_the_least_recently_served(tmp_path: Path) -> None:
+    from almond_axol.recording.dataset_browser import _prune_preview_cache
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for i, name in enumerate(("old", "mid", "new")):
+        path = cache / f"{name}.mp4"
+        path.write_bytes(b"x" * 100)
+        os.utime(path, (i + 1, i + 1))
+
+    _prune_preview_cache(cache, cache / "old.mp4", budget=200)
+
+    # "old" was just served (kept), so the next-oldest goes.
+    assert sorted(p.name for p in cache.iterdir()) == ["new.mp4", "old.mp4"]

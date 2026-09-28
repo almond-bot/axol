@@ -2618,7 +2618,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/datasets/video", response_model=None)
     async def get_dataset_video(
-        repo_id: str, episode: int, camera: str
+        repo_id: str, episode: int, camera: str, fps: int = 0
     ) -> FileResponse | JSONResponse:
         """The mp4 holding one camera's frames for an episode (Range-capable).
 
@@ -2626,13 +2626,31 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         share chunk files); the episode listing carries the ``from``/``to``
         span the player seeks within. The mp4s' moov atom is at the end, so
         browsers rely on Range requests, which FileResponse answers.
+
+        ``fps`` asks for the player's cut instead (what the panel uses): a
+        cached file holding only the episode's span, starting at 0, with its
+        index first so it starts playing before it has downloaded, and every
+        Nth packet for a rate below the dataset's (Axol's all-intra 60 fps
+        cameras are ~21 Mbps each, more than a Wi-Fi or Tailscale link carries
+        for four at once) — see ``dataset_browser.episode_preview``.
         """
-        from ..recording.dataset_browser import DatasetBrowseError, episode_video
+        from ..recording.dataset_browser import (
+            DatasetBrowseError,
+            PreviewError,
+            episode_preview,
+            episode_video,
+        )
+
+        def _resolve() -> Path:
+            root = _dataset_root(repo_id)
+            if fps > 0:
+                return episode_preview(root, episode, camera, fps)
+            return episode_video(root, episode, camera)[0]
 
         try:
-            path, _ = await asyncio.to_thread(
-                lambda: episode_video(_dataset_root(repo_id), episode, camera)
-            )
+            path = await asyncio.to_thread(_resolve)
+        except PreviewError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
         except DatasetBrowseError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         except ImportError as exc:
