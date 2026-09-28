@@ -6,6 +6,7 @@ import {
   computeArgs,
   curatedFields,
   defaultString,
+  episodeVideoSource,
   filterSchema,
   flattenFields,
   isModified,
@@ -18,12 +19,14 @@ import {
   parseHardwareProfile,
   participatingCameraSerials,
   perRunFields,
+  previewStep,
   runFieldVisible,
   saveLocalHardwareProfile,
   saveOpSettings,
   serverHttpBase,
   type CameraSpec,
   type CommandSpec,
+  type DatasetEpisode,
   type OperationId,
   type SchemaField,
   type SchemaNode,
@@ -192,5 +195,40 @@ describe("supervisor pure helpers", () => {
     expect(loadOpSettings(op)).toEqual({ sim: true })
     localStorage.setItem("axolOp:teleop", "{not json")
     expect(loadOpSettings(op)).toEqual({})
+  })
+})
+
+describe("dataset preview sources", () => {
+  const episode: DatasetEpisode = {
+    index: 3,
+    length: 120,
+    durationS: 2,
+    tasks: ["pick"],
+    videos: { "observation.images.left_arm": { from: 6, to: 8 } },
+  }
+
+  it.each([
+    [60, 15, 4],
+    [60, 30, 2],
+    [60, 0, 1],
+    [30, 30, 1],
+    [30, 15, 2],
+    [10, 15, 1],
+  ])("keeps every Nth frame (%i fps at %i → %i)", (dataset, preview, step) => {
+    expect(previewStep(dataset, preview)).toBe(step)
+  })
+
+  it("asks for the host's cut, rebased to the episode", () => {
+    const light = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 15)
+    expect(light.span).toEqual({ from: 0, to: 2 })
+    const url = new URL(light.url, "http://host")
+    expect(url.searchParams.get("fps")).toBe("15")
+    expect(url.searchParams.get("episode")).toBe("3")
+    expect(url.hash).toBe("#t=0.000,2.000")
+
+    // Full rate is the cut too (index first, so it starts before it downloads).
+    const full = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 0)
+    expect(new URL(full.url, "http://host").searchParams.get("fps")).toBe("60")
+    expect(full.span).toEqual({ from: 0, to: 2 })
   })
 })
