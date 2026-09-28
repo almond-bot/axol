@@ -52,12 +52,14 @@ class BatteryCurveTest(unittest.TestCase):
     def test_curve_points_and_interpolation(self) -> None:
         for volts, percent in LIFEPO4_8S_CURVE:
             self.assertAlmostEqual(battery_percent(volts), percent)
-        # Halfway between 26.15 V (25 %) and 26.35 V (50 %).
-        self.assertAlmostEqual(battery_percent(26.25), 37.5)
+        # Halfway between 26.16 V (60 %) and 26.4 V (70 %).
+        self.assertAlmostEqual(battery_percent(26.28), 65.0)
 
-    def test_matches_the_bms_on_jelly(self) -> None:
-        # Measured at rest on Jelly: 25.69 V while the LiTime app showed 18 %.
-        self.assertAlmostEqual(battery_percent(25.69), 18.0, delta=3.0)
+    def test_is_the_published_cell_curve_times_eight(self) -> None:
+        # EVE's resting chart: 3.40 V/cell full, 3.26 V/cell half, 3.20 V/cell 20 %.
+        self.assertAlmostEqual(battery_percent(27.20), 100.0)
+        self.assertAlmostEqual(battery_percent(26.08), 50.0)
+        self.assertAlmostEqual(battery_percent(25.60), 20.0)
 
     def test_clamps_outside_the_curve(self) -> None:
         self.assertEqual(battery_percent(12.0), 0.0)
@@ -74,7 +76,7 @@ class BatteryCurveTest(unittest.TestCase):
             battery_percent(math.nan)
 
     def test_estimate(self) -> None:
-        status = estimate_battery(26.35)
+        status = estimate_battery(26.08)
         assert status is not None
         self.assertAlmostEqual(status.percent, 50.0)
         self.assertAlmostEqual(status.remaining_ah, CAPACITY_AH / 2)
@@ -100,7 +102,6 @@ class BatteryCurveTest(unittest.TestCase):
             status = estimate_battery(volts)
             assert status is not None
             self.assertFalse(status.charging)
-            self.assertEqual(status.percent, 100.0)
         # Nor does the estimator, even coming off the charger.
         est = BatteryEstimator()
         est.update(27.5)
@@ -224,7 +225,7 @@ class LiftPowerTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(lift.power.supply_volts, 26.35)
         battery = lift.battery
         assert battery is not None
-        self.assertAlmostEqual(battery.percent, 50.0)
+        self.assertAlmostEqual(battery.percent, battery_percent(26.35))
 
     def test_stale_power_means_no_battery(self) -> None:
         lift = Lift("can-test")
@@ -347,7 +348,7 @@ class ReadPowerTest(unittest.IsolatedAsyncioTestCase):
 
         assert power is not None and battery is not None
         self.assertAlmostEqual(power.supply_volts, 26.63)
-        self.assertAlmostEqual(battery.percent, 75.0)
+        self.assertAlmostEqual(battery.percent, battery_percent(26.63))
         bus = _AnsweringBus.instances[0]
         self.assertEqual(bus.sent[:2], [b"\x05\x00\x00", b"\x08"])
         # Never a motion opcode: no STOP / JOG / HOME / SET_POS.

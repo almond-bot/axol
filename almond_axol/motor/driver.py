@@ -258,8 +258,27 @@ class MotorDriver(ABC):
         """Persist every deferred config write to flash/ROM."""
         raise MotorError(f"config access is not supported by {type(self).__name__}")
 
+    async def param_supported(self, param: MotorParam) -> bool:
+        """Whether this motor's firmware implements ``param``.
+
+        True unless the driver overrides it; see ``ParamSpec.min_firmware``.
+        """
+        return True
+
+    async def _require_supported(self, param: MotorParam) -> None:
+        if not await self.param_supported(param):
+            raise MotorError(
+                f"{param.name} is not implemented by this motor's firmware "
+                f"(needs VersionDate >= {self.PARAMS[param].min_firmware})"
+            )
+
     async def read_config(self, param: MotorParam) -> float:
-        """Read one configuration parameter, in the unit its spec names."""
+        """Read one configuration parameter, in the unit its spec names.
+
+        Raises MotorError for a parameter the motor's firmware doesn't
+        implement, whose reply would otherwise be junk.
+        """
+        await self._require_supported(param)
         raw = await self._config_read(int(param))
         return raw * self.PARAMS[param].scale
 
@@ -273,6 +292,7 @@ class MotorDriver(ABC):
         spec = self.PARAMS[param]
         if spec.access is Access.READ_ONLY:
             raise MotorError(f"{param.name} is read-only")
+        await self._require_supported(param)
         await self._config_write(int(param), value / spec.scale)
         await self._config_commit()
 
@@ -284,7 +304,10 @@ class MotorDriver(ABC):
         Pass ``raw_range`` to sweep bare indices instead of the known table —
         the way to pin down parameters a vendor GUI exposes but whose indices
         are still unidentified. Indices the motor rejects are left out rather
-        than reported as an error, since a sweep is expected to hit gaps.
+        than reported as an error, since a sweep is expected to hit gaps. A raw
+        sweep cannot tell an unimplemented index from a real one — both answer.
+
+        Known parameters the motor's firmware doesn't implement are left out.
         """
         if not self.PARAMS:
             raise MotorError(f"dump_config is not supported by {type(self).__name__}")
@@ -296,7 +319,11 @@ class MotorDriver(ABC):
                 except MotorError:
                     continue
             return values
-        return {param: await self.read_config(param) for param in self.PARAMS}
+        return {
+            param: await self.read_config(param)
+            for param in self.PARAMS
+            if await self.param_supported(param)
+        }
 
     async def restore_config(
         self, values: Mapping[MotorParam, float], *, include_protected: bool = False
@@ -306,7 +333,8 @@ class MotorDriver(ABC):
         Parameters already holding the requested value are skipped so a restore
         onto a matching motor costs no flash writes, and the whole batch shares
         a single commit. Read-only parameters are always skipped, and protected
-        ones unless ``include_protected`` is set — see :class:`Access`.
+        ones unless ``include_protected`` is set — see :class:`Access` — and so
+        are parameters the motor's firmware doesn't implement.
         """
         if not self.PARAMS:
             raise MotorError(
@@ -318,6 +346,8 @@ class MotorDriver(ABC):
             if spec is None or spec.access is Access.READ_ONLY:
                 continue
             if spec.access is Access.PROTECTED and not include_protected:
+                continue
+            if not await self.param_supported(param):
                 continue
             if math.isclose(await self.read_config(param), value, rel_tol=1e-6):
                 continue

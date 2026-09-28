@@ -844,6 +844,21 @@ class AxolVRTeleop(Teleoperator):
         """
         self._core.resume_ik()
 
+    def block_engage(self) -> None:
+        """Ignore the grips until :meth:`unblock_engage`.
+
+        Used by ``collect-data`` while an episode saves: the arms are home
+        and nothing streams the tracking target, so an engage there would
+        snap the arms to the controller once the next episode starts
+        commanding. Afterwards both grips must be released, then squeezed,
+        to engage. Safe from any thread.
+        """
+        self._core.block_engage()
+
+    def unblock_engage(self) -> None:
+        """Lift :meth:`block_engage`. Safe from any thread."""
+        self._core.unblock_engage()
+
     def resync_to_positions(
         self, pos_left: np.ndarray | None, pos_right: np.ndarray | None
     ) -> None:

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
   ExternalLink,
@@ -852,7 +852,7 @@ function OperatorDeck({
   )
 }
 
-function EpisodeControls({
+export function EpisodeControls({
   policy,
   onEpisode,
   hud,
@@ -906,7 +906,12 @@ function EpisodeControls({
     ? `Recording starts in ${vrCountdownS} s — controller countdown; press A again to cancel.`
     : status
 
+  // Auto-submitting inputs register a flush, so a button clicked inside the
+  // debounce window still sends the text typed just before it first.
+  const flushes = useRef(new Map<string, () => void>())
+
   function click(control: EpisodeControlSpec) {
+    for (const flush of flushes.current.values()) flush()
     if (control.confirm && armed !== control.command) {
       setArmed(control.command)
       return
@@ -955,11 +960,15 @@ function EpisodeControls({
           key={`${c.command}:${c.placeholder ?? ""}`}
           control={c}
           onEpisode={onEpisode}
+          flushes={flushes}
         />
       ))}
     </div>
   )
 }
+
+/** How long typing must pause before an `autoSubmit` input sends its text. */
+const AUTO_SUBMIT_MS = 400
 
 /**
  * A server-driven episode control rendered as a text field + submit button
@@ -969,22 +978,53 @@ function EpisodeControls({
  * `value` (the current server-side text), so an earlier submission survives
  * phase changes and can be edited; submit is disabled while the text matches
  * what the server already has.
+ *
+ * With `autoSubmit` there is no button: the text is sent once typing pauses
+ * (Enter sends at once), and a status hint says whether the op has it yet.
+ * Clearing the field sends nothing — the op keeps its last value.
  */
 function EpisodeInputControl({
   control,
   onEpisode,
+  flushes,
 }: {
   control: EpisodeControlSpec
   onEpisode: (command: string) => void
+  flushes: RefObject<Map<string, () => void>>
 }) {
   const [text, setText] = useState(control.value ?? "")
   const serverValue = control.value ?? ""
   const unchanged = text.trim() === serverValue.trim()
+  const auto = control.autoSubmit === true
+  // The text last sent, so the debounce and a flush don't resend it while
+  // the snapshot is still catching up.
+  const sent = useRef(serverValue.trim())
 
   function submit() {
-    if (unchanged || !text.trim()) return
-    onEpisode(`${control.command} ${text.trim()}`)
+    const trimmed = text.trim()
+    if (!trimmed || trimmed === serverValue.trim() || trimmed === sent.current) return
+    sent.current = trimmed
+    onEpisode(`${control.command} ${trimmed}`)
   }
+
+  const submitRef = useRef(submit)
+  useEffect(() => {
+    submitRef.current = submit
+  })
+  useEffect(() => {
+    if (!auto) return
+    const key = control.command
+    const registry = flushes.current
+    registry.set(key, () => submitRef.current())
+    return () => {
+      registry.delete(key)
+    }
+  }, [auto, control.command, flushes])
+  useEffect(() => {
+    if (!auto) return
+    const t = setTimeout(() => submitRef.current(), AUTO_SUBMIT_MS)
+    return () => clearTimeout(t)
+  }, [auto, text])
 
   return (
     <div className="flex items-center gap-2">
@@ -997,9 +1037,15 @@ function EpisodeInputControl({
         }}
         className="h-8 flex-1"
       />
-      <Button variant="outline" size="sm" disabled={unchanged || !text.trim()} onClick={submit}>
-        {control.label}
-      </Button>
+      {auto ? (
+        <span className="w-16 shrink-0 text-right text-xs text-white/45">
+          {text.trim() ? (unchanged ? "Saved" : "Saving…") : ""}
+        </span>
+      ) : (
+        <Button variant="outline" size="sm" disabled={unchanged || !text.trim()} onClick={submit}>
+          {control.label}
+        </Button>
+      )}
     </div>
   )
 }

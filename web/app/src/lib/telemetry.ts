@@ -139,6 +139,8 @@ export async function fetchTelemetryHistory(
 export interface MotorDetails {
   arm: string
   joint: string
+  /** Driver family, e.g. "myactuator" or "damiao". */
+  type?: string
   model: string | null
   firmware: number | null
   status: string | null
@@ -153,6 +155,65 @@ export interface MotorDetails {
 
 export async function fetchMotorDetails(arm: string, joint: string): Promise<MotorDetails> {
   return json(await fetch(apiUrl(`/api/robot/motors/${arm}/${joint}`)))
+}
+
+// ---------------------------------------------------------------------------
+// Motor configuration parameters (the parameter editor)
+// ---------------------------------------------------------------------------
+
+/**
+ * How freely a parameter may be written: `protected` covers factory,
+ * calibration and bus-identity settings and needs an explicit confirmation.
+ */
+export type MotorParamAccess = "read_write" | "protected" | "read_only"
+
+export interface MotorConfigParam {
+  name: string
+  /** Raw 0xC0 index (MyActuator) or register ID (Damiao). */
+  index: number
+  unit: string
+  access: MotorParamAccess
+  integer: boolean
+  /** False when this motor's firmware doesn't implement the parameter. */
+  supported: boolean
+  value: number | null
+  error: string | null
+}
+
+export interface MotorConfig {
+  arm: string
+  joint: string
+  type: string
+  firmware: number | null
+  params: MotorConfigParam[]
+}
+
+export interface MotorConfigWriteResult {
+  name: string
+  requested: number
+  /** The value the motor reports after the write (it may clamp). */
+  value: number | null
+}
+
+export async function fetchMotorConfig(arm: string, joint: string): Promise<MotorConfig> {
+  return json(await fetch(apiUrl(`/api/robot/motors/${arm}/${joint}/config`)))
+}
+
+/** Write one parameter; the motor persists it to flash. */
+export async function writeMotorConfig(
+  arm: string,
+  joint: string,
+  param: string,
+  value: number,
+  allowProtected = false
+): Promise<MotorConfigWriteResult> {
+  return json(
+    await fetch(apiUrl(`/api/robot/motors/${arm}/${joint}/config`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ param, value, allowProtected }),
+    })
+  )
 }
 
 // ---------------------------------------------------------------------------

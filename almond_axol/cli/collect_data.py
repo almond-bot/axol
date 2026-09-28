@@ -1004,6 +1004,9 @@ class _NullCollectControl:
     def note_returning(self) -> None:
         pass
 
+    def note_dataset(self, repo_id: str, root: Path) -> None:
+        pass
+
 
 class _QueueCollectControl:
     """Web episode control for ``collect-data``: panel-driven recording.
@@ -1031,6 +1034,9 @@ class _QueueCollectControl:
         self._episodes_recorded = 0
         # perf_counter deadline of a pending panel-started countdown.
         self._countdown_deadline: float | None = None
+        # The dataset this session records into (note_dataset), so the
+        # panel's dataset preview can follow it.
+        self._dataset: dict[str, str] | None = None
 
     # -- serve API surface --------------------------------------------------
 
@@ -1053,7 +1059,14 @@ class _QueueCollectControl:
             }
             if self._episode is not None:
                 snap["episode"] = self._episode
+            if self._dataset is not None:
+                snap["dataset"] = dict(self._dataset)
             return snap
+
+    def note_dataset(self, repo_id: str, root: Path) -> None:
+        """The dataset this session records into (the snapshot's ``dataset``)."""
+        with self._lock:
+            self._dataset = {"repoId": repo_id, "root": str(Path(root).resolve())}
 
     # -- loop-side surface --------------------------------------------------
 
@@ -1330,6 +1343,10 @@ def _run_session(
     rerun_port = cfg.rerun_port
 
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    # Name the dataset for the panel's preview. getattr: a downstream
+    # package may hand in its own control without this hook.
+    if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+        note_dataset(repo_id, dataset_root)
 
     # Flag physically-stereo ZED X before the relay/robot opens the cameras so
     # the relay and in-process fallback both use the stereo grab path. The pure
@@ -2788,6 +2805,12 @@ def _run_session(
             # sustained yank. The episode is saved/discarded on this thread
             # in parallel; on a save the headset stays in SAVING (controls
             # blocked) until the write completes.
+            #
+            # The grips are blocked for the whole stretch: once the arms are
+            # home nothing streams the tracking target until the next episode
+            # loop, so a squeeze mid-save would engage invisibly and the arms
+            # would then jump to the controller the moment the save finished.
+            teleop.block_engage()
             home_future = asyncio.run_coroutine_threadsafe(
                 _return_home_loop(), robot.event_loop
             )
@@ -2805,6 +2828,8 @@ def _run_session(
                 loop_stop.set()
                 _drain_robot_future(home_future)
                 raise
+            finally:
+                teleop.unblock_engage()
             # Drain VR events fired during the return, then unblock the
             # headset for the next take.
             teleop.get_teleop_events()

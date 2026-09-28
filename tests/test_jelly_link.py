@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from almond_axol.robot.battery import battery_percent
 from almond_axol.serve import app as app_module
 from almond_axol.serve import jelly_link
 from almond_axol.serve.jelly_link import (
@@ -386,7 +387,7 @@ class LiftDeviceSnapshotTest(unittest.TestCase):
         )
         battery = device.snapshot(polling=True)["battery"]
         self.assertEqual(battery["voltage"], 26.35)
-        self.assertEqual(battery["percent"], 50.0)
+        self.assertEqual(battery["percent"], round(battery_percent(26.35), 1))
         self.assertFalse(battery["charging"])
         self.assertFalse(battery["underLoad"])
         self.assertTrue(battery["live"])
@@ -403,7 +404,7 @@ class LiftDeviceSnapshotTest(unittest.TestCase):
         device.last_power_monotonic = time.monotonic() - 600.0
         # A task owns the bus: the last reading stays, marked not live.
         battery = device.snapshot(polling=False)["battery"]
-        self.assertEqual(battery["percent"], 75.0)
+        self.assertEqual(battery["percent"], round(battery_percent(26.63), 1))
         self.assertFalse(battery["live"])
         self.assertGreaterEqual(battery["ageSeconds"], 600.0)
         # Polling again but the board went quiet: still not live.

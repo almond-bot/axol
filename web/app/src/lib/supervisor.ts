@@ -694,6 +694,11 @@ export interface EpisodeControlSpec {
   /** The current server-side text, prefilled whenever the input (re)appears
    *  so a submitted value survives phase changes and can be edited. */
   value?: string
+  /** Send the text by itself shortly after typing stops (no Enter or submit
+   *  button needed); a click on one of the box's buttons sends pending text
+   *  first. For inputs whose value the op reads later, e.g. the next
+   *  episode's task name read when recording starts. */
+  autoSubmit?: boolean
 }
 
 export interface PolicyState {
@@ -708,6 +713,8 @@ export interface PolicyState {
   /** 1-based number of the episode being recorded next/now, when the op
    *  tracks a dataset episode index (mirrors the headset HUD readout). */
   episode?: number
+  /** The dataset this session records into (the dataset preview follows it). */
+  dataset?: { repoId: string; root: string }
 }
 
 export interface OpStatus {
@@ -782,6 +789,95 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** Where one camera's frames for an episode sit inside its mp4 (seconds). */
+export interface EpisodeVideoSpan {
+  from: number
+  to: number
+}
+
+/** One saved episode, as the dataset preview lists it. */
+export interface DatasetEpisode {
+  /** LeRobot's 0-based episode_index. */
+  index: number
+  length: number
+  durationS: number
+  tasks: string[]
+  /** Keyed by camera feature (e.g. observation.images.overhead). */
+  videos: Record<string, EpisodeVideoSpan>
+}
+
+export interface DatasetEpisodes {
+  repoId: string
+  root: string
+  fps: number
+  cameras: string[]
+  /** Every task string in the dataset, in task_index order. */
+  tasks: string[]
+  episodes: DatasetEpisode[]
+  /** meta/episodes files that could not be read (a save in progress). */
+  unreadableFiles: number
+}
+
+/** A dataset's saved episodes (includes a live session's, once saved). */
+export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpisodes> {
+  const q = new URLSearchParams({ repo_id: repoId })
+  return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
+}
+
+/** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
+ *  `dataset_browser.preview_step`; 1 = every frame). */
+export function previewStep(datasetFps: number, previewFps: number): number {
+  if (previewFps <= 0 || datasetFps <= 0) return 1
+  return Math.max(1, Math.round(datasetFps / previewFps))
+}
+
+/** Where a player finds one camera's episode: the URL and its span in it. */
+export interface EpisodeVideoSource {
+  url: string
+  span: EpisodeVideoSpan
+}
+
+/**
+ * One camera's episode video, as the host's player cut: just the episode
+ * (starting at 0), with the mp4's index first so it plays before it has
+ * downloaded, keeping every Nth frame for a `previewFps` below the dataset's
+ * (0 = every frame). The media fragment makes the browser stop at the end.
+ */
+export function episodeVideoSource(
+  repoId: string,
+  episode: DatasetEpisode,
+  camera: string,
+  datasetFps: number,
+  previewFps = 0
+): EpisodeVideoSource {
+  const original = episode.videos[camera]
+  const span = { from: 0, to: original.to - original.from }
+  const q = new URLSearchParams({
+    repo_id: repoId,
+    episode: String(episode.index),
+    camera,
+    fps: String(previewFps > 0 ? previewFps : datasetFps || 1),
+  })
+  const fragment = `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}`
+  return { url: apiUrl(`/api/datasets/video?${q}${fragment}`), span }
+}
+
+/** Rename a saved episode's task (409 while a save holds the dataset). */
+export async function setEpisodeTask(
+  repoId: string,
+  episode: number,
+  task: string
+): Promise<DatasetEpisode> {
+  const res: { episode: DatasetEpisode } = await json(
+    await fetch(apiUrl(`/api/datasets/episodes/${episode}/task`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoId, task }),
+    })
+  )
+  return res.episode
 }
 
 /** One row of a per-run field's server-side pick list. */
