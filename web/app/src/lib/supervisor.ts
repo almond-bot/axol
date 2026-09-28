@@ -694,6 +694,11 @@ export interface EpisodeControlSpec {
   /** The current server-side text, prefilled whenever the input (re)appears
    *  so a submitted value survives phase changes and can be edited. */
   value?: string
+  /** Send the text by itself shortly after typing stops (no Enter or submit
+   *  button needed); a click on one of the box's buttons sends pending text
+   *  first. For inputs whose value the op reads later, e.g. the next
+   *  episode's task name read when recording starts. */
+  autoSubmit?: boolean
 }
 
 export interface PolicyState {
