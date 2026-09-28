@@ -94,19 +94,27 @@ def record(
     dumped: Any,
     errors: Any,
     udp_port: int | None = None,
+    stereo: bool = False,
 ) -> None:
     """Open camera ``serial`` and record its IMU until ``stop`` is set.
 
     ``ready`` / ``dumped`` are set, ``stop`` / ``dump`` polled (Event-like),
     ``errors.put(text)`` reports a failure; ``udp_port`` streams each sample.
+    ``stereo`` opens a stereo ZED (``sl.Camera`` — the overhead camera) with
+    depth off instead of a ZED X One.
     """
     try:
         import pyzed.sl as sl
     except ImportError as exc:
         errors.put(f"pyzed not importable ({exc}) — run `axol zed.install`")
         return
-    zed = sl.CameraOne()
-    init = sl.InitParametersOne()
+    if stereo:
+        zed = sl.Camera()
+        init = sl.InitParameters()
+        init.depth_mode = sl.DEPTH_MODE.NONE
+    else:
+        zed = sl.CameraOne()
+        init = sl.InitParametersOne()
     init.set_from_serial_number(serial)
     if hasattr(init, "sdk_verbose"):
         init.sdk_verbose = 0
@@ -202,6 +210,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Also send each sample to 127.0.0.1:PORT as it arrives",
     )
     p.add_argument(
+        "--stereo",
+        action="store_true",
+        help="The camera is a stereo ZED (the overhead camera), not a ZED X One",
+    )
+    p.add_argument(
         "--worker",
         default=f"{__name__}:record",
         help="module:function to run in place of the camera (tests)",
@@ -221,7 +234,9 @@ def main(argv: list[str] | None = None) -> None:
         stop.set()
 
     threading.Thread(target=_commands, daemon=True).start()
-    extra = {"udp_port": args.udp} if args.udp else {}
+    extra: dict[str, Any] = {"udp_port": args.udp} if args.udp else {}
+    if args.stereo:
+        extra["stereo"] = True
     worker(
         args.serial,
         args.out,
