@@ -55,6 +55,8 @@ from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -313,6 +315,10 @@ class _StdinPolicyControl:
         # Panel-only readout; the terminal announces episodes via the log.
         pass
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        # Panel-only: names the dataset the panel's preview follows.
+        pass
+
     def poll_gate(self) -> str | None:
         # Terminal collect-dagger opens an episode from the VR record button
         # only, so there is nothing to poll here.
@@ -395,6 +401,9 @@ class _QueuePolicyControl:
         # Instruction + button label of the gate currently open, if any.
         self._gate_message = ""
         self._gate_label = "Start episode"
+        # The dataset this session records into (note_dataset), so the
+        # panel's dataset preview can follow it.
+        self._dataset: dict[str, str] | None = None
 
     def push(self, command: str) -> None:
         self._q.put(command)
@@ -412,6 +421,13 @@ class _QueuePolicyControl:
         with self._state_lock:
             self._episode = episode
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        """The dataset this session records into (the snapshot's ``dataset``)."""
+        from pathlib import Path
+
+        with self._state_lock:
+            self._dataset = {"repoId": repo_id, "root": str(Path(root).resolve())}
+
     def snapshot(self) -> dict[str, Any]:
         """Thread-safe phase/count/message/buttons for the /api/op/status API."""
         with self._state_lock:
@@ -422,7 +438,7 @@ class _QueuePolicyControl:
             else:
                 message = _POLICY_PHASE_MESSAGES.get(phase, "")
                 controls = [dict(c) for c in _POLICY_PHASE_CONTROLS.get(phase, ())]
-            return {
+            snap: dict[str, Any] = {
                 "phase": phase,
                 # Saves are what number an episode, so a discarded rollout is
                 # re-recorded under the same number — as the log line says.
@@ -437,6 +453,9 @@ class _QueuePolicyControl:
                 "message": message,
                 "controls": controls,
             }
+            if self._dataset is not None:
+                snap["dataset"] = dict(self._dataset)
+            return snap
 
     def _drain(self) -> None:
         import queue
@@ -2132,6 +2151,10 @@ def _run(
     dataset_root: Path | None = None
     if repo_id:
         dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        # Name the dataset for the panel's preview. getattr: a downstream
+        # package may hand in its own control without this hook.
+        if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+            note_dataset(repo_id, dataset_root)
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the

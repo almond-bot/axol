@@ -1091,6 +1091,10 @@ def _run(
     # schema and ignores the fresh feature dict supplied to the recorder, so a
     # non-DAgger dataset cannot be made label-capable implicitly on resume.
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+    # Name the dataset for the panel's preview. getattr: a downstream
+    # package may hand in its own control without this hook.
+    if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+        note_dataset(repo_id, dataset_root)
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (

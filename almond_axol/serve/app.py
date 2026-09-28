@@ -188,6 +188,13 @@ class ProximityRequest(BaseModel):
     disabled: bool = True
 
 
+class EpisodeTaskRequest(BaseModel):
+    """Rename one saved episode's task (the dataset preview's task editor)."""
+
+    repoId: str
+    task: str
+
+
 class MotorConfigWriteRequest(BaseModel):
     """One configuration parameter to write on a motor (the parameter editor).
 
@@ -2546,6 +2553,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
+    def _datasets_base() -> Path | None:
+        """Where ``/api/datasets`` scans (None = the LeRobot cache dir)."""
+        stored_root = settings.snapshot()["values"].get("recording.root")
+        return Path(str(stored_root)).expanduser() if stored_root else None
+
+    def _dataset_root(repo_id: str) -> Path:
+        from ..recording.dataset_browser import resolve_dataset
+        from ..recording.datasets import lerobot_home
+
+        return resolve_dataset(_datasets_base() or lerobot_home(), repo_id)
+
     @app.get("/api/datasets")
     async def get_datasets() -> dict[str, Any]:
         """LeRobot datasets on this host, newest first.
@@ -2554,13 +2572,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         collect-data writes to), otherwise the LeRobot cache dir — the same
         place replay-dataset resolves a bare repo id against.
         """
-        from pathlib import Path
-
         from ..recording.datasets import list_datasets
 
-        stored_root = settings.snapshot()["values"].get("recording.root")
-        base = Path(str(stored_root)).expanduser() if stored_root else None
-        found = await asyncio.to_thread(list_datasets, base)
+        found = await asyncio.to_thread(list_datasets, _datasets_base())
         return {
             "datasets": [
                 {
@@ -2572,6 +2586,94 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 for d in found
             ]
         }
+
+    # -- dataset preview (saved episodes' videos + task, task rename) --------
+    #
+    # Reads the files a recording session has already closed, so it works on
+    # the dataset a live session is recording into (its snapshot names it as
+    # ``dataset``); the take in progress is not listed until it is saved.
+
+    @app.get("/api/datasets/episodes", response_model=None)
+    async def get_dataset_episodes(repo_id: str) -> dict[str, Any] | JSONResponse:
+        """A dataset's saved episodes: length, task(s), each camera's video span."""
+        from ..recording.dataset_browser import DatasetBrowseError, read_episodes
+
+        def _read() -> dict[str, Any]:
+            root = _dataset_root(repo_id)
+            return {
+                "repoId": repo_id,
+                "root": str(root),
+                **read_episodes(root).to_dict(),
+            }
+
+        try:
+            return await asyncio.to_thread(_read)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse(
+                {"error": f"dataset preview needs the lerobot extra ({exc})"},
+                status_code=501,
+            )
+
+    @app.get("/api/datasets/video", response_model=None)
+    async def get_dataset_video(
+        repo_id: str, episode: int, camera: str
+    ) -> FileResponse | JSONResponse:
+        """The mp4 holding one camera's frames for an episode (Range-capable).
+
+        The file can hold several episodes (datasets not recorded by axol
+        share chunk files); the episode listing carries the ``from``/``to``
+        span the player seeks within. The mp4s' moov atom is at the end, so
+        browsers rely on Range requests, which FileResponse answers.
+        """
+        from ..recording.dataset_browser import DatasetBrowseError, episode_video
+
+        try:
+            path, _ = await asyncio.to_thread(
+                lambda: episode_video(_dataset_root(repo_id), episode, camera)
+            )
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=501)
+        return FileResponse(path, media_type="video/mp4")
+
+    @app.put("/api/datasets/episodes/{episode}/task", response_model=None)
+    async def put_episode_task(
+        episode: int, req: EpisodeTaskRequest
+    ) -> dict[str, Any] | JSONResponse:
+        """Rename a saved episode's task, also while a session records into it.
+
+        Serialized with the recorder's saves by the dataset's metadata lock
+        (see ``recording.dataset_browser``); a save that holds it longer than
+        the timeout answers 409 and the panel retries.
+        """
+        from ..recording.dataset_browser import (
+            DatasetBrowseError,
+            DatasetBusyError,
+            rename_episode_task,
+        )
+
+        def _rename() -> dict[str, Any]:
+            root = _dataset_root(req.repoId)
+            return rename_episode_task(root, episode, req.task).to_dict()
+
+        try:
+            summary = await asyncio.to_thread(_rename)
+        except DatasetBusyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except ImportError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=501)
+        _logger.info(
+            "Dataset %s: episode %d task set to %r",
+            req.repoId,
+            episode,
+            req.task.strip(),
+        )
+        return {"episode": summary}
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 

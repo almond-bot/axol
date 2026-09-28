@@ -884,7 +884,10 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             recorder._capture_error = None
             recorder._row_times = []
             recorder._dataset = dataset
-            recorder._config = {"smooth_ee_hz": 0.0}
+            recorder._config = {
+                "smooth_ee_hz": 0.0,
+                "dataset_root": str(Path(directory) / "dataset"),
+            }
             recorder._verifier = Mock()
             recorder._episodes_recorded = 0
             recorder._fatal_error = None
