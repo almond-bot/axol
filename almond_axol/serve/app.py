@@ -37,6 +37,7 @@ from ..constants import (
     CAN_RIGHT,
     URDF_PATH,
 )
+from ..motor.errors import MotorError
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -185,6 +186,18 @@ class ProximityRequest(BaseModel):
     """
 
     disabled: bool = True
+
+
+class MotorConfigWriteRequest(BaseModel):
+    """One configuration parameter to write on a motor (the parameter editor).
+
+    ``allowProtected`` is the explicit confirmation a protected parameter
+    (factory, calibration, bus identity) needs before it is written.
+    """
+
+    param: str
+    value: float
+    allowProtected: bool = False
 
 
 class SessionInputRequest(BaseModel):
@@ -1635,6 +1648,45 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             except RuntimeError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=409)
         return JSONResponse(details)
+
+    @app.get("/api/robot/motors/{arm}/{joint}/config")
+    async def robot_motor_config(arm: str, joint: str) -> JSONResponse:
+        """Every configuration parameter of one motor, over the idle link."""
+        async with session_launch_reservation:
+            try:
+                config = await asyncio.to_thread(robot.motor_config, arm, joint)
+            except KeyError:
+                return JSONResponse({"error": "unknown motor"}, status_code=404)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(config)
+
+    @app.post("/api/robot/motors/{arm}/{joint}/config")
+    async def robot_motor_config_write(
+        arm: str, joint: str, req: MotorConfigWriteRequest
+    ) -> JSONResponse:
+        """Write one configuration parameter (persisted to flash) and read it back."""
+        async with session_launch_reservation:
+            try:
+                result = await asyncio.to_thread(
+                    robot.set_motor_config,
+                    arm,
+                    joint,
+                    req.param,
+                    req.value,
+                    allow_protected=req.allowProtected,
+                )
+            except KeyError:
+                return JSONResponse({"error": "unknown motor"}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            except (MotorError, TimeoutError) as exc:
+                return JSONResponse(
+                    {"error": f"write failed: {exc or 'timed out'}"}, status_code=502
+                )
+        return JSONResponse(result)
 
     # -- motor telemetry (diagnostics dashboard) -----------------------------
 
