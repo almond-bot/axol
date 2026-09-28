@@ -851,6 +851,20 @@ class KinematicsSolver:
             _se3_to_pose(jaxlie.SE3(fk[self.r_ee_idx])),
         )
 
+    def ee_positions(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Batched :meth:`fk` positions: ``(M, N)`` joint rows → the left and
+        right gripper-mount positions, ``(M, 3)`` each (world frame). Jitted
+        once per solver, so a few rows per control tick are cheap."""
+        fk = self.__dict__.get("_fk_batch")
+        if fk is None:
+            fk = self._fk_batch = jax.jit(jax.vmap(self.robot.forward_kinematics))
+        rows = np.asarray(q, dtype=np.float32).reshape(-1, len(self._pyroki_index))
+        pyroki = np.empty_like(rows)
+        pyroki[:, self._pyroki_index] = rows  # to_pyroki_order, per row
+        poses = np.asarray(fk(jnp.asarray(pyroki)))
+        # jaxlie SE3 parameters: (qw, qx, qy, qz, x, y, z).
+        return poses[:, self.l_ee_idx, 4:], poses[:, self.r_ee_idx, 4:]
+
     def elbow_positions(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """World-frame elbow positions from joint positions.
 

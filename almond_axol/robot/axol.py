@@ -921,6 +921,13 @@ class AxolArm:
             ]
             | None
         ) = None
+        # Extra feedforward torque (Nm, 7 arm joints) added to the gravity
+        # t_ff of every motion_control — set per tick by a controller acting
+        # on a sensor this class does not own (tune.motion --imu-damp: the
+        # wrist IMU's vertical damping). ``None`` = nothing added. The core
+        # reads the joint's load from t_ff (fl, the Stribeck load term), so
+        # keep it to a fraction of a newton-metre.
+        self.extra_torque: np.ndarray | None = None
 
     @property
     def present_joints(self) -> frozenset[Joint]:
@@ -1606,6 +1613,16 @@ class AxolArm:
             ]
         )
 
+    def _extra_torque(self) -> np.ndarray:
+        """:attr:`extra_torque`, validated (finite, 7 long) or zeros."""
+        extra = self.extra_torque
+        if extra is None:
+            return np.zeros(len(ARM_JOINTS))
+        extra = np.asarray(extra, dtype=float).reshape(-1)[: len(ARM_JOINTS)]
+        if len(extra) != len(ARM_JOINTS) or not np.all(np.isfinite(extra)):
+            return np.zeros(len(ARM_JOINTS))
+        return extra
+
     async def motion_control(self, q: np.ndarray) -> None:
         """Send control commands to all joints concurrently.
 
@@ -1784,6 +1801,7 @@ class AxolArm:
             # gripperless SKU (the core has no gripper configured and
             # ignores the slot).
             sink_cmds: list[tuple[float, ...]] = []
+            extra = self._extra_torque()
             for i, j in enumerate(ARM_JOINTS):
                 gains = getattr(self._arm_config, j.value)
                 sink_cmds.append(
@@ -1792,7 +1810,7 @@ class AxolArm:
                         1.0,
                         gains.kp,
                         gains.kd,
-                        float(gravity[i]),
+                        float(gravity[i]) + extra[i],
                         float(host_scale[i]) * gains.kd_host,
                         damp_w0[i],
                         self._damp_q[i],
@@ -1815,6 +1833,7 @@ class AxolArm:
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
+        extra = self._extra_torque()
         dither = self._dither.update(
             [getattr(self._arm_config, j.value).dither_nm for j in ARM_JOINTS],
             [getattr(self._arm_config, j.value).dither_hz for j in ARM_JOINTS],
@@ -1871,6 +1890,7 @@ class AxolArm:
                 )
             t_ff = (
                 float(gravity[i])
+                + extra[i]
                 + compute_friction(
                     velocities[i], f.fc + f.fl * abs(float(gravity[i])), f.k, f.fv, f.fo
                 )

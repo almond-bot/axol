@@ -97,10 +97,14 @@ class _FakeAxol:
     async def __aexit__(self, *exc: object) -> None:
         return None
 
+    applied: list = []
+
     async def motion_control(self, left=None, right=None) -> None:
         if left is not None and self.left is not None:
             self.left.step(left)
         if right is not None:
+            extra = getattr(self.right, "extra_torque", None)
+            _FakeAxol.applied.append(None if extra is None else np.array(extra))
             self.right.step(right)
 
     def set_recording_engaged(self, on: bool) -> None:
@@ -130,8 +134,37 @@ def _motion(path: Path) -> ReferenceMotion:
     return m
 
 
+class _FakeImu:
+    """A live wrist IMU reading a 2 Hz vertical shake on the fake clock."""
+
+    def __init__(self, sides, enabled=True, live=False, **_kw) -> None:
+        self.sides = list(sides) if enabled else []
+        self.live = live
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def poll(self, side: str) -> np.ndarray:
+        t = _FakeAxol.clock.now
+        az = 9.80665 + 0.3 * math.sin(2 * math.pi * 2.0 * t)
+        return np.array([[t, 0.0, 0.0, az, 0.0, 0.0, 0.0]])
+
+    def run_blocks(self, t0, t1, origin=None):
+        return {}, {}
+
+
+def _ee_positions(rows):
+    rows = np.asarray(rows, dtype=float).reshape(-1, 14)
+    z = 0.6 * np.sin(rows[:, 7]) + 0.3 * np.sin(rows[:, 7] + rows[:, 10])
+    right = np.stack([np.zeros(len(rows)), np.zeros(len(rows)), z], 1)
+    return np.zeros_like(right), right
+
+
 class SessionTest(unittest.TestCase):
-    def _run(self, argv: list[str], tmp: Path) -> str:
+    def _run(self, argv: list[str], tmp: Path, imu: bool = False) -> str:
         from almond_axol.cli.tune import motion as cli
         from almond_axol.tuning import runs
 
@@ -139,8 +172,12 @@ class SessionTest(unittest.TestCase):
         _FakeAxol.start = motion.q[0, 7:].astype(float)
         _FakeAxol.clock = _Clock()
         solver = SimpleNamespace(
-            num_joints=14, left_indices=list(range(7)), right_indices=list(range(7, 14))
+            num_joints=14,
+            left_indices=list(range(7)),
+            right_indices=list(range(7, 14)),
+            ee_positions=_ee_positions,
         )
+        _FakeAxol.applied = []
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers()
         cli.add_parser(sub)
@@ -151,8 +188,8 @@ class SessionTest(unittest.TestCase):
                 str(tmp / "sim.npz"),
                 "--arms",
                 "right",
-                "--no-imu",
             ]
+            + ([] if imu else ["--no-imu"])
             + argv
         )
         clock = _FakeAxol.clock
@@ -160,6 +197,8 @@ class SessionTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(cli, "Axol", _FakeAxol))
+            if imu:
+                stack.enter_context(mock.patch.object(cli, "WristImu", _FakeImu))
             stack.enter_context(
                 mock.patch(
                     "almond_axol.kinematics.solver.KinematicsSolver", lambda: solver
@@ -232,6 +271,48 @@ class SessionTest(unittest.TestCase):
                 ["--correction", best, "--repeat", "2", "--label", "replay"], tmp
             )
             self.assertIn("correction:", text)
+
+    def test_imu_damping_alternates_clamps_and_is_saved(self) -> None:
+        from almond_axol.tuning import runs
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            text = self._run(
+                [
+                    "--imu-damp",
+                    "200",
+                    "--imu-damp-max",
+                    "0.4",
+                    "--imu-damp-alternate",
+                    "--repeat",
+                    "2",
+                    "--label",
+                    "damp",
+                ],
+                tmp,
+                imu=True,
+            )
+            self.assertIn("IMU damping (right): 200 N·s/m", text)
+            self.assertIn("IMU damping off this pass", text)
+            self.assertIn("IMU damping ON this pass", text)
+            applied = [a for a in _FakeAxol.applied if a is not None]
+            self.assertTrue(applied)
+            peak = np.abs(np.stack(applied)).max(axis=0)
+            self.assertLessEqual(peak.max(), 0.4 + 1e-9)
+            self.assertGreater(peak[0], 0.0)  # shoulder_1
+            self.assertGreater(peak[3], 0.0)  # elbow
+            self.assertEqual(peak[4], 0.0)  # wrist_1 untouched
+            metas = [
+                runs.load_run(p.name, self.runs_dir) for p in self.runs_dir.iterdir()
+            ]
+            by_pass = {m[0]["label"]: m for m in metas}
+            on = by_pass["damp [2/2]"]
+            off = by_pass["damp [1/2]"]
+            self.assertEqual(on[0]["metrics"]["imu_damp"], 200.0)
+            self.assertEqual(off[0]["metrics"]["imu_damp"], 0.0)
+            self.assertIn("imu_damp", on[1])
+            self.assertNotIn("imu_damp", off[1])
+            self.assertEqual(on[1]["imu_damp"].shape[1], 9)
 
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model

@@ -32,6 +32,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -57,6 +59,9 @@ LOW_BAND = (1.0, 3.0)
 HIGH_BAND = (3.0, 15.0)
 
 _OPEN_TIMEOUT_S = 12.0
+# A live sample, as ``almond_axol.zed.imu_worker.SAMPLE_FORMAT`` sends it.
+_SAMPLE_FORMAT = "<d6f"
+_SAMPLE_SIZE = struct.calcsize(_SAMPLE_FORMAT)
 _STOP_TIMEOUT_S = 6.0
 
 
@@ -138,16 +143,21 @@ class WristImu:
         enabled: bool = True,
         serial_of: Any = None,
         worker: str | None = None,
+        live: bool = False,
     ) -> None:
         """``serial_of`` replaces :func:`imu_serial`; ``worker`` (a
         ``module:function`` the subprocess runs in place of
-        :func:`almond_axol.zed.imu_worker.record`) replaces the camera (tests)."""
+        :func:`almond_axol.zed.imu_worker.record`) replaces the camera (tests).
+        ``live`` also streams every sample to this process as it arrives —
+        read with :meth:`poll`."""
         self._sides = [s for s in sides if s in ("left", "right")]
         self._enabled = enabled
         self._serial_of = serial_of or imu_serial
         self._worker = worker
         self._recorders: dict[str, _Recorder] = {}
         self._tmp: tempfile.TemporaryDirectory[str] | None = None
+        self._live = live
+        self._socks: dict[str, socket.socket] = {}
 
     def __enter__(self) -> "WristImu":
         self.start()
@@ -187,6 +197,13 @@ class WristImu:
             ]
             if self._worker:
                 cmd += ["--worker", self._worker]
+            if self._live:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(("127.0.0.1", 0))
+                sock.setblocking(False)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+                self._socks[side] = sock
+                cmd += ["--udp", str(sock.getsockname()[1])]
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -236,6 +253,22 @@ class WristImu:
             _logger.info("wrist IMU: recording the %s camera (%d)", side, serial)
             self._recorders[side] = rec
 
+    def poll(self, side: str) -> np.ndarray:
+        """Live samples of ``side`` received since the last call, ``(n, 7)``
+        rows of ``t, acc xyz, gyro xyz`` (``live=True`` only; empty
+        otherwise). Never blocks."""
+        sock = self._socks.get(side)
+        rows = []
+        if sock is not None and side in self._recorders:
+            while True:
+                try:
+                    data = sock.recv(64)
+                except (BlockingIOError, OSError):
+                    break
+                if len(data) == _SAMPLE_SIZE:
+                    rows.append(struct.unpack(_SAMPLE_FORMAT, data))
+        return np.asarray(rows, dtype=float).reshape(-1, 7)
+
     def flush(self, timeout: float = 2.0) -> None:
         """Load the samples recorded so far without stopping — for tools that
         save a run per candidate mid-session (``tune.pid``)."""
@@ -271,6 +304,9 @@ class WristImu:
                 _logger.warning(
                     "wrist IMU: the %s camera returned no IMU samples", rec.side
                 )
+        for sock in self._socks.values():
+            sock.close()
+        self._socks.clear()
         if self._tmp is not None and all(r.stopped for r in self._recorders.values()):
             self._tmp.cleanup()
             self._tmp = None

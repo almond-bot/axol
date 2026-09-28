@@ -51,6 +51,34 @@ def fake_worker(
     _write_samples(out_path, ts, acc, gyro)
 
 
+def live_worker(
+    serial: int,
+    out_path: str,
+    ready: Any,
+    stop: Any,
+    dump: Any,
+    dumped: Any,
+    errors: Any,
+    udp_port: int | None = None,
+) -> None:
+    """``fake_worker`` that also streams each sample like the real one."""
+    from almond_axol.zed.imu_worker import _LiveSender
+    from almond_axol.zed.imu_worker import write_samples as _write_samples
+
+    live = _LiveSender(udp_port)
+    ts, acc, gyro = [], [], []
+    ready.set()
+    while not stop.is_set():
+        now = time.perf_counter()
+        a = (0.0, 0.0, 9.81 - 0.5e-3 * _W * _W * math.sin(_W * now))
+        ts.append(now)
+        acc.append(a)
+        gyro.append((0.0, 0.0, 0.0))
+        live.send(now, a, (0.0, 0.0, 0.0))
+        time.sleep(0.005)
+    _write_samples(out_path, ts, acc, gyro)
+
+
 def broken_worker(
     serial: int,
     out_path: str,
@@ -131,6 +159,27 @@ class RecorderTest(unittest.TestCase):
         finally:
             imu.stop()
         imu.stop()  # idempotent
+
+    def test_live_samples_stream_while_recording(self) -> None:
+        imu = WristImu(
+            ["right"],
+            serial_of=lambda side: 1234,
+            worker=f"{__name__}:live_worker",
+            live=True,
+        )
+        imu.start()
+        try:
+            time.sleep(1.0)
+            rows = imu.poll("right")
+            self.assertGreater(len(rows), 50)
+            self.assertEqual(rows.shape[1], 7)
+            self.assertAlmostEqual(float(np.median(rows[:, 3])), 9.81, delta=0.05)
+            now = time.perf_counter()
+            self.assertLess(now - rows[-1, 0], 0.1)  # same clock, fresh
+            self.assertEqual(len(imu.poll("right")) < 10, True)  # drained
+        finally:
+            imu.stop()
+        self.assertEqual(len(imu.poll("right")), 0)
 
     def test_no_camera_or_a_camera_that_fails_leaves_no_data(self) -> None:
         with WristImu(["left"], serial_of=lambda side: None) as imu:

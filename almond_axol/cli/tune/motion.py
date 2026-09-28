@@ -585,6 +585,39 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "reference",
     )
     p.add_argument(
+        "--imu-damp",
+        type=float,
+        default=0.0,
+        metavar="C",
+        help="Damp the tool's vertical shake from the wrist IMU: a force of "
+        "-C x the IMU's band vertical velocity (N·s/m) at the tool, applied "
+        "through --imu-damp-joint by the measured-pose Jacobian (see "
+        "almond_axol.tuning.imu_damping). Start at 5; the simulation damped "
+        "a hidden 2 Hz mode 31/44/52%% at 5/10/20 and diverged by 80. The "
+        "damper switches itself off if the shake it measures runs away",
+    )
+    p.add_argument(
+        "--imu-damp-joint",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Joints that apply the IMU damping (repeatable; default the "
+        "driven arm's shoulder_1, shoulder_2 and elbow)",
+    )
+    p.add_argument(
+        "--imu-damp-max",
+        type=float,
+        default=0.5,
+        metavar="NM",
+        help="Per-joint clamp on the IMU damping torque (default 0.5 Nm)",
+    )
+    p.add_argument(
+        "--imu-damp-alternate",
+        action="store_true",
+        help="IMU damping on every second pass only (passes 2, 4, ...), for "
+        "an A/B inside one session",
+    )
+    p.add_argument(
         "--correction",
         metavar="RUN_ID",
         help="Fly the offset a --learn run saved (that pass's 'correction') on "
@@ -791,6 +824,75 @@ def _ik_stream(solver, sent: np.ndarray, to_full, info: dict) -> np.ndarray:
         "what the run scores"
     )
     return out
+
+
+#: The height Jacobian is refreshed every this many ticks (the pose moves
+#: slowly against the shake; one batched FK of 4 poses per refresh).
+_JAC_EVERY = 4
+
+
+def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
+    """One :class:`TipDamper` per driven side, or none (``--imu-damp 0``)."""
+    from ...tuning.imu_damping import TipDamper
+
+    if args.imu_damp <= 0:
+        return {}
+    if args.no_imu:
+        raise SystemExit("tune.motion: --imu-damp needs the wrist IMU (drop --no-imu)")
+    names = [j.value for j in ARM_JOINTS]
+    sides = ["left", "right"] if args.arms == "both" else [args.arms]
+    out = {}
+    for side in sides:
+        specs = args.imu_damp_joint or [
+            f"{side}.shoulder_1",
+            f"{side}.shoulder_2",
+            f"{side}.elbow",
+        ]
+        cols = []
+        for spec in specs:
+            s_side, _, joint = spec.partition(".")
+            if joint not in names or s_side not in ("left", "right"):
+                raise SystemExit(f"--imu-damp-joint wants SIDE.JOINT, got {spec!r}")
+            if s_side == side:
+                cols.append(names.index(joint))
+        if cols:
+            out[side] = TipDamper(
+                gain=args.imu_damp, columns=tuple(cols), max_torque=args.imu_damp_max
+            )
+            print(
+                f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
+                + ", ".join(names[c] for c in cols)
+                + f" (clamp {args.imu_damp_max:g} Nm"
+                + (", alternate passes)" if args.imu_damp_alternate else ")")
+            )
+    return out
+
+
+def _height_jacobian(
+    solver: Any, q_full: np.ndarray, side: str, columns: tuple[int, ...]
+) -> np.ndarray:
+    """∂(gripper-mount height)/∂q for the arm's 7 joints (m/rad; zero outside
+    ``columns``), by central differences at ``q_full``."""
+    h = 1e-3
+    idx = solver.left_indices if side == "left" else solver.right_indices
+    rows = [q_full]
+    for c in columns:
+        for sign in (1.0, -1.0):
+            r = np.array(q_full, dtype=np.float32, copy=True)
+            r[idx[c]] += sign * h
+            rows.append(r)
+    left, right = solver.ee_positions(np.stack(rows))
+    z = (left if side == "left" else right)[:, 2]
+    jac = np.zeros(7)
+    for n, c in enumerate(columns):
+        jac[c] = (z[1 + 2 * n] - z[2 + 2 * n]) / (2 * h)
+    return jac
+
+
+def _clear_extra_torque(axol: Any) -> None:
+    for arm in (getattr(axol, "left", None), getattr(axol, "right", None)):
+        if arm is not None:
+            arm.extra_torque = None
 
 
 def _invert_stream(
@@ -1100,6 +1202,11 @@ async def _run(args: argparse.Namespace) -> None:
         )
     # The offset each pass flew, alongside passes_run.
     pass_offsets: list[np.ndarray | None] = []
+    dampers = _imu_dampers(args)
+    # Per pass: whether IMU damping flew it; per sample: the damper's view.
+    pass_damped: list[bool] = []
+    pass_damp_rows: list[tuple[int, int]] = []
+    log_damp: list[np.ndarray] = []
 
     watchdog = ContactWatchdog(args.torque_threshold)
     # Firmware-loop joints, as (side, index in the arm's 7, name), for the
@@ -1144,6 +1251,7 @@ async def _run(args: argparse.Namespace) -> None:
         waypoints: list[np.ndarray] | np.ndarray,
         record: bool = False,
         refs: np.ndarray | None = None,
+        damp: bool = False,
     ) -> tuple[str, float] | None:
         """Stream full-N waypoints at the motion rate with deadline pacing.
 
@@ -1160,10 +1268,30 @@ async def _run(args: argparse.Namespace) -> None:
         right = np.zeros(8, dtype=np.float32)
         t0 = time.perf_counter()
         deadline = t0
+        active = {side: d for side, d in dampers.items() if damp and side in imu.sides}
+        for side, d in active.items():
+            imu.poll(side)  # drop what queued between passes
+            d.start(t0)
+        jac: dict[str, np.ndarray] = {}
         for k, q in enumerate(waypoints):
             deadline += period
             left[:7] = q[solver.left_indices]
             right[:7] = q[solver.right_indices]
+            for side, d in active.items():
+                arm = axol.left if side == "left" else axol.right
+                if arm is None:
+                    continue
+                if k % _JAC_EVERY == 0 or side not in jac:
+                    jac[side] = _height_jacobian(
+                        solver, snapshot(axol), side, d.columns
+                    )
+                d.feed(imu.poll(side))
+                tau = d.torque(time.perf_counter(), jac[side])
+                arm.extra_torque = tau
+                if record:
+                    log_damp.append(
+                        np.concatenate([[d.estimator.value, float(d.tripped)], tau])
+                    )
             await axol.motion_control(
                 left=left if axol.left is not None else None,
                 right=right if axol.right is not None else None,
@@ -1210,8 +1338,17 @@ async def _run(args: argparse.Namespace) -> None:
                 )
             )
             if tripped is not None:
+                _clear_extra_torque(axol)
                 return tripped
             await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+        _clear_extra_torque(axol)
+        for side, d in active.items():
+            if d.tripped:
+                print(
+                    f"  ! IMU damping ({side}) switched itself off: the band "
+                    f"velocity passed {d.trip_speed * 1e3:.0f} mm/s for "
+                    f"{d.trip_s:g} s — lower --imu-damp"
+                )
         return None
 
     print("Planning approach and return trajectories ...")
@@ -1234,6 +1371,7 @@ async def _run(args: argparse.Namespace) -> None:
     imu = WristImu(
         ["left", "right"] if args.arms == "both" else [args.arms],
         enabled=not args.no_imu,
+        live=args.imu_damp > 0,
     )
     imu.start()
 
@@ -1291,6 +1429,13 @@ async def _run(args: argparse.Namespace) -> None:
                         learner.offset.copy() if learner is not None else fixed_offset
                     )
                     pass_offsets.append(offset)
+                    damp_this = bool(dampers) and (
+                        not args.imu_damp_alternate or k % 2 == 1
+                    )
+                    pass_damped.append(damp_this)
+                    if dampers:
+                        print(f"  IMU damping {'ON' if damp_this else 'off'} this pass")
+                    damp_start = len(log_damp)
                     playback = traj_playback
                     if offset is not None and np.any(offset):
                         playback = [
@@ -1303,9 +1448,11 @@ async def _run(args: argparse.Namespace) -> None:
                             playback,
                             record=True,
                             refs=ref if stream_differs or offset is not None else None,
+                            damp=damp_this,
                         )
                     finally:
                         passes_run[-1] = (pass_start, len(log_t))
+                        pass_damp_rows.append((damp_start, len(log_damp)))
                     if contact is not None:
                         raise _Contact(contact)
                     if learner is not None and k + 1 < args.learn:
@@ -1429,6 +1576,8 @@ async def _run(args: argparse.Namespace) -> None:
             "per_joint": per_joint,
             "completed": bool(b - a >= len(sent)),
         }
+        if pass_index < len(pass_damped):
+            summary["imu_damp"] = args.imu_damp if pass_damped[pass_index] else 0.0
         if moved:
             worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
             summary["worst_joint"] = worst[0]
@@ -1459,6 +1608,11 @@ async def _run(args: argparse.Namespace) -> None:
             series.update(imu_series)
             if log_sent:
                 series["sent"] = np.stack(log_sent[a:b])
+            if pass_index < len(pass_damp_rows):
+                d0, d1 = pass_damp_rows[pass_index]
+                if d1 > d0:
+                    # Per sample: band vertical velocity (m/s), tripped, τ (7).
+                    series["imu_damp"] = np.stack(log_damp[d0:d1]).astype(np.float32)
             if pass_index < len(pass_offsets) and pass_offsets[pass_index] is not None:
                 series["correction"] = pass_offsets[pass_index].astype(np.float32)
             label = " ".join(x for x in (args.label, tag.strip()) if x) or None

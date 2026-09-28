@@ -12,6 +12,11 @@ the camera is open, ``dumped`` after each ``dump`` request (the samples so far
 written to ``PATH``), ``error <text>`` for anything that goes wrong; ``stop``
 (or stdin closing) ends it after a final write.
 
+With ``--udp PORT`` every sample is also sent as it arrives, one datagram
+to ``127.0.0.1:PORT`` (:data:`SAMPLE_FORMAT`: t, acc xyz, gyro xyz), for a
+controller that acts on the wrist's motion live (``tune.motion
+--imu-damp``); the file dumps are unchanged.
+
 ``PATH`` is an ``.npz`` of ``t`` (``time.perf_counter`` seconds —
 ``CLOCK_MONOTONIC``, shared across processes, the clock the tuning logs use),
 ``acc`` (m/s², gravity included) and ``gyro`` (deg/s).
@@ -44,6 +49,8 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import socket
+import struct
 import sys
 import threading
 import time
@@ -57,6 +64,8 @@ _POLL_S = 0.00025
 _SILENT_S = 1.0
 # A sample this much older than the moment it is read is a leftover, not data.
 _STALE_S = 0.5
+#: One live sample: perf_counter time (s), acceleration (m/s²), gyro (deg/s).
+SAMPLE_FORMAT = "<d6f"
 
 
 def write_samples(
@@ -84,11 +93,12 @@ def record(
     dump: Any,
     dumped: Any,
     errors: Any,
+    udp_port: int | None = None,
 ) -> None:
     """Open camera ``serial`` and record its IMU until ``stop`` is set.
 
     ``ready`` / ``dumped`` are set, ``stop`` / ``dump`` polled (Event-like),
-    ``errors.put(text)`` reports a failure.
+    ``errors.put(text)`` reports a failure; ``udp_port`` streams each sample.
     """
     try:
         import pyzed.sl as sl
@@ -107,6 +117,7 @@ def record(
     ts: list[float] = []
     acc: list[tuple[float, float, float]] = []
     gyro: list[tuple[float, float, float]] = []
+    live = _LiveSender(udp_port)
     try:
         sensors = sl.SensorsData()
         # IMU stamps are UNIX nanoseconds; map them to CLOCK_MONOTONIC.
@@ -129,6 +140,7 @@ def record(
                     ts.append(stamp * 1e-9 - wall_minus_perf)
                     acc.append(tuple(imu.get_linear_acceleration()))
                     gyro.append(tuple(imu.get_angular_velocity()))
+                    live.send(ts[-1], acc[-1], gyro[-1])
             if not silent_reported and time.perf_counter() - last_new > _SILENT_S:
                 silent_reported = True
                 errors.put(f"camera {serial}: no IMU sample for {_SILENT_S:g} s")
@@ -142,6 +154,25 @@ def record(
     finally:
         zed.close()
         write_samples(out_path, ts, acc, gyro)
+
+
+class _LiveSender:
+    """Best-effort datagrams of each sample to a local port (or nothing)."""
+
+    def __init__(self, port: int | None) -> None:
+        self._sock = None
+        self._addr = ("127.0.0.1", int(port)) if port else None
+        if self._addr is not None:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.setblocking(False)
+
+    def send(self, t: float, acc: Any, gyro: Any) -> None:
+        if self._sock is None:
+            return
+        try:
+            self._sock.sendto(struct.pack(SAMPLE_FORMAT, t, *acc, *gyro), self._addr)
+        except OSError:
+            pass  # a full buffer drops a sample; the file keeps it
 
 
 class _Line:
@@ -164,6 +195,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--serial", type=int, required=True)
     p.add_argument("--out", required=True)
     p.add_argument(
+        "--udp",
+        type=int,
+        default=None,
+        metavar="PORT",
+        help="Also send each sample to 127.0.0.1:PORT as it arrives",
+    )
+    p.add_argument(
         "--worker",
         default=f"{__name__}:record",
         help="module:function to run in place of the camera (tests)",
@@ -183,8 +221,16 @@ def main(argv: list[str] | None = None) -> None:
         stop.set()
 
     threading.Thread(target=_commands, daemon=True).start()
+    extra = {"udp_port": args.udp} if args.udp else {}
     worker(
-        args.serial, args.out, _Line("ready"), stop, dump, _Line("dumped"), _Errors()
+        args.serial,
+        args.out,
+        _Line("ready"),
+        stop,
+        dump,
+        _Line("dumped"),
+        _Errors(),
+        **extra,
     )
 
 
