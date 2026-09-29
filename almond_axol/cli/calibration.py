@@ -1,5 +1,5 @@
 """
-axol calibration.pull
+axol calibration.pull / calibration.push
 
 Fetch this robot's factory calibration (friction + gravity, all joints —
 written by ``axol tune.factory``) from the cloud and cache it locally.
@@ -18,17 +18,35 @@ so anything you later tune locally (``tune.friction --save``, ``tune.pid
 No credentials needed — the calibration objects live in a public bucket
 (``axol can.setup`` also runs this pull automatically at the end of setup).
 
+``calibration.push`` goes the other way: it uploads this machine's local
+calibration file (``~/.almond/calibration.json`` — everything ``tune.friction``,
+``tune.gravity``, ``tune.pid`` and ``motion``-side tools saved on this robot)
+to the cloud under the hub serial, merged per joint over what is already
+stored there, so a robot calibrated joint by joint needs no re-run of
+``tune.factory`` to share its values. It needs the Supabase write key
+(``AXOL_SUPABASE_KEY``, as ``tune.factory`` does).
+
 Examples:
     axol calibration.pull
     axol calibration.pull --hub-serial 004800345542501420373234
+    axol calibration.push --dry-run
+    axol calibration.push
 """
 
 import argparse
 from typing import Any
 
 from ..constants import ARM_JOINTS
-from ..robot.calibration import save_factory_calibration
-from ..robot.calibration_cloud import fetch_calibration
+from ..robot.calibration import (
+    CALIBRATION_PATH,
+    load_calibration,
+    save_factory_calibration,
+)
+from ..robot.calibration_cloud import (
+    fetch_calibration,
+    push_calibration,
+    supabase_credentials,
+)
 from .can.setup import hub_serial
 
 
@@ -49,6 +67,82 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.set_defaults(func=run)
 
+    u = subparsers.add_parser(
+        "calibration.push",
+        help="Upload this robot's local calibration file to the cloud (by hub "
+        "adapter serial), merged per joint over what is stored there.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    u.add_argument(
+        "--hub-serial",
+        default=None,
+        metavar="SERIAL",
+        help="Robot identity (default: the attached Axol hub adapter's USB serial)",
+    )
+    u.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be uploaded without uploading",
+    )
+    u.set_defaults(func=run_push)
+
+
+def merge_documents(
+    cloud: dict[str, Any] | None, local: dict[str, dict[str, Any]], serial: str
+) -> dict[str, Any]:
+    """The cloud document with every joint the local file has replaced by the
+    local entry (a joint calibrated here wins as a whole; joints only the
+    cloud has are kept)."""
+    merged: dict[str, Any] = {"version": 1, "hub_serial": serial}
+    for side in ("left", "right"):
+        old = (cloud or {}).get(side)
+        side_doc = dict(old) if isinstance(old, dict) else {}
+        for joint, entry in (local.get(side) or {}).items():
+            side_doc[joint] = entry
+        if side_doc:
+            merged[side] = side_doc
+    return merged
+
+
+def run_push(args: argparse.Namespace) -> None:
+    """Upload the local calibration file for this robot."""
+    serial = args.hub_serial or hub_serial()
+    if serial is None:
+        raise SystemExit(
+            "No Axol hub adapter detected — plug the robot in (or pass "
+            "--hub-serial) so the upload knows which robot it is."
+        )
+    local = load_calibration(CALIBRATION_PATH, expected_hub_serial=serial)
+    if not any(local.get(s) for s in ("left", "right")):
+        raise SystemExit(
+            f"No calibration for hub {serial} in {CALIBRATION_PATH} — nothing to push."
+        )
+    try:
+        cloud = fetch_calibration(serial)
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: could not read the stored calibration: {exc}")
+    merged = merge_documents(cloud, local, serial)
+    print(f"Calibration for hub {serial} ({CALIBRATION_PATH}):")
+    _summarize(merged)
+    if args.dry_run:
+        print("\n(dry run — nothing uploaded)")
+        return
+    creds = supabase_credentials()
+    if creds is None:
+        raise SystemExit(
+            "No Supabase write key (AXOL_SUPABASE_KEY, plus AXOL_SUPABASE_URL "
+            "if not baked in) — cannot upload."
+        )
+    try:
+        push_calibration(creds, serial, merged)
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: {exc}")
+    print(
+        f"\nUploaded to the cloud as {serial}; any machine fetches it with "
+        "axol calibration.pull."
+    )
+
 
 def _summarize(document: dict[str, Any]) -> None:
     for side in ("left", "right"):
@@ -62,7 +156,15 @@ def _summarize(document: dict[str, Any]) -> None:
             if not isinstance(entry, dict):
                 continue
             tags = [
-                t for t, k in (("friction", "friction"), ("com", "com")) if k in entry
+                t
+                for t, k in (
+                    ("friction", "friction"),
+                    ("stribeck", "stribeck_dfs"),
+                    ("com", "com"),
+                    ("gains", "kp"),
+                    ("cogging", "cogging"),
+                )
+                if k in entry
             ]
             parts.append(f"{j.value} ({'+'.join(tags)})" if tags else j.value)
         print(f"  {side}: {', '.join(parts) if parts else '(no data)'}")
