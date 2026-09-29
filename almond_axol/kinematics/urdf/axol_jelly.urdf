@@ -13,7 +13,9 @@
      rays meet on the lens axis 2.2 mm behind the front glass); fitting real
      wrist images through each camera's factory calibration agrees within
      the fit's ~3 mm resolution. Roll puts the gripper at the bottom of the
-     image, as in real frames.
+     image, as in real frames. Head camera frames (head_camera_*_optical,
+     ZED X Mini Wide): each lens's projection centre from Stereolabs' model,
+     7.2 mm behind its front cover.
 -->
 <robot name="assembly">
     <link name="base">
@@ -873,12 +875,12 @@
         <child link="right_wrist_camera_optical" />
     </joint>
     <joint name="head_camera_left_optical_0" type="fixed">
-        <origin xyz="0.0250101 -0.107619 0.132221" rpy="-2.61799 -2.03277e-06 -3.14159" />
+        <origin xyz="0.0250101 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
         <parent link="head" />
         <child link="head_camera_left_optical" />
     </joint>
     <joint name="head_camera_right_optical_0" type="fixed">
-        <origin xyz="-0.0249785 -0.107619 0.132221" rpy="-2.61799 -2.03277e-06 -3.14159" />
+        <origin xyz="-0.0249785 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
         <parent link="head" />
         <child link="head_camera_right_optical" />
     </joint>
