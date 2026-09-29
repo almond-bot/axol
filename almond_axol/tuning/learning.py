@@ -116,6 +116,14 @@ class CommandLearner:
     band: tuple[float, float] = LEARN_BAND
     gain: float = 0.7
     max_rad: float = math.radians(1.5)
+    #: A pass this much worse than the best so far rolls back. The encoder
+    #: error repeats pass to pass to a few percent; the wrist IMU's tool
+    #: error varies ±20-40% at an unchanged offset, and at 1.15 every noisy
+    #: pass rolled back and halved the gain until learning stopped (2026-09-29).
+    worse_ratio: float = WORSE_RATIO
+    #: The gain never halves below this, so a run of noisy passes cannot
+    #: freeze the learning.
+    min_gain: float = 0.0
     offset: np.ndarray = field(init=False)
     _history: list[tuple[np.ndarray, np.ndarray]] = field(init=False)
     _best: tuple[float, np.ndarray] | None = field(init=False, default=None)
@@ -146,10 +154,10 @@ class CommandLearner:
         motion = np.zeros_like(actual)
         motion[:, cols] = band_limit(actual[:, cols], self.fs, self.band)
         self._history.append((applied, motion))
-        if self._best is not None and total > WORSE_RATIO * self._best[0]:
+        if self._best is not None and total > self.worse_ratio * self._best[0]:
             # Worse than the best pass: back to its offset, gentler steps.
             self.offset = self._best[1].copy()
-            self.gain *= 0.5
+            self.gain = max(self.gain * 0.5, self.min_gain)
             return PassReport(band_rms, total, True, self.gain, "rollback")
         if self._best is None or total < self._best[0]:
             self._best = (total, applied.copy())

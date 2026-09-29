@@ -1383,6 +1383,9 @@ async def _run(args: argparse.Namespace) -> None:
             band=(float(args.learn_band[0]), float(args.learn_band[1])),
             gain=args.learn_gain,
             max_rad=math.radians(args.learn_max_deg),
+            # The IMU's tool error is noisier pass to pass than the encoders'.
+            worse_ratio=1.5 if args.learn_imu else 1.15,
+            min_gain=0.2 if args.learn_imu else 0.0,
         )
         print(
             f"  learning: {args.learn} passes on "
