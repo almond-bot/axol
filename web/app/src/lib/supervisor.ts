@@ -701,6 +701,59 @@ export interface EpisodeControlSpec {
   autoSubmit?: boolean
 }
 
+/** One labelled line of an episode brief; a list value renders one entry per line. */
+export interface EpisodeBriefItem {
+  label: string
+  value: string | string[]
+  /** Call it out (e.g. which arm to use). */
+  emphasis?: boolean
+}
+
+/** One thing drawn in a cell of an episode brief's layout grid. */
+export interface EpisodeBriefPlacement {
+  /** Keys into the grid's `cols` / `rows`. */
+  col: string
+  row: string
+  label: string
+  detail?: string
+  /** How it is drawn: `object` (what the episode manipulates), `target` (where
+   *  it goes), `zone` (an area to keep clear / place into), `reference`,
+   *  `container`, `distractor`. Unknown roles draw neutrally. */
+  role?: string
+  /** Orientation in degrees, counter-clockwise seen from above. */
+  rotation?: number
+}
+
+/** A top-down layout diagram: rows run away from the viewer (first row
+ *  farthest), columns left to right; `footer` names the near edge. */
+export interface EpisodeBriefGrid {
+  cols: { key: string; label: string }[]
+  rows: { key: string; label: string }[]
+  items: EpisodeBriefPlacement[]
+  footer?: string
+}
+
+/**
+ * A structured instruction card for the episode about to record (or
+ * recording): e.g. a scripted scene's setup, so an operator can arrange the
+ * workspace without reading a spreadsheet. Everything but `title` optional.
+ */
+export interface EpisodeBrief {
+  /** Small caption above the title (a section / group name). */
+  eyebrow?: string
+  title: string
+  /** Short status chip beside the title ("Already recorded"). */
+  tag?: string
+  /** `done` tints the card as completed. */
+  tone?: "default" | "done"
+  /** The instruction itself, shown large. */
+  headline?: string
+  items?: EpisodeBriefItem[]
+  note?: string
+  progress?: { done: number; total: number; label?: string }
+  grid?: EpisodeBriefGrid
+}
+
 export interface PolicyState {
   phase: PolicyPhase
   episodesRecorded: number
@@ -715,6 +768,8 @@ export interface PolicyState {
   episode?: number
   /** The dataset this session records into (the dataset preview follows it). */
   dataset?: { repoId: string; root: string }
+  /** What to set up / do for this episode, as a card above the status line. */
+  brief?: EpisodeBrief
 }
 
 export interface OpStatus {
