@@ -128,33 +128,18 @@ def _pair_distances(model: AxolModel, q_left, q_right) -> dict[tuple[str, str], 
 
 class CapsuleDistanceTest(unittest.TestCase):
     def test_parallel_segments_pair_their_closest_points(self) -> None:
+        # almond-pyroki < 0.1.1 paired mismatched points for (anti)parallel
+        # segments, which read the right upper arm hanging beside the Jelly
+        # lift column 165 mm further away than it is. pyproject pins >= 0.1.1.
         import jax.numpy as jnp
-        import numpy as np
-        from pyroki.collision import _utils
-
-        from almond_axol.kinematics import model
+        from pyroki.collision._utils import closest_segment_to_segment_points
 
         # Two vertical segments 0.3 m apart, pointing opposite ways and
         # overlapping in height: the true gap is exactly 0.3 m.
         a1, b1 = jnp.array([0.0, 0.0, 0.0]), jnp.array([0.0, 0.0, 0.34])
         a2, b2 = jnp.array([0.3, 0.0, 0.3]), jnp.array([0.3, 0.0, -0.7])
-        c1, c2 = model._closest_segment_to_segment_points(a1, b1, a2, b2)
+        c1, c2 = closest_segment_to_segment_points(a1, b1, a2, b2)
         self.assertAlmostEqual(float(jnp.linalg.norm(c1 - c2)), 0.3, places=6)
-        # And it is what pyroki's capsule pairs now call.
-        self.assertIs(
-            _utils.closest_segment_to_segment_points,
-            model._closest_segment_to_segment_points,
-        )
-
-        # The stock almond-pyroki routine still gets this wrong; when this
-        # fails, the fork has the fix and model._patch_pyroki can go.
-        import importlib.util
-
-        spec = importlib.util.spec_from_file_location("stock_utils", _utils.__file__)
-        stock = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(stock)
-        s1, s2 = stock.closest_segment_to_segment_points(a1, b1, a2, b2)
-        self.assertGreater(float(np.linalg.norm(s1 - s2)), 0.31)
 
     def test_both_arms_read_the_same_clearance(self) -> None:
         # The body is symmetric, so mirrored arms must be too; the parallel
