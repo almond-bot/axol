@@ -54,14 +54,14 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
 </Note>
 
 <Accordion title="Per-joint defaults">
-  Both arms share these. `kp`/`kd` are the stiffness-`1` values (the default); the **soft** columns are what stiffness `0` blends toward. `shoulder_1` also sets `kd_host_q` to `3.0`; every other joint leaves it `null`.
+  Both arms share these. `kp`/`kd` are the stiffness-`1` values (the default); the **soft** columns are what stiffness `0` blends toward. `shoulder_1` pins its host damper at `kd_host_hz` 3.2 / `kd_host_q` 1.0 and the `elbow` at 1.6 / 1.5 (every other joint leaves both `null`: a pose-tracked centre, the shared Q); both run the Stribeck cancellation (`stribeck_gain` 0.8 / 0.5, `stribeck_pole` 40), and `shoulder_1`'s `cogging_gain` is 0. Those two joints' values come from slow-motion tuning on the jelly robot (2026-09) — slow_osc's wrist shake −44%, shoulder_1's ripple −66% against the old 250/3.5/40 and 130/5/0 sets.
 
   | Joint | `kp` | `kd` | `kd_host` | `j_eff` | `mass` (kg) | soft `kp` | soft `kd` |
   |---|---|---|---|---|---|---|---|
-  | `shoulder_1` | 250 | 3.5 | 40 | 1.27 | 1.80 | 40 | 1.4 |
+  | `shoulder_1` | 450 | 5.0 | 70 | 1.27 | 1.80 | 40 | 1.4 |
   | `shoulder_2` | 250 | 3.5 | 35 | 1.1 | 1.00 | 50 | 1.57 |
   | `shoulder_3` | 180 | 5.0 | 0 | 0.25 | 3.75 | 45 | 1.0 |
-  | `elbow` | 130 | 5.0 | 0 | 0.6 | 0.25 | 40 | 2.22 |
+  | `elbow` | 200 | 5.0 | 10 | 0.6 | 0.25 | 40 | 2.22 |
   | `wrist_1` | 180 | 1.7 | 0 | 0 | 0.25 | 30 | 0.69 |
   | `wrist_2` | 130 | 2.25 | 0 | 0 | 0.65 | 25 | 1.5 |
   | `wrist_3` | 130 | 2.0 | 0 | 0 | 0.75 | 25 | 0.9 |

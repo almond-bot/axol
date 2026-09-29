@@ -694,15 +694,38 @@ class ArmConfig:
     # tune.friction --save`` store per-robot values that override these.
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
+            # 09-28, s1_creep and slow_osc through the realtime core at 240 Hz):
+            # the notchy slow motion was a ~2 Hz spring-mass ringing on
+            # velocity-weakening friction. Stiffer (kp 450, from 250), the
+            # firmware kd at its maximum, the host damper pinned on the
+            # measured 3.2 Hz loop mode with a wider band, and the Stribeck
+            # cancellation on — with the slow_osc wrist shake down 44% and
+            # shoulder_1's ripple down 66% from the untuned 250/3.5/40 set.
+            # 480 Hz on the joint made no difference once friction was
+            # calibrated (same-session A/B, 2026-09-29).
+            kp=450.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
-            # mode is the impedance mode, moving with reflected inertia.
-            kd_host=40.0,
+            kd_host=70.0,
+            kd_host_hz=3.2,
+            # Q 1.0 (the band ±1.6 Hz around 3.2): the old pose-tracked Q=3
+            # was confined to keep the damper off a ~13 Hz mast/forearm mode
+            # the wide Q=0.8 band once fed on the reference robot (0.551 Nm /
+            # +0.0255 W, a whole-arm shudder). At Q 1.0 the band is down to
+            # 0.26 there (Q=3: 0.09); the jelly robot ran it with no buzz on
+            # either joint — re-check on a robot that shudders.
+            kd_host_q=1.0,
+            stribeck_gain=0.8,
+            stribeck_pole=40.0,
+            # The cogging series a friction sweep fits for this joint did not
+            # help (the ripple it cancels is a small, speed- and direction-
+            # dependent share of the notch): off by default, even where a
+            # calibration file carries one.
+            cogging_gain=0.0,
             firmware=_X8_STOCK_FIRMWARE_GAINS,
         )
     )
@@ -743,7 +766,12 @@ class ArmConfig:
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=130.0,
+            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
+            # 09-28, el_creep and slow_osc): stiffer (kp 200, from 130), the
+            # Stribeck cancellation on, and a gentle host damper on the
+            # elbow's own ~1.3-1.6 Hz slow-motion mode — the elbow's slow_osc
+            # ripple down 48% and its 3°/s creep ripple down 56%.
+            kp=200.0,
             # The motor-side maximum is the phase-safe lever for the loaded
             # 6.7-12.5 Hz transmission mode.
             kd=5.0,
@@ -751,11 +779,15 @@ class ArmConfig:
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # No host damping. The far-forward rust_damping event sits at
-            # 8.7-11.3 Hz while this joint's old host band was nearly fully
-            # active at 9.55 Hz. Hardware step/replay A/Bs found that term
-            # increased overshoot without removing a ring; firmware kd=5
-            # settled the joint without the host-loop phase risk.
+            # Host damping only low and narrow: the far-forward rust_damping
+            # event sits at 8.7-11.3 Hz, and the joint's old host band, active
+            # at 9.55 Hz, increased overshoot without removing a ring. At
+            # 1.6 Hz / Q 1.5 the band is down to ~0.15 at 9.5 Hz.
+            kd_host=10.0,
+            kd_host_hz=1.6,
+            kd_host_q=1.5,
+            stribeck_gain=0.5,
+            stribeck_pole=40.0,
             firmware=_X6_ROLL_STOCK_FIRMWARE_GAINS,
         )
     )
@@ -947,22 +979,9 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
-    # Both sides couple shoulder-1 into a ~13 Hz mast/forearm structural
-    # mode. With the old wide Q=0.8 shoulder damper, its high-side leakage
-    # became phase-positive at that mode: an RT control-term trace measured
-    # 0.551 Nm / +0.0255 W and a whole-arm right-side shudder (47/87/99 mdeg
-    # RMS at shoulder-1 / elbow / wrist-3); repeated left-side traces expose
-    # the same 12.5-12.9 Hz mode. Q=3 keeps unity gain at the intended,
-    # pose-tracked ~3.2 Hz shoulder mode while confining it enough to cut the
-    # right-side figures to 6/10/9 mdeg in an otherwise-identical hardware
-    # A/B. Apply it symmetrically: the structure and control law are shared,
-    # and leaving one side at Q=0.8 merely moves the excitation risk there.
-    # This shared config feeds every production control path; factory and
-    # local calibration entries can still override it.
-    arm = replace(
-        arm,
-        shoulder_1=replace(arm.shoulder_1, kd_host_q=3.0),
-    )
+    # shoulder_1's host-damper Q lives on its JointConfig (1.0, see there);
+    # it used to be forced to 3.0 here, symmetrically, against the ~13 Hz
+    # mast/forearm mode. Factory and local calibration entries override it.
     arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),

@@ -195,7 +195,10 @@ class StictionConfigTest(unittest.TestCase):
             self.assertEqual(jc.stiction_err_deg, 0.1, name)
             self.assertEqual(jc.dither_nm, 0.0, name)
             self.assertEqual(jc.wire_mode, "mit", name)
-            self.assertEqual(jc.stribeck_gain, 0.0, name)
+            # Stribeck cancellation is on where slow-motion tuning found it
+            # smoothed the joint (config.py, 2026-09-29), off elsewhere.
+            want = {"shoulder_1": 0.8, "elbow": 0.5}.get(name, 0.0)
+            self.assertEqual(jc.stribeck_gain, want, name)
 
     def test_calibration_file_can_set_the_fields(self) -> None:
         base = ArmConfig().shoulder_1
