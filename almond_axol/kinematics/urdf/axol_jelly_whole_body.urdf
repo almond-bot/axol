@@ -7,7 +7,15 @@
      the torso (lift, 0 = fully raised, per stage; the second stage mimics
      it). The world frame is the arm model's with every body joint at zero.
      The arms collide with the shoulder bar, top plate, head camera, each
-     lift-column section and the deck (deck_0..2).
+     lift-column section and the deck (deck_0..2). Wrist camera frames
+     (*_wrist_camera_optical): axis and roll are right (the axis matches
+     Stereolabs' own camera frames in the CAD; roll puts the gripper at the
+     bottom of the image, as in real frames), but the ORIGIN IS NOT THE
+     OPTICAL CENTRE: it sits at the camera body's seal ring, about 26 mm
+     behind the front glass, and the ZED X One S fisheye's projection centre
+     lies somewhere forward inside the lens (not published). Renders from
+     the wrist differ from real images by tens of pixels until the offset is
+     calibrated.
 -->
 <robot name="assembly">
     <link name="base">
@@ -869,12 +877,12 @@
     <link name="head_camera_left_optical" />
     <link name="head_camera_right_optical" />
     <joint name="left_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.24535e-06 -0.0919574 -0.0450941" rpy="-2.70526 -2.78718e-06 -1.29967e-06" />
+        <origin xyz="2.24535e-06 -0.0919574 -0.0450941" rpy="2.70526 7.56894e-06 -3.14158" />
         <parent link="left_wrist_camera" />
         <child link="left_wrist_camera_optical" />
     </joint>
     <joint name="right_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.11683e-06 -0.091963 -0.0450936" rpy="-2.70526 5.02791e-06 2.34453e-06" />
+        <origin xyz="2.11683e-06 -0.091963 -0.0450936" rpy="2.70526 -6.68559e-06 3.14159" />
         <parent link="right_wrist_camera" />
         <child link="right_wrist_camera_optical" />
     </joint>

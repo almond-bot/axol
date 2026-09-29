@@ -247,6 +247,9 @@ class CameraFramesTest(unittest.TestCase):
                 + sim.get_transform(f"{side}_finger_2")[:3, 3]
             ) / 2
             self.assertGreater((fingers - cam[:3, 3]) @ cam[:3, 2], 0.0)
+            # ...with the gripper at the bottom of the image, as in real
+            # wrist frames (+y is image down).
+            self.assertGreater((fingers - cam[:3, 3]) @ cam[:3, 1], 0.0)
 
 
 if __name__ == "__main__":

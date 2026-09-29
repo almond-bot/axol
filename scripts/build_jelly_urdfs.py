@@ -257,6 +257,17 @@ SIM_NOTE = (
     "rotation. Mesh paths are relative to this file."
 )
 
+WRIST_CAMERA_NOTE = (
+    "Wrist camera frames (*_wrist_camera_optical): axis and roll are right "
+    "(the axis matches Stereolabs' own camera frames in the CAD; roll puts "
+    "the gripper at the bottom of the image, as in real frames), but the "
+    "ORIGIN IS NOT THE OPTICAL CENTRE: it sits at the camera body's seal "
+    "ring, about 26 mm behind the front glass, and the ZED X One S "
+    "fisheye's projection centre lies somewhere forward inside the lens "
+    "(not published). Renders from the wrist differ from real images by "
+    "tens of pixels until the offset is calibrated."
+)
+
 # Masses (kg) of the non-arm links in the sim model: ESTIMATES, not measured.
 # The wrist-3 entries are carved out of AxolConfig's wrist_3 mass (which
 # lumps the whole gripper assembly), so they redistribute rather than add.
@@ -642,16 +653,26 @@ def build_meshes(
 # -- camera frames -----------------------------------------------------------
 
 
-def _frame(origin: np.ndarray, z: np.ndarray, x_hint: np.ndarray) -> np.ndarray:
-    """Right-handed frame at ``origin`` with +z along ``z`` and +x ~ ``x_hint``."""
+def _frame(
+    origin: np.ndarray,
+    z: np.ndarray,
+    x_hint: np.ndarray | None = None,
+    y_hint: np.ndarray | None = None,
+) -> np.ndarray:
+    """Right-handed frame at ``origin`` with +z along ``z`` and +x ~ ``x_hint``
+    (or +y ~ ``y_hint``)."""
     z = z / np.linalg.norm(z)
-    x = x_hint - (x_hint @ z) * z
-    x /= np.linalg.norm(x)
     frame = np.eye(4)
-    frame[:3, 0] = x
-    frame[:3, 1] = np.cross(z, x)
-    frame[:3, 2] = z
-    frame[:3, 3] = origin
+    if y_hint is not None:
+        y = y_hint - (y_hint @ z) * z
+        y /= np.linalg.norm(y)
+        x = np.cross(y, z)
+    else:
+        assert x_hint is not None
+        x = x_hint - (x_hint @ z) * z
+        x /= np.linalg.norm(x)
+        y = np.cross(z, x)
+    frame[:3, 0], frame[:3, 1], frame[:3, 2], frame[:3, 3] = x, y, z, origin
     return frame
 
 
@@ -666,27 +687,32 @@ def camera_frames(
     """Optical frames (ROS convention: +z out of the lens, +x image right,
     +y image down), as ``{link: (parent, pose in parent)}``.
 
-    - Wrist ZED X One (mono): at the centre of the lens seal ring, +z along
-      the ring's normal away from the camera body. The sensor's roll cannot
-      be read from the CAD (the body is square), so +x is taken along the
-      gripper's jaw axis (its link x) — check against a real frame; a wrong
-      guess is a 180-degree roll about +z.
+    - Wrist ZED X One S (mono fisheye): at the centre of the lens seal ring,
+      +z along the ring's normal away from the camera body. The sensor's roll
+      cannot be read from the CAD (the body is square); it is set from real
+      wrist images, which show the gripper at the bottom of the frame with
+      the fingers pointing up into the scene: +y (image down) points from the
+      lens toward that gripper's fingers. The seal ring is not the optical
+      centre, which lies somewhere forward inside the lens and is not
+      published: see WRIST_CAMERA_NOTE.
     - Head ZED X Mini (stereo): one frame per lens at the centre of its front
       cover, +z out of the camera, +x from the left lens to the right one
       (the ZED convention: the right camera sits at +x of the left). The two
       covers are checked to be the 50 mm baseline apart.
     """
     out: dict[str, tuple[str, np.ndarray]] = {}
-    for seal, lens, rear in (
+    for seal, lens, rear, fingers in (
         (
             "camera_component___seal___zed_x_one",
             "fisheye_lens",
             "camera_component___body_zed_x_one___rear",
+            ("gripper_tip", "gripper_tip_1"),
         ),
         (
             "camera_component___seal___zed_x_one_1",
             "fisheye_lens_1",
             "camera_component___body_zed_x_one___rear_1",
+            ("gripper_tip_2", "gripper_tip_3"),
         ),
     ):
         ring = in_root[seal]
@@ -697,7 +723,8 @@ def camera_frames(
             z = -z
         side = "left" if centre[1] > 0 else "right"
         parent = f"{side}_wrist_camera"
-        world = _frame(centre, z, frames(f"{side}_gripper")[:3, 0])
+        tips = np.vstack([in_root[f] for f in fingers]).mean(axis=0)
+        world = _frame(centre, z, y_hint=tips - centre)
         out[f"{side}_wrist_camera_optical"] = (
             parent,
             np.linalg.inv(frames(parent)) @ world,
@@ -1237,6 +1264,8 @@ def write_urdf(
         "compensation match it exactly; joint limits and meshes are the "
         "export's. "
         + {"arm": ARM_NOTE, "whole_body": WHOLE_BODY_NOTE, "sim": SIM_NOTE}[model]
+        + " "
+        + WRIST_CAMERA_NOTE
     )
     header = "<!-- " + textwrap.fill(note, 76, subsequent_indent="     ") + "\n-->\n"
     out_path.write_text(header + body + "\n")
