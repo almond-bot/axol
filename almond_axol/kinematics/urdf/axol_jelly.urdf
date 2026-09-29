@@ -726,9 +726,9 @@
     </joint>
     <link name="left_fingers">
         <collision>
-            <origin xyz="1.85871e-06 8.83948e-05 -0.102211" rpy="0 1.5707963267948966 0" />
+            <origin xyz="1.98195e-06 8.84465e-05 -0.102211" rpy="0 1.5707963267948966 0" />
             <geometry>
-                <cylinder radius="0.05876" length="0.15223" />
+                <cylinder radius="0.05876" length="0.1299" />
             </geometry>
         </collision>
     </link>
@@ -739,9 +739,9 @@
     </joint>
     <link name="right_fingers">
         <collision>
-            <origin xyz="2.03804e-06 8.28814e-05 -0.10221" rpy="0 1.5707963267948966 0" />
+            <origin xyz="2.31257e-06 8.28004e-05 -0.10221" rpy="0 1.5707963267948966 0" />
             <geometry>
-                <cylinder radius="0.05876" length="0.15206" />
+                <cylinder radius="0.05876" length="0.13015" />
             </geometry>
         </collision>
     </link>
@@ -865,78 +865,78 @@
     <link name="head_camera_left_optical" />
     <link name="head_camera_right_optical" />
     <joint name="left_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.33373e-06 -0.0821122 -0.0662075" rpy="2.70526 7.56894e-06 -3.14158" />
+        <origin xyz="2.45697e-06 -0.0821122 -0.0662075" rpy="2.70526 7.56617e-06 -3.14158" />
         <parent link="left_wrist_camera" />
         <child link="left_wrist_camera_optical" />
     </joint>
     <joint name="right_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.00434e-06 -0.0821178 -0.066207" rpy="2.70526 -6.68559e-06 3.14159" />
+        <origin xyz="2.70961e-06 -0.0821178 -0.066207" rpy="2.70526 -6.68623e-06 -3.14159" />
         <parent link="right_wrist_camera" />
         <child link="right_wrist_camera_optical" />
     </joint>
     <joint name="head_camera_left_optical_0" type="fixed">
-        <origin xyz="0.0250101 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
+        <origin xyz="0.0250102 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
         <parent link="head" />
         <child link="head_camera_left_optical" />
     </joint>
     <joint name="head_camera_right_optical_0" type="fixed">
-        <origin xyz="-0.0249785 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
+        <origin xyz="-0.0249784 -0.104017 0.138461" rpy="-2.61799 -2.03277e-06 -3.14159" />
         <parent link="head" />
         <child link="head_camera_right_optical" />
     </joint>
     <link name="floor" />
     <joint name="floor_0" type="fixed">
-        <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
+        <origin xyz="-0.112228 5.24549e-06 -0.46944" rpy="0 0 0" />
         <parent link="root" />
         <child link="floor" />
     </joint>
     <joint name="jelly_0" type="fixed">
-        <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
+        <origin xyz="-0.112228 5.24549e-06 -0.46944" rpy="0 0 0" />
         <parent link="root" />
         <child link="jelly" />
     </joint>
     <joint name="lift_stage_0" type="fixed">
-        <origin xyz="-0.112228 5.12225e-06 -0.46944" rpy="0 0 0" />
+        <origin xyz="-0.112228 5.24549e-06 -0.46944" rpy="0 0 0" />
         <parent link="root" />
         <child link="lift_stage" />
     </joint>
     <joint name="left_finger_1_0" type="fixed">
-        <origin xyz="0.0123745 0.0340885 -0.0542893" rpy="1.5708 -2.65359e-06 -3.14159" />
+        <origin xyz="0.0125619 0.0340885 -0.0542893" rpy="1.57079 -2.65359e-06 -3.14159" />
         <parent link="left_gripper" />
         <child link="left_finger_1" />
     </joint>
     <joint name="left_finger_2_0" type="fixed">
-        <origin xyz="-0.0123708 -0.0324116 -0.0542893" rpy="1.5708 -3.74129e-12 4.69282e-06" />
+        <origin xyz="-0.0125578 -0.0324116 -0.0542893" rpy="1.5708 -3.76379e-12 4.69282e-06" />
         <parent link="left_gripper" />
         <child link="left_finger_2" />
     </joint>
     <joint name="right_finger_1_0" type="fixed">
-        <origin xyz="0.0125623 0.0340828 -0.0542888" rpy="1.57079 -9.99998e-06 3.14159" />
+        <origin xyz="0.0125624 0.0340829 -0.0542888" rpy="1.5708 -1e-05 -3.14159" />
         <parent link="right_gripper" />
         <child link="right_finger_1" />
     </joint>
     <joint name="right_finger_2_0" type="fixed">
-        <origin xyz="-0.0125578 -0.0324171 -0.0542887" rpy="1.5708 7.34639e-06 -2.03923e-06" />
+        <origin xyz="-0.0125574 -0.0324172 -0.0542887" rpy="1.5708 7.34641e-06 3.26795e-06" />
         <parent link="right_gripper" />
         <child link="right_finger_2" />
     </joint>
     <joint name="wheel_1_link_0" type="fixed">
-        <origin xyz="0.215832 0.215834 0.06335" rpy="3.14159 0 5.30718e-06" />
+        <origin xyz="0.215834 0.215832 0.06335" rpy="3.14159 0 0" />
         <parent link="jelly" />
         <child link="wheel_1_link" />
     </joint>
     <joint name="wheel_2_link_0" type="fixed">
-        <origin xyz="0.215834 -0.215832 0.06335" rpy="0 0 0" />
+        <origin xyz="0.215832 -0.215834 0.06335" rpy="0 0 -5.30718e-06" />
         <parent link="jelly" />
         <child link="wheel_2_link" />
     </joint>
     <joint name="wheel_3_link_0" type="fixed">
-        <origin xyz="-0.215834 0.215832 0.06335" rpy="0 0 0" />
+        <origin xyz="-0.215832 0.215834 0.06335" rpy="0 0 0" />
         <parent link="jelly" />
         <child link="wheel_3_link" />
     </joint>
     <joint name="wheel_4_link_0" type="fixed">
-        <origin xyz="-0.215832 -0.215834 0.06335" rpy="3.14159 0 5.30718e-06" />
+        <origin xyz="-0.215834 -0.215832 0.06335" rpy="3.14159 0 0" />
         <parent link="jelly" />
         <child link="wheel_4_link" />
     </joint>
