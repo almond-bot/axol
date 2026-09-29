@@ -400,8 +400,13 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(line.split()[9:13], ["0.0", "0.0", "0.0", "0.0"], line)
                 # Stiction and dither terms stay off on the bench too, and
                 # every joint is on the MIT frame.
+                fields = line.split()[13:]
+                # The Stribeck *shape* (dfs, load gain, vs) is per-joint
+                # calibration data; on the bench its gain (before it) is 0.
+                self.assertEqual(fields[6], "0.0", line)
+                fields[7:10] = ["0.3", "0.1", "0.1"]
                 self.assertEqual(
-                    line.split()[13:],
+                    fields,
                     [
                         "0.0",
                         "0.0017453292519943296",

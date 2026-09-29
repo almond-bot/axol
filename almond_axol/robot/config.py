@@ -786,7 +786,7 @@ class ArmConfig:
             kd_host=10.0,
             kd_host_hz=1.6,
             kd_host_q=1.5,
-            stribeck_gain=0.5,
+            stribeck_gain=0.8,
             stribeck_pole=40.0,
             firmware=_X6_ROLL_STOCK_FIRMWARE_GAINS,
         )
@@ -883,39 +883,62 @@ class _ArmFriction:
     wrist_3: FrictionParams
 
 
-# Per-joint friction values measured with ``axol tune.friction`` on the
-# reference robot. The two arms share gains, masses, and (after mirroring)
-# CoMs, but motor-by-motor friction differs enough to be worth identifying
-# per side — and per robot: these are only the *fallback* for machines that
-# have not been calibrated. Run ``axol tune.friction --save`` on each new
-# Axol to write its own values to ``~/.almond/calibration.json``, which
-# overrides these defaults (see :mod:`almond_axol.robot.calibration`).
+# Per-joint friction fallbacks for machines without their own calibration —
+# measured on the jelly robot with ``axol tune.friction --profile slow``
+# (2026-09-28/29: 1-30 deg/s sweeps, the slow speeds at the joint's least-
+# and most-loaded angles, fitted with the realtime core's own law). They
+# replace the reference robot's 7-72 deg/s Coulomb fits, which had no load
+# dependence and whose k (742-927) the core caps at 100 anyway. Friction is
+# per motor — left and right differ (the left elbow 0.04 + 0.086|g| Nm, the
+# right 0.27 + 0.045|g|) — so run ``axol tune.friction --profile slow --save``
+# on each Axol to write its own values to ``~/.almond/calibration.json``,
+# which overrides these (see :mod:`almond_axol.robot.calibration`).
 #
-# Shoulders were swept at 0.13–0.38 rad/s only: above ~0.5 rad/s the
-# MyActuator torque telemetry on the heavy joints degrades (apparent
-# friction *decreases* with speed, scatter grows to ±10 Nm), which is what
-# produced the large phantom viscous terms in earlier fits — every joint is
-# in fact Coulomb-dominated (fv ≈ 0) except a small real viscous drag on
-# wrist_1 and right shoulder_3.
+# The ``fo`` offsets are the sweeps' mean gravity-model residuals; the large
+# shoulder_2 ones (+1.04 right, -0.61 left) made no difference to slow_osc
+# either way (same-session A/B).
 _LEFT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=0.9091, k=799.59, fv=0.0, fo=0.37),
-    shoulder_2=FrictionParams(fc=1.1378, k=756.76, fv=0.0, fo=-0.3969),
-    shoulder_3=FrictionParams(fc=0.3599, k=835.51, fv=0.0, fo=-0.0133),
-    elbow=FrictionParams(fc=0.6023, k=855.95, fv=0.0, fo=-0.072),
-    wrist_1=FrictionParams(fc=0.3765, k=88.91, fv=0.0298, fo=-0.0115),
-    wrist_2=FrictionParams(fc=0.1521, k=780.31, fv=0.0, fo=-0.0152),
-    wrist_3=FrictionParams(fc=0.0714, k=927.26, fv=0.0, fo=0.0042),
+    shoulder_1=FrictionParams(fc=0.5903, k=100.0, fv=0.0, fo=0.0733, fl=0.0491),
+    shoulder_2=FrictionParams(fc=0.4702, k=100.0, fv=0.0, fo=-0.6108, fl=0.0401),
+    shoulder_3=FrictionParams(fc=0.3664, k=100.0, fv=0.0, fo=-0.0018, fl=0.0786),
+    elbow=FrictionParams(fc=0.0382, k=100.0, fv=0.0, fo=-0.0113, fl=0.0858),
+    wrist_1=FrictionParams(fc=0.4791, k=100.0, fv=0.0, fo=0.0686),
+    wrist_2=FrictionParams(fc=0.1228, k=100.0, fv=0.0, fo=-0.0286),
+    wrist_3=FrictionParams(fc=0.2765, k=100.0, fv=0.0, fo=0.0267),
 )
 
 _RIGHT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=1.2972, k=742.11, fv=0.0, fo=-0.1557),
-    shoulder_2=FrictionParams(fc=1.3950, k=768.06, fv=0.0, fo=0.2082),
-    shoulder_3=FrictionParams(fc=0.4377, k=107.94, fv=0.0853, fo=-0.0147),
-    elbow=FrictionParams(fc=0.6066, k=784.78, fv=0.0, fo=0.049),
-    wrist_1=FrictionParams(fc=0.5245, k=98.58, fv=0.3062, fo=-0.0097),
-    wrist_2=FrictionParams(fc=0.1092, k=899.67, fv=0.0, fo=0.0021),
-    wrist_3=FrictionParams(fc=0.1172, k=204.46, fv=0.0, fo=0.0042),
+    shoulder_1=FrictionParams(fc=0.4022, k=100.0, fv=0.0, fo=-0.3074, fl=0.0544),
+    shoulder_2=FrictionParams(fc=1.3210, k=100.0, fv=0.0, fo=1.0389, fl=0.0768),
+    shoulder_3=FrictionParams(fc=0.3674, k=100.0, fv=0.0, fo=0.1217, fl=0.0550),
+    elbow=FrictionParams(fc=0.2704, k=100.0, fv=0.0, fo=0.0197, fl=0.0448),
+    wrist_1=FrictionParams(fc=0.4998, k=100.0, fv=0.0, fo=0.1562),
+    wrist_2=FrictionParams(fc=0.1923, k=100.0, fv=0.0, fo=-0.0657),
+    wrist_3=FrictionParams(fc=0.2790, k=100.0, fv=0.0, fo=-0.0392),
 )
+
+# The same sweeps' low-speed (Stribeck) excess, per side: ``(stribeck_dfs,
+# stribeck_load_gain, stribeck_vs)``. Only shoulder_1 and the elbow cancel
+# it (``stribeck_gain`` on their JointConfig); on shoulder_2/3 cancelling it
+# made slow motion rougher, and the wrists are untested.
+_LEFT_STRIBECK: dict[str, tuple[float, float, float]] = {
+    "shoulder_1": (0.9814, 0.0485, 0.1),
+    "shoulder_2": (0.6142, 0.0389, 0.0989),
+    "shoulder_3": (0.2214, 0.1685, 0.1),
+    "elbow": (0.2347, 0.1301, 0.1),
+    "wrist_1": (0.5188, 0.0, 0.1),
+    "wrist_2": (0.0828, 0.0, 0.1),
+    "wrist_3": (0.2378, 0.0, 0.1),
+}
+_RIGHT_STRIBECK: dict[str, tuple[float, float, float]] = {
+    "shoulder_1": (0.7326, 0.0335, 0.1),
+    "shoulder_2": (1.1065, 0.066, 0.0937),
+    "shoulder_3": (0.4078, 0.1479, 0.1),
+    "elbow": (0.1558, 0.1405, 0.0754),
+    "wrist_1": (0.3968, 0.0, 0.0852),
+    "wrist_2": (0.1498, 0.0, 0.1),
+    "wrist_3": (0.2439, 0.0, 0.0916),
+}
 
 
 def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
@@ -991,6 +1014,19 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         wrist_1=replace(arm.wrist_1, friction=replace(friction.wrist_1)),
         wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
         wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
+    )
+    stribeck = _LEFT_STRIBECK if is_left else _RIGHT_STRIBECK
+    arm = replace(
+        arm,
+        **{
+            name: replace(
+                getattr(arm, name),
+                stribeck_dfs=dfs,
+                stribeck_load_gain=ls,
+                stribeck_vs=vs,
+            )
+            for name, (dfs, ls, vs) in stribeck.items()
+        },
     )
     # Override order: coded defaults ← this robot's factory calibration
     # (fetched from the cloud by ``axol calibration.pull``) ← the local

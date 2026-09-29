@@ -54,7 +54,7 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
 </Note>
 
 <Accordion title="Per-joint defaults">
-  Both arms share these. `kp`/`kd` are the stiffness-`1` values (the default); the **soft** columns are what stiffness `0` blends toward. `shoulder_1` pins its host damper at `kd_host_hz` 3.2 / `kd_host_q` 1.0 and the `elbow` at 1.6 / 1.5 (every other joint leaves both `null`: a pose-tracked centre, the shared Q); both run the Stribeck cancellation (`stribeck_gain` 0.8 / 0.5, `stribeck_pole` 40), and `shoulder_1`'s `cogging_gain` is 0. Those two joints' values come from slow-motion tuning on the jelly robot (2026-09) — slow_osc's wrist shake −44%, shoulder_1's ripple −66% against the old 250/3.5/40 and 130/5/0 sets.
+  Both arms share these. `kp`/`kd` are the stiffness-`1` values (the default); the **soft** columns are what stiffness `0` blends toward. `shoulder_1` pins its host damper at `kd_host_hz` 3.2 / `kd_host_q` 1.0 and the `elbow` at 1.6 / 1.5 (every other joint leaves both `null`: a pose-tracked centre, the shared Q); both run the Stribeck cancellation (`stribeck_gain` 0.8, `stribeck_pole` 40), and `shoulder_1`'s `cogging_gain` is 0. Those two joints' values come from slow-motion tuning on the jelly robot (2026-09) — slow_osc's wrist shake −44%, shoulder_1's ripple −66% against the old 250/3.5/40 and 130/5/0 sets.
 
   | Joint | `kp` | `kd` | `kd_host` | `j_eff` | `mass` (kg) | soft `kp` | soft `kd` |
   |---|---|---|---|---|---|---|---|
@@ -68,15 +68,15 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
 </Accordion>
 
 <Accordion title="Per-motor friction defaults">
-  Fallback values of `fc`, `k`, `fv`, `fo` for each motor, measured on the reference robot with [`tune.friction`](/cli/tune-friction).
+  Fallback friction for each motor, `fc + fl·|g|` sliding (Nm, `k` 100 — the realtime core's cap) with offset `fo`, and the low-speed Stribeck excess `dfs + ls·|g|` over `vs` (rad/s). Measured on the jelly robot with [`tune.friction --profile slow`](/cli/tune-friction) (2026-09); only `shoulder_1` and `elbow` cancel the excess by default (`stribeck_gain` 0.8). Friction is per motor — calibrate each robot.
 
-  | Joint | Left arm | Right arm |
+  | Joint | Left: `fc`, `fl`, `fo` / `dfs`, `ls`, `vs` | Right: `fc`, `fl`, `fo` / `dfs`, `ls`, `vs` |
   |---|---|---|
-  | `shoulder_1` | `0.9091, 799.59, 0, 0.37` | `1.2972, 742.11, 0, −0.1557` |
-  | `shoulder_2` | `1.1378, 756.76, 0, −0.3969` | `1.3950, 768.06, 0, 0.2082` |
-  | `shoulder_3` | `0.3599, 835.51, 0, −0.0133` | `0.4377, 107.94, 0.0853, −0.0147` |
-  | `elbow` | `0.6023, 855.95, 0, −0.072` | `0.6066, 784.78, 0, 0.049` |
-  | `wrist_1` | `0.3765, 88.91, 0.0298, −0.0115` | `0.5245, 98.58, 0.3062, −0.0097` |
-  | `wrist_2` | `0.1521, 780.31, 0, −0.0152` | `0.1092, 899.67, 0, 0.0021` |
-  | `wrist_3` | `0.0714, 927.26, 0, 0.0042` | `0.1172, 204.46, 0, 0.0042` |
+  | `shoulder_1` | `0.5903, 0.0491, 0.0733` / `0.9814, 0.0485, 0.1` | `0.4022, 0.0544, −0.3074` / `0.7326, 0.0335, 0.1` |
+  | `shoulder_2` | `0.4702, 0.0401, −0.6108` / `0.6142, 0.0389, 0.0989` | `1.3210, 0.0768, 1.0389` / `1.1065, 0.066, 0.0937` |
+  | `shoulder_3` | `0.3664, 0.0786, −0.0018` / `0.2214, 0.1685, 0.1` | `0.3674, 0.0550, 0.1217` / `0.4078, 0.1479, 0.1` |
+  | `elbow` | `0.0382, 0.0858, −0.0113` / `0.2347, 0.1301, 0.1` | `0.2704, 0.0448, 0.0197` / `0.1558, 0.1405, 0.0754` |
+  | `wrist_1` | `0.4791, 0, 0.0686` / `0.5188, 0, 0.1` | `0.4998, 0, 0.1562` / `0.3968, 0, 0.0852` |
+  | `wrist_2` | `0.1228, 0, −0.0286` / `0.0828, 0, 0.1` | `0.1923, 0, −0.0657` / `0.1498, 0, 0.1` |
+  | `wrist_3` | `0.2765, 0, 0.0267` / `0.2378, 0, 0.1` | `0.2790, 0, −0.0392` / `0.2439, 0, 0.0916` |
 </Accordion>
