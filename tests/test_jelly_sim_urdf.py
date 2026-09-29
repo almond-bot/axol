@@ -177,7 +177,9 @@ class JellySimUrdfTest(unittest.TestCase):
                 jc = getattr(arm, joint.value)
                 with self.subTest(joint=name):
                     dyn = joints[name].dynamics
-                    self.assertAlmostEqual(float(dyn.friction), jc.friction.fc, places=5)
+                    self.assertAlmostEqual(
+                        float(dyn.friction), jc.friction.fc, places=5
+                    )
                     self.assertAlmostEqual(float(dyn.damping), jc.friction.fv, places=5)
                     self.assertEqual(drives[name]["stiffness"], jc.kp)
                     self.assertEqual(drives[name]["damping"], jc.kd)
