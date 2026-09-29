@@ -161,16 +161,14 @@ class JellySimUrdfTest(unittest.TestCase):
             self.assertTrue((JELLY_SIM_URDF.parent / ref).is_file(), ref)
 
     def test_joint_friction_and_drive_gains_are_axol_configs(self) -> None:
-        import json
-
         from almond_axol.constants import urdf_joint_name
 
         cfg = AxolConfig().resolved()
-        drives = json.loads(
-            (JELLY_SIM_URDF.parent / "axol_jelly_sim_drives.json").read_text()
-        )["joints"]
         joints = {j.name: j for j in self.sim.robot.joints}
-        self.assertEqual(set(drives), set(ARM_JOINT_NAMES))
+        drives = {j.attrib["name"]: j.find("drive") for j in self.root.findall("joint")}
+        self.assertEqual(
+            {name for name, d in drives.items() if d is not None}, set(ARM_JOINT_NAMES)
+        )
         for arm, side in ((cfg.left, True), (cfg.right, False)):
             for joint in ARM_JOINTS:
                 name = urdf_joint_name(joint, is_left=side)
@@ -181,8 +179,9 @@ class JellySimUrdfTest(unittest.TestCase):
                         float(dyn.friction), jc.friction.fc, places=5
                     )
                     self.assertAlmostEqual(float(dyn.damping), jc.friction.fv, places=5)
-                    self.assertEqual(drives[name]["stiffness"], jc.kp)
-                    self.assertEqual(drives[name]["damping"], jc.kd)
+                    drive = drives[name].attrib
+                    self.assertAlmostEqual(float(drive["stiffness"]), jc.kp, places=5)
+                    self.assertAlmostEqual(float(drive["damping"]), jc.kd, places=5)
 
     def test_a_physics_engine_loads_it(self) -> None:
         xml = JELLY_SIM_URDF.read_text().replace(
