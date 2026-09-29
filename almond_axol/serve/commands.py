@@ -167,7 +167,9 @@ class CommandDef:
         # Lazy loader for an episode-control class, constructed as
         # ``cls(stop_event)`` and handed to the entrypoint as ``control``. It
         # must expose ``push(command: str)`` for API-pushed decisions and
-        # ``snapshot() -> dict`` for the phase the panel renders.
+        # ``snapshot() -> dict`` for the phase the panel renders (the web
+        # app's ``PolicyState``: phase, message, controls, episode, dataset,
+        # and an optional ``brief`` instruction card).
         self._episode_control = episode_control
         # Config keys the panel surfaces per run; everything else comes from
         # the shared settings, folded in server-side.

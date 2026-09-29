@@ -36,6 +36,7 @@ import { CuratedForm } from "@/components/config-form"
 import type { FieldSuggestion } from "@/components/suggest-input"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
+import { EpisodeBriefCard } from "@/components/episode-brief"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -938,6 +939,7 @@ export function EpisodeControls({
           {policy?.episodesRecorded ?? 0} saved
         </span>
       </div>
+      {policy?.brief && <EpisodeBriefCard brief={policy.brief} phase={phase} />}
       <span className="text-sm text-white/60">{displayStatus}</span>
       {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
