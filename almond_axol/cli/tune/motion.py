@@ -585,6 +585,23 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "reference",
     )
     p.add_argument(
+        "--notch",
+        type=float,
+        action="append",
+        default=[],
+        metavar="HZ",
+        help="Notch the streamed motion at HZ (repeatable) with teleop's "
+        "command notch (VRTeleopConfig.command_notch_hz: causal biquads "
+        "between the IK EMA and the tracker) — for structural modes the joint "
+        "loops cannot damp; scored against the clean reference",
+    )
+    p.add_argument(
+        "--notch-q",
+        type=float,
+        default=2.0,
+        help="Quality factor of the --notch filters (default 2.0; bandwidth f0/Q)",
+    )
+    p.add_argument(
         "--imu-damp",
         type=float,
         default=0.0,
@@ -1191,6 +1208,21 @@ async def _run(args: argparse.Namespace) -> None:
     if args.invert:
         sent = _invert_stream(sent, ref, holds, overrides, motion.rate, args.arms)
         stream_differs = True
+    if args.notch:
+        from ...teleop.filter import NotchFilter
+
+        notch = NotchFilter(args.notch, args.notch_q, motion.rate)
+        rows = np.asarray(sent, dtype=float)
+        notch.reset(rows[0])
+        sent = np.stack([notch.update(r) for r in rows]).astype(float)
+        for col in holds:
+            sent[:, col] = rows[:, col]
+        stream_differs = True
+        print(
+            "  notch: "
+            + ", ".join(f"{f:g} Hz" for f in args.notch)
+            + f" (Q {args.notch_q:g}) on the streamed motion"
+        )
     n_wp = len(sent)
     ref_arr = np.asarray(ref, dtype=float)
     learner: CommandLearner | None = None
