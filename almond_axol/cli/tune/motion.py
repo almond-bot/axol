@@ -1575,6 +1575,15 @@ async def _run(args: argparse.Namespace) -> None:
         live=args.imu_damp > 0,
     )
     imu.start()
+    needs_imu = args.learn_imu or args.imu_damp > 0
+    if needs_imu and not imu.sides:
+        imu.stop()
+        raise SystemExit(
+            "tune.motion: the wrist IMU did not start (camera did not open) and "
+            + ("--learn-imu" if args.learn_imu else "--imu-damp")
+            + " needs it — nothing moved. If the ZED stack is wedged, restart "
+            "it (sudo systemctl restart zed_x_daemon) and try again."
+        )
 
     async with robot as axol:
         contact: tuple[str, float] | None = None
