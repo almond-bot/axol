@@ -209,6 +209,10 @@ COMMON_HULLS = (
 # along y stay within a few cm of it.
 DECK_STRIPS = 3
 
+# Visual meshes the wrist cameras see up close (5-10 cm): simplified to the
+# tight tolerance so renders from the wrist match real images.
+CAMERA_VIEWED = ("_gripper", "_finger_1", "_finger_2")
+
 _CYLINDER_RPY = {0: "0 1.5707963267948966 0", 1: "-1.5707963267948966 0 0", 2: "0 0 0"}
 
 # Frame at the ground under the robot (the export's root), in the IK models.
@@ -475,13 +479,8 @@ def _cluster(mesh: trimesh.Trimesh, cell: float) -> trimesh.Trimesh:
     return out
 
 
-def _decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
-    """Quadric decimation, falling back to grid clustering where it stalls.
-
-    CAD fasteners and connectors (thread flanks, knurling) often defeat the
-    quadric simplifier; clustering always converges and is plenty for a
-    viewer mesh.
-    """
+def _simplify(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
+    """Quadric decimation, falling back to grid clustering where it stalls."""
     import fast_simplification
 
     if len(mesh.faces) <= target:
@@ -489,12 +488,44 @@ def _decimate(mesh: trimesh.Trimesh, target: int) -> trimesh.Trimesh:
     v, f = fast_simplification.simplify(
         mesh.vertices, mesh.faces, 1.0 - target / len(mesh.faces)
     )
-    mesh = trimesh.Trimesh(v, f)
+    out = trimesh.Trimesh(v, f)
     cell = 5e-4
-    while len(mesh.faces) > target * 1.2:
-        mesh = _cluster(mesh, cell)
+    while len(out.faces) > target * 1.2:
+        out = _cluster(out, cell)
         cell *= 1.5
-    return mesh
+    return out
+
+
+def _deviation(a: trimesh.Trimesh, b: trimesh.Trimesh, n: int = 4000) -> float:
+    """Symmetric surface deviation (m, 99th percentile of sampled distances)."""
+    pa = trimesh.sample.sample_surface(a, n, seed=0)[0]
+    pb = trimesh.sample.sample_surface(b, n, seed=1)[0]
+    d = np.r_[
+        trimesh.proximity.closest_point(b, pa)[1],
+        trimesh.proximity.closest_point(a, pb)[1],
+    ]
+    return float(np.percentile(d, 99))
+
+
+def _decimate(
+    mesh: trimesh.Trimesh, target: int, tolerance: float
+) -> tuple[trimesh.Trimesh, float]:
+    """The smallest simplification within ``tolerance`` of the CAD surface.
+
+    Simplifying CAD parts is lossy in ways that matter at camera range (the
+    wrist camera sees the gripper from 5-10 cm): an unchecked pass once left
+    the gripper body 7 mm short and up to 27 mm off the CAD surface. The face
+    budget doubles until the result is within ``tolerance``; parts that never
+    get there keep their full CAD mesh.
+    """
+    budget = target
+    while budget < len(mesh.faces):
+        candidate = _simplify(mesh, budget)
+        error = _deviation(mesh, candidate)
+        if error <= tolerance:
+            return candidate, error
+        budget *= 2
+    return mesh, 0.0
 
 
 class Frames:
@@ -531,6 +562,8 @@ def build_meshes(
     frames: Frames,
     min_part: float,
     visual_faces: int,
+    tolerance: float,
+    loose_tolerance: float,
 ) -> tuple[
     dict[str, list[tuple[str, tuple[float, ...]]]],
     dict[str, tuple[str, list[np.ndarray]]],
@@ -586,14 +619,23 @@ def build_meshes(
         old.unlink()
     visuals: dict[str, list[tuple[str, tuple[float, ...]]]] = defaultdict(list)
     counters: dict[str, int] = defaultdict(int)
+    worst = tight = (0.0, "")
     for (target, rgba), meshes in sorted(by_color.items()):
         merged = trimesh.util.concatenate(meshes)
         merged.merge_vertices()
-        merged = _decimate(merged, visual_faces)
+        tol = tolerance if target.endswith(CAMERA_VIEWED) else loose_tolerance
+        merged, error = _decimate(merged, visual_faces, tol)
+        worst = max(worst, (error, target))
+        if target.endswith(CAMERA_VIEWED):
+            tight = max(tight, (error, target))
         name = f"{target}_{counters[target]}.stl"
         counters[target] += 1
         merged.export(URDF_DIR / MESH_SUBDIR / name)
         visuals[target].append((f"{MESH_SUBDIR}/{name}", rgba))
+    print(
+        f"visual meshes: worst deviation {worst[0] * 1e3:.2f} mm ({worst[1]}); "
+        f"camera-viewed {tight[0] * 1e3:.2f} mm ({tight[1]})"
+    )
     return visuals, pieces, {k: np.vstack(v) for k, v in in_root.items()}
 
 
@@ -1208,6 +1250,19 @@ def main() -> None:
     )
     ap.add_argument("--min-part-mm", type=float, default=15.0)
     ap.add_argument("--visual-faces", type=int, default=2000)
+    ap.add_argument(
+        "--visual-tolerance-mm",
+        type=float,
+        default=0.3,
+        help="largest deviation from the CAD of what the wrist cameras see "
+        "(grippers and fingers)",
+    )
+    ap.add_argument(
+        "--loose-tolerance-mm",
+        type=float,
+        default=1.0,
+        help="largest deviation from the CAD of every other visual mesh",
+    )
     args = ap.parse_args()
     urdfs = sorted((args.export_dir / "urdf").glob("*.urdf"))
     if len(urdfs) != 1:
@@ -1228,7 +1283,13 @@ def main() -> None:
         print(f"  {name:12s} [{lo:+.4f}, {hi:+.4f}]{mark}")
     frames = Frames(classic, export, tf)
     visuals, pieces, in_root = build_meshes(
-        export, args.export_dir, frames, args.min_part_mm, args.visual_faces
+        export,
+        args.export_dir,
+        frames,
+        args.min_part_mm,
+        args.visual_faces,
+        args.visual_tolerance_mm * 1e-3,
+        args.loose_tolerance_mm * 1e-3,
     )
     cameras = camera_frames(in_root, frames)
     col = Collision(frames, pieces, export)
