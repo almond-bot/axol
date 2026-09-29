@@ -546,6 +546,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "this motion: it measures what each joint needed.",
     )
     p.add_argument(
+        "--learn-imu",
+        action="store_true",
+        help="With --learn: the error the learning cancels is the tool's "
+        "vertical deviation from its commanded path as the wrist IMU measures "
+        "it — including flex the joint encoders cannot see — spread over the "
+        "learned joints by their lever arms, instead of each joint's encoder "
+        "error. Tests whether joint commands can cancel that motion at all "
+        "(single driven arm with its wrist camera)",
+    )
+    p.add_argument(
         "--learn-gain",
         type=float,
         default=0.7,
@@ -1061,6 +1071,135 @@ def _learn_step(
     )
 
 
+def _tool_error_as_joints(
+    t: np.ndarray,
+    imu_t: np.ndarray,
+    imu_acc: np.ndarray,
+    imu_gyro: np.ndarray | None,
+    ref: np.ndarray,
+    columns: np.ndarray,
+    side: str,
+    to_full: Any,
+    solver: Any,
+    band: tuple[float, float],
+) -> tuple[np.ndarray, float]:
+    """The wrist IMU's tool-height error mapped onto the learned joints.
+
+    The IMU's vertical displacement in ``band`` (gravity-projected, twice
+    integrated) against the commanded tool height through the same band; the
+    difference is spread over ``columns`` by the height Jacobian's
+    minimum-norm inverse (each joint takes its lever's share). Returns the
+    ``(N, 14)`` joint-space error (command minus actual convention) and the
+    tool error's RMS (m).
+    """
+    from ...tuning.learning import band_limit
+    from ...tuning.wrist_imu import _band_integrate
+
+    fs_i = 1.0 / float(np.median(np.diff(imu_t)))
+    grid = np.arange(imu_t[0], imu_t[-1], 1.0 / fs_i)
+    acc = np.stack([np.interp(grid, imu_t, imu_acc[:, i]) for i in range(3)], 1)
+    # Vertical acceleration with gravity carried through the camera's
+    # rotation by the gyro: the wrist turns tens of degrees in a motion, and
+    # a fixed "up" leaks that tilt in as fake vertical motion at the band's
+    # low edge, where double integration amplifies it most.
+    up = acc[: int(fs_i)].mean(axis=0)
+    a_v = np.empty(len(grid))
+    gyro = (
+        np.radians(
+            np.stack([np.interp(grid, imu_t, imu_gyro[:, i]) for i in range(3)], 1)
+        )
+        if imu_gyro is not None
+        else None
+    )
+    dt = 1.0 / fs_i
+    for n in range(len(grid)):
+        if gyro is not None:
+            up = up - np.cross(gyro[n], up) * dt
+        up = up + (acc[n] - up) * (dt / 2.0)
+        gn = float(np.linalg.norm(up)) or 9.80665
+        a_v[n] = float(acc[n] @ up) / gn - gn
+    z_imu = np.interp(t, grid, _band_integrate(a_v[:, None], fs_i, band)[:, 0])
+    fs = 1.0 / float(np.median(np.diff(t)))
+    full = np.stack([to_full(r) for r in ref]).astype(np.float32)
+    left, right = solver.ee_positions(full)
+    z_cmd = band_limit((left if side == "left" else right)[:, 2], fs, band)
+    tool_err = z_cmd - z_imu  # positive: the tool is below its path
+    idx = solver.left_indices if side == "left" else solver.right_indices
+    base = 0 if side == "left" else 7
+    cols = [c for c in np.where(columns)[0] if base <= c < base + 7]
+    step = 12
+    sub = np.arange(0, len(full), step)
+    jac = np.zeros((len(sub), len(cols)))
+    h = 1e-3
+    for n, c in enumerate(cols):
+        pert = full[sub].copy()
+        pert[:, idx[c - base]] += h
+        lp, rp = solver.ee_positions(pert)
+        jac[:, n] = (
+            (lp if side == "left" else rp)[:, 2]
+            - (left if side == "left" else right)[sub, 2]
+        ) / h
+    jac_full = np.stack(
+        [np.interp(np.arange(len(full)), sub, jac[:, n]) for n in range(len(cols))], 1
+    )
+    norm = np.maximum(np.sum(jac_full**2, axis=1), 1e-6)
+    err = np.zeros((len(ref), len(columns)))
+    for n, c in enumerate(cols):
+        err[:, c] = jac_full[:, n] * tool_err / norm
+    return err, float(np.std(tool_err))
+
+
+def _learn_step_imu(
+    learner: CommandLearner,
+    k: int,
+    imu: Any,
+    arms: str,
+    t: np.ndarray,
+    t_abs: np.ndarray,
+    ref: np.ndarray,
+    to_full: Any,
+    solver: Any,
+) -> None:
+    """``--learn-imu``: feed the learner the IMU-measured tool error."""
+    side = arms if arms in ("left", "right") else "right"
+    if len(t) < learner.n:
+        print(f"  learning: pass {k + 1} cut short — offset left unchanged")
+        return
+    imu.flush()
+    w = imu.window(
+        side, float(t_abs[0]), float(t_abs[-1]), origin=float(t_abs[0] - t[0])
+    )
+    if w is None or len(w["t"]) < 100:
+        print(
+            f"  learning: pass {k + 1} has no {side} wrist IMU data — offset left unchanged"
+        )
+        return
+    err, tool_rms = _tool_error_as_joints(
+        t[: learner.n],
+        w["t"],
+        w["acc"],
+        w.get("gyro"),
+        ref[: learner.n],
+        learner.columns,
+        side,
+        to_full,
+        solver,
+        learner.band,
+    )
+    # The learner cancels ``ref - actual``; hand it the tool error that way.
+    rep = learner.update(ref[: learner.n], ref[: learner.n] - err)
+    action = {
+        "first": "first step (error advanced by the lag)",
+        "model": f"model step (gain {rep.gain:g})",
+        "rollback": f"worse than the best pass — rolled back, gain now {rep.gain:g}",
+    }[rep.step]
+    print(
+        f"  learning (IMU): pass {k + 1} tool error {tool_rms * 1e3:.2f} mm rms "
+        f"({learner.band[0]:g}-{learner.band[1]:g} Hz) → {action}; next offset "
+        f"peak {math.degrees(float(np.abs(learner.offset).max())):.3f}°"
+    )
+
+
 async def _run(args: argparse.Namespace) -> None:
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
@@ -1113,6 +1252,12 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"  impedance rate: {side}.{joint} = {FAST_IMPEDANCE_HZ:.0f} Hz")
     if args.repeat < 0:
         raise SystemExit("tune.motion: --repeat must be 0 (until Ctrl-C) or more")
+    if args.learn_imu and not args.learn:
+        raise SystemExit("tune.motion: --learn-imu goes with --learn N")
+    if args.learn_imu and (args.no_imu or args.arms == "both"):
+        raise SystemExit(
+            "tune.motion: --learn-imu needs one driven arm and its wrist IMU"
+        )
     if args.learn:
         if args.learn < 2:
             raise SystemExit("tune.motion: --learn needs at least 2 passes")
@@ -1511,7 +1656,19 @@ async def _run(args: argparse.Namespace) -> None:
                         pass_damp_rows.append((damp_start, len(log_damp)))
                     if contact is not None:
                         raise _Contact(contact)
-                    if learner is not None and k + 1 < args.learn:
+                    if learner is not None and k + 1 < args.learn and args.learn_imu:
+                        _learn_step_imu(
+                            learner,
+                            k,
+                            imu,
+                            args.arms,
+                            np.asarray(log_t[pass_start:]),
+                            np.asarray(log_abs[pass_start:]),
+                            ref_arr,
+                            to_full,
+                            solver,
+                        )
+                    elif learner is not None and k + 1 < args.learn:
                         _learn_step(
                             learner,
                             k,
