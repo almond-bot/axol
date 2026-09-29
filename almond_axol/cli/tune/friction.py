@@ -101,9 +101,13 @@ _WINDOW_BELOW_DEG = 8.0
 _WINDOW_S = 15.0
 _WINDOW_MIN_DEG = 8.0
 #: Default share of the fitted low-speed excess the runtime cancels
-#: (``stribeck_gain``): right shoulder_1's creep ripple was lowest at 0.8
-#: (2026-09-24, round 5/6).
-DEFAULT_STRIBECK_GAIN = 0.8
+#: (``stribeck_gain``), per joint. On for shoulder_1 and the elbow (right
+#: shoulder_1's creep ripple was lowest at 0.8, 2026-09-24). Off elsewhere:
+#: on the jelly robot's right shoulder_2 / shoulder_3 it raised the slow_osc
+#: ripple 30% / 18% against the same calibration without it — under
+#: shoulder_2's ~17 Nm load the fitted excess is ~2 Nm, driven by the
+#: measured velocity (2026-09-29) — and on the wrists it is untested.
+DEFAULT_STRIBECK_GAIN = {Joint.SHOULDER_1: 0.8, Joint.ELBOW: 0.8}
 
 
 async def _ramp_to(
@@ -934,6 +938,12 @@ def fit_and_report(
     return fit
 
 
+def _stribeck_gain(args: argparse.Namespace, joint: Joint) -> float:
+    if args.stribeck_gain is not None:
+        return float(args.stribeck_gain)
+    return DEFAULT_STRIBECK_GAIN.get(joint, 0.0)
+
+
 def save_slow_fit(fit: "FrictionFit", side: str, joint: Joint, gain: float) -> Path:
     path = update_joint_calibration(
         side,
@@ -991,9 +1001,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--stribeck-gain",
         type=float,
-        default=DEFAULT_STRIBECK_GAIN,
+        default=None,
         help="Share of the fitted low-speed excess the runtime cancels, saved "
-        f"with --profile slow (default {DEFAULT_STRIBECK_GAIN:g})",
+        "with --profile slow (default 0.8 on shoulder_1 and the elbow, 0 "
+        "elsewhere: on shoulder_2/3 it made slow motion rougher)",
     )
     p.add_argument(
         "--fit-csv",
@@ -1106,7 +1117,7 @@ async def _run(args: argparse.Namespace) -> None:
         print(f"\nFitting {side_str} {joint.value} from {len(data['q'])} saved samples")
         fit = fit_and_report(data, joint, is_left, other_targets)
         if fit is not None and args.save:
-            save_slow_fit(fit, side_str, joint, args.stribeck_gain)
+            save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
         elif fit is not None:
             print("\n  (re-run with --save to persist)")
         return
@@ -1186,7 +1197,7 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 fit = fit_and_report(rows, joint, is_left, other_targets)
                 if fit is not None and args.save:
-                    save_slow_fit(fit, side_str, joint, args.stribeck_gain)
+                    save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
                 elif fit is not None:
                     print("\n  (re-run with --save to persist)")
                 return
