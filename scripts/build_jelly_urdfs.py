@@ -258,14 +258,12 @@ SIM_NOTE = (
 )
 
 WRIST_CAMERA_NOTE = (
-    "Wrist camera frames (*_wrist_camera_optical): axis and roll are right "
-    "(the axis matches Stereolabs' own camera frames in the CAD; roll puts "
-    "the gripper at the bottom of the image, as in real frames), but the "
-    "ORIGIN IS NOT THE OPTICAL CENTRE: it sits at the camera body's seal "
-    "ring, about 26 mm behind the front glass, and the ZED X One S "
-    "fisheye's projection centre lies somewhere forward inside the lens "
-    "(not published). Renders from the wrist differ from real images by "
-    "tens of pixels until the offset is calibrated."
+    "Wrist camera frames (*_wrist_camera_optical, ZED X One S fisheye): the "
+    "origin is Stereolabs' fisheye-lens reference frame from the camera's "
+    "CAD, 18.9 mm ahead of the body's seal ring on the lens axis; fitting "
+    "real wrist images through each camera's factory calibration put the "
+    "projection centre within 0.6 mm of it on both arms. Roll puts the "
+    "gripper at the bottom of the image, as in real frames."
 )
 
 # Masses (kg) of the non-arm links in the sim model: ESTIMATES, not measured.
@@ -687,32 +685,36 @@ def camera_frames(
     """Optical frames (ROS convention: +z out of the lens, +x image right,
     +y image down), as ``{link: (parent, pose in parent)}``.
 
-    - Wrist ZED X One S (mono fisheye): at the centre of the lens seal ring,
-      +z along the ring's normal away from the camera body. The sensor's roll
+    - Wrist ZED X One S (mono fisheye): at Stereolabs' fisheye-lens
+      reference frame from the camera's CAD, which sits on the lens axis
+      18.9 mm ahead of the body's seal ring; +z along the ring's normal away
+      from the camera body. Fitting real wrist images (both arms, each
+      camera's factory calibration) put the projection centre within
+      0.6 mm of it. The sensor's roll
       cannot be read from the CAD (the body is square); it is set from real
       wrist images, which show the gripper at the bottom of the frame with
       the fingers pointing up into the scene: +y (image down) points from the
-      lens toward that gripper's fingers. The seal ring is not the optical
-      centre, which lies somewhere forward inside the lens and is not
-      published: see WRIST_CAMERA_NOTE.
+      lens toward that gripper's fingers.
     - Head ZED X Mini (stereo): one frame per lens at the centre of its front
       cover, +z out of the camera, +x from the left lens to the right one
       (the ZED convention: the right camera sits at +x of the left). The two
       covers are checked to be the 50 mm baseline apart.
     """
     out: dict[str, tuple[str, np.ndarray]] = {}
-    for seal, lens, rear, fingers in (
+    for seal, lens, rear, fingers, lens_frame in (
         (
             "camera_component___seal___zed_x_one",
             "fisheye_lens",
             "camera_component___body_zed_x_one___rear",
             ("gripper_tip", "gripper_tip_1"),
+            "fisheye_lens__1_",
         ),
         (
             "camera_component___seal___zed_x_one_1",
             "fisheye_lens_1",
             "camera_component___body_zed_x_one___rear_1",
             ("gripper_tip_2", "gripper_tip_3"),
+            "fisheye_lens__1__1",
         ),
     ):
         ring = in_root[seal]
@@ -723,8 +725,23 @@ def camera_frames(
             z = -z
         side = "left" if centre[1] > 0 else "right"
         parent = f"{side}_wrist_camera"
+        # The optical centre: Stereolabs' own fisheye-lens reference frame in
+        # the camera's CAD, on the ring's axis ahead of it. Fitting real wrist
+        # images through each camera's factory calibration put the
+        # projection centre +19.0-19.5 mm ahead of the ring on both arms;
+        # this frame is +18.9 mm.
+        lens_origin = (
+            frames.tf @ frames.export.get_transform(lens_frame, frames.export.base_link)
+        )[:3, 3]
+        ahead = float((lens_origin - centre) @ z)
+        off_axis = float(np.linalg.norm((lens_origin - centre) - ahead * z))
+        if not (0.010 < ahead < 0.030) or off_axis > 5e-4:
+            raise SystemExit(
+                f"{lens_frame} is not on the lens axis ahead of the seal ring "
+                f"({ahead * 1e3:.1f} mm ahead, {off_axis * 1e3:.2f} mm off axis)"
+            )
         tips = np.vstack([in_root[f] for f in fingers]).mean(axis=0)
-        world = _frame(centre, z, y_hint=tips - centre)
+        world = _frame(lens_origin, z, y_hint=tips - centre)
         out[f"{side}_wrist_camera_optical"] = (
             parent,
             np.linalg.inv(frames(parent)) @ world,

@@ -8,14 +8,12 @@
      collide with the shoulder bar (s1), the lift column (base), its top
      plate (lift_plate) and the head-camera mount (head), exactly as the
      classic arms collide with the classic base and s1. Wrist camera frames
-     (*_wrist_camera_optical): axis and roll are right (the axis matches
-     Stereolabs' own camera frames in the CAD; roll puts the gripper at the
-     bottom of the image, as in real frames), but the ORIGIN IS NOT THE
-     OPTICAL CENTRE: it sits at the camera body's seal ring, about 26 mm
-     behind the front glass, and the ZED X One S fisheye's projection centre
-     lies somewhere forward inside the lens (not published). Renders from
-     the wrist differ from real images by tens of pixels until the offset is
-     calibrated.
+     (*_wrist_camera_optical, ZED X One S fisheye): the origin is
+     Stereolabs' fisheye-lens reference frame from the camera's CAD, 18.9 mm
+     ahead of the body's seal ring on the lens axis; fitting real wrist
+     images through each camera's factory calibration put the projection
+     centre within 0.6 mm of it on both arms. Roll puts the gripper at the
+     bottom of the image, as in real frames.
 -->
 <robot name="assembly">
     <link name="base">
@@ -865,12 +863,12 @@
     <link name="head_camera_left_optical" />
     <link name="head_camera_right_optical" />
     <joint name="left_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.24535e-06 -0.0919574 -0.0450941" rpy="2.70526 7.56894e-06 -3.14158" />
+        <origin xyz="2.3035e-06 -0.0839662 -0.0622315" rpy="2.70526 7.56894e-06 -3.14158" />
         <parent link="left_wrist_camera" />
         <child link="left_wrist_camera_optical" />
     </joint>
     <joint name="right_wrist_camera_optical_0" type="fixed">
-        <origin xyz="2.11683e-06 -0.091963 -0.0450936" rpy="2.70526 -6.68559e-06 3.14159" />
+        <origin xyz="2.01193e-06 -0.0839718 -0.0622309" rpy="2.70526 -6.68559e-06 3.14159" />
         <parent link="right_wrist_camera" />
         <child link="right_wrist_camera_optical" />
     </joint>
