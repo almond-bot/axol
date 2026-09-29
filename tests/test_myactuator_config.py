@@ -95,6 +95,18 @@ class MyActuatorConfigTest(unittest.IsolatedAsyncioTestCase):
         dumped = await motor.dump_config()
         self.assertEqual(dumped[MyActuatorParam.MAX_TORQUE], 129.0)
 
+    async def test_2nd_encoder_mode_also_writes_its_resolution(self) -> None:
+        motor, bus = _motor(_OLD_FW)
+        await motor.write_config(MyActuatorParam.ENABLE_2ND_ENCODER, 3)
+        self.assertEqual(bus.writes, [(0x29, 3.0), (0x3C, 131072.0)])
+        bus.writes.clear()
+        await motor.write_config(MyActuatorParam.ENABLE_2ND_ENCODER, 2)
+        self.assertEqual(bus.writes, [(0x29, 2.0), (0x3C, 16384.0)])
+        bus.writes.clear()
+        # Disabled / mode 1 leave the resolution alone, as the setup software does.
+        await motor.write_config(MyActuatorParam.ENABLE_2ND_ENCODER, 0)
+        self.assertEqual(bus.writes, [(0x29, 0.0)])
+
 
 if __name__ == "__main__":
     unittest.main()
