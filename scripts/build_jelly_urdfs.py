@@ -355,7 +355,7 @@ def align(
             lines.append((*_axis_line(classic, c), *_axis_line(export, e)))
     d_c = np.array([ln[1] for ln in lines])
     d_e = np.array([ln[3] for ln in lines])
-    best = None
+    fits = []
     for signs in itertools.product((1.0, -1.0), repeat=len(CLASSIC_JOINTS)):
         sg = np.array(signs * 2)
         u, _, vt = np.linalg.svd((d_e * sg[:, None]).T @ d_c)
@@ -363,14 +363,19 @@ def align(
         if np.linalg.det(rot) < 0:
             continue
         err = np.linalg.norm((rot @ (d_e * sg[:, None]).T).T - d_c)
-        if best is None or err < best[0]:
-            best = (err, sg, rot)
-    assert best is not None
-    err, sg, rot = best
+        fits.append((err, sg, rot))
+    err = min(f[0] for f in fits)
     if err > 1e-3:
         raise SystemExit(
             f"arm joint axes do not match the classic arms (err {err:.2e})"
         )
+    # Axis directions carry no sign, and the two arms mirror each other, so
+    # the robot turned half a turn fits the axes as well; which of those
+    # tied fits scores lowest is float noise. The export is level and faces
+    # forward (checked below), so take the fit closest to no rotation.
+    _, sg, rot = max(
+        (f for f in fits if f[0] < err + 1e-6), key=lambda f: np.trace(f[2])
+    )
     rows, rhs = [], []
     for p_c, d, p_e, _ in lines:
         m = np.eye(3) - np.outer(d, d)
