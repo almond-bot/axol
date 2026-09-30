@@ -264,7 +264,7 @@ class VRTeleopConfig:
     reset_collision_margin: float = 0.025
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False

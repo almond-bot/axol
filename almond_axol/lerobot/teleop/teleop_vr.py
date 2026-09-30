@@ -793,6 +793,40 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.reset_pending
 
+    @property
+    def at_rest(self) -> bool:
+        """True while the last completed move left the arms in the rest pose.
+
+        See :attr:`VRTeleopCore.at_rest`; a teardown park reads it to decide
+        whether a return-to-rest would move the arms at all.
+        """
+        return self._core.at_rest
+
+    @property
+    def ik_paused(self) -> bool:
+        """True while the IK pipeline is frozen for an out-of-band move.
+
+        See :attr:`VRTeleopCore.ik_paused`; the pause brackets every limp
+        gravity-comp hold, so a teardown park reads it to leave hand-guided
+        arms alone.
+        """
+        return self._core.ik_paused
+
+    @property
+    def ik_worker_alive(self) -> bool:
+        """True while the IK subprocess and its dispatch thread are both up.
+
+        The subprocess plans rest moves and the thread hands it the reset
+        request, so without either nothing can plan a return-to-rest and a
+        teardown park skips rather than waits.
+        """
+        return (
+            self._ik_process is not None
+            and self._ik_process.is_alive()
+            and self._ik_thread is not None
+            and self._ik_thread.is_alive()
+        )
+
     def cancel_reset(self) -> None:
         """Abandon a pending, planning, or playing reset move.
 
