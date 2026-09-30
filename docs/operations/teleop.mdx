@@ -111,7 +111,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 3 s so it always finishes inside the panel's stop window; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
+  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 6 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
 </Note>
 
 <Note>

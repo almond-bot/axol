@@ -186,7 +186,7 @@ class RunPolicyConfig:
     # drops the arms into a limp gravity-comp hold instead of pulling
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
     # Contact watchdog while the *policy* drives the arms: the same
     # sustained-torque-residual trip, checked on every executed action. On a
     # trip the episode aborts (nothing is saved) and the arms drop into the

@@ -178,7 +178,7 @@ class IKResetController:
         self,
         robot: "AxolRobot",
         *,
-        torque_threshold: float = 4.0,
+        torque_threshold: float = 6.0,
         gravity_comp_kd: float = 0.25,
         wait_retry: Callable[[], bool] | None = None,
         stopped: Callable[[], bool] | None = None,

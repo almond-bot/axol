@@ -1129,7 +1129,7 @@ def _run(
 
     # Guarded return-to-rest knobs, read from the shared teleop config (the
     # same fields collect-data / `axol teleop` use — see VRTeleopConfig).
-    reset_torque_threshold = 4.0
+    reset_torque_threshold = 6.0
     reset_gravity_comp_kd = 0.25
 
     # The teleop smoothing filters advance once per get_action() call with a
