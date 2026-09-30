@@ -698,6 +698,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "run with the IMU recorded, write it to --gyro-mount, and exit",
     )
     p.add_argument(
+        "--imu-damp-ref",
+        choices=("encoder", "command"),
+        default="encoder",
+        help="What --imu-damp measures the tool's velocity against: the "
+        "height the joint encoders give (encoder, the default: damp only the "
+        "flex past the encoders) or the commanded height (command: damp the "
+        "whole deviation from the path, encoder-visible wobble included — on "
+        "jelly a shoulder_1 torque probe moved the 1-3 Hz tool height "
+        "coherently while barely moving the hidden flex)",
+    )
+    p.add_argument(
         "--imu-damp-alternate",
         action="store_true",
         help="IMU damping on every second pass only (passes 2, 4, ...), for "
@@ -952,7 +963,8 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
                 + ", ".join(names[c] for c in cols)
-                + f" (clamp {args.imu_damp_max:g} Nm, band from {args.imu_damp_hp:g} Hz"
+                + f" (clamp {args.imu_damp_max:g} Nm, band from {args.imu_damp_hp:g} Hz, "
+                + f"against the {args.imu_damp_ref} height"
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
     return out
@@ -1730,6 +1742,10 @@ async def _run(args: argparse.Namespace) -> None:
                         )
                     else:
                         height = _height(solver, q_meas, side)
+                    if args.imu_damp_ref == "command":
+                        # The tool height this waypoint commands: the
+                        # damper then sees the whole deviation from the path.
+                        height = _height(solver, np.asarray(q), side)
                     now = time.perf_counter()
                     d.feed_height(now, height)
                     d.feed(imu.poll(side))
