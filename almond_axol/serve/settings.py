@@ -755,6 +755,21 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help="Maximum change of any joint between consecutive IK solutions.",
             ),
+            SettingDef(
+                key="kinematics.whole_body",
+                label="Whole-body IK (sim only)",
+                type="boolean",
+                help=(
+                    "Solve for the Jelly base and lift as well as the arms "
+                    "(mobile Axol): when a hand target is out of the arms' "
+                    "reach the base drives toward it and the lift lowers for "
+                    "low targets. Off (the default) is arm IK — the base and "
+                    "lift stay put. Teleop in sim only for now; driving the "
+                    "real wheels and lift from the IK is not implemented yet."
+                ),
+                # Teleop only: data collection records arm joints alone.
+                targets={"teleop": ("kinematics.whole_body",)},
+            ),
         ),
     ),
     SettingCategory(

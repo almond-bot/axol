@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
+    from .constants import AxolModel
     from .serve.settings import SettingsStore
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "shared_config",
     "shared_mantis_can_channels",
     "shared_overlay",
+    "resolve_robot_model",
     "store_path",
 ]
 
@@ -197,3 +199,42 @@ def shared_mantis_can_channels(
     if store is None:
         store = load_store()
     return store.mantis_can_channels()
+
+
+def resolve_robot_model(
+    model: AxolModel | str | None = None,
+    *,
+    jelly_enabled: bool | None = None,
+    store: SettingsStore | None = None,
+) -> AxolModel:
+    """Which Axol version's URDF to use: ``model`` if given, else inferred.
+
+    An explicit value (``KinematicsConfig.robot_model``) wins and is
+    validated. Otherwise the robot is the mobile Axol exactly when Jelly is
+    enabled — attached and not switched off. A session that has already
+    decided whether it drives Jelly passes ``jelly_enabled``; everything else
+    (the sim, run policy, the tuning tools, the control panel's viewer) takes
+    a ``kinematics.robot_model`` saved in the shared settings if there is
+    one, else runs the same detection as teleop against the shared ``jelly``
+    settings (:func:`almond_axol.robot.jelly.detect_jelly`).
+    """
+    from .constants import AxolModel
+
+    if isinstance(model, AxolModel):
+        return model
+    if model is not None:
+        return AxolModel(str(model).strip().lower())
+    if jelly_enabled is None:
+        from .kinematics.config import KinematicsConfig
+        from .robot.jelly import JellyConfig, detect_jelly
+
+        if store is None:
+            store = load_store()
+        # A kinematics.robot_model saved in the settings overrides the
+        # inference for callers that built a default config.
+        saved = shared_config(KinematicsConfig, "teleop", "kinematics", store=store)
+        if saved.robot_model is not None:
+            return AxolModel(str(saved.robot_model).strip().lower())
+        jelly = shared_config(JellyConfig, "teleop", "jelly", store=store)
+        jelly_enabled = detect_jelly(jelly) is not None
+    return AxolModel.MOBILE if jelly_enabled else AxolModel.CLASSIC

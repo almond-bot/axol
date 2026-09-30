@@ -45,6 +45,8 @@ import threading
 import time
 from typing import Any
 
+from dataclasses import replace
+
 import numpy as np
 from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
@@ -54,6 +56,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
+from ...settings import resolve_robot_model
 from ...teleop.core import TCPPoseSnapshot, VRTeleopCore, wait_for_ik_ready
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
@@ -111,16 +114,6 @@ class AxolVRTeleop(Teleoperator):
         self._ik_thread: threading.Thread | None = None
         self._ik_stop = threading.Event()
 
-        # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
-        # in the shared core so this flow and native `axol teleop` (VRTeleop)
-        # cannot drift apart.
-        self._core = VRTeleopCore(
-            config.vr_teleop_config,
-            _logger,
-            self._broadcast_tracking,
-            self._broadcast_json,
-        )
-
         # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
         # base/lift during a session, exactly as in native teleop. Whether the
@@ -130,6 +123,34 @@ class AxolVRTeleop(Teleoperator):
         # recorded into the dataset and policies never control it.
         jelly_cfg = detect_jelly(config.jelly)
         self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
+
+        if config.kinematics_config.whole_body:
+            raise ValueError(
+                "whole-body IK is teleop-only (axol teleop --sim): recorded "
+                "datasets carry arm joints only, so a policy could not "
+                "reproduce base or lift motion"
+            )
+        # Enabling Jelly means this is the mobile Axol: the IK solver and the
+        # headset overlay use its URDF unless the kinematics config names one.
+        # Written back so the session's config records the version it ran.
+        config.kinematics_config = replace(
+            config.kinematics_config,
+            robot_model=resolve_robot_model(
+                config.kinematics_config.robot_model,
+                jelly_enabled=jelly_cfg is not None,
+            ).value,
+        )
+
+        # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
+        # in the shared core so this flow and native `axol teleop` (VRTeleop)
+        # cannot drift apart.
+        self._core = VRTeleopCore(
+            config.vr_teleop_config,
+            _logger,
+            self._broadcast_tracking,
+            self._broadcast_json,
+            robot_model=config.kinematics_config.robot_model,
+        )
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).

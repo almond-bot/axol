@@ -233,7 +233,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiortc", specifier = ">=1.14.0,<1.15" },
-    { name = "almond-pyroki", specifier = ">=0.1.0,<0.2" },
+    { name = "almond-pyroki", specifier = ">=0.1.1,<0.2" },
     { name = "datasets", marker = "extra == 'lerobot'", specifier = ">=4.8,<5" },
     { name = "draccus", specifier = ">=0.11.6,<0.12" },
     { name = "fastapi", specifier = ">=0.135.2,<0.136" },
@@ -289,7 +289,7 @@ wheels = [
 
 [[package]]
 name = "almond-pyroki"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "almond-jaxls" },
@@ -306,9 +306,9 @@ dependencies = [
     { name = "viser" },
     { name = "yourdfpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/62/c7/fc6d9b3e9468eed3e2f0bba698cff53fe707f67c6fff9c4daa6f97e80253/almond_pyroki-0.1.0.tar.gz", hash = "sha256:e1ae10636554d32f17c90365d5caadd22c9e8864d86c96385d53c259d3eff508", size = 41124, upload-time = "2026-08-11T20:33:03.35Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/1b/385d7f3c03c3264a45c87e30424a879f07d7d29b303d9473f2415d5b6453/almond_pyroki-0.1.1.tar.gz", hash = "sha256:8b14fe5cbafd4202f0a6d15ac2401bc919dd01caafeaecabd97936034feb5111", size = 42396, upload-time = "2026-09-28T23:58:30.261Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/24/3b977247ca19366225244ab38194ee8ca2a14839f09a753a994f9c823189/almond_pyroki-0.1.0-py3-none-any.whl", hash = "sha256:35720e87af788575c8c8fcfd586e84a0003a614bb92853f23f0de819514091aa", size = 45383, upload-time = "2026-08-11T20:33:02.051Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/88/0b6eea46d7fe90a0debd791512b8692bf585248e01f6be232447c11e77b0/almond_pyroki-0.1.1-py3-none-any.whl", hash = "sha256:fd57d4dc8b032e8e9aabacadffa64c45f45c7d8b392dc3484dab4dce2d181512", size = 45714, upload-time = "2026-09-28T23:58:28.882Z" },
 ]
 
 [[package]]

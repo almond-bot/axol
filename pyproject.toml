@@ -34,7 +34,7 @@ dependencies = [
     # PyPI release and pins jaxls from git, which PyPI rejects in dependency
     # metadata — the fork (and its almond-jaxls companion) is what makes
     # almond-axol itself installable from PyPI.
-    "almond-pyroki>=0.1.0,<0.2",
+    "almond-pyroki>=0.1.1,<0.2",
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
     "uvicorn[standard]>=0.42.0,<0.43",
