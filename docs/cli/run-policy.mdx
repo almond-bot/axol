@@ -34,7 +34,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID). With `--policy_type custom`, the address of your policy server (default `null` = `127.0.0.1`, nothing is spawned); a `ws://` / `wss://` URL is also accepted |
 | `--server_port INT` | Policy server port — for the localhost child process, the remote server, or your custom policy server (default: 8765) |
 | `--actions_per_chunk INT` | Maximum action horizon per inference call (default: 50). Custom endpoints may return from one row up to this limit; the remaining rows must still cover the adoption point. LeRobot policies cap the request by their supported horizon |
-| `--plan_config.request_interval INT` | Custom policies: request a new plan after this many dispatched rows (default: 10) |
+| `--plan_config.request_interval INT` | Custom policies: request a new plan after this many dispatched rows (default: 5) |
 | `--plan_config.max_adoption_offset_steps INT` | Custom policies: largest permitted reply age in control steps from its saved request origin (default: 6); must be inside the action horizon |
 | `--plan_config.late_policy {abort,blocking_refresh}` | Custom policies: abort, or hold and obtain fresh reset plans when a reply is too late or the accepted horizon expires (default: `blocking_refresh`) |
 | `--chunk_size_threshold FLOAT` | LeRobot policies only: trigger a fresh observation when the queue drops to this fraction of a chunk (default: 0.9) |
@@ -89,12 +89,8 @@ original custom-policy protocol, with no automatic fallback.
 ```bash
 axol run-policy --policy_type custom --server_host 192.0.2.10 \
     --task "Pick the red cube" --actions_per_chunk 30 \
-    --plan_config.request_interval 10 \
-    --plan_config.max_adoption_offset_steps 6 \
     --robot_config.cameras "{overhead: {serial: 41234567}}"
 ```
 
-See the [custom policy interface documentation](/api/policy-plan) for setup,
-timing, continuity, recovery and DAgger semantics. The original `Policy` /
-`serve()` server SDK does not implement this contract and cannot serve this
-robot command unchanged.
+Write the endpoint with the [`almond_axol.policy`](/api/policy) SDK (`Policy` + `serve()`) and test it without the robot using [`policy.check`](/cli/policy-check). See the [custom policy interface documentation](/api/policy-plan) for setup,
+timing, continuity, recovery and DAgger semantics.

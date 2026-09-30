@@ -57,7 +57,7 @@ class PlanSpec:
     cameras: tuple[CameraSpec, ...]
     fps: int = 30
     actions_per_chunk: int = 30
-    request_interval: int = 10
+    request_interval: int = 5
     max_adoption_offset_steps: int | None = 6
     dispatch_feedback: bool = False
 

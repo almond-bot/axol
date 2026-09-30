@@ -111,6 +111,57 @@ class PlanRobotClientTest(unittest.TestCase):
             plan_config=PlanRuntimeConfig(**options),
         )
 
+    def test_sdk_policy_server_drives_the_robot_client(self):
+        from almond_axol.policy import Observation, Policy, PolicyServer
+
+        class Ramp(Policy):
+            def __init__(self) -> None:
+                self.observations: list[Observation] = []
+
+            def infer(self, obs: Observation) -> np.ndarray:
+                self.observations.append(obs)
+                start = obs.plan[0, 0] if obs.plan is not None else 0.0
+                chunk = np.zeros((30, 14), dtype=np.float32)
+                chunk[:, 0] = start + np.arange(30) * 0.001
+                return chunk
+
+        policy = Ramp()
+        server = PolicyServer(policy, host="127.0.0.1", port=0)
+        serving = threading.Thread(target=server.serve_forever, daemon=True)
+        serving.start()
+        client = self.make_client(f"ws://127.0.0.1:{server.port}")
+        workers = []
+        try:
+            self.assertTrue(client.start())
+            client.reset_episode_state()
+            for target, args in [
+                (client.receive_actions, ()),
+                (client.control_loop, ("ignored",)),
+                (client.observation_loop, ("ignored",)),
+            ]:
+                worker = threading.Thread(target=target, args=args, daemon=True)
+                workers.append(worker)
+                worker.start()
+            deadline = time.perf_counter() + 5
+            while (
+                len(self.sent) < 40
+                and client.fatal_error is None
+                and time.perf_counter() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertIsNone(client.fatal_error)
+            self.assertGreaterEqual(len(policy.observations), 3)
+            self.assertIsNone(policy.observations[0].plan)
+            # Continuing from obs.plan makes the executed trace one ramp.
+            x = [a["left_ee.x"] for _, a in self.sent[:40]]
+            np.testing.assert_allclose(np.diff(x), 0.001, atol=1e-6)
+        finally:
+            client.stop()
+            for worker in workers:
+                worker.join(timeout=3)
+            server.shutdown()
+            serving.join(timeout=3)
+
     def test_custom_factory_uses_continuation_transport_without_selector(self):
         from almond_axol.policy.plan_client import PlanPolicyClient
 
@@ -127,8 +178,13 @@ class PlanRobotClientTest(unittest.TestCase):
         server = PlanPeer(policy, host="127.0.0.1", port=0)
         serving = threading.Thread(target=server.serve_forever, daemon=True)
         serving.start()
+        # The peer replays one fixed chunk, so this trace assumes the first
+        # ten rows run before any hand-over (a 10-row request cadence).
         client = self.make_client(
-            f"ws://127.0.0.1:{server.port}", output_width=5, output_height=3
+            f"ws://127.0.0.1:{server.port}",
+            output_width=5,
+            output_height=3,
+            request_interval=10,
         )
         workers = []
         try:
@@ -162,7 +218,9 @@ class PlanRobotClientTest(unittest.TestCase):
             self.assertEqual(
                 continuation.prediction_id, policy.observations[0].request_id
             )
-            self.assertGreaterEqual(continuation.from_row, 10)
+            self.assertGreaterEqual(
+                continuation.from_row, client._plan_config.request_interval
+            )
             dispatched = policy.observations[1].last_dispatched
             self.assertEqual(
                 dispatched.prediction_id, policy.observations[0].request_id

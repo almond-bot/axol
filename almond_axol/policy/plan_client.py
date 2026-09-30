@@ -19,6 +19,16 @@ from .plan_protocol import (
 from .protocol import MAX_MESSAGE_BYTES, PolicyProtocolError, decode_message
 
 
+def policy_url(host: str, port: int) -> str:
+    """``ws://host:port`` for a bare host; a ``ws://``/``wss://`` URL passes through."""
+    host = host.strip()
+    if host.startswith(("ws://", "wss://")):
+        return host
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # bare IPv6 literal
+    return f"ws://{host}:{port}"
+
+
 class PlanPolicyClient:
     """Drive all request/reply calls from one inference thread.
 

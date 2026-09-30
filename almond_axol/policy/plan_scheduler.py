@@ -25,7 +25,7 @@ class PlanRuntimeConfig:
     That recovery does not claim to reproduce another client's lateness rules.
     """
 
-    request_interval: int = 10
+    request_interval: int = 5
     max_adoption_offset_steps: int = 6
     reply_timeout_s: float = 10.0
     late_policy: str = "blocking_refresh"

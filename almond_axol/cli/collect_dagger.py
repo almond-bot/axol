@@ -1334,7 +1334,7 @@ def _run(
         # current run's intended dataset.
         check_resume_consistency(dataset_root)
     if remote_policy:
-        from ..policy.client import policy_url
+        from ..policy.plan_client import policy_url
         from ..policy.plan_dagger import PlanDaggerPolicy
 
         policy = PlanDaggerPolicy(

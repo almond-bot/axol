@@ -49,7 +49,7 @@ from `collect-data`, not the run-policy inference category.
 | `--server_host` | `127.0.0.1` | Address of the existing policy endpoint. |
 | `--server_port` | `8765` | Policy endpoint port. |
 | `--actions_per_chunk` | `30` | Maximum returned plan horizon. |
-| `--plan_config.request_interval` | `10` | Dispatch this many rows between policy requests. |
+| `--plan_config.request_interval` | `5` | Dispatch this many rows between policy requests. |
 | `--plan_config.max_adoption_offset_steps` | `6` | Maximum reply age in control steps; must be inside the action horizon. |
 | `--plan_config.late_policy` | `blocking_refresh` | Hold and request reset plans on expiry, or choose `abort`. |
 | `--hold_to_intervene` | `false` | Must be `true` for custom policies: held grips take control; releasing both requests policy handback. |

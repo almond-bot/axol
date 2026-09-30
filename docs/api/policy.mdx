@@ -1,23 +1,226 @@
 ---
 title: "almond_axol.policy"
-description: "Robot client and wire contract for architecture-independent custom policies."
+description: "Serve your own model as an Axol policy: receive joints and camera frames, return action chunks."
 ---
 
-`run-policy --policy_type custom` and `collect-dagger --policy_type custom`
-use the [custom policy interface](/api/policy-plan). The robot sends compressed,
-time-aligned observations and references to its accepted plan and confirmed
-dispatches. The endpoint returns absolute action plans; the robot controls
-when their rows may execute.
+The SDK for running a model that isn't a LeRobot checkpoint. You write a `Policy` and start it with `serve()`. Then run [Run Policy](/operations/custom-policy) or [DAgger collection](/cli/collect-dagger#remote-policies-through-the-custom-policy-interface) with policy type `custom`. The robot sends each observation (joint state and RGB camera frames) to your `infer()` and executes the action chunks it returns.
 
-See the [wire contract](/api/policy-plan) for the message schemas, scheduling,
-continuation, reset and DAgger semantics, or [Run Your Own Policy](/operations/custom-policy)
-for robot-side configuration.
+`serve()` implements the endpoint side of the [custom policy interface](/api/policy-plan) for you. It agrees the session contract with the robot and caches every plan it publishes. It turns the robot's continuation reference into the rows still executing (`Observation.plan`), clears that history whenever the robot resets, and can optionally ensemble overlapping chunks. Your code only sees observations and returns chunks.
 
-## Robot-side API
+It needs only Axol's base install (numpy, websockets, OpenCV and Pillow). LeRobot and torch are not required.
 
-`PlanPolicyClient` provides the serialized WebSocket request/reply transport.
-The CLI also uses a local scheduler to retain an accepted plan, reject expired
-rows and invalidate pending replies when control ownership changes.
+```python
+from almond_axol.policy import Observation, Policy, PolicySpec, serve
+```
+
+## Quick start
+
+```python
+import numpy as np
+
+from almond_axol.policy import Observation, Policy, PolicySpec, serve
+
+
+class HoldStill(Policy):
+    """Holds the current pose — swap in your model."""
+
+    def setup(self, spec: PolicySpec) -> None:
+        # Load weights here; spec says what the robot will send and expect.
+        self.index = [spec.state_names.index(name) for name in spec.action_names]
+
+    def reset(self) -> None:
+        pass  # clear recurrent state
+
+    def infer(self, obs: Observation) -> np.ndarray:
+        # obs.state: float32 joints; obs.images["overhead"]: (H, W, 3) uint8 RGB
+        target = obs.state[self.index]
+        return np.tile(target, (30, 1))  # (T, D): one row per control tick
+
+
+serve(HoldStill(), host="0.0.0.0", port=8765)
+```
+
+A plain function works too, for stateless models:
+
+```python
+import numpy as np
+
+from almond_axol.policy import Observation, serve
+
+
+def infer(obs: Observation) -> np.ndarray:
+    return obs.state[None, :]  # a one-row chunk
+
+
+serve(infer, port=8765)
+```
+
+## `Policy`
+
+Base class for a custom policy. Override `infer`; the other methods are optional hooks.
+
+| Method | Description |
+|---|---|
+| `setup(spec)` | Called once per robot connection, before any observation. `spec` is the session's [`PolicySpec`](#policyspec). Load your model here. Raising refuses the session, and the operator sees your message. |
+| `reset()` | Called whenever the robot discards its plan: at the start of every episode, and whenever execution restarts from scratch mid-episode (a stop, an operator takeover in DAgger, or recovery from a late reply). Clear recurrent state here. |
+| `infer(obs)` | Return an action chunk predicted from the [`Observation`](#observation). See [Action chunks](#action-chunks). |
+
+Set these class attributes to have the session refused before anything moves:
+
+| Attribute | Description |
+|---|---|
+| `action_names` | The action layout your model emits, in column order. The session is refused unless the robot's layout matches exactly (for example, a joint-space model on a robot configured for Cartesian actions). `None` (default) accepts the robot's layout. |
+| `fps` | The control rate your model was trained at. The session is refused unless the robot runs at the same `--fps`. `None` (default) skips the check. |
+| `name` | Shown in the server's log when a robot connects. |
+
+The model, checkpoint and task instruction belong to your policy: pass them to its constructor. The robot sends neither its task label nor its policy path.
+
+## `Observation`
+
+What `infer` receives: one observation per request, captured with the same exposure-time alignment as data collection.
+
+| Attribute | Description |
+|---|---|
+| `state` | `np.ndarray` (float32) in `PolicySpec.state_names` order. |
+| `state_names` | Names for each entry of `state`. |
+| `joints` | `state` as a `{name: value}` dict, e.g. `obs.joints["left_gripper.pos"]`. |
+| `images` | Camera name → `(height, width, 3)` uint8 **RGB** frame. |
+| `plan` | The rows of the robot's current plan that haven't executed yet, aligned with your reply: `plan[k]` is what the robot would command at the tick your row `k` targets. `None` when nothing is executing (episode start, after a reset). Read-only. |
+| `delay_steps` | The robot's estimate of how many of your rows will already have passed when your reply arrives. `None` unless the robot runs with `--plan_config.advertise_delay true`. |
+| `state_time_ns` | Robot-monotonic time the state was sampled. |
+| `image_time_ns` | Robot-monotonic capture time per camera. |
+| `request_id` | This request's id, which is also the id of the plan you publish. |
+
+## `PolicySpec`
+
+The robot's session contract, passed to `Policy.setup` (an alias of `PlanSpec`).
+
+| Attribute | Description |
+|---|---|
+| `state_names` | Order of `Observation.state`. |
+| `action_names` | The column order every action chunk must have. |
+| `cameras` | The cameras each observation carries (`CameraSpec` with `name` and `shape`). |
+| `camera_names` | Just the camera names. |
+| `fps` | Control rate: row `k` of a chunk runs `k / fps` seconds after its request. |
+| `actions_per_chunk` | The most rows the robot uses from one chunk. Extra rows are dropped. |
+| `request_interval` | How many rows the robot executes between requests. |
+| `max_adoption_offset_steps` | The latest row a reply may start executing at. A slower reply triggers recovery. |
+
+### State and action names
+
+The names follow the robot's configuration, so you can train on a dataset recorded with [`collect-data`](/operations/data-collection) and use its `observation.state` / `action` names as-is.
+
+| Robot config | State / action names (per arm, `left_` then `right_`) |
+|---|---|
+| default (joint space) | `shoulder_1.pos`, `shoulder_2.pos`, `shoulder_3.pos`, `elbow.pos`, `wrist_1.pos`, `wrist_2.pos`, `wrist_3.pos`, `gripper.pos` — 16 dimensions |
+| `observe_cartesian: true` | `ee.x`, `ee.y`, `ee.z`, `ee.rx`, `ee.ry`, `ee.rz` (metres + rotation vector, world frame) and `gripper.pos` — 14 dimensions |
+| `observe_torques: true` | The state also carries each joint's `.torque` (actions don't) |
+
+Arm joints are radians. The gripper is normalized: `0.0` is closed and `1.0` is fully open. The gripperless SKU drops the `gripper.pos` entries. The observation and action layouts can differ, e.g. joint observations with Cartesian actions.
+
+## Action chunks
+
+`infer` returns a chunk of future targets:
+
+- a `(T, D)` array-like (numpy, torch or nested lists) whose `D` columns follow `PolicySpec.action_names`;
+- a single `(D,)` action (a one-row chunk); or
+- a list of `{action_name: value}` dicts.
+
+Row `k` is the target for the `k`-th tick after the request was taken. The robot keeps executing its current plan while you infer. When your reply arrives, it switches to it at the row that is due by then: if 3 ticks passed, it starts at your row 3. Rows are never retimed. Rows beyond `actions_per_chunk` are dropped. Every command then goes through the robot's IK, velocity/acceleration shaping and contact safeguards.
+
+The robot executes your chunks **as published**, without blending them. Two ways to keep the hand-over smooth:
+
+- **Continue the motion in progress.** Condition your next chunk on `obs.plan`, the rows it will replace (real-time chunking). At minimum, start near `obs.plan[0]`.
+- **Let the server ensemble.** Pass `ensemble=` to `serve()` for chunked policies trained with ACT-style temporal ensembling (below).
+
+Replies must arrive within `max_adoption_offset_steps` rows (default 6, i.e. 200 ms at 30 Hz) and within 10 s overall. The robot then recovers: by default it holds, calls `reset`, and requests a fresh plan. `setup` has up to 5 minutes. Check an endpoint with [`check_policy`](#check_policy) before running it on the robot.
+
+## `serve`
+
+```python
+serve(
+    policy,
+    host = "0.0.0.0",
+    port = 8765,
+    *,
+    ensemble = None,
+)
+```
+
+Serves `policy` (a `Policy` or a callable `obs -> chunk`) until Ctrl+C. It accepts one robot at a time. An exception in your code is logged and sent back to the robot, which stops the rollout and shows the message.
+
+`ensemble=k` temporally ensembles overlapping chunks before publishing them. Each row is a weighted average of every prediction covering that tick, weighted `exp(-k·i)` with `i = 0` the oldest. `0.01` is ACT's default. Grippers and rotation-vector dims follow the newest prediction instead of being averaged. Leave it at `None` for policies that already produce smooth plans.
+
+<Warning>
+  The interface is unauthenticated plaintext, like the LeRobot inference
+  server. Bind `127.0.0.1` when the model runs on the robot's own machine.
+  Otherwise, keep the server on an isolated, trusted network and firewall the
+  port so only the robot's IP can connect: anyone who can reach it can
+  impersonate the policy and send arbitrary actions.
+</Warning>
+
+## `PolicyServer`
+
+The non-blocking form of `serve`: run it on a background thread, e.g. in a notebook or test.
+
+```python
+import threading
+
+from almond_axol.policy import Observation, PolicyServer
+
+
+def hold(obs: Observation):
+    return obs.state[None, :]
+
+
+server = PolicyServer(hold, host="127.0.0.1", port=0)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+print(server.port)  # the bound port (port=0 picks a free one)
+server.shutdown()
+```
+
+| Method | Description |
+|---|---|
+| `serve_forever()` | Serve until `shutdown()`. |
+| `shutdown()` | Stop serving and close the socket. |
+| `port` | The bound TCP port. |
+
+## `check_policy`
+
+Exercises an endpoint without a robot, e.g. in a unit test or CI. It plays the robot's side of a session on a virtual clock, using the same scheduler as `run-policy`. That scheduler decides when to request and which rows of a delayed reply to adopt, and recovers from late replies. The simulated arm tracks its commands perfectly. [`axol policy.check`](/cli/policy-check) is the same from the command line.
+
+```python
+from almond_axol.policy import check_policy, default_spec
+
+report = check_policy(
+    "ws://127.0.0.1:8765",
+    spec=default_spec(cameras=("overhead", "left_arm")),
+    ticks=300,
+    delay_steps=3,
+)
+print(report.summary())
+assert not report.recoveries
+```
+
+`delay_steps` is the simulated reply latency in ticks, independent of this machine's speed. `default_spec()` builds the contract `run-policy` sends with default settings. Its arguments are `cartesian`, `cameras`, `image_shape`, `fps`, `actions_per_chunk`, `request_interval` and `max_adoption_offset_steps`.
+
+`CheckReport` has these members:
+
+| Attribute | Description |
+|---|---|
+| `targets` | `(ticks, D)` executed targets. NaN rows mean nothing was executing, e.g. while waiting for the first plan. |
+| `plan_ids` | The plan each tick came from. |
+| `requests` | Requests sent. |
+| `adopted` | Replies adopted. |
+| `recoveries` | Why each recovery happened (late reply, exhausted plan). |
+| `latency_s` | Real round trip per request. |
+| `max_step_within_plan` | Per-dim largest step between consecutive ticks of one plan. |
+| `max_step_at_switch` | The same, where one plan hands over to the next. It should be no larger than `max_step_within_plan`. |
+| `summary()` | A readable report. |
+
+## Robot side and wire format
+
+To implement the endpoint in another language, follow the [custom policy interface](/api/policy-plan) directly. These types are its Python form, and `PlanPolicyClient` is the robot's client:
 
 ```python
 from almond_axol.policy import (
@@ -40,24 +243,4 @@ from almond_axol.policy import (
 | `PlanActions` | Reply identifier, action matrix and optional tighter adoption deadline |
 | `PlanPolicyClient` | Connect, reset, infer and close operations; inference and reset share one owner |
 
-## Migration from the original custom-policy SDK
-
-The robot commands now require the plan contract, identified by
-`protocol: "axol-policy"` and `version: 2` in the handshake. There is no
-legacy robot mode or automatic fallback.
-
-Remove the former `--custom_protocol` CLI option and `custom_protocol` config
-entries: that selector no longer exists. `--policy_type custom` always uses
-the current interface. Wire version 2 is the compatibility marker, not an
-opt-in setting; endpoints advertising version 1 must upgrade before connecting.
-
-The original `Policy`, `PolicySpec`, `Observation`, `PolicyServer` and
-`serve()` APIs speak the earlier raw-observation protocol. Their existing
-server implementations are **not compatible** with the current robot
-commands. Those standalone SDK APIs remain available for existing external
-callers, but neither robot command selects them. An endpoint must implement
-the [current contract](/api/policy-plan),
-including exact setup negotiation, reset acknowledgments, compressed sensor
-observations and published-plan references. Model loading and instruction
-selection belong to that endpoint; the robot no longer forwards `policy_path`
-or task instructions to it.
+The SDK speaks interface version 2, the only version the robot accepts.

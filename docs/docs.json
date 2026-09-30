@@ -105,6 +105,7 @@
                   "cli/replay-dataset",
                   "cli/run-policy",
                   "cli/inference-server",
+                  "cli/policy-check",
                   "cli/migrate-dataset"
                 ]
               },

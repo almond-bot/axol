@@ -5,9 +5,10 @@ description: "Compressed observations and cached action-plan continuation withou
 
 `run-policy --policy_type custom` and `collect-dagger --policy_type custom`
 use this interface for compressed observations and accepted-plan continuation.
-It replaces the original raw-observation custom-policy path. The handshake
-retains `version: 2` to reject incompatible endpoints; there is no legacy
-robot mode, protocol-selection flag or automatic downgrade.
+The [`almond_axol.policy`](/api/policy) SDK's `serve()` implements the
+endpoint side of this interface; read on to implement it yourself (for
+example, in another language). The handshake carries `version: 2`; the robot
+rejects any other version and never downgrades.
 
 The desktop owns the model, instruction text, normalization, conditioning,
 and its prediction cache. The robot owns capture, the dispatch clock, and

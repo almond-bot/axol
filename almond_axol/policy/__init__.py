@@ -1,21 +1,21 @@
-"""The custom policy interface: timestamped observations and plan continuation.
+"""Run your own model on Axol — no LeRobot checkpoint required.
 
-``run-policy --policy_type custom`` and ``collect-dagger --policy_type custom``
-always use :class:`PlanPolicyClient` and the wire contract defined in
-:mod:`almond_axol.policy.plan_protocol`. The robot owns scheduling and
-execution; model processing and published-plan caching stay at the endpoint.
-The handshake's version 2 identifies that required contract, not an opt-in mode.
+Write a :class:`Policy` (or a plain ``obs -> chunk`` function), start it with
+:func:`serve`, and run ``axol run-policy --policy_type custom`` or
+``axol collect-dagger --policy_type custom`` (control panel: policy type
+``custom``). The robot sends each :class:`Observation` — joint state, RGB
+camera frames, and the rows of its current plan that haven't executed yet —
+and executes the action chunks you return. Test an endpoint without a robot
+with :func:`check_policy` / ``axol policy.check``.
 
-The original :class:`PolicyClient`, :class:`Policy`, :class:`PolicyServer`,
-and :func:`serve` exports remain for standalone legacy SDK consumers. They
-speak wire version 1 and are incompatible with the current robot commands;
-there is no robot-side downgrade or legacy execution path.
-
-The current interface uses OpenCV for PNG and Pillow for optional image resize.
+Underneath is the custom policy interface
+(:mod:`almond_axol.policy.plan_protocol`, wire version 2): implement it
+directly if your model lives outside Python. :class:`PlanPolicyClient` is the
+robot's side of it.
 """
 
-from .client import PolicyClient, policy_url
-from .plan_client import PlanPolicyClient
+from .check import CheckReport, check_policy, default_spec
+from .plan_client import PlanPolicyClient, policy_url
 from .plan_protocol import (
     PLAN_PROTOCOL_VERSION,
     Continuation,
@@ -24,21 +24,13 @@ from .plan_protocol import (
     PlanObservation,
     PlanSpec,
 )
-from .protocol import (
-    PROTOCOL_VERSION,
-    CameraSpec,
-    Observation,
-    PolicyProtocolError,
-    PolicyRemoteError,
-    PolicySpec,
-    ReadyInfo,
-)
-from .server import Policy, PolicyServer, serve
+from .protocol import CameraSpec, PolicyProtocolError, PolicyRemoteError
+from .server import Observation, Policy, PolicyServer, PolicySpec, serve
 
 __all__ = [
     "PLAN_PROTOCOL_VERSION",
-    "PROTOCOL_VERSION",
     "CameraSpec",
+    "CheckReport",
     "Continuation",
     "LastDispatched",
     "Observation",
@@ -47,12 +39,12 @@ __all__ = [
     "PlanPolicyClient",
     "PlanSpec",
     "Policy",
-    "PolicyClient",
     "PolicyProtocolError",
     "PolicyRemoteError",
     "PolicyServer",
     "PolicySpec",
-    "ReadyInfo",
+    "check_policy",
+    "default_spec",
     "policy_url",
     "serve",
 ]

@@ -22,6 +22,9 @@ def chunk(base: int = 0) -> np.ndarray:
 
 class SchedulerTest(unittest.TestCase):
     def scheduler(self, **options) -> PlanScheduler:
+        # These traces are written for a 10-row request cadence (the "k10"
+        # schedule), independent of the shipped default.
+        options.setdefault("request_interval", 10)
         return PlanScheduler(
             fps=30, horizon=30, width=1, config=PlanRuntimeConfig(**options)
         )

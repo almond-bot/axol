@@ -45,7 +45,7 @@ Execution filtering applies downstream of either path.
 | Flag | Default | Description |
 |---|---|---|
 | `--actions_per_chunk` | `50` | Maximum actions requested from the policy per call. |
-| `--plan_config.request_interval` | `10` | Custom policies: dispatch this many rows between requests. |
+| `--plan_config.request_interval` | `5` | Custom policies: dispatch this many rows between requests. |
 | `--plan_config.max_adoption_offset_steps` | `6` | Custom policies: maximum reply age in control steps from the saved request origin. Must be inside the action horizon. |
 | `--plan_config.late_policy` | `blocking_refresh` | Custom policies: hold and request reset plans on expiry, or select `abort` to fail the session. |
 | `--chunk_size_threshold` | `0.9` | LeRobot policies: request the next chunk when the queue drops below this fraction. |
