@@ -195,6 +195,54 @@ def test_a_file_being_written_is_skipped_not_fatal(tmp_path: Path) -> None:
     assert listing.unreadable_files == 1
 
 
+def test_listing_rereads_only_changed_episode_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _make_dataset(tmp_path, "ds", ["pick", "place", "pick"], shared=False)
+    reads: list[str] = []
+    real_read_table = pq.read_table
+
+    def counting_read_table(path, *args, **kwargs):
+        if (
+            isinstance(path, (str, Path))
+            and Path(path).parent.parent.name == "episodes"
+        ):
+            reads.append(Path(path).name)
+        return real_read_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(pq, "read_table", counting_read_table)
+
+    read_episodes(root)
+    assert sorted(reads) == ["file-000.parquet", "file-001.parquet", "file-002.parquet"]
+
+    # A refresh (and every per-camera preview lookup) reuses unchanged files.
+    reads.clear()
+    read_episodes(root)
+    episode_video(root, 1, CAM)
+    assert reads == []
+
+    # A rename replaces its file; only that one is read again.
+    rename_episode_task(root, 1, "stack cups")
+    reads.clear()
+    listing = read_episodes(root)
+    assert reads == ["file-001.parquet"]
+    assert [e.tasks for e in listing.episodes] == [["pick"], ["stack cups"], ["pick"]]
+
+
+def test_a_file_that_was_being_written_is_read_once_complete(tmp_path: Path) -> None:
+    root = _make_dataset(tmp_path, "ds", ["pick", "place", "pick"], shared=False)
+    meta = root / "meta" / "episodes" / "chunk-000" / "file-002.parquet"
+    complete = meta.read_bytes()
+    meta.write_bytes(b"PAR1\x00")
+    assert [e.index for e in read_episodes(root).episodes] == [0, 1]
+
+    meta.write_bytes(complete)
+
+    listing = read_episodes(root)
+    assert [e.index for e in listing.episodes] == [0, 1, 2]
+    assert listing.unreadable_files == 0
+
+
 @pytest.mark.parametrize("shared", [True, False])
 def test_rename_to_a_new_task_appends_it_and_touches_only_that_episode(
     tmp_path: Path, shared: bool
