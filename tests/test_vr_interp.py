@@ -334,6 +334,14 @@ class PoseInterpolatorLateStreamTest(unittest.TestCase):
         assert frame is not None
         self.assertAlmostEqual(frame.l_ee.position.x, 0.2)
 
+    def test_server_config_sets_the_gate(self) -> None:
+        # ``--vr_server.interp_max_lag_s`` (documented in the teleop latency
+        # tuning) must reach the server's interpolator; 0 disables the gate.
+        self.assertEqual(VRServer()._interp._max_lag, 0.5)
+        server = VRServer(VRServerConfig(interp_max_lag_s=0.0))
+        rendered = _stalled_stream(server._interp)
+        self.assertGreater(max(rendered[130:]), 0.29)
+
 
 class VRFrameValidationTest(unittest.TestCase):
     def test_quaternion_is_normalized_at_network_model_boundary(self) -> None:
