@@ -49,6 +49,7 @@ import logging
 import math
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -68,6 +69,7 @@ from ...robot.config import (
 )
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
+from ...tuning.imu_damping import GyroFlexDamper
 from ...tuning.learning import LEARN_BAND, CommandLearner
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 from ...tuning.runs import load_run
@@ -650,6 +652,41 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "commanded motion through on slow_osc",
     )
     p.add_argument(
+        "--gyro-damp",
+        type=float,
+        default=0.0,
+        metavar="C",
+        help="Damp the flex past the joint encoders from the wrist gyro: "
+        "each --gyro-damp-joint gets a torque of -C x the gyro's rotation "
+        "rate less the encoder-implied rate, about that joint's axis "
+        "(N·m·s/rad; see almond_axol.tuning.imu_damping.GyroFlexDamper). "
+        "Needs the camera mount (--gyro-mount). Shares --imu-damp-max and "
+        "--imu-damp-alternate",
+    )
+    p.add_argument(
+        "--gyro-damp-joint",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT[=C]",
+        help="Joints that apply the gyro damping, optionally with their own "
+        "gain (repeatable; default the driven arm's shoulder_1 and elbow at "
+        "--gyro-damp)",
+    )
+    p.add_argument(
+        "--gyro-mount",
+        default=str(Path.home() / ".almond" / "wrist_imu_mount.json"),
+        metavar="PATH",
+        help="The wrist cameras' rotation against the gripper mount, per side "
+        "(default ~/.almond/wrist_imu_mount.json; write it with "
+        "--gyro-mount-fit)",
+    )
+    p.add_argument(
+        "--gyro-mount-fit",
+        metavar="RUN_ID",
+        help="Fit the wrist camera's mount rotation from a saved tune.motion "
+        "run with the IMU recorded, write it to --gyro-mount, and exit",
+    )
+    p.add_argument(
         "--imu-damp-alternate",
         action="store_true",
         help="IMU damping on every second pass only (passes 2, 4, ...), for "
@@ -908,6 +945,138 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
     return out
+
+
+def _gyro_dampers(args: argparse.Namespace) -> dict[str, Any]:
+    """One :class:`GyroFlexDamper` per driven side, or none (``--gyro-damp 0``)."""
+    import json
+
+    from ...tuning.imu_damping import GyroFlexDamper
+
+    if args.gyro_damp <= 0:
+        return {}
+    if args.imu_damp > 0:
+        raise SystemExit("tune.motion: --gyro-damp and --imu-damp are exclusive")
+    if args.no_imu:
+        raise SystemExit("tune.motion: --gyro-damp needs the wrist IMU (drop --no-imu)")
+    path = Path(args.gyro_mount).expanduser()
+    try:
+        mounts = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(
+            f"tune.motion: --gyro-damp needs the camera mount ({path}: {e}); "
+            "fit it with --gyro-mount-fit RUN_ID"
+        ) from e
+    names = [j.value for j in ARM_JOINTS]
+    sides = ["left", "right"] if args.arms == "both" else [args.arms]
+    out = {}
+    for side in sides:
+        specs = args.gyro_damp_joint or [f"{side}.shoulder_1", f"{side}.elbow"]
+        gains: dict[int, float] = {}
+        for spec in specs:
+            name, _, c = spec.partition("=")
+            s_side, _, joint = name.partition(".")
+            if joint not in names or s_side not in ("left", "right"):
+                raise SystemExit(
+                    f"--gyro-damp-joint wants SIDE.JOINT[=C], got {spec!r}"
+                )
+            if s_side == side:
+                gains[names.index(joint)] = float(c) if c else args.gyro_damp
+        if not gains:
+            continue
+        if side not in mounts:
+            raise SystemExit(
+                f"tune.motion: no {side} camera mount in {path}; "
+                "fit it with --gyro-mount-fit RUN_ID"
+            )
+        out[side] = GyroFlexDamper(
+            gains=gains,
+            mount=np.asarray(mounts[side]["rotation"], dtype=float),
+            max_torque=args.imu_damp_max,
+        )
+        print(
+            f"  gyro flex damping ({side}): "
+            + ", ".join(f"{names[j]} {c:g}" for j, c in sorted(gains.items()))
+            + f" N·m·s/rad (clamp {args.imu_damp_max:g} Nm"
+            + (", alternate passes)" if args.imu_damp_alternate else ")")
+        )
+    return out
+
+
+def _fit_gyro_mount(args: argparse.Namespace) -> None:
+    """``--gyro-mount-fit``: the camera mount from a saved run, to --gyro-mount."""
+    import json
+
+    from ...kinematics.solver import KinematicsSolver
+    from ...tuning.imu_damping import fit_mount
+
+    _, series = load_run(args.gyro_mount_fit)
+    solver = KinematicsSolver()
+    path = Path(args.gyro_mount).expanduser()
+    try:
+        mounts = json.loads(path.read_text())
+    except (OSError, ValueError):
+        mounts = {}
+    done = False
+    for side, base in (("left", 0), ("right", 7)):
+        if f"imu_{side}_t" not in series:
+            continue
+        q = np.asarray(series["actual"], dtype=float)
+        rows = np.zeros((len(q), solver.num_joints), dtype=np.float32)
+        rows[:, solver.left_indices] = q[:, :7]
+        rows[:, solver.right_indices] = q[:, 7:]
+        if not np.all(np.isfinite(q[:, base : base + 7])):
+            continue
+        rl, rr = solver.ee_rotations(rows)
+        mount, r2 = fit_mount(
+            series["t"],
+            rl if side == "left" else rr,
+            series[f"imu_{side}_t"],
+            series[f"imu_{side}_gyro"],
+        )
+        mounts[side] = {
+            "rotation": mount.tolist(),
+            "fit_r2": r2,
+            "run": args.gyro_mount_fit,
+            "fitted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        print(f"  {side} camera mount: fit R² {r2:.3f} from {args.gyro_mount_fit}")
+        if r2 < 0.9:
+            print("  ! poor fit: record a run with more wrist rotation")
+        done = True
+    if not done:
+        raise SystemExit(f"--gyro-mount-fit: {args.gyro_mount_fit} has no wrist IMU")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(mounts, indent=2))
+    print(f"Wrote {path}")
+
+
+def _joint_axes(
+    solver: Any, q_full: np.ndarray, side: str, columns: tuple[int, ...]
+) -> tuple[np.ndarray, np.ndarray]:
+    """The gripper mount's rotation (world ← mount) at ``q_full`` and the
+    world-frame unit axes (7, 3) of ``columns`` (zero rows elsewhere)."""
+    h = 1e-3
+    idx = solver.left_indices if side == "left" else solver.right_indices
+    rows = [np.asarray(q_full, dtype=np.float32)]
+    for c in columns:
+        r = np.array(q_full, dtype=np.float32, copy=True)
+        r[idx[c]] += h
+        rows.append(r)
+    rl, rr = solver.ee_rotations(np.stack(rows))
+    rots = rl if side == "left" else rr
+    axes = np.zeros((7, 3))
+    for n, c in enumerate(columns):
+        d = rots[1 + n] @ rots[0].T
+        a = 0.5 * np.array([d[2, 1] - d[1, 2], d[0, 2] - d[2, 0], d[1, 0] - d[0, 1]])
+        axes[c] = a / max(float(np.linalg.norm(a)), 1e-12)
+    return rots[0], axes
+
+
+def _ee_rotation(solver: Any, q_full: np.ndarray, side: str) -> np.ndarray:
+    """The gripper mount's rotation (world ← mount) at ``q_full``."""
+    rl, rr = solver.ee_rotations(np.asarray(q_full, dtype=np.float32)[None])
+    return (rl if side == "left" else rr)[0]
 
 
 def _height(solver: Any, q_full: np.ndarray, side: str) -> float:
@@ -1201,6 +1370,9 @@ def _learn_step_imu(
 
 
 async def _run(args: argparse.Namespace) -> None:
+    if args.gyro_mount_fit:
+        _fit_gyro_mount(args)
+        return
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
 
@@ -1403,7 +1575,7 @@ async def _run(args: argparse.Namespace) -> None:
         )
     # The offset each pass flew, alongside passes_run.
     pass_offsets: list[np.ndarray | None] = []
-    dampers = _imu_dampers(args)
+    dampers = _imu_dampers(args) | _gyro_dampers(args)
     # Per pass: whether IMU damping flew it; per sample: the damper's view.
     pass_damped: list[bool] = []
     pass_damp_rows: list[tuple[int, int]] = []
@@ -1483,16 +1655,26 @@ async def _run(args: argparse.Namespace) -> None:
                 if arm is None:
                     continue
                 q_meas = snapshot(axol)
-                if k % _JAC_EVERY == 0 or side not in jac:
-                    height, jac[side] = _height_jacobian(
-                        solver, q_meas, side, d.columns
-                    )
+                if isinstance(d, GyroFlexDamper):
+                    if k % _JAC_EVERY == 0 or side not in jac:
+                        rot, jac[side] = _joint_axes(solver, q_meas, side, d.columns)
+                    else:
+                        rot = _ee_rotation(solver, q_meas, side)
+                    now = time.perf_counter()
+                    d.feed(imu.poll(side))
+                    d.feed_pose(now, rot, jac[side])
+                    tau = d.torque(now)
                 else:
-                    height = _height(solver, q_meas, side)
-                now = time.perf_counter()
-                d.feed_height(now, height)
-                d.feed(imu.poll(side))
-                tau = d.torque(now, jac[side])
+                    if k % _JAC_EVERY == 0 or side not in jac:
+                        height, jac[side] = _height_jacobian(
+                            solver, q_meas, side, d.columns
+                        )
+                    else:
+                        height = _height(solver, q_meas, side)
+                    now = time.perf_counter()
+                    d.feed_height(now, height)
+                    d.feed(imu.poll(side))
+                    tau = d.torque(now, jac[side])
                 arm.extra_torque = tau
                 if record:
                     log_damp.append(np.concatenate([[d.flex, float(d.tripped)], tau]))
@@ -1548,6 +1730,13 @@ async def _run(args: argparse.Namespace) -> None:
         _clear_extra_torque(axol)
         for side, d in active.items():
             if d.tripped:
+                if isinstance(d, GyroFlexDamper):
+                    print(
+                        f"  ! gyro damping ({side}) switched itself off: the flex "
+                        f"rate passed {math.degrees(d.trip_rate):.1f}°/s for "
+                        f"{d.trip_s:g} s — lower --gyro-damp"
+                    )
+                    continue
                 print(
                     f"  ! IMU damping ({side}) switched itself off: the flex "
                     f"velocity passed {d.trip_speed * 1e3:.0f} mm/s for "
@@ -1575,15 +1764,21 @@ async def _run(args: argparse.Namespace) -> None:
     imu = WristImu(
         ["left", "right"] if args.arms == "both" else [args.arms],
         enabled=not args.no_imu,
-        live=args.imu_damp > 0,
+        live=args.imu_damp > 0 or args.gyro_damp > 0,
     )
     imu.start()
-    needs_imu = args.learn_imu or args.imu_damp > 0
+    needs_imu = args.learn_imu or args.imu_damp > 0 or args.gyro_damp > 0
     if needs_imu and not imu.sides:
         imu.stop()
         raise SystemExit(
             "tune.motion: the wrist IMU did not start (camera did not open) and "
-            + ("--learn-imu" if args.learn_imu else "--imu-damp")
+            + (
+                "--learn-imu"
+                if args.learn_imu
+                else "--gyro-damp"
+                if args.gyro_damp > 0
+                else "--imu-damp"
+            )
             + " needs it — nothing moved. If the ZED stack is wedged, restart "
             "it (sudo systemctl restart zed_x_daemon) and try again."
         )
@@ -1803,6 +1998,7 @@ async def _run(args: argparse.Namespace) -> None:
         }
         if pass_index < len(pass_damped):
             summary["imu_damp"] = args.imu_damp if pass_damped[pass_index] else 0.0
+            summary["gyro_damp"] = args.gyro_damp if pass_damped[pass_index] else 0.0
         if moved:
             worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
             summary["worst_joint"] = worst[0]

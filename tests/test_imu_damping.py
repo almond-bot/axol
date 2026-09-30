@@ -167,5 +167,150 @@ class FlexTest(unittest.TestCase):
         self.assertLess(results[True], 0.3 * results[False])
 
 
+def _rot_z(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _two_mass(c: float, seconds: float = 6.0) -> tuple[np.ndarray, np.ndarray]:
+    """A joint whose motor sits on its impedance spring (kp 450, kd 5) and
+    carries a link through a compliant gearbox that rings at ~2 Hz. The
+    encoder sees the motor, the wrist gyro the link. Returns the link's and
+    the motor's angle after an initial link deflection, with a
+    GyroFlexDamper of gain ``c`` on the motor torque."""
+    from almond_axol.tuning.imu_damping import GyroFlexDamper
+
+    fs, j1, j2 = 240.0, 0.05, 0.5
+    kp, kd, k = 450.0, 5.0, 80.0
+    d = GyroFlexDamper(gains={0: c}, mount=np.eye(3), max_torque=2.0, ramp_s=0.0)
+    x1 = v1 = v2 = 0.0
+    x2 = math.radians(0.3)
+    sub = 10
+    dt = 1.0 / (fs * sub)
+    d.start(0.0)
+    axes = np.zeros((7, 3))
+    axes[0] = [0.0, 0.0, 1.0]
+    link, motor, gyro = [], [], []
+    for i in range(int(seconds * fs)):
+        t = i / fs
+        gyro.append((t, v2))
+        # The IMU's sample is ~8 ms old when the loop reads it.
+        arrived = [g for g in gyro if g[0] <= t - 0.008]
+        if arrived:
+            d.feed(
+                np.array(
+                    [[arrived[-1][0], 0, 0, G, 0, 0, math.degrees(arrived[-1][1])]]
+                )
+            )
+        d.feed_pose(t, _rot_z(x1), axes)
+        tau = d.torque(t)[0]
+        for _ in range(sub):
+            spring = k * (x2 - x1)
+            a1 = (-kp * x1 - kd * v1 + spring + tau) / j1
+            a2 = -spring / j2
+            v1 += a1 * dt
+            x1 += v1 * dt
+            v2 += a2 * dt
+            x2 += v2 * dt
+        link.append(x2)
+        motor.append(x1)
+    return np.array(link), np.array(motor)
+
+
+class GyroFlexTest(unittest.TestCase):
+    def test_rigid_rotation_is_not_flex(self) -> None:
+        from almond_axol.tuning.imu_damping import GyroFlexDamper
+
+        mount = _rot_z(0.4) @ np.array([[1.0, 0, 0], [0, 0, -1.0], [0, 1.0, 0]])
+        d = GyroFlexDamper(gains={0: 10.0}, mount=mount, delay_s=0.0)
+        d.start(0.0)
+        axes = np.zeros((7, 3))
+        axes[0] = [0.0, 0.0, 1.0]
+        peak = 0.0
+        for i in range(int(5 * 240)):
+            t = i / 240.0
+            a = 0.8 * math.sin(2 * math.pi * 0.3 * t)
+            w = 0.8 * 2 * math.pi * 0.3 * math.cos(2 * math.pi * 0.3 * t)
+            gyro_cam = mount @ np.array([0.0, 0.0, w])  # body rate = world rate about z
+            d.feed(np.array([[t, 0, 0, G, *np.degrees(gyro_cam)]]))
+            d.feed_pose(t, _rot_z(a), axes)
+            if t > 2.0:
+                peak = max(peak, abs(d.flex_axis[0]))
+        # The encoder rate is a backward difference, half a tick behind the
+        # gyro: that residue at 1.5 rad/s is ~0.02 rad/s, the rest is gone.
+        self.assertLess(peak, 0.03)
+
+    def test_damps_the_link_mode_the_encoder_cannot_see(self) -> None:
+        free, _ = _two_mass(0.0)
+        damped, _ = _two_mass(3.0)
+        late = slice(240, None)
+        self.assertLess(np.std(damped[late]), 0.5 * np.std(free[late]))
+
+    def test_wrong_sign_trips_instead_of_running_away(self) -> None:
+        link, _ = _two_mass(-60.0)
+        self.assertTrue(np.all(np.isfinite(link)))
+        self.assertLess(np.abs(link).max(), math.radians(5.0))
+
+    def test_clamp_and_stale_cutoff(self) -> None:
+        from almond_axol.tuning.imu_damping import GyroFlexDamper
+
+        d = GyroFlexDamper(
+            gains={3: 100.0}, mount=np.eye(3), max_torque=0.2, ramp_s=0.0, delay_s=0.0
+        )
+        d.start(0.0)
+        axes = np.zeros((7, 3))
+        axes[3] = [0.0, 0.0, 1.0]
+        for i in range(60):
+            t = i / 240.0
+            d.feed(np.array([[t, 0, 0, G, 0, 0, 3.0 * math.sin(2 * math.pi * 2 * t)]]))
+            d.feed_pose(t, np.eye(3), axes)
+            tau = d.torque(t)
+            self.assertLessEqual(abs(tau[3]), 0.2 + 1e-12)
+            self.assertEqual(tau[0], 0.0)
+        # No IMU sample for longer than stale_s: no torque.
+        d.feed_pose(1.0, np.eye(3), axes)
+        self.assertEqual(float(np.abs(d.torque(1.0)).max()), 0.0)
+
+    def test_fit_mount_recovers_the_camera_rotation(self) -> None:
+        from almond_axol.tuning.imu_damping import fit_mount
+
+        true = _rot_z(0.7) @ np.array([[1.0, 0, 0], [0, 0, -1.0], [0, 1.0, 0]])
+        fs = 240.0
+        t = np.arange(int(20 * fs)) / fs
+        ax = np.stack(
+            [
+                np.sin(2 * math.pi * 0.2 * t),
+                np.cos(2 * math.pi * 0.13 * t),
+                0.5 + 0 * t,
+            ],
+            1,
+        )
+        ax /= np.linalg.norm(ax, axis=1, keepdims=True)
+        ang = 0.6 * np.sin(2 * math.pi * 0.25 * t)
+        rots = []
+        for a, u in zip(ang, ax):
+            k = np.array([[0, -u[2], u[1]], [u[2], 0, -u[0]], [-u[1], u[0], 0]])
+            rots.append(np.eye(3) + math.sin(a) * k + (1 - math.cos(a)) * k @ k)
+        rots = np.array(rots)
+        dr = np.einsum("nji,njk->nik", rots[:-1], rots[1:])
+        w = (
+            0.5
+            * np.stack(
+                [
+                    dr[:, 2, 1] - dr[:, 1, 2],
+                    dr[:, 0, 2] - dr[:, 2, 0],
+                    dr[:, 1, 0] - dr[:, 0, 1],
+                ],
+                1,
+            )
+            * fs
+        )
+        w = np.vstack([w, w[-1:]])
+        gyro = np.degrees(w @ true.T)
+        mount, r2 = fit_mount(t, rots, t, gyro)
+        self.assertGreater(r2, 0.99)
+        self.assertLess(float(np.abs(mount - true).max()), 0.02)
+
+
 if __name__ == "__main__":
     unittest.main()

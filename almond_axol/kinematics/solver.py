@@ -611,6 +611,25 @@ def _se3_to_pose(se3: jaxlie.SE3) -> Pose:
     )
 
 
+def _quat_to_matrix(wxyz: np.ndarray) -> np.ndarray:
+    """``(M, 4)`` unit quaternions (w, x, y, z) → ``(M, 3, 3)`` rotations."""
+    w, x, y, z = (np.asarray(wxyz, dtype=np.float64)[:, i] for i in range(4))
+    return np.stack(
+        [
+            np.stack(
+                [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1
+            ),
+            np.stack(
+                [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1
+            ),
+            np.stack(
+                [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1
+            ),
+        ],
+        axis=1,
+    )
+
+
 # ---------------------------------------------------------------------------
 # KinematicsSolver
 # ---------------------------------------------------------------------------
@@ -864,6 +883,22 @@ class KinematicsSolver:
         poses = np.asarray(fk(jnp.asarray(pyroki)))
         # jaxlie SE3 parameters: (qw, qx, qy, qz, x, y, z).
         return poses[:, self.l_ee_idx, 4:], poses[:, self.r_ee_idx, 4:]
+
+    def ee_rotations(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Batched :meth:`fk` orientations: ``(M, N)`` joint rows → the left
+        and right gripper-mount rotations (world ← mount), ``(M, 3, 3)``
+        each. Shares :meth:`ee_positions`' jitted FK."""
+        fk = self.__dict__.get("_fk_batch")
+        if fk is None:
+            fk = self._fk_batch = jax.jit(jax.vmap(self.robot.forward_kinematics))
+        rows = np.asarray(q, dtype=np.float32).reshape(-1, len(self._pyroki_index))
+        pyroki = np.empty_like(rows)
+        pyroki[:, self._pyroki_index] = rows
+        poses = np.asarray(fk(jnp.asarray(pyroki)))
+        return (
+            _quat_to_matrix(poses[:, self.l_ee_idx, :4]),
+            _quat_to_matrix(poses[:, self.r_ee_idx, :4]),
+        )
 
     def elbow_positions(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """World-frame elbow positions from joint positions.

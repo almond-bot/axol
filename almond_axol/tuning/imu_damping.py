@@ -274,3 +274,194 @@ class TipDamper:
                 np.clip(ramp * jac_z[i] * force, -self.max_torque, self.max_torque)
             )
         return tau
+
+
+# ---------------------------------------------------------------------------
+# Gyro flex damping
+# ---------------------------------------------------------------------------
+#
+# The accelerometer path above has to integrate and high-pass near 1 Hz to
+# turn acceleration into velocity, and that filter's phase is what kept
+# TipDamper out of the 1-3 Hz band. The gyro measures rotation *rate*
+# directly: less the rotation rate the joint encoders imply (FK of the
+# measured pose, differenced), it is the rate of the flex past the encoders,
+# with only the IMU's few-ms latency. On slow_osc (2026-09-30) that causal
+# signal, projected on shoulder_1's and the elbow's axes, matched its
+# zero-phase version to −1° and coherence 0.96-0.97 over 1-3 Hz.
+
+
+def _vee(m: np.ndarray) -> np.ndarray:
+    """The rotation vector of a small rotation matrix (its skew part)."""
+    return 0.5 * np.array([m[2, 1] - m[1, 2], m[0, 2] - m[2, 0], m[1, 0] - m[0, 1]])
+
+
+def fit_mount(
+    t: np.ndarray,
+    rotations: np.ndarray,
+    imu_t: np.ndarray,
+    gyro_deg_s: np.ndarray,
+    band: tuple[float, float] = (0.1, 1.0),
+) -> tuple[np.ndarray, float]:
+    """The wrist camera's rotation against the gripper mount (cam ← mount)
+    from a recorded motion, and the fit's R².
+
+    Kabsch-aligns the gyro to the FK body rate on the slow deliberate motion
+    (``band``), where the arm is rigid and both see the same rotation.
+    ``rotations`` are the measured pose's world ← mount matrices at ``t``.
+    """
+    from .learning import band_limit
+
+    t = np.asarray(t, dtype=float)
+    fs = (len(t) - 1) / (t[-1] - t[0])
+    dr = np.einsum("nji,njk->nik", rotations[:-1], rotations[1:])
+    w = np.stack([_vee(m) for m in dr]) * fs
+    w = np.vstack([w, w[-1:]])
+    g = np.radians(np.asarray(gyro_deg_s, dtype=float))
+    g = np.stack([np.interp(t, imu_t, g[:, i]) for i in range(3)], 1)
+    a, b = band_limit(w, fs, band), band_limit(g, fs, band)
+    u, _, vt = np.linalg.svd(a.T @ b)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    mount = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+    r2 = 1.0 - float(np.sum((b - a @ mount.T) ** 2)) / max(float(np.sum(b**2)), 1e-18)
+    return mount, r2
+
+
+@dataclass
+class GyroFlexDamper:
+    """``τ_j = −c_j · ω_flex · a_j`` on the chosen arm joints.
+
+    ``ω_flex`` is the wrist gyro's rotation rate less the rate the joint
+    encoders imply, in the world frame; ``a_j`` is joint ``j``'s axis at the
+    measured pose, so each joint damps the flex about its own axis — the
+    motion past its encoder. Sign as :class:`TipDamper`'s (a force against
+    the flex velocity), which damped the 3-15 Hz shake on hardware.
+
+    Args:
+        gains: ``{arm-joint index: c}`` (N·m·s/rad).
+        mount: The camera's rotation against the gripper mount (cam ←
+            mount, :func:`fit_mount`).
+        hp_hz: Causal first-order high-pass on the flex rate — removes gyro
+            bias and a mount misfit's leak of the deliberate motion.
+        lp_hz: Causal two-pole low-pass (two first-order sections). The
+            gyro's flex rate on slow_osc was 1.27°/s at 15-60 Hz (noise and
+            structural buzz) against 0.41°/s at 1-3 Hz; two poles at 15 Hz
+            cut 30 Hz 5× for 15° of lag at 2 Hz.
+        delay_s: The encoder rate is held back by this much so it lines up
+            with the gyro's latency.
+        trip_rate: A flex rate above this (rad/s) for ``trip_s`` switches
+            the damper off for the pass (:attr:`tripped`). slow_osc's own
+            peaks near 0.05 rad/s undamped.
+    """
+
+    gains: dict[int, float]
+    mount: np.ndarray
+    max_torque: float = 0.5
+    hp_hz: float = 0.5
+    lp_hz: float = 15.0
+    delay_s: float = 0.008
+    ramp_s: float = 1.0
+    stale_s: float = 0.05
+    trip_rate: float = 0.15
+    trip_s: float = 0.15
+    tripped: bool = field(default=False, init=False)
+    flex_axis: np.ndarray = field(default_factory=lambda: np.zeros(7), init=False)
+    _gyro: np.ndarray | None = field(default=None, init=False)
+    _last_sample: float | None = field(default=None, init=False)
+    _rot: np.ndarray | None = field(default=None, init=False)
+    _rot_t: float | None = field(default=None, init=False)
+    _rates: list[tuple[float, np.ndarray]] = field(default_factory=list, init=False)
+    _hp: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    _hp_in: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    _lp: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    _lp2: np.ndarray = field(default_factory=lambda: np.zeros(3), init=False)
+    _filt_t: float | None = field(default=None, init=False)
+    _started: float | None = field(default=None, init=False)
+    _ramp_from: float | None = field(default=None, init=False)
+    _fast_since: float | None = field(default=None, init=False)
+
+    @property
+    def columns(self) -> tuple[int, ...]:
+        return tuple(sorted(self.gains))
+
+    @property
+    def flex(self) -> float:
+        """Largest flex rate about a damped joint's axis (rad/s)."""
+        return float(np.max(np.abs(self.flex_axis[list(self.columns)])))
+
+    def start(self, now: float) -> None:
+        self.tripped = False
+        self._gyro = self._last_sample = self._rot = self._rot_t = None
+        self._rates = []
+        self._hp, self._hp_in = np.zeros(3), np.zeros(3)
+        self._lp, self._lp2 = np.zeros(3), np.zeros(3)
+        self._filt_t = None
+        self.flex_axis = np.zeros(7)
+        self._started = self._ramp_from = now
+        self._fast_since = None
+
+    def feed(self, rows: np.ndarray) -> None:
+        """Live IMU rows (``t, acc xyz, gyro xyz`` in °/s), oldest first."""
+        if len(rows):
+            self._gyro = np.radians(np.asarray(rows[-1][4:7], dtype=float))
+            self._last_sample = float(rows[-1][0])
+
+    def feed_pose(self, now: float, rotation: np.ndarray, axes: np.ndarray) -> None:
+        """The measured pose this tick: world ← mount ``rotation`` (3, 3) and
+        the arm joints' world-frame unit ``axes`` (7, 3)."""
+        rotation = np.asarray(rotation, dtype=float)
+        if self._rot is not None and self._rot_t is not None:
+            dt = now - self._rot_t
+            if 0.0 < dt < 0.1:
+                self._rates.append((now, _vee(self._rot.T @ rotation) / dt))
+        self._rot, self._rot_t = rotation, now
+        while len(self._rates) > 1 and self._rates[1][0] <= now - self.delay_s:
+            self._rates.pop(0)
+        if self._gyro is None or not self._rates:
+            return
+        w_enc = self._rates[0][1]  # mount frame, delay_s old
+        raw = self._gyro - self.mount @ w_enc  # camera frame
+        if self._filt_t is None:
+            self._filt_t, self._hp_in = now, raw
+            return
+        dt = now - self._filt_t
+        self._filt_t = now
+        if not 0.0 < dt < 0.1:
+            return
+        a = 1.0 / (1.0 + 2 * math.pi * self.hp_hz * dt)
+        self._hp = a * (self._hp + raw - self._hp_in)
+        self._hp_in = raw
+        alpha = 1 - math.exp(-2 * math.pi * self.lp_hz * dt)
+        self._lp += (self._hp - self._lp) * alpha
+        self._lp2 += (self._lp - self._lp2) * alpha
+        world = rotation @ (self.mount.T @ self._lp2)
+        self.flex_axis = np.asarray(axes, dtype=float) @ world
+
+    def torque(self, now: float) -> np.ndarray:
+        tau = np.zeros(7)
+        started = self._started is not None and now - self._started >= self.ramp_s
+        if started and self.flex > self.trip_rate:
+            if self._fast_since is None:
+                self._fast_since = now
+            elif now - self._fast_since > self.trip_s:
+                self.tripped = True
+        else:
+            self._fast_since = None
+        if self.tripped:
+            return tau
+        if self._last_sample is None or now - self._last_sample > self.stale_s:
+            self._ramp_from = None
+            return tau
+        if self._ramp_from is None:
+            self._ramp_from = now
+        ramp = (
+            min(1.0, max(0.0, (now - self._ramp_from) / self.ramp_s))
+            if self.ramp_s > 0
+            else 1.0
+        )
+        for j, c in self.gains.items():
+            tau[j] = float(
+                np.clip(
+                    -ramp * c * self.flex_axis[j], -self.max_torque, self.max_torque
+                )
+            )
+        return tau

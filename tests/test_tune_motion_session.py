@@ -150,10 +150,23 @@ class _FakeImu:
     def poll(self, side: str) -> np.ndarray:
         t = _FakeAxol.clock.now
         az = 9.80665 + 0.3 * math.sin(2 * math.pi * 2.0 * t)
-        return np.array([[t, 0.0, 0.0, az, 0.0, 0.0, 0.0]])
+        # ... and a 2 Hz flex rotation about the vertical the fake FK's
+        # rotation axis shares (5°/s).
+        gz = 5.0 * math.sin(2 * math.pi * 2.0 * t)
+        return np.array([[t, 0.0, 0.0, az, 0.0, 0.0, gz]])
 
     def run_blocks(self, t0, t1, origin=None):
         return {}, {}
+
+
+def _ee_rotations(rows):
+    rows = np.asarray(rows, dtype=float).reshape(-1, 14)
+    a = rows[:, 7] + rows[:, 10]
+    c, sn = np.cos(a), np.sin(a)
+    rot = np.zeros((len(rows), 3, 3))
+    rot[:, 0, 0], rot[:, 0, 1], rot[:, 1, 0], rot[:, 1, 1] = c, -sn, sn, c
+    rot[:, 2, 2] = 1.0
+    return np.repeat(np.eye(3)[None], len(rows), 0), rot
 
 
 def _ee_positions(rows):
@@ -176,6 +189,7 @@ class SessionTest(unittest.TestCase):
             left_indices=list(range(7)),
             right_indices=list(range(7, 14)),
             ee_positions=_ee_positions,
+            ee_rotations=_ee_rotations,
         )
         _FakeAxol.applied = []
         parser = argparse.ArgumentParser()
@@ -313,6 +327,55 @@ class SessionTest(unittest.TestCase):
             self.assertIn("imu_damp", on[1])
             self.assertNotIn("imu_damp", off[1])
             self.assertEqual(on[1]["imu_damp"].shape[1], 9)
+
+    def test_gyro_damping_needs_a_mount_then_clamps_and_is_saved(self) -> None:
+        import json
+
+        from almond_axol.tuning import runs
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            mount = tmp / "mount.json"
+            with self.assertRaises(SystemExit) as err:
+                self._run(
+                    ["--gyro-damp", "5", "--gyro-mount", str(mount)], tmp, imu=True
+                )
+            self.assertIn("--gyro-mount-fit", str(err.exception))
+            mount.write_text(json.dumps({"right": {"rotation": np.eye(3).tolist()}}))
+            text = self._run(
+                [
+                    "--gyro-damp",
+                    "5",
+                    "--gyro-damp-joint",
+                    "right.shoulder_1",
+                    "--gyro-damp-joint",
+                    "right.elbow=2",
+                    "--gyro-mount",
+                    str(mount),
+                    "--imu-damp-max",
+                    "0.3",
+                    "--imu-damp-alternate",
+                    "--repeat",
+                    "2",
+                    "--label",
+                    "gyro",
+                ],
+                tmp,
+                imu=True,
+            )
+            self.assertIn("gyro flex damping (right): shoulder_1 5, elbow 2", text)
+            applied = [a for a in _FakeAxol.applied if a is not None]
+            self.assertTrue(applied)
+            peak = np.abs(np.stack(applied)).max(axis=0)
+            self.assertLessEqual(peak.max(), 0.3 + 1e-9)
+            self.assertGreater(peak[0], 0.0)
+            self.assertEqual(peak[1], 0.0)  # shoulder_2 not damped
+            metas = [
+                runs.load_run(p.name, self.runs_dir) for p in self.runs_dir.iterdir()
+            ]
+            by_pass = {m[0]["label"]: m for m in metas}
+            self.assertEqual(by_pass["gyro [2/2]"][0]["metrics"]["gyro_damp"], 5.0)
+            self.assertEqual(by_pass["gyro [1/2]"][0]["metrics"]["gyro_damp"], 0.0)
 
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model
