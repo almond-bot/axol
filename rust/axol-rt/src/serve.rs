@@ -899,8 +899,11 @@ impl Thinning {
 
     /// The read-lane entry served on `tick`: the lane takes a turn on one
     /// tick in `read_div`.
+    // `%`, not `is_multiple_of`: that is Rust 1.87+, and the robots build
+    // with 1.84 (read_div is never 0).
+    #[allow(unknown_lints, clippy::manual_is_multiple_of)]
     fn read_turn(&self, tick: u64) -> Option<usize> {
-        if !tick.is_multiple_of(self.read_div) {
+        if tick % self.read_div != 0 {
             return None;
         }
         Self::turn(&self.read_lane, tick / self.read_div)
