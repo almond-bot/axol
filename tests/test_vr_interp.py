@@ -227,6 +227,122 @@ class PoseInterpolatorSafetyTest(unittest.TestCase):
         self.assertTrue(recovered.l_tracked)
 
 
+def _lift_x(seq: int) -> float:
+    """A hand that lifts 0.3 m over seq 120-170 and is back down by seq 230."""
+    if seq < 120:
+        return 0.0
+    if seq < 170:
+        return 0.3 * (seq - 120) / 50
+    if seq < 200:
+        return 0.3
+    if seq < 230:
+        return 0.3 * (230 - seq) / 30
+    return 0.0
+
+
+def _stalled_stream(interp: PoseInterpolator) -> list[float]:
+    """Stream seq 0..599 (captured at 100 Hz) over a link that, like a starved
+    Wi-Fi uplink, carries only 50 frames/s from 1.0 s to 3.5 s — the backlog
+    grows — and then drains it at 400 frames/s. Returns the left x rendered
+    at 100 Hz from 1.0 s to 6.0 s."""
+    arrivals = []
+    link_free = 0.0
+    for seq in range(600):
+        arrive = 0.01 * seq + 0.02
+        if arrive >= 1.0:
+            rate = 50.0 if link_free < 3.5 else 400.0
+            arrive = max(arrive, link_free + 1.0 / rate)
+            link_free = arrive
+        arrivals.append((arrive, seq))
+    rendered = []
+    pending = iter(arrivals)
+    nxt = next(pending)
+    for tick in range(600):
+        now = 0.01 * tick
+        while nxt is not None and nxt[0] <= now:
+            interp.push(_frame(nxt[1], x=_lift_x(nxt[1])), now=nxt[0])
+            nxt = next(pending, None)
+        frame = interp.sample(now=now)
+        if frame is not None and tick >= 100:
+            rendered.append(frame.l_ee.position.x)
+    return rendered
+
+
+class PoseInterpolatorLateStreamTest(unittest.TestCase):
+    def test_a_stalled_stream_is_held_not_replayed(self) -> None:
+        # The lift (1.2-1.7 s) and the return (2.0-2.3 s) both happen while
+        # the link is backed up; its frames arrive seconds late. The arm must
+        # not perform them then: it holds, then follows the (lowered) hand.
+        rendered = _stalled_stream(PoseInterpolator())
+
+        # Up to max_lag_s of backlog is indistinguishable from jitter and
+        # plays (the lift starts); past it the arm holds — no late motion at
+        # all — until on-time frames resume, then follows the hand.
+        self.assertLess(max(rendered), 0.2)
+        held = rendered[110:270]  # 2.1-3.7 s
+        self.assertEqual(max(held), min(held))
+        self.assertAlmostEqual(rendered[-1], 0.0)
+
+    def test_without_the_gate_the_delayed_motion_is_replayed(self) -> None:
+        # The behaviour the gate exists to prevent (max_lag_s <= 0 keeps it).
+        rendered = _stalled_stream(PoseInterpolator(max_lag_s=0.0))
+
+        # The full lift, performed after the hand was already back down (2.3 s).
+        self.assertGreater(max(rendered[130:]), 0.29)
+
+    def test_ordinary_jitter_still_plays_every_motion(self) -> None:
+        # A 0.3 s hold-up (a relayed link's bursts are ~150 ms) is late but
+        # within max_lag_s: the motion is smoothed through, not dropped.
+        interp = PoseInterpolator()
+        for seq in range(100):
+            interp.push(_frame(seq, x=_lift_x(seq)), now=0.01 * seq + 0.02)
+        peak = 0.0
+        for tick in range(100, 400):
+            now = 0.01 * tick + 0.02
+            if tick >= 130 and tick % 30 == 0:
+                # Everything captured in the last 0.3 s lands at once.
+                for seq in range(tick - 30, tick):
+                    interp.push(_frame(seq, x=_lift_x(seq)), now=now)
+            frame = interp.sample(now=now)
+            assert frame is not None
+            peak = max(peak, frame.l_ee.position.x)
+        self.assertGreater(peak, 0.25)
+
+    def test_late_frames_still_carry_their_control_state(self) -> None:
+        interp = PoseInterpolator()
+        for seq in range(100):
+            interp.push(_frame(seq), now=0.01 * seq + 0.02)
+        late = _frame(100, x=0.3).model_copy(update={"l_lock": True})
+        interp.push(late, now=3.0)
+
+        frame = interp.sample(now=3.0)
+        assert frame is not None
+        self.assertTrue(frame.l_lock)
+        self.assertAlmostEqual(frame.l_ee.position.x, 0.0)
+
+    def test_reset_forgets_the_late_baseline(self) -> None:
+        # A new timing domain (reconnect, reload) must not be judged against
+        # the previous one's transit.
+        interp = PoseInterpolator()
+        for seq in range(100):
+            interp.push(_frame(seq), now=0.01 * seq + 0.02)
+        interp.reset()
+        for seq in range(10):
+            interp.push(_frame(seq, x=0.2), now=50.0 + 0.01 * seq)
+
+        frame = interp.sample(now=50.1)
+        assert frame is not None
+        self.assertAlmostEqual(frame.l_ee.position.x, 0.2)
+
+    def test_server_config_sets_the_gate(self) -> None:
+        # ``--vr_server.interp_max_lag_s`` (documented in the teleop latency
+        # tuning) must reach the server's interpolator; 0 disables the gate.
+        self.assertEqual(VRServer()._interp._max_lag, 0.5)
+        server = VRServer(VRServerConfig(interp_max_lag_s=0.0))
+        rendered = _stalled_stream(server._interp)
+        self.assertGreater(max(rendered[130:]), 0.29)
+
+
 class VRFrameValidationTest(unittest.TestCase):
     def test_quaternion_is_normalized_at_network_model_boundary(self) -> None:
         frame = _frame(1).model_dump()

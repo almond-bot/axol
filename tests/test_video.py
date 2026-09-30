@@ -18,9 +18,9 @@ from almond_axol.video.hw_video import (
     dataset_vbr_bitrate,
 )
 from almond_axol.video.shm_frames import (
+    _RAW_RING_SLOTS,
     RawFrameReader,
     RawFrameWriter,
-    _RAW_RING_SLOTS,
     _au_has_coded_slice,
     _block_size,
     rgba_to_rgb,

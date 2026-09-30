@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from almond_axol.cli import provision
@@ -236,6 +237,11 @@ class ProvisionSafetyTest(unittest.TestCase):
                 "run",
                 side_effect=lambda: succeed("gst-build"),
             ),
+            patch.object(
+                provision,
+                "tune_host",
+                side_effect=lambda **_: succeed("tuning"),
+            ),
             self.assertRaises(SystemExit) as raised,
         ):
             provision.run()
@@ -251,6 +257,7 @@ class ProvisionSafetyTest(unittest.TestCase):
                 "calibration",
                 "gst",
                 "gst-build",
+                "tuning",
             ],
         )
         message = str(raised.exception)
@@ -336,3 +343,85 @@ class ProvisionEscalationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HostTuningTest(unittest.TestCase):
+    """`axol provision` is the only command a host needs, Jetson or not."""
+
+    def test_boot_runs_only_the_tuning_without_the_update_lock(self) -> None:
+        with (
+            patch.object(provision, "tune_host") as tune,
+            patch.object(provision, "host_update_lock") as lock,
+            patch.object(provision, "_sudo_held_update_lock") as sudo_lock,
+            patch.object(provision, "_run_locked") as locked,
+        ):
+            provision.run(SimpleNamespace(boot=True))
+        tune.assert_called_once()
+        lock.assert_not_called()
+        sudo_lock.assert_not_called()
+        locked.assert_not_called()
+
+    def test_inside_serve_the_tuning_is_left_to_the_unit(self) -> None:
+        # The self-updater's provision can overlap a robot session; the
+        # restart it ends with runs the unit's ExecStartPre tuning anyway.
+        with (
+            patch.object(provision.os, "geteuid", return_value=0),
+            patch.object(
+                provision, "host_update_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(provision, "_neutralize_legacy_can_root_execution"),
+            patch.object(provision, "_step", return_value=True) as step,
+            patch.object(provision, "privileged_service_active", return_value=True),
+            patch.object(provision, "tune_host") as tune,
+        ):
+            provision.run()
+        labels = [c.args[0] for c in step.call_args_list]
+        self.assertFalse(any(label.startswith("host tuning") for label in labels))
+        tune.assert_not_called()
+
+    def test_jetson_hosts_get_the_realtime_tuning(self) -> None:
+        with (
+            patch.object(provision.jetson, "_is_jetson", return_value=True),
+            patch.object(
+                provision.jetson,
+                "host_model",
+                return_value="NVIDIA Jetson AGX Thor Developer Kit",
+            ),
+            patch.object(provision.jetson, "pin_realtime_clocks") as pin,
+            self.assertLogs(provision._logger, "INFO") as logs,
+        ):
+            provision.tune_host(interactive=False)
+        pin.assert_called_once_with(interactive=False)
+        self.assertIn("AGX Thor", logs.output[0])
+        self.assertIn("core layout:", logs.output[-1])
+
+    def test_other_hosts_are_left_alone(self) -> None:
+        with (
+            patch.object(provision.jetson, "_is_jetson", return_value=False),
+            patch.object(
+                provision.jetson,
+                "host_model",
+                return_value="Raspberry Pi 5 Model B Rev 1.0",
+            ),
+            patch.object(provision.jetson, "pin_realtime_clocks") as pin,
+            self.assertLogs(provision._logger, "INFO") as logs,
+        ):
+            provision.tune_host()
+        pin.assert_not_called()
+        self.assertIn("no Jetson tuning", logs.output[0])
+
+    def test_jetson_setup_is_an_alias_of_the_boot_tuning(self) -> None:
+        from almond_axol.cli.jetson import setup as jetson_setup
+
+        with patch.object(provision, "tune_host") as tune:
+            jetson_setup.run()
+        tune.assert_called_once_with(interactive=True)
+
+    def test_installer_leaves_tuning_to_provision_and_the_unit(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[1] / "web" / "app" / "public" / "install"
+        ).read_text()
+        self.assertIn("ExecStartPre=-${BIN_DIR}/axol provision --boot", script)
+        self.assertIn("After=network-online.target nvpmodel.service", script)
+        # No separate operator/installer step any more.
+        self.assertNotIn("axol jetson.setup", script)

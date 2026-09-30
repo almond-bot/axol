@@ -2490,14 +2490,19 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
             fps=int(config["fps"]),
             allowed_extra_features=frozenset(config.get("allowed_resume_features", ())),
         )
-        return LeRobotDataset.resume(
-            repo_id=config["repo_id"],
-            root=config["dataset_root"],
-            image_writer_threads=4,
-            streaming_encoding=True,
-            encoder_threads=_ENCODER_THREADS,
-            rgb_encoder=rgb_encoder,
-        )
+        from .dataset_browser import dataset_metadata_lock
+
+        # The panel's task rename rewrites tasks.parquet / info.json under
+        # this lock; don't load them halfway through one.
+        with dataset_metadata_lock(config["dataset_root"]):
+            return LeRobotDataset.resume(
+                repo_id=config["repo_id"],
+                root=config["dataset_root"],
+                image_writer_threads=4,
+                streaming_encoding=True,
+                encoder_threads=_ENCODER_THREADS,
+                rgb_encoder=rgb_encoder,
+            )
     dataset = LeRobotDataset.create(
         repo_id=config["repo_id"],
         fps=config["fps"],
@@ -2846,6 +2851,23 @@ def _discard_episode_buffer(dataset: Any) -> str | None:
         _logger.exception("discarding the buffered episode failed")
         return f"episode discard failed: {type(error).__name__}: {error}"
     return None
+
+
+def _save_episode_locked(dataset: "LeRobotDataset", dataset_root: str) -> None:
+    """``dataset.save_episode()`` under the dataset's metadata lock.
+
+    The panel's dataset preview can rename a saved episode's task while this
+    session still has the dataset open (``dataset_browser.rename_episode_task``).
+    LeRobot's save rewrites ``meta/tasks.parquet`` and ``meta/info.json`` from
+    its in-memory copies, so the save holds the same lock and first reloads the
+    task table from disk: a task the rename appended keeps its index, and this
+    episode's new tasks (if any) are numbered after it.
+    """
+    from .dataset_browser import dataset_metadata_lock, reload_tasks_from_disk
+
+    with dataset_metadata_lock(dataset_root):
+        reload_tasks_from_disk(dataset.meta, dataset_root)
+        dataset.save_episode()
 
 
 def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
@@ -3378,7 +3400,7 @@ class InProcessRecorder:
         except Exception:
             self._dataset.clear_episode_buffer()
             raise
-        self._dataset.save_episode()
+        _save_episode_locked(self._dataset, self._config["dataset_root"])
         # The write succeeded, so shutdown must preserve/finalize this episode
         # even if the durability step below fails. This is an internal cleanup
         # count, not a success acknowledgement to the caller.
@@ -3679,12 +3701,13 @@ def _recorder_main(
 
     # Imports done. Unless the caller shares the IK core with this recorder
     # (the policy ops, whose relay leaves the background cores ~5 % idle —
-    # see affinity.pin_background_and_ik), narrow to the background cores
+    # see affinity.pin_background_and_ik), narrow to the recorder cores
     # before the readers spawn their gst threads (threads inherit the
     # spawning thread's affinity), so nothing of the steady state lands on
-    # the IK core.
+    # the IK core. On 12+ core hosts those are two cores of its own, free of
+    # FIFO camera work; elsewhere they are the background cores.
     if pinned and not config.get("share_ik_core", False):
-        affinity.pin_background()
+        affinity.pin_recorder()
 
     # Build a per-source frame reader matching the relay's chosen transport.
     # gstshm-h264: an EncodedAuReader (shmsrc → gdpdepay → h264parse → appsink)
@@ -3984,7 +4007,7 @@ def _recorder_main(
                         conn.send(("error", str(exc)))
                         continue
                     try:
-                        dataset.save_episode()
+                        _save_episode_locked(dataset, config["dataset_root"])
                         # The dataset write happened even if the durability
                         # flush below fails. Count it for shutdown recovery so
                         # finalization verifies/preserves the episode instead
@@ -4107,6 +4130,8 @@ class DatasetRecorderProcess:
     all real-time, the background cores leave the CFS recorder too little to
     sustain 60 rows/s and every take ends on ``encoded-AU backlog exceeded``
     after 25-30 s — see :func:`almond_axol.utils.affinity.pin_background_and_ik`.
+    On 12+ core hosts the recorder has cores of its own free of FIFO camera
+    work, nothing is borrowed, and the flag has no effect.
     """
 
     def __init__(

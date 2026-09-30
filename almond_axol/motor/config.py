@@ -57,10 +57,23 @@ class ParamSpec:
     which is a needless footgun to expose, so it is shown and set in ms.
     """
 
+    min_firmware: int | None = None
+    """Oldest firmware VersionDate that implements the parameter, if not all do.
+
+    On older firmware the index still answers, but with junk: the reply echoes
+    the request and carries whatever bytes the motor last transmitted. The
+    driver skips such parameters in dumps and restores and refuses to read or
+    write them individually.
+    """
+
 
 # ---------------------------------------------------------------------------
 # MyActuator — 0xC0 parameter indices
 # ---------------------------------------------------------------------------
+
+# First MyActuator firmware (VersionDate) implementing protocol V4.4 — the
+# MIT-range change in myactuator.py and the 0x46-0x4A parameters below.
+MYACTUATOR_FW_V44 = 2026042402
 
 # Index range worth sweeping in a raw dump. The vendor software never addresses
 # anything above 0x55, so this covers its whole parameter space.
@@ -75,71 +88,165 @@ class MyActuatorParam(IntEnum):
     whose entire "advanced parameter" UI is built on 0xC0 — 158 of the ~180 CAN
     calls in that binary are 0xC0, with 0xC1 committing batches to ROM.
 
-    Indices were recovered by matching each 0xC0 call site to the field it
-    loads from or stores into, then aligning those fields against the parameter
-    list the GUI renders. The fields form one contiguous run, and four of them
-    (:attr:`ENCODER_CALIBRATION_VALUE`, :attr:`OVER_VOLTAGE`,
-    :attr:`LOW_VOLTAGE`, :attr:`STALL_TIME_LIMIT`) were confirmed directly,
-    which pins the alignment for the rest.
+    This table is the mapping the **fleet firmware actually uses**
+    (VersionDate 2025070202 and 2026042402), pinned two independent ways that
+    agree exactly:
 
-    Parameters the GUI shows past the end of this run — stall current, shutdown
-    and resume temperature, max and nominal speed — are deliberately absent:
-    their call sites could not be resolved, so their indices are unknown.
-    Reading an unknown index is harmless, so use ``dump_config(raw_range=...)``
-    to identify them against a motor rather than guessing here. "Motor Position
-    Zero" is likewise omitted because two candidate indices fit it equally well;
-    the documented 0x64 command already sets the zero position.
+    * Static: every 0xC0 call site in the setup binary (``myactuator.exe``,
+      Setup Software V4.0) was decoded through its shared frame builder
+      (``sub_0x4039e0``: ``[0xC0, 0x00, index, rw, v0..v3]``), which fixes the
+      whole index space at 0x01-0x55 and shows which index each GUI field reads
+      (and, from the Save handlers, which ones it writes and how).
+    * Live: the value the GUI shows for every field was matched against a raw
+      ``dump_config(raw_range=...)`` sweep of the five left-arm motors. The
+      per-motor values that differ (Factory Time, Motor Position Zero, KT_OUT,
+      the current and speed limits, Current/Voltage Sample Res, Max Torque)
+      each match exactly one index on every motor, so the mapping is not a
+      coincidence. Every write the GUI makes to these indices sends the four
+      little-endian bytes of a float32, the same encoding ``_write_param`` uses.
+
+    An earlier revision of this table was mis-indexed for the current firmware —
+    it named, e.g., 0x54/0x55 "over/low voltage" when the real voltage
+    thresholds are at 0x13/0x14 (the setup software uses 0x54/0x55 for the MIT
+    KP/KD ceilings, which no fleet firmware implements). Every
+    entry below was re-derived from the GUI ground truth; if you ever move to a
+    firmware line whose ``dump_config`` no longer matches, re-verify before
+    trusting a write.
+
+    A handful of factory/identity fields the GUI's "Settings" tab exposes (pole
+    pairs, single-turn resolution, calibration current, phase order, encoder
+    calibration value, powerdown-save-multiturn, change-direction) are
+    intentionally absent: their indices are not in the captured screenshots and
+    could not be pinned by value. Reading an unknown index is harmless, so
+    recover them with ``dump_config(raw_range=...)`` against a motor rather than
+    guessing. The motor's zero is set by the documented 0x64 command;
+    ``MOTOR_POSITION_ZERO`` here is the raw calibration field and is protected.
+
+    The Motor-panel selectors were disambiguated from the read handler's widget
+    calls (a read feeding a checkbox is float-tested against zero and stored as
+    a byte; one feeding a combo box is stored as a value) and from the combo item
+    strings, which give each selector's value meaning — see ``MYACTUATOR_PARAMS``.
+
+    Not every index is implemented on every firmware. An unimplemented one still
+    answers, echoing the request but carrying whatever value bytes the motor
+    last sent, so it reads as plausible junk (often ~0) rather than failing.
+    Probed on the fleet by priming the motor with a known reply and reading the
+    index straight after: 0x54/0x55 ("MIT model max KP/KD") are unimplemented on
+    both firmware lines and so are left out, and 0x46-0x4A are implemented on
+    2026042402 (the X8s) but not 2025070202 (the X6s) — see ``min_firmware``.
+    Firmware and model coincide on this fleet, so the gate is by firmware, as
+    the driver's other V4.4 behavior is.
+
+    "Enable CAN Filter" is deliberately absent. The GUI reads the checkbox from
+    0x32 and writes it through function-control 0x20/0x02 rather than 0xC0, but
+    0x32 reads 1 on every fleet motor while the GUI shows the filter off, so the
+    label cannot be confirmed. 0x32 stays reachable through a raw sweep.
     """
 
-    POWERDOWN_SAVE_MULTITURN = 0x1C
-    POLE_PAIRS = 0x1D
-    SINGLE_TURN_RESOLUTION = 0x1F
-    CALIBRATION_CURRENT = 0x20
-    EXCHANGE_PHASE = 0x21
-    EBRAKE_HOLD_DUTY = 0x22
-    BRAKE_MODE = 0x23
-    MAX_POSITIVE_POSITION = 0x24
-    MIN_NEGATIVE_POSITION = 0x25
-    POSITION_PLAN_MAX_ACC = 0x26
-    POSITION_PLAN_MAX_DEC = 0x27
-    POSITION_PLAN_MAX_SPEED = 0x28
-    SPEED_PLAN_MAX_ACC = 0x29
-    SPEED_PLAN_MAX_DEC = 0x3C
-    CHANGE_MOTOR_DIRECTION = 0x3E
-    ENCODER_CALIBRATION_VALUE = 0x46
-    STALL_TIME_LIMIT = 0x47
-    EBRAKE_START_DUTY = 0x48
-    CURRENT_SAMPLE_RES = 0x49
-    OVER_VOLTAGE = 0x54
-    LOW_VOLTAGE = 0x55
+    # Motor Information panel (Basic Parameters tab).
+    MOTOR_NUMBER = 0x01
+    FACTORY_TIME = 0x02
+    REDUCTION_RATIO = 0x03
+    # Protect Parameters panel.
+    OVER_VOLTAGE = 0x13
+    LOW_VOLTAGE = 0x14
+    STALL_TIME_LIMIT = 0x15
+    EBRAKE_START_DUTY = 0x16
+    CURRENT_SAMPLE_RES = 0x17
+    EBRAKE_HOLD_DUTY = 0x18
+    BRAKE_MODE = 0x19
+    # Plan Parameters panel.
+    MAX_POSITIVE_POSITION = 0x1A
+    MIN_NEGATIVE_POSITION = 0x1B
+    POSITION_PLAN_MAX_ACC = 0x1C
+    POSITION_PLAN_MAX_DEC = 0x1D
+    SPEED_PLAN_MAX_ACC = 0x1F
+    SPEED_PLAN_MAX_DEC = 0x20
+    MOTOR_POSITION_ZERO = 0x21
+    # Motor Parameters panel.
+    RATED_CURRENT = 0x22
+    MAX_CURRENT = 0x23
+    STALL_CURRENT = 0x24
+    SHUTDOWN_TEMP = 0x25
+    RESUME_TEMP = 0x26
+    MAX_SPEED = 0x27
+    NOMINAL_SPEED = 0x28
+    ENABLE_2ND_ENCODER = 0x29
+    ENABLE_ETHERCAT = 0x3B
+    SECOND_ENCODER_RESOLUTION = 0x3C
+    THERMISTOR = 0x3D
+    KT_OUT = 0x3E
+    ENCODER2_ABNORMAL_VALUE = 0x3F
+    ENCODER2_ABNORMAL_SPEED = 0x40
+    AUTOMATIC_ERROR_RECOVERY = 0x41
+    MAX_TORQUE = 0x46
+    VOLTAGE_SAMPLE_RES = 0x47
+    LPF_CF_FOR_CURRENT = 0x48
+    LPF_CF_FOR_SPEED = 0x49
+    ERROR_DETECTION_LPF_CF = 0x4A
 
 
 _RW = Access.READ_WRITE
 _PROT = Access.PROTECTED
 _RO = Access.READ_ONLY
+_V44 = MYACTUATOR_FW_V44
 
 MYACTUATOR_PARAMS: dict[MyActuatorParam, ParamSpec] = {
-    MyActuatorParam.POWERDOWN_SAVE_MULTITURN: ParamSpec(""),
-    MyActuatorParam.POLE_PAIRS: ParamSpec("", _PROT),
-    MyActuatorParam.SINGLE_TURN_RESOLUTION: ParamSpec("pulses", _PROT),
-    MyActuatorParam.CALIBRATION_CURRENT: ParamSpec("A", _PROT),
-    MyActuatorParam.EXCHANGE_PHASE: ParamSpec("", _PROT),
+    # Motor Information (Basic Parameters tab). The GUI's Save writes all three,
+    # but they are factory identity — and the reduction ratio scales the output
+    # position — so they are protected.
+    MyActuatorParam.MOTOR_NUMBER: ParamSpec("", _PROT),
+    MyActuatorParam.FACTORY_TIME: ParamSpec("", _PROT),
+    MyActuatorParam.REDUCTION_RATIO: ParamSpec("", _PROT),
+    # Protect Parameters.
+    MyActuatorParam.OVER_VOLTAGE: ParamSpec("V"),
+    MyActuatorParam.LOW_VOLTAGE: ParamSpec("V"),
+    MyActuatorParam.STALL_TIME_LIMIT: ParamSpec("s"),
+    MyActuatorParam.EBRAKE_START_DUTY: ParamSpec("%"),
+    MyActuatorParam.CURRENT_SAMPLE_RES: ParamSpec("mOhm", _PROT),
     MyActuatorParam.EBRAKE_HOLD_DUTY: ParamSpec("%"),
+    # 0 = holding brake ("E-Brake"), 1 = braking resistor.
     MyActuatorParam.BRAKE_MODE: ParamSpec(""),
+    MyActuatorParam.ERROR_DETECTION_LPF_CF: ParamSpec("", min_firmware=_V44),
+    MyActuatorParam.AUTOMATIC_ERROR_RECOVERY: ParamSpec(""),
+    # Second-encoder (OUTENCODER2) deviation thresholds. No unit suffix in the
+    # GUI and stored unscaled, so none is claimed.
+    MyActuatorParam.ENCODER2_ABNORMAL_VALUE: ParamSpec(""),
+    MyActuatorParam.ENCODER2_ABNORMAL_SPEED: ParamSpec(""),
+    # Plan Parameters.
     MyActuatorParam.MAX_POSITIVE_POSITION: ParamSpec("deg"),
     MyActuatorParam.MIN_NEGATIVE_POSITION: ParamSpec("deg"),
     MyActuatorParam.POSITION_PLAN_MAX_ACC: ParamSpec("dps/s"),
     MyActuatorParam.POSITION_PLAN_MAX_DEC: ParamSpec("dps/s"),
-    MyActuatorParam.POSITION_PLAN_MAX_SPEED: ParamSpec("rpm"),
     MyActuatorParam.SPEED_PLAN_MAX_ACC: ParamSpec("dps/s"),
     MyActuatorParam.SPEED_PLAN_MAX_DEC: ParamSpec("dps/s"),
-    MyActuatorParam.CHANGE_MOTOR_DIRECTION: ParamSpec("", _PROT),
-    MyActuatorParam.ENCODER_CALIBRATION_VALUE: ParamSpec("", _PROT),
-    MyActuatorParam.STALL_TIME_LIMIT: ParamSpec("s"),
-    MyActuatorParam.EBRAKE_START_DUTY: ParamSpec("%"),
-    MyActuatorParam.CURRENT_SAMPLE_RES: ParamSpec("mOhm", _PROT),
-    MyActuatorParam.OVER_VOLTAGE: ParamSpec("V"),
-    MyActuatorParam.LOW_VOLTAGE: ParamSpec("V"),
+    MyActuatorParam.MOTOR_POSITION_ZERO: ParamSpec("pulses", _PROT),
+    # The GUI gives KT_OUT no unit, so none is claimed.
+    MyActuatorParam.KT_OUT: ParamSpec("", _PROT),
+    MyActuatorParam.MAX_TORQUE: ParamSpec("Nm", _PROT, min_firmware=_V44),
+    MyActuatorParam.VOLTAGE_SAMPLE_RES: ParamSpec("kOhm", _PROT, min_firmware=_V44),
+    # Motor Parameters (limits).
+    MyActuatorParam.RATED_CURRENT: ParamSpec("A"),
+    MyActuatorParam.MAX_CURRENT: ParamSpec("A"),
+    MyActuatorParam.STALL_CURRENT: ParamSpec("A"),
+    MyActuatorParam.SHUTDOWN_TEMP: ParamSpec("C"),
+    MyActuatorParam.RESUME_TEMP: ParamSpec("C"),
+    MyActuatorParam.MAX_SPEED: ParamSpec("rpm"),
+    MyActuatorParam.NOMINAL_SPEED: ParamSpec("rpm"),
+    MyActuatorParam.LPF_CF_FOR_CURRENT: ParamSpec("", min_firmware=_V44),
+    MyActuatorParam.LPF_CF_FOR_SPEED: ParamSpec("", min_firmware=_V44),
+    # Second-encoder / fieldbus / thermistor configuration. The GUI's Save writes
+    # all four over 0xC0; they are hardware/identity settings, so protected.
+    #
+    # ENABLE_2ND_ENCODER is a mode: 0 = disabled, 1 = "Encoder1 262144",
+    # 2 = "Encoder2 16384", 3 = "Encoder3 131072". The GUI derives
+    # SECOND_ENCODER_RESOLUTION (pulses/rev) from that mode and always writes the
+    # pair together — change them together too. THERMISTOR: 0 = "Thermistor1",
+    # 1 = "Thermistor2".
+    MyActuatorParam.ENABLE_2ND_ENCODER: ParamSpec("", _PROT),
+    MyActuatorParam.SECOND_ENCODER_RESOLUTION: ParamSpec("pulses", _PROT),
+    MyActuatorParam.ENABLE_ETHERCAT: ParamSpec("", _PROT),
+    MyActuatorParam.THERMISTOR: ParamSpec("", _PROT),
 }
 
 

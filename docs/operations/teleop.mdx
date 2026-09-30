@@ -154,6 +154,8 @@ If teleop feels too laggy, adjust in this order — one knob at a time, on the r
 
 <Note>
   The jitter buffer (`interp_max_delay_s`) self-regulates — it only adds delay while packet delivery is actually bursty, so lowering its cap mostly changes how much of a bad Wi-Fi episode gets smoothed versus played as a catch-up. If you're chasing network-induced lag, the [USB connection](/guides/quest-over-usb) and the [router settings above](#network-tip) are worth more than any knob here.
+
+  A stall is handled separately from jitter: a pose frame arriving more than `--vr_server.interp_max_lag_s` (default `0.5` s) later than the stream's normal transit is not played. When the headset's Wi-Fi uplink stalls for a few seconds and then drains its backlog, the arms hold instead of performing your motion seconds after you made it, then move to your current pose once on-time frames resume. The teleop log shows a warning when a stall starts (`VR pose stream arriving … late`) and when it ends (`VR pose stream on time again after …`). `0` disables the gate.
 </Note>
 
 ## Next steps

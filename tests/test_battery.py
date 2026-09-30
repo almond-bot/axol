@@ -11,6 +11,7 @@ from almond_axol.cli.can import setup as can_setup
 from almond_axol.robot import lift as lift_module
 from almond_axol.robot.battery import (
     CAPACITY_AH,
+    CHARGING_CLEAR_VOLTS,
     CHARGING_VOLTS,
     LIFEPO4_8S_CURVE,
     BatteryEstimator,
@@ -51,12 +52,14 @@ class BatteryCurveTest(unittest.TestCase):
     def test_curve_points_and_interpolation(self) -> None:
         for volts, percent in LIFEPO4_8S_CURVE:
             self.assertAlmostEqual(battery_percent(volts), percent)
-        # Halfway between 26.15 V (25 %) and 26.35 V (50 %).
-        self.assertAlmostEqual(battery_percent(26.25), 37.5)
+        # Halfway between 26.16 V (60 %) and 26.4 V (70 %).
+        self.assertAlmostEqual(battery_percent(26.28), 65.0)
 
-    def test_matches_the_bms_on_jelly(self) -> None:
-        # Measured at rest on Jelly: 25.69 V while the LiTime app showed 18 %.
-        self.assertAlmostEqual(battery_percent(25.69), 18.0, delta=3.0)
+    def test_is_the_published_cell_curve_times_eight(self) -> None:
+        # EVE's resting chart: 3.40 V/cell full, 3.26 V/cell half, 3.20 V/cell 20 %.
+        self.assertAlmostEqual(battery_percent(27.20), 100.0)
+        self.assertAlmostEqual(battery_percent(26.08), 50.0)
+        self.assertAlmostEqual(battery_percent(25.60), 20.0)
 
     def test_clamps_outside_the_curve(self) -> None:
         self.assertEqual(battery_percent(12.0), 0.0)
@@ -73,7 +76,7 @@ class BatteryCurveTest(unittest.TestCase):
             battery_percent(math.nan)
 
     def test_estimate(self) -> None:
-        status = estimate_battery(26.35)
+        status = estimate_battery(26.08)
         assert status is not None
         self.assertAlmostEqual(status.percent, 50.0)
         self.assertAlmostEqual(status.remaining_ah, CAPACITY_AH / 2)
@@ -85,6 +88,26 @@ class BatteryCurveTest(unittest.TestCase):
         assert status is not None
         self.assertTrue(status.charging)
         self.assertEqual(status.percent, 100.0)
+
+    def test_bulk_charging_voltage_reports_charging(self) -> None:
+        # Measured on Jelly on the charger, nearly full: the rail sat at 27.5 V,
+        # far below the charger's 29.2 V absorption voltage.
+        status = estimate_battery(27.5)
+        assert status is not None
+        self.assertTrue(status.charging)
+
+    def test_full_resting_pack_is_not_charging(self) -> None:
+        # Measured on Jelly, full and unplugged: the board read 27.0 V.
+        for volts in (26.7, 27.0):
+            status = estimate_battery(volts)
+            assert status is not None
+            self.assertFalse(status.charging)
+        # Nor does the estimator, even coming off the charger.
+        est = BatteryEstimator()
+        est.update(27.5)
+        for _ in range(20):
+            status = est.update(27.0)
+        self.assertFalse(status.charging)
 
     def test_no_pack_is_none_not_empty(self) -> None:
         # The board on USB power alone reads a few volts of nothing.
@@ -129,10 +152,35 @@ class BatteryEstimatorTest(unittest.TestCase):
         assert charging is not None
         self.assertTrue(charging.charging)
         self.assertAlmostEqual(charging.voltage, 29.1)
-        unplugged = est.update(27.0)
+        unplugged = est.update(26.6)
         assert unplugged is not None
-        self.assertAlmostEqual(unplugged.voltage, 27.0)
-        self.assertLess(unplugged.voltage, CHARGING_VOLTS)
+        self.assertFalse(unplugged.charging)
+        self.assertAlmostEqual(unplugged.voltage, 26.6)
+
+    def test_charging_has_hysteresis(self) -> None:
+        est = BatteryEstimator()
+        est.update(26.5)
+        self.assertTrue(est.update(CHARGING_VOLTS + 0.3).charging)
+        # Dipping just under the set threshold keeps it charging...
+        between = (CHARGING_VOLTS + CHARGING_CLEAR_VOLTS) / 2
+        for _ in range(20):
+            status = est.update(between)
+        self.assertTrue(status.charging)
+        # ...until the rail drops below the clear threshold.
+        self.assertFalse(est.update(CHARGING_CLEAR_VOLTS - 0.3).charging)
+        # And from rest the same in-between voltage does not set it.
+        est = BatteryEstimator()
+        for _ in range(20):
+            status = est.update(between)
+        self.assertFalse(status.charging)
+
+    def test_reset_clears_charging(self) -> None:
+        est = BatteryEstimator()
+        est.update(28.0)
+        est.reset()
+        status = est.update((CHARGING_VOLTS + CHARGING_CLEAR_VOLTS) / 2)
+        assert status is not None
+        self.assertFalse(status.charging)
 
     def test_pack_removed_clears_the_estimate(self) -> None:
         est = BatteryEstimator()
@@ -177,7 +225,7 @@ class LiftPowerTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(lift.power.supply_volts, 26.35)
         battery = lift.battery
         assert battery is not None
-        self.assertAlmostEqual(battery.percent, 50.0)
+        self.assertAlmostEqual(battery.percent, battery_percent(26.35))
 
     def test_stale_power_means_no_battery(self) -> None:
         lift = Lift("can-test")
@@ -300,7 +348,7 @@ class ReadPowerTest(unittest.IsolatedAsyncioTestCase):
 
         assert power is not None and battery is not None
         self.assertAlmostEqual(power.supply_volts, 26.63)
-        self.assertAlmostEqual(battery.percent, 75.0)
+        self.assertAlmostEqual(battery.percent, battery_percent(26.63))
         bus = _AnsweringBus.instances[0]
         self.assertEqual(bus.sent[:2], [b"\x05\x00\x00", b"\x08"])
         # Never a motion opcode: no STOP / JOG / HOME / SET_POS.

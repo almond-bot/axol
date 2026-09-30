@@ -44,6 +44,7 @@ from typing import Any
 
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
+from ..utils.logquiet import quiet_noisy_loggers
 from ..zed import stereo_serials
 from .commands import (
     flag_default,
@@ -53,7 +54,6 @@ from .commands import (
     normalize_boolean_args,
     safety_flags,
 )
-from ..utils.logquiet import quiet_noisy_loggers
 from .manager import Session
 
 _logger = logging.getLogger(__name__)

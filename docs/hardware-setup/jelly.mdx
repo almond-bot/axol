@@ -1,0 +1,127 @@
+---
+title: "Axol + Jelly"
+description: "Axol Jelly setup."
+---
+
+import MountAxol from "/snippets/hardware/mount-axol.mdx";
+
+<Frame>
+  <img src="/assets/axol_mount_jelly.png" alt="Almond Axol on the Jelly Mobile base" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+Jelly Mobile is the **powered mobile base**: a holonomic omni-wheel drive, a 610mm telescoping lift, and a 2.4 kWh battery. Once set up, the headset thumbsticks drive it during teleop. See [Jelly in the VR interface guide](/guides/vr-interface#jelly). Specs are on the [Jelly Mobile product page](https://www.almond.bot/jelly-mobile), and base and lift dimensions are in the [outline drawing](https://www.almond.bot/resources/jelly_outline.pdf) (PDF).
+
+### Tools required
+
+You'll need a hex (Allen) key for the M8 bolts that mount Axol, and a Torx driver for the bolts that mount the compute (M6 or M3, depending on which one you have):
+
+| Screw | Driver |
+|---|---|
+| M8 (Axol) | 6&nbsp;mm hex |
+| M6 (Jetson AGX Orin) | T30 Torx |
+| M3 (ZED Box Orin) | T10 Torx |
+
+### Power panel
+
+<Frame>
+  <img src="/assets/jelly_power_panel.png" alt="Jelly's power panel: on-switch, E-Stop connector, power switch, and charge connector" width="500" style={{ margin: "0 auto" }} />
+</Frame>
+
+Everything electrical on Jelly goes through the panel on its back:
+
+- **Green on-switch**: starts Jelly once the power switch is on and the E-Stop is disengaged.
+- **E-Stop connector** (below the on-switch): plug the E-Stop in here. Keep it somewhere the operator can reach.
+- **Red power switch**: the main power switch. Turn it off to fully de-energize the base.
+- **Anderson connector**: the charge port. See [Charging Jelly](#charging-jelly).
+
+<Warning>
+  The E-Stop immediately cuts power to the robot, causing the arms to drop. It does not cut power to the Jetson.
+</Warning>
+
+<Note>
+  Abruptly shutting down the Jetson can sometimes corrupt the OS. Shut it down from the OS first, then turn the red power switch off.
+</Note>
+
+### Assembling Jelly
+
+<Steps>
+  <Step title="Unbox">
+    Set Jelly on a level floor with room to work around it.
+  </Step>
+  <Step title="Attach the cable chain">
+    The cable chain that carries Axol's cables up the lift column may ship with its top end loose for transport. If so, fasten the top bracket of the chain to the top plate so the chain follows the lift as it moves.
+  </Step>
+  <Step title="Mount the compute">
+    Install the Compute Kit in the base compartment as described in [Mounting the compute](#mounting-the-compute) below.
+  </Step>
+  <Step title="Power on">
+    Plug the E-Stop into its connector on the [power panel](#power-panel) above and make sure it is disengaged, turn the red power switch on, then press the green on-switch. The compute in the base boots with it.
+  </Step>
+  <Step title="Raise the lift to install height">
+    Run [`axol lift.goto`](/cli/lift-goto). Its default target of **75%** is the robot install height, comfortable for sliding Axol onto the mounting plate. The lift ships homed, so there is no calibration to run first.
+  </Step>
+  <Step title="Mount Axol">
+    Follow [Mounting Axol](#mounting-axol) below: four **M8×12 bolts** with locking washers, threaded in from underneath the plate.
+  </Step>
+  <Step title="Connect Axol">
+    Plug the **XT90** power lead and **USB-C** control cable into the back of Axol. Then fit the cameras with the [Axol Cameras](/hardware-setup/cameras) guide. Their GMSL cables are already connected at the compute end.
+  </Step>
+  <Step title="Drive">
+    Drive the base and lift from the headset thumbsticks during teleop. See [Jelly in the VR interface guide](/guides/vr-interface#jelly).
+  </Step>
+</Steps>
+
+### Mounting the compute
+
+<Frame>
+  <img src="/assets/jelly_compute.jpg" alt="The compute mounted inside Jelly's base compartment, with the power, USB, and antenna cables connected" width="500" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Compute Kit is **not pre-installed**. It mounts inside the compartment in Jelly's base, which provides a **19V DC power lead** (up to **5A**) from the battery and the **CAN adapters** for the wheels and lift. The compartment also carries the base's **antenna cables** (the braided pair on the right in the photo), which connect to the compute's antenna ports. Every cable the compute needs is already in the compartment: the power lead, the CAN adapters, the antenna cables, Axol's **USB-C** control cable, and the Camera Kit's **GMSL cables**. You only plug them in.
+
+<Steps>
+  <Step title="Mount the compute">
+    Fasten the compute into the base compartment using the mounting brackets that come with it, heatsink fins facing out so it can breathe. The bolts depend on which compute you have:
+
+    - **ZED Box Orin**: 4× **M3×12** Torx bolts (T10).
+    - **Jetson AGX Orin**: 4× **M6×12** Torx bolts (T30).
+  </Step>
+  <Step title="Connect power, CAN, and antennas">
+    Plug the compartment's **19V, 5A** DC power lead into the compute's power input, the wheel and lift **USB-to-CAN** adapters into its USB ports, and the two **antenna cables** onto the compute's antenna connectors.
+  </Step>
+  <Step title="Connect Axol and the cameras">
+    Plug Axol's USB-C control cable into a USB port on the compute and the GMSL cables into its **GMSL2** inputs.
+  </Step>
+</Steps>
+
+<MountAxol />
+
+### Charging Jelly
+
+Jelly runs from a **2.4 kWh** battery good for **4 to 10 hours** depending on how much you drive and lift. It charges through the **Anderson connector** on the power panel, using the charger in the box.
+
+<Steps>
+  <Step title="Power off">
+    Stop driving, shut the Jetson down from the OS, then turn the red power switch off. The lift holds its position unpowered, so it can stay wherever it is.
+  </Step>
+  <Step title="Connect the charger">
+    Plug the charger into a wall outlet, then into the Anderson connector on the power panel.
+  </Step>
+  <Step title="Wait for full">
+    Leave it connected until the charger reports full. Unplug the charger before powering Jelly back on.
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
+    Mount the Camera Kit's wrist and head cameras and wire them to the compute.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the robot machine and open the web control panel.
+  </Card>
+  <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
+    Back to the setup guides for every configuration.
+  </Card>
+</CardGroup>

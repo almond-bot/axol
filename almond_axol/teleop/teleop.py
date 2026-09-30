@@ -55,7 +55,7 @@ from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
-from .core import VRTeleopCore
+from .core import VRTeleopCore, wait_for_ik_ready
 from .recorder import make as _recorder_make
 from .worker import run_ik_worker
 
@@ -421,8 +421,7 @@ class VRTeleop:
         child_conn.close()
 
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, parent_conn.recv)
-        assert isinstance(msg, tuple) and msg[0] == "ready"
+        msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
         self._core.set_solution(q_init, left_indices, right_indices)
 

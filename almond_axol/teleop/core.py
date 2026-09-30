@@ -98,6 +98,48 @@ def recv_with_timeout(
             return conn.recv()
 
 
+# Ceiling on the IK worker's startup (solver build, rest-pose settle, first
+# trajectory compile): well past an Orin NX's ~minute, short of forever for a
+# worker that hung. A worker that dies is caught within one poll instead.
+IK_READY_TIMEOUT_S = 300.0
+_IK_READY_POLL_S = 0.5
+
+
+def wait_for_ik_ready(
+    conn: multiprocessing.connection.Connection,
+    process: Any,
+    *,
+    timeout: float = IK_READY_TIMEOUT_S,
+    stopped: Callable[[], bool] | None = None,
+) -> tuple | None:
+    """Wait for the IK worker's ``("ready", ...)`` handshake; the one shared wait.
+
+    Every flow that starts :func:`~.worker.run_ik_worker` (teleop,
+    collect-data, the rollout reset controller) waits here, so they agree:
+    a slow-but-healthy startup always completes, a worker process that dies
+    fails at once with its exit code, a hung one times out after ``timeout``,
+    and ``stopped`` aborts the wait (returns ``None``).
+    """
+    deadline = time.monotonic() + timeout
+    while not conn.poll(_IK_READY_POLL_S):
+        if stopped is not None and stopped():
+            return None
+        if process is not None and not process.is_alive():
+            raise RuntimeError(
+                f"IK worker exited during startup (exit code {process.exitcode}); "
+                "see its log above."
+            )
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"IK worker did not become ready within {timeout:.0f}s "
+                "(solver build, rest-pose settle, and startup trajectory)."
+            )
+    msg = conn.recv()
+    if not (isinstance(msg, tuple) and msg and msg[0] == "ready"):
+        raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
+    return msg
+
+
 class VRTeleopCore:
     """Engage + smoothing + reset state machine shared by both teleop flows.
 
@@ -264,6 +306,14 @@ class VRTeleopCore:
         # positions (see :meth:`resync_to_positions`) before resuming, so the
         # reset trajectory plans from where the arms actually are.
         self._ik_paused: bool = False
+
+        # Engage block (set while the owner can't act on tracking, e.g.
+        # collect-data saving an episode after the arms are home). Grips are
+        # ignored while blocked, and ``_engage_release_required`` then holds
+        # the gate until a fully released frame, so a squeeze held through
+        # the block can't engage the instant it lifts.
+        self._engage_blocked: bool = False
+        self._engage_release_required: bool = False
 
         # Arrival time of the most recent raw VR frame (written on the VR
         # server thread in note_frame_reset, read on the IK thread). Drives
@@ -443,6 +493,31 @@ class VRTeleopCore:
         self._ik_paused = False
 
     # ------------------------------------------------------------------
+    # Engage block (owner can't follow tracking right now)
+    # ------------------------------------------------------------------
+
+    def block_engage(self) -> None:
+        """Ignore the grips until :meth:`unblock_engage`.
+
+        For windows where nothing is streaming the tracking target to the
+        arms — e.g. collect-data saving an episode after the return to rest.
+        An engage there would still move the IK target, so the arms would
+        jump to the controller once commanding resumes. An arm that is
+        engaged when the block lands is disengaged on the next frame.
+        Safe to call from any thread.
+        """
+        self._engage_release_required = True
+        self._engage_blocked = True
+
+    def unblock_engage(self) -> None:
+        """Lift :meth:`block_engage`.
+
+        Engaging still needs both grips released first, then a fresh
+        both-grips squeeze. Safe to call from any thread.
+        """
+        self._engage_blocked = False
+
+    # ------------------------------------------------------------------
     # Engage toggle + IK target (IK thread)
     # ------------------------------------------------------------------
 
@@ -495,10 +570,26 @@ class VRTeleopCore:
         On the first engage out of rest, the velocity cap starts at
         ``engage_max_vel`` and smoothsteps up to ``teleop_max_vel`` across
         ``engage_duration`` (advanced in :meth:`compute_output`).
+
+        While :meth:`block_engage` is in effect the grips are ignored (and a
+        still-engaged session is disengaged); afterwards a fully released
+        frame must arrive before the both-grips engage is accepted again.
         """
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
         both = l_lock and r_lock
+        if self._engage_blocked or self._engage_release_required:
+            if self.teleop_enabled:
+                self._disengage_all("Teleop disabled (engage blocked)")
+            if not self._engage_blocked and not l_lock and not r_lock:
+                self._engage_release_required = False
+            # Track the raw edges so the toggle scheme sees no rising edge
+            # from a grip that was already held when the block lifted.
+            self._prev_both = both
+            self._prev_l_lock = l_lock
+            self._prev_r_lock = r_lock
+            self._ack_lock_release(frame, l_lock, r_lock)
+            return
         was_left = self.left_enabled
         was_right = self.right_enabled
         was_enabled = was_left or was_right
@@ -554,11 +645,23 @@ class VRTeleopCore:
         self._prev_both = both
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
+        self._ack_lock_release(frame, l_lock, r_lock)
 
-        # Managed tracker bridges hold both lock bits low until this explicit
-        # acknowledgement comes back. Unlike a fixed-duration release pulse,
-        # the handshake cannot be missed while this IK thread is blocked for
-        # several seconds waiting on a solve.
+        # Only track a gripper while its arm is engaged, so a frozen arm's
+        # grasp (and a disengaged session) can't be actuated by the trigger.
+        if self.left_enabled:
+            self.l_grip = frame.l_grip
+        if self.right_enabled:
+            self.r_grip = frame.r_grip
+
+    def _ack_lock_release(self, frame: object, l_lock: bool, r_lock: bool) -> None:
+        """Acknowledge a managed tracker bridge's lock-release request.
+
+        Managed tracker bridges hold both lock bits low until this explicit
+        acknowledgement comes back. Unlike a fixed-duration release pulse,
+        the handshake cannot be missed while this IK thread is blocked for
+        several seconds waiting on a solve.
+        """
         lock_release_id = getattr(frame, "lock_release_id", None)
         if (
             lock_release_id is not None
@@ -569,13 +672,6 @@ class VRTeleopCore:
             self._broadcast_json(
                 {"type": "lock_release", "value": int(lock_release_id)}
             )
-
-        # Only track a gripper while its arm is engaged, so a frozen arm's
-        # grasp (and a disengaged session) can't be actuated by the trigger.
-        if self.left_enabled:
-            self.l_grip = frame.l_grip
-        if self.right_enabled:
-            self.r_grip = frame.r_grip
 
     def _accept_tracking_frame(self, frame: object) -> bool:
         """Gate absolute-mode frames across an optical tracking dropout.

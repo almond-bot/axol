@@ -50,7 +50,8 @@ class IKResetController:
 
     Mirrors the reset path used by ``AxolVRTeleop`` (collect-data) but
     without the VR server. ``start()`` spawns ``run_ik_worker`` (JAX +
-    JITed solver, ~10-20 s); ``wait_ready()`` blocks on the handshake;
+    JITed solver: ~30 s on a fast host, over a minute on an Orin NX);
+    ``wait_ready()`` blocks on the handshake;
     ``return_to_rest()`` plans a joint-space trajectory and streams its
     waypoints to the impedance controller. Spawn before ``client.start()``
     so the IK JIT overlaps with the policy load.
@@ -109,20 +110,34 @@ class IKResetController:
                 mark_hardware_cleanup_uncertain(setup_error, cleanup_error)
             raise
 
-    def wait_ready(self, timeout: float = 60.0) -> None:
-        """Block until the IK worker has finished JIT compilation."""
+    def wait_ready(
+        self,
+        timeout: float | None = None,
+        stopped: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Block until the IK worker has finished its startup.
+
+        The same wait teleop and collect-data use
+        (:func:`~almond_axol.teleop.core.wait_for_ik_ready`). It used to be a
+        fixed 60 s here, which failed replay-dataset and run-policy on an
+        Orin NX (startup runs past a minute) while teleop came up fine.
+
+        Returns True once ready, False if ``stopped`` fired first.
+        """
+        from ..teleop.core import IK_READY_TIMEOUT_S, wait_for_ik_ready
+
         if self._ready:
-            return
+            return True
         if self._conn is None:
             raise RuntimeError("IK reset controller not started")
-        if not self._conn.poll(timeout):
-            raise TimeoutError(
-                f"IK worker did not become ready within {timeout:.1f}s "
-                "(JAX JIT compilation may have stalled)."
-            )
-        msg = self._conn.recv()
-        if not (isinstance(msg, tuple) and msg[0] == "ready"):
-            raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
+        msg = wait_for_ik_ready(
+            self._conn,
+            self._proc,
+            timeout=IK_READY_TIMEOUT_S if timeout is None else timeout,
+            stopped=stopped,
+        )
+        if msg is None:
+            return False
         import numpy as np
 
         _, q_init, left_indices, right_indices, _startup_traj = msg
@@ -130,6 +145,7 @@ class IKResetController:
         self._left_indices = [int(i) for i in left_indices]
         self._right_indices = [int(i) for i in right_indices]
         self._ready = True
+        return True
 
     def return_to_rest(
         self,
@@ -172,7 +188,8 @@ class IKResetController:
             ``True`` once the arms reached rest; ``False`` if aborted
             (stopped, or the operator declined the retry).
         """
-        self.wait_ready()
+        if not self.wait_ready(stopped=stopped):
+            return False
         while True:
             outcome = self._play_to_rest(robot, torque_threshold, stopped)
             if outcome != "contact":

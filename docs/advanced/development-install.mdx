@@ -66,13 +66,7 @@ axol provision
 
 This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box (Duo / Mini) camera-driver upgrade, the board-IMU group access (`gyro.install`, [Jelly](/guides/vr-interface#jelly)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box driver / board IMU). You can also run them individually.
 
-On a Jetson, pin the NVENC/VIC and CPU clocks for low-latency encode and a steady IK loop (the install script wires this into the systemd unit so it re-runs at every boot):
-
-```bash
-axol jetson.setup
-```
-
-See [`jetson.setup`](/cli/jetson-setup). It's a no-op on non-Jetson machines.
+Its last step applies the host's real-time tuning: on a Jetson (Orin NX, AGX Orin, Thor) it selects the max power mode, pins the NVENC/VIC/GPU and CPU clocks, steers the CAN adapters' interrupt onto a CAN core, and schedules the Argus camera daemon real-time — see [`jetson.setup`](/cli/jetson-setup) for each. It's a no-op on other hosts. The tuning resets at reboot; the install script's systemd unit re-applies it at every boot with `axol provision --boot`, and on a dev checkout without that unit you can run the same command after a reboot.
 
 ## First-run hardware setup
 
