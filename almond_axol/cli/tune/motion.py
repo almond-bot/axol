@@ -708,6 +708,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "drove a 7 Hz mode, so a high gain needs this below it",
     )
     p.add_argument(
+        "--imu-damp-lead",
+        type=float,
+        default=0.0,
+        metavar="HZ",
+        help="Centre of a lead-lag stage on the damped velocity (+37° phase "
+        "there; default 0 = none) — for the frequency where the damping's "
+        "loop phase runs out",
+    )
+    p.add_argument(
         "--imu-damp-ref",
         choices=("encoder", "command"),
         default="encoder",
@@ -971,6 +980,7 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                     hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp
                 ),
                 encoder=EncoderVelocity(hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp),
+                lead_hz=args.imu_damp_lead,
             )
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "

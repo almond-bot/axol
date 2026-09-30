@@ -215,7 +215,14 @@ class TipDamper:
     trip_s: float = 0.15
     estimator: VerticalVelocity = field(default_factory=VerticalVelocity)
     encoder: EncoderVelocity = field(default_factory=EncoderVelocity)
+    #: Centre (Hz) of a first-order lead-lag on the flex velocity (zero at
+    #: lead_hz/2, pole at 2·lead_hz: +37° there, 4× gain above), or 0 for
+    #: none. On jelly's shoulder_1 the damping's loop phase wraps near 8 Hz.
+    lead_hz: float = 0.0
     tripped: bool = field(default=False, init=False)
+    _lead_in: float = field(default=0.0, init=False)
+    _lead_out: float = field(default=0.0, init=False)
+    _lead_t: float | None = field(default=None, init=False)
     _started: float | None = field(default=None, init=False)
     _fast_since: float | None = field(default=None, init=False)
     _last_sample: float | None = field(default=None, init=False)
@@ -233,6 +240,7 @@ class TipDamper:
         self._ramp_from = now
         self._started = now
         self.tripped = False
+        self._lead_t = None
         self._fast_since = None
 
     def feed(self, rows: np.ndarray) -> None:
@@ -244,6 +252,26 @@ class TipDamper:
     def feed_height(self, t: float, z: float) -> None:
         """The tool height the encoders give (FK of the measured pose, m)."""
         self.encoder.update(t, z)
+
+    def _lead(self, now: float, x: float) -> float:
+        """The lead-lag stage (:attr:`lead_hz`), bilinear at this tick's dt."""
+        if self.lead_hz <= 0:
+            return x
+        if self._lead_t is None:
+            self._lead_t, self._lead_in, self._lead_out = now, x, x
+            return x
+        dt = now - self._lead_t
+        self._lead_t = now
+        if not 0.0 < dt < 0.1:
+            return self._lead_out
+        wz, wp = math.pi * self.lead_hz, 4 * math.pi * self.lead_hz
+        # H(s) = (1 + s/wz) / (1 + s/wp), Tustin with s = (2/dt)(z-1)/(z+1).
+        k = 2.0 / dt
+        b0, b1 = 1 + k / wz, 1 - k / wz
+        a0, a1 = 1 + k / wp, 1 - k / wp
+        y = (b0 * x + b1 * self._lead_in - a1 * self._lead_out) / a0
+        self._lead_in, self._lead_out = x, y
+        return y
 
     def torque(self, now: float, jac_z: np.ndarray) -> np.ndarray:
         """Joint torques (7,) for this tick. ``jac_z[i]`` = ∂(tool height)/∂q_i
@@ -268,7 +296,7 @@ class TipDamper:
         if self._ramp_from is None:
             self._ramp_from = now
         ramp = min(1.0, max(0.0, (now - self._ramp_from) / self.ramp_s))
-        force = -self.gain * self.flex
+        force = -self.gain * self._lead(now, self.flex)
         for i in self.columns:
             tau[i] = float(
                 np.clip(ramp * jac_z[i] * force, -self.max_torque, self.max_torque)
