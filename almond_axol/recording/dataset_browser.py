@@ -262,10 +262,39 @@ def _summary(
     )
 
 
-def read_episodes(root: Path) -> DatasetEpisodes:
-    """Every readable saved episode of the dataset at ``root``, by index."""
+# Decoded ``meta/episodes`` rows by file, reused while the file is unchanged.
+# The listing runs inside the serve process — under ``axol serve`` the control
+# loop is a thread of it — after every save, and once more per camera for each
+# preview request (:func:`episode_video`); re-reading every file each time cost
+# ~25 ms per episode on an Orin NX (3.8 s for a 150-episode dataset, five times
+# over per saved episode the panel previews). Recorded files are written once,
+# and a task rename replaces its file (new mtime/inode), so a stat is enough to
+# tell a cached file is still current.
+_episode_rows: dict[Path, tuple[tuple[int, int, int, frozenset[str]], list]] = {}
+_episode_rows_guard = threading.Lock()
+
+
+def _read_episode_rows(path: Path, wanted: set[str]) -> list[dict[str, Any]]:
+    """``path``'s rows restricted to ``wanted`` columns; cached per file version."""
     import pyarrow.parquet as pq
 
+    st = path.stat()
+    key = (st.st_mtime_ns, st.st_size, st.st_ino, frozenset(wanted))
+    with _episode_rows_guard:
+        hit = _episode_rows.get(path)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    schema = pq.read_schema(path)
+    rows = pq.read_table(
+        path, columns=[n for n in schema.names if n in wanted]
+    ).to_pylist()
+    with _episode_rows_guard:
+        _episode_rows[path] = (key, rows)
+    return rows
+
+
+def read_episodes(root: Path) -> DatasetEpisodes:
+    """Every readable saved episode of the dataset at ``root``, by index."""
     info = _load_info(root)
     fps = int(info.get("fps") or 0)
     cameras = _camera_keys(info)
@@ -278,14 +307,11 @@ def read_episodes(root: Path) -> DatasetEpisodes:
     unreadable = 0
     for path in _episode_files(root):
         try:
-            schema = pq.read_schema(path)
-            table = pq.read_table(
-                path, columns=[n for n in schema.names if n in wanted]
-            )
+            rows = _read_episode_rows(path, wanted)
         except Exception:  # footerless (being written) or torn — skip, count
             unreadable += 1
             continue
-        for row in table.to_pylist():
+        for row in rows:
             episodes.append(_summary(row, fps, cameras, info))
     episodes.sort(key=lambda e: e.index)
     try:

@@ -394,6 +394,12 @@ function EpisodePlayer({
     [keys]
   )
   const [playing, setPlaying] = useState(false)
+  // The sources the operator has pressed Play on. Until then nothing loads
+  // (see the <video> preload below); after it, loading must continue while
+  // playback is held for buffering, which a paused preload="none" element
+  // may not do.
+  const [armedFor, setArmedFor] = useState<typeof sources | null>(null)
+  const armed = armedFor === sources
   const [buffering, setBuffering] = useState(false)
   const [time, setTime] = useState(0)
   const duration = episode.durationS
@@ -418,6 +424,7 @@ function EpisodePlayer({
   }
 
   function play() {
+    setArmedFor(sources)
     if (time >= duration - 0.05) seek(0)
     each((video) => {
       void video.play().catch(() => undefined)
@@ -506,7 +513,14 @@ function EpisodePlayer({
                 src={source.url}
                 muted
                 playsInline
-                preload="auto"
+                // Nothing loads until Play. The card follows the live session
+                // and selects each newly saved episode, so an eager preload
+                // pulled every camera's cut (~50 MB) after every save, over
+                // the next take: on an Orin NX recording at 60 fps with the
+                // headset and panel streaming, that extra network and serve
+                // work on the camera cores starved the dataset encoders and
+                // discarded takes started within ~40 s of a save.
+                preload={armed ? "auto" : "none"}
                 onLoadedMetadata={(e) => {
                   e.currentTarget.currentTime = source.span.from + time
                 }}

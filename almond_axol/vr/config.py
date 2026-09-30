@@ -33,6 +33,11 @@ class VRServerConfig:
         interp_outlier_k: Hampel outlier threshold in robust standard
             deviations for the glitch rejection inside the smoothing window.
             Lower is more aggressive. ``<= 0`` disables rejection.
+        interp_max_lag_s: Pose frames arriving more than this much later than
+            the stream's normal transit are not played (their control state
+            still applies): after a network stall the arms hold, then follow
+            the current pose, instead of replaying the operator's motion
+            seconds late. ``<= 0`` disables the gate.
         pose_source_kind: Exclusive pose producer for this server. ``"webxr"``
             accepts Quest (plus legacy clients); ``"tracker"`` accepts only a
             Lighthouse/Ultimate bridge while other sockets remain view-only.
@@ -52,5 +57,6 @@ class VRServerConfig:
     interp_max_delay_s: float = 0.15
     interp_smooth_window_s: float = 0.12
     interp_outlier_k: float = 4.0
+    interp_max_lag_s: float = 0.5
     pose_source_kind: str | None = None
     expected_pose_source_id: str | None = None
