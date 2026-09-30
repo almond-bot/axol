@@ -1629,11 +1629,11 @@ export function perRunFields(
     .sort((a, b) => Number(b.required) - Number(a.required))
 }
 
-/** run-policy's `policy_type` for the operator's own model (almond_axol.policy). */
+/** The `policy_type` value for the custom policy interface. */
 export const CUSTOM_POLICY_TYPE = "custom"
 
 const CUSTOM_POLICY_PATH_HELP =
-  "Optional for a custom policy — passed to your policy server as-is (e.g. which model to load)."
+  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
 
 /** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
 export function isCustomPolicyRun(values: Record<string, unknown>): boolean {
@@ -1642,11 +1642,10 @@ export function isCustomPolicyRun(values: Record<string, unknown>): boolean {
 
 /**
  * Per-run field rules that depend on the chosen policy type. A LeRobot policy
- * needs its checkpoint path; a custom policy (your own model behind
- * `almond_axol.policy.serve`) doesn't — the path is optional and forwarded to
- * your server. The host marks `policy_path` optional so a custom run can
- * start; this re-marks it required for every other policy type. Ops without
- * a `policy_type` field pass through untouched.
+ * needs its checkpoint path; a custom policy endpoint selects its own model,
+ * so the path is unused and is not sent. The host marks `policy_path` optional
+ * so a custom run can start; this re-marks it required for every other policy
+ * type. Ops without a `policy_type` field pass through untouched.
  */
 export function applyPolicyTypeRules(fields: SchemaField[], custom: boolean): SchemaField[] {
   if (!fields.some((f) => f.key === "policy_type")) return fields

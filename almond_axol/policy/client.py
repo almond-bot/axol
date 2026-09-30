@@ -1,8 +1,8 @@
-"""Robot side of the custom policy protocol.
+"""Standalone client for the legacy wire-version-1 SDK.
 
-``axol run-policy --policy_type custom`` uses :class:`PolicyClient` to talk to
-a :func:`~almond_axol.policy.serve` process; it is equally usable on its own to
-exercise a policy server without a robot (see ``axol policy.check``).
+The robot commands use :class:`~almond_axol.policy.plan_client.PlanPolicyClient`
+and reject this older contract. This module remains for existing standalone
+SDK consumers; it is not a selectable robot execution path.
 """
 
 from __future__ import annotations
@@ -125,10 +125,24 @@ class PolicyClient:
                 pass
 
     def _request(self, message: bytes) -> tuple[dict[str, Any], memoryview]:
+        from websockets.exceptions import ConnectionClosed
+
         ws = self._ws
         if ws is None:
             raise PolicyProtocolError("Policy connection is closed.")
-        ws.send(message)
+        try:
+            ws.send(message)
+        except ConnectionClosed as closed:
+            # A refused session can close before hello is sent. Read the queued
+            # error, but never accept success for a request we did not send.
+            try:
+                reply = ws.recv(timeout=self.reply_timeout)
+            except (ConnectionClosed, TimeoutError):
+                raise closed from None
+            header, payload = decode_message(reply)
+            if header.get("type") != "error":
+                raise closed
+            return header, payload
         try:
             reply = ws.recv(timeout=self.reply_timeout)
         except TimeoutError:

@@ -505,10 +505,11 @@ export function OperationPanel({
                   )}
                   {customPolicy && (
                     <p className="text-xs leading-relaxed text-white/45">
-                      Custom policy: start your own policy server (
-                      <code className="font-mono text-white/60">almond_axol.policy.serve</code>)
-                      before pressing Start. Run Policy connects to the server host and port in
-                      Settings → Inference — this machine on port 8765 when the host is blank.
+                      Custom policy: start an endpoint implementing the custom policy interface
+                      before pressing Start. Run Policy uses the host and port in Settings →
+                      Inference; a blank host connects to this machine on the configured port
+                      (default 8765). Select the model and instruction on the endpoint; the task
+                      labels recordings.
                     </p>
                   )}
                   {!live &&

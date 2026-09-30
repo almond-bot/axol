@@ -30,9 +30,9 @@ from ..cli import config as _config  # noqa: F401
 # Leaf fields whose allowed values we know up front, keyed by the leaf segment
 # of the dotted path, so they render as dropdowns instead of free text. A
 # dataclass field annotated with a ``Literal`` takes its options from the
-# annotation instead (see ``_literal_options``), so a command-specific choice
-# set — run-policy's ``policy_type`` accepts ``custom``, collect-dagger's does
-# not — can't drift from what draccus will actually accept.
+# annotation instead (see ``_literal_options``), so each command's choices
+# stay aligned with what draccus accepts, including ``custom`` remote policies
+# in run-policy and collect-dagger.
 _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
     "mantis_source": ["quest", "lighthouse", "ultimate"],

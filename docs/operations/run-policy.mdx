@@ -5,7 +5,10 @@ description: "Run a trained policy autonomously — from the web control panel o
 
 Run Policy executes a trained policy on the robot autonomously: it streams the robot's joint positions and camera frames to the policy, which returns action chunks that drive the arms. It runs on the same machine as [data collection](/operations/data-collection) — the computer wired to the robot with the ZED cameras attached.
 
-By default, inference runs **locally** on that machine. Optionally, it can be **offloaded to a more powerful machine** on the network (e.g. a desktop with a discrete GPU): the robot machine sends observations over gRPC and receives actions back.
+For LeRobot policy types, inference runs **locally** by default. It can be
+offloaded to a more powerful machine on the network: the robot sends
+observations over gRPC and receives actions back. Custom policies use the
+[custom policy interface](/api/policy-plan) to connect to an existing endpoint.
 
 ```mermaid
 flowchart LR
@@ -22,7 +25,7 @@ flowchart LR
 You can launch a rollout from the **web control panel** or the **CLI** (`axol run-policy`).
 
 <Tip>
-  Not a LeRobot checkpoint? Pick policy type **`custom`** to drive the arms from your own model: it receives joints + camera frames and returns action chunks through the [`almond_axol.policy`](/api/policy) SDK. See [Run Your Own Policy](/operations/custom-policy).
+  Not a LeRobot checkpoint? Pick policy type **`custom`** to use the [custom policy interface](/api/policy-plan). The robot sends compressed observations and plan references, then executes the endpoint's absolute targets. Model selection and instructions stay at the endpoint; no checkpoint path is needed on the robot. See [Run Your Own Policy](/operations/custom-policy).
 </Tip>
 
 ## Before you start
@@ -92,10 +95,16 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
 **Discarding** an episode uses that same limp hold up front: because a bad rollout usually leaves the arms somewhere they shouldn't be, they go slack for hand-repositioning first, so you untangle them by hand rather than dragging them home from a failed pose — then return to rest replans from where you left them.
 
 <Info>
-  Rollout execution stays smooth on any inference hardware. Every command the policy produces is shaped by the same velocity/acceleration profile teleop and all training data go through, so a slow or bursty inference platform decelerates the arms to a brief hold and ramps back out instead of jerking at chunk boundaries. The shaping knobs (`--exec_max_vel`, `--ensemble_blend_s`, `--align_fade_s`) are in the [`run-policy`](/cli/run-policy) reference.
+  Execution filters constrain joint commands downstream of the policy. LeRobot
+  policies also use chunk ensembling and alignment (`--ensemble_blend_s`,
+  `--align_fade_s`). Custom-policy endpoints publish their final plan and own
+  any ensembling; the robot keeps its accepted suffix unchanged. Smooth model
+  boundaries still require compatible targets and sufficient inference
+  throughput. See [`run-policy`](/cli/run-policy) and the
+  [custom policy interface timing](/api/policy-plan#robot-control-loop).
 </Info>
 
-## Offload inference to a remote server (optional)
+## Offload LeRobot inference to a remote server (optional)
 
 <Steps>
   <Step title="Start the inference server on the GPU machine">

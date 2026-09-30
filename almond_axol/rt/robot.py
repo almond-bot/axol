@@ -80,7 +80,11 @@ from ..motor import ControlMode, Joint, Motor, MotorError, MotorGains, MotorStat
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import AxolArm, AxolHardware, _rollback_newly_enabled_motors
-from ..robot.base import RobotBase, mark_hardware_cleanup_uncertain
+from ..robot.base import (
+    HardwareCleanupError,
+    RobotBase,
+    mark_hardware_cleanup_uncertain,
+)
 from ..robot.config import AxolConfig
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
@@ -238,6 +242,7 @@ class Axol(RobotBase):
         # until ``disable`` / ``disconnect``) and Python must not send CAN.
         self._core_started = False
         self._armed = False
+        self._preserve_disconnect_pending = False
         # The motors the in-flight ``enable()`` is bringing up itself — its
         # rollback set. ``None`` until the post-prep holding snapshot: before
         # it nothing has been enabled, after it the joints *not* listed were
@@ -1124,20 +1129,49 @@ class Axol(RobotBase):
 
         After :meth:`connect` only: closes the maintenance proxies.
         """
-        if not self._armed:
+        self._preserve_disconnect_pending = True
+        if not self._armed and not self._core_started:
             await self._robot.disconnect()
+            self._preserve_disconnect_pending = False
             return
         if self._rec is not None:
             self.set_recording_engaged(False)
         for _side, arm in self._arms():
             arm._command_sink = None
         self._link.on_feedback = None
+        original_process = self._link._proc
         try:
             await self._link.close()
-        except Exception:  # noqa: BLE001 - the motors hold either way
-            _logger.exception("rt: core link teardown failed")
+        except BaseException as exc:
+            # Retain the runtime and its ownership flags for a preserving
+            # retry. A failed close must never fall back to torque-off or
+            # let another process take over a possibly live core's buses.
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: preserving disconnect failed; core ownership is uncertain"
+            ) from exc
+        try:
+            core_stopped = all(
+                process is None or process.poll() is not None
+                for process in (original_process, self._link._proc)
+            )
+        except BaseException as exc:
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: cannot verify core exit; hardware ownership is uncertain"
+            ) from exc
+        if not core_stopped:
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: core is still running after disconnect; "
+                "hardware ownership is uncertain"
+            )
         self._armed = False
         self._core_started = False
+        self._preserve_disconnect_pending = False
         if self._rec is not None:
             try:
                 self._rec.dump()
@@ -1174,6 +1208,9 @@ class Axol(RobotBase):
         :meth:`_rollback_enable`, which torques off only the motors it
         brought up.)
         """
+        if getattr(self, "_preserve_disconnect_pending", False):
+            await self.disconnect()
+            return
         if not self._core_started:
             if all(bus.never_opened for bus in self._buses()):
                 _logger.info(

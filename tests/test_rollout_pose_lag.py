@@ -10,7 +10,7 @@ from unittest import mock
 import numpy as np
 
 from almond_axol.lerobot.robot import robot_axol
-from almond_axol.lerobot.robot.robot_axol import AxolRobot
+from almond_axol.lerobot.robot.robot_axol import AxolRobot, PolicyObservationNotReady
 from almond_axol.lerobot.rollout import ActionPublisher, RolloutCaptureThread
 
 
@@ -329,7 +329,7 @@ class AxolObservationPoseLagTest(unittest.TestCase):
             robot._axol.state_nearest.assert_not_called()
         empty.read_latest.assert_not_called()
 
-    def test_unbracketed_or_distant_telemetry_is_fatal(self) -> None:
+    def test_unbracketed_or_distant_telemetry_is_typed_as_unavailable(self) -> None:
         camera = _camera(30, 7, 499.0, 499.0)
         robot = _robot_with_cameras({"wrist": camera}, state_nearest=lambda _ts: None)
         with (
@@ -337,7 +337,9 @@ class AxolObservationPoseLagTest(unittest.TestCase):
                 "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
                 return_value=499.01,
             ),
-            self.assertRaisesRegex(RuntimeError, "no retained robot telemetry"),
+            self.assertRaisesRegex(
+                PolicyObservationNotReady, "no retained robot telemetry"
+            ),
         ):
             robot.get_observation_with_pose_lag()
 
@@ -348,9 +350,41 @@ class AxolObservationPoseLagTest(unittest.TestCase):
                 "almond_axol.lerobot.robot.robot_axol.time.perf_counter",
                 return_value=499.01,
             ),
-            self.assertRaisesRegex(RuntimeError, "too far from policy camera"),
+            self.assertRaisesRegex(
+                PolicyObservationNotReady, "too far from policy camera"
+            ),
         ):
             robot.get_observation_with_pose_lag()
+
+    def test_camera_silence_is_typed_as_unavailable(self) -> None:
+        robot = _robot_with_cameras({"wrist": _camera(30, 1, 100.0, 100.0)})
+        with (
+            mock.patch.object(robot_axol.time, "perf_counter", return_value=101.0),
+            self.assertRaisesRegex(PolicyObservationNotReady, "no fresh frame"),
+        ):
+            robot.get_observation_with_pose_lag()
+
+    def test_no_published_frame_preserves_unavailable_error_type(self) -> None:
+        camera = SimpleNamespace(latest_capture_ts=mock.Mock(return_value=None))
+        with self.assertRaisesRegex(PolicyObservationNotReady, "no frame yet"):
+            AxolRobot._newest_policy_exposure("wrist", camera)
+
+    def test_device_error_is_not_classified_as_transient(self) -> None:
+        for error in (RuntimeError("device lost"), TimeoutError("read failed")):
+            camera = SimpleNamespace(latest_capture_ts=mock.Mock(side_effect=error))
+            with self.subTest(error=error), self.assertRaises(RuntimeError) as raised:
+                AxolRobot._newest_policy_exposure("wrist", camera)
+            self.assertNotIsInstance(raised.exception, PolicyObservationNotReady)
+
+    def test_invalid_capture_timestamp_is_not_classified_as_transient(self) -> None:
+        camera = _camera(30, 1, float("nan"), 100.0)
+        robot = _robot_with_cameras({"wrist": camera})
+        with (
+            mock.patch.object(robot_axol.time, "perf_counter", return_value=100.01),
+            self.assertRaisesRegex(RuntimeError, "invalid capture timestamp") as raised,
+        ):
+            robot.get_observation_with_pose_lag()
+        self.assertNotIsInstance(raised.exception, PolicyObservationNotReady)
 
     def test_concurrent_calls_keep_their_own_lag(self) -> None:
         barrier = threading.Barrier(2)

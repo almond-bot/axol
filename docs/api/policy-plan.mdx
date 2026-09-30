@@ -1,0 +1,290 @@
+---
+title: "Custom policy interface"
+description: "Compressed observations and cached action-plan continuation without model-specific robot code."
+---
+
+`run-policy --policy_type custom` and `collect-dagger --policy_type custom`
+use this interface for compressed observations and accepted-plan continuation.
+It replaces the original raw-observation custom-policy path. The handshake
+retains `version: 2` to reject incompatible endpoints; there is no legacy
+robot mode, protocol-selection flag or automatic downgrade.
+
+The desktop owns the model, instruction text, normalization, conditioning,
+and its prediction cache. The robot owns capture, the dispatch clock, and
+replacement of future targets. Every reply contains absolute robot-space
+targets in the agreed action layout, units and robot coordinate frames. Names and shapes
+are validated on the wire; matching numerical units and frame conventions is
+also an endpoint responsibility. The observation and action layouts may
+be different (for example, joint observations with Cartesian actions).
+
+## Setup
+
+`PlanPolicyClient.connect(spec)` sends `hello`. A successful server echoes the
+entire validated specification in `ready`; the client refuses any mismatch.
+
+```python
+from almond_axol.policy.plan_protocol import PlanSpec
+from almond_axol.policy.protocol import CameraSpec
+
+spec = PlanSpec(
+    state_names=("joint.left", "joint.right"),
+    action_names=("target.x", "target.y", "gripper"),
+    cameras=(CameraSpec("overhead", (288, 480, 3)),),
+    fps=30,
+    actions_per_chunk=30,
+    request_interval=10,
+    max_adoption_offset_steps=6,
+    dispatch_feedback=True,
+)
+```
+
+`hello` and `ready` both contain `protocol: "axol-policy"`, `version: 2`,
+ordered state/action names, cameras, and the four scheduling fields above.
+Each camera has `name`, prepared `shape: [height, width, 3]`, and `codec: "png"`.
+Camera preparation and action-name conventions must agree with the remote
+endpoint; it must reject incompatible specifications before sending `ready`.
+
+The generic robot client sends `dispatch_feedback: true` in
+`hello`; `ready` must echo it. This enables the dispatch reference described
+below without naming a policy architecture. `PlanSpec.dispatch_feedback`
+can represent low-level clients without this capability; those clients omit
+the capability and dispatch-reference fields from the wire.
+An explicit `dispatch_feedback: false` is not a wire representation. An
+endpoint without dispatch-feedback support rejects it during setup, so the
+robot client and remote endpoint must agree on this capability. The handshake does
+not silently downgrade dispatch feedback.
+
+`max_adoption_offset_steps` is the greatest permitted age of a reply in
+control steps, relative to its locally saved request origin. It never delays
+an early response. The wire schema permits `None` to remove that additional
+deadline; rows still expire at their original scheduled times. The generic
+robot runtime requires an integer deadline inside the horizon. The initial implementation requires PNG
+for every image, preserving RGB pixels exactly after configured preparation.
+
+## Recurring request and reply
+
+Each WebSocket message is binary: a big-endian uint32 JSON-header byte count,
+that many UTF-8 JSON bytes, then the binary payload. WebSocket compression is
+disabled because image data is already PNG.
+
+An `infer` header is:
+
+```json
+{
+  "type": "infer",
+  "request_id": "episode-1-request-42",
+  "observation": {
+    "state": [0.1, -0.2],
+    "state_sample_time_ns": 100000001,
+    "images": [
+      {"name": "overhead", "capture_time_ns": 99999999, "byte_length": 12345}
+    ]
+  },
+  "continuation": {"prediction_id": "episode-1-request-41", "from_row": 10},
+  "last_dispatched": {"prediction_id": "episode-1-request-41", "row": 9}
+}
+```
+
+The image payload concatenates complete PNG byte streams in negotiated camera
+order. Timestamps are integer nanoseconds in one robot monotonic clock; they
+are not comparable to the desktop clock. The decoded image representation is an RGB uint8 array. Camera count/order/shape, PNG format, lengths,
+finite state values, and all message fields are validated.
+
+`continuation` identifies the actual accepted prediction and its first
+remaining row. It means the queued targets are an unchanged suffix of that
+prediction, not merely that it was the last one generated. It is `null` on
+bootstrap or after a reset. The endpoint must reject a missing cache entry or
+exhausted suffix instead of silently using a different plan. Robot-side temporal
+blending or editing of queued targets is incompatible with this compact
+reference. Low-level control/filtering remains downstream of those targets.
+
+When `dispatch_feedback` is enabled, every `infer` header must also contain
+`last_dispatched`. Its value is either `null` or an object with
+`prediction_id` and a zero-based `row`. It identifies the last published
+target row whose local dispatch path completed successfully in the current
+reset generation. This is local send completion, not a hardware acknowledgment.
+It does not report a measured pose, successful physical tracking,
+or the applied setpoint after trajectory filtering or inverse kinematics.
+The referenced value is the exact prefilter row previously sent by the
+desktop. With dispatch feedback disabled, the field must be omitted.
+
+The client freezes both references with the request's saved row origin,
+using the latest confirmed dispatch without waiting for a send in progress.
+A send still in progress is not reported as completed, even if its row has
+already been reserved. A failed dispatch is never reported as completed;
+completion from an invalidated generation cannot repopulate the reference.
+`last_dispatched: null` means there is no confirmed dispatch reference
+belonging to the current scheduler/reset generation, including recovery.
+A dispatch from an invalidated generation may still finish physically and
+remain omitted. Null does not imply that no command was sent since the wire
+reset or that the robot has stopped physically.
+
+The two references may name different plans. For example, after dispatching
+`X[12]`, the client may accept a delayed plan `Y` whose next remaining row is
+`Y[3]`. Before dispatching that row, an observation reports
+`continuation={prediction_id: "Y", from_row: 3}` and
+`last_dispatched={prediction_id: "X", row: 12}`. `Y[2]` was skipped, so
+subtracting one from `continuation.from_row` would not identify the previous
+command. Desktop adapters must retain both cited plans when they need this
+history.
+
+Fixed-budget adapters receive no latency field. An adaptive adapter may opt
+into the optional top-level integer `delay_steps`; it is conditioning input,
+never a command to delay adoption. The generic runtime caps its estimate at
+`actions_per_chunk`; that value means a full horizon or longer. Instruction
+text stays on the desktop.
+
+The `actions` reply header contains:
+
+```json
+{
+  "type": "actions",
+  "request_id": "episode-1-request-42",
+  "shape": [30, 3]
+}
+```
+
+Its payload is row-major little-endian float32 values. An optional
+`max_adoption_offset_steps` may tighten the negotiated deadline for this
+reply. There are no absolute robot ticks on the wire. The robot associates
+row zero with the request origin saved locally, drops elapsed or irrevocable
+rows, and adopts the remaining suffix immediately. Fixed-prefix conditioning and
+real-time chunking require the same robot-side replacement operation.
+
+## Lifecycle and failure
+
+After connecting, call `client.reset(episode)` before the first inference.
+`reset` carries an integer `episode`; `reset_ok` echoes it. Before acknowledging,
+the endpoint must clear all cached predictions and recurrent state. Request IDs are nonempty strings,
+unique within an episode. Only one request may be outstanding on a client.
+
+On a hold, task change, or new episode, invalidate pending predictions in the
+local scheduler immediately. Then serialize `reset` after any outstanding
+request. Do not let a pre-reset reply repopulate the robot queue. Changing
+desktop instruction text must follow this episode boundary too.
+
+The generic runtime's `late_policy="blocking_refresh"` invalidates the
+accepted plan and dispatch reference on a late reply or exhausted horizon.
+It serializes a desktop reset after pending inference drains, then holds
+while requesting a fresh unconditioned plan. It executes up to
+`request_interval` rows, invalidates again, and repeats. This clears desktop
+history at each refresh; blocking mode persists until the scheduler itself
+is reset. A late response does not automatically resume asynchronous
+continuation. `late_policy="abort"` instead fails the session.
+
+An error reply has `type: "error"` and `message`. The endpoint must reject
+malformed requests, unknown continuation or dispatch references, and invalid
+model output. The client closes its connection on an error reply, malformed
+response or timeout.
+After a transport failure, start a new connection and explicitly reset it;
+a late reply cannot be mistaken for a subsequent request. The client does
+not automatically reconnect and resume motion.
+
+## Robot control loop
+
+Select the interface with `axol run-policy --policy_type custom
+--server_host HOST --server_port 8765 --task TASK`.
+The normal robot and camera configuration still applies. `task` labels the
+recording; instruction
+selection stays at the remote endpoint and is not sent in each observation.
+
+Observation acquisition and WebSocket request/reply run outside the periodic
+control thread. There is one outstanding request, one accepted plan and no
+queue of speculative future plans. Compression and network waits do not hold
+the dispatch lock. A short lock protects the cursor, accepted plan and reset
+generation; hardware sends run outside it. The controller reserves a row under
+that lock, so a replacement cannot overwrite a row already being sent.
+
+A request saves the next dispatch tick as its local origin. If its origin is
+`o` and the next unreserved tick when the reply arrives is `k`, the client
+adopts the suffix starting at `max(0, k - o)`. Row zero is never retimed to the
+reply's arrival. During bootstrap there is no accepted plan: the robot holds
+and the cursor stays fixed, so its first reply starts at row zero. After acquisition,
+the client freezes its origin and references; image preparation, encoding and
+transport consume the request's adoption budget. Reusing a camera frame does
+not refresh its capture timestamp. Freshness is checked before inference.
+A missed control deadline invalidates the plan instead of replaying a burst
+of missed targets.
+
+For example, at 30 Hz with a 30-row horizon and a request every 10 rows:
+
+| Event | Next command / request context |
+| --- | --- |
+| Plan A has dispatched rows 0 through 9 | Next queued row is A[10] |
+| Request B begins | `continuation=(A,10)`, `last_dispatched=(A,9)` |
+| Inference runs for three control ticks | Robot dispatches A[10], A[11], A[12] |
+| B arrives within its adoption deadline | Skip B[0:3]; next target is B[3] |
+
+Here each plan's identifier is the `request_id` whose reply published it.
+The numerical example assumes sends have completed before the next snapshot;
+a send still in progress remains unconfirmed in `last_dispatched`.
+
+The scheduler copies accepted arrays and marks them immutable. Custom policies
+bypass the LeRobot chunk alignment and temporal ensemble code. Their targets
+still pass through the existing execution path: joint limits, Cartesian IK
+when configured, configured trajectory filtering, the realtime controller and
+configured contact safeguards. For independent layouts, `robot_config.action_space` selects `joint`
+or `cartesian` without forcing the observation layout to change. Omitting it
+preserves the earlier coupled behavior of `observe_cartesian`.
+
+## Why the custom policy interface supports different policy families
+
+The remaining queued targets are completely described by `(prediction_id,
+from_row)` because the robot executes one unchanged suffix. A remote endpoint
+that retains the exact published plans can reconstruct that suffix without
+receiving a duplicate action matrix on every request. It must retain both
+referenced plans when continuation and confirmed dispatch name different IDs.
+Relative actions must be converted to the negotiated absolute target layout
+before publication; model preprocessing, normalization and recurrent state
+remain outside the robot runtime.
+
+For real-time chunking, an endpoint can condition its next prediction on the
+accepted suffix and use a fixed latency budget or the optional delay estimate.
+The client continues dispatching the old plan while inference runs, then
+skips the expired prefix of the new plan. The robot does not need to know
+whether the endpoint used hard prefix conditioning, inpainting or another
+sampling method.
+
+For temporal ensembling, the endpoint can retain overlapping raw predictions,
+compute the desired weighted targets and publish the final resulting plan.
+The reference must name those final published targets, not an unprocessed
+model chunk. The robot neither stores ensemble weights nor re-ensembles the
+reply. `request_interval=1` permits inference on every control tick, but
+matching a per-tick ensemble requires sufficient end-to-end throughput: one
+outstanding request does not make an arbitrarily slow policy run at the
+control rate.
+
+These are sufficient **execution and feedback semantics**, not a guarantee
+that arbitrary replies are smooth. The endpoint must produce compatible
+boundary targets and obey the declared layout and timing. Filters and local
+limits constrain motor commands downstream; `last_dispatched` is not their
+output or measured tracking. Timestamped state is the physical feedback. The
+protocol does not promise position/velocity/acceleration continuity across
+arbitrary model outputs, nor continuity of policy history after recovery.
+In blocking-refresh mode the reset deliberately drops that history.
+
+## DAgger ownership and recording
+
+`collect-dagger --policy_type custom
+--hold_to_intervene true` uses the same wire messages and scheduler. A single
+local control loop owns both policy and operator sends. Either held grip
+revokes pending policy work immediately and gives the operator that arm;
+the other arm holds. Loss of the operator link while grips remain held keeps
+that ownership and holds the last command.
+
+With `shadow_inference=true`, observations and inference continue during
+operator control, but replies are discarded. Releasing both grips starts a
+new local generation, serializes a remote reset after any outstanding reply,
+and holds the last operator command until a fresh plan arrives. A joint-space
+handover after IK starts from that held command and constrains velocity and
+acceleration. Repeated intervention revokes that transition too. No late
+pre-intervention prediction can retake control.
+
+Recording continues within the same dataset episode, with per-row intervention
+labels and capture fences at ownership changes. `record_joint_actions=true`
+records resolved joint commands independently of the policy's wire action
+layout. `home_on_start=true` homes before the first episode;
+`start_from_current_pose=true` preserves the pose set during scene reset for
+subsequent starts. Terminal `q` from idle or an active episode parks through
+rest and zero before disabling motors. Contact, fault and interrupted-cleanup
+paths retain the existing support-preserving behavior.

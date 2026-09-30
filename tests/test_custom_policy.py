@@ -1,7 +1,8 @@
-"""Custom policy support: the almond_axol.policy SDK and run-policy's client for it."""
+"""Legacy SDK regression tests and current robot interface migration checks."""
 
 from __future__ import annotations
 
+import io
 import threading
 import time
 import unittest
@@ -20,8 +21,8 @@ from almond_axol.policy import (
     PolicyServer,
     PolicySpec,
     policy_url,
+    protocol,
 )
-from almond_axol.policy import protocol
 
 STATE = tuple(f"joint_{i}.pos" for i in range(4))
 ACTIONS = tuple(f"joint_{i}.pos" for i in range(4))
@@ -292,6 +293,40 @@ class ServerClientTest(unittest.TestCase):
                     ):
                         second.connect(_spec())
 
+    def test_refusal_received_before_hello_send_is_reported(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        ws = mock.Mock()
+        ws.send.side_effect = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws.recv.return_value = protocol.encode_error(
+            "Policy server already has a robot connected."
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+            self.assertRaisesRegex(PolicyRemoteError, "already has a robot"),
+        ):
+            client.connect(_spec())
+
+    def test_send_failure_cannot_consume_a_queued_success(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws = mock.Mock()
+        ws.send.side_effect = closed
+        ws.recv.return_value = protocol.encode_ready(
+            protocol.ReadyInfo(action_names=ACTIONS)
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+        ):
+            with self.assertRaises(ConnectionClosedOK) as error:
+                client.connect(_spec())
+            self.assertIs(error.exception, closed)
+
 
 # ----------------------------------------------------------------------
 # run-policy's robot-side client (needs the lerobot extra)
@@ -327,7 +362,7 @@ class CustomRobotClientTest(unittest.TestCase):
             server_address="unused",
             policy_type="custom",
             pretrained_name_or_path="custom",
-            actions_per_chunk=4,
+            actions_per_chunk=30,
             policy_device="cpu",
             client_device="cpu",
             task="stack the cups",
@@ -341,119 +376,64 @@ class CustomRobotClientTest(unittest.TestCase):
             **kwargs,
         )
 
-    @staticmethod
-    def _observation(timestep: int):  # type: ignore[no-untyped-def]
-        from lerobot.async_inference.helpers import TimedObservation
+    def test_default_custom_client_rejects_legacy_peer_without_dispatch(self) -> None:
+        from almond_axol.policy.plan_client import PlanPolicyClient
 
-        raw = {name: float(i) for i, name in enumerate(ROBOT_ACTIONS)}
-        raw["overhead"] = _frame()
-        raw["task"] = "stack the cups"
-        return TimedObservation(
-            timestamp=time.time(), timestep=timestep, observation=raw
-        )
-
-    def test_rollout_round_trip(self) -> None:
-        policy = _Recorder(rows=6)
+        policy = _Recorder()
         with _Served(policy) as served:
-            client = self._client(served.url, custom_policy_path="org/cups")
-            try:
-                self.assertTrue(client.start())
-                spec = policy.specs[0]
-                self.assertEqual(spec.action_names, ROBOT_ACTIONS)
-                self.assertEqual(spec.camera_names, ("overhead",))
-                self.assertEqual(spec.policy_path, "org/cups")
-                self.assertEqual(spec.task, "stack the cups")
-
-                client.reset_episode_state()
-                self.assertEqual(policy.resets, 1)
-                client.start_barrier = threading.Barrier(1)
-                receiver = threading.Thread(target=client.receive_actions, daemon=True)
-                receiver.start()
-                client.send_observation(self._observation(timestep=10))
-
-                deadline = time.time() + 5
-                while client.action_queue.qsize() < 4 and time.time() < deadline:
-                    time.sleep(0.01)
-                client.shutdown_event.set()
-                receiver.join(timeout=5)
-                self.assertFalse(receiver.is_alive())
-                self.assertIsNone(client.fatal_error)
-
-                queued = list(client.action_queue.queue)
-                # Truncated to actions_per_chunk and stamped from the obs timestep.
-                self.assertEqual([a.get_timestep() for a in queued], [10, 11, 12, 13])
-                np.testing.assert_allclose(
-                    queued[1].get_action().numpy()[:3], [1, 2, 3]
-                )
-                obs = policy.observations[0]
-                self.assertEqual(obs.state_names, ROBOT_ACTIONS)
-                self.assertEqual(obs.task, "stack the cups")
-            finally:
-                client.stop()
-
-    def test_action_layout_mismatch_is_refused(self) -> None:
-        from almond_axol.lerobot.action_schema import ActionSchemaError
-
-        class JointOnly(Policy):
-            action_names = tuple(f"other_{i}.pos" for i in range(14))
-
-        with _Served(JointOnly()) as served:
             client = self._client(served.url)
             try:
-                with self.assertRaisesRegex(ActionSchemaError, "Custom policy action"):
+                self.assertIsInstance(client._policy_client, PlanPolicyClient)
+                with self.assertRaises(PolicyRemoteError):
                     client.start()
-                with self.assertRaisesRegex(ActionSchemaError, "before"):
-                    client.send_observation(self._observation(0))
+                self.assertFalse(client._action_schema_confirmed)
+                self.assertIsNone(client._policy_client._ws)
+                self.assertEqual(policy.specs, [])
+                self.assertEqual(policy.observations, [])
+                client.robot.send_action.assert_not_called()
+                client.robot.connect.assert_not_called()
             finally:
                 client.stop()
 
-    def test_declared_fps_mismatch_is_refused(self) -> None:
-        class Slow(Policy):
-            fps = 15
-
-        with _Served(Slow()) as served:
-            client = self._client(served.url)
-            try:
-                with self.assertRaisesRegex(ValueError, "--fps 15"):
-                    client.start()
-            finally:
-                client.stop()
-            client = self._client(served.url, allow_fps_mismatch=True)
-            try:
-                self.assertTrue(client.start())
-            finally:
-                client.stop()
-
-    def test_policy_failure_is_fatal(self) -> None:
-        def broken(obs: Observation) -> None:
-            raise RuntimeError("model crashed")
-
-        with _Served(broken) as served:
-            client = self._client(served.url)
-            try:
-                client.start()
-                client.reset_episode_state()
-                client.start_barrier = threading.Barrier(1)
-                receiver = threading.Thread(target=client.receive_actions, daemon=True)
-                receiver.start()
-                client.send_observation(self._observation(0))
-                receiver.join(timeout=5)
-                self.assertIsInstance(client.fatal_error, PolicyRemoteError)
-                self.assertIn("model crashed", str(client.fatal_error))
-                self.assertFalse(client.running)
-            finally:
-                client.stop()
-
-    def test_unreachable_server_names_the_fix(self) -> None:
+    def test_unreachable_endpoint_cannot_confirm_action_schema(self) -> None:
         client = self._client("ws://127.0.0.1:1")
         try:
-            with self.assertRaisesRegex(RuntimeError, "almond_axol.policy.serve"):
+            with self.assertRaises(OSError):
                 client.start()
+            self.assertFalse(client._action_schema_confirmed)
+            client.robot.send_action.assert_not_called()
         finally:
             client.stop()
 
 
 class RunPolicyConfigTest(unittest.TestCase):
+    def test_cli_selects_custom_without_a_version_and_rejects_old_selector(self):
+        from almond_axol.cli.collect_dagger import DaggerConfig
+        from almond_axol.cli.config import parse
+        from almond_axol.cli.run_policy import RunPolicyConfig
+
+        for config_class in (RunPolicyConfig, DaggerConfig):
+            args = [
+                "--policy_type",
+                "custom",
+                "--task",
+                "test",
+                "--robot_config.cameras",
+                "{overhead: {serial: 1234}}",
+            ]
+            if config_class is DaggerConfig:
+                args += ["--repo_id", "local/test", "--hold_to_intervene", "true"]
+            with self.subTest(command=config_class.__name__):
+                self.assertEqual(parse(config_class, args).policy_type, "custom")
+                for old_version in ("1", "2"):
+                    with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        with self.assertRaises(SystemExit) as error:
+                            parse(
+                                config_class, args + ["--custom_protocol", old_version]
+                            )
+                        self.assertEqual(error.exception.code, 2)
+                        self.assertIn("unrecognized arguments", stderr.getvalue())
+
     def test_lerobot_policy_still_needs_a_path(self) -> None:
         from almond_axol.cli import run_policy
 
@@ -461,7 +441,7 @@ class RunPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--policy_path is required"):
             run_policy._run(cfg)
 
-    def test_form_schema_offers_custom_for_run_policy_only(self) -> None:
+    def test_form_schema_offers_custom_for_run_policy_and_dagger(self) -> None:
         from almond_axol.cli.collect_dagger import DaggerConfig
         from almond_axol.cli.run_policy import RunPolicyConfig
         from almond_axol.serve.introspect import build_schema
@@ -480,8 +460,13 @@ class RunPolicyConfigTest(unittest.TestCase):
         self.assertIn("custom", run_type["options"])
         self.assertTrue(run_type["required"])
         self.assertFalse(field(RunPolicyConfig, "policy_path")["required"])
-        self.assertNotIn("custom", field(DaggerConfig, "policy_type")["options"])
-        self.assertTrue(field(DaggerConfig, "policy_path")["required"])
+        self.assertIn("custom", field(DaggerConfig, "policy_type")["options"])
+        self.assertFalse(field(DaggerConfig, "policy_path")["required"])
+        for config_class in (RunPolicyConfig, DaggerConfig):
+            with self.subTest(command=config_class.__name__):
+                with self.assertRaises(AssertionError):
+                    field(config_class, "custom_protocol")
+                self.assertIsNotNone(field(config_class, "plan_config"))
 
 
 if __name__ == "__main__":
