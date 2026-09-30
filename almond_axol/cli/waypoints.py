@@ -23,6 +23,22 @@ the object. Waypoints that do not change a gripper do not pause to work it.
 In the ``axol serve`` control panel the same actions are buttons — the running
 session publishes them, so the panel needs no knowledge of this command.
 
+``--teach vr`` teaches from the VR headset instead of by hand: a normal teleop
+session drives the arms (squeeze both grips to engage, the triggers work the
+grippers) and the controllers record, with every prompt shown in the headset:
+
+    A                    record the current pose (stops a playback too)
+    left stick click     undo the last waypoint
+    right stick click    play the path
+
+The keys and panel buttons above keep working alongside. Playback stands
+teleop down, and when it ends the arms return to rest and teleop picks up
+again. A teleop session needs no second person at a keyboard and puts each
+pose where the operator aimed it, and it teaches in ``--sim`` as well.
+
+``--labels`` names the path's waypoints in order, and the prompt says which
+one to teach next.
+
 The whole path is solved *before* the arms move, so a waypoint the straight
 line cannot reach is reported while the robot is still standing still.
 
@@ -31,6 +47,8 @@ Examples:
     axol waypoints --file pick_place.json       # keep a named path
     axol waypoints --play_only --loops 0        # replay until stopped
     axol waypoints --sim --file pick_place.json # preview it in the browser
+    axol waypoints --teach vr                   # teach from the headset
+    axol waypoints --teach vr --labels "[home, pick_hover, place]"
 """
 
 from __future__ import annotations
@@ -38,11 +56,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import socket
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -54,8 +73,11 @@ from ..teleop.config import VRTeleopConfig
 from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.paths import almond_path
 from ..waypoints import Waypoint, WaypointSet
-from .config import LogLevel, normalize_bool_flags, parse
+from .config import LogLevel, normalize_bool_flags, parse, register_literal
 from .gravity_comp import _resolve_free_joints
+
+if TYPE_CHECKING:
+    from ..teleop import VRTeleop
 
 _logger = logging.getLogger(__name__)
 
@@ -71,6 +93,13 @@ Grip = tuple[float, float]
 # One planned move: the joint vectors to stream, the gripper openings held
 # while streaming them, and the openings to reach on arrival.
 Leg = tuple[list[np.ndarray], Grip, Grip]
+
+# How the arms are moved to each waypoint while teaching.
+TeachMode = register_literal(Literal["hand", "vr"])
+
+# Poll interval (s) of the VR teaching loop. Teleop's own control loop streams
+# the arms; this one only watches for commands.
+_VR_POLL_S = 0.02
 
 
 def _default_file() -> str:
@@ -103,6 +132,12 @@ class WaypointsCmdConfig:
     the cost of an arm that rings longer when something disturbs it and does
     not yield if the path meets an obstacle. Hand-guiding is unaffected either
     way: gravity compensation zeroes the position gain on free joints.
+
+    ``teach="vr"`` teaches through a VR teleop session instead, run with the
+    same teleop, IK and VR-server parameters ``axol teleop`` uses (the
+    robot's shared settings). ``free_joints`` and ``kd`` do not apply to it,
+    and Jelly is never driven: moving the base would move every waypoint
+    taught so far.
     """
 
     axol: AxolConfig = field(default_factory=AxolConfig)
@@ -145,15 +180,29 @@ class WaypointsCmdConfig:
     a leg in the configuration IK settled into, which reaches the taught
     gripper pose by a slightly different elbow angle than the operator used;
     without a blend that difference is taken up in a single tick."""
+    teach: TeachMode = "hand"
+    """How the arms get to each waypoint while teaching: ``hand`` holds them
+    in gravity compensation to be hand-guided, ``vr`` drives them with VR
+    teleop and records from the headset's controllers."""
+    labels: list[str] | None = None
+    """Names for the path's waypoints, in order: the i-th waypoint is saved
+    under the i-th name, and the teaching prompt names the next one. Waypoints
+    past the end of the list keep the default name."""
     free_joints: list[str] | None = None
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
     rate_hz: float = 250.0
     play_only: bool = False
-    """Skip teaching and replay ``file`` straight away. Implied by ``sim``."""
+    """Skip teaching and replay ``file`` straight away. Implied by ``sim``
+    unless ``teach`` is ``vr``."""
     sim: bool = False
-    """Play the path in the browser visualizer instead of on the robot."""
+    """Run in the browser visualizer instead of on the robot."""
     log_level: LogLevel = "INFO"
+
+
+def _play_only(cfg: WaypointsCmdConfig) -> bool:
+    """Whether a session skips teaching. Sim has no arms to hand-guide."""
+    return cfg.play_only or (cfg.sim and cfg.teach == "hand")
 
 
 # ----------------------------------------------------------------------
@@ -288,6 +337,53 @@ class _QueueWaypointControl:
 Control = _StdinWaypointControl | _QueueWaypointControl
 
 
+class _HeadsetButtons:
+    """The controller buttons ``--teach vr`` binds, as session commands.
+
+    Teleop leaves A unbound, and the stick clicks only ever drive Jelly's
+    lift, which this command never runs. :meth:`feed` sees every VR frame on
+    the VR server thread (see :meth:`VRTeleop.add_frame_listener`) and queues
+    one command per press; the session drains them with :meth:`poll`.
+    """
+
+    # (frame field, command). A is "record"; the session reads it as "stop"
+    # while a path is playing.
+    BINDINGS: tuple[tuple[str, str], ...] = (
+        ("r_a", "record"),
+        ("l_stick_click", "undo"),
+        ("r_stick_click", "play"),
+    )
+
+    def __init__(self) -> None:
+        self._q: queue.Queue[str] = queue.Queue()
+        self._held = {name: False for name, _ in self.BINDINGS}
+
+    def feed(self, frame: Any) -> None:
+        for name, command in self.BINDINGS:
+            pressed = bool(getattr(frame, name, False))
+            if pressed and not self._held[name]:
+                self._q.put(command)
+            self._held[name] = pressed
+
+    def poll(self) -> str | None:
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def clear(self) -> None:
+        """Drop presses queued before the current phase began."""
+        while self.poll() is not None:
+            pass
+
+
+# In-headset reminder of the buttons that do something in each phase.
+_HEADSET_HINTS = {
+    "teaching": "A record · L-stick undo · R-stick play",
+    "playing": "A stop",
+}
+
+
 class _SolverHandle:
     """Builds the IK solver on a background thread.
 
@@ -404,7 +500,12 @@ def _ease_in_offsets(
 
 
 class _Session:
-    """One ``axol waypoints`` run: teach, play, park, repeat."""
+    """One ``axol waypoints`` run: teach, play, park, repeat.
+
+    With ``teleop`` (``--teach vr``) the teaching phase runs that VR teleop
+    session instead of gravity compensation. The caller owns its lifecycle:
+    it must be entered (which also enables ``robot``) before :meth:`run`.
+    """
 
     def __init__(
         self,
@@ -412,12 +513,20 @@ class _Session:
         robot: RobotBase,
         control: Control,
         stop_event: threading.Event,
+        teleop: VRTeleop | None = None,
     ) -> None:
         self._cfg = cfg
         self._robot = robot
         self._control = control
         self._stop = stop_event
         self._sim = cfg.sim
+        self._teleop = teleop
+        self._buttons: _HeadsetButtons | None = None
+        if teleop is not None:
+            self._buttons = _HeadsetButtons()
+            teleop.add_frame_listener(self._buttons.feed)
+        # True once playback has stood teleop down, until it is handed back.
+        self._teleop_suspended = False
         self._store = WaypointSet.load(cfg.file)
         # The frame held to the straight line: the point the fingers close on,
         # or the mount itself on a gripperless arm.
@@ -453,8 +562,15 @@ class _Session:
 
     @property
     def _play_only(self) -> bool:
-        """Sim has no arms to hand-guide, so it can only replay a saved path."""
-        return self._cfg.play_only or self._sim
+        return _play_only(self._cfg)
+
+    @property
+    def _vr(self) -> bool:
+        return self._teleop is not None
+
+    def wait_for_solver(self) -> None:
+        """Block until the playback IK solver is built (raises if it failed)."""
+        self._solver_handle.get()
 
     # -- robot helpers ---------------------------------------------------
 
@@ -493,8 +609,9 @@ class _Session:
 
         An absent arm, or the gripperless SKU, has nothing to work — offering
         the operator a control for it would be a button that does nothing.
+        Neither is there when teaching in VR, where the triggers work them.
         """
-        if not self._cfg.axol.has_gripper:
+        if not self._cfg.axol.has_gripper or self._vr:
             return []
         present = (
             (True, True)
@@ -516,11 +633,22 @@ class _Session:
             right=right if self._robot.right is not None else None,
         )
 
+    def _poll(self, *, playing: bool = False) -> str | None:
+        """The next command from the headset, the terminal or the panel."""
+        if self._buttons is not None:
+            pressed = self._buttons.poll()
+            if pressed is not None:
+                if playing:
+                    # A stops a playback; the stick clicks mean nothing then.
+                    return "stop" if pressed == "record" else None
+                return pressed
+        return self._control.poll()
+
     def _interrupted(self) -> bool:
         """True if the operator asked to stop; latches a quit for :meth:`run`."""
         if self._stop.is_set():
             return True
-        command = self._control.poll()
+        command = self._poll(playing=True)
         if command == "quit":
             self._quit = True
             return True
@@ -528,10 +656,47 @@ class _Session:
 
     # -- published state -------------------------------------------------
 
+    def _set_state(
+        self, phase: str, message: str, controls: list[dict[str, str]]
+    ) -> None:
+        """Publish to the terminal / panel and, in VR, to the headset."""
+        self._control.set_state(phase, message, controls, len(self._store))
+        if self._teleop is not None:
+            hint = _HEADSET_HINTS.get(phase)
+            self._teleop.set_banner(f"{message}\n{hint}" if hint else message)
+
+    def _next_label(self) -> str | None:
+        """The ``labels`` name the next recording is saved under, if any."""
+        labels = self._cfg.labels or []
+        count = len(self._store)
+        return labels[count] if count < len(labels) else None
+
+    def _teaching_message(self) -> str:
+        count = len(self._store)
+        how = "drive the arms from the headset" if self._vr else "hand-guide the arms"
+        labels = self._cfg.labels or []
+        upcoming = self._next_label()
+        if upcoming is not None:
+            return (
+                f"Teaching — {how} to {upcoming} ({count + 1} of {len(labels)}) "
+                "and record it."
+            )
+        if count == 0:
+            if self._vr:
+                return "Teaching — squeeze both grips to drive the arms, then record."
+            return "Teaching — hand-guide the arms and record a waypoint."
+        if count == 1:
+            return "Teaching — 1 waypoint. Record at least one more to play."
+        return f"Teaching — {count} waypoints. Play when you are ready."
+
     def _publish_teaching(self, message: str | None = None) -> None:
         count = len(self._store)
+        upcoming = self._next_label()
         controls: list[dict[str, str]] = [
-            {"command": "record", "label": "Record waypoint"}
+            {
+                "command": "record",
+                "label": f"Record {upcoming}" if upcoming else "Record waypoint",
+            }
         ]
         if count >= 2:
             controls.append({"command": "play", "label": f"Play {count} waypoints"})
@@ -544,48 +709,32 @@ class _Session:
             controls.append({"command": "undo", "label": "Undo last"})
             controls.append({"command": "clear", "label": "Clear all"})
         if message is None:
-            if count == 0:
-                message = "Teaching — hand-guide the arms and record a waypoint."
-            elif count == 1:
-                message = "Teaching — 1 waypoint. Record at least one more to play."
-            else:
-                message = f"Teaching — {count} waypoints. Play when you are ready."
-        self._control.set_state("teaching", message, controls, count)
+            message = self._teaching_message()
+        self._set_state("teaching", message, controls)
 
     def _publish(self, phase: str, message: str, stoppable: bool = False) -> None:
         controls = [{"command": "stop", "label": "Stop playback"}] if stoppable else []
-        self._control.set_state(phase, message, controls, len(self._store))
+        self._set_state(phase, message, controls)
+
+    def publish_done(self) -> None:
+        """Report the session over, with why it gave up if it did."""
+        self._set_state("done", self._failure or "Session finished.", [])
 
     # -- teaching --------------------------------------------------------
 
     async def teach(self) -> None:
-        """Hold the arms in gravity comp until the operator plays or quits."""
+        """Hold the arms for teaching until the operator plays or quits."""
+        if self._vr:
+            await self._teach_vr()
+            return
         self._robot.reset_gravity_hold()
         self._under_position_control = False
         self._publish_teaching()
         dt = 1.0 / self._cfg.rate_hz
         while not self._stop.is_set():
             loop_start = time.monotonic()
-            command = self._control.poll()
-            if command == "quit":
-                self._quit = True
+            if await self._handle_teaching_command(self._poll()):
                 return
-            if command == "play":
-                if len(self._store) >= 2:
-                    return
-                self._publish_teaching("Record at least two waypoints before playing.")
-            elif command == "record":
-                await self._record()
-            elif command == "undo":
-                self._store.pop()
-                self._store.save(self._cfg.file)
-                self._publish_teaching()
-            elif command == "clear":
-                self._store.clear()
-                self._store.save(self._cfg.file)
-                self._publish_teaching()
-            elif command in ("grip-left", "grip-right"):
-                self._cycle_grip(0 if command == "grip-left" else 1)
 
             await self._robot.gravity_compensate(
                 kd=self._cfg.kd,
@@ -596,6 +745,81 @@ class _Session:
             if spent < dt:
                 await asyncio.sleep(dt - spent)
 
+    async def _teach_vr(self) -> None:
+        """Run VR teleop until the operator plays or quits.
+
+        Teleop's own control loop drives the arms, as in ``axol teleop``; this
+        one only watches for commands. On the way out teleop is stood down
+        (see :meth:`VRTeleop.suspend`) so playback — or the park on quit —
+        can command the arms, and it is handed back on the next pass.
+        """
+        assert self._teleop is not None and self._buttons is not None
+        teleop = self._teleop
+        if self._teleop_suspended:
+            # Back from a playback: teleop re-seeds at wherever the arms were
+            # left and plays its own guarded return to rest.
+            await teleop.resume()
+            self._teleop_suspended = False
+        # Teleop holds the arms stiff, so quitting from here parks them.
+        self._under_position_control = True
+        self._buttons.clear()
+        self._publish_teaching()
+        loop = asyncio.create_task(teleop.run(), name="axol-waypoint-teleop")
+        try:
+            while not self._stop.is_set():
+                if loop.done():
+                    # A teleop fault ends the session rather than leaving the
+                    # arms unattended while this loop keeps polling.
+                    loop.result()
+                    raise RuntimeError("the teleop loop stopped unexpectedly")
+                if await self._handle_teaching_command(self._poll()):
+                    return
+                await asyncio.sleep(_VR_POLL_S)
+        finally:
+            loop.cancel()
+            try:
+                raising = sys.exc_info()[1]
+                (outcome,) = await asyncio.gather(loop, return_exceptions=True)
+                # A fault the check above raised is already on its way out;
+                # one that landed after the check is still worth hearing about.
+                if isinstance(outcome, Exception) and outcome is not raising:
+                    _logger.error("teleop loop failed: %s", outcome)
+            finally:
+                teleop.suspend()
+                self._teleop_suspended = True
+
+    async def _handle_teaching_command(self, command: str | None) -> bool:
+        """Act on one teaching command. True when teaching should end."""
+        if command == "quit":
+            self._quit = True
+            return True
+        if command == "play":
+            if len(self._store) < 2:
+                self._publish_teaching("Record at least two waypoints before playing.")
+            elif self._teleop is not None and self._teleop.is_resetting:
+                # Standing teleop down cuts its return to rest off mid-move.
+                self._publish_teaching("Wait for the arms to reach rest, then play.")
+            else:
+                return True
+        elif command == "record":
+            await self._record()
+        elif command == "undo":
+            self._store.pop()
+            self._store.save(self._cfg.file)
+            self._publish_teaching()
+        elif command == "clear":
+            self._store.clear()
+            self._store.save(self._cfg.file)
+            self._publish_teaching()
+        elif command in ("grip-left", "grip-right"):
+            if self._vr:
+                self._publish_teaching(
+                    "The controller triggers work the grippers while teaching in VR."
+                )
+            else:
+                self._cycle_grip(0 if command == "grip-left" else 1)
+        return False
+
     def _cycle_grip(self, index: int) -> None:
         """Open one gripper if it is closed, close it if it is open."""
         left, right = self._grip_target
@@ -604,17 +828,43 @@ class _Session:
         )
         self._publish_teaching()
 
+    def _commanded_grip(self) -> Grip:
+        """What each gripper is being told to do, as a waypoint stores it.
+
+        In VR that is the trigger, snapped to open or closed: a grasp is a
+        squeezed trigger, whatever the fingers stalled at, and playback only
+        works grippers between the two states.
+        """
+        if self._teleop is None:
+            return self._grip_target
+        left, right = self._teleop.grip_targets
+        return (
+            GRIP_OPEN if left >= 0.5 else GRIP_CLOSED,
+            GRIP_OPEN if right >= 0.5 else GRIP_CLOSED,
+        )
+
     async def _record(self) -> None:
+        if self._teleop is not None and self._teleop.is_resetting:
+            self._publish_teaching(
+                "The arms are returning to rest — record once they stop."
+            )
+            return
         left, right = (arm.copy() for arm in await self._positions())
         # Store what the gripper was *told* to do, not where it ended up. A
         # grasp stalls the fingers on the object well short of closed, and
         # replaying that measurement would bring them to rest against it
         # under no load rather than gripping. Commanding closed again lets
         # the torque limit set the force.
-        left[_GRIP], right[_GRIP] = self._grip_target
-        self._store.append(Waypoint(left=left, right=right))
+        left[_GRIP], right[_GRIP] = self._commanded_grip()
+        label = self._next_label() or ""
+        self._store.append(Waypoint(left=left, right=right, label=label))
         self._store.save(self._cfg.file)
-        _logger.info("Recorded waypoint %d to %s", len(self._store), self._cfg.file)
+        _logger.info(
+            "Recorded waypoint %d%s to %s",
+            len(self._store),
+            f" ({label})" if label else "",
+            self._cfg.file,
+        )
         self._publish_teaching()
 
     # -- playback --------------------------------------------------------
@@ -650,6 +900,9 @@ class _Session:
             # pose looks like a jump and trips the max-step safety check.
             self._robot.reset_command_state()
         self._under_position_control = True
+        if self._buttons is not None:
+            # An A pressed while planning was meant for teaching, not a stop.
+            self._buttons.clear()
 
         loops = self._cfg.loops
         run = 0
@@ -664,7 +917,8 @@ class _Session:
                 trajectory, held, arrival = leg
                 # Leg 0 is the approach, so leg n arrives at waypoint n + 1;
                 # the closing leg comes back around to waypoint 1.
-                where = f"waypoint {(index % len(self._store)) + 1}"
+                target = index % len(self._store)
+                where = self._store[target].label or f"waypoint {target + 1}"
                 suffix = "" if loops == 1 else f" (run {run})"
                 self._publish("playing", f"Moving to {where}{suffix}", stoppable=True)
                 if not await self._stream(solver, trajectory, held):
@@ -676,8 +930,9 @@ class _Session:
         """Report what the grippers will do, before anything moves.
 
         A path where they never change is a path taught without ever pressing
-        ``[`` or ``]``, which looks on playback exactly like a gripper that
-        does not work. Say so rather than let it look like a fault.
+        ``[`` or ``]`` (or, in VR, a trigger), which looks on playback exactly
+        like a gripper that does not work. Say so rather than let it look like
+        a fault.
         """
         if not self._cfg.axol.has_gripper:
             return
@@ -694,10 +949,16 @@ class _Session:
             ),
         )
         if len(set(grips)) == 1:
+            how = (
+                "squeeze or release a trigger"
+                if self._vr
+                else "open or close one with [ or ]"
+            )
             _logger.warning(
                 "Every waypoint asks for the same gripper openings, so the "
-                "grippers will not move during playback. Open or close one "
-                "with [ or ] before recording the waypoint it should happen at."
+                "grippers will not move during playback. To work one, %s "
+                "before recording the waypoint it should happen at.",
+                how,
             )
 
     def _plan(self, solver: Any) -> list[Leg]:
@@ -869,6 +1130,10 @@ class _Session:
                 if self._quit or self._stop.is_set():
                     return
             await self.play()
+            if self._vr and not (self._play_only or self._quit):
+                # Back to teaching: teleop takes the arms home itself, through
+                # its guarded return (see _teach_vr).
+                continue
             await self.park()
             if self._play_only or self._quit:
                 return
@@ -909,16 +1174,33 @@ def _run(
         stop_event = threading.Event()
     if not cfg.sim and cfg.left_channel is None and cfg.right_channel is None:
         raise ValueError("Both arms disabled — nothing to do.")
-    if (cfg.play_only or cfg.sim) and len(WaypointSet.load(cfg.file)) < 2:
+    if _play_only(cfg) and len(WaypointSet.load(cfg.file)) < 2:
         raise ValueError(
             f"{cfg.file} holds fewer than two waypoints, so there is nothing to "
-            "play. Teach a path first (run without --play_only / --sim)."
+            "play. Teach a path first (run without --play_only / --sim, or "
+            "teach it in the browser with --sim --teach vr)."
         )
 
     owns_control = control is None
     if control is None:
         control = _StdinWaypointControl()
-        if not (cfg.play_only or cfg.sim):
+        if _play_only(cfg):
+            pass
+        elif cfg.teach == "vr":
+            from ..utils.network import local_ip
+
+            print(
+                "Waypoint teach-and-repeat in VR. Connect the VR app "
+                "(https://axol.almond.bot) to this machine:\n"
+                f"  Hostname : {socket.gethostname()}.local\n"
+                f"  IP       : {local_ip()}\n"
+                "Squeeze both grips to drive the arms, then in the headset:\n"
+                "  A record   left stick click undo   right stick click play\n"
+                "or on this terminal:\n"
+                "  [Enter] record   u undo    c clear\n"
+                "  p play           s stop    q quit"
+            )
+        else:
             print(
                 "Waypoint teach-and-repeat. Hand-guide the arms, then:\n"
                 "  [Enter] record   u undo    c clear   [ / ] grippers\n"
@@ -934,6 +1216,14 @@ def _run(
 async def _session(
     cfg: WaypointsCmdConfig, stop_event: threading.Event, control: Control
 ) -> None:
+    vr = cfg.teach == "vr" and not _play_only(cfg)
+    teleop_cfg: VRTeleopConfig | None = None
+    if vr:
+        from ..settings import shared_config
+
+        # The same teleop parameters `axol teleop` runs with.
+        teleop_cfg = shared_config(VRTeleopConfig, "teleop", "teleop")
+
     if cfg.sim:
         from ..robot.sim import Sim
 
@@ -942,33 +1232,61 @@ async def _session(
         from ..robot import Axol
 
         # Rust is the sole hardware backend for both teaching and playback.
+        # Teaching in VR gives its core the velocity caps teleop runs under.
+        caps = (
+            {}
+            if teleop_cfg is None
+            else {
+                "max_vel": teleop_cfg.teleop_max_vel,
+                "max_accel": teleop_cfg.teleop_max_accel,
+            }
+        )
         robot = Axol(
             config=cfg.axol,
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
+            **caps,
         )
 
-    async with robot:
-        session = _Session(cfg, robot, control, stop_event)
+    if not vr:
+        async with robot:
+            await _drive(_Session(cfg, robot, control, stop_event), stop_event)
+        return
+
+    from ..teleop import VRTeleop
+    from .teleop import realtime_control_thread
+
+    # Kinematics and the VR server come from the shared teleop settings too.
+    # No Jelly: moving the base would move every waypoint taught so far.
+    teleop = VRTeleop(robot, config=teleop_cfg)
+    session = _Session(cfg, robot, control, stop_event, teleop=teleop)
+    # Build the playback solver before teleop starts, not alongside it: its
+    # JAX warmup would otherwise compete with the IK worker's own startup
+    # (which has a deadline) and then with the teleop control loop.
+    control.set_state("preparing", "Warming up the IK solver…", [], len(session.store))
+    await asyncio.to_thread(session.wait_for_solver)
+    # Pinned like `axol teleop`: an unpinned control loop hitches.
+    with realtime_control_thread():
+        async with teleop:
+            await _drive(session, stop_event)
+
+
+async def _drive(session: _Session, stop_event: threading.Event) -> None:
+    """Run ``session`` to the end, parking the arms however it ends."""
+    try:
+        await session.run()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        _logger.info("Interrupted — parking the arms before shutting down.")
+    finally:
+        # Python 3.11+ asyncio.run cancels the task on SIGINT, so without
+        # uncancel every cleanup await below would re-raise CancelledError
+        # immediately and the arms would skip their return to rest.
+        current = asyncio.current_task()
+        if current is not None:
+            current.uncancel()
+        stop_event.set()
         try:
-            await session.run()
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            _logger.info("Interrupted — parking the arms before shutting down.")
-        finally:
-            # Python 3.11+ asyncio.run cancels the task on SIGINT, so without
-            # uncancel every cleanup await below would re-raise CancelledError
-            # immediately and the arms would skip their return to rest.
-            current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
-            stop_event.set()
-            try:
-                await session.park()
-            except Exception:  # noqa: BLE001 - still tear the robot down
-                _logger.warning("return-to-rest during teardown failed", exc_info=True)
-            control.set_state(
-                "done",
-                session.failure or "Session finished.",
-                [],
-                len(session.store),
-            )
+            await session.park()
+        except Exception:  # noqa: BLE001 - still tear the robot down
+            _logger.warning("return-to-rest during teardown failed", exc_info=True)
+        session.publish_done()

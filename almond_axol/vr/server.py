@@ -238,6 +238,12 @@ class VRServer:
         # readout — the default for plain teleop, which never sets it.
         self._episode: int | None = None
 
+        # One-line operator prompt shown top-centre in the headset HUD by a
+        # command that guides the operator through steps of its own (``axol
+        # waypoints --teach vr``). Same lifecycle as ``_episode``: broadcast on
+        # change and replayed to late joiners. ``None`` hides it.
+        self._banner: str | None = None
+
         # Latest headset HUD state (armed save/discard confirmation popup,
         # record countdown) published by the driving client via a ``hud``
         # signaling message, and that client's id. Relayed to every *other*
@@ -393,6 +399,27 @@ class VRServer:
         thread (a plain attribute assignment).
         """
         self._episode = episode
+
+    def set_banner(self, text: str | None) -> None:
+        """Show ``text`` as the headset's prompt banner (``None`` hides it).
+
+        For commands that walk the operator through steps of their own, so
+        the prompt reaches them inside the headset rather than only on the
+        terminal. Stored for clients that connect later and, while the server
+        is running, broadcast to every connected client. Safe to call from
+        any thread.
+        """
+        if text == self._banner:
+            return
+        self._banner = text
+        loop = self._loop
+        if loop is None:
+            return
+        message = json.dumps({"type": "banner", "value": text})
+        try:
+            asyncio.run_coroutine_threadsafe(self.broadcast_text(message), loop)
+        except RuntimeError:
+            pass  # server loop already shut down
 
     def set_video_expected(self, expected: bool) -> None:
         """Declare whether camera video is expected to become available.
@@ -1306,6 +1333,8 @@ class VRServer:
             announcements.append(("episode", self._episode))
         if self._hud is not None:
             announcements.append(("hud", self._hud))
+        if self._banner is not None:
+            announcements.append(("banner", self._banner))
 
         for message_type, value in announcements:
             try:

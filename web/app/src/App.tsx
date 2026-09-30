@@ -937,6 +937,31 @@ function EpisodeDisplay({ episode }: { episode: number | null }) {
   )
 }
 
+// Prompt from a host command that walks the operator through steps of its own
+// (`axol waypoints --teach vr`), shown top-centre under the help icon. Null
+// (plain teleop and data collection never send one) renders nothing.
+function BannerDisplay({ banner }: { banner: string | null }) {
+  if (!banner) return null
+
+  return (
+    <HudText
+      position={[0, 0.07, -0.5]}
+      fontSize={0.014}
+      fontWeight="bold"
+      color="white"
+      anchorX="center"
+      anchorY="top"
+      textAlign="center"
+      maxWidth={0.3}
+      renderOrder={999}
+      material-depthTest={false}
+      {...hudBg}
+    >
+      {banner}
+    </HudText>
+  )
+}
+
 function HelpPanel({
   onDismiss,
   mode,
@@ -1239,6 +1264,8 @@ export default function App() {
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
+  // Host prompt banner (see BannerDisplay); null until a command sends one.
+  const [banner, setBanner] = useState<string | null>(null)
   const [xrError, setXrError] = useState<string | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
 
@@ -1502,6 +1529,7 @@ export default function App() {
               onPoseMode={setPoseMode}
               onPoseSourceKind={setPoseSourceKind}
               onEpisode={setEpisode}
+              onBanner={setBanner}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
@@ -1514,6 +1542,7 @@ export default function App() {
                 viewOnly={poseSourceKind === "tracker"}
               />
               <EpisodeDisplay episode={episode} />
+              <BannerDisplay banner={banner} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
