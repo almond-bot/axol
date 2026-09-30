@@ -1443,6 +1443,8 @@ def run_ik_worker(
 
     - ``VRFrame``                      → ``q`` (one solve step)
     - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
+      an explicit joint target for the second (zero) leg of a guarded park.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -1528,10 +1530,23 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                q_target = (
+                    np.asarray(msg[2], dtype=np.float32) if len(msg) == 3 else q_rest
+                )
+                if (
+                    len(msg) not in (2, 3)
+                    or q_current.shape != q_rest.shape
+                    or q_target.shape != q_rest.shape
+                    or not np.isfinite(q_current).all()
+                    or not np.isfinite(q_target).all()
+                ):
+                    raise ValueError(
+                        "reset requires finite current/target joint vectors"
+                    )
+                traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
-                q = traj[-1].copy() if traj else q_rest.copy()
-                conn.send(("reset_traj", q_rest.copy(), traj))
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, tuple) and msg[0] == "sync":
                 pos_l = np.asarray(msg[1], dtype=np.float32)
                 pos_r = np.asarray(msg[2], dtype=np.float32)

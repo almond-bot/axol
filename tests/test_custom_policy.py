@@ -20,8 +20,8 @@ from almond_axol.policy import (
     PolicyServer,
     PolicySpec,
     policy_url,
+    protocol,
 )
-from almond_axol.policy import protocol
 
 STATE = tuple(f"joint_{i}.pos" for i in range(4))
 ACTIONS = tuple(f"joint_{i}.pos" for i in range(4))
@@ -292,6 +292,40 @@ class ServerClientTest(unittest.TestCase):
                     ):
                         second.connect(_spec())
 
+    def test_refusal_received_before_hello_send_is_reported(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        ws = mock.Mock()
+        ws.send.side_effect = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws.recv.return_value = protocol.encode_error(
+            "Policy server already has a robot connected."
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+            self.assertRaisesRegex(PolicyRemoteError, "already has a robot"),
+        ):
+            client.connect(_spec())
+
+    def test_send_failure_cannot_consume_a_queued_success(self) -> None:
+        from websockets.exceptions import ConnectionClosedOK
+        from websockets.frames import Close
+
+        closed = ConnectionClosedOK(Close(1000, ""), Close(1000, ""), True)
+        ws = mock.Mock()
+        ws.send.side_effect = closed
+        ws.recv.return_value = protocol.encode_ready(
+            protocol.ReadyInfo(action_names=ACTIONS)
+        )
+        with (
+            mock.patch("websockets.sync.client.connect", return_value=ws),
+            PolicyClient("ws://unused") as client,
+        ):
+            with self.assertRaises(ConnectionClosedOK) as error:
+                client.connect(_spec())
+            self.assertIs(error.exception, closed)
+
 
 # ----------------------------------------------------------------------
 # run-policy's robot-side client (needs the lerobot extra)
@@ -461,7 +495,7 @@ class RunPolicyConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "--policy_path is required"):
             run_policy._run(cfg)
 
-    def test_form_schema_offers_custom_for_run_policy_only(self) -> None:
+    def test_form_schema_offers_custom_for_run_policy_and_dagger(self) -> None:
         from almond_axol.cli.collect_dagger import DaggerConfig
         from almond_axol.cli.run_policy import RunPolicyConfig
         from almond_axol.serve.introspect import build_schema
@@ -480,8 +514,8 @@ class RunPolicyConfigTest(unittest.TestCase):
         self.assertIn("custom", run_type["options"])
         self.assertTrue(run_type["required"])
         self.assertFalse(field(RunPolicyConfig, "policy_path")["required"])
-        self.assertNotIn("custom", field(DaggerConfig, "policy_type")["options"])
-        self.assertTrue(field(DaggerConfig, "policy_path")["required"])
+        self.assertIn("custom", field(DaggerConfig, "policy_type")["options"])
+        self.assertFalse(field(DaggerConfig, "policy_path")["required"])
 
 
 if __name__ == "__main__":

@@ -197,7 +197,8 @@
               "api/zed",
               "api/motor",
               "api/lerobot",
-              "api/policy"
+              "api/policy",
+              "api/policy-plan"
             ]
           }
         ]

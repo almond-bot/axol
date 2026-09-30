@@ -71,3 +71,12 @@ If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format d
 <Info>
   Action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by the buffered chunks is the exponentially-weighted average across those chunks, with the gripper indices snapped to the newest contributing chunk so bang-bang grasp commands aren't smeared. The control loop and observation send run on separate threads — decoupling the ~60-70 ms ZED-read + gRPC send from the 60 Hz action stream that would otherwise collapse to ~27 Hz on the upstream single-threaded design.
 </Info>
+
+## Custom policy interface (v2)
+
+Use `--custom_protocol 2` to select version 2 of the custom policy interface
+for compressed observations, accepted-plan
+continuation and confirmed dispatch references. The ZED box executes a single
+unchanged plan suffix while inference runs remotely; late replies skip elapsed
+rows instead of retiming their first row. See the [custom policy interface documentation](/api/policy-plan) for negotiation, timing, recovery and DAgger semantics.
+The default remains version 1.

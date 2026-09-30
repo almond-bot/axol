@@ -117,3 +117,12 @@ During a rollout, an exception in `infer`, a malformed chunk, a dropped connecti
     Episode control, contact stops, and execution smoothing, shared with LeRobot policies.
   </Card>
 </CardGroup>
+
+## Custom policy interface (v2)
+
+Use `--custom_protocol 2` to select version 2 of the custom policy interface
+for compressed observations, accepted-plan
+continuation and confirmed dispatch references. The ZED box executes a single
+unchanged plan suffix while inference runs remotely; late replies skip elapsed
+rows instead of retiming their first row. See the [custom policy interface documentation](/api/policy-plan) for negotiation, timing, recovery and DAgger semantics.
+The default remains version 1.

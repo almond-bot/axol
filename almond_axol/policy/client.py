@@ -125,10 +125,24 @@ class PolicyClient:
                 pass
 
     def _request(self, message: bytes) -> tuple[dict[str, Any], memoryview]:
+        from websockets.exceptions import ConnectionClosed
+
         ws = self._ws
         if ws is None:
             raise PolicyProtocolError("Policy connection is closed.")
-        ws.send(message)
+        try:
+            ws.send(message)
+        except ConnectionClosed as closed:
+            # A refused session can close before hello is sent. Read the queued
+            # error, but never accept success for a request we did not send.
+            try:
+                reply = ws.recv(timeout=self.reply_timeout)
+            except (ConnectionClosed, TimeoutError):
+                raise closed from None
+            header, payload = decode_message(reply)
+            if header.get("type") != "error":
+                raise closed
+            return header, payload
         try:
             reply = ws.recv(timeout=self.reply_timeout)
         except TimeoutError:

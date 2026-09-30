@@ -7,10 +7,25 @@ panel: **Run Policy**, policy type ``custom``). The robot sends each
 action chunks you return. See :mod:`almond_axol.policy.protocol` for the wire
 format if your model lives outside Python.
 
-This package only needs Axol's base install (numpy + websockets).
+The custom policy interface (v2) adds lossless image transport and references
+to accepted plans.
+Use :class:`PlanPolicyClient` with a compatible external endpoint. The robot
+owns scheduling and execution; architecture-specific processing stays remote.
+
+Version 1 only needs numpy and websockets. Version 2 also uses OpenCV for its
+PNG codec; the optional robot-side image resize uses Pillow.
 """
 
 from .client import PolicyClient, policy_url
+from .plan_client import PlanPolicyClient
+from .plan_protocol import (
+    PLAN_PROTOCOL_VERSION,
+    Continuation,
+    LastDispatched,
+    PlanActions,
+    PlanObservation,
+    PlanSpec,
+)
 from .protocol import (
     PROTOCOL_VERSION,
     CameraSpec,
@@ -23,9 +38,16 @@ from .protocol import (
 from .server import Policy, PolicyServer, serve
 
 __all__ = [
+    "PLAN_PROTOCOL_VERSION",
     "PROTOCOL_VERSION",
     "CameraSpec",
+    "Continuation",
+    "LastDispatched",
     "Observation",
+    "PlanActions",
+    "PlanObservation",
+    "PlanPolicyClient",
+    "PlanSpec",
     "Policy",
     "PolicyClient",
     "PolicyProtocolError",

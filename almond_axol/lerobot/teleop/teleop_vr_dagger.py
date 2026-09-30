@@ -88,6 +88,15 @@ class DaggerVRTeleop(AxolVRTeleop):
 
     # -- Intervention state exposed to the CLI --------------------------------
 
+    def set_hold_to_intervene(self, enabled: bool) -> None:
+        """Select per-arm grip holds before connecting the teleop worker."""
+        self._core.hold_to_intervene = enabled
+
+    @property
+    def grips_held_raw(self) -> bool:
+        """Raw grip state survives forced disengagement or a stale VR link."""
+        return self._core.l_lock_raw or self._core.r_lock_raw
+
     @property
     def teleop_engaged(self) -> bool:
         """Whether the operator currently has control (both grips engaged)."""

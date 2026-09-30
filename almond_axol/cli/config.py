@@ -147,10 +147,9 @@ DatasetResolution = register_literal(Literal["SVGA", "HD1080", "HD1200"])
 PolicyType = register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 )
-# run-policy also accepts ``custom``: your own model behind a policy server
-# built on :mod:`almond_axol.policy` (or anything speaking its protocol),
-# instead of a LeRobot checkpoint. collect-dagger loads its policy in-process
-# through LeRobot, so it keeps the plain ``PolicyType``.
+# run-policy and collect-dagger also accept ``custom`` for a remote endpoint
+# speaking the policy protocol, instead of loading a LeRobot checkpoint.
+# Remote DAgger uses the custom policy interface (v2).
 RunPolicyType = register_literal(Literal[PolicyType, "custom"])
 AggregateFn = register_literal(
     Literal[

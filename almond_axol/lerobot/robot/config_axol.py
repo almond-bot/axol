@@ -17,6 +17,7 @@ from ...robot.config import AxolConfig
 # prefers gst when its stack is installed and falls back to the SDK.
 # Registered with draccus so it decodes/validates on the CLI.
 VideoBackend = register_literal(Literal["auto", "gst", "sdk"])
+ActionSpace = register_literal(Literal["joint", "cartesian"])
 
 
 @RobotConfig.register_subclass("axol")
@@ -51,9 +52,20 @@ class AxolRobotConfig(RobotConfig):
     axol_config: AxolConfig = field(default_factory=AxolConfig)
     observe_torques: bool = False
     observe_cartesian: bool = False
+    # None preserves the original coupled layout. An explicit override allows
+    # measured joint observations and Cartesian policy targets independently.
+    action_space: ActionSpace | None = None
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
     video_backend: VideoBackend = "auto"
+
+    @property
+    def cartesian_actions(self) -> bool:
+        return (
+            self.observe_cartesian
+            if self.action_space is None
+            else self.action_space == "cartesian"
+        )
 
     def select_assigned_cameras(self, *, minimum: int = 1) -> None:
         """Drop unassigned camera slots (serial ``<= 0``), requiring ``minimum``.
