@@ -16,7 +16,7 @@ import numpy as np
 
 @dataclass
 class PlanRuntimeConfig:
-    """Custom policy interface options for ``run-policy --custom_protocol 2``.
+    """Custom policy interface options for ``run-policy --policy_type custom``.
 
     Zero output dimensions retain camera geometry. Resizing uses Pillow RGB
     interpolation before the mandatory lossless wire encoding. Late/exhausted

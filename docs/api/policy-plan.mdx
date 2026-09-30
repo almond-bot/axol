@@ -1,11 +1,13 @@
 ---
-title: "Custom policy interface (v2)"
+title: "Custom policy interface"
 description: "Compressed observations and cached action-plan continuation without model-specific robot code."
 ---
 
-Version 2 of the custom policy interface adds compressed observations and
-accepted-plan continuation to the existing SDK. Version 1 remains available unchanged. A v2 client and v1 server reject each
-other during the handshake; there is no automatic downgrade to raw images.
+`run-policy --policy_type custom` and `collect-dagger --policy_type custom`
+use this interface for compressed observations and accepted-plan continuation.
+It replaces the original raw-observation custom-policy path. The handshake
+retains `version: 2` to reject incompatible endpoints; there is no legacy
+robot mode, protocol-selection flag or automatic downgrade.
 
 The desktop owns the model, instruction text, normalization, conditioning,
 and its prediction cache. The robot owns capture, the dispatch clock, and
@@ -42,13 +44,13 @@ Each camera has `name`, prepared `shape: [height, width, 3]`, and `codec: "png"`
 Camera preparation and action-name conventions must agree with the remote
 endpoint; it must reject incompatible specifications before sending `ready`.
 
-The updated generic robot client also sends `dispatch_feedback: true` in
+The generic robot client sends `dispatch_feedback: true` in
 `hello`; `ready` must echo it. This enables the dispatch reference described
 below without naming a policy architecture. `PlanSpec.dispatch_feedback`
-defaults to `False` for SDK clients using the original v2 contract; in that
-case the capability and dispatch-reference fields are omitted from the wire.
+can represent low-level clients without this capability; those clients omit
+the capability and dispatch-reference fields from the wire.
 An explicit `dispatch_feedback: false` is not a wire representation. An
-older strict v2 peer rejects the new capability during setup, so the updated
+endpoint without dispatch-feedback support rejects it during setup, so the
 robot client and remote endpoint must agree on this capability. The handshake does
 not silently downgrade dispatch feedback.
 
@@ -62,8 +64,8 @@ for every image, preserving RGB pixels exactly after configured preparation.
 ## Recurring request and reply
 
 Each WebSocket message is binary: a big-endian uint32 JSON-header byte count,
-that many UTF-8 JSON bytes, then the binary payload. The same framing is used
-by v1. WebSocket compression is disabled because image data is already PNG.
+that many UTF-8 JSON bytes, then the binary payload. WebSocket compression is
+disabled because image data is already PNG.
 
 An `infer` header is:
 
@@ -180,10 +182,10 @@ not automatically reconnect and resume motion.
 
 ## Robot control loop
 
-Enable the opt-in transport with `axol run-policy --policy_type custom
---custom_protocol 2 --server_host HOST --server_port 8765 --task TASK`.
-The normal robot and camera configuration still applies. Version 1 remains
-the default for `run-policy`. `task` labels the recording in v2; instruction
+Select the interface with `axol run-policy --policy_type custom
+--server_host HOST --server_port 8765 --task TASK`.
+The normal robot and camera configuration still applies. `task` labels the
+recording; instruction
 selection stays at the remote endpoint and is not sent in each observation.
 
 Observation acquisition and WebSocket request/reply run outside the periodic
@@ -217,8 +219,8 @@ Here each plan's identifier is the `request_id` whose reply published it.
 The numerical example assumes sends have completed before the next snapshot;
 a send still in progress remains unconfirmed in `last_dispatched`.
 
-The scheduler copies accepted arrays and marks them immutable. Version 2
-bypasses the version-1 chunk alignment and temporal ensemble code. Its targets
+The scheduler copies accepted arrays and marks them immutable. Custom policies
+bypass the LeRobot chunk alignment and temporal ensemble code. Their targets
 still pass through the existing execution path: joint limits, Cartesian IK
 when configured, configured trajectory filtering, the realtime controller and
 configured contact safeguards. For independent layouts, `robot_config.action_space` selects `joint`
@@ -263,7 +265,7 @@ In blocking-refresh mode the reset deliberately drops that history.
 
 ## DAgger ownership and recording
 
-`collect-dagger --policy_type custom --custom_protocol 2
+`collect-dagger --policy_type custom
 --hold_to_intervene true` uses the same wire messages and scheduler. A single
 local control loop owns both policy and operator sends. Either held grip
 revokes pending policy work immediately and gives the operator that arm;

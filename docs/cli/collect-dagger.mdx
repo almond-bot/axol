@@ -25,8 +25,8 @@ Policy observations use the same exposure-time synchronization as `run-policy`: 
 
 | Flag | Description |
 |---|---|
-| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID; required for local policies. Unused by remote v2 collection, which leaves model selection to the endpoint |
-| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot,custom}` | Local policy architecture, or `custom` for a remote v2 endpoint (required) |
+| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID; required for local policies. Unused by custom policies, which leave model selection to the endpoint |
+| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot,custom}` | Local policy architecture, or `custom` for a remote endpoint using the custom policy interface (required) |
 | `--task TEXT` | Natural language task description recorded with the dataset (required) |
 | `--repo_id <user>/<dataset>` | Dataset repo ID the episodes are recorded to (required). Point it at an existing dataset to **resume** it — new episodes append with the same resume/repair semantics as [`collect-data`](/cli/collect-data) |
 | `--subtasks '["step one", "step two"]'` | Local policies only: ordered per-step instructions, as one inline JSON/YAML list. Typing a number `1..N` + Enter (or pushing it from the panel) switches the instruction sent to the policy mid-episode without ending it; the dataset's task string stays `--task`. Default: none |
@@ -75,8 +75,8 @@ Between episodes the grips work as plain teleop (both to engage, one to disengag
 
 ## Remote policies through the custom policy interface
 
-`--policy_type custom --custom_protocol 2` runs inference on a desktop using
-version 2 of the custom policy interface. It requires `--hold_to_intervene true`: hold
+`--policy_type custom` runs inference on a desktop using
+the custom policy interface. It requires `--hold_to_intervene true`: hold
 either grip to control that arm; the other arm holds its pose. Release both
 to return to the policy. A lost headset connection with grips held keeps
 human ownership and holds position until an explicit release arrives.
@@ -85,7 +85,7 @@ The freeze/toggle controls described above apply to local policies only.
 For example, on the robot host, replace the endpoint address and camera serial:
 
 ```bash
-axol collect-dagger --policy_type custom --custom_protocol 2 \
+axol collect-dagger --policy_type custom \
     --server_host 192.0.2.10 --server_port 8765 \
     --task "Pick the cube" --repo_id myorg/remote-policy-corrections \
     --hold_to_intervene true --record_joint_actions true \
@@ -94,7 +94,7 @@ axol collect-dagger --policy_type custom --custom_protocol 2 \
 ```
 
 The endpoint must accept the robot's declared state, action and camera layout.
-No checkpoint path is needed. `--task` labels the dataset; v2 does not send
+No checkpoint path is needed. `--task` labels the dataset; the robot does not send
 model selection or instruction text to the endpoint. The control panel exposes
 these fields through the command schema too. Configure DAgger's own
 `server_host` and `hold_to_intervene` settings; its shared defaults follow

@@ -1,10 +1,9 @@
-"""Wire format for Axol's custom policy protocol.
+"""Shared framing/validation helpers and the legacy wire-version-1 schema.
 
-A custom policy is any process that speaks this protocol over a WebSocket:
-``axol run-policy --policy_type custom`` (the robot) connects to it, sends the
-robot's joint state + camera frames, and executes the action chunks it sends
-back. The Python side of both ends lives in :mod:`almond_axol.policy`, but the
-format is small enough to implement in any language.
+Current robot commands use :mod:`almond_axol.policy.plan_protocol`, which
+reuses this module's framing and validation helpers. The version-1 messages
+below remain for standalone legacy SDK consumers; the robot no longer accepts
+that interface and does not downgrade to it.
 
 Every WebSocket message is one binary frame::
 

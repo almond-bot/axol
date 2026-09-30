@@ -108,9 +108,19 @@ class PlanRobotClientTest(unittest.TestCase):
             robot=robot,
             publisher=None,
             custom_policy_url=url,
-            custom_protocol=2,
             plan_config=PlanRuntimeConfig(**options),
         )
+
+    def test_custom_factory_uses_continuation_transport_without_selector(self):
+        from almond_axol.policy.plan_client import PlanPolicyClient
+
+        client = self.make_client("ws://unused")
+        try:
+            self.assertIsInstance(client._policy_client, PlanPolicyClient)
+            self.assertFalse(client._action_schema_confirmed)
+            client.robot.connect.assert_not_called()
+        finally:
+            client.stop()
 
     def test_real_transport_drives_independent_layout_without_task_or_blending(self):
         policy = _Policy()

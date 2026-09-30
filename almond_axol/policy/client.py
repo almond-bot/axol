@@ -1,8 +1,8 @@
-"""Robot side of the custom policy protocol.
+"""Standalone client for the legacy wire-version-1 SDK.
 
-``axol run-policy --policy_type custom`` uses :class:`PolicyClient` to talk to
-a :func:`~almond_axol.policy.serve` process; it is equally usable on its own to
-exercise a policy server without a robot (see ``axol policy.check``).
+The robot commands use :class:`~almond_axol.policy.plan_client.PlanPolicyClient`
+and reject this older contract. This module remains for existing standalone
+SDK consumers; it is not a selectable robot execution path.
 """
 
 from __future__ import annotations

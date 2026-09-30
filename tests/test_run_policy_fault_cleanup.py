@@ -28,6 +28,8 @@ def run_session(
     quit_requested=False,
     late_episode_choice=None,
     pre_episode_error=None,
+    episode_time_s=120,
+    episode_choices=None,
 ):
     events = []
     stopped = Event()
@@ -54,6 +56,8 @@ def run_session(
     control = mock.Mock()
     control.quit_requested = quit_requested
     control.poll_choice.return_value = None if fault else episode_choice
+    if episode_choices is not None:
+        control.poll_choice.side_effect = episode_choices
     control.resolve_timeout.return_value = timeout_choice
     gates = iter(gate_choices) if gate_choices is not None else None
 
@@ -92,7 +96,7 @@ def run_session(
     cfg = run_policy.RunPolicyConfig(
         policy_type="custom",
         task="test",
-        custom_protocol=2,
+        episode_time_s=episode_time_s,
         robot_config=object(),
         actions_per_chunk=30,
         soft_park_on_quit=soft_park,

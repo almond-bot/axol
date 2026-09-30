@@ -211,9 +211,10 @@ def _default_robot_config() -> AxolRobotConfig:
 class DaggerConfig:
     """Config for ``axol collect-dagger``.
 
-    The policy side mirrors ``run-policy`` (``--policy_path`` /
-    ``--policy_type`` / ``--device``, but inference is in-process and
-    synchronous — one ``select_action`` per tick); the recording side mirrors
+    Local policies use ``--policy_path`` / ``--policy_type`` / ``--device``
+    for synchronous inference. ``policy_type=custom`` always uses the
+    continuation-aware custom policy interface with a remote endpoint.
+    The recording side mirrors
     ``collect-data`` (``--dataset_resolution`` for the relay's dataset branch,
     ``teleop_config`` for the VR server / IK / smoothing parameters).
     """
@@ -224,7 +225,6 @@ class DaggerConfig:
     policy_path: str = ""
     server_host: str = "127.0.0.1"
     server_port: int = 8765
-    custom_protocol: int = 2
     actions_per_chunk: int = 30
     plan_config: PlanRuntimeConfig = field(default_factory=PlanRuntimeConfig)
     shadow_inference: bool = True
@@ -1178,8 +1178,6 @@ def _run(
     if remote_policy:
         import math
 
-        if cfg.custom_protocol != 2:
-            raise ValueError("Remote DAgger requires custom_protocol=2")
         cfg.plan_config.validate(fps=fps, horizon=cfg.actions_per_chunk)
         if not cfg.hold_to_intervene:
             raise ValueError("Remote DAgger requires hold_to_intervene=true")

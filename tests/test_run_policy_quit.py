@@ -12,6 +12,19 @@ from almond_axol.policy.plan_scheduler import PlanSchedulingError
 from .test_run_policy_fault_cleanup import run_session
 
 
+def test_custom_zero_duration_waits_for_operator_instead_of_timing_out():
+    result = run_session(
+        soft_park=True,
+        episode_time_s=0,
+        episode_choice=None,
+        episode_choices=[None, None, "q", "q"],
+    )
+    assert result.raised is None
+    assert result.control.poll_choice.call_count >= 3
+    result.control.resolve_timeout.assert_not_called()
+    assert result.events == ["workers stopped", "client stopped", "park", "disable"]
+
+
 @pytest.mark.parametrize("entry", ["first gate", "next gate", "episode", "time cap"])
 def test_explicit_quit_parks_after_client_quiescence(entry):
     kwargs = {"soft_park": True}

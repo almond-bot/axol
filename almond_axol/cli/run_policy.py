@@ -7,15 +7,13 @@ LeRobot's async inference (``lerobot.async_inference``). By default a
 ``--server_host`` to use a remote inference server started with
 ``axol inference-server`` on a more powerful machine instead (joint
 positions + camera frames are streamed to it over gRPC and it returns
-action chunks). ``--policy_type custom`` instead connects to your own
-model's server (``almond_axol.policy.serve``) over a small WebSocket
-protocol — no LeRobot checkpoint involved. Either way the parent drives an
-``AxolRobotClient`` (a thin ``RobotClient`` subclass) that streams
-observations to the server and consumes the returned action chunks. Cameras
-and joints are sampled
-via ``ZedCamera.read_at_or_after(now)`` so every inference observation is
-timestamp-aligned the same way the training data is (see
-``AxolRobot.get_observation``).
+action chunks). ``--policy_type custom`` connects to a compatible external
+endpoint over the continuation-capable WebSocket contract (wire version 2).
+It sends timestamped observations and accepted-plan references, then adopts
+the unexpired suffix of each reply. Model selection, instruction text and
+temporal ensembling belong to the external endpoint. Both modes use an
+``AxolRobotClient`` (a ``RobotClient`` subclass) with timestamp-aligned camera
+and joint observations (see ``AxolRobot.get_observation``).
 
 Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
 + discard), or ``q`` (quit + discard) on stdin. ``--episode_time_s`` is a
@@ -66,10 +64,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 # Custom policy servers (``--policy_type custom``): the ``hello`` reply covers
-# the server's ``Policy.setup`` — typically a model load — so it gets far
+# endpoint preparation — typically a model load — so it gets far
 # longer than a steady-state inference round trip.
 CUSTOM_POLICY_SETUP_TIMEOUT_S = 300.0
-CUSTOM_POLICY_REPLY_TIMEOUT_S = 60.0
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -132,22 +129,21 @@ class RunPolicyConfig:
     then apply to that server (it downloads the policy itself, so the
     path must be reachable from it, e.g. a HF Hub repo id).
 
-    ``policy_type custom`` runs your own model instead of a LeRobot
-    checkpoint: start a server with :func:`almond_axol.policy.serve` and
-    point ``--server_host`` / ``--server_port`` at it (default
-    ``127.0.0.1:8765``, i.e. the robot machine). Nothing is spawned or
-    downloaded; ``policy_path`` is optional and passed to your server as-is,
-    and ``device`` is unused.
+    ``policy_type custom`` connects to a compatible external endpoint using
+    the continuation-capable policy contract (wire version 2). Point
+    ``--server_host`` / ``--server_port`` at it (default ``127.0.0.1:8765``).
+    Nothing is spawned or downloaded; model selection and instruction text
+    belong to that endpoint. ``policy_path`` and ``device`` are unused, and
+    ``task`` labels the local recording.
     """
 
     policy_type: RunPolicyType
     task: str
-    # LeRobot checkpoint (local path or HF Hub repo id). Required unless
-    # policy_type is custom, where it is optional and forwarded to your policy
-    # server verbatim (e.g. to choose among the models it hosts).
+    # LeRobot checkpoint (local path or HF Hub repo id). Required for LeRobot
+    # policy types; unused for custom endpoints, which own model selection.
     policy_path: str = ""
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
-    episode_time_s: int = 120  # 0 means operator-ended, continuous episodes in v2
+    episode_time_s: int = 120  # 0 means operator-ended custom-policy episodes
     # An explicit q parks through rest and zero before releasing torque. Other
     # exits preserve support when enabled. Existing clients keep their normal
     # shutdown behavior unless explicitly opted in.
@@ -172,9 +168,7 @@ class RunPolicyConfig:
     device: str = "cuda"
     server_host: str | None = None
     server_port: int = 8765
-    # Version 1 preserves the original execution behavior. The custom policy
-    # interface (v2) uses compressed observations and a plan dispatcher.
-    custom_protocol: int = 1
+    # Custom policies use compressed observations and a plan dispatcher.
     plan_config: PlanRuntimeConfig = field(default_factory=PlanRuntimeConfig)
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
@@ -1275,9 +1269,6 @@ def _build_axol_robot_client(
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
     policy_torque_threshold: float = 0.0,
     custom_policy_url: str | None = None,
-    custom_policy_path: str | None = None,
-    allow_fps_mismatch: bool = False,
-    custom_protocol: int = 1,
     plan_config: PlanRuntimeConfig | None = None,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
@@ -1303,14 +1294,11 @@ def _build_axol_robot_client(
             ``contact_tripped`` and shuts the episode down. ``<= 0``
             disables (the default; see
             ``RunPolicyConfig.policy_torque_threshold``).
-        custom_policy_url: When set, talk to a custom policy server
-            (:mod:`almond_axol.policy`) at this ``ws://`` URL instead of a
-            LeRobot ``PolicyServer``; everything downstream of the chunk
-            (aggregation, shaping, contact watchdog) is shared.
-        custom_policy_path: The operator's ``--policy_path``, forwarded to the
-            custom server verbatim (``None`` when blank).
-        allow_fps_mismatch: Let a custom server that declares a different
-            training fps run anyway (``RunPolicyConfig.allow_fps_mismatch``).
+        custom_policy_url: When set, use the continuation-capable custom
+            policy endpoint at this ``ws://`` URL instead of a LeRobot
+            ``PolicyServer``. Local action shaping and the configured contact
+            watchdog remain shared; chunk alignment and ensembling are bypassed.
+        plan_config: Scheduling and observation settings for custom policies.
     """
     import threading as _threading
     from queue import Queue
@@ -2176,190 +2164,6 @@ def _build_axol_robot_client(
                 pass
             self.logger.debug("AxolRobotClient channel closed (robot left connected)")
 
-    class AxolCustomPolicyClient(AxolRobotClient):  # type: ignore[misc, valid-type]
-        """``AxolRobotClient`` whose chunks come from a custom policy server.
-
-        Only the transport differs: instead of LeRobot's gRPC
-        ``PolicyServer`` it holds one :class:`~almond_axol.policy.PolicyClient`
-        WebSocket session (``hello`` once per run, ``reset`` per episode).
-        The protocol is strict request/reply, so ``send_observation`` only
-        parks the newest observation in a one-slot mailbox and the receiver
-        thread owns every round trip: it sends the parked observation, waits
-        for its chunk, stamps the chunk's rows with consecutive timesteps
-        from the observation's (as LeRobot's server does), and installs it
-        through the same alignment/ensemble path as a LeRobot chunk. A reply
-        that lands after the episode ended is read and dropped, so the
-        session stays in step for the next episode.
-        """
-
-        def _open_transport(self) -> None:
-            from ..policy import PolicyClient
-
-            self._policy_client = PolicyClient(
-                custom_policy_url,
-                reply_timeout=CUSTOM_POLICY_REPLY_TIMEOUT_S,
-            )
-            self._obs_slot: TimedObservation | None = None
-            self._obs_ready = _threading.Condition()
-            self._episode = 0
-            self.logger.info(
-                "AxolRobotClient using custom policy server at %s", custom_policy_url
-            )
-
-        def start(self) -> bool:  # type: ignore[override]
-            """Open the session and prove the policy's action layout and fps."""
-            from ..lerobot.inference_wire import _observation_layout
-            from ..policy import CameraSpec, PolicyRemoteError, PolicySpec
-
-            state_names, cameras = _observation_layout(
-                self.policy_config.lerobot_features
-            )
-            self._state_names = state_names
-            self._camera_names = tuple(name for name, _ in cameras)
-            spec = PolicySpec(
-                state_names=state_names,
-                action_names=self._expected_action_schema,
-                cameras=tuple(CameraSpec(name, shape) for name, shape in cameras),
-                fps=self.config.fps,
-                actions_per_chunk=self.config.actions_per_chunk,
-                task=self.config.task,
-                policy_path=custom_policy_path,
-            )
-            self._action_schema_confirmed = False
-            client = self._policy_client
-            client.reply_timeout = CUSTOM_POLICY_SETUP_TIMEOUT_S
-            try:
-                ready = client.connect(spec)
-            except PolicyRemoteError as exc:
-                raise RuntimeError(f"Custom policy refused the session: {exc}") from exc
-            except (OSError, TimeoutError) as exc:
-                raise RuntimeError(
-                    f"Could not reach the custom policy server at "
-                    f"{custom_policy_url} ({exc}). Start it first — "
-                    "almond_axol.policy.serve(...) — and check Settings → "
-                    "Inference server host/port (--server_host/--server_port)."
-                ) from exc
-            finally:
-                client.reply_timeout = CUSTOM_POLICY_REPLY_TIMEOUT_S
-            require_exact_action_schema(
-                ready.action_names,
-                self._expected_action_schema,
-                policy_label="Custom policy",
-            )
-            if ready.fps is not None and ready.fps != self.config.fps:
-                message = (
-                    f"--fps {self.config.fps} does not match the fps the custom "
-                    f"policy declares ({ready.fps}); actions would replay at the "
-                    "wrong speed."
-                )
-                if not allow_fps_mismatch:
-                    raise ValueError(
-                        f"{message} Pass --fps {ready.fps}, or "
-                        "--allow_fps_mismatch true to override deliberately."
-                    )
-                _logger.warning("%s Continuing: --allow_fps_mismatch is set.", message)
-            self._action_schema_confirmed = True
-            self.shutdown_event.clear()
-            self.logger.info(
-                "Custom policy%s ready (%d ordered action dimensions).",
-                f" {ready.name!r}" if ready.name else "",
-                len(ready.action_names),
-            )
-            return True
-
-        def _reset_server(self) -> None:
-            with self._obs_ready:
-                self._obs_slot = None
-            self._episode += 1
-            self._policy_client.reset(self._episode)
-
-        def send_observation(self, obs: TimedObservation) -> bool:  # type: ignore[override]
-            """Park ``obs`` for the receiver thread, replacing any unsent one."""
-            if not self.running or not self._action_schema_confirmed:
-                raise ActionSchemaError(
-                    "Refusing to send observations before the policy handshake."
-                )
-            with self._obs_ready:
-                self._obs_slot = obs
-                self._obs_ready.notify()
-            return True
-
-        def _take_observation(self) -> TimedObservation | None:
-            with self._obs_ready:
-                self._obs_ready.wait_for(
-                    lambda: self._obs_slot is not None or not self.running,
-                    timeout=self.config.environment_dt,
-                )
-                obs, self._obs_slot = self._obs_slot, None
-            return obs
-
-        def receive_actions(self, verbose: bool = False) -> None:  # type: ignore[override]
-            """Run observation → chunk round trips until the episode ends."""
-            import torch
-
-            if not self._action_schema_confirmed:
-                self.fatal_error = ActionSchemaError(
-                    "Refusing to receive policy actions before the policy handshake."
-                )
-                self.shutdown_event.set()
-                return
-            self.start_barrier.wait()
-            self.logger.info("Custom policy receiver starting")
-            dt = self.config.environment_dt
-            while self.running:
-                obs = self._take_observation()
-                if obs is None:
-                    continue
-                raw = obs.get_observation()
-                try:
-                    chunk = self._policy_client.infer(
-                        state=[raw[name] for name in self._state_names],
-                        images={name: raw[name] for name in self._camera_names},
-                        task=raw["task"],
-                        timestep=obs.get_timestep(),
-                        timestamp=obs.get_timestamp(),
-                    )
-                except Exception as exc:  # noqa: BLE001 - any failure ends the rollout
-                    if self.running:
-                        self.logger.error(
-                            "Custom policy request failed: %s; shutting down", exc
-                        )
-                        self.fatal_error = exc
-                        self.shutdown_event.set()
-                    return
-                if not self.running:
-                    return
-                t0 = obs.get_timestamp()
-                i0 = obs.get_timestep()
-                timed = [
-                    TimedAction(
-                        timestamp=t0 + k * dt,
-                        timestep=i0 + k,
-                        action=torch.from_numpy(row.copy()),
-                    )
-                    for k, row in enumerate(chunk[: self.config.actions_per_chunk])
-                ]
-                try:
-                    self._install_timed_actions(
-                        timed, verbose=verbose, receive_time=time.time()
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.logger.error(
-                        "Installing a custom policy chunk failed: %s; shutting down",
-                        exc,
-                    )
-                    self.fatal_error = exc
-                    self.shutdown_event.set()
-                    return
-
-        def stop(self) -> None:  # type: ignore[override]
-            """Close the policy session; the shared robot stays connected."""
-            self.shutdown_event.set()
-            self._action_schema_confirmed = False
-            with self._obs_ready:
-                self._obs_ready.notify_all()
-            self._policy_client.close()
-
     class AxolPlanPolicyClient(AxolRobotClient):
         """Custom policy interface (v2) transport and dispatcher.
 
@@ -2811,13 +2615,9 @@ def _build_axol_robot_client(
                 self._plan_ready.notify_all()
             self._policy_client.close()
 
-    if custom_protocol not in (1, 2):
-        raise ValueError("custom_protocol must be 1 or 2")
-    client_class = AxolRobotClient
-    if custom_policy_url is not None:
-        client_class = (
-            AxolPlanPolicyClient if custom_protocol == 2 else AxolCustomPolicyClient
-        )
+    client_class = (
+        AxolPlanPolicyClient if custom_policy_url is not None else AxolRobotClient
+    )
     return client_class(
         config,
         robot,
@@ -2895,13 +2695,8 @@ def _run(
     robot_config = cfg.robot_config
 
     custom_policy = policy_type == "custom"
-    custom_protocol = getattr(cfg, "custom_protocol", 1)
     plan_config = getattr(cfg, "plan_config", None) or PlanRuntimeConfig()
-    if custom_protocol not in (1, 2):
-        raise ValueError("custom_protocol must be 1 or 2")
-    if custom_protocol == 2:
-        if not custom_policy:
-            raise ValueError("custom_protocol=2 requires policy_type=custom")
+    if custom_policy:
         if episode_time_s < 0:
             raise ValueError("episode_time_s must be nonnegative; 0 is continuous")
         plan_config.validate(fps=fps, horizon=actions_per_chunk)
@@ -2912,12 +2707,12 @@ def _run(
         raise ValueError(
             f"--policy_path is required for a {policy_type!r} policy (a LeRobot "
             "checkpoint path or HF Hub repo id). To run your own model, use "
-            "--policy_type custom with a policy server from almond_axol.policy."
+            "--policy_type custom with a compatible custom policy endpoint."
         )
 
     # Fail fast (before any hardware or server spawn) if --fps disagrees with
     # the fps the checkpoint was trained at. A custom policy has no checkpoint
-    # to read; its server may declare its fps in the handshake instead.
+    # to read; its endpoint must echo the exact control rate in its handshake.
     if not custom_policy:
         _check_training_fps(cfg)
 
@@ -3078,8 +2873,8 @@ def _run(
         # pipelines. Remote inference uses the already-running endpoint. Both
         # this child and the reset worker are created inside the lifecycle
         # guard so even a setup-time failure reaches the cleanup below. A
-        # custom policy is the operator's own, already-running server
-        # (almond_axol.policy.serve); nothing is spawned for it.
+        # custom policy is the operator's own, already-running compatible
+        # endpoint; nothing is spawned for it.
         custom_policy_url: str | None = None
         if custom_policy:
             from ..policy import policy_url
@@ -3143,18 +2938,18 @@ def _run(
         # ``RobotClientConfig`` requires a name from upstream's registry;
         # ``temporal_ensemble`` is handled in our override so pass a
         # placeholder that the dispatcher short-circuits.
-        if aggregate_fn == "temporal_ensemble":
+        if not custom_policy and aggregate_fn == "temporal_ensemble":
             _logger.info(
                 f"Aggregation: temporal_ensemble "
                 f"(coeff={temporal_ensemble_coeff:+.3f}, ACT default 0.01)."
             )
-        else:
+        elif not custom_policy:
             _logger.info(f"Aggregation: {aggregate_fn}.")
         client_cfg = RobotClientConfig(
             robot=robot_config,
             policy_type=policy_type,
-            # LeRobot's config rejects an empty path; a custom policy's is
-            # optional, so it is carried separately below.
+            # LeRobot's config requires a nonempty placeholder. Custom
+            # endpoints select their own model; this field is never sent.
             pretrained_name_or_path=policy_path or "custom",
             actions_per_chunk=actions_per_chunk,
             task=task,
@@ -3180,9 +2975,6 @@ def _run(
             exec_max_accel=cfg.exec_max_accel,
             policy_torque_threshold=cfg.policy_torque_threshold,
             custom_policy_url=custom_policy_url,
-            custom_policy_path=policy_path.strip() or None,
-            allow_fps_mismatch=cfg.allow_fps_mismatch,
-            custom_protocol=custom_protocol,
             plan_config=plan_config,
         )
 
@@ -3261,7 +3053,7 @@ def _run(
 
             episode_limit = (
                 "continuous; operator ends the episode"
-                if custom_protocol == 2 and episode_time_s == 0
+                if custom_policy and episode_time_s == 0
                 else f"safety cap {episode_time_s}s"
             )
             quit_key = (
@@ -3316,7 +3108,7 @@ def _run(
 
                 deadline = (
                     float("inf")
-                    if custom_protocol == 2 and episode_time_s == 0
+                    if custom_policy and episode_time_s == 0
                     else time.perf_counter() + episode_time_s
                 )
                 try:

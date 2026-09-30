@@ -888,9 +888,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="text",
                 help=(
                     "Address of a remote `axol inference-server`, or of your "
-                    "own policy server for policy type `custom`. Leave unset "
-                    "to run inference locally (a custom server then runs on "
-                    "this machine)."
+                    "endpoint implementing the custom policy interface. "
+                    "Leave unset for local LeRobot inference, or to connect "
+                    "to a custom endpoint on this machine. Start custom "
+                    "endpoints separately."
                 ),
                 effective_default="local — inference runs on this machine",
             ),
@@ -900,7 +901,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "Port of the inference server (local or remote), or of "
-                    "your custom policy server."
+                    "your endpoint implementing the custom policy interface."
                 ),
             ),
             SettingDef(
@@ -919,7 +920,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.chunk_size_threshold",
                 label="Chunk size threshold",
                 type="number",
-                help="Queue fraction below which the next chunk is requested.",
+                help=(
+                    "Queue fraction below which the next chunk is requested "
+                    "(LeRobot policies only)."
+                ),
             ),
             SettingDef(
                 key="inference.aggregate_fn",
@@ -932,13 +936,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "average",
                     "conservative",
                 ),
-                help="How overlapping action chunks are combined.",
+                help="How overlapping action chunks are combined (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.temporal_ensemble_coeff",
                 label="Temporal ensemble coeff",
                 type="number",
-                help="Exponential weight for the temporal_ensemble aggregation.",
+                help=(
+                    "Exponential weight for the temporal_ensemble aggregation "
+                    "(LeRobot policies only)."
+                ),
             ),
         ),
     ),
