@@ -698,6 +698,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "run with the IMU recorded, write it to --gyro-mount, and exit",
     )
     p.add_argument(
+        "--imu-damp-lp",
+        type=float,
+        default=15.0,
+        metavar="HZ",
+        help="High edge of the damped band (default 15; first-order). On "
+        "jelly's shoulder_1 the damping's loop phase wraps near 7 Hz: at 200 "
+        "N·s/m against the command height it cut the 1-3 Hz sway 18%% and "
+        "drove a 7 Hz mode, so a high gain needs this below it",
+    )
+    p.add_argument(
         "--imu-damp-ref",
         choices=("encoder", "command"),
         default="encoder",
@@ -957,13 +967,16 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 gain=args.imu_damp,
                 columns=tuple(cols),
                 max_torque=args.imu_damp_max,
-                estimator=VerticalVelocity(hp_hz=args.imu_damp_hp),
-                encoder=EncoderVelocity(hp_hz=args.imu_damp_hp),
+                estimator=VerticalVelocity(
+                    hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp
+                ),
+                encoder=EncoderVelocity(hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp),
             )
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
                 + ", ".join(names[c] for c in cols)
-                + f" (clamp {args.imu_damp_max:g} Nm, band from {args.imu_damp_hp:g} Hz, "
+                + f" (clamp {args.imu_damp_max:g} Nm, band {args.imu_damp_hp:g}-"
+                + f"{args.imu_damp_lp:g} Hz, "
                 + f"against the {args.imu_damp_ref} height"
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
