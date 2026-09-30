@@ -215,6 +215,10 @@ class TipDamper:
     trip_s: float = 0.15
     estimator: VerticalVelocity = field(default_factory=VerticalVelocity)
     encoder: EncoderVelocity = field(default_factory=EncoderVelocity)
+    #: Per-column scale on ``gain`` (default 1): on jelly shoulder_1 damps
+    #: the 1-3 Hz sway and the elbow the 3-15 Hz shake, each up to its own
+    #: gain before its loop phase runs out.
+    weights: dict[int, float] = field(default_factory=dict)
     #: Centre (Hz) of a first-order lead-lag on the flex velocity (zero at
     #: lead_hz/2, pole at 2·lead_hz: +37° there, 4× gain above), or 0 for
     #: none. On jelly's shoulder_1 the damping's loop phase wraps near 8 Hz.
@@ -299,7 +303,11 @@ class TipDamper:
         force = -self.gain * self._lead(now, self.flex)
         for i in self.columns:
             tau[i] = float(
-                np.clip(ramp * jac_z[i] * force, -self.max_torque, self.max_torque)
+                np.clip(
+                    ramp * self.weights.get(i, 1.0) * jac_z[i] * force,
+                    -self.max_torque,
+                    self.max_torque,
+                )
             )
         return tau
 

@@ -630,9 +630,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--imu-damp-joint",
         action="append",
         default=[],
-        metavar="SIDE.JOINT",
-        help="Joints that apply the IMU damping (repeatable; default the "
-        "driven arm's shoulder_1, shoulder_2 and elbow)",
+        metavar="SIDE.JOINT[=SCALE]",
+        help="Joints that apply the IMU damping, optionally with a scale on "
+        "--imu-damp for that joint (repeatable; default the driven arm's "
+        "shoulder_1, shoulder_2 and elbow)",
     )
     p.add_argument(
         "--imu-damp-max",
@@ -965,12 +966,18 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
             f"{side}.elbow",
         ]
         cols = []
+        weights: dict[int, float] = {}
         for spec in specs:
-            s_side, _, joint = spec.partition(".")
+            name, _, scale = spec.partition("=")
+            s_side, _, joint = name.partition(".")
             if joint not in names or s_side not in ("left", "right"):
-                raise SystemExit(f"--imu-damp-joint wants SIDE.JOINT, got {spec!r}")
+                raise SystemExit(
+                    f"--imu-damp-joint wants SIDE.JOINT[=SCALE], got {spec!r}"
+                )
             if s_side == side:
                 cols.append(names.index(joint))
+                if scale:
+                    weights[names.index(joint)] = float(scale)
         if cols:
             out[side] = TipDamper(
                 gain=args.imu_damp,
@@ -981,10 +988,14 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 encoder=EncoderVelocity(hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp),
                 lead_hz=args.imu_damp_lead,
+                weights=weights,
             )
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
-                + ", ".join(names[c] for c in cols)
+                + ", ".join(
+                    names[c] + (f" ×{weights[c]:g}" if c in weights else "")
+                    for c in cols
+                )
                 + f" (clamp {args.imu_damp_max:g} Nm, band {args.imu_damp_hp:g}-"
                 + f"{args.imu_damp_lp:g} Hz, "
                 + f"against the {args.imu_damp_ref} height"
