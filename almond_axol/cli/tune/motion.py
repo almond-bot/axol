@@ -69,7 +69,7 @@ from ...robot.config import (
 )
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
-from ...tuning.imu_damping import GyroFlexDamper
+from ...tuning.imu_damping import GyroFlexDamper, TorqueProbe
 from ...tuning.learning import LEARN_BAND, CommandLearner
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 from ...tuning.runs import load_run
@@ -681,6 +681,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--gyro-mount-fit)",
     )
     p.add_argument(
+        "--torque-probe",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT=NM",
+        help="Add a known multisine torque (0.5-15 Hz, NM peak) to this joint "
+        "(repeatable; add --imu-damp-alternate to probe every second pass) and "
+        "log the gyro flex estimate, to "
+        "measure the torque → flex response --gyro-damp closes its loop "
+        "through. Needs --gyro-mount",
+    )
+    p.add_argument(
         "--gyro-mount-fit",
         metavar="RUN_ID",
         help="Fit the wrist camera's mount rotation from a saved tune.motion "
@@ -953,6 +964,8 @@ def _gyro_dampers(args: argparse.Namespace) -> dict[str, Any]:
 
     from ...tuning.imu_damping import GyroFlexDamper
 
+    if args.torque_probe:
+        return _torque_probes(args)
     if args.gyro_damp <= 0:
         return {}
     if args.imu_damp > 0:
@@ -999,6 +1012,52 @@ def _gyro_dampers(args: argparse.Namespace) -> dict[str, Any]:
             + ", ".join(f"{names[j]} {c:g}" for j, c in sorted(gains.items()))
             + f" N·m·s/rad (clamp {args.imu_damp_max:g} Nm"
             + (", alternate passes)" if args.imu_damp_alternate else ")")
+        )
+    return out
+
+
+def _load_gyro_mounts(args: argparse.Namespace) -> tuple[Path, dict[str, Any]]:
+    import json
+
+    path = Path(args.gyro_mount).expanduser()
+    try:
+        return path, json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(
+            f"tune.motion: gyro damping needs the camera mount ({path}: {e}); "
+            "fit it with --gyro-mount-fit RUN_ID"
+        ) from e
+
+
+def _torque_probes(args: argparse.Namespace) -> dict[str, Any]:
+    """``--torque-probe``: one :class:`TorqueProbe` per side it names."""
+    from ...tuning.imu_damping import TorqueProbe
+
+    if args.no_imu:
+        raise SystemExit("tune.motion: --torque-probe needs the wrist IMU")
+    path, mounts = _load_gyro_mounts(args)
+    names = [j.value for j in ARM_JOINTS]
+    amps: dict[str, dict[int, float]] = {}
+    for spec in args.torque_probe:
+        name, _, a = spec.partition("=")
+        side, _, joint = name.partition(".")
+        if joint not in names or side not in ("left", "right") or not a:
+            raise SystemExit(f"--torque-probe wants SIDE.JOINT=NM, got {spec!r}")
+        if abs(float(a)) > 1.0:
+            raise SystemExit("--torque-probe: keep the probe at or under 1 Nm")
+        amps.setdefault(side, {})[names.index(joint)] = float(a)
+    out = {}
+    for side, a in amps.items():
+        if side not in mounts:
+            raise SystemExit(f"tune.motion: no {side} camera mount in {path}")
+        out[side] = TorqueProbe(
+            amplitudes=a, mount=np.asarray(mounts[side]["rotation"], dtype=float)
+        )
+        print(
+            f"  torque probe ({side}): "
+            + ", ".join(f"{names[j]} {v:g} Nm" for j, v in sorted(a.items()))
+            + " peak, 0.5-15 Hz multisine"
+            + (" on alternate passes" if args.imu_damp_alternate else "")
         )
     return out
 
@@ -1655,7 +1714,7 @@ async def _run(args: argparse.Namespace) -> None:
                 if arm is None:
                     continue
                 q_meas = snapshot(axol)
-                if isinstance(d, GyroFlexDamper):
+                if isinstance(d, (GyroFlexDamper, TorqueProbe)):
                     if k % _JAC_EVERY == 0 or side not in jac:
                         rot, jac[side] = _joint_axes(solver, q_meas, side, d.columns)
                     else:
@@ -1764,10 +1823,15 @@ async def _run(args: argparse.Namespace) -> None:
     imu = WristImu(
         ["left", "right"] if args.arms == "both" else [args.arms],
         enabled=not args.no_imu,
-        live=args.imu_damp > 0 or args.gyro_damp > 0,
+        live=args.imu_damp > 0 or args.gyro_damp > 0 or bool(args.torque_probe),
     )
     imu.start()
-    needs_imu = args.learn_imu or args.imu_damp > 0 or args.gyro_damp > 0
+    needs_imu = (
+        args.learn_imu
+        or args.imu_damp > 0
+        or args.gyro_damp > 0
+        or bool(args.torque_probe)
+    )
     if needs_imu and not imu.sides:
         imu.stop()
         raise SystemExit(

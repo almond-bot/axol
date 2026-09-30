@@ -465,3 +465,76 @@ class GyroFlexDamper:
                 )
             )
         return tau
+
+
+@dataclass
+class TorqueProbe:
+    """A known torque excitation on chosen arm joints, for measuring the
+    joint-torque → flex response the gyro damper closes its loop through.
+
+    A multisine: ``components`` sines spread log-uniformly over ``band`` with
+    random phases (``seed``), scaled to ``amplitude`` Nm peak per joint and
+    faded in and out over ``ramp_s``. It plugs into the same pass loop as
+    :class:`GyroFlexDamper` (it keeps that damper's flex estimate running,
+    with zero gain, so the log carries it) and never reacts to what it
+    measures.
+    """
+
+    amplitudes: dict[int, float]
+    mount: np.ndarray
+    band: tuple[float, float] = (0.5, 15.0)
+    components: int = 40
+    seed: int = 0
+    ramp_s: float = 1.0
+    monitor: GyroFlexDamper = field(init=False)
+    tripped: bool = field(default=False, init=False)
+    _started: float | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        rng = np.random.default_rng(self.seed)
+        self._freqs = np.geomspace(self.band[0], self.band[1], self.components)
+        self._phases = rng.uniform(0.0, 2 * math.pi, self.components)
+        # The multisine's own crest: scale so the peak is ``amplitude``.
+        t = np.arange(0.0, 60.0, 0.002)
+        peak = np.abs(
+            np.sin(2 * math.pi * self._freqs[:, None] * t + self._phases[:, None]).sum(
+                0
+            )
+        ).max()
+        self._scale = 1.0 / float(peak)
+        self.monitor = GyroFlexDamper(
+            gains={j: 0.0 for j in self.amplitudes}, mount=self.mount
+        )
+
+    @property
+    def columns(self) -> tuple[int, ...]:
+        return tuple(sorted(self.amplitudes))
+
+    @property
+    def flex(self) -> float:
+        """The flex rate about the first probed joint's axis (rad/s, signed)."""
+        return float(self.monitor.flex_axis[self.columns[0]])
+
+    def start(self, now: float) -> None:
+        self._started = now
+        self.monitor.start(now)
+
+    def feed(self, rows: np.ndarray) -> None:
+        self.monitor.feed(rows)
+
+    def feed_pose(self, now: float, rotation: np.ndarray, axes: np.ndarray) -> None:
+        self.monitor.feed_pose(now, rotation, axes)
+
+    def torque(self, now: float) -> np.ndarray:
+        tau = np.zeros(7)
+        if self._started is None:
+            return tau
+        s = now - self._started
+        ramp = min(1.0, s / self.ramp_s) if self.ramp_s > 0 else 1.0
+        u = (
+            float(np.sin(2 * math.pi * self._freqs * s + self._phases).sum())
+            * self._scale
+        )
+        for j, a in self.amplitudes.items():
+            tau[j] = ramp * a * u
+        return tau

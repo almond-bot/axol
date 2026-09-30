@@ -377,6 +377,38 @@ class SessionTest(unittest.TestCase):
             self.assertEqual(by_pass["gyro [2/2]"][0]["metrics"]["gyro_damp"], 5.0)
             self.assertEqual(by_pass["gyro [1/2]"][0]["metrics"]["gyro_damp"], 0.0)
 
+    def test_torque_probe_drives_only_its_joint_within_its_amplitude(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            mount = tmp / "mount.json"
+            mount.write_text(json.dumps({"right": {"rotation": np.eye(3).tolist()}}))
+            with self.assertRaises(SystemExit):
+                self._run(
+                    ["--torque-probe", "right.elbow=2", "--gyro-mount", str(mount)],
+                    tmp,
+                    imu=True,
+                )
+            text = self._run(
+                [
+                    "--torque-probe",
+                    "right.elbow=0.3",
+                    "--gyro-mount",
+                    str(mount),
+                    "--label",
+                    "probe",
+                ],
+                tmp,
+                imu=True,
+            )
+            self.assertIn("torque probe (right): elbow 0.3 Nm", text)
+            applied = np.stack([a for a in _FakeAxol.applied if a is not None])
+            peak = np.abs(applied).max(axis=0)
+            self.assertGreater(peak[3], 0.1)
+            self.assertLessEqual(peak[3], 0.3 + 1e-9)
+            self.assertEqual(float(np.delete(peak, 3).max()), 0.0)
+
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model
 
