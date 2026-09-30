@@ -223,7 +223,16 @@ class TipDamper:
     #: lead_hz/2, pole at 2·lead_hz: +37° there, 4× gain above), or 0 for
     #: none. On jelly's shoulder_1 the damping's loop phase wraps near 8 Hz.
     lead_hz: float = 0.0
+    #: Notch (Hz, 0 = none) on the damping force, Q :attr:`notch_q`, designed
+    #: at the 240 Hz motion rate: where the loop phase has wrapped the
+    #: damping drives the mode it should damp (jelly: ~11 Hz with the elbow
+    #: in, a buzz the vertical shake score barely sees but the IMU's
+    #: acceleration does).
+    notch_hz: float = 0.0
+    notch_q: float = 1.0
     tripped: bool = field(default=False, init=False)
+    _nx: list[float] = field(default_factory=lambda: [0.0, 0.0], init=False)
+    _ny: list[float] = field(default_factory=lambda: [0.0, 0.0], init=False)
     _lead_in: float = field(default=0.0, init=False)
     _lead_out: float = field(default=0.0, init=False)
     _lead_t: float | None = field(default=None, init=False)
@@ -245,6 +254,7 @@ class TipDamper:
         self._started = now
         self.tripped = False
         self._lead_t = None
+        self._nx, self._ny = [0.0, 0.0], [0.0, 0.0]
         self._fast_since = None
 
     def feed(self, rows: np.ndarray) -> None:
@@ -277,6 +287,25 @@ class TipDamper:
         self._lead_in, self._lead_out = x, y
         return y
 
+    def _notch(self, x: float) -> float:
+        if self.notch_hz <= 0:
+            return x
+        w0 = 2 * math.pi * self.notch_hz / 240.0
+        alpha = math.sin(w0) / (2 * self.notch_q)
+        a0 = 1 + alpha
+        b0, b1, b2 = 1 / a0, -2 * math.cos(w0) / a0, 1 / a0
+        a1, a2 = -2 * math.cos(w0) / a0, (1 - alpha) / a0
+        y = (
+            b0 * x
+            + b1 * self._nx[0]
+            + b2 * self._nx[1]
+            - a1 * self._ny[0]
+            - a2 * self._ny[1]
+        )
+        self._nx = [x, self._nx[0]]
+        self._ny = [y, self._ny[0]]
+        return y
+
     def torque(self, now: float, jac_z: np.ndarray) -> np.ndarray:
         """Joint torques (7,) for this tick. ``jac_z[i]`` = ∂(tool height)/∂q_i
         (m/rad) at the measured pose."""
@@ -300,7 +329,7 @@ class TipDamper:
         if self._ramp_from is None:
             self._ramp_from = now
         ramp = min(1.0, max(0.0, (now - self._ramp_from) / self.ramp_s))
-        force = -self.gain * self._lead(now, self.flex)
+        force = -self.gain * self._notch(self._lead(now, self.flex))
         for i in self.columns:
             tau[i] = float(
                 np.clip(

@@ -718,6 +718,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "loop phase runs out",
     )
     p.add_argument(
+        "--imu-damp-notch",
+        type=float,
+        default=0.0,
+        metavar="HZ",
+        help="Notch the damping force at HZ (Q --imu-damp-notch-q; default 0 "
+        "= none), for a mode the damping drives once its loop phase has "
+        "wrapped",
+    )
+    p.add_argument(
+        "--imu-damp-notch-q",
+        type=float,
+        default=1.0,
+        help="Quality factor of --imu-damp-notch (default 1.0)",
+    )
+    p.add_argument(
         "--imu-damp-ref",
         choices=("encoder", "command"),
         default="encoder",
@@ -989,6 +1004,8 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 encoder=EncoderVelocity(hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp),
                 lead_hz=args.imu_damp_lead,
                 weights=weights,
+                notch_hz=args.imu_damp_notch,
+                notch_q=args.imu_damp_notch_q,
             )
             print(
                 f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
