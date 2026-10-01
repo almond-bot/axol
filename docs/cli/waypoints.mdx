@@ -1,9 +1,9 @@
 ---
 title: "waypoints"
-description: "Teach poses by hand in gravity comp, then replay them as straight-line moves."
+description: "Teach poses by hand in gravity comp or from the VR headset, then replay them as straight-line moves."
 ---
 
-Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so you can hand-guide them; every time you record, the pose both arms are in is appended to a waypoint file. On playback each **gripper tip** travels a straight line in Cartesian space from waypoint to waypoint — position interpolated linearly, orientation slerped — and every sample along the line is resolved to joint angles with the [IK solver](/api/kinematics), pausing at each waypoint to work the grippers.
+Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so you can hand-guide them — or, with `--teach vr`, you [drive them from the headset](#teaching-in-vr) — and every time you record, the pose both arms are in is appended to a waypoint file. On playback each **gripper tip** travels a straight line in Cartesian space from waypoint to waypoint — position interpolated linearly, orientation slerped — and every sample along the line is resolved to joint angles with the [IK solver](/api/kinematics), pausing at each waypoint to work the grippers.
 
 The line is held at the point the fingers close on, not at the gripper mount the kinematics chain ends at. The two are 145 mm apart, so holding the mount straight would swing the tip through an arc of several centimetres whenever the wrist reorients along the way.
 
@@ -33,6 +33,35 @@ On the terminal, single keys on stdin:
 
 The same actions are buttons in the [control panel](/guides/control-panel) — the running session publishes them, so a path can be taught and replayed with no terminal at all.
 
+## Teaching in VR
+
+`--teach vr` runs a normal [VR teleop](/cli/teleop) session for the teaching instead of gravity compensation. Squeeze both grips to engage and drive the arms where you want them, as in teleop, then record from the controllers:
+
+| Button | Action |
+|---|---|
+| `A` | Record the pose both arms are in (during playback: stop) |
+| Left stick click | Undo the last waypoint |
+| Right stick click | Play the path |
+
+The terminal keys and panel buttons keep working alongside. The headset shows what to do next, and which buttons do what, in a banner at the top of its HUD.
+
+It is one person with the headset on the whole time, so nobody has to stand at a keyboard, and each pose lands where you aimed it rather than where a limp arm settled. It also works with `--sim`, so a path can be taught in the browser visualizer without a robot.
+
+- **Grippers** follow the triggers, as in teleop. Each waypoint records what the trigger is asking for, snapped to open or closed: a squeezed trigger is a grasp, whatever the fingers stalled at. The `[` / `]` gripper keys do nothing in this mode.
+- **Playback** stands teleop down: the path is planned and played exactly as in hand mode. Afterwards, teleop takes the arms back to rest through its own guarded return and teaching resumes, so squeeze both grips again to carry on. Play waits while the arms are still returning to rest.
+- **Teleop parameters** are the robot's shared ones, the same as `axol teleop`'s (the control panel's teleop, kinematics and VR-server settings). `--free_joints` and `--kd` do not apply. [Jelly](/guides/vr-interface#jelly) is never driven: moving the base would move every waypoint taught so far, and it frees the stick clicks for undo and play.
+- **Quitting** while teaching parks the arms at rest, because teleop is holding them stiff rather than limp.
+
+### Named waypoints
+
+`--labels` names the path's waypoints in order. The i-th waypoint is saved under the i-th name, the prompt asks for the next one (`drive the arms to pick_hover (2 of 5)`), and playback reports progress by name. Waypoints past the end of the list keep the default name. Labels work in hand mode too.
+
+```bash
+axol waypoints --teach vr --file station.json --labels "[home, pick_hover, pick, place_hover, place]"
+```
+
+`--teach vr` builds on [#217](https://github.com/almond-bot/axol/pull/217) by Yousef Hindy, who first built headset-guided pose teaching for a fixtured pick-and-place station.
+
 ## Grasping
 
 A gripper is open or closed, nothing in between, and each one is worked on its own — `[` for the left, `]` for the right — so one arm can carry something while the other is still being guided. Both start open. Whatever state a gripper is in when you record is what that waypoint asks for, so a path always says what both grippers should be doing:
@@ -58,7 +87,7 @@ Grip force is the gripper's `torque_limit`, shared with every other operation an
 |---|---|
 | `--file PATH` | Waypoint file to record into and play back from. Written after every change. Default `~/.almond/waypoints.json` |
 | `--play_only BOOL` | Skip teaching and replay the file straight away. Default `false` |
-| `--sim BOOL` | Preview a saved path in the browser visualizer instead of on the robot (implies `--play_only`). Default `false` |
+| `--sim BOOL` | Run in the browser visualizer instead of on the robot. Implies `--play_only` unless `--teach vr`, which teaches in the visualizer. Default `false` |
 | `--loops INT` | Times to run the path; `0` replays until stopped. Default 1 |
 | `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.25 |
 | `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 1.2 |
@@ -69,8 +98,10 @@ Grip force is the gripper's `torque_limit`, shared with every other operation an
 | `--min_travel FLOAT` | An arm whose gripper tip moves less than this (m) between two waypoints holds still for that leg. Default 0.01 |
 | `--min_rotation FLOAT` | Rotation counterpart to `--min_travel` (rad). Default 0.05 |
 | `--ease_in FLOAT` | Seconds spent blending onto the start of each leg, so the arm rejoins the plan smoothly instead of taking up the difference in one tick. Default 0.4 |
-| `--free_joints [J1,J2,...]` | Joints to gravity-compensate while teaching. Default `null` = all 7 |
-| `--kd FLOAT` | Velocity damping on free joints while teaching (Nm·s/rad). Default 0.25 |
+| `--teach {hand,vr}` | How the arms get to each waypoint while teaching: `hand` holds them in gravity compensation to hand-guide, `vr` drives them with [VR teleop](#teaching-in-vr). Default `hand` |
+| `--labels [NAME,...]` | [Names for the path's waypoints](#named-waypoints), in order. Default `null` |
+| `--free_joints [J1,J2,...]` | Joints to gravity-compensate while teaching by hand. Default `null` = all 7 |
+| `--kd FLOAT` | Velocity damping on free joints while teaching by hand (Nm·s/rad). Default 0.25 |
 | `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
 | `--rate_hz FLOAT` | Control loop and waypoint rate in Hz (default: 250) |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
@@ -82,6 +113,8 @@ axol waypoints                                  # teach, then play
 axol waypoints --file pick_place.json           # keep a named path
 axol waypoints --play_only --loops 0            # replay it until stopped
 axol waypoints --sim --file pick_place.json     # preview it in the browser
+axol waypoints --teach vr                       # teach from the VR headset
+axol waypoints --sim --teach vr                 # teach in the browser visualizer
 axol waypoints --speed 0.03 --dwell 2           # slow, with a long pause
 axol waypoints --speed 0.5                      # brisk
 ```
@@ -118,5 +151,5 @@ Each arm entry is 7 joint angles in radians (`SHOULDER_1` … `WRIST_3`, joint f
 </Tip>
 
 <Note>
-  Playback starts by moving to the first waypoint with a collision-aware joint-space move, and parks at the rest pose when the path finishes or is stopped. Quitting straight out of teaching skips that move — your hands are on a limp arm, so nothing stiffens up and drives home.
+  Playback starts by moving to the first waypoint with a collision-aware joint-space move, and parks at the rest pose when the path finishes or is stopped (when teaching in VR, teleop's own return to rest does it). Quitting straight out of hand teaching skips that move — your hands are on a limp arm, so nothing stiffens up and drives home. Quitting out of VR teaching parks, since teleop holds the arms stiff.
 </Note>

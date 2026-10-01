@@ -495,9 +495,41 @@ class VRTeleopCore:
 
         The pause brackets every limp gravity-comp hold, so this doubles as
         "the arms are hand-guidable rather than position-controlled" — a
-        teardown park must not pull limp arms anywhere.
+        teardown park must not pull limp arms anywhere. It also covers a
+        :meth:`suspend_tracking` hand-off, where the arms belong to another
+        controller, which parks them itself.
         """
         return self._ik_paused
+
+    def suspend_tracking(self) -> None:
+        """Stand teleop down so another controller can command the arms.
+
+        For a caller that stops consuming :meth:`compute_output` to drive the
+        arms itself — ``axol waypoints --teach vr`` playing a taught path back.
+        Disengages both arms, abandons any reset in progress and idles the IK
+        pipeline, so nothing teleop does in the meantime can act on a
+        solution the arms are about to leave. Hand control back with
+        :meth:`resume_tracking`. Safe to call from any thread.
+        """
+        self.pause_ik()
+        self.cancel_reset()
+        self._disengage_all("Teleop suspended")
+
+    def resume_tracking(
+        self, cur_left: np.ndarray | None, cur_right: np.ndarray | None
+    ) -> None:
+        """Take the arms back after :meth:`suspend_tracking`.
+
+        Re-seeds the pipeline at the measured positions (as
+        :meth:`resync_to_positions`) and queues a return to rest before the
+        IK loop resumes. The reset is what re-seats the IK worker, whose own
+        last solution is wherever tracking left off: its reset reply plans
+        from the re-seeded pose and clears the worker's engage state, so the
+        next both-grips engage snapshots the pose the arms are really in.
+        """
+        self.resync_to_positions(cur_left, cur_right)
+        self.request_reset()
+        self.resume_ik()
 
     # ------------------------------------------------------------------
     # Engage block (owner can't follow tracking right now)

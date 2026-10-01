@@ -29,9 +29,11 @@ flags, so a direct run uses the same values as a panel-launched one.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import socket
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
 from ..utils import affinity
@@ -451,11 +453,12 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
         await jelly.disable()
 
 
-async def _run(cfg: TeleopCmdConfig) -> None:
-    """Run teleop under the same CPU-affinity guard as ``collect-data``.
+@contextlib.contextmanager
+def realtime_control_thread() -> Iterator[None]:
+    """Run a teleop control loop under the same CPU-affinity guard as ``collect-data``.
 
     The 120 Hz control loop, the VR pose thread and the IK dispatch thread
-    all start inside :func:`_run_session`, so pinning the calling thread here
+    all start inside the guarded block, so pinning the calling thread here
     puts every one of them on the control core (children inherit the mask)
     exactly as ``collect-data`` / ``collect-dagger`` do. Until 2026-09-15 plain
     teleop skipped this and its loop floated across all cores as an ordinary
@@ -495,7 +498,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         if original_affinity is not None:
             affinity.pin_realtime()
             fifo = affinity.prioritize_control_thread()
-        await _run_session(cfg)
+        yield
     finally:
         if fifo:
             affinity.release_control_thread()
@@ -507,6 +510,12 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                     "teleop: could not restore the original CPU affinity",
                     exc_info=True,
                 )
+
+
+async def _run(cfg: TeleopCmdConfig) -> None:
+    """Run teleop pinned to the control core (see :func:`realtime_control_thread`)."""
+    with realtime_control_thread():
+        await _run_session(cfg)
 
 
 async def _run_session(cfg: TeleopCmdConfig) -> None:

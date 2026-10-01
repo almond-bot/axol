@@ -73,6 +73,7 @@ export function AxolVRClient({
   onPoseMode,
   onPoseSourceKind,
   onEpisode,
+  onBanner,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -101,6 +102,10 @@ export function AxolVRClient({
   // Called with the current 1-based episode number while collecting data (and
   // null if the server ever clears it). Drives the in-headset episode readout.
   onEpisode?: (episode: number | null) => void
+  // Called with the host's prompt banner (a command walking the operator
+  // through steps of its own, e.g. `axol waypoints --teach vr`), or null to
+  // hide it. Drives the in-headset banner readout.
+  onBanner?: (banner: string | null) => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -140,6 +145,9 @@ export function AxolVRClient({
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
   const serverEpisodeRef = useRef<number | null | -1>(-1)
+  // Server-pushed prompt banner, applied at the start of the next frame.
+  // undefined is the "nothing pending" sentinel (null is an explicit clear).
+  const serverBannerRef = useRef<string | null | undefined>(undefined)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
@@ -183,6 +191,9 @@ export function AxolVRClient({
       // XR session, but a reconnect commonly happens outside one.
       serverEpisodeRef.current = -1
       onEpisode?.(null)
+      // Same for the prompt banner: it belongs to the session that sent it.
+      serverBannerRef.current = undefined
+      onBanner?.(null)
       if (currentWs) {
         currentWs.onmessage = (event: MessageEvent) => {
           if (wsRef.current !== currentWs) return
@@ -211,6 +222,8 @@ export function AxolVRClient({
               onPoseSourceKind?.(msg.value)
             } else if (msg.type === "episode") {
               serverEpisodeRef.current = typeof msg.value === "number" ? msg.value : null
+            } else if (msg.type === "banner") {
+              serverBannerRef.current = typeof msg.value === "string" ? msg.value : null
             }
           } catch {
             // ignore malformed messages
@@ -302,6 +315,10 @@ export function AxolVRClient({
     if (serverEpisodeRef.current !== -1) {
       onEpisode?.(serverEpisodeRef.current)
       serverEpisodeRef.current = -1
+    }
+    if (serverBannerRef.current !== undefined) {
+      onBanner?.(serverBannerRef.current)
+      serverBannerRef.current = undefined
     }
 
     // Apply server-pushed state override before processing button presses.
@@ -551,6 +568,9 @@ export function AxolVRClient({
     const r_stick_x = rightSource?.gamepad?.axes[2] ?? 0
     const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
     const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
+    // A, raw. Teleop leaves it unbound; `axol waypoints --teach vr` records
+    // on it (data collection's use of A stays local, via the state above).
+    const r_a = aPressed
 
     // Serialise once so both transports carry the identical frame (same seq),
     // letting the server treat them as one stream and de-dupe to whichever
@@ -575,6 +595,7 @@ export function AxolVRClient({
       r_stick_x,
       l_stick_click,
       r_stick_click,
+      r_a,
       seq: nextPoseSequence(seqRef.current!),
       // One logical identity across USB, WebRTC, and network WebSocket. The
       // server de-dupes the shared sequence globally and can keep this Quest

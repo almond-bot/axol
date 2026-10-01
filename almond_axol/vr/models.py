@@ -171,6 +171,10 @@ class VRFrame(BaseModel):
             rotation.
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
+        r_a:     Right controller A button held. Plain teleop leaves it
+            unbound; ``axol waypoints --teach vr`` records a waypoint on its
+            rising edge (and stops a playback). Defaults to False so older web
+            builds, which omit it, never trigger anything.
     """
 
     l_ee: VRPose
@@ -204,3 +208,4 @@ class VRFrame(BaseModel):
     r_stick_x: FiniteFloat = 0.0
     l_stick_click: bool = False
     r_stick_click: bool = False
+    r_a: bool = False

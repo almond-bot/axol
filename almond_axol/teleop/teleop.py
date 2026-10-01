@@ -38,6 +38,7 @@ import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 
@@ -54,6 +55,7 @@ from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
+from ..vr.models import VRFrame
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
 from .core import VRTeleopCore, wait_for_ik_ready
@@ -210,6 +212,8 @@ class VRTeleop:
         self._core = VRTeleopCore(
             config, _logger, self._broadcast_tracking, self._broadcast_json
         )
+        # Extra per-frame observers (see add_frame_listener).
+        self._frame_listeners: list[Callable[[VRFrame], None]] = []
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -823,6 +827,79 @@ class VRTeleop:
             self._core.unblock_engage()
 
     # ------------------------------------------------------------------
+    # Hooks for commands built on a teleop session
+    # ------------------------------------------------------------------
+
+    def add_frame_listener(self, callback: Callable[[VRFrame], None]) -> None:
+        """Also call ``callback`` with every VR frame the headset sends.
+
+        For commands that read controller buttons teleop leaves unbound (``axol
+        waypoints --teach vr`` records on A). Runs on the VR server thread, so
+        keep it short and hand the work to another thread; an exception it
+        raises is logged and never reaches teleop.
+        """
+        self._frame_listeners.append(callback)
+
+    def set_banner(self, text: str | None) -> None:
+        """Show a one-line prompt in the headset (``None`` hides it).
+
+        See :meth:`almond_axol.vr.server.VRServer.set_banner`. Safe to call
+        from any thread.
+        """
+        self._vr_server.set_banner(text)
+
+    @property
+    def grip_targets(self) -> tuple[float, float]:
+        """The ``(left, right)`` gripper openings teleop is commanding, in [0, 1].
+
+        What the controller triggers asked for, not where the fingers came to
+        rest — the same distinction :class:`~almond_axol.waypoints.Waypoint`
+        makes for a grasp.
+        """
+        return self._core.l_grip, self._core.r_grip
+
+    @property
+    def is_resetting(self) -> bool:
+        """True while a return to rest is pending, being planned, or playing."""
+        return self._core.is_resetting
+
+    def suspend(self) -> None:
+        """Stand teleop down so the caller can command the robot directly.
+
+        Stop :meth:`run` first (cancel its task): nothing may be streaming
+        teleop's output while another controller drives the arms. Tracking
+        disengages and the IK pipeline idles until :meth:`resume`. See
+        :meth:`VRTeleopCore.suspend_tracking`. While suspended the caller owns
+        the arms, teardown included: the park before torque-off is skipped
+        (as for a limp hold), so park them yourself before leaving.
+        """
+        self._core.suspend_tracking()
+
+    async def resume(self) -> None:
+        """Hand the arms back to teleop after :meth:`suspend`.
+
+        Re-seeds teleop at the pose the arms were left in and queues a return
+        to rest, which the next :meth:`run` plays through its usual guarded
+        path; engaging then needs a fresh both-grips squeeze. Call before
+        restarting :meth:`run`.
+        """
+        reset_command_state = getattr(self._robot, "reset_command_state", None)
+        if callable(reset_command_state):
+            # The arms were commanded outside teleop, so the robot's cached
+            # command history is stale (see RobotBase.reset_command_state).
+            reset_command_state()
+        left_arm = getattr(self._robot, "left", None)
+        right_arm = getattr(self._robot, "right", None)
+        if left_arm is None and right_arm is None:
+            pos_l, pos_r = await self._robot.get_positions()
+        else:
+            # Hardware: the telemetry cache is the only read allowed while
+            # background telemetry runs.
+            pos_l = left_arm.positions if left_arm is not None else None
+            pos_r = right_arm.positions if right_arm is not None else None
+        self._core.resume_tracking(pos_l, pos_r)
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -1111,6 +1188,11 @@ class VRTeleop:
             # collect-data flow). Resets force a stop so the base doesn't
             # creep while the arms replay their return-to-rest trajectory.
             self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+        for listener in self._frame_listeners:
+            try:
+                listener(frame)
+            except Exception:  # noqa: BLE001 - an observer must not break teleop
+                _logger.exception("VR frame listener failed")
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)

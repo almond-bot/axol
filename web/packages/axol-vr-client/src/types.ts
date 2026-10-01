@@ -69,4 +69,6 @@ export type AxolPoseData = {
   l_stick_click?: boolean
   /** Right thumbstick pressed in — lift up while held. */
   r_stick_click?: boolean
+  /** Right A button held (raw). Records a waypoint under `axol waypoints --teach vr`. */
+  r_a?: boolean
 }

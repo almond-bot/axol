@@ -414,9 +414,11 @@ COMMANDS: dict[str, CommandDef] = {
         "waypoints",
         "waypoints",
         "Waypoints",
-        "Hand-guide the arms in gravity comp to record waypoints, then replay "
-        "them as straight-line moves solved with inverse kinematics. Enable "
-        "simulation to preview a saved path in the browser.",
+        "Hand-guide the arms in gravity comp (or drive them from the VR "
+        "headset with teach set to vr) to record waypoints, then replay them "
+        "as straight-line moves solved with inverse kinematics. Enable "
+        "simulation to preview a saved path in the browser, or to teach one "
+        "there in VR.",
         "Operate",
         "draccus",
         _waypoints,
@@ -427,7 +429,7 @@ COMMANDS: dict[str, CommandDef] = {
         # The gravity-comp side of a session takes the same config shape
         # (axol.*, channels, kd, rates), so the settings table is inherited.
         settings_like="gravity-comp",
-        per_run_fields=("file", "loops", "play_only", "sim"),
+        per_run_fields=("file", "loops", "play_only", "sim", "teach", "labels"),
     ),
     "collect-data": CommandDef(
         "collect-data",
