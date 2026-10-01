@@ -1,0 +1,202 @@
+--- a/gst-zedxone-src/gstzedxonesrc.h
++++ b/gst-zedxone-src/gstzedxonesrc.h
+@@ -112,6 +112,9 @@
+ 
+     GstCaps *_caps;        // Stream caps
+     guint _outFramesize;   // Output frame size in byte
++
++    // Axol: the IMU forwarder (AXOL_IMU_UDP), NULL when off.
++    gpointer _axolImu;
+ };
+ 
+ struct _GstZedXOneSrcClass {
+--- a/gst-zedxone-src/gstzedxonesrc.cpp
++++ b/gst-zedxone-src/gstzedxonesrc.cpp
+@@ -35,9 +35,160 @@
+ 
+ #include <chrono>
+ 
++
+ GST_DEBUG_CATEGORY_STATIC(gst_zedxonesrc_debug);
+ #define GST_CAT_DEFAULT gst_zedxonesrc_debug
+ 
++// ----> Axol: wrist IMU forwarding
++// While this element owns the camera nothing else can open it, so a robot
++// that streams the wrist camera's video (teleop) gets its IMU from here: with
++// AXOL_IMU_UDP="<serial>:<port>[+<port>...][;<serial>:...]" in the
++// environment, a thread polls the camera's IMU and sends every new sample to
++// 127.0.0.1:<port> as the 32-byte "<d6f" datagram almond_axol.zed.imu_worker
++// sends — CLOCK_MONOTONIC time (s), acceleration (m/s²), angular velocity
++// (deg/s) — for the realtime core's tip damper.
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <time.h>
++
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace {
++
++struct AxolImuForwarder {
++    std::thread thread;
++    std::atomic<bool> stop{false};
++    int sock = -1;
++    std::vector<sockaddr_in> addrs;
++};
++
++double axol_mono_minus_real() {
++    timespec m, r;
++    clock_gettime(CLOCK_MONOTONIC, &m);
++    clock_gettime(CLOCK_REALTIME, &r);
++    return static_cast<double>(m.tv_sec - r.tv_sec) + (m.tv_nsec - r.tv_nsec) * 1e-9;
++}
++
++std::vector<int> axol_imu_ports(unsigned long long serial) {
++    std::vector<int> out;
++    const char *env = getenv("AXOL_IMU_UDP");
++    if (env == nullptr) {
++        return out;
++    }
++    const std::string all(env);
++    size_t pos = 0;
++    while (pos < all.size()) {
++        size_t end = all.find(';', pos);
++        if (end == std::string::npos) {
++            end = all.size();
++        }
++        const std::string item = all.substr(pos, end - pos);
++        const size_t colon = item.find(':');
++        if (colon != std::string::npos &&
++            strtoull(item.substr(0, colon).c_str(), nullptr, 10) == serial) {
++            const std::string ports = item.substr(colon + 1);
++            size_t p = 0;
++            while (p < ports.size()) {
++                size_t e = ports.find('+', p);
++                if (e == std::string::npos) {
++                    e = ports.size();
++                }
++                const int port = atoi(ports.substr(p, e - p).c_str());
++                if (port > 0 && port < 65536) {
++                    out.push_back(port);
++                }
++                p = e + 1;
++            }
++        }
++        pos = end + 1;
++    }
++    return out;
++}
++
++void axol_imu_loop(sl::CameraOne *zed, AxolImuForwarder *fw) {
++    sl::SensorsData sens;
++    unsigned long long last = 0;
++    double offset = axol_mono_minus_real();
++    unsigned n = 0;
++    while (!fw->stop.load()) {
++        if (zed->getSensorsData(sens, sl::TIME_REFERENCE::CURRENT) == sl::ERROR_CODE::SUCCESS) {
++            const unsigned long long ts = sens.imu.timestamp.getNanoseconds();
++            if (ts != 0 && ts != last) {
++                last = ts;
++                if (++n % 2000 == 0) {
++                    offset = axol_mono_minus_real();   // follow wall-clock steps
++                }
++                const double t = static_cast<double>(ts) * 1e-9 + offset;
++                const float v[6] = {sens.imu.linear_acceleration.x,
++                                    sens.imu.linear_acceleration.y,
++                                    sens.imu.linear_acceleration.z,
++                                    sens.imu.angular_velocity.x,
++                                    sens.imu.angular_velocity.y,
++                                    sens.imu.angular_velocity.z};
++                unsigned char pkt[32];
++                memcpy(pkt, &t, 8);
++                memcpy(pkt + 8, v, 24);
++                for (const auto &a : fw->addrs) {
++                    sendto(fw->sock, pkt, sizeof(pkt), MSG_DONTWAIT,
++                           reinterpret_cast<const sockaddr *>(&a), sizeof(a));
++                }
++            }
++        }
++        usleep(250);
++    }
++}
++
++void axol_imu_start(GstZedXOneSrc *src) {
++    const unsigned long long serial = src->_zed->getCameraInformation().serial_number;
++    const std::vector<int> ports = axol_imu_ports(serial);
++    if (ports.empty()) {
++        return;
++    }
++    auto *fw = new AxolImuForwarder();
++    fw->sock = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fw->sock < 0) {
++        GST_WARNING_OBJECT(src, "Axol IMU forwarding: no socket");
++        delete fw;
++        return;
++    }
++    for (int port : ports) {
++        sockaddr_in a;
++        memset(&a, 0, sizeof(a));
++        a.sin_family = AF_INET;
++        a.sin_port = htons(static_cast<uint16_t>(port));
++        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++        fw->addrs.push_back(a);
++    }
++    fw->thread = std::thread(axol_imu_loop, src->_zed.get(), fw);
++    src->_axolImu = fw;
++    GST_INFO_OBJECT(src, "Axol IMU forwarding: camera %llu to %zu port(s)", serial, ports.size());
++}
++
++void axol_imu_stop(GstZedXOneSrc *src) {
++    auto *fw = static_cast<AxolImuForwarder *>(src->_axolImu);
++    if (fw == nullptr) {
++        return;
++    }
++    fw->stop.store(true);
++    if (fw->thread.joinable()) {
++        fw->thread.join();
++    }
++    if (fw->sock >= 0) {
++        close(fw->sock);
++    }
++    delete fw;
++    src->_axolImu = nullptr;
++}
++
++}   // namespace
++// <---- Axol: wrist IMU forwarding
++
+ /* prototypes */
+ static void gst_zedxonesrc_set_property(GObject *object, guint property_id, const GValue *value,
+                                         GParamSpec *pspec);
+@@ -761,6 +912,8 @@
+ }
+ 
+ static void gst_zedxonesrc_reset(GstZedXOneSrc *src) {
++    // Axol: the IMU thread reads the camera — stop it before it closes.
++    axol_imu_stop(src);
+     if (src->_zed->isOpened()) {
+         src->_zed->close();
+     }
+@@ -824,6 +977,7 @@
+     gst_base_src_set_format(GST_BASE_SRC(src), GST_FORMAT_TIME);
+ 
+     // ----> Parameters initialization
++    src->_axolImu = NULL;   // Axol: IMU forwarder, started with the camera
+     src->_cameraResolution = DEFAULT_PROP_CAM_RES;
+     src->_cameraFps = DEFAULT_PROP_CAM_FPS;
+     src->_sdkVerboseLevel = DEFAULT_PROP_VERBOSE_LVL;
+@@ -1459,6 +1613,9 @@
+     }
+     // <---- Open camera
+ 
++    // Axol: forward the IMU when AXOL_IMU_UDP names this camera.
++    axol_imu_start(src);
++
+     // Check FPS
+     src->_realFps = static_cast<int>(src->_zed->getCameraInformation().camera_configuration.fps);
+     if (src->_realFps != src->_cameraFps) {
