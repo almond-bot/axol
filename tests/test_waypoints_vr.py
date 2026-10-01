@@ -375,5 +375,15 @@ class TeleopPiecesTest(unittest.TestCase):
         self.assertEqual((core.l_grip, core.r_grip), (GRIP_CLOSED, GRIP_CLOSED))
 
 
+class ControlPanelTest(unittest.TestCase):
+    def test_teach_renders_as_a_choice_and_is_offered_per_run(self) -> None:
+        from almond_axol.serve.commands import COMMANDS, get_schema
+
+        (teach,) = [n for n in get_schema("waypoints").nodes if n["key"] == "teach"]
+        self.assertEqual((teach["type"], teach["options"]), ("select", ["hand", "vr"]))
+        self.assertIn("teach", COMMANDS["waypoints"].per_run_fields)
+        self.assertIn("labels", COMMANDS["waypoints"].per_run_fields)
+
+
 if __name__ == "__main__":
     unittest.main()

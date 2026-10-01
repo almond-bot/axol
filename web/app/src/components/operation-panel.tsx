@@ -297,6 +297,9 @@ export function OperationPanel({
   // run); otherwise the saved setting decides the next start.
   const savedValues = liveArgs ? null : sharedValues
   const armsOff = !mantisMode && isArmsOffRun(meta, effectiveSettings, savedValues)
+  // Waypoints taught from the headset (`teach: vr`) run a VR teleop session,
+  // so the operator needs the same connect hint as teleop — plus its buttons.
+  const vrWaypoints = meta.id === "waypoints" && effectiveSettings.teach === "vr"
   // Sim, arms-off, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
@@ -581,7 +584,8 @@ export function OperationPanel({
               )}
 
               <RunningHints
-                usesHeadset={meta.usesHeadset}
+                usesHeadset={meta.usesHeadset || vrWaypoints}
+                vrWaypoints={vrWaypoints}
                 mantisMode={mantisMode}
                 mantisSource={mantisSource}
                 dataCollection={meta.id === "collect-data"}
@@ -1056,8 +1060,9 @@ function trackerLabelFor(source: string | null): string {
   return source === "ultimate" ? "Ultimate" : "Lighthouse"
 }
 
-function RunningHints({
+export function RunningHints({
   usesHeadset,
+  vrWaypoints = false,
   mantisMode,
   mantisSource,
   dataCollection,
@@ -1067,6 +1072,7 @@ function RunningHints({
   viewerPort,
 }: {
   usesHeadset: boolean
+  vrWaypoints?: boolean
   mantisMode: boolean
   mantisSource: string
   dataCollection: boolean
@@ -1106,6 +1112,14 @@ function RunningHints({
         <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
           connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.
+          {vrWaypoints && (
+            <>
+              {" "}
+              Squeeze both grips to drive the arms. <span className="text-white/70">A</span> records
+              a waypoint (and stops a playback), the left stick click undoes, and the right stick
+              click plays.
+            </>
+          )}
         </p>
       )}
       {questMantis && (
