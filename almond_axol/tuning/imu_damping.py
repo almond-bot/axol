@@ -328,7 +328,11 @@ class TipDamper:
             return tau
         if self._ramp_from is None:
             self._ramp_from = now
-        ramp = min(1.0, max(0.0, (now - self._ramp_from) / self.ramp_s))
+        ramp = (
+            min(1.0, max(0.0, (now - self._ramp_from) / self.ramp_s))
+            if self.ramp_s > 0
+            else 1.0
+        )
         force = -self.gain * self._notch(self._lead(now, self.flex))
         for i in self.columns:
             tau[i] = float(
@@ -339,6 +343,48 @@ class TipDamper:
                 )
             )
         return tau
+
+
+@dataclass
+class EncoderTipDamper(TipDamper):
+    """:class:`TipDamper` without the camera: the tool's vertical velocity
+    from FK of the measured joints (:meth:`feed_height`) against the commanded
+    tool height (:meth:`feed_command`), both through the same band chain, so
+    the damper sees the tool's deviation from its path as the encoders see it
+    — no IMU latency, and blind to flex past the joints. For arms without a
+    wrist camera; the force law, clamp, ramp, lead, notch and trip are
+    :class:`TipDamper`'s.
+    """
+
+    command: EncoderVelocity = field(
+        default_factory=lambda: EncoderVelocity(delay_s=0.0)
+    )
+
+    def __post_init__(self) -> None:
+        # Neither height waits for an IMU: no alignment delay on either chain.
+        self.encoder.delay_s = 0.0
+        self.command.delay_s = 0.0
+
+    @property
+    def flex(self) -> float:
+        """Band tool velocity measured by the encoders less commanded (m/s)."""
+        return self.encoder.value - self.command.value
+
+    def start(self, now: float) -> None:
+        super().start(now)
+        self.command.reset()
+
+    def feed(self, rows: np.ndarray) -> None:
+        """No IMU: nothing to take."""
+
+    def feed_height(self, t: float, z: float) -> None:
+        """The tool height FK of the measured joints gives (m)."""
+        self.encoder.update(t, z)
+        self._last_sample = t
+
+    def feed_command(self, t: float, z: float) -> None:
+        """The tool height this tick commands (m)."""
+        self.command.update(t, z)
 
 
 # ---------------------------------------------------------------------------

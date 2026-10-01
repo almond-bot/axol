@@ -312,5 +312,25 @@ class GyroFlexTest(unittest.TestCase):
         self.assertLess(float(np.abs(mount - true).max()), 0.02)
 
 
+class EncoderTipTest(unittest.TestCase):
+    def test_tracking_the_command_is_not_flex_and_a_wobble_is(self) -> None:
+        from almond_axol.tuning.imu_damping import EncoderTipDamper
+
+        d = EncoderTipDamper(gain=100.0, columns=(0,), ramp_s=0.0)
+        d.start(0.0)
+        quiet, shaky = [], []
+        for i in range(int(8 * 240)):
+            t = i / 240.0
+            z_cmd = 0.05 * math.sin(2 * math.pi * 0.2 * t)
+            wobble = 0.0005 * math.sin(2 * math.pi * 2.0 * t) if t > 4 else 0.0
+            d.feed_command(t, z_cmd)
+            d.feed_height(t, z_cmd + wobble)
+            tau = d.torque(t, np.array([-0.4, 0, 0, 0, 0, 0, 0]))
+            (quiet if 2 < t < 4 else shaky if t > 5 else []).append(d.flex)
+            self.assertLessEqual(abs(tau[0]), d.max_torque + 1e-12)
+        self.assertLess(np.std(quiet), 1e-6)
+        self.assertGreater(np.std(shaky), 0.003)
+
+
 if __name__ == "__main__":
     unittest.main()

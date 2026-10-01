@@ -409,6 +409,30 @@ class SessionTest(unittest.TestCase):
             self.assertLessEqual(peak[3], 0.3 + 1e-9)
             self.assertEqual(float(np.delete(peak, 3).max()), 0.0)
 
+    def test_encoder_damping_runs_without_the_imu(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            text = self._run(
+                [
+                    "--imu-damp",
+                    "100",
+                    "--imu-damp-source",
+                    "encoder",
+                    "--imu-damp-joint",
+                    "right.shoulder_1",
+                    "--imu-damp-max",
+                    "0.3",
+                    "--label",
+                    "enc",
+                ],
+                Path(d),
+            )
+            self.assertIn("encoder damping (right): 100 N·s/m", text)
+            applied = np.stack([a for a in _FakeAxol.applied if a is not None])
+            peak = np.abs(applied).max(axis=0)
+            self.assertGreater(peak[0], 0.0)
+            self.assertLessEqual(peak[0], 0.3 + 1e-9)
+            self.assertEqual(float(np.delete(peak, 0).max()), 0.0)
+
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model
 

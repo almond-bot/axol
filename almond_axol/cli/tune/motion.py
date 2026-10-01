@@ -69,7 +69,7 @@ from ...robot.config import (
 )
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
-from ...tuning.imu_damping import GyroFlexDamper, TorqueProbe
+from ...tuning.imu_damping import EncoderTipDamper, GyroFlexDamper, TorqueProbe
 from ...tuning.learning import LEARN_BAND, CommandLearner
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 from ...tuning.runs import load_run
@@ -744,6 +744,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Quality factor of --imu-damp-notch (default 1.0)",
     )
     p.add_argument(
+        "--imu-damp-source",
+        choices=("imu", "encoder"),
+        default="imu",
+        help="What --imu-damp measures the tool's velocity with: the wrist IMU "
+        "(default) or FK of the joint encoders (encoder: no camera needed and "
+        "no IMU latency, but blind to flex past the joints; always against "
+        "the commanded height)",
+    )
+    p.add_argument(
         "--imu-damp-ref",
         choices=("encoder", "command"),
         default="encoder",
@@ -976,11 +985,17 @@ _JAC_EVERY = 4
 
 def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
     """One :class:`TipDamper` per driven side, or none (``--imu-damp 0``)."""
-    from ...tuning.imu_damping import EncoderVelocity, TipDamper, VerticalVelocity
+    from ...tuning.imu_damping import (
+        EncoderTipDamper,
+        EncoderVelocity,
+        TipDamper,
+        VerticalVelocity,
+    )
 
     if args.imu_damp <= 0:
         return {}
-    if args.no_imu:
+    by_encoder = args.imu_damp_source == "encoder"
+    if args.no_imu and not by_encoder:
         raise SystemExit("tune.motion: --imu-damp needs the wrist IMU (drop --no-imu)")
     names = [j.value for j in ARM_JOINTS]
     sides = ["left", "right"] if args.arms == "both" else [args.arms]
@@ -1005,7 +1020,18 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 if scale:
                     weights[names.index(joint)] = float(scale)
         if cols:
-            out[side] = TipDamper(
+            kind = EncoderTipDamper if by_encoder else TipDamper
+            extra = (
+                {
+                    "command": EncoderVelocity(
+                        hp_hz=args.imu_damp_hp, lp_hz=args.imu_damp_lp
+                    )
+                }
+                if by_encoder
+                else {}
+            )
+            out[side] = kind(
+                **extra,
                 gain=args.imu_damp,
                 columns=tuple(cols),
                 max_torque=args.imu_damp_max,
@@ -1019,14 +1045,19 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 notch_q=args.imu_damp_notch_q,
             )
             print(
-                f"  IMU damping ({side}): {args.imu_damp:g} N·s/m at the tool through "
+                f"  {'encoder' if by_encoder else 'IMU'} damping ({side}): "
+                + f"{args.imu_damp:g} N·s/m at the tool through "
                 + ", ".join(
                     names[c] + (f" ×{weights[c]:g}" if c in weights else "")
                     for c in cols
                 )
                 + f" (clamp {args.imu_damp_max:g} Nm, band {args.imu_damp_hp:g}-"
                 + f"{args.imu_damp_lp:g} Hz, "
-                + f"against the {args.imu_damp_ref} height"
+                + (
+                    "encoder height against the command"
+                    if by_encoder
+                    else f"against the {args.imu_damp_ref} height"
+                )
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
     return out
@@ -1802,7 +1833,11 @@ async def _run(args: argparse.Namespace) -> None:
         right = np.zeros(8, dtype=np.float32)
         t0 = time.perf_counter()
         deadline = t0
-        active = {side: d for side, d in dampers.items() if damp and side in imu.sides}
+        active = {
+            side: d
+            for side, d in dampers.items()
+            if damp and (side in imu.sides or isinstance(d, EncoderTipDamper))
+        }
         for side, d in active.items():
             imu.poll(side)  # drop what queued between passes
             d.start(t0)
@@ -1832,11 +1867,13 @@ async def _run(args: argparse.Namespace) -> None:
                         )
                     else:
                         height = _height(solver, q_meas, side)
-                    if args.imu_damp_ref == "command":
+                    now = time.perf_counter()
+                    if isinstance(d, EncoderTipDamper):
+                        d.feed_command(now, _height(solver, np.asarray(q), side))
+                    elif args.imu_damp_ref == "command":
                         # The tool height this waypoint commands: the
                         # damper then sees the whole deviation from the path.
                         height = _height(solver, np.asarray(q), side)
-                    now = time.perf_counter()
                     d.feed_height(now, height)
                     d.feed(imu.poll(side))
                     tau = d.torque(now, jac[side])
@@ -1929,12 +1966,14 @@ async def _run(args: argparse.Namespace) -> None:
     imu = WristImu(
         ["left", "right"] if args.arms == "both" else [args.arms],
         enabled=not args.no_imu,
-        live=args.imu_damp > 0 or args.gyro_damp > 0 or bool(args.torque_probe),
+        live=(args.imu_damp > 0 and args.imu_damp_source == "imu")
+        or args.gyro_damp > 0
+        or bool(args.torque_probe),
     )
     imu.start()
     needs_imu = (
         args.learn_imu
-        or args.imu_damp > 0
+        or (args.imu_damp > 0 and args.imu_damp_source == "imu")
         or args.gyro_damp > 0
         or bool(args.torque_probe)
     )
