@@ -515,7 +515,8 @@ pub struct DobParams {
 }
 
 /// Disturbance observer: the torque the joint's model does not account for,
-/// `Q·(τ − g) − J·Q·s²q` — measured motor torque less model gravity, less
+/// `Q·(τ − g) − J·Q·s²q` (Q third order: two poles on both channels, a third
+/// on the estimate) — measured motor torque less model gravity, less
 /// inertia × the encoder's acceleration, both through the same Q filter (so
 /// the estimate is the disturbance seen through Q, not a noisy double
 /// derivative) — high-passed. Added back to the command (`+ gain × d̂`) it
@@ -530,6 +531,7 @@ pub struct Dob {
     ud: f64,
     hp_in: f64,
     hp_out: f64,
+    lp: f64,
     primed: bool,
     /// The last estimate (Nm, high-passed).
     pub d: f64,
@@ -568,7 +570,13 @@ impl Dob {
         let a = 1.0 / (1.0 + 2.0 * std::f64::consts::PI * p.hp_hz * dt);
         self.hp_out = a * (self.hp_out + raw - self.hp_in);
         self.hp_in = raw;
-        self.d = self.hp_out;
+        // A third pole at the same frequency: Q·s²q tends to the constant
+        // ω²·q at high frequency, so a second-order Q passes the encoder's
+        // quantization steps straight into the torque (on jelly's shoulder_1
+        // half the feedback was > 15 Hz). Q needs one more order than the
+        // joint's two for the acceleration estimate to roll off.
+        self.lp += (self.hp_out - self.lp) * (1.0 - (-w * dt).exp());
+        self.d = self.lp;
         self.d
     }
 }
@@ -613,7 +621,9 @@ mod tests {
         };
         let (open, _) = run(0.0, 0.3);
         let (closed, ff) = run(0.8, 0.3);
-        assert!(closed < 0.5 * open, "{closed} vs {open}");
+        // ~47% less with the third pole (its lag at 2 Hz is the price of
+        // keeping encoder quantization out of the torque).
+        assert!(closed < 0.65 * open, "{closed} vs {open}");
         assert!(ff > 0.1, "{ff}");
         let (_, idle) = run(0.8, 0.0);
         assert!(idle < 1e-6, "{idle}");
