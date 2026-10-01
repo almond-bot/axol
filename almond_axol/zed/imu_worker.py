@@ -12,8 +12,8 @@ the camera is open, ``dumped`` after each ``dump`` request (the samples so far
 written to ``PATH``), ``error <text>`` for anything that goes wrong; ``stop``
 (or stdin closing) ends it after a final write.
 
-With ``--udp PORT`` every sample is also sent as it arrives, one datagram
-to ``127.0.0.1:PORT`` (:data:`SAMPLE_FORMAT`: t, acc xyz, gyro xyz), for a
+With ``--udp PORT`` (repeatable) every sample is also sent as it arrives,
+one datagram to each ``127.0.0.1:PORT`` (:data:`SAMPLE_FORMAT`: t, acc xyz, gyro xyz), for a
 controller that acts on the wrist's motion live (``tune.motion
 --imu-damp``); the file dumps are unchanged.
 
@@ -93,7 +93,7 @@ def record(
     dump: Any,
     dumped: Any,
     errors: Any,
-    udp_port: int | None = None,
+    udp_port: int | list[int] | None = None,
     stereo: bool = False,
 ) -> None:
     """Open camera ``serial`` and record its IMU until ``stop`` is set.
@@ -167,20 +167,25 @@ def record(
 class _LiveSender:
     """Best-effort datagrams of each sample to a local port (or nothing)."""
 
-    def __init__(self, port: int | None) -> None:
+    def __init__(self, port: int | list[int] | None) -> None:
+        ports = port if isinstance(port, list) else [port] if port else []
         self._sock = None
-        self._addr = ("127.0.0.1", int(port)) if port else None
-        if self._addr is not None:
+        # Every listener gets every sample: the tuning loop and, for the
+        # in-core tip damper, the realtime core's own socket.
+        self._addrs = [("127.0.0.1", int(p)) for p in ports if p]
+        if self._addrs:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._sock.setblocking(False)
 
     def send(self, t: float, acc: Any, gyro: Any) -> None:
         if self._sock is None:
             return
-        try:
-            self._sock.sendto(struct.pack(SAMPLE_FORMAT, t, *acc, *gyro), self._addr)
-        except OSError:
-            pass  # a full buffer drops a sample; the file keeps it
+        packet = struct.pack(SAMPLE_FORMAT, t, *acc, *gyro)
+        for addr in self._addrs:
+            try:
+                self._sock.sendto(packet, addr)
+            except OSError:
+                pass  # a full buffer or no listener drops a sample; the file keeps it
 
 
 class _Line:
@@ -205,9 +210,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--udp",
         type=int,
+        action="append",
         default=None,
         metavar="PORT",
-        help="Also send each sample to 127.0.0.1:PORT as it arrives",
+        help="Also send each sample to 127.0.0.1:PORT as it arrives (repeatable)",
     )
     p.add_argument(
         "--stereo",
@@ -234,7 +240,7 @@ def main(argv: list[str] | None = None) -> None:
         stop.set()
 
     threading.Thread(target=_commands, daemon=True).start()
-    extra: dict[str, Any] = {"udp_port": args.udp} if args.udp else {}
+    extra: dict[str, Any] = {"udp_port": list(args.udp)} if args.udp else {}
     if args.stereo:
         extra["stereo"] = True
     worker(

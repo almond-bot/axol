@@ -144,12 +144,15 @@ class WristImu:
         serial_of: Any = None,
         worker: str | None = None,
         live: bool = False,
+        forward: dict[str, int] | None = None,
     ) -> None:
         """``serial_of`` replaces :func:`imu_serial`; ``worker`` (a
         ``module:function`` the subprocess runs in place of
         :func:`almond_axol.zed.imu_worker.record`) replaces the camera (tests).
         ``live`` also streams every sample to this process as it arrives —
-        read with :meth:`poll`."""
+        read with :meth:`poll`. ``forward`` (``{side: port}``) also streams
+        that side's samples to a local UDP port — the realtime core's tip
+        damper listens on one."""
         self._sides = [s for s in sides if s in ("left", "right")]
         self._enabled = enabled
         self._serial_of = serial_of or imu_serial
@@ -157,6 +160,7 @@ class WristImu:
         self._recorders: dict[str, _Recorder] = {}
         self._tmp: tempfile.TemporaryDirectory[str] | None = None
         self._live = live
+        self._forward = dict(forward or {})
         self._socks: dict[str, socket.socket] = {}
 
     def __enter__(self) -> "WristImu":
@@ -204,6 +208,8 @@ class WristImu:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
                 self._socks[side] = sock
                 cmd += ["--udp", str(sock.getsockname()[1])]
+            if side in self._forward:
+                cmd += ["--udp", str(self._forward[side])]
             try:
                 proc = subprocess.Popen(
                     cmd,

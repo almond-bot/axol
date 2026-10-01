@@ -744,6 +744,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Quality factor of --imu-damp-notch (default 1.0)",
     )
     p.add_argument(
+        "--imu-damp-core",
+        action="store_true",
+        help="Run --imu-damp in the realtime core instead of this loop: the "
+        "wrist IMU's samples go straight to the bus thread and the torque "
+        "joins the joints' feedforward on the tick it is computed (Python's "
+        "loop added ~15-25 ms, which capped the gain). Takes the same "
+        "--imu-damp* settings; the IMU source only",
+    )
+    p.add_argument(
         "--imu-damp-source",
         choices=("imu", "encoder"),
         default="imu",
@@ -1004,7 +1013,7 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
         VerticalVelocity,
     )
 
-    if args.imu_damp <= 0:
+    if args.imu_damp <= 0 or args.imu_damp_core:
         return {}
     by_encoder = args.imu_damp_source == "encoder"
     if args.imu_damp_ref == "model":
@@ -1095,6 +1104,101 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 + (", alternate passes)" if args.imu_damp_alternate else ")")
             )
     return out
+
+
+#: UDP port the realtime core's tip damper listens on, per side.
+_TIP_PORTS = {"left": 47810, "right": 47811}
+
+
+def _core_tip_damping(
+    args: argparse.Namespace, config: Any, solver: Any
+) -> dict[str, int]:
+    """``--imu-damp-core``: put each driven arm's tip damper in the realtime
+    core (``ArmConfig.tip_damp``) and return the UDP port per side the wrist
+    IMU must also stream to."""
+    from ...robot.config import TipDampConfig
+    from ...rt.tipdamp import check_chain, poe_chain
+    from ...tuning.tracking_model import load_models
+
+    if not args.imu_damp_core or args.imu_damp <= 0:
+        return {}
+    if args.imu_damp_source != "imu":
+        raise SystemExit("tune.motion: --imu-damp-core runs the IMU damper only")
+    if args.no_imu:
+        raise SystemExit("tune.motion: --imu-damp-core needs the wrist IMU")
+    names = [j.value for j in ARM_JOINTS]
+    sides = ["left", "right"] if args.arms == "both" else [args.arms]
+    models = load_models() if args.imu_damp_ref == "model" else {}
+    ports = {}
+    for side in sides:
+        joints: dict[str, float] = {}
+        for spec in args.imu_damp_joint or [
+            f"{side}.shoulder_1",
+            f"{side}.shoulder_2",
+            f"{side}.elbow",
+        ]:
+            name, _, scale = spec.partition("=")
+            s_side, _, joint = name.partition(".")
+            if joint not in names or s_side not in ("left", "right"):
+                raise SystemExit(
+                    f"--imu-damp-joint wants SIDE.JOINT[=SCALE], got {spec!r}"
+                )
+            if s_side == side:
+                joints[joint] = float(scale) if scale else 1.0
+        if not joints:
+            continue
+        joint_lp: dict[str, float] = {}
+        for spec in args.imu_damp_joint_lp:
+            name, _, hz = spec.partition("=")
+            s_side, _, joint = name.partition(".")
+            if s_side == side and joint in names and hz:
+                joint_lp[joint] = float(hz)
+        chain = poe_chain(solver, side)
+        err = check_chain(solver, side, chain)
+        if err > 1e-4:
+            raise SystemExit(
+                f"tune.motion: the {side} arm's kinematics are not a serial "
+                f"revolute chain the core can run ({err * 1e3:.2f} mm off)"
+            )
+        cfg = TipDampConfig(
+            gain=args.imu_damp,
+            joints=joints,
+            joint_lp=joint_lp,
+            hp_hz=args.imu_damp_hp,
+            lp_hz=args.imu_damp_lp,
+            lead_hz=args.imu_damp_lead,
+            notch_hz=args.imu_damp_notch,
+            notch_q=args.imu_damp_notch_q,
+            max_torque=args.imu_damp_max,
+            reference=args.imu_damp_ref,
+            imu_port=_TIP_PORTS[side],
+            tracking_models={
+                key.split(".", 1)[1]: m
+                for key, m in models.items()
+                if key.startswith(f"{side}.")
+            },
+            chain=chain,
+        )
+        getattr(config, side).tip_damp = cfg
+        ports[side] = cfg.imu_port
+        print(
+            f"  in-core tip damping ({side}): {cfg.gain:g} N·s/m through "
+            + ", ".join(
+                f"{j}"
+                + (f" ×{w:g}" if w != 1.0 else "")
+                + (f" (lp {joint_lp[j]:g} Hz)" if j in joint_lp else "")
+                for j, w in joints.items()
+            )
+            + f", band {cfg.hp_hz:g}-{cfg.lp_hz:g} Hz, against the {cfg.reference} "
+            + (
+                f"(models: {', '.join(sorted(cfg.tracking_models)) or 'none'})"
+                if cfg.reference == "model"
+                else "height"
+            )
+            + f", udp {cfg.imu_port}"
+            + (", alternate passes" if args.imu_damp_alternate else "")
+        )
+    return ports
 
 
 def _gyro_dampers(args: argparse.Namespace) -> dict[str, Any]:
@@ -1713,6 +1817,7 @@ async def _run(args: argparse.Namespace) -> None:
     from ...teleop.trajectory import plan_collision_aware_trajectory
 
     solver = KinematicsSolver()
+    core_tip_ports = _core_tip_damping(args, config, solver)
     rest_cfg = VRTeleopConfig()
     q_rest = np.zeros(solver.num_joints, dtype=np.float32)
     q_rest[solver.left_indices] = rest_cfg.rest_pose_left
@@ -2036,13 +2141,17 @@ async def _run(args: argparse.Namespace) -> None:
     imu = WristImu(
         ["left", "right"] if args.arms == "both" else [args.arms],
         enabled=not args.no_imu,
-        live=(args.imu_damp > 0 and args.imu_damp_source == "imu")
+        live=(
+            args.imu_damp > 0 and args.imu_damp_source == "imu" and not core_tip_ports
+        )
         or args.gyro_damp > 0
         or bool(args.torque_probe),
+        forward=core_tip_ports,
     )
     imu.start()
     needs_imu = (
-        args.learn_imu
+        bool(core_tip_ports)
+        or args.learn_imu
         or (args.imu_damp > 0 and args.imu_damp_source == "imu")
         or args.gyro_damp > 0
         or bool(args.torque_probe)
@@ -2116,12 +2225,17 @@ async def _run(args: argparse.Namespace) -> None:
                         learner.offset.copy() if learner is not None else fixed_offset
                     )
                     pass_offsets.append(offset)
-                    damp_this = bool(dampers) and (
+                    damp_this = bool(dampers or core_tip_ports) and (
                         not args.imu_damp_alternate or k % 2 == 1
                     )
                     pass_damped.append(damp_this)
-                    if dampers:
-                        print(f"  IMU damping {'ON' if damp_this else 'off'} this pass")
+                    if dampers or core_tip_ports:
+                        print(
+                            f"  {'in-core tip' if core_tip_ports else 'IMU'} damping "
+                            f"{'ON' if damp_this else 'off'} this pass"
+                        )
+                    for side in core_tip_ports:
+                        axol.set_tip_damping(side, damp_this)
                     damp_start = len(log_damp)
                     playback = traj_playback
                     if offset is not None and np.any(offset):
@@ -2138,6 +2252,8 @@ async def _run(args: argparse.Namespace) -> None:
                             damp=damp_this,
                         )
                     finally:
+                        for side in core_tip_ports:
+                            axol.set_tip_damping(side, False)
                         passes_run[-1] = (pass_start, len(log_t))
                         pass_damp_rows.append((damp_start, len(log_damp)))
                     if contact is not None:

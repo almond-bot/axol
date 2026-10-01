@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A tip-damping session on the robot, unattended (~50 min), then the report.
+# A tip-damping session on the robot, unattended (~60 min), then the report.
 #
 #   bash scripts/damp_session.sh            # everything
 #   bash scripts/damp_session.sh right      # right arm only (slow_osc + other motions)
@@ -32,6 +32,15 @@ saved_id() { # the last run id the log saved
 }
 
 preflight() {
+    # The realtime core must be built from this checkout (the config protocol
+    # moves with it) and carry its scheduling capabilities.
+    local BIN=rust/axol-rt/target/release/axol-rt
+    if [ ! -x "$BIN" ] || [ -n "$(find rust/axol-rt/src -newer "$BIN" -name '*.rs' | head -1)" ]; then
+        echo "axol-rt is out of date: (cd rust/axol-rt && cargo build --release) && sudo setcap cap_ipc_lock,cap_sys_nice=ep $BIN"
+        exit 1
+    fi
+    getcap "$BIN" | grep -q cap_sys_nice || {
+        echo "axol-rt lost its capabilities: sudo setcap cap_ipc_lock,cap_sys_nice=ep $BIN"; exit 1; }
     systemctl is-active --quiet zed_x_daemon || {
         echo "zed_x_daemon is not active: sudo systemctl restart zed_x_daemon"; exit 1; }
     uv run axol motor.health 2>&1 | grep -vE "^INFO|^WARNING" | tee -a "$LOG" | grep -q "did not respond\|timed out" && {
@@ -47,6 +56,12 @@ right() {
     tm "R cmd 120"          "${S[@]}" --imu-damp 120 --imu-damp-ref command "${J[@]}" "${BAND[@]}"
     tm "R model 120"        "${S[@]}" --imu-damp 120 --imu-damp-ref model   "${J[@]}" "${BAND[@]}"
     tm "R model 160"        "${S[@]}" --imu-damp 160 --imu-damp-ref model   "${J[@]}" "${BAND[@]}"
+    # 1b. The same damper in the realtime core: no Python loop in the IMU's
+    #     path, so the phase wrap should move up and allow more gain.
+    tm "R core cmd 120"     "${S[@]}" --imu-damp-core --imu-damp 120 --imu-damp-ref command "${J[@]}" "${BAND[@]}"
+    tm "R core model 120"   "${S[@]}" --imu-damp-core --imu-damp 120 --imu-damp-ref model   "${J[@]}" "${BAND[@]}"
+    tm "R core model 180"   "${S[@]}" --imu-damp-core --imu-damp 180 --imu-damp-ref model   "${J[@]}" "${BAND[@]}"
+    tm "R core model 250"   "${S[@]}" --imu-damp-core --imu-damp 250 --imu-damp-ref model   "${J[@]}" "${BAND[@]}"
     # 2. The ~11 Hz buzz: low-pass the elbow's channel only.
     tm "R model 120 ellp6"  "${S[@]}" --imu-damp 120 --imu-damp-ref model   "${J[@]}" --imu-damp-joint-lp right.elbow=6 "${BAND[@]}"
     # 3. Encoder-only damping (no camera), lag removed by the model reference.

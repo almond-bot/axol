@@ -85,6 +85,8 @@ class _FakeAxol:
     clock = _Clock()
 
     def __init__(self, config=None, record=None, loop_hz=None, **channels) -> None:
+        self.config = config
+        self.tip_calls: list[tuple[str, bool]] = []
         self.left = (
             None if "left_channel" in channels else _Arm(np.zeros(7), self.clock)
         )
@@ -109,6 +111,9 @@ class _FakeAxol:
 
     def set_recording_engaged(self, on: bool) -> None:
         pass
+
+    def set_tip_damping(self, side: str, on: bool) -> None:
+        self.tip_calls.append((side, on))
 
 
 def _plan(solver, q_from, q_to, speed, rate, min_duration):
@@ -137,9 +142,12 @@ def _motion(path: Path) -> ReferenceMotion:
 class _FakeImu:
     """A live wrist IMU reading a 2 Hz vertical shake on the fake clock."""
 
-    def __init__(self, sides, enabled=True, live=False, **_kw) -> None:
+    forwards: list = []
+
+    def __init__(self, sides, enabled=True, live=False, forward=None, **_kw) -> None:
         self.sides = list(sides) if enabled else []
         self.live = live
+        _FakeImu.forwards.append(dict(forward or {}))
 
     def start(self) -> None:
         pass
@@ -490,6 +498,59 @@ class SessionTest(unittest.TestCase):
             self.assertIn("encoder height against the expected path", text)
             applied = [a for a in _FakeAxol.applied if a is not None]
             self.assertTrue(applied)
+
+    def test_core_damping_configures_the_core_and_switches_it_per_pass(self) -> None:
+        _FakeAxol.instances = []
+        _FakeImu.forwards = []
+        with tempfile.TemporaryDirectory() as d:
+            chain = {
+                "w": np.tile([0.0, -1.0, 0.0], (7, 1)),
+                "r": np.zeros((7, 3)),
+                "m": np.eye(4),
+            }
+            with (
+                mock.patch("almond_axol.rt.tipdamp.check_chain", lambda *a, **k: 0.0),
+                mock.patch("almond_axol.rt.tipdamp.poe_chain", lambda *a, **k: chain),
+            ):
+                text = self._run(
+                    [
+                        "--imu-damp",
+                        "120",
+                        "--imu-damp-core",
+                        "--imu-damp-ref",
+                        "command",
+                        "--imu-damp-joint",
+                        "right.shoulder_1",
+                        "--imu-damp-joint",
+                        "right.elbow=0.6",
+                        "--imu-damp-joint-lp",
+                        "right.elbow=6",
+                        "--imu-damp-alternate",
+                        "--repeat",
+                        "2",
+                        "--label",
+                        "core",
+                    ],
+                    Path(d),
+                    imu=True,
+                )
+        self.assertIn("in-core tip damping (right): 120 N·s/m", text)
+        self.assertIn("in-core tip damping ON this pass", text)
+        robot = _FakeAxol.instances[-1]
+        tip = robot.config.right.tip_damp
+        self.assertEqual(tip.joints, {"shoulder_1": 1.0, "elbow": 0.6})
+        self.assertEqual(tip.joint_lp, {"elbow": 6.0})
+        self.assertEqual(tip.reference, "command")
+        self.assertIsNotNone(tip.chain)
+        self.assertIsNone(robot.config.left.tip_damp)
+        # Pass 1 off, pass 2 on, and off after each pass.
+        self.assertEqual(
+            robot.tip_calls,
+            [("right", False), ("right", False), ("right", True), ("right", False)],
+        )
+        self.assertIn({"right": 47811}, _FakeImu.forwards)
+        # The Python loop applied nothing itself.
+        self.assertTrue(all(a is None for a in _FakeAxol.applied))
 
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model

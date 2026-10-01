@@ -658,6 +658,64 @@ _X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
 )
 
 
+#: ``TipDampConfig.reference`` → the realtime core's reference code.
+TIP_REFERENCES = {"encoder": 0, "command": 1, "model": 2}
+
+
+@dataclass
+class TipDampConfig:
+    """One arm's in-core tip damper (see ``tune.motion --imu-damp``).
+
+    Attributes:
+        gain: N·s/m of vertical damping at the tool.
+        joints: ``{joint name: gain scale}`` — the joints that apply it.
+        joint_lp: ``{joint name: Hz}`` — a first-order low-pass on that
+            joint's channel.
+        hp_hz / lp_hz: The damped band's edges (0.3 / 40 on jelly).
+        lead_hz: Centre of a lead-lag stage, 0 = none.
+        notch_hz / notch_q: A notch on the force, 0 = none.
+        max_torque: Per-joint clamp (Nm).
+        reference: ``encoder``, ``command`` or ``model`` — what the IMU's
+            velocity is measured against (``model``: the commanded joints
+            through ``tracking_models``).
+        delay_s: The reference waits this long to line up with the IMU.
+        imu_port: UDP port the core receives the wrist IMU's samples on.
+        tracking_models: ``{joint name: TrackingModel}`` for ``model``.
+        chain: The arm's product-of-exponentials FK
+            (``almond_axol.rt.tipdamp.poe_chain``); built from the solver at
+            enable when ``None``.
+    """
+
+    gain: float
+    joints: dict[str, float]
+    joint_lp: dict[str, float] = field(default_factory=dict)
+    hp_hz: float = 0.3
+    lp_hz: float = 40.0
+    lead_hz: float = 0.0
+    notch_hz: float = 0.0
+    notch_q: float = 1.0
+    max_torque: float = 1.5
+    reference: str = "command"
+    delay_s: float = 0.008
+    ramp_s: float = 1.0
+    stale_s: float = 0.05
+    trip_speed: float = 0.08
+    trip_s: float = 0.15
+    imu_port: int = 0
+    tracking_models: dict[str, Any] = field(default_factory=dict)
+    chain: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        names = {j.value for j in ARM_JOINTS}
+        for name in (*self.joints, *self.joint_lp, *self.tracking_models):
+            if name not in names:
+                raise ValueError(f"tip damper: unknown arm joint {name!r}")
+        if self.reference not in TIP_REFERENCES:
+            raise ValueError(
+                f"tip damper: reference must be one of {sorted(TIP_REFERENCES)}"
+            )
+
+
 @dataclass
 class ArmConfig:
     """Per-joint configuration for a single arm.
@@ -838,6 +896,9 @@ class ArmConfig:
     gripper: PositionForceConfig = field(
         default_factory=lambda: PositionForceConfig(torque_limit=0.5, max_speed=10.0)
     )
+    #: The realtime core's wrist-IMU tip damper for this arm, or ``None``.
+    #: Configured off; ``Axol.set_tip_damping`` switches it on and off.
+    tip_damp: TipDampConfig | None = None
 
     def mirror_to_right(self) -> "ArmConfig":
         """Return a copy with link CoMs mirrored across the X axis.
