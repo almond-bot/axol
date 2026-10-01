@@ -64,13 +64,14 @@ The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separate
 axol zed.install
 ```
 
-Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once:
 
 ```bash
 axol gst.install
 axol gst.build-zed   # build the patched ZED source plugins (needs the ZED SDK)
-axol jetson.setup    # Jetson only; no-op elsewhere
 ```
+
+`axol provision` runs both of these and, on a Jetson (Orin NX, AGX Orin, Thor), also pins the NVENC/VIC/GPU and CPU clocks and steers the CAN interrupt for the real-time loops. It is the one command a host needs; the installer's systemd unit re-applies the per-boot part (`axol provision --boot`) at every boot.
 
 Before using any motor or robot commands, initialize the CAN hardware:
 
@@ -117,6 +118,8 @@ Pull requests must pass the `Python` and `Web` GitHub Actions checks before merg
 ### Get Started
 
 - [Overview](https://docs.almond.bot)
+- [Hardware Overview](https://docs.almond.bot/hardware) — Axol, the Owl Mount / Ox Cart / Jelly Mobile mounts, the Camera Kit, and the Compute Kit
+- [Hardware Setup](https://docs.almond.bot/hardware-setup) — step-by-step guides for each mount (standalone, Owl Mount, Ox Cart, Jelly) and the cameras
 - [Installation](https://docs.almond.bot/installation)
 
 ### Operations
@@ -128,6 +131,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
 - [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+- [Run Your Own Policy](https://docs.almond.bot/operations/custom-policy) — drive the arms from your own (non-LeRobot) model via the `almond_axol.policy` SDK
 - [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
 ### Mantis
@@ -181,6 +185,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
+- [`policy.check`](https://docs.almond.bot/cli/policy-check) — exercise a custom policy endpoint without a robot
 - [`provision`](https://docs.almond.bot/cli/provision)
 - [`rt.install`](https://docs.almond.bot/cli/rt-install)
 - [`zed.driver`](https://docs.almond.bot/cli/zed-driver)
@@ -211,3 +216,5 @@ Each operation can be driven from the web control panel or the CLI:
 - [`almond_axol.zed`](https://docs.almond.bot/api/zed)
 - [`almond_axol.motor`](https://docs.almond.bot/api/motor)
 - [`almond_axol.lerobot`](https://docs.almond.bot/api/lerobot)
+- [`almond_axol.policy`](https://docs.almond.bot/api/policy) — serve your own model to `run-policy` / `collect-dagger`: joints + camera frames in, action chunks out
+- [Custom policy interface](https://docs.almond.bot/api/policy-plan) — the wire contract underneath, for endpoints outside Python

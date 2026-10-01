@@ -7,12 +7,13 @@ LeRobot's async inference (``lerobot.async_inference``). By default a
 ``--server_host`` to use a remote inference server started with
 ``axol inference-server`` on a more powerful machine instead (joint
 positions + camera frames are streamed to it over gRPC and it returns
-action chunks). Either way the parent drives an ``AxolRobotClient`` (a
-thin ``RobotClient`` subclass) that streams observations to the server
-and consumes the returned action chunks. Cameras and joints are sampled
-via ``ZedCamera.read_at_or_after(now)`` so every inference observation is
-timestamp-aligned the same way the training data is (see
-``AxolRobot.get_observation``).
+action chunks). ``--policy_type custom`` connects to a compatible external
+endpoint over the continuation-capable WebSocket contract (wire version 2).
+It sends timestamped observations and accepted-plan references, then adopts
+the unexpired suffix of each reply. Model selection, instruction text and
+temporal ensembling belong to the external endpoint. Both modes use an
+``AxolRobotClient`` (a ``RobotClient`` subclass) with timestamp-aligned camera
+and joint observations (see ``AxolRobot.get_observation``).
 
 Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
 + discard), or ``q`` (quit + discard) on stdin. ``--episode_time_s`` is a
@@ -34,13 +35,16 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
+    arms_reporting,
 )
+from ..policy.plan_scheduler import PlanRuntimeConfig
 from ..recording import (
     EpisodeDurabilityError,
     make_episode_durable,
@@ -50,15 +54,23 @@ from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
+from ..utils.logquiet import quiet_noisy_loggers
 from .collect_data import check_resume_consistency
-from .config import AggregateFn, LogLevel, PolicyType, parse
+from .config import AggregateFn, LogLevel, RunPolicyType, parse
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
+
+# Custom policy servers (``--policy_type custom``): the ``hello`` reply covers
+# endpoint preparation — typically a model load — so it gets far
+# longer than a steady-state inference round trip.
+CUSTOM_POLICY_SETUP_TIMEOUT_S = 300.0
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -120,14 +132,31 @@ class RunPolicyConfig:
     ``--server_host`` — ``policy_path`` / ``policy_type`` / ``device``
     then apply to that server (it downloads the policy itself, so the
     path must be reachable from it, e.g. a HF Hub repo id).
+
+    ``policy_type custom`` connects to a compatible external endpoint using
+    the continuation-capable policy contract (wire version 2). Point
+    ``--server_host`` / ``--server_port`` at it (default ``127.0.0.1:8765``).
+    Nothing is spawned or downloaded; model selection and instruction text
+    belong to that endpoint. ``policy_path`` and ``device`` are unused, and
+    ``task`` labels the local recording.
     """
 
-    policy_path: str
-    policy_type: PolicyType
+    policy_type: RunPolicyType
     task: str
+    # LeRobot checkpoint (local path or HF Hub repo id). Required for LeRobot
+    # policy types; unused for custom endpoints, which own model selection.
+    policy_path: str = ""
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
-    episode_time_s: int = 120
-    fps: int = 60
+    episode_time_s: int = 120  # 0 means operator-ended custom-policy episodes
+    # An explicit q parks through rest and zero before releasing torque. Other
+    # exits preserve support when enabled. Existing clients keep their normal
+    # shutdown behavior unless explicitly opted in.
+    soft_park_on_quit: bool = False
+    # Control/recording rate — must equal the fps the policy was trained at
+    # (collect-data's default, 30). A 60 fps checkpoint needs --fps 60; the
+    # sanity check below refuses a mismatch rather than replaying actions at
+    # the wrong speed.
+    fps: int = 30
     # Escape hatch for the training-fps sanity check: when the checkpoint
     # records the fps its dataset was collected at (see _training_fps) and it
     # differs from --fps, run-policy refuses to start — actions would replay
@@ -143,6 +172,8 @@ class RunPolicyConfig:
     device: str = "cuda"
     server_host: str | None = None
     server_port: int = 8765
+    # Custom policies use compressed observations and a plan dispatcher.
+    plan_config: PlanRuntimeConfig = field(default_factory=PlanRuntimeConfig)
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
@@ -177,7 +208,11 @@ class RunPolicyConfig:
     # drops the arms into a limp gravity-comp hold instead of pulling
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
+    # Optional deployment rest goals, in radians (seven arm joints per side).
+    # Omitted sides retain the generic teleoperation rest configuration.
+    rest_pose_left: list[float] | None = None
+    rest_pose_right: list[float] | None = None
     # Contact watchdog while the *policy* drives the arms: the same
     # sustained-torque-residual trip, checked on every executed action. On a
     # trip the episode aborts (nothing is saved) and the arms drop into the
@@ -270,28 +305,52 @@ _GATE_CONTACT = "contact"
 class _StdinPolicyControl:
     """Terminal episode control: stdin keystrokes + Enter-to-continue prompts."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        eof_choice: str | None = None,
+        immediate_quit: bool = False,
+        quit_from_holds: bool = False,
+    ) -> None:
         self._stop: "threading.Event | None" = None
         self._result: dict[str, str | None] = {"choice": None}
         self._thread: "threading.Thread | None" = None
+        self.quit_requested = False
+        self._eof_choice = eof_choice
+        self._immediate_quit = immediate_quit
+        # ``q`` at a limp contact/discard hold quits (and the arms lose their
+        # gravity-comp support at teardown). Only the custom policy interface
+        # opts in; elsewhere a hold keeps its original "any input returns to
+        # rest" prompt so a stray ``q`` can't drop the arms.
+        self._quit_from_holds = quit_from_holds
 
     def await_continue(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
     ) -> bool:
+        quittable = phase == _GATE_READY or self._quit_from_holds
         try:
-            input(f"{message} [Enter] ")
+            raw = input(
+                f"{message} [Enter]=continue, q=quit: "
+                if quittable
+                else f"{message} [Enter] "
+            )
+            self.quit_requested = False
+            if quittable and raw.strip().lower() == "q":
+                self.quit_requested = phase == _GATE_READY
+                return False
             return True
         except (EOFError, KeyboardInterrupt):
+            self.quit_requested = False
             return False
 
     def await_contact_clear(self) -> bool:
-        return self.await_continue(_CONTACT_PROMPT)
+        return self.await_continue(_CONTACT_PROMPT, phase=_GATE_CONTACT)
 
     def await_episode_contact_clear(self) -> bool:
-        return self.await_continue(_EPISODE_CONTACT_PROMPT)
+        return self.await_continue(_EPISODE_CONTACT_PROMPT, phase=_GATE_CONTACT)
 
     def await_manual_reset(self) -> bool:
-        return self.await_continue(_DISCARD_LIMP_PROMPT)
+        return self.await_continue(_DISCARD_LIMP_PROMPT, phase="limp")
 
     def begin_gate(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
@@ -308,6 +367,10 @@ class _StdinPolicyControl:
         # Panel-only readout; the terminal announces episodes via the log.
         pass
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        # Panel-only: names the dataset the panel's preview follows.
+        pass
+
     def poll_gate(self) -> str | None:
         # Terminal collect-dagger opens an episode from the VR record button
         # only, so there is nothing to poll here.
@@ -318,35 +381,79 @@ class _StdinPolicyControl:
         on_subtask: "Callable[[int], None] | None" = None,
         num_subtasks: int = 0,
     ) -> None:
+        self._start_reader(on_subtask, num_subtasks)
+
+    def _start_reader(
+        self,
+        on_subtask: Callable[[int], None] | None = None,
+        num_subtasks: int = 0,
+        *,
+        allowed_choices: tuple[str, ...] = ("s", "r", "q"),
+    ) -> None:
         from ..lerobot.rollout import stdin_watcher
 
         self._stop = threading.Event()
         self._result = {"choice": None}
+        self.quit_requested = False
+        ready = threading.Event()
         self._thread = threading.Thread(
             target=stdin_watcher,
             args=(self._stop, self._result, on_subtask, num_subtasks),
+            kwargs={
+                "eof_choice": self._eof_choice,
+                "immediate_quit": self._immediate_quit,
+                "ready_event": ready,
+                "allowed_choices": allowed_choices,
+            },
             name="axol-stdin-watcher",
             daemon=True,
         )
         self._thread.start()
+        if not ready.wait(timeout=1.0):
+            self.end_episode()
+            raise RuntimeError("stdin watcher did not become ready")
+        self._check_reader_error()
+
+    def _check_reader_error(self) -> None:
+        if error := self._result.get("error"):
+            raise RuntimeError(f"Episode input reader failed: {error}")
 
     def poll_choice(self) -> str | None:
-        return self._result.get("choice")
+        self._check_reader_error()
+        choice = self._result.get("choice")
+        if choice == "q":
+            self.quit_requested = True
+        return choice
 
     def resolve_timeout(self, episode_time_s: int) -> str:
         try:
             raw = input(
-                f"Episode time cap ({episode_time_s}s) reached. "
-                "[Enter]=save, r=rerecord, q=quit: "
+                f"Episode time cap ({episode_time_s}s) reached. [Enter]=save, r=rerecord, q=quit: "
             )
         except (EOFError, KeyboardInterrupt):
-            return "q"
+            self.quit_requested = False
+            return "abort"
         raw = raw.strip().lower()
+        self.quit_requested = raw == "q"
         return "q" if raw == "q" else ("r" if raw == "r" else "s")
 
     def end_episode(self) -> None:
         if self._stop is not None:
             self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                raise RuntimeError("stdin watcher did not stop before the next prompt")
+        self._check_reader_error()
+
+    def discard_quit_input(self) -> None:
+        """Do not let a trailing Enter acknowledge a later parking failure."""
+        if self._immediate_quit and self.quit_requested:
+            import sys
+            import termios
+
+            if sys.stdin.isatty():
+                termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
 
     def note_saved(self) -> None:
         # Web-control-only bookkeeping; the terminal path shows saves via the log.
@@ -375,6 +482,7 @@ class _QueuePolicyControl:
         self._q: "queue.Queue[str]" = queue.Queue()
         self._stop = stop_event
         self._choice: str | None = None
+        self.quit_requested = False
         self._on_subtask: "Callable[[int], None] | None" = None
         self._num_subtasks = 0
         # Episode phase/count, read by the serve runner so the web control panel
@@ -390,6 +498,9 @@ class _QueuePolicyControl:
         # Instruction + button label of the gate currently open, if any.
         self._gate_message = ""
         self._gate_label = "Start episode"
+        # The dataset this session records into (note_dataset), so the
+        # panel's dataset preview can follow it.
+        self._dataset: dict[str, str] | None = None
 
     def push(self, command: str) -> None:
         self._q.put(command)
@@ -407,6 +518,13 @@ class _QueuePolicyControl:
         with self._state_lock:
             self._episode = episode
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        """The dataset this session records into (the snapshot's ``dataset``)."""
+        from pathlib import Path
+
+        with self._state_lock:
+            self._dataset = {"repoId": repo_id, "root": str(Path(root).resolve())}
+
     def snapshot(self) -> dict[str, Any]:
         """Thread-safe phase/count/message/buttons for the /api/op/status API."""
         with self._state_lock:
@@ -417,7 +535,7 @@ class _QueuePolicyControl:
             else:
                 message = _POLICY_PHASE_MESSAGES.get(phase, "")
                 controls = [dict(c) for c in _POLICY_PHASE_CONTROLS.get(phase, ())]
-            return {
+            snap: dict[str, Any] = {
                 "phase": phase,
                 # Saves are what number an episode, so a discarded rollout is
                 # re-recorded under the same number — as the log line says.
@@ -432,6 +550,9 @@ class _QueuePolicyControl:
                 "message": message,
                 "controls": controls,
             }
+            if self._dataset is not None:
+                snap["dataset"] = dict(self._dataset)
+            return snap
 
     def _drain(self) -> None:
         import queue
@@ -512,6 +633,7 @@ class _QueuePolicyControl:
                 continue
             decision = self._gate_decision(cmd)
             if decision is not None:
+                self.quit_requested = decision == "quit" and phase == _GATE_READY
                 return decision == "go"
         return False
 
@@ -553,6 +675,7 @@ class _QueuePolicyControl:
         num_subtasks: int = 0,
     ) -> None:
         self._choice = None
+        self.quit_requested = False
         self._on_subtask = on_subtask
         self._num_subtasks = num_subtasks
         self._drain()
@@ -570,6 +693,8 @@ class _QueuePolicyControl:
                 return None
             if cmd in ("s", "r", "q"):
                 self._choice = cmd
+                if cmd == "q":
+                    self.quit_requested = True
                 return cmd
             # Subtask switches keep the episode running; anything else is
             # ignored rather than mistaken for a decision.
@@ -592,8 +717,9 @@ class _QueuePolicyControl:
                 continue
             if cmd in ("s", "r", "q"):
                 self._set_phase("resetting")
+                self.quit_requested = cmd == "q"
                 return cmd
-        return "q"
+        return "abort"
 
     def end_episode(self) -> None:
         # The episode ended; the loop returns to rest before the next gate.
@@ -611,6 +737,7 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     # Translate operator-actionable hardware faults into a clean non-zero
     # exit instead of a multi-frame traceback.
@@ -821,8 +948,7 @@ def _lingering_episode_thread_error(
     if not alive:
         return None
     return HardwareCleanupError(
-        "episode worker(s) did not stop: "
-        f"{', '.join(alive)}; hardware access may still be active"
+        f"episode worker(s) did not stop: {', '.join(alive)}; hardware access may still be active"
     )
 
 
@@ -890,8 +1016,7 @@ def _shutdown_policy_server_process(
         )
     for label, failure in failures:
         error.add_note(
-            f"additional policy-server {label} failure: "
-            f"{type(failure).__name__}: {failure}"
+            f"additional policy-server {label} failure: {type(failure).__name__}: {failure}"
         )
     if failures:
         raise error from failures[0][1]
@@ -1007,8 +1132,7 @@ def _stop_episode_workers(
         )
         for label, failure in failures:
             error.add_note(
-                f"additional episode-worker {label} failure: "
-                f"{type(failure).__name__}: {failure}"
+                f"additional episode-worker {label} failure: {type(failure).__name__}: {failure}"
             )
         return False, error
 
@@ -1019,8 +1143,7 @@ def _stop_episode_workers(
         )
         for label, failure in failures:
             error.add_note(
-                f"additional episode-worker {label} failure: "
-                f"{type(failure).__name__}: {failure}"
+                f"additional episode-worker {label} failure: {type(failure).__name__}: {failure}"
             )
         return True, error
     return True, None
@@ -1034,8 +1157,7 @@ def _clear_episode_buffer_after_workers(
     """Clear a rollout buffer only after capture-thread exit is proven."""
     if not workers_stopped:
         raise HardwareCleanupError(
-            "refusing to clear the rollout buffer while an episode worker may "
-            "still be writing it"
+            "refusing to clear the rollout buffer while an episode worker may still be writing it"
         )
     dataset.clear_episode_buffer()
 
@@ -1181,6 +1303,8 @@ def _build_axol_robot_client(
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
     policy_torque_threshold: float = 0.0,
+    custom_policy_url: str | None = None,
+    plan_config: PlanRuntimeConfig | None = None,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -1205,6 +1329,11 @@ def _build_axol_robot_client(
             ``contact_tripped`` and shuts the episode down. ``<= 0``
             disables (the default; see
             ``RunPolicyConfig.policy_torque_threshold``).
+        custom_policy_url: When set, use the continuation-capable custom
+            policy endpoint at this ``ws://`` URL instead of a LeRobot
+            ``PolicyServer``. Local action shaping and the configured contact
+            watchdog remain shared; chunk alignment and ensembling are bypassed.
+        plan_config: Scheduling and observation settings for custom policies.
     """
     import threading as _threading
     from queue import Queue
@@ -1212,6 +1341,7 @@ def _build_axol_robot_client(
     import grpc
     from lerobot.async_inference.helpers import (
         FPSTracker,
+        TimedAction,
         TimedObservation,
         map_robot_keys_to_lerobot_features,
     )
@@ -1353,7 +1483,11 @@ def _build_axol_robot_client(
             if (
                 exec_max_vel > 0.0
                 and exec_max_accel > 0.0
-                and not getattr(robot.config, "observe_cartesian", False)
+                and not getattr(
+                    robot,
+                    "cartesian_actions",
+                    getattr(robot.config, "observe_cartesian", False),
+                )
             ):
                 self._exec_filter = TrapezoidalFilter(
                     float(exec_max_vel),
@@ -1392,15 +1526,8 @@ def _build_axol_robot_client(
                 action_schema=self._expected_action_schema,
             )
 
-            self.channel = grpc.insecure_channel(
-                self.server_address,
-                grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s"),
-            )
-            self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
             self.logger = RobotClient.logger
-            self.logger.info(
-                f"AxolRobotClient connecting to server at {self.server_address}"
-            )
+            self._open_transport()
 
             self.shutdown_event = _threading.Event()
             self.latest_action_lock = _threading.Lock()
@@ -1414,6 +1541,23 @@ def _build_axol_robot_client(
             self.fps_tracker = FPSTracker(target_fps=self.config.fps)
             self.must_go = _threading.Event()
             self.must_go.set()
+
+        def _open_transport(self) -> None:
+            """Create the gRPC channel to the LeRobot ``PolicyServer``."""
+            self.channel = grpc.insecure_channel(
+                self.server_address,
+                grpc_channel_options(
+                    initial_backoff=f"{self.config.environment_dt:.4f}s"
+                ),
+            )
+            self.stub = services_pb2_grpc.AsyncInferenceStub(self.channel)
+            self.logger.info(
+                f"AxolRobotClient connecting to server at {self.server_address}"
+            )
+
+        def _reset_server(self) -> None:
+            """Clear the server's per-episode state (see ``reset_episode_state``)."""
+            self.stub.Ready(services_pb2.Empty())
 
         def start(self) -> bool:  # type: ignore[override]
             """Load the policy and prove its ordered action schema.
@@ -1460,8 +1604,7 @@ def _build_axol_robot_client(
                 self._action_schema_confirmed = False
                 if exc.code() == grpc.StatusCode.FAILED_PRECONDITION:
                     raise ActionSchemaError(
-                        "Policy server rejected the action-schema handshake: "
-                        f"{exc.details()}"
+                        f"Policy server rejected the action-schema handshake: {exc.details()}"
                     ) from exc
                 self.logger.error("Failed to connect to policy server: %s", exc)
                 return False
@@ -1502,8 +1645,7 @@ def _build_axol_robot_client(
                     grpc.StatusCode.INTERNAL,
                 }:
                     error = InferenceWireError(
-                        "Policy server rejected the safe observation protocol: "
-                        f"{exc.details()}"
+                        f"Policy server rejected the safe observation protocol: {exc.details()}"
                     )
                     self.fatal_error = error
                     self.shutdown_event.set()
@@ -1524,7 +1666,20 @@ def _build_axol_robot_client(
             receive_time: float | None = None,
         ) -> None:
             """Validate and install one safe action response (testable seam)."""
-            timed_actions = decode_timed_actions(payload, self._expected_action_schema)
+            self._install_timed_actions(
+                decode_timed_actions(payload, self._expected_action_schema),
+                verbose=verbose,
+                receive_time=receive_time,
+            )
+
+        def _install_timed_actions(
+            self,
+            timed_actions: list[TimedAction],
+            *,
+            verbose: bool = False,
+            receive_time: float | None = None,
+        ) -> None:
+            """Aggregate one validated chunk into the action queue."""
             client_device = self.config.client_device
             if client_device != "cpu":
                 for timed_action in timed_actions:
@@ -1566,8 +1721,7 @@ def _build_axol_robot_client(
             """Receive only bounded numeric action frames; malformed is fatal."""
             if not self._action_schema_confirmed:
                 error = ActionSchemaError(
-                    "Refusing to receive policy actions before exact action-schema "
-                    "confirmation."
+                    "Refusing to receive policy actions before exact action-schema confirmation."
                 )
                 self.fatal_error = error
                 self.shutdown_event.set()
@@ -1602,8 +1756,7 @@ def _build_axol_robot_client(
                         grpc.StatusCode.INTERNAL,
                     }:
                         error = InferenceWireError(
-                            "Policy server rejected the safe action protocol: "
-                            f"{exc.details()}"
+                            f"Policy server rejected the safe action protocol: {exc.details()}"
                         )
                         self.fatal_error = error
                         self.shutdown_event.set()
@@ -1634,7 +1787,9 @@ def _build_axol_robot_client(
             ``last_processed_obs`` is left in place, but the first observation
             of an episode is must-go and bypasses the similarity check.)
             """
-            self.stub.Ready(services_pb2.Empty())
+            self._reset_server()
+            if getattr(self.robot, "cartesian_actions", False):
+                self.robot.reset_cartesian_seed()
             with self.action_queue_lock:
                 self.action_queue = Queue()
                 self.action_queue_size = []
@@ -1856,8 +2011,7 @@ def _build_axol_robot_client(
             """
             if not self._action_schema_confirmed:
                 raise ActionSchemaError(
-                    "Refusing to send a policy action before exact action-schema "
-                    "confirmation."
+                    "Refusing to send a policy action before exact action-schema confirmation."
                 )
             if np.shape(target_vec) != (len(self._expected_action_schema),):
                 raise ActionSchemaError(
@@ -2045,7 +2199,461 @@ def _build_axol_robot_client(
                 pass
             self.logger.debug("AxolRobotClient channel closed (robot left connected)")
 
-    return AxolRobotClient(
+    class AxolPlanPolicyClient(AxolRobotClient):
+        """Custom policy interface (v2) transport and dispatcher.
+
+        Model semantics stay on the server.
+
+        The observation worker captures a coherent sensor/continuation request;
+        the receiver owns the single network round trip; the control worker
+        dispatches an unchanged row on an absolute periodic clock. Only local
+        scheduler bookkeeping is protected by ``_plan_ready``. Neither image
+        work, a network call nor a hardware send holds that lock.
+        """
+
+        def _open_transport(self) -> None:
+            from ..policy.plan_client import PlanPolicyClient
+            from ..policy.plan_scheduler import PlanScheduler
+
+            self._plan_config = plan_config or PlanRuntimeConfig()
+            self._scheduler = PlanScheduler(
+                fps=self.config.fps,
+                horizon=self.config.actions_per_chunk,
+                width=len(self._expected_action_schema),
+                config=self._plan_config,
+            )
+            self._policy_client = PlanPolicyClient(
+                custom_policy_url,
+                reply_timeout=self._plan_config.reply_timeout_s,
+            )
+            self._plan_ready = _threading.Condition(_threading.RLock())
+            self._plan_slot = None
+            self._network_busy = False
+            self._episode = 0
+            self._plan_last_target = None
+            # (scheduler generation, published-plan row successfully sent).
+            # A new accepted plan need not have dispatched any of its rows.
+            self._plan_last_dispatched = None
+            self._wire_generation = None
+
+        def start(self) -> bool:
+            from ..lerobot.inference_wire import _observation_layout
+            from ..policy import CameraSpec
+            from ..policy.plan_protocol import PlanSpec
+
+            state_names, cameras = _observation_layout(
+                self.policy_config.lerobot_features
+            )
+            self._state_names = state_names
+            self._camera_names = tuple(name for name, _ in cameras)
+            cfg = self._plan_config
+            prepared_cameras = tuple(
+                CameraSpec(
+                    name,
+                    (
+                        (cfg.output_height, cfg.output_width, 3)
+                        if cfg.output_width
+                        else shape
+                    ),
+                )
+                for name, shape in cameras
+            )
+            spec = PlanSpec(
+                state_names=state_names,
+                action_names=self._expected_action_schema,
+                cameras=prepared_cameras,
+                fps=self.config.fps,
+                actions_per_chunk=self.config.actions_per_chunk,
+                request_interval=cfg.request_interval,
+                max_adoption_offset_steps=cfg.max_adoption_offset_steps,
+                dispatch_feedback=True,
+            )
+            self._policy_client.reply_timeout = CUSTOM_POLICY_SETUP_TIMEOUT_S
+            try:
+                accepted = self._policy_client.connect(spec)
+            finally:
+                self._policy_client.reply_timeout = cfg.reply_timeout_s
+            if accepted != spec:
+                raise ValueError(
+                    "custom policy endpoint did not accept the exact execution specification"
+                )
+            self._action_schema_confirmed = True
+            self.shutdown_event.clear()
+            self.logger.info(
+                "Custom policy interface (v2) ready: %d Hz, horizon=%d, interval=%d, late=%s; "
+                "lossless compressed images; on-arrival replacement without blending",
+                spec.fps,
+                spec.actions_per_chunk,
+                cfg.request_interval,
+                cfg.late_policy,
+            )
+            return True
+
+        def _reset_server(self) -> None:
+            # _run proves the old episode workers exited before calling this.
+            with self._plan_ready:
+                if self._network_busy:
+                    raise RuntimeError(
+                        "cannot reset while plan inference is still running"
+                    )
+                self._scheduler.reset()
+                self._plan_slot = None
+                self._plan_last_target = None
+                self._plan_last_dispatched = None
+                self._episode += 1
+            self._policy_client.reset(self._episode)
+            self._wire_generation = self._scheduler.generation
+
+        def reset_episode_state(self) -> None:
+            super().reset_episode_state()
+            # Seed the first-step safety check from measured FK, not the first
+            # policy target. Subsequent checks use the actual dispatched target.
+            if getattr(self.robot, "cartesian_actions", False):
+                left, right = self.robot.positions
+                measured = self.robot._joints_to_cartesian(left, right)
+                self._plan_last_target = np.array(
+                    [measured[name] for name in self._expected_action_schema],
+                    dtype=np.float32,
+                )
+
+        def _plan_fail(self, exc: BaseException) -> None:
+            if self.running:
+                self.fatal_error = exc
+                self.logger.error("Custom policy interface failed: %s", exc)
+            self.shutdown_event.set()
+            with self._plan_ready:
+                self._scheduler.invalidate()
+                self._plan_slot = None
+                self._plan_last_dispatched = None
+                self._plan_ready.notify_all()
+
+        def _capture_plan_observation(self, startup_deadline_ns: int | None):
+            """Wait for sensor publication after startup stalls, before any plan.
+
+            Only initial acquisition retries timing/availability failures. Once
+            a valid observation has been acquired, the normal fatal timing
+            checks apply. Timestamps and freshness limits are never changed.
+            """
+            from ..lerobot.robot.robot_axol import PolicyObservationNotReady
+            from ..policy.plan_scheduler import SensorTimingError, validate_sensor_times
+
+            started_ns = time.perf_counter_ns()
+            last_error = None
+            while self.running:
+                try:
+                    raw, state_ns, camera_ns = (
+                        self.robot.get_observation_with_sensor_timestamps()
+                    )
+                    now_ns = time.perf_counter_ns()
+                    if set(camera_ns) != set(self._camera_names):
+                        raise ValueError(
+                            "camera timestamps do not match negotiated cameras"
+                        )
+                    validate_sensor_times(
+                        state_ns, camera_ns, now_ns, self._plan_config
+                    )
+                except (PolicyObservationNotReady, SensorTimingError) as exc:
+                    if startup_deadline_ns is None or (
+                        isinstance(exc, SensorTimingError) and not exc.retriable
+                    ):
+                        raise
+                    remaining_s = (startup_deadline_ns - time.perf_counter_ns()) / 1e9
+                    if remaining_s <= 0:
+                        raise TimeoutError(
+                            "Timed out waiting for a fresh initial policy observation "
+                            f"after {self._plan_config.startup_observation_timeout_s:g}s: "
+                            f"{exc}"
+                        ) from exc
+                    if last_error is None:
+                        self.logger.warning(
+                            "Waiting for fresh initial policy observation: %s", exc
+                        )
+                    last_error = exc
+                    self.shutdown_event.wait(min(0.01, remaining_s))
+                    continue
+                if not self.running:
+                    return None
+                if startup_deadline_ns is not None:
+                    if now_ns > startup_deadline_ns:
+                        raise TimeoutError(
+                            "Initial policy observation capture exceeded the "
+                            f"{self._plan_config.startup_observation_timeout_s:g}s "
+                            "startup deadline"
+                        )
+                    self.logger.info(
+                        "Initial policy observation ready after %.1f ms: "
+                        "state age=%.1f ms; camera ages=%s ms",
+                        (now_ns - started_ns) / 1e6,
+                        (now_ns - state_ns) / 1e6,
+                        {
+                            name: round((now_ns - stamp) / 1e6, 1)
+                            for name, stamp in camera_ns.items()
+                        },
+                    )
+                return raw, state_ns, camera_ns, now_ns
+            return None
+
+        def observation_loop(self, task, verbose: bool = False) -> None:
+            from ..policy.plan_protocol import Continuation, PlanObservation
+            from ..policy.plan_scheduler import (
+                prepare_plan_images,
+            )
+
+            try:
+                self.start_barrier.wait()
+                startup_deadline_ns = time.perf_counter_ns() + round(
+                    self._plan_config.startup_observation_timeout_s * 1e9
+                )
+                while self.running:
+                    with self._plan_ready:
+                        if (
+                            self._network_busy
+                            or self._plan_slot is not None
+                            or not self._scheduler.request_due
+                        ):
+                            self._plan_ready.wait(timeout=self.config.environment_dt)
+                            continue
+                        generation = self._scheduler.generation
+                    captured = self._capture_plan_observation(startup_deadline_ns)
+                    if captured is None:
+                        return
+                    raw, state_ns, camera_ns, now_ns = captured
+                    startup_deadline_ns = None
+                    with self._plan_ready:
+                        if (
+                            not self.running
+                            or generation != self._scheduler.generation
+                            or not self._scheduler.request_due
+                        ):
+                            continue
+                        pending = self._scheduler.begin_request(now_ns)
+                        dispatched = self._plan_last_dispatched
+                        last_dispatched = (
+                            dispatched[1]
+                            if dispatched is not None and dispatched[0] == generation
+                            else None
+                        )
+                        delay = (
+                            self._scheduler.delay_steps
+                            if self._plan_config.advertise_delay
+                            else None
+                        )
+                    # Row origin, continuation and dispatch feedback are frozen; time
+                    # spent preparing/encoding images consumes this request's
+                    # original budget. Never replace only its observation.
+                    images = prepare_plan_images(
+                        {name: raw[name] for name in self._camera_names},
+                        self._plan_config,
+                    )
+                    observation = PlanObservation(
+                        request_id=pending.request_id,
+                        state=np.asarray(
+                            [raw[name] for name in self._state_names], dtype=np.float32
+                        ),
+                        images=images,
+                        state_sample_time_ns=state_ns,
+                        image_capture_time_ns=camera_ns,
+                        continuation=(
+                            None
+                            if pending.prediction_id is None
+                            else Continuation(
+                                pending.prediction_id,
+                                pending.from_row,
+                            )
+                        ),
+                        delay_steps=delay,
+                        last_dispatched=last_dispatched,
+                    )
+                    with self._plan_ready:
+                        if self.running and self._scheduler.is_pending(
+                            pending.request_id
+                        ):
+                            self._plan_slot = observation
+                            self._plan_ready.notify_all()
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(
+                        RuntimeError(
+                            "custom policy interface episode start barrier broke"
+                        )
+                    )
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def receive_actions(self, verbose: bool = False) -> None:
+            from ..policy.plan_scheduler import (
+                SensorTimingError,
+                validate_sensor_times,
+            )
+
+            try:
+                self.start_barrier.wait()
+                while self.running:
+                    with self._plan_ready:
+                        self._plan_ready.wait_for(
+                            lambda: self._plan_slot is not None or not self.running,
+                            timeout=self.config.environment_dt,
+                        )
+                        if not self.running:
+                            return
+                        obs, self._plan_slot = self._plan_slot, None
+                        if obs is None or not self._scheduler.is_pending(
+                            obs.request_id
+                        ):
+                            continue
+                        self._network_busy = True
+                        generation = self._scheduler.generation
+                    try:
+                        if self._wire_generation != generation:
+                            # Recovery/hold clears desktop conditioning only
+                            # after old inference has drained. Local dispatch
+                            # was invalidated immediately, without this RPC.
+                            self._episode += 1
+                            self._policy_client.reset(self._episode)
+                            self._wire_generation = generation
+                        try:
+                            validate_sensor_times(
+                                obs.state_sample_time_ns,
+                                obs.image_capture_time_ns,
+                                time.perf_counter_ns(),
+                                self._plan_config,
+                            )
+                        except SensorTimingError as exc:
+                            if not exc.retriable:
+                                raise
+                            with self._plan_ready:
+                                self._scheduler.cancel_unsent(obs.request_id)
+                            continue
+                        reply = self._policy_client.infer(obs)
+                        with self._plan_ready:
+                            if self.running:
+                                accepted = self._scheduler.adopt(
+                                    reply.request_id,
+                                    reply.actions,
+                                    time.perf_counter_ns(),
+                                    reply.max_adoption_offset_steps,
+                                )
+                                if not accepted and self._scheduler.last_recovery:
+                                    self.logger.warning(
+                                        "Custom policy interface recovery: %s",
+                                        self._scheduler.last_recovery,
+                                    )
+                    finally:
+                        with self._plan_ready:
+                            self._network_busy = False
+                            self._plan_ready.notify_all()
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(
+                        RuntimeError(
+                            "custom policy interface episode start barrier broke"
+                        )
+                    )
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def _check_plan_step(self, target: np.ndarray) -> None:
+            from ..policy.plan_scheduler import PlanSchedulingError
+
+            if not np.isfinite(target).all():
+                raise PlanSchedulingError("non-finite dispatch target")
+            if self._plan_last_target is not None:
+                names = self._expected_action_schema
+                for side in ("left", "right"):
+                    keys = [f"{side}_ee.{axis}" for axis in ("x", "y", "z")]
+                    if all(key in names for key in keys):
+                        indices = [names.index(key) for key in keys]
+                        step = float(
+                            np.linalg.norm(
+                                target[indices] - self._plan_last_target[indices]
+                            )
+                        )
+                        if step > self._plan_config.max_cartesian_step_m:
+                            raise PlanSchedulingError(
+                                f"{side} Cartesian step {step:.4f}m exceeds limit"
+                            )
+
+        def control_loop(self, task, verbose: bool = False) -> None:
+            from ..policy.plan_protocol import LastDispatched
+
+            try:
+                self.start_barrier.wait()
+                dt = self.config.environment_dt
+                deadline = time.perf_counter()
+                while self.running:
+                    remaining = deadline - time.perf_counter()
+                    if remaining > 0 and self.shutdown_event.wait(remaining):
+                        return
+                    now = time.perf_counter()
+                    with self._plan_ready:
+                        if now - deadline >= dt and self._scheduler.actions is not None:
+                            self._scheduler.recover("control dispatch deadline overrun")
+                            self._plan_slot = None
+                        # Capture the identity before pop can exhaust/invalidate
+                        # the plan, or an inference reply can replace it.
+                        dispatch_generation = self._scheduler.generation
+                        dispatch_id = self._scheduler.prediction_id
+                        dispatch_row = (
+                            self._scheduler.next_tick - self._scheduler.origin_tick
+                        )
+                        popped = self._scheduler.pop()
+                        self._plan_ready.notify_all()
+                    if popped is not None and self.running:
+                        tick, target = popped
+                        self._check_plan_step(target)
+                        self._shape_and_send(target)
+                        with self._plan_ready:
+                            # A failed send never reaches this point. A hold or
+                            # reset while sending must not resurrect an old ID
+                            # after the desktop's prediction cache is cleared.
+                            if (
+                                self.running
+                                and dispatch_generation == self._scheduler.generation
+                            ):
+                                self._plan_last_dispatched = (
+                                    dispatch_generation,
+                                    LastDispatched(dispatch_id, dispatch_row),
+                                )
+                                self._plan_ready.notify_all()
+                        self._plan_last_target = target.copy()
+                        self._exec_last_target = target
+                        with self.latest_action_lock:
+                            self.latest_action = tick
+                        if time.perf_counter() >= deadline + dt:
+                            with self._plan_ready:
+                                self._scheduler.recover(
+                                    "hardware dispatch exceeded control budget"
+                                )
+                                self._plan_slot = None
+                                self._plan_ready.notify_all()
+                    deadline += dt
+                    # Missed slots never trigger a burst of catch-up commands.
+                    if deadline < time.perf_counter():
+                        deadline = time.perf_counter() + dt
+            except _threading.BrokenBarrierError:
+                if self.running:
+                    self._plan_fail(
+                        RuntimeError(
+                            "custom policy interface episode start barrier broke"
+                        )
+                    )
+            except Exception as exc:
+                self._plan_fail(exc)
+
+        def stop(self) -> None:
+            self.shutdown_event.set()
+            self._action_schema_confirmed = False
+            with self._plan_ready:
+                self._scheduler.invalidate()
+                self._plan_slot = None
+                self._plan_last_dispatched = None
+                self._plan_ready.notify_all()
+            self._policy_client.close()
+
+    client_class = (
+        AxolPlanPolicyClient if custom_policy_url is not None else AxolRobotClient
+    )
+    return client_class(
         config,
         robot,
         publisher,
@@ -2082,7 +2690,17 @@ def _run(
     if stop_event is None:
         stop_event = threading.Event()
     if control is None:
-        control = _StdinPolicyControl()
+        # The custom policy interface's terminal contract: EOF aborts the
+        # episode and ``q`` quits from any gate. LeRobot runs keep the original
+        # behaviour (EOF lets the episode run to its cap; holds only continue).
+        terminal_contract = cfg.policy_type == "custom" or getattr(
+            cfg, "soft_park_on_quit", False
+        )
+        control = _StdinPolicyControl(
+            eof_choice="abort" if terminal_contract else None,
+            immediate_quit=getattr(cfg, "soft_park_on_quit", False),
+            quit_from_holds=terminal_contract,
+        )
 
     # Import lerobot's RobotClient module first, through the shim that undoes
     # its root-logger takeover — otherwise every CAN frame send gets debug-
@@ -2119,13 +2737,35 @@ def _run(
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
 
+    custom_policy = policy_type == "custom"
+    plan_config = getattr(cfg, "plan_config", None) or PlanRuntimeConfig()
+    if custom_policy:
+        if episode_time_s < 0:
+            raise ValueError("episode_time_s must be nonnegative; 0 is continuous")
+        plan_config.validate(fps=fps, horizon=actions_per_chunk)
+        # Fail before camera discovery/robot construction if the selected
+        # compressed transport's optional image dependency is absent.
+        import PIL.Image  # noqa: F401
+    if not custom_policy and not policy_path.strip():
+        raise ValueError(
+            f"--policy_path is required for a {policy_type!r} policy (a LeRobot "
+            "checkpoint path or HF Hub repo id). To run your own model, use "
+            "--policy_type custom with a compatible custom policy endpoint."
+        )
+
     # Fail fast (before any hardware or server spawn) if --fps disagrees with
-    # the fps the checkpoint was trained at.
-    _check_training_fps(cfg)
+    # the fps the checkpoint was trained at. A custom policy has no checkpoint
+    # to read; its endpoint must echo the exact control rate in its handshake.
+    if not custom_policy:
+        _check_training_fps(cfg)
 
     dataset_root: Path | None = None
     if repo_id:
         dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        # Name the dataset for the panel's preview. getattr: a downstream
+        # package may hand in its own control without this hook.
+        if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+            note_dataset(repo_id, dataset_root)
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
@@ -2267,6 +2907,12 @@ def _run(
     episode_workers: list[tuple[str, Any]] = []
     episode_workers_stopped = True
     session_error: BaseException | None = None
+    robot_connected = False
+    normal_quit = False
+    abort_requested = False
+    # Disabling raised arms drops them under gravity, so the cleanup below
+    # returns them to rest first — but only when they are somewhere else.
+    arms_at_rest = True
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -2276,8 +2922,17 @@ def _run(
         # a ~15 s network + GPU spike that can disrupt already-open camera
         # pipelines. Remote inference uses the already-running endpoint. Both
         # this child and the reset worker are created inside the lifecycle
-        # guard so even a setup-time failure reaches the cleanup below.
-        if server_host is None:
+        # guard so even a setup-time failure reaches the cleanup below. A
+        # custom policy is the operator's own, already-running compatible
+        # endpoint; nothing is spawned for it.
+        custom_policy_url: str | None = None
+        if custom_policy:
+            from ..policy import policy_url
+
+            server_host = server_host or "127.0.0.1"
+            custom_policy_url = policy_url(server_host, server_port)
+            _logger.info(f"Using custom policy server at {custom_policy_url}.")
+        elif server_host is None:
             server_host = "127.0.0.1"
             server_cfg_dict = {
                 "host": "127.0.0.1",
@@ -2298,8 +2953,7 @@ def _run(
             )
             server_proc.start()
             _logger.info(
-                f"Started PolicyServer on 127.0.0.1:{server_port} "
-                f"(pid={server_proc.pid})."
+                f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid})."
             )
         else:
             _logger.info(
@@ -2307,37 +2961,69 @@ def _run(
             )
 
         # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
-        reset_controller = IKResetController()
+        reset_controller = IKResetController(
+            rest_pose_left=getattr(cfg, "rest_pose_left", None),
+            rest_pose_right=getattr(cfg, "rest_pose_right", None),
+        )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded() -> bool:
-            """Guarded return to rest; ``False`` when the operator aborted."""
+        def _return_to_rest_guarded(*, final: bool = False) -> bool:
+            """Guarded return to rest; ``False`` when the operator aborted.
+
+            ``final=True`` is the teardown park played on the way out. The
+            stop flag is already set by then, so a deadline bounds the move
+            instead — well inside the caller's stop grace — and there is no
+            operator left to answer a contact retry.
+            """
+            nonlocal arms_at_rest
             assert reset_controller is not None
-            return reset_controller.return_to_rest(
+            if final:
+                deadline = time.perf_counter() + PARK_TIMEOUT_S
+                contact = threading.Event()
+                arms_at_rest = reset_controller.return_to_rest(
+                    robot,
+                    torque_threshold=cfg.reset_torque_threshold,
+                    gravity_comp_kd=cfg.reset_gravity_comp_kd,
+                    # A contact trip ends the park at once rather than holding
+                    # limp until the deadline: the torque-off follows anyway.
+                    stopped=lambda: (
+                        contact.is_set() or time.perf_counter() >= deadline
+                    ),
+                    on_contact=contact.set,
+                )
+                return arms_at_rest
+            arms_at_rest = reset_controller.return_to_rest(
                 robot,
                 torque_threshold=cfg.reset_torque_threshold,
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
                 stopped=stop_event.is_set,
                 wait_retry=control.await_contact_clear,
             )
+            return arms_at_rest
 
-        _wait_for_port(server_host, server_port, timeout=30.0)
+        if not custom_policy:
+            # A custom server is reached with its own connect (a clear error
+            # if it isn't up); only our own spawned/remote gRPC server needs
+            # the startup grace period.
+            _wait_for_port(server_host, server_port, timeout=30.0)
 
         # ``RobotClientConfig`` requires a name from upstream's registry;
         # ``temporal_ensemble`` is handled in our override so pass a
         # placeholder that the dispatcher short-circuits.
-        if aggregate_fn == "temporal_ensemble":
+        if not custom_policy and aggregate_fn == "temporal_ensemble":
             _logger.info(
                 f"Aggregation: temporal_ensemble "
                 f"(coeff={temporal_ensemble_coeff:+.3f}, ACT default 0.01)."
             )
-        else:
+        elif not custom_policy:
             _logger.info(f"Aggregation: {aggregate_fn}.")
         client_cfg = RobotClientConfig(
             robot=robot_config,
             policy_type=policy_type,
-            pretrained_name_or_path=policy_path,
+            # LeRobot's config requires a nonempty placeholder. Custom
+            # endpoints select their own model; this field is never sent.
+            pretrained_name_or_path=policy_path or "custom",
             actions_per_chunk=actions_per_chunk,
             task=task,
             server_address=f"{server_host}:{server_port}",
@@ -2361,6 +3047,8 @@ def _run(
             exec_max_vel=cfg.exec_max_vel,
             exec_max_accel=cfg.exec_max_accel,
             policy_torque_threshold=cfg.policy_torque_threshold,
+            custom_policy_url=custom_policy_url,
+            plan_config=plan_config,
         )
 
         _logger.info("Loading policy on server (one-time)...")
@@ -2369,12 +3057,17 @@ def _run(
 
         _logger.info("Connecting robot...")
         robot.connect()
+        robot_connected = True
 
         # A Cartesian-action policy resolves each action to joints via IK in
         # send_action. Build that solver now, before the control loop, so its
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
         # below instead of stalling the first policy action.
-        if getattr(robot.config, "observe_cartesian", False):
+        if getattr(
+            robot.config,
+            "cartesian_actions",
+            getattr(robot.config, "observe_cartesian", False),
+        ):
             _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
@@ -2431,9 +3124,19 @@ def _run(
 
             control.begin_episode()
 
+            episode_limit = (
+                "continuous; operator ends the episode"
+                if custom_policy and episode_time_s == 0
+                else f"safety cap {episode_time_s}s"
+            )
+            quit_key = (
+                "q (no Enter)"
+                if getattr(cfg, "soft_park_on_quit", False)
+                else "q+Enter"
+            )
             print(
-                f"  Press s=save+end, r=rerecord+end, q=quit "
-                f"(safety cap {episode_time_s}s).",
+                f"  Press s+Enter=save, r+Enter=rerecord, {quit_key}=quit "
+                f"({episode_limit}).",
                 flush=True,
             )
 
@@ -2450,8 +3153,17 @@ def _run(
             # in-process under ``axol serve``: an exception escaping the
             # episode must not leave automatic collection off for the rest
             # of the serve process's lifetime.
+            gc_t0 = time.perf_counter()
             gc.collect()
             gc.disable()
+            _logger.info(
+                "Pre-episode gc.collect: %.0f ms%s",
+                (time.perf_counter() - gc_t0) * 1000.0,
+                "; custom policy interface (v2) waits for fresh sensors before "
+                "its first request"
+                if custom_policy
+                else "",
+            )
             timed_out = False
             interrupted = False
             episode_error: BaseException | None = None
@@ -2464,13 +3176,19 @@ def _run(
                     ("observation", obs_thread),
                 ]
                 episode_workers_stopped = False
+                # The policy is about to drive the arms off the rest pose.
+                arms_at_rest = False
                 receiver_thread.start()
                 control_thread.start()
                 obs_thread.start()
                 if capture is not None:
                     capture.start()
 
-                deadline = time.perf_counter() + episode_time_s
+                deadline = (
+                    float("inf")
+                    if custom_policy and episode_time_s == 0
+                    else time.perf_counter() + episode_time_s
+                )
                 try:
                     while True:
                         if stop_event.is_set():
@@ -2496,6 +3214,7 @@ def _run(
                         time.sleep(0.1)
                 except KeyboardInterrupt:
                     interrupted = True
+                    abort_requested = True
             except BaseException as error:
                 episode_error = error
             finally:
@@ -2597,10 +3316,11 @@ def _run(
                 continue
 
             choice = control.poll_choice()
-            if timed_out:
+            if timed_out and choice is None:
                 choice = control.resolve_timeout(episode_time_s)
 
-            if choice == "q":
+            if choice in ("q", "abort"):
+                normal_quit = choice == "q"
                 if dataset is not None:
                     _clear_episode_buffer_after_workers(
                         dataset, workers_stopped=episode_workers_stopped
@@ -2678,11 +3398,102 @@ def _run(
             raise client.fatal_error
 
     except KeyboardInterrupt:
-        pass
+        abort_requested = True
     except BaseException as error:
         session_error = error
         raise
     finally:
+        soft_park = getattr(cfg, "soft_park_on_quit", False)
+        policy_failed = session_error is not None or (
+            client is not None and client.fatal_error is not None
+        )
+        # Holding the last command after a failure is the custom policy
+        # interface's contract (a remote endpoint's fault must not drop the
+        # arms mid-plan). LeRobot policies keep their original teardown: a
+        # failure disables the motors, as it always has.
+        preserve_on_failure = custom_policy
+        preserve_position = robot_connected and (
+            (policy_failed and preserve_on_failure) or soft_park
+        )
+        cleanup_failures: list[tuple[str, BaseException]] = []
+        input_stopped = False
+        try:
+            # begin_episode precedes the pre-episode GC and worker try block;
+            # interruption there must still restore the terminal before gates.
+            control.end_episode()
+            input_stopped = True
+        except BaseException as error:
+            cleanup_failures.append(("episode input", error))
+            policy_failed = True
+            preserve_position = robot_connected and (preserve_on_failure or soft_park)
+        client_stopped = False
+        soft_parked = False
+        parking_error: BaseException | None = None
+        explicit_quit = normal_quit or getattr(control, "quit_requested", False) is True
+        if (
+            soft_park
+            and robot_connected
+            and explicit_quit
+            and not policy_failed
+            and not abort_requested
+            and episode_workers_stopped
+            and not stop_event.is_set()
+            and client is not None
+            and client.contact_tripped is None
+        ):
+            try:
+                # All action, observation and capture workers have joined.
+                # Invalidate queued plans and close the client BEFORE giving
+                # the reset controller sole ownership of the command stream.
+                control.end_episode()
+                client.stop()
+                client_stopped = True
+                assert reset_controller is not None
+                if not reset_controller.park(
+                    robot,
+                    torque_threshold=cfg.reset_torque_threshold,
+                    stopped=stop_event.is_set,
+                ):
+                    raise RuntimeError("Soft park did not complete; preserving torque")
+                preserve_position = False
+                soft_parked = True
+            except BaseException as error:
+                parking_error = error
+                cleanup_failures.append(("soft park", error))
+                _logger.exception("Soft park failed; motor torque will be preserved")
+        if (
+            preserve_position
+            and episode_workers_stopped
+            and (policy_failed or parking_error is not None)
+        ):
+            # Workers have stopped sending targets. Keep the existing realtime
+            # core alive at this gate, with its last-target hold and damping.
+            # Neither acknowledgment nor EOF/interrupt authorizes torque-off.
+            _logger.error(
+                "Policy stopped after an error. Suppressing automatic torque-off "
+                "and return-to-rest; motors remain energized."
+            )
+            if (
+                input_stopped
+                and not stop_event.is_set()
+                and not isinstance(parking_error, (KeyboardInterrupt, EOFError))
+            ):
+                try:
+                    if isinstance(control, _StdinPolicyControl):
+                        control.discard_quit_input()
+                    control.await_continue(
+                        "Policy failed. Exit stops realtime damping and leaves "
+                        "motors energized. Continue when ready.",
+                        label="Exit with motors energized",
+                    )
+                except (KeyboardInterrupt, EOFError):
+                    pass
+                except BaseException as error:
+                    # A failed operator surface must not skip preserving cleanup
+                    # or replace the original policy exception.
+                    _logger.exception("policy fault acknowledgment failed")
+                    if session_error is not None:
+                        session_error.add_note(f"fault acknowledgment failed: {error}")
         # Ignore SIGINT during cleanup so a second Ctrl+C can't abort
         # partway through disconnect/teardown. Restored at end of block.
         import signal
@@ -2693,16 +3504,44 @@ def _run(
             pass
 
         _logger.info("Stopping.")
-        if client is not None:
+        if client is not None and not client_stopped:
             try:
                 client.stop()
             except BaseException as exc:
                 _logger.exception("policy client cleanup failed")
-                cleanup_failures = [("policy client", exc)]
-            else:
-                cleanup_failures = []
-        else:
-            cleanup_failures = []
+                cleanup_failures.append(("policy client", exc))
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped when the motors are being left energized instead (a custom
+        # policy fault, or a failed soft park: preserve_position), after a
+        # completed soft park (the arms are parked at zero on purpose), when
+        # the arms are already at rest, when a limp hold left
+        # them in the operator's hands, when the bus no longer reports a pose
+        # to plan from, or when a live episode worker may still be inside the
+        # robot. (``collect-data`` reads the same three states off its teleop
+        # core instead, because its rest moves are planned by the teleop IK
+        # worker rather than by this out-of-band reset controller.)
+        #
+        # Bounded by the deadline ``final=True`` installs, polled once per
+        # control cycle whose own robot call the driver caps at 1 s. Every
+        # failure is swallowed, so the disconnect below happens either way and
+        # a lost park costs only what was lost before it existed.
+        try:
+            if (
+                episode_workers_stopped
+                and not preserve_position
+                and not soft_parked
+                and not arms_at_rest
+                and reset_controller is not None
+                and not reset_controller.arms_limp
+                and arms_reporting(robot)
+            ):
+                _logger.info("Returning to rest before disabling the arms.")
+                _return_to_rest_guarded(final=True)
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
+
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses. The one exception
@@ -2713,10 +3552,20 @@ def _run(
         robot_error = _cleanup_after_episode_workers(
             workers_stopped=episode_workers_stopped,
             label="robot disconnect",
-            cleanup=robot.disconnect,
+            cleanup=(
+                robot.disconnect_preserving_position
+                if preserve_position
+                else robot.disconnect
+            ),
         )
         if robot_error is not None:
             cleanup_failures.append(("robot disconnect", robot_error))
+        elif preserve_position and episode_workers_stopped:
+            _logger.warning(
+                "Exited with motor torque preserved at the last command. "
+                "The realtime controller has stopped; this is not an active "
+                "long-term support controller."
+            )
 
         if reset_controller is not None:
             try:
@@ -2812,8 +3661,7 @@ def _run(
         if session_error is not None:
             for label, failure in cleanup_failures:
                 session_error.add_note(
-                    f"additional {label} cleanup failure: "
-                    f"{type(failure).__name__}: {failure}"
+                    f"additional {label} cleanup failure: {type(failure).__name__}: {failure}"
                 )
                 if label == "robot disconnect" or isinstance(
                     failure, HardwareCleanupError
@@ -2827,8 +3675,7 @@ def _run(
                 if failure is robot_failure:
                     continue
                 error.add_note(
-                    f"additional {label} cleanup failure: "
-                    f"{type(failure).__name__}: {failure}"
+                    f"additional {label} cleanup failure: {type(failure).__name__}: {failure}"
                 )
             raise error from robot_failure
         elif cleanup_failures:
@@ -2845,8 +3692,7 @@ def _run(
                 if index == selected_index:
                     continue
                 first_failure.add_note(
-                    f"additional {label} cleanup failure: "
-                    f"{type(failure).__name__}: {failure}"
+                    f"additional {label} cleanup failure: {type(failure).__name__}: {failure}"
                 )
             _logger.error("%s cleanup failed", first_label)
             raise first_failure

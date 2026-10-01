@@ -255,10 +255,18 @@ class AxolEnableBusHandoffTest(unittest.IsolatedAsyncioTestCase):
         bus._state = "open"
         bus._writer = MagicMock(is_closing=lambda: False)
         self.assertTrue(bus.is_open)
-        with patch.object(self.hardware, "disconnect", AsyncMock()) as disconnect:
+
+        async def close_bus() -> None:
+            bus._state = "closed"
+
+        with patch.object(
+            self.hardware, "disconnect", AsyncMock(side_effect=close_bus)
+        ) as disconnect:
             with self.assertRaises(_LinkStartFailed):
                 await self.robot.enable()
         disconnect.assert_awaited_once()
+        # Nothing was brought up, so the rollback torques nothing off.
+        self.hardware.disable.assert_not_awaited()
 
 
 class AxolEnableRollbackBeforeCoreTest(unittest.IsolatedAsyncioTestCase):
@@ -299,6 +307,110 @@ class AxolEnableRollbackBeforeCoreTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.hardware, "disable", AsyncMock()) as disable:
             await self.robot.disable()
         disable.assert_awaited_once()
+
+
+class _BringUpFailed(Exception):
+    """Sentinel: ``_enable`` failed after the core started."""
+
+
+class AxolEnableRollbackKeepsHeldJointsTest(unittest.IsolatedAsyncioTestCase):
+    """A failed ``enable()`` torques off only the joints it brought up.
+
+    Reconnecting to a live robot finds some joints holding from the previous
+    session. The core's prep leaves them alone, and so must the rollback of a
+    bring-up that fails afterwards: the classic per-motor transaction —
+    cold joints off, held joints holding — not ``disable()``'s arm-wide
+    torque-off (or a core disarm, which disables every motor it prepared).
+    """
+
+    HELD = {Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.GRIPPER}
+
+    def setUp(self) -> None:
+        self.enterContext(patch.object(axol_module, "CanBus"))
+        self.enterContext(patch("almond_axol.rt.robot.RtLink"))
+        self.robot = Axol(left_channel="can0", right_channel=None)
+        self.hardware = self.robot._robot
+        self.arm = self.hardware.left
+        assert self.arm is not None
+        link = self.robot._link
+        for name in ("start", "configure", "prep", "arm", "disarm", "close"):
+            setattr(link, name, AsyncMock())
+        self.link = link
+        self.enterContext(patch.object(self.hardware, "connect", AsyncMock()))
+        self.enterContext(patch.object(self.hardware, "disconnect", AsyncMock()))
+        self.enterContext(patch.object(self.hardware, "disable", AsyncMock()))
+        flags = [joint in self.HELD for joint in self.arm.motors]
+        self.enterContext(
+            patch.object(self.arm, "get_holding", AsyncMock(return_value=flags))
+        )
+        self.disables = {
+            joint: self.enterContext(patch.object(motor, "disable", AsyncMock()))
+            for joint, motor in self.arm.motors.items()
+        }
+
+    def _assert_only_cold_joints_torqued_off(self) -> None:
+        for joint, disable in self.disables.items():
+            if joint in self.HELD:
+                disable.assert_not_awaited()
+            else:
+                disable.assert_awaited_once()
+        # Neither arm-wide torque-off may run: both would drop the held joints.
+        self.hardware.disable.assert_not_awaited()
+        self.link.disarm.assert_not_awaited()
+        self.link.close.assert_awaited_once()
+        self.hardware.disconnect.assert_awaited()
+        self.assertFalse(self.robot._armed)
+        self.assertFalse(self.robot._core_started)
+        self.assertIsNone(self.robot._enable_cold)
+
+    async def test_failure_before_arming_rolls_back_only_cold_joints(self) -> None:
+        # Fails right after the holding snapshot, with Python owning the bus.
+        with patch.object(
+            self.arm, "resolve_joint_offsets", AsyncMock(side_effect=_BringUpFailed())
+        ):
+            with self.assertRaises(_BringUpFailed):
+                await self.robot.enable()
+        self._assert_only_cold_joints_torqued_off()
+
+    async def test_failure_after_arming_rolls_back_only_cold_joints(self) -> None:
+        # Fails once the core holds the bus: the core is stopped without a
+        # disarm (it would disable the held joints too) and the cold joints
+        # are torqued off from Python over the reopened proxies.
+        self.hardware._left_bus.close = AsyncMock()
+        with (
+            patch.object(self.arm, "resolve_joint_offsets", AsyncMock()),
+            patch(
+                "almond_axol.motor.myactuator.MyActuatorMotor._detect_capabilities",
+                AsyncMock(),
+            ),
+            patch(
+                "almond_axol.motor.myactuator.MyActuatorMotor._apply_low_voltage_threshold",
+                AsyncMock(),
+            ),
+            patch.object(self.robot, "_bring_up_gripper", AsyncMock()),
+            patch.object(self.hardware, "get_positions", AsyncMock()),
+            patch.object(
+                self.robot,
+                "_wait_for_caches",
+                AsyncMock(side_effect=_BringUpFailed()),
+            ),
+        ):
+            with self.assertRaises(_BringUpFailed):
+                await self.robot.enable()
+        self.link.arm.assert_awaited_once()
+        self._assert_only_cold_joints_torqued_off()
+
+    async def test_failure_before_the_snapshot_touches_no_motor(self) -> None:
+        # Prep failed: nothing has been enabled, so the robot is left as found.
+        self.link.prep.side_effect = _BringUpFailed()
+        with self.assertRaises(_BringUpFailed):
+            await self.robot.enable()
+        for disable in self.disables.values():
+            disable.assert_not_awaited()
+        self.hardware.disable.assert_not_awaited()
+        self.link.disarm.assert_not_awaited()
+        self.link.close.assert_awaited_once()
+        self.assertFalse(self.robot._core_started)
 
 
 class MantisApiTest(unittest.TestCase):

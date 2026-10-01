@@ -1,0 +1,39 @@
+---
+title: "Axol Standalone"
+description: "Bolt Axol to your own table or fixture, then fit the cameras, power, and wiring."
+---
+
+import MountAxol from "/snippets/hardware/mount-axol.mdx";
+import Power from "/snippets/hardware/power.mdx";
+
+Axol ships fully assembled. In the standalone configuration you provide the table or fixture: drill or tap its top for Axol's four **M8** mounting holes using the [mounting holes diagram](https://www.almond.bot/resources/axol_mounting_holes.pdf), and make sure the surface is rigid enough to take the arms' reaction loads without flexing.
+
+<Tip>
+  If you're mounting to a T-slot table, the [Owl Mount](/hardware-setup/owl-mount) drops onto 2020, 4040, and 4545 extrusion patterns without drilling.
+</Tip>
+
+### Tools required
+
+You'll need a hex (Allen) key for the socket head cap screws that hold Axol to your fixture:
+
+| Screw | Hex key |
+|---|---|
+| M8 | 6&nbsp;mm |
+
+<MountAxol />
+
+<Power />
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
+    Mount the Camera Kit's wrist and head cameras and wire them to the compute.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the robot machine and open the web control panel.
+  </Card>
+  <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
+    Back to the setup guides for every configuration.
+  </Card>
+</CardGroup>

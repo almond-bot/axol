@@ -41,6 +41,7 @@ from ..constants import ARM_JOINTS, Joint
 from ..robot import Axol
 from ..teleop.recorder import TeleopRecorder
 from ..teleop.recorder import make as _recorder_make
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import GravityCompCmdConfig, parse
 
 
@@ -80,6 +81,7 @@ def main(argv: list[str]) -> None:
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
     try:
         asyncio.run(_run(cfg))
     except KeyboardInterrupt:

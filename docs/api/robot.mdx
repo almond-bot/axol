@@ -184,6 +184,51 @@ if cfg is not None:
     jelly = Jelly(cfg)
 ```
 
+### Battery
+
+Jelly's charge is estimated from the 24 V rail that the jelly_legs lift
+controller measures (its `GET_POWER` telemetry). The estimate uses the resting
+LiFePO4 curve of the two 24 V 50 Ah packs wired in parallel (8S, 100 Ah).
+While Jelly is enabled with its lift, `jelly.battery` updates about once a
+second. It returns `None` before the first reading, with no pack connected (the
+board is running from USB), or on firmware that doesn't answer `GET_POWER`.
+`read_battery()` takes a single reading without enabling anything. It never
+sends a motion command.
+
+```python
+import asyncio
+from almond_axol.robot import read_battery, read_power
+
+async def main():
+    battery = await read_battery()         # None if the lift board is silent
+    if battery is not None:
+        print(f"{battery.percent:.0f}% ({battery.voltage:.2f} V)")
+        print(battery.charging, battery.under_load, battery.remaining_ah)
+
+    power = await read_power()             # raw telemetry: rail volts, leg amps
+    if power is not None:
+        print(power.supply_volts, power.leg_currents)
+
+asyncio.run(main())
+```
+
+Both return a `BatteryStatus`:
+
+| Field | Description |
+|---|---|
+| `percent` | State of charge, 0–100, from the published LiFePO4 resting-voltage curve (EVE's per-cell chart, times 8). Jelly never fully rests, so it can read well below the packs' own BMS on the flat middle of the curve |
+| `voltage` | Pack voltage (smoothed while resting) |
+| `charging` | Rail above any resting voltage (≥ 27.1 V, clearing below 27.05 V): a charger is connected; `percent` reads near full and is meaningless while charging. Early in a charge a low pack can stay under the threshold, so `False` does not rule a charger out |
+| `under_load` | Only a reading taken while the lift or wheels were moving exists, so the estimate reads low |
+
+`battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity.
+
+The curve is EVE's published LiFePO4 resting-voltage chart per cell (3.40 V
+full, 3.26 V half, 3.20 V at 20%), times eight for Jelly's 8S packs. LiFePO4
+voltage barely moves through the middle of its charge (about 0.16 V across the
+pack from 40% to 60%), so treat `percent` as a band. The estimate also can't be
+better than the board's ADC, which can be off by a few hundred millivolts.
+
 ## `Sim`
 
 `Sim` implements the same interface as `Axol`. Use it to visualise motion without hardware. Requires the `sim` extra.

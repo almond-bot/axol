@@ -974,8 +974,9 @@ export default function Diagnostics() {
       ),
     [commands, robot?.profile]
   )
-  // The Diagnostics category splits into three dashboard sections. A host
-  // that predates the section field sends none — everything then lands under
+  // The Diagnostics category splits into three dashboard sections: Tests and
+  // Helpers here, and the tuning workbench's tabs for "tuning". A host that
+  // predates the section field sends none — everything then lands under
   // Tests, which matches the old single-section layout.
   const testCommands = useMemo(
     () => diagCommands.filter((c) => (c.section ?? "test") === "test"),
@@ -1479,23 +1480,12 @@ export default function Diagnostics() {
           </div>
         </section>
 
-        {/* Diagnostics actions */}
-        <section className="flex flex-col gap-3">
-          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
-          <DiagnosticActions
-            commands={diagCommands}
-            activeCommand={activeRun?.command ?? null}
-            activeSince={activeRun?.session.startedAt ?? null}
-            busy={launchBusy}
-            disabled={!serverOk || busyElsewhere}
-            hiddenKeys={configHiddenKeys}
-            pickerJoints={joints}
-            onLaunch={launch}
-            onStop={stopActive}
-          />
-        </section>
+        {/* Each Diagnostics command has exactly one home: Tests or Helpers
+            below, or a tab of the tuning workbench for the "tuning" section
+            (a tuning command without a tab, like the retired offline filter
+            test, stays CLI-only). */}
 
-        {/* Tests: pass/fail checks (ROM soaks, camera cable). */}
+        {/* Tests: pass/fail checks (ROM soak, lift cycle, camera cable). */}
         {testCommands.length > 0 && (
           <section className="flex flex-col gap-3">
             <h2 className="font-heading text-base font-semibold">Tests</h2>
@@ -1513,7 +1503,7 @@ export default function Diagnostics() {
           </section>
         )}
 
-        {/* Helpers: utility moves (lift homing / height). */}
+        {/* Helpers: utility moves (ROM cleanup, lift homing / height). */}
         {helperCommands.length > 0 && (
           <section className="flex flex-col gap-3">
             <h2 className="font-heading text-base font-semibold">Helpers</h2>

@@ -7,12 +7,23 @@
 
 use crate::can::CanSock;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const STALL_DETECT: Duration = Duration::from_secs(1);
 const PURGE_DEDUPE: Duration = Duration::from_secs(3);
 static LAST_PURGE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// The provisioned bring-up script — `almond_axol.constants.CAN_BRINGUP_SCRIPT`.
+/// Root-owned and outside the operator-writable state tree, which is why
+/// `axol provision` grants the purge a NOPASSWD sudo rule for exactly this
+/// path (`almond_axol.utils.can_purge`).
+const BRINGUP_SCRIPT: &str = "/etc/almond-axol/can/startup.sh";
+/// Where `axol can.setup` wrote the same script before the move to
+/// `/etc`. Still honoured so a purge works on a robot that has not been
+/// re-provisioned yet; `axol provision` deletes the root references to it.
+const LEGACY_BRINGUP_SCRIPT: &str = ".almond/can/startup.sh";
 
 fn is_tx_full(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EAGAIN))
@@ -68,17 +79,41 @@ fn run_root(args: &[&str]) -> io::Result<std::process::ExitStatus> {
         .status()
 }
 
+/// The bring-up script to flap with, provisioned location first.
+///
+/// Split out from [`purge_tx_queue`] so the preference order is testable: a
+/// core running as root under systemd has `HOME=/root` and a manual run has
+/// the operator's, so keying only off `$HOME` (as this did) missed the
+/// script on every provisioned robot and silently fell back to the
+/// single-interface flap below.
+fn bringup_script_in(provisioned: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if provisioned.is_file() {
+        return Some(provisioned.to_path_buf());
+    }
+    home.map(|h| h.join(LEGACY_BRINGUP_SCRIPT))
+        .filter(|p| p.is_file())
+}
+
+fn bringup_script() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    bringup_script_in(Path::new(BRINGUP_SCRIPT), home.as_deref())
+}
+
 /// Drop frames queued behind a dead bus by flapping the CAN interface.
 ///
 /// Prefer the installed bring-up script because the dual-channel adapter is
 /// most reliable when both channels are flapped together. A purge performed
 /// for the other arm within the last three seconds counts for this arm too.
+///
+/// Returns false when the flap could not be run at all — most often because
+/// escalation failed: `run_root` uses `sudo -n`, so an operator account
+/// without the provisioned NOPASSWD rule (and without a cached credential)
+/// cannot purge. The callers say so in their stall report, and the next
+/// session's bring-up refuses to enable into a queue that is still poisoned
+/// (`almond_axol.cli.can.setup.purge_stale_tx`).
 pub fn purge_tx_queue(iface: &str) -> bool {
     let mut last = LAST_PURGE.lock().unwrap();
-    let script = std::env::var("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".almond/can/startup.sh"))
-        .ok()
-        .filter(|p| p.exists());
+    let script = bringup_script();
     if script.is_some() && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE) {
         return true;
     }
@@ -98,5 +133,56 @@ pub fn purge_tx_queue(iface: &str) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A unique scratch directory; the crate has no dev-dependencies.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "axol-rt-safety-{}-{tag}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".almond/can")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prefers_the_provisioned_script_over_the_operator_copy() {
+        // The bug this guards: keying only off $HOME found the legacy copy on
+        // an un-provisioned robot and *nothing* on a provisioned one, so every
+        // e-stop purge fell back to the single-interface flap that wedges the
+        // dual-channel adapter's RX path.
+        let dir = scratch("both");
+        let provisioned = dir.join("etc-startup.sh");
+        std::fs::write(&provisioned, "#!/bin/bash\n").unwrap();
+        std::fs::write(dir.join(LEGACY_BRINGUP_SCRIPT), "#!/bin/bash\n").unwrap();
+        assert_eq!(
+            bringup_script_in(&provisioned, Some(&dir)),
+            Some(provisioned)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_operator_copy_before_provisioning() {
+        let dir = scratch("legacy");
+        let legacy = dir.join(LEGACY_BRINGUP_SCRIPT);
+        std::fs::write(&legacy, "#!/bin/bash\n").unwrap();
+        assert_eq!(
+            bringup_script_in(&dir.join("absent.sh"), Some(&dir)),
+            Some(legacy)
+        );
+    }
+
+    #[test]
+    fn no_script_anywhere_leaves_the_ip_link_fallback() {
+        let dir = scratch("none");
+        assert_eq!(bringup_script_in(&dir.join("absent.sh"), Some(&dir)), None);
+        assert_eq!(bringup_script_in(&dir.join("absent.sh"), None), None);
     }
 }

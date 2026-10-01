@@ -38,6 +38,7 @@ from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
+from ...utils.logquiet import quiet_noisy_loggers
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -270,6 +271,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def run(args: argparse.Namespace) -> None:
     """Run the left-arm repeatability test (rest ↔ target cycles)."""
     logging.basicConfig(level=getattr(logging, args.log_level))
+    quiet_noisy_loggers()
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:

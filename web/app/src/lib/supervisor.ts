@@ -51,6 +51,8 @@ export interface CommandSpec {
   perRunFields?: string[]
   /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
   suggestedFields?: string[]
+  /** Suggested fields whose value must be one of the suggestions (rendered as a select). */
+  strictFields?: string[]
   /** Drives episodes the panel can start / save / discard. */
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
@@ -200,7 +202,7 @@ export async function fetchInfo(): Promise<ServerInfo> {
 export type UpdateState = "idle" | "updating" | "error"
 
 /** Current step while an update is applying; null when not updating. */
-export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
+export type UpdatePhase = "upgrading" | "provisioning" | "restarting" | "rebooting"
 
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
@@ -214,7 +216,7 @@ export interface UpdateStatus {
   /** Safe to restart now (no op running). */
   idle: boolean
   state: UpdateState
-  /** Step while state is "updating" (upgrading/provisioning/restarting); else null. */
+  /** Step while state is "updating" (upgrading/provisioning/restarting/rebooting); else null. */
   phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */
   error: string | null
@@ -518,10 +520,31 @@ export interface JellyWheelsStatus extends JellyLinkStatusBase {
   reachableCount: number
 }
 
+/**
+ * Jelly's battery, estimated from the 24 V rail the lift board measures
+ * (two LiFePO4 packs in parallel; see almond_axol/robot/battery.py).
+ */
+export interface JellyBattery {
+  /** Pack volts (smoothed while resting). */
+  voltage: number
+  /** State of charge, 0-100, from the resting-voltage curve. */
+  percent: number
+  /** Rail held above any resting voltage: a charger is connected. */
+  charging: boolean
+  /** Only a reading taken under lift/wheel load so far: reads low. */
+  underLoad: boolean
+  /** Seconds since the reading, measured on the robot. */
+  ageSeconds: number
+  /** False while a task owns the bus or the board went quiet: last known. */
+  live: boolean
+}
+
 export interface JellyLiftStatus extends JellyLinkStatusBase {
   /** Whether the board answered recently; null while nobody polls it. */
   reachable: boolean | null
   status: LiftBoardStatus | null
+  /** Absent on older hosts; null before a reading, with no pack, or on old firmware. */
+  battery?: JellyBattery | null
 }
 
 export interface JellyStatus {
@@ -671,6 +694,64 @@ export interface EpisodeControlSpec {
   /** The current server-side text, prefilled whenever the input (re)appears
    *  so a submitted value survives phase changes and can be edited. */
   value?: string
+  /** Send the text by itself shortly after typing stops (no Enter or submit
+   *  button needed); a click on one of the box's buttons sends pending text
+   *  first. For inputs whose value the op reads later, e.g. the next
+   *  episode's task name read when recording starts. */
+  autoSubmit?: boolean
+}
+
+/** One labelled line of an episode brief; a list value renders one entry per line. */
+export interface EpisodeBriefItem {
+  label: string
+  value: string | string[]
+  /** Call it out (e.g. which arm to use). */
+  emphasis?: boolean
+}
+
+/** One thing drawn in a cell of an episode brief's layout grid. */
+export interface EpisodeBriefPlacement {
+  /** Keys into the grid's `cols` / `rows`. */
+  col: string
+  row: string
+  label: string
+  detail?: string
+  /** How it is drawn: `object` (what the episode manipulates), `target` (where
+   *  it goes), `zone` (an area to keep clear / place into), `reference`,
+   *  `container`, `distractor`. Unknown roles draw neutrally. */
+  role?: string
+  /** Orientation in degrees, counter-clockwise seen from above. */
+  rotation?: number
+}
+
+/** A top-down layout diagram: rows run away from the viewer (first row
+ *  farthest), columns left to right; `footer` names the near edge. */
+export interface EpisodeBriefGrid {
+  cols: { key: string; label: string }[]
+  rows: { key: string; label: string }[]
+  items: EpisodeBriefPlacement[]
+  footer?: string
+}
+
+/**
+ * A structured instruction card for the episode about to record (or
+ * recording): e.g. a scripted scene's setup, so an operator can arrange the
+ * workspace without reading a spreadsheet. Everything but `title` optional.
+ */
+export interface EpisodeBrief {
+  /** Small caption above the title (a section / group name). */
+  eyebrow?: string
+  title: string
+  /** Short status chip beside the title ("Already recorded"). */
+  tag?: string
+  /** `done` tints the card as completed. */
+  tone?: "default" | "done"
+  /** The instruction itself, shown large. */
+  headline?: string
+  items?: EpisodeBriefItem[]
+  note?: string
+  progress?: { done: number; total: number; label?: string }
+  grid?: EpisodeBriefGrid
 }
 
 export interface PolicyState {
@@ -685,6 +766,10 @@ export interface PolicyState {
   /** 1-based number of the episode being recorded next/now, when the op
    *  tracks a dataset episode index (mirrors the headset HUD readout). */
   episode?: number
+  /** The dataset this session records into (the dataset preview follows it). */
+  dataset?: { repoId: string; root: string }
+  /** What to set up / do for this episode, as a card above the status line. */
+  brief?: EpisodeBrief
 }
 
 export interface OpStatus {
@@ -759,6 +844,95 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** Where one camera's frames for an episode sit inside its mp4 (seconds). */
+export interface EpisodeVideoSpan {
+  from: number
+  to: number
+}
+
+/** One saved episode, as the dataset preview lists it. */
+export interface DatasetEpisode {
+  /** LeRobot's 0-based episode_index. */
+  index: number
+  length: number
+  durationS: number
+  tasks: string[]
+  /** Keyed by camera feature (e.g. observation.images.overhead). */
+  videos: Record<string, EpisodeVideoSpan>
+}
+
+export interface DatasetEpisodes {
+  repoId: string
+  root: string
+  fps: number
+  cameras: string[]
+  /** Every task string in the dataset, in task_index order. */
+  tasks: string[]
+  episodes: DatasetEpisode[]
+  /** meta/episodes files that could not be read (a save in progress). */
+  unreadableFiles: number
+}
+
+/** A dataset's saved episodes (includes a live session's, once saved). */
+export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpisodes> {
+  const q = new URLSearchParams({ repo_id: repoId })
+  return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
+}
+
+/** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
+ *  `dataset_browser.preview_step`; 1 = every frame). */
+export function previewStep(datasetFps: number, previewFps: number): number {
+  if (previewFps <= 0 || datasetFps <= 0) return 1
+  return Math.max(1, Math.round(datasetFps / previewFps))
+}
+
+/** Where a player finds one camera's episode: the URL and its span in it. */
+export interface EpisodeVideoSource {
+  url: string
+  span: EpisodeVideoSpan
+}
+
+/**
+ * One camera's episode video, as the host's player cut: just the episode
+ * (starting at 0), with the mp4's index first so it plays before it has
+ * downloaded, keeping every Nth frame for a `previewFps` below the dataset's
+ * (0 = every frame). The media fragment makes the browser stop at the end.
+ */
+export function episodeVideoSource(
+  repoId: string,
+  episode: DatasetEpisode,
+  camera: string,
+  datasetFps: number,
+  previewFps = 0
+): EpisodeVideoSource {
+  const original = episode.videos[camera]
+  const span = { from: 0, to: original.to - original.from }
+  const q = new URLSearchParams({
+    repo_id: repoId,
+    episode: String(episode.index),
+    camera,
+    fps: String(previewFps > 0 ? previewFps : datasetFps || 1),
+  })
+  const fragment = `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}`
+  return { url: apiUrl(`/api/datasets/video?${q}${fragment}`), span }
+}
+
+/** Rename a saved episode's task (409 while a save holds the dataset). */
+export async function setEpisodeTask(
+  repoId: string,
+  episode: number,
+  task: string
+): Promise<DatasetEpisode> {
+  const res: { episode: DatasetEpisode } = await json(
+    await fetch(apiUrl(`/api/datasets/episodes/${episode}/task`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoId, task }),
+    })
+  )
+  return res.episode
 }
 
 /** One row of a per-run field's server-side pick list. */
@@ -1384,6 +1558,8 @@ export interface OperationMeta {
   fields: string[]
   /** Per-run fields whose values the host suggests (typing stays free-form). */
   suggestedFields: string[]
+  /** Suggested fields that take only a suggested value: a select, no free typing. */
+  strictFields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
   /** Needs at least one camera serial configured (collect-data / run-policy). */
@@ -1421,6 +1597,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["sim"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
@@ -1438,6 +1615,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -1456,6 +1634,7 @@ export const OPERATIONS: OperationMeta[] = [
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -1477,6 +1656,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop", "interpolate"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -1495,6 +1675,7 @@ export const OPERATIONS: OperationMeta[] = [
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
     suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -1524,6 +1705,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     description: s.description,
     fields: s.perRunFields ?? [],
     suggestedFields: s.suggestedFields ?? [],
+    strictFields: s.strictFields ?? [],
     // Every in-process operation drives the arms; only a sim run doesn't, and
     // that's decided per run from simFlag.
     requiresRobot: true,
@@ -1606,6 +1788,34 @@ export function perRunFields(
   return [...byKey.values()]
     .filter((f) => runFieldVisible(f.key, profile))
     .sort((a, b) => Number(b.required) - Number(a.required))
+}
+
+/** The `policy_type` value for the custom policy interface. */
+export const CUSTOM_POLICY_TYPE = "custom"
+
+const CUSTOM_POLICY_PATH_HELP =
+  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
+
+/** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
+export function isCustomPolicyRun(values: Record<string, unknown>): boolean {
+  return values.policy_type === CUSTOM_POLICY_TYPE
+}
+
+/**
+ * Per-run field rules that depend on the chosen policy type. A LeRobot policy
+ * needs its checkpoint path; a custom policy endpoint selects its own model,
+ * so the path is unused and is not sent. The host marks `policy_path` optional
+ * so a custom run can start; this re-marks it required for every other policy
+ * type. Ops without a `policy_type` field pass through untouched.
+ */
+export function applyPolicyTypeRules(fields: SchemaField[], custom: boolean): SchemaField[] {
+  if (!fields.some((f) => f.key === "policy_type")) return fields
+  return fields.map((f) => {
+    if (f.key !== "policy_path") return f
+    return custom
+      ? { ...f, required: false, help: CUSTOM_POLICY_PATH_HELP }
+      : { ...f, required: true }
+  })
 }
 
 // ---------------------------------------------------------------------------

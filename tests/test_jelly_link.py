@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from almond_axol.robot.battery import battery_percent
 from almond_axol.serve import app as app_module
 from almond_axol.serve import jelly_link
 from almond_axol.serve.jelly_link import (
@@ -39,11 +40,11 @@ from almond_axol.serve.robot_link import (
 )
 from almond_axol.serve.runner import OperationRunner
 from tests.test_serve_session_reservation import (
+    _hub_state,
     _Jelly,
     _Manager,
     _Robot,
     _Runner,
-    _hub_state,
     _test_app,
 )
 
@@ -374,6 +375,53 @@ class LiftDeviceSnapshotTest(unittest.TestCase):
         self.assertIsNone(board["driversEnabled"])
         self.assertIsNone(board["vmPresent"])
         self.assertIsNone(board["driverFaultMask"])
+
+    def test_power_frame_reports_the_battery(self) -> None:
+        device = _LiftDevice()
+        self.assertIsNone(device.snapshot(polling=True)["battery"])
+        device._on_message(
+            SimpleNamespace(
+                arbitration_id=0x422,
+                data=struct.pack("<HHHBB", 26350, 26, 23, 0, 0x03),
+            )
+        )
+        battery = device.snapshot(polling=True)["battery"]
+        self.assertEqual(battery["voltage"], 26.35)
+        self.assertEqual(battery["percent"], round(battery_percent(26.35), 1))
+        self.assertFalse(battery["charging"])
+        self.assertFalse(battery["underLoad"])
+        self.assertTrue(battery["live"])
+        self.assertLess(battery["ageSeconds"], 1.0)
+
+    def test_battery_outlives_a_hand_over_as_last_known(self) -> None:
+        device = _LiftDevice()
+        device._on_message(
+            SimpleNamespace(
+                arbitration_id=0x422,
+                data=struct.pack("<HHHBB", 26630, 0, 0, 0, 0x03),
+            )
+        )
+        device.last_power_monotonic = time.monotonic() - 600.0
+        # A task owns the bus: the last reading stays, marked not live.
+        battery = device.snapshot(polling=False)["battery"]
+        self.assertEqual(battery["percent"], round(battery_percent(26.63), 1))
+        self.assertFalse(battery["live"])
+        self.assertGreaterEqual(battery["ageSeconds"], 600.0)
+        # Polling again but the board went quiet: still not live.
+        self.assertFalse(device.snapshot(polling=True)["battery"]["live"])
+
+    def test_ping_polls_status_and_power(self) -> None:
+        device = _LiftDevice()
+        sent: list[bytes] = []
+
+        async def send(arbitration_id: int, data: bytes) -> bool:
+            self.assertEqual(arbitration_id, 0x420)
+            sent.append(data)
+            return True
+
+        device._bus = SimpleNamespace(_send=send)  # type: ignore[assignment]
+        asyncio.run(device.ping())
+        self.assertEqual(sent, [b"\x04", b"\x08"])
 
     def test_other_frames_are_ignored(self) -> None:
         device = _LiftDevice()

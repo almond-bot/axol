@@ -28,6 +28,7 @@ This module provides the pieces shared by all five commands:
   semantics (defaults -> shared settings -> ``--config_path`` file -> CLI
   flags).
 - :func:`register_literal` plus the :data:`LogLevel` / :data:`PolicyType` /
+  :data:`RunPolicyType` /
   :data:`AggregateFn` aliases it registers with draccus so it validates
   choices the way ``argparse``'s ``choices=`` used to. ``lerobot`` config
   modules call :func:`register_literal` for their own ``Literal`` fields.
@@ -149,6 +150,10 @@ DatasetResolution = register_literal(Literal["SVGA", "HD1080", "HD1200"])
 PolicyType = register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 )
+# run-policy and collect-dagger also accept ``custom`` for a remote endpoint
+# speaking the continuation-aware custom policy interface instead of loading
+# a LeRobot checkpoint. Both commands require the same wire-version-2 contract.
+RunPolicyType = register_literal(Literal[PolicyType, "custom"])
 AggregateFn = register_literal(
     Literal[
         "temporal_ensemble",

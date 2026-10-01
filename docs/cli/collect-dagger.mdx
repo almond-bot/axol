@@ -3,7 +3,7 @@ title: "collect-dagger"
 description: "DAgger data collection: a trained policy drives while the operator intervenes from VR, and both are recorded."
 ---
 
-Runs a trained policy on the robot while the operator watches in VR and steps in to correct it, recording the whole session — policy segments **and** human corrections — to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. It's the [DAgger](https://arxiv.org/abs/1011.0686) loop: gather demonstrations exactly where the policy struggles, so a retrain fixes those failures. Inference runs in-process (one action per control tick), and everything else — cameras, recording, the guarded return-to-rest — follows [`collect-data`](/cli/collect-data). Loops until `Ctrl+C`.
+Runs a trained policy on the robot while the operator watches in VR and steps in to correct it, recording the whole session — policy segments **and** human corrections — to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. It's the [DAgger](https://arxiv.org/abs/1011.0686) loop: gather demonstrations exactly where the policy struggles, so a retrain fixes those failures. Local policies run inference in-process (one action per control tick); [remote policies](#remote-policies-through-the-custom-policy-interface) use a background desktop connection. Cameras and recording follow [`collect-data`](/cli/collect-data).
 
 <Warning>
   Load only policy checkpoints and resumed datasets that you created or
@@ -11,31 +11,31 @@ Runs a trained policy on the robot while the operator watches in VR and steps in
   parsing are not sandboxed.
 </Warning>
 
-The VR grip ("side") buttons drive the intervention during an episode: while the policy is driving, **either grip alone** freezes it (the robot holds pose and recording pauses); **both grips** hand control to the operator (teleop engages at the robot's current pose and recording resumes); **either grip alone** again hands it back to the policy. Nothing is recorded during the frozen gap, so the dataset flows straight from the policy's motion into the correction. Rows recorded while the operator drives are tagged with LeRobot's per-frame `intervention` flag.
+For local policies, the VR grip ("side") buttons drive the intervention during an episode: while the policy is driving, **either grip alone** freezes it (the robot holds pose and recording pauses); **both grips** hand control to the operator (teleop engages at the robot's current pose and recording resumes); **either grip alone** again hands it back to the policy. Nothing is recorded during the frozen gap, so the dataset flows straight from the policy's motion into the correction. Remote policies use [hold-to-intervene controls](#remote-policies-through-the-custom-policy-interface). Both modes tag operator rows with LeRobot's per-frame `intervention` flag.
 
-Episode boundaries work like `collect-data`: press the **record** button to start an episode (the policy starts driving and recording begins), press it again to save, or press it with the **reset** button held to discard and re-record. On stdin, `s` saves, `r` discards, and `q` discards and quits; `--episode_time_s` is a safety cap that saves the episode if nothing is pressed. With `--subtasks` supplied, typing a number `1..N` switches the policy's instruction mid-episode without ending it.
+Episode boundaries work like `collect-data`: press the **record** button to start an episode (the policy starts driving and recording begins), press it again to save, or press it with the **reset** button held to discard and re-record. On stdin, `s` saves, `r` discards, and `q` discards and quits; `--episode_time_s` is a safety cap that saves the episode if nothing is pressed. For local policies with `--subtasks` supplied, typing a number `1..N` switches the policy's instruction mid-episode without ending it.
 
 <Tip>
   For the end-to-end workflow — from a trained checkpoint to recorded corrections — see the [DAgger Collection guide](/operations/dagger).
 </Tip>
 
-This command is configured via draccus. The policy side mirrors [`run-policy`](/cli/run-policy) (`--policy_path` / `--policy_type` / `--device`, but inference is in-process and synchronous), and the recording side mirrors [`collect-data`](/cli/collect-data) (the nested `robot_config` / `teleop_config` configs — cameras, per-joint gains, IK, VR server). Nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration) for the syntax and [DAgger Collection Config Parameters](/operations/dagger-config) for every field and its default.
+This command is configured via draccus. Local inference uses `--policy_path`, `--policy_type` and `--device` and runs synchronously in-process. `--policy_type custom` selects the [custom policy interface](/api/policy-plan), with observation acquisition and inference outside the control loop. The recording side mirrors [`collect-data`](/cli/collect-data): nested `robot_config` / `teleop_config` settings select cameras, per-joint gains, IK and the VR server. Nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration) for the syntax and [DAgger Collection Config Parameters](/operations/dagger-config) for the settings reference.
 
-Policy observations use the same exposure-time synchronization as `run-policy`: the median camera exposure selects the nearest 240 Hz robot-state sample. The inferred action is published to the recorder with that exposure timestamp, so DAgger policy rows do not pair later joint values with earlier images.
+Policy observations use the same exposure-time synchronization as `run-policy`: the median camera exposure selects the nearest 240 Hz robot-state sample. Local inference publishes its action with that observation's exposure timestamp. Remote collection instead publishes measured state and the locally dispatched action at each control tick; the recorder pairs camera exposures with this history independently of inference timing. A delayed remote reply therefore does not assign its old observation timestamp to a newly dispatched command.
 
 | Flag | Description |
 |---|---|
-| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
-| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy_path` (required) |
+| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID; required for local policies. Unused by custom policies, which leave model selection to the endpoint |
+| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot,custom}` | Local policy architecture, or `custom` for a remote endpoint using the custom policy interface (required) |
 | `--task TEXT` | Natural language task description recorded with the dataset (required) |
 | `--repo_id <user>/<dataset>` | Dataset repo ID the episodes are recorded to (required). Point it at an existing dataset to **resume** it — new episodes append with the same resume/repair semantics as [`collect-data`](/cli/collect-data) |
-| `--subtasks '["step one", "step two"]'` | Ordered per-step instructions, as one inline JSON/YAML list. Typing a number `1..N` + Enter (or pushing it from the panel) switches the instruction sent to the policy mid-episode without ending it; the dataset's task string stays `--task`. Default: none |
-| `--episode_time_s INT` | Safety cap per episode in seconds (default: 600); hitting it saves the episode. Generous by default because DAgger episodes include interventions |
-| `--fps INT` | Policy and recording frame rate (default: 60). The policy and frozen states tick at this rate and the dataset is sampled at it, so it must match the policy's training fps. Camera capture may be faster, but cannot be slower. The independent headset stream remains fixed at 30 fps. |
+| `--subtasks '["step one", "step two"]'` | Local policies only: ordered per-step instructions, as one inline JSON/YAML list. Typing a number `1..N` + Enter (or pushing it from the panel) switches the instruction sent to the policy mid-episode without ending it; the dataset's task string stays `--task`. Default: none |
+| `--episode_time_s INT` | Safety cap per episode in seconds (default: 600); hitting it saves the episode. `0` removes the cap |
+| `--fps INT` | Policy and recording frame rate (default: 30). The policy and frozen states tick at this rate and the dataset is sampled at it, so it must match the policy's training fps (a checkpoint trained on 60 fps data needs `--fps 60`). Cameras capture at 60 and are decimated to this before encoding, so it cannot exceed the capture rate. The independent headset stream remains fixed at 30 fps. |
 | `--teleop_hz INT` | Motor command rate while the operator is engaged — the intervention (teleop) state only (default: 120). Decoupled from `--fps` for smoother commanded motion, exactly like [`collect-data`](/cli/collect-data); the teleop smoothing frequency is pinned to this value. The policy and frozen states always tick at `--fps` |
 | `--policy_fps INT` | Rate the relay delivers **policy observation** frames at (default: 20; capped at the capture rate). The dataset still records every `--fps` exposure — this only thins the RGB ring the control process reads its inference images from, ahead of the GPU conversion, so the relay's three per-camera branches fit beside the headset and panel streams. Between ring frames a tick re-uses the last frame set (the loop, the recorder's state rows and the action stream all stay at `--fps`); the RTC runner only requests a new chunk every few hundred ms anyway |
-| `--policy_max_vel FLOAT` | Per-joint velocity ceiling (rad/s) for the envelope over the **policy's** arm actions (default: 6.2832 = 2π). Transparent for normal trained motion; it only engages on discontinuities — a policy outlier or a re-plan from a stale observation — so a bad action can't snap the arms. `0` disables it. Teleop actions are already shaped by the teleop smoothing stack |
-| `--policy_max_accel FLOAT` | Per-joint acceleration ceiling (rad/s²) for that policy-action envelope (default: 21.9911 = 7π) |
+| `--policy_max_vel FLOAT` | Local policies only: per-joint velocity ceiling (rad/s) for the arm-action envelope (default: 6.2832 = 2π); `0` disables it. Cartesian actions use the robot's IK execution path instead. Remote handback uses the joint transition described below |
+| `--policy_max_accel FLOAT` | Local policies only: per-joint acceleration ceiling (rad/s²) for that action envelope (default: 21.9911 = 7π) |
 | `--device STR` | PyTorch device for the in-process policy inference (default: `cuda`); use `cpu` with the hosted aarch64/Jetson CPU-only PyPI Torch build, or explicitly manage a JetPack-compatible Torch + Torchvision build |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC; the independent full-resolution headset stream is fixed at 30 fps. Resuming an existing dataset keeps its original resolution regardless of this flag |
 | `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Same capped-VBR NVENC encode path as [`collect-data`](/cli/collect-data) |
@@ -43,7 +43,7 @@ Policy observations use the same exposure-time synchronization as `run-policy`: 
 | `--push_to_hub true` | Push the dataset to HuggingFace Hub when done |
 | `--robot_config.cameras DICT` | The camera slots (`overhead` / `left_arm` / `right_arm`) to use, with each ZED camera's serial, as one inline YAML/JSON value: `--robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"`. Assign the cameras the policy was trained on — **at least one with recording enabled** (the policy fail-fasts on a visual-feature mismatch at connect). Same syntax and stereo auto-detection as [`collect-data`](/cli/collect-data) |
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]` (default: 0.5). Should match the value used when the policy's data was collected, so corrections are recorded under the same dynamics. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot) |
-| `--teleop_config.vr_teleop_config.reset_torque_threshold FLOAT` | Contact watchdog for **every** return-to-rest — the between-episode home and each idle-phase reset (default: 4.0 Nm). A sustained torque residual (measured minus modeled gravity) stops the move and drops the arms into a limp **gravity-compensation hold**; free them by hand, then press the VR **reset** button (or continue at the gate) to replan from where they are. `0` disables the watchdog. Shared with [`teleop`](/cli/teleop) and [`collect-data`](/cli/collect-data) |
+| `--teleop_config.vr_teleop_config.reset_torque_threshold FLOAT` | Contact watchdog for **every** return-to-rest — the between-episode home and each idle-phase reset (default: 6.0 Nm). A sustained torque residual (measured minus modeled gravity) stops the move and drops the arms into a limp **gravity-compensation hold**; free them by hand, then press the VR **reset** button (or continue at the gate) to replan from where they are. `0` disables the watchdog. Shared with [`teleop`](/cli/teleop) and [`collect-data`](/cli/collect-data) |
 | `--teleop_config.vr_teleop_config.reset_gravity_comp_kd FLOAT` | Velocity damping (Nm·s/rad) for that contact-fallback hold (default: 0.25); same semantics as [`gravity-comp`](/cli/gravity-comp) `--kd` |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
@@ -61,7 +61,7 @@ axol collect-dagger --policy_path ./checkpoints/epoch_100 --policy_type smolvla 
     --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
 ```
 
-## Intervention flow
+## Local-policy intervention flow
 
 The grip buttons move control between the policy and the operator during an episode. A takeover engages teleop at the robot's **measured** pose (the IK worker and smoothing filters are synced to it first, so engaging never drags the arm toward a stale target), and the **grippers adopt the controller triggers immediately** — pre-set the triggers before you squeeze the grips (hold a trigger down so a held part stays gripped). When you hand back, the policy backend is reset so it re-plans from the corrected pose instead of continuing from its pre-freeze state.
 
@@ -73,9 +73,72 @@ The grip buttons move control between the policy and the operator during an epis
 
 Between episodes the grips work as plain teleop (both to engage, one to disengage — nothing is recorded) so you can reset the scene with the arms, and the VR **reset** button homes them on demand. The VR reset button and the startup trajectory are disabled *inside* an episode: episodes end from the record button, and homing is the collision-aware `IKResetController`'s job. If the headset link goes stale mid-intervention, tracking auto-disengages and control hands back to the policy.
 
+## Remote policies through the custom policy interface
+
+`--policy_type custom` runs inference on a desktop using
+the custom policy interface. It requires `--hold_to_intervene true`: hold
+either grip to control that arm; the other arm holds its pose. Release both
+to return to the policy. A lost headset connection with grips held keeps
+human ownership and holds position until an explicit release arrives.
+The freeze/toggle controls described above apply to local policies only.
+
+For example, on the robot host, replace the endpoint address and camera serial:
+
+```bash
+axol collect-dagger --policy_type custom \
+    --server_host 192.0.2.10 --server_port 8765 \
+    --task "Pick the cube" --repo_id myorg/remote-policy-corrections \
+    --hold_to_intervene true --record_joint_actions true \
+    --home_on_start true --start_from_current_pose true \
+    --robot_config.cameras "{overhead: {serial: 41234567}}"
+```
+
+The endpoint must accept the robot's declared state, action and camera layout.
+No checkpoint path is needed. `--task` labels the dataset; the robot does not send
+model selection or instruction text to the endpoint. The control panel exposes
+these fields through the command schema too. Configure DAgger's own
+`server_host` and `hold_to_intervene` settings; its shared defaults follow
+`collect-data`, so run-policy's shared inference settings do not select the
+DAgger endpoint.
+
+The background worker continues requesting predictions during teleop by
+default (`--shadow_inference false` disables this). These predictions never
+command motors. Takeover and handback invalidate old requests; handback
+resets desktop history and requests a fresh plan from the corrected pose.
+The robot holds the last operator command during this wait, then applies
+`--handover_duration_s` (default `0.2667`) of joint blending after IK, with a
+velocity/acceleration-limited convergence tail. This transition leaves the
+published plan and its continuation references unchanged.
+
+Use `--record_joint_actions true` to record resolved joint commands even
+when the policy sends Cartesian targets. The dataset's declared action
+schema and both policy/operator rows then use joints; images and measured
+state keep their configured schema. Takeovers keep the same dataset episode
+and `intervention` labels, with a brief capture fence at each source change
+so a row cannot pair the previous source's action with the new source's label.
+
+`--start_from_current_pose true` skips the startup home and the mandatory
+home after idle teleop. Add `--home_on_start true` to restore the startup home
+while keeping episode starts at the operator's current pose. The guarded
+startup move must finish before the first VR Record gate opens.
+Cartesian IK, when selected, is warmed before motors are enabled so its first
+solve cannot stall policy dispatch.
+`--episode_time_s 0` removes the episode time cap.
+Instruction selection is managed by the desktop; remote-mode `--subtasks`
+is rejected.
+
+For remote policies, press terminal `q` once to park through rest and zero
+before disabling motors, either at the idle VR Record gate or during an
+episode. It needs no Enter and discards any in-flight episode. `s` + Enter
+and `r` + Enter retain their save/discard behavior during episodes. An idle
+`q` never starts policy execution. EOF, `Ctrl-C`, faults, declining a contact
+retry and failed parking preserve existing motor support when disconnecting;
+an already limp contact state remains limp, without a new parking move.
+Network teardown follows robot cleanup so a slow peer cannot delay it.
+
 ## DAgger annotation
 
-Every dataset `collect-dagger` creates declares LeRobot's native per-frame `intervention` feature — a bool tagged `True` on rows recorded while the operator was driving and `False` on the policy's own rows — the same annotation LeRobot's DAgger rollout strategy uses, so downstream training can weight or filter the corrections. The frozen gap between a freeze and a takeover is not recorded, so an episode plays straight through from policy motion into the correction and back; because LeRobot timestamps are index-based, the capture clock re-anchors on resume. Resuming an existing dataset requires it to already carry the `intervention` feature (one recorded by this command); a dataset created before the feature existed is rejected rather than recorded into untagged.
+Every dataset `collect-dagger` creates declares LeRobot's native per-frame `intervention` feature — a bool tagged `True` on rows recorded while the operator was driving and `False` on the policy's own rows — the same annotation LeRobot's DAgger rollout strategy uses, so downstream training can weight or filter the corrections. Local collection omits its frozen gap; remote collection briefly fences capture at ownership changes. Because LeRobot timestamps are index-based, capture re-anchors on resume while retaining one dataset episode. Resuming an existing dataset requires it to already carry the `intervention` feature (one recorded by this command); a dataset created before the feature existed is rejected rather than recorded into untagged.
 
 <Note>
   The camera and recording plumbing is `collect-data`'s out-of-process split, with one twist: the video relay owns the ZED cameras and streams the headset view, and its raw branch is forced onto the shared-memory (`pyshm`) transport so the frames are readable both **here** (the policy builds its observations from them) and by the dataset-recorder subprocess. The relay is required — there is no in-process camera fallback, since per-frame camera work in the control process would starve the policy and teleop loops. Install the GStreamer stack ([`gst.install`](/cli/gst-install) + [`gst.build-zed`](/cli/gst-build-zed)) if the relay can't start.

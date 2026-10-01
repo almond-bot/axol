@@ -8,8 +8,8 @@ from typing import Any
 
 import numpy as np
 
-from almond_axol.teleop import mantis_grippers
 from almond_axol.robot.base import HardwareCleanupError
+from almond_axol.teleop import mantis_grippers
 
 
 class _FakeReader:

@@ -35,6 +35,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -328,6 +329,41 @@ def _install(binary: Path, ref: str, dest: Path) -> Path:
     return dest
 
 
+_RT_CAPS = ("cap_sys_nice", "cap_ipc_lock")
+
+
+def _find_tool(name: str) -> str | None:
+    """``name`` on PATH, or in /usr/sbin (not on a normal user's PATH)."""
+    found = shutil.which(name)
+    if found is None and Path(f"/usr/sbin/{name}").exists():
+        found = f"/usr/sbin/{name}"
+    return found
+
+
+def _has_realtime_caps(binary: Path) -> bool:
+    """Whether ``binary`` already carries both effective+permitted file caps.
+
+    Reading file capabilities needs no privilege, so an up-to-date install
+    (every re-provision at the same version) skips the root-only setcap.
+    """
+    getcap = _find_tool("getcap")
+    if getcap is None:
+        return False
+    try:
+        out = subprocess.run(
+            [getcap, str(binary)], capture_output=True, text=True, timeout=10.0
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    # libcap 2.4x prints "path cap_ipc_lock,cap_sys_nice=ep"; older releases
+    # "path = cap_ipc_lock,cap_sys_nice+ep". Nothing at all when unset.
+    match = re.search(r"(\S*cap_\S*)[=+]([eip]+)\s*$", out)
+    if match is None:
+        return False
+    caps, flags = match.group(1).split(","), match.group(2)
+    return all(cap in caps for cap in _RT_CAPS) and "e" in flags and "p" in flags
+
+
 def _grant_realtime(binary: Path) -> None:
     """Give only the Rust core permission to enter its bounded RT policy.
 
@@ -340,31 +376,36 @@ def _grant_realtime(binary: Path) -> None:
     so a page reclaimed under the recorder's I/O pressure can never fault a
     CAN thread mid-tick. Without the second capability the core still runs,
     unlocked, and says so.
+
+    Escalates by itself: directly as root (the hosted service / installer),
+    else through sudo -- passwordless or already-cached credentials work
+    headless (e.g. provision spawned by a manual ``axol serve``), and a
+    terminal gets one password prompt. Only a host with none of those fails.
     """
     if sys.platform != "linux":
         return
-    setcap = shutil.which("setcap")
-    if setcap is None and Path("/usr/sbin/setcap").exists():
-        setcap = "/usr/sbin/setcap"
+    if _has_realtime_caps(binary):
+        return
+    setcap = _find_tool("setcap")
     if setcap is None:
-        raise RuntimeError("setcap is required to grant axol-rt real-time scheduling")
+        raise RuntimeError(
+            "setcap is required to grant axol-rt real-time scheduling "
+            "(sudo apt install libcap2-bin)"
+        )
 
     cmd = [setcap, "cap_sys_nice,cap_ipc_lock=ep", str(binary)]
     if os.geteuid() == 0:
         subprocess.run(cmd, check=True)
-    elif sys.stdin is not None and sys.stdin.isatty():
-        # Interactive development install: ask once through the shared sudo
-        # helper. Headless provisioning is normally the root system service;
-        # if it is not, fail loudly below instead of hanging for a password.
+    else:
         from ..utils.sudo import prime_sudo, run_root
 
         if not prime_sudo():
-            raise RuntimeError("sudo is required to grant CAP_SYS_NICE to axol-rt")
+            raise RuntimeError(
+                "granting axol-rt real-time scheduling needs root, and this "
+                "run has no root, no passwordless sudo, and no terminal to ask "
+                f"for a password. Run once from a terminal: sudo {' '.join(cmd)}"
+            )
         run_root(cmd, check=True)
-    else:
-        raise RuntimeError(
-            "axol-rt needs CAP_SYS_NICE; run `axol rt.install` interactively"
-        )
     print(f"axol-rt realtime scheduling enabled: {binary}")
 
 

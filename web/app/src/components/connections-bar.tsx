@@ -12,8 +12,9 @@ import {
 } from "lucide-react"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { WheelGrid } from "@/components/jelly-status"
+import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
 import {
+  jellyBattery,
   jellyDeviceView,
   liftSummaryText,
   STATUS_DOT_CLASS,
@@ -511,6 +512,7 @@ export function ConnectionsBar({
         : jellyViews.some((v) => v.label === "CAN detected")
           ? "CAN detected"
           : "Disconnected"
+  const battery = jellySupported ? jellyBattery(jelly) : null
 
   return (
     <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -586,7 +588,9 @@ export function ConnectionsBar({
             </div>
           ) : undefined
         }
-      />
+      >
+        {battery ? <BatteryIndicator battery={battery} /> : undefined}
+      </Tile>
 
       {/* Host power confirmation (shutdown / restart) */}
       {powerOpen && (

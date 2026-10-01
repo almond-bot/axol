@@ -20,6 +20,17 @@
         "pages": [
           "index",
           "hardware",
+          {
+            "group": "Hardware Setup",
+            "root": "hardware-setup",
+            "pages": [
+              "hardware-setup/standalone",
+              "hardware-setup/owl-mount",
+              "hardware-setup/ox-cart",
+              "hardware-setup/jelly",
+              "hardware-setup/cameras"
+            ]
+          },
           "installation"
         ]
       },
@@ -29,33 +40,46 @@
           {
             "group": "Teleoperation",
             "root": "operations/teleop",
-            "pages": ["operations/teleop-config"]
+            "pages": [
+              "operations/teleop-config"
+            ]
           },
           {
             "group": "Gravity Compensation",
             "root": "operations/gravity-comp",
-            "pages": ["operations/gravity-comp-config"]
+            "pages": [
+              "operations/gravity-comp-config"
+            ]
           },
           {
             "group": "Data Collection",
             "root": "operations/data-collection",
-            "pages": ["operations/data-collection-config"]
+            "pages": [
+              "operations/data-collection-config"
+            ]
           },
           {
             "group": "Replay Dataset",
             "root": "operations/replay-dataset",
-            "pages": ["operations/replay-dataset-config"]
+            "pages": [
+              "operations/replay-dataset-config"
+            ]
           },
           "operations/train-policy",
           {
             "group": "Run Policy",
             "root": "operations/run-policy",
-            "pages": ["operations/run-policy-config"]
+            "pages": [
+              "operations/run-policy-config",
+              "operations/custom-policy"
+            ]
           },
           {
             "group": "DAgger Collection",
             "root": "operations/dagger",
-            "pages": ["operations/dagger-config"]
+            "pages": [
+              "operations/dagger-config"
+            ]
           }
         ]
       },
@@ -78,7 +102,9 @@
           {
             "group": "Web Control Panel",
             "root": "guides/control-panel",
-            "pages": ["guides/control-panel-settings"]
+            "pages": [
+              "guides/control-panel-settings"
+            ]
           },
           "guides/diagnostics-dashboard",
           "guides/vr-interface",
@@ -105,6 +131,7 @@
                   "cli/replay-dataset",
                   "cli/run-policy",
                   "cli/inference-server",
+                  "cli/policy-check",
                   "cli/migrate-dataset"
                 ]
               },
@@ -196,7 +223,9 @@
               "api/vr",
               "api/zed",
               "api/motor",
-              "api/lerobot"
+              "api/lerobot",
+              "api/policy",
+              "api/policy-plan"
             ]
           }
         ]

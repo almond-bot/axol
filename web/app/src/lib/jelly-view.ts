@@ -2,6 +2,7 @@ import {
   liftFaultLabel,
   wheelFaults,
   type CanDevicePresence,
+  type JellyBattery,
   type JellyDevice,
   type JellyLiftStatus,
   type JellyStatus,
@@ -43,6 +44,61 @@ export function liftSummaryText(status: JellyLiftStatus): string {
   ]
     .filter(Boolean)
     .join(" · ")
+}
+
+/** Below these the battery shows amber, then red (LiFePO4 falls off a cliff under ~10%). */
+export const BATTERY_LOW_PERCENT = 25
+export const BATTERY_CRITICAL_PERCENT = 10
+
+/**
+ * The battery reading worth showing: only while the lift link is up or lent
+ * to a task (a stale reading is still labelled with its age), never from a
+ * link the operator disconnected.
+ */
+export function jellyBattery(jelly: JellyStatus | null | undefined): JellyBattery | null {
+  const lift = jelly?.lift
+  if (!lift || (lift.state !== "connected" && lift.state !== "busy")) return null
+  return lift.battery ?? null
+}
+
+export type BatteryLevel = "charging" | "ok" | "low" | "critical"
+
+export function batteryLevel(battery: JellyBattery): BatteryLevel {
+  if (battery.charging) return "charging"
+  if (battery.percent <= BATTERY_CRITICAL_PERCENT) return "critical"
+  if (battery.percent <= BATTERY_LOW_PERCENT) return "low"
+  return "ok"
+}
+
+/** "12 s", "4 min", "2 h 5 min" */
+export function formatAge(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)} s`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return `${minutes} min`
+  const h = Math.floor(minutes / 60)
+  const m = minutes % 60
+  return m ? `${h} h ${m} min` : `${h} h`
+}
+
+/** Short headline: "62%", "Charging", "~40%" for a reading taken under load. */
+export function batteryText(battery: JellyBattery): string {
+  if (battery.charging) return "Charging"
+  const pct = `${Math.round(battery.percent)}%`
+  return battery.underLoad ? `~${pct}` : pct
+}
+
+/** Hover detail: the voltage behind the number and how far to trust it. */
+export function batteryTooltip(battery: JellyBattery): string {
+  const lines = [
+    battery.charging
+      ? `Battery charging · ${battery.voltage.toFixed(2)} V`
+      : `Battery ${Math.round(battery.percent)}% · ${battery.voltage.toFixed(2)} V`,
+  ]
+  if (!battery.live) lines.push(`Last reading ${formatAge(battery.ageSeconds)} ago`)
+  if (battery.underLoad)
+    lines.push("Measured while the lift or wheels were moving, so it reads low")
+  lines.push("Estimated from the lift board's 24 V rail (2× LiFePO4, 100 Ah)")
+  return lines.join("\n")
 }
 
 export interface JellyDeviceView {

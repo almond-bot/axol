@@ -2,12 +2,16 @@ import { beforeEach, describe, expect, it } from "vitest"
 
 import {
   HARDWARE_PROFILE_ARG,
+  CUSTOM_POLICY_TYPE,
+  applyPolicyTypeRules,
   cameraCount,
   computeArgs,
   curatedFields,
   defaultString,
+  episodeVideoSource,
   filterSchema,
   flattenFields,
+  isCustomPolicyRun,
   isModified,
   isRobotFreeRun,
   loadLocalHardwareProfile,
@@ -18,12 +22,14 @@ import {
   parseHardwareProfile,
   participatingCameraSerials,
   perRunFields,
+  previewStep,
   runFieldVisible,
   saveLocalHardwareProfile,
   saveOpSettings,
   serverHttpBase,
   type CameraSpec,
   type CommandSpec,
+  type DatasetEpisode,
   type OperationId,
   type SchemaField,
   type SchemaNode,
@@ -151,6 +157,30 @@ describe("supervisor pure helpers", () => {
     expect(runFieldVisible("repo_id", "mantis")).toBe(true)
   })
 
+  it("requires a policy path only for LeRobot policy types", () => {
+    const field = (key: string, required: boolean): SchemaField => ({
+      kind: "field",
+      key,
+      label: key,
+      type: "text",
+      default: null,
+      required,
+    })
+    const fields = [field("policy_type", true), field("task", true), field("policy_path", false)]
+    const lerobot = applyPolicyTypeRules(fields, false)
+    expect(lerobot.find((f) => f.key === "policy_path")?.required).toBe(true)
+    const custom = applyPolicyTypeRules(fields, true)
+    const path = custom.find((f) => f.key === "policy_path")
+    expect(path?.required).toBe(false)
+    expect(path?.help).toMatch(/policy server/)
+    expect(custom.map((f) => f.key)).toEqual(["policy_type", "task", "policy_path"])
+    // Ops without a policy type are left alone.
+    const other = [field("policy_path", false)]
+    expect(applyPolicyTypeRules(other, false)).toBe(other)
+    expect(isCustomPolicyRun({ policy_type: CUSTOM_POLICY_TYPE })).toBe(true)
+    expect(isCustomPolicyRun({ policy_type: "act" })).toBe(false)
+  })
+
   it("resolves curated and per-run fields with required ones first", () => {
     const mantisFlag: SchemaField = {
       kind: "field",
@@ -192,5 +222,40 @@ describe("supervisor pure helpers", () => {
     expect(loadOpSettings(op)).toEqual({ sim: true })
     localStorage.setItem("axolOp:teleop", "{not json")
     expect(loadOpSettings(op)).toEqual({})
+  })
+})
+
+describe("dataset preview sources", () => {
+  const episode: DatasetEpisode = {
+    index: 3,
+    length: 120,
+    durationS: 2,
+    tasks: ["pick"],
+    videos: { "observation.images.left_arm": { from: 6, to: 8 } },
+  }
+
+  it.each([
+    [60, 15, 4],
+    [60, 30, 2],
+    [60, 0, 1],
+    [30, 30, 1],
+    [30, 15, 2],
+    [10, 15, 1],
+  ])("keeps every Nth frame (%i fps at %i → %i)", (dataset, preview, step) => {
+    expect(previewStep(dataset, preview)).toBe(step)
+  })
+
+  it("asks for the host's cut, rebased to the episode", () => {
+    const light = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 15)
+    expect(light.span).toEqual({ from: 0, to: 2 })
+    const url = new URL(light.url, "http://host")
+    expect(url.searchParams.get("fps")).toBe("15")
+    expect(url.searchParams.get("episode")).toBe("3")
+    expect(url.hash).toBe("#t=0.000,2.000")
+
+    // Full rate is the cut too (index first, so it starts before it downloads).
+    const full = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 0)
+    expect(new URL(full.url, "http://host").searchParams.get("fps")).toBe("60")
+    expect(full.span).toEqual({ from: 0, to: 2 })
   })
 })

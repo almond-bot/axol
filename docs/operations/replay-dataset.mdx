@@ -10,6 +10,12 @@ Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight
   from the old URDF and replay about 90° off on current releases. Run
   [`axol migrate-dataset`](/cli/migrate-dataset) once before replaying them.
   Joint-space datasets are unaffected.
+
+  **Mantis** datasets recorded with axol 0.2.4 or earlier used a Vive
+  tracker→gripper rotation that pitched every recorded gripper ~90° away from
+  the operator's hold; the arms barely move on replay. Run
+  [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation)
+  once before replaying them.
 </Warning>
 
 No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.

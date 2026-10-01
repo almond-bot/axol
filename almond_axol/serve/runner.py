@@ -44,6 +44,7 @@ from typing import Any
 
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
+from ..utils.logquiet import quiet_noisy_loggers
 from ..zed import stereo_serials
 from .commands import (
     flag_default,
@@ -375,6 +376,9 @@ class _Capture:
         root = logging.getLogger()
         self._old_root_level = root.level
         root.setLevel(self._level)
+        # A DEBUG op must not unmute aiortc's per-packet lines etc. (the
+        # in-process CLIs do the same right after their basicConfig).
+        quiet_noisy_loggers()
         root.addHandler(self._handler)
         self._old_stdout, self._old_stderr = sys.stdout, sys.stderr
         try:
@@ -509,6 +513,10 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+            # The cap follows the root level: re-derive it for the restored
+            # level so a finished DEBUG op's INFO cap does not outlive it
+            # under a stricter root (nor an ERROR op's cap mute warnings).
+            quiet_noisy_loggers()
         # Before the saved streams close below: handlers must not be left on them.
         self._restore_handlers()
         self._teardown_fd_tee()

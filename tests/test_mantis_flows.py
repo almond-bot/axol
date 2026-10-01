@@ -22,6 +22,7 @@ from almond_axol.lerobot.teleop.config_vr import AxolVRTeleopConfig
 from almond_axol.mantis.calibration import (
     LEGACY_TRACKER_KEY,
     ULTIMATE_POSE_CONVENTION_FIELD,
+    VIVE_TCP_ROTATION_QUAT,
     VIVE_TRACKER_CAD_ORIGINS_MM,
     candidate_transform_for,
     design_transform_for,
@@ -1065,10 +1066,19 @@ class MantisFlowTest(unittest.TestCase):
             survive = design_transform_for("left", "survive:T20")
             self.assertIsNotNone(survive)
             assert survive is not None
-            ultimate = [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068]
+            ultimate = [0.0, 0.0465, -0.092, 0.0, 1.0, 0.0, 0.0]
             self.assertEqual(
                 design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
                 ultimate,
+            )
+            # Both Vive families ship the corrected Ry(180°) rotation, not the
+            # retired Rx(+90°) (which pitched every recorded gripper ~90°).
+            self.assertEqual(survive[3:], list(VIVE_TCP_ROTATION_QUAT))
+            self.assertEqual(ultimate[3:], list(VIVE_TCP_ROTATION_QUAT))
+            np.testing.assert_allclose(
+                quat_xyzw_to_matrix(np.asarray(survive[3:])),
+                np.diag([-1.0, 1.0, -1.0]),
+                atol=1e-9,
             )
             self.assertEqual(
                 design_transform_for("right", "ultimate:11:22:33:44:55:66"),
@@ -1088,16 +1098,18 @@ class MantisFlowTest(unittest.TestCase):
 
             # Origins are expressed in the shared gripper/CAD frame G, while
             # the stored translation is the TCP origin in tracker frame T.
-            # Therefore delta_p_TG = -R_TG @ delta_O; Rx(+90 deg) turns the
-            # +11 mm CAD-z origin shift into +11 mm of tracker-y translation.
+            # The translation (and this delta) were derived under the mount
+            # CAD convention, where the +11 mm CAD-z origin shift becomes
+            # +11 mm of tracker-y translation; the rotation fix above did not
+            # touch the translation (bench verification pending).
             origin_delta_m = (
                 np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"])
                 - np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["survive"])
             ) / 1000.0
-            rotation_tg = quat_xyzw_to_matrix(np.asarray(survive[3:]))
+            np.testing.assert_allclose(origin_delta_m, [0.0, 0.0, 0.011], atol=1e-9)
             np.testing.assert_allclose(
                 np.asarray(ultimate[:3]) - np.asarray(survive[:3]),
-                -(rotation_tg @ origin_delta_m),
+                [0.0, 0.011, 0.0],
                 atol=1e-9,
             )
 

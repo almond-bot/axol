@@ -2,7 +2,8 @@
 rom.enable
 
 Range of motion test for the Axol robot. Sweeps every joint through its full
-range.
+range, except wrist_2 and wrist_3, which stop ROM_LIMIT_MARGIN (5°) short of
+each limit so those motors are never driven hard into the ends of travel.
 
 Enables the motors, eases to home, then prompts to close each gripper onto the
 item and loops the sweep for two hours. When the soak finishes (or on Ctrl-C)
@@ -88,11 +89,11 @@ from ...motor import CanBus, Motor, MotorError
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
-    LIMITS,
     SHOULDER_1_LEFT_LIMITS,
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
 )
+from ...robot.axol import LIMITS as _AXOL_LIMITS
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
 from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
@@ -118,6 +119,25 @@ AXOL_HOME_SPEED = 0.1 * 2 * math.pi  # rad/s
 AXOL_WAYPOINT_PAUSE = 1.0  # seconds
 SOAK_DURATION = 7200  # seconds (2 hours)
 CYCLE_PAUSE = 2.0  # seconds
+
+# wrist_2 and wrist_3 stop this far inside each joint limit. Commanding their
+# exact limit parks the joint against its end of travel for the whole waypoint
+# pause, which over a two-hour soak overtorques those motors. Every other joint
+# still sweeps to its full limit.
+ROM_LIMIT_MARGIN = math.radians(5)  # rad
+ROM_INSET_JOINTS = frozenset({Joint.WRIST_2, Joint.WRIST_3})
+
+
+def _inset(limits: tuple[float, float]) -> tuple[float, float]:  # rad
+    """Pull a (low, high) joint range in by ROM_LIMIT_MARGIN on both sides."""
+    low, high = limits
+    return low + ROM_LIMIT_MARGIN, high - ROM_LIMIT_MARGIN
+
+
+LIMITS: dict[Joint, tuple[float, float]] = {
+    joint: _inset(limits) if joint in ROM_INSET_JOINTS else limits
+    for joint, limits in _AXOL_LIMITS.items()
+}
 
 WRIST_TEST_ELBOW_ANGLE = math.pi / 2  # rad
 SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
@@ -230,7 +250,7 @@ def resolve_bus_joints(
 # Gains for a partial arm off the robot: the soft end of the stiffness
 # slider — the hand-guidable gains (wrist_2 25/1.5, wrist_3 25/0.9, see
 # ``_SOFT_GAINS`` in robot/config.py), damping-ratio-consistent with the tuned
-# set. The production gains (wrist_2 130/3.5) vibrate heavily on a wrist kit
+# set. The production gains (wrist_2 130/2.25) vibrate heavily on a wrist kit
 # clamped to a bench: firmware kd on the Damiao wrists already sits at the
 # edge of a unit-dependent buzz on the robot (kd=5 buzzes at 110 Hz), and a
 # rigid mount with none of the arm's compliance behind the stator moves that

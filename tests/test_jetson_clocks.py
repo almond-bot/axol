@@ -205,3 +205,174 @@ def test_public_clock_helpers_share_escalator(
     jetson.pin_realtime_clocks(interactive=True)
     assert [name for name, _ in seen] == ["engine", "mode", "engine", "cpu"]
     assert seen[1][1] is seen[2][1] is seen[3][1]
+
+
+@pytest.mark.parametrize(
+    ("nodes", "pinned"),
+    [
+        # Orin (Orin NX 16GB, AGX Orin; nvgpu): one node per engine, each
+        # pinned min_freq = max_freq.
+        (
+            ("15480000.nvenc", "15340000.vic", "17000000.gpu"),
+            {
+                ("15480000.nvenc", "min_freq", "900"),
+                ("15340000.vic", "min_freq", "900"),
+                ("17000000.gpu", "min_freq", "900"),
+            },
+        ),
+        # Thor T5000 (OpenRM): NVENC is clocked by the GPU's multimedia (NVD)
+        # domain and CUDA by GPC; only the VIC keeps its own node. The old
+        # globs pinned the VIC alone and left encode + CUDA at the floor. The
+        # GPU domains get the performance governor and never a min_freq
+        # access (see jetson._GOVERNOR_CLOCK_GLOBS).
+        (
+            ("8188050000.vic", "gpu-gpc-0", "gpu-nvd-0"),
+            {
+                ("8188050000.vic", "min_freq", "900"),
+                ("gpu-gpc-0", "governor", "performance"),
+                ("gpu-nvd-0", "governor", "performance"),
+            },
+        ),
+    ],
+    ids=["orin", "thor"],
+)
+def test_engine_pins_cover_every_supported_jetson(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nodes: tuple[str, ...],
+    pinned: set[tuple[str, str, str]],
+) -> None:
+    devfreq = tmp_path / "devfreq"
+    for name in (*nodes, "unrelated-cpu-bw"):
+        node = devfreq / name
+        node.mkdir(parents=True)
+        (node / "max_freq").write_text("900\n")
+        (node / "min_freq").write_text("300\n")
+        (node / "governor").write_text("nvhost_podgov\n")
+        (node / "available_governors").write_text(
+            "nvhost_podgov performance userspace\n"
+        )
+
+    original_glob = Path.glob
+
+    def glob(path: Path, pattern: str):
+        if str(path) == "/sys/class/devfreq":
+            return original_glob(devfreq, pattern)
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", glob)
+    writer = _Writer()
+    jetson._pin_engines(writer)
+    assert {(p.parent.name, p.name, v) for p, v in writer.writes} == pinned
+
+
+def test_thor_gpu_domains_never_touch_their_frequency_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Reading min_freq / max_freq takes the devfreq lock and cur_freq calls
+    # into the GPU driver; a JetPack 7.2 report has min_freq reads stuck in D
+    # state behind a deadlocked devfreq_wq worker. Already-pinned domains are
+    # recognised from `governor` alone, and one without the performance
+    # governor is reported rather than min_freq-pinned.
+    devfreq = tmp_path / "devfreq"
+    for name, governor, available in (
+        ("gpu-gpc-0", "performance", "performance nvhost_podgov"),
+        ("gpu-nvd-0", "nvhost_podgov", "nvhost_podgov userspace"),
+    ):
+        node = devfreq / name
+        node.mkdir(parents=True)
+        (node / "governor").write_text(governor + "\n")
+        (node / "available_governors").write_text(available + "\n")
+    original_glob = Path.glob
+    original_read = Path.read_text
+
+    def glob(path: Path, pattern: str):
+        if str(path) == "/sys/class/devfreq":
+            return original_glob(devfreq, pattern)
+        return original_glob(path, pattern)
+
+    def read_text(path: Path, *args, **kwargs):
+        assert path.name not in {"min_freq", "max_freq", "cur_freq"}, path
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", glob)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    writer = _Writer()
+    jetson._pin_engines(writer)
+    assert writer.writes == []
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        # AGX Orin 64GB: MAXN plus the fixed-TDP modes.
+        (
+            "< POWER_MODEL ID=0 NAME=MAXN >\n< POWER_MODEL ID=1 NAME=MODE_15W >\n"
+            "< POWER_MODEL ID=2 NAME=MODE_30W >\n< POWER_MODEL ID=3 NAME=MODE_50W >\n",
+            ("0", "MAXN"),
+        ),
+        # Thor T5000 (L4T R38): MAXN is mode 0, the 120 W default is mode 1.
+        (
+            "< POWER_MODEL ID=0 NAME=MAXN >\n< POWER_MODEL ID=1 NAME=120W >\n"
+            "< POWER_MODEL ID=2 NAME=90W >\n< POWER_MODEL ID=3 NAME=70W >\n",
+            ("0", "MAXN"),
+        ),
+    ],
+    ids=["agx-orin", "thor-t5000"],
+)
+def test_max_power_mode_on_agx_orin_and_thor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: str,
+    expected: tuple[str, str],
+) -> None:
+    conf = tmp_path / "nvpmodel.conf"
+    conf.write_text(config)
+    monkeypatch.setattr(jetson, "_NVPMODEL_CONFIG", conf)
+    assert jetson._preferred_max_power_mode() == expected
+
+
+def test_host_model_strips_the_device_tree_terminator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = tmp_path / "model"
+    model.write_bytes(b"NVIDIA Jetson AGX Thor Developer Kit\0")
+    monkeypatch.setattr(jetson, "_DEVICE_TREE_MODEL", model)
+    assert jetson.host_model() == "NVIDIA Jetson AGX Thor Developer Kit"
+    monkeypatch.setattr(jetson, "_DEVICE_TREE_MODEL", tmp_path / "absent")
+    assert jetson.host_model() is None
+
+
+def test_pin_check_reads_only_the_governor_on_thor_gpu_domains(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logging
+
+    from almond_axol.utils import jetson_diag
+
+    devfreq = tmp_path / "devfreq"
+    for name, governor in (("gpu-gpc-0", "performance"), ("gpu-nvd-0", "podgov")):
+        (devfreq / name).mkdir(parents=True)
+        (devfreq / name / "governor").write_text(governor + "\n")
+    original_glob = Path.glob
+    original_read = Path.read_text
+
+    def glob(path: Path, pattern: str):
+        if str(path) == "/sys/class/devfreq":
+            return original_glob(devfreq, pattern)
+        if str(path) == "/sys/devices/system/cpu":
+            return iter([])
+        return original_glob(path, pattern)
+
+    def read_text(path: Path, *args, **kwargs):
+        assert path.name not in {"min_freq", "max_freq", "cur_freq"}, path
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", glob)
+    monkeypatch.setattr(Path, "read_text", read_text)
+    logger = logging.getLogger("test.tegra")
+    warnings: list[str] = []
+    monkeypatch.setattr(logger, "warning", lambda msg, *a: warnings.append(msg % a))
+    jetson_diag.TegraStatsDiag(logger)._check_pins()
+    assert len(warnings) == 1
+    assert "gpu-nvd-0" in warnings[0]

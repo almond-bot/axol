@@ -8,9 +8,11 @@ low-level :class:`~almond_axol.robot.axol.AxolHardware` (buses, motors,
 model math) as an implementation detail. What changed is behind the scenes:
 while enabled, the CAN buses are owned by the ``axol-rt`` subprocess:
 
-- ``enable()`` runs the split bring-up: the core resets the motors (prep),
-  then Python resolves joint offsets and MyActuator decode ranges through a
-  Rust maintenance proxy. That proxy exits before the realtime core enables
+- ``enable()`` runs the split bring-up: the core resets the *cold* motors
+  (prep — joints already enabled and holding are left untouched, exactly
+  as the classic idempotent enable attaches to them), then Python resolves
+  joint offsets and MyActuator decode ranges through a Rust maintenance
+  proxy. That proxy exits before the realtime core enables
   and holds, making the core the sole CAN owner while armed. ``Motor`` caches
   fill from the core's per-tick telemetry packets — ~480 packet decodes/s
   replacing ~7,700 Python frame dispatches/s on this CPU-starved Jetson.
@@ -25,7 +27,10 @@ while enabled, the CAN buses are owned by the ``axol-rt`` subprocess:
   POSITION_FORCE command (motor-frame target, speed limit, torque limit).
 - The *fast* physics all run in the core, per 240 Hz tick, from its own
   trajectory and feedback states: a golden-ported trapezoid tracker chases
-  the latest target (replacing linear interpolation), the classic 20 rad/s
+  the latest target (replacing linear interpolation) — carried forward along
+  the stream's own velocity for up to 80 ms when this side's tick is late,
+  so a Python stall renders as smooth motion rather than a stop-then-lunge
+  (``filter::Holdover``) —, the classic 20 rad/s
   command-derivative chain computes smooth friction/inertia feedforwards
   from that executed trajectory (friction params ride the config; the
   pose-scaled ``j_eff`` rides each target), and band-passed velocity damping
@@ -71,11 +76,15 @@ from typing import Self
 import numpy as np
 
 from ..constants import ARM_JOINTS
-from ..motor import ControlMode, Joint, MotorError, MotorGains, MotorStatus
+from ..motor import ControlMode, Joint, Motor, MotorError, MotorGains, MotorStatus
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
-from ..robot.axol import AxolArm, AxolHardware
-from ..robot.base import RobotBase
+from ..robot.axol import AxolArm, AxolHardware, _rollback_newly_enabled_motors
+from ..robot.base import (
+    HardwareCleanupError,
+    RobotBase,
+    mark_hardware_cleanup_uncertain,
+)
 from ..robot.config import AxolConfig
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
@@ -233,6 +242,12 @@ class Axol(RobotBase):
         # until ``disable`` / ``disconnect``) and Python must not send CAN.
         self._core_started = False
         self._armed = False
+        self._preserve_disconnect_pending = False
+        # The motors the in-flight ``enable()`` is bringing up itself — its
+        # rollback set. ``None`` until the post-prep holding snapshot: before
+        # it nothing has been enabled, after it the joints *not* listed were
+        # found holding and must survive a failed bring-up untouched.
+        self._enable_cold: list[tuple[str, Motor]] | None = None
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._max_vel = max_vel
@@ -359,11 +374,16 @@ class Axol(RobotBase):
             return
         try:
             await self._enable()
-        except BaseException:
+        except BaseException as setup_error:
             # A failed/cancelled __aenter__ has no __aexit__. Run teardown in
             # its own shielded task so every resource acquired by _enable is
             # rolled back before the original failure reaches the caller.
-            cleanup = asyncio.create_task(self.disable(), name="rt-startup-rollback")
+            # The rollback is the classic transaction, not disable(): only
+            # the motors this call brought up are torqued off, joints found
+            # holding at entry keep holding.
+            cleanup = asyncio.create_task(
+                self._rollback_enable(setup_error), name="rt-startup-rollback"
+            )
             while not cleanup.done():
                 try:
                     await asyncio.shield(cleanup)
@@ -382,11 +402,13 @@ class Axol(RobotBase):
             else:
                 _logger.error("rt: startup rollback was unexpectedly cancelled")
             raise
+        self._enable_cold = None
 
     async def _enable(self) -> None:
         """Bring up the realtime core; :meth:`enable` owns rollback."""
         self._fb_packets = [0, 0]
         self._limp_announced = False
+        self._enable_cold = None
         # Hand the interfaces to the core quiet: a robot that was
         # ``connect()``-ed (or enabled with ``hold=False``) still has Python's
         # maintenance proxies open and possibly a telemetry poll running. The
@@ -394,15 +416,43 @@ class Axol(RobotBase):
         # must not cache a pre-reset frame; torque is untouched by this.
         if any(bus.is_open for bus in self._buses()):
             await self._robot.disconnect()
+        # Nothing owns the interfaces at this instant, which is the only
+        # point in a bring-up where they can be flapped: drop anything a
+        # dead bus left queued (an e-stop's in-flight position commands,
+        # which the kernel holds on the interface and replays the moment the
+        # motors answer again) before the core takes them. Doing it here
+        # rather than in the `connect()` below is the whole point — by then
+        # the core has started, prepped, and already flushed the queue into
+        # the motors.
+        await self._robot._purge_stale_can_queues()
         await self._link.start()
         self._core_started = True
         await self._link.configure(self._config_text())
-        # The core's prep resets the MyActuator motors (multi-turn wrap state
-        # changes) — it must complete before Python resolves offsets, and
-        # before Python's buses open so no pre-reset frame is ever cached.
+        # The core's prep resets the cold MyActuator motors (multi-turn wrap
+        # state changes) — it must complete before Python resolves offsets,
+        # and before Python's buses open so no pre-reset frame is ever
+        # cached. Joints found already enabled and holding are skipped by
+        # the core (the 0x76 reset reboots the motor and drops torque for
+        # ~2 s), so reconnecting to a live robot keeps it holding — the same
+        # per-motor idempotency as the classic AxolHardware.enable().
         await self._link.prep()
 
-        await self._robot.connect()
+        # The core owns the interfaces now, so this must not flap them; the
+        # purge above already ran while they were free.
+        await self._robot.connect(purge_stale=False)
+        # The transaction snapshot, taken before anything is enabled: after
+        # prep a cold joint has just been reset (not running) and a held one
+        # is still holding, so this is exactly the classic held/cold split.
+        # Only the cold set is rolled back if the bring-up fails from here.
+        cold: list[tuple[str, Motor]] = []
+        for side, arm in self._arms():
+            label = "left" if side == 0 else "right"
+            flags = await arm.get_holding()
+            for joint, holding in zip(arm.motors, flags):
+                if not holding:
+                    cold.append((f"{label}.{joint.value}", arm.motors[joint]))
+        self._enable_cold = cold
+
         for _side, arm in self._arms():
             await arm.resolve_joint_offsets()
             # Python never calls Motor.enable() in production control, so run the
@@ -451,6 +501,89 @@ class Axol(RobotBase):
             "rt: armed — axol-rt owns the bus at %.0f Hz; Python streams targets",
             self._loop_hz,
         )
+
+    async def _rollback_enable(self, setup_error: BaseException) -> None:
+        """Undo a failed :meth:`enable`, torquing off only what it brought up.
+
+        The classic ``AxolHardware.enable`` transaction: motors that were
+        cold at entry (``_enable_cold``) are disabled, motors found holding
+        keep holding — a failed reconnect must not drop the arm it was
+        attaching to. Before the holding snapshot nothing has been enabled
+        (prep's resets are torque-neutral on a cold motor), so the robot is
+        left exactly as found.
+
+        The core is stopped *without* a disarm: ``D`` is the operator's
+        torque-off and would disable every motor the core prepared, held
+        joints included. On the closed link it exits leaving each motor at
+        its last command (the bring-up hold), and the cold set is then
+        disabled from Python over the reopened maintenance proxies.
+        Failures to confirm are attached to ``setup_error`` and mark the
+        hardware cleanup uncertain, as in classic mode.
+        """
+        cold = self._enable_cold
+        self._enable_cold = None
+        for _side, arm in self._arms():
+            arm._command_sink = None
+        self._link.on_feedback = None
+        self._armed = False
+        if self._core_started:
+            try:
+                await self._link.close()
+            except Exception:  # noqa: BLE001 - the motors hold either way
+                _logger.exception("rt: core teardown failed during startup rollback")
+            self._core_started = False
+
+        if cold is None:
+            _logger.info(
+                "rt: startup rollback — no motor was brought up; the robot is "
+                "left exactly as it was found"
+            )
+        elif not cold:
+            _logger.info(
+                "rt: startup rollback — every joint was already holding and "
+                "keeps holding; nothing to torque off"
+            )
+        else:
+            labels = ", ".join(label for label, _ in cold)
+            _logger.warning(
+                "rt: startup rollback — torquing off the joints this enable() "
+                "brought up (%s); joints found holding keep holding",
+                labels,
+            )
+            # The core has exited (close() reaped it), so the interfaces are
+            # free for the maintenance proxies again. Without them the cold
+            # motors cannot be reached: report that as an uncertain cleanup
+            # rather than pretend they are off.
+            try:
+                # No purge on a cleanup path: this exists to reach the cold
+                # motors and torque them off, and must not fail (or flap a
+                # bus) on the way there.
+                await self._robot.connect(purge_stale=False)
+            except BaseException as bus_error:  # noqa: BLE001 - reported below
+                setup_error.add_note(
+                    "Startup rollback could not reopen the CAN buses to torque "
+                    f"off the newly enabled motors ({labels}): "
+                    f"{type(bus_error).__name__}: {bus_error}"
+                )
+                mark_hardware_cleanup_uncertain(setup_error, bus_error)
+                return
+            await _rollback_newly_enabled_motors(cold, setup_error)
+            cold_motors = [motor for _, motor in cold]
+            for _side, arm in self._arms():
+                if any(motor in cold_motors for motor in arm.motors.values()):
+                    try:
+                        arm.reset_command_state()
+                    except BaseException as state_error:  # noqa: BLE001
+                        setup_error.add_note(
+                            "Could not reset arm command history after startup "
+                            f"rollback: {type(state_error).__name__}: {state_error}"
+                        )
+
+        if any(bus.is_open for bus in self._buses()):
+            try:
+                await self._robot.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                _logger.exception("rt: python-side disconnect failed after rollback")
 
     async def connect(self) -> None:
         """Open the CAN buses only — nothing is actuated.
@@ -1017,20 +1150,49 @@ class Axol(RobotBase):
 
         After :meth:`connect` only: closes the maintenance proxies.
         """
-        if not self._armed:
+        self._preserve_disconnect_pending = True
+        if not self._armed and not self._core_started:
             await self._robot.disconnect()
+            self._preserve_disconnect_pending = False
             return
         if self._rec is not None:
             self.set_recording_engaged(False)
         for _side, arm in self._arms():
             arm._command_sink = None
         self._link.on_feedback = None
+        original_process = self._link._proc
         try:
             await self._link.close()
-        except Exception:  # noqa: BLE001 - the motors hold either way
-            _logger.exception("rt: core link teardown failed")
+        except BaseException as exc:
+            # Retain the runtime and its ownership flags for a preserving
+            # retry. A failed close must never fall back to torque-off or
+            # let another process take over a possibly live core's buses.
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: preserving disconnect failed; core ownership is uncertain"
+            ) from exc
+        try:
+            core_stopped = all(
+                process is None or process.poll() is not None
+                for process in (original_process, self._link._proc)
+            )
+        except BaseException as exc:
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: cannot verify core exit; hardware ownership is uncertain"
+            ) from exc
+        if not core_stopped:
+            if self._link._proc is None and original_process is not None:
+                self._link._proc = original_process
+            raise HardwareCleanupError(
+                "rt: core is still running after disconnect; "
+                "hardware ownership is uncertain"
+            )
         self._armed = False
         self._core_started = False
+        self._preserve_disconnect_pending = False
         if self._rec is not None:
             try:
                 self._rec.dump()
@@ -1058,13 +1220,18 @@ class Axol(RobotBase):
 
         Before any bus has ever been opened there is nothing to torque off:
         no frame has left this process, so the motors are exactly as they
-        were found. That is the rollback of an :meth:`enable` that failed
-        before its core started (``axol-rt`` missing or stale, config
-        rejected) and the second ``disable()`` a context manager or teleop
-        teardown then issues. The classic torque-off could only raise over
-        the unopened bus there, turning a startup error into a false
-        "hardware ownership uncertain" lockout upstream.
+        were found. That is the ``disable()`` a context manager or teleop
+        teardown issues after an :meth:`enable` that failed before its core
+        started (``axol-rt`` missing or stale, config rejected). The classic
+        torque-off could only raise over the unopened bus there, turning a
+        startup error into a false "hardware ownership uncertain" lockout
+        upstream. (A failed ``enable()`` rolls itself back through
+        :meth:`_rollback_enable`, which torques off only the motors it
+        brought up.)
         """
+        if getattr(self, "_preserve_disconnect_pending", False):
+            await self.disconnect()
+            return
         if not self._core_started:
             if all(bus.never_opened for bus in self._buses()):
                 _logger.info(

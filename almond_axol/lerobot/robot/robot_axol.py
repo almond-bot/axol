@@ -30,9 +30,9 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -45,6 +45,7 @@ from ...constants import Joint
 from ...robot.base import HardwareCleanupError
 from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
+from ...utils import affinity
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
@@ -119,6 +120,15 @@ _POLICY_CAMERA_SKEW_PERIODS = 1.5
 _POLICY_SKEW_REPORT_INTERVAL_S = 5.0
 
 
+class PolicyObservationNotReady(RuntimeError):
+    """A synchronized camera/state sample is temporarily unavailable.
+
+    Startup may retry this bounded availability failure while the arms hold.
+    Invalid timestamps, device failures, and arbitrary camera exceptions are
+    deliberately not classified as transient by the observation builder.
+    """
+
+
 @dataclass(frozen=True)
 class _PolicyObservation:
     """One built policy observation, re-served until the cameras move on.
@@ -136,6 +146,7 @@ class _PolicyObservation:
     observation: RobotObservation
     capture_ts: float
     state_ts: float
+    camera_capture_ts: dict[str, float] = field(default_factory=dict)
 
 
 class _PolicySkewMonitor:
@@ -251,6 +262,7 @@ class AxolRobot(Robot):
         # not stop its coroutine, so a retry must wait for this exact attempt
         # rather than submit a second, overlapping motor/bus teardown.
         self._disconnect_future: Future[None] | None = None
+        self._preserve_disconnect_requested = False
         # The last policy observation built, keyed on its anchor exposure; it
         # is served again until the cameras deliver a newer exposure (see
         # ``_get_synchronized_observation``).
@@ -260,13 +272,15 @@ class AxolRobot(Robot):
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
-        # Built on connect() only when observe_cartesian is set; turns cached
-        # joint angles into end-effector poses for the observation.
+        # Built on connect() when observations or actions are Cartesian;
+        # converts measured joints for observations and dispatch safety checks.
         self._fk: AxolForwardKinematics | None = None
         # Full IK solver, built lazily the first time a Cartesian action is sent
         # (run-policy). Collect-data commands joint targets, so it never builds
         # this; only the cheap forward-kinematics helper above runs there.
         self._ik: KinematicsSolver | None = None
+        self._last_joint_command: np.ndarray | None = None
+        self._dispatch_untrusted = False
         # Post-IK command shapers for Cartesian actions (one per arm), built
         # lazily alongside their first use. Cartesian clients stream EE poses
         # whose IK solutions can step arbitrarily (discontinuous policy
@@ -361,7 +375,9 @@ class AxolRobot(Robot):
                     by_cfg[id(cfg)] = cam
                     stereo_cameras.append(cam)
                 cameras[key] = cam.left_view if eye == "left" else cam.right_view
-        return cameras, stereo_cameras
+        # Building mono and stereo cameras separately must not reorder the
+        # observation features used by datasets and policy handshakes.
+        return {key: cameras[key] for key in obs_cams}, stereo_cameras
 
     def _build_gst_cameras(self) -> tuple[dict, list]:
         """Build cameras on the gst pipeline (raw for dataset + encoded view)."""
@@ -456,10 +472,19 @@ class AxolRobot(Robot):
         return features
 
     @property
+    def cartesian_actions(self) -> bool:
+        explicit = getattr(self.config, "action_space", None)
+        return (
+            self.config.observe_cartesian
+            if explicit is None
+            else explicit == "cartesian"
+        )
+
+    @property
     def action_features(self) -> dict:
         if self._action_features is None:
-            if self.config.observe_cartesian:
-                # Mirror the observation: command each arm by a 6-axis EE pose
+            if self.cartesian_actions:
+                # Command each arm by a 6-axis EE pose independently of observations
                 # (resolved to joints via IK in send_action) plus gripper (when
                 # this robot has one).
                 gripper_l = [_LEFT_GRIPPER_KEY] if self._has_gripper else []
@@ -487,10 +512,44 @@ class AxolRobot(Robot):
             )
         loop = asyncio.new_event_loop()
         self._loop = loop
+        scheduled = threading.Event()
+        scheduling_error: list[BaseException] = []
+
+        def run_control_loop() -> None:
+            # This thread *is* the control loop: collect-data / collect-dagger
+            # schedule their hot loop onto it and run-policy hands it every
+            # action, so it gets the realtime core and SCHED_FIFO the same way
+            # `axol teleop` treats its own loop thread (2026-09-15: as an
+            # ordinary CFS peer of the VR/IK/diag threads on that core it
+            # waited ~300 ms of every second for the CPU — one tick in fifty
+            # 15-50 ms late, arms hitching). Threads it spawns start CFS.
+            #
+            # A denied real-time class is handed back to connect() instead of
+            # raised here: this thread would otherwise die before
+            # run_forever(), leaving every coroutine scheduled onto the loop
+            # to fail on the 30 s timeout below with nothing naming the cause.
+            try:
+                affinity.enter_control_thread()
+            except BaseException as exc:  # noqa: BLE001 - relayed to connect()
+                scheduling_error.append(exc)
+                scheduled.set()
+                return
+            scheduled.set()
+            loop.run_forever()
+
         self._loop_thread = threading.Thread(
-            target=loop.run_forever, name="axol-event-loop", daemon=True
+            target=run_control_loop, name="axol-event-loop", daemon=True
         )
         self._loop_thread.start()
+        scheduled.wait()
+        if scheduling_error:
+            # The thread has already exited, so nothing will ever service this
+            # loop; drop it and let connect() be retried once the operator has
+            # fixed the grant.
+            self._loop = None
+            self._loop_thread = None
+            loop.close()
+            raise scheduling_error[0]
 
         self._connect_future = asyncio.run_coroutine_threadsafe(
             self._connect_async(), loop
@@ -506,7 +565,9 @@ class AxolRobot(Robot):
             raise
         self._connect_future = None
 
-        if self.config.observe_cartesian and self._fk is None:
+        if (
+            self.config.observe_cartesian or self.cartesian_actions
+        ) and self._fk is None:
             from ...kinematics.fk import AxolForwardKinematics
 
             self._fk = AxolForwardKinematics()
@@ -551,6 +612,26 @@ class AxolRobot(Robot):
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
+        self._disconnect(preserve_position=False)
+
+    def disconnect_preserving_position(self) -> None:
+        """Close cameras and CAN while leaving motors on their last command.
+
+        Use after a software fault once every action/observation worker has
+        stopped. This does not park the arms or remove motor power. The core
+        stops streaming, so host damping ends; the motors retain their last
+        firmware gains and gravity feedforward. A core already limp remains
+        limp rather than being commanded back into a position hold.
+        """
+        self._disconnect(preserve_position=True)
+
+    def _disconnect(self, *, preserve_position: bool) -> None:
+        # A generic cleanup retry after a preserving teardown failure must
+        # not reinterpret that fault as permission to remove motor support.
+        preserve_position = preserve_position or getattr(
+            self, "_preserve_disconnect_requested", False
+        )
+        self._preserve_disconnect_requested = preserve_position
         camera_failures: list[BaseException] = []
         for cam in self.cameras.values():
             if cam.is_connected:
@@ -581,19 +662,20 @@ class AxolRobot(Robot):
         ):
             if self._disconnect_future is None:
                 self._disconnect_future = asyncio.run_coroutine_threadsafe(
-                    self._disconnect_async(), self._loop
+                    self._disconnect_async(preserve_position=preserve_position),
+                    self._loop,
                 )
             future = self._disconnect_future
             try:
                 future.result(timeout=10)
             except BaseException as exc:
                 # A completed failure is retryable by submitting a fresh
-                # disable. A timeout stays attached so the retry waits for the
+                # teardown. A timeout stays attached so the retry waits for the
                 # still-running coroutine instead of overlapping it.
                 if future.done():
                     self._disconnect_future = None
                 raise HardwareCleanupError(
-                    "robot disable failed; hardware ownership is uncertain"
+                    "robot teardown failed; hardware ownership is uncertain"
                 ) from exc
             self._disconnect_future = None
 
@@ -612,14 +694,20 @@ class AxolRobot(Robot):
         self._loop_thread = None
         self._fk = None
         self._ik = None
+        self._last_joint_command = None
+        self._dispatch_untrusted = False
+        self._preserve_disconnect_requested = False
         _logger.info("AxolRobot disconnected.")
         if camera_failures:
             raise camera_failures[0]
 
-    async def _disconnect_async(self) -> None:
+    async def _disconnect_async(self, *, preserve_position: bool = False) -> None:
         if self._axol is None:
             return
-        await self._axol.disable()
+        if preserve_position:
+            await self._axol.disconnect()
+        else:
+            await self._axol.disable()
         self._axol = None
 
     # ------------------------------------------------------------------
@@ -652,6 +740,53 @@ class AxolRobot(Robot):
         assert self._axol.left is not None
         assert self._axol.right is not None
         return self._axol.left.positions, self._axol.right.positions
+
+    def parking_positions(
+        self, max_age_s: float = 0.5
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Read live motor feedback for a guarded park, without requesting CAN.
+
+        Every motor must have recent feedback; an average snapshot timestamp
+        could hide one silent motor. Faulted, limp or uncertain dispatch state
+        cannot authorize another powered move.
+        """
+        if self._axol is None:
+            raise RuntimeError("Soft park requires a connected robot")
+        if self._axol.fault is not None or self._axol.limp is not None:
+            raise RuntimeError("Soft park refused: realtime core is faulted or limp")
+        if self._dispatch_untrusted:
+            raise RuntimeError(
+                "Soft park refused: previous command completion is unknown"
+            )
+        for arm in (self._axol.left, self._axol.right):
+            if arm is None or len(arm.motors) != 8:
+                raise RuntimeError("Soft park requires feedback for both complete arms")
+            for motor in arm.motors.values():
+                feedback_ts = motor.feedback_ts
+                age = time.time() - feedback_ts
+                if not np.isfinite(age) or not 0 <= age <= max_age_s:
+                    raise RuntimeError(
+                        "Soft park refused: stale or invalid motor feedback"
+                    )
+        left, right = (np.asarray(pos).copy() for pos in self.positions)
+        if any(
+            pos.shape != (8,) or not np.isfinite(pos).all() for pos in (left, right)
+        ):
+            raise RuntimeError("Soft park refused: invalid measured joint positions")
+        return left, right
+
+    def parking_gripper_hold(self) -> tuple[float, float]:
+        """Keep a stiff hold's commanded grasp for both legs of a park."""
+        left, right = self.parking_positions()
+        command = self._last_joint_command
+        hold = (
+            (float(command[7]), float(command[15]))
+            if command is not None
+            else (float(left[7]), float(right[7]))
+        )
+        if not all(np.isfinite(value) and 0 <= value <= 1 for value in hold):
+            raise RuntimeError("Soft park refused: invalid gripper hold")
+        return hold
 
     @property
     def event_loop(self) -> asyncio.AbstractEventLoop:
@@ -713,11 +848,11 @@ class AxolRobot(Robot):
         The teleop produces joint-position targets; in cartesian mode the
         *recorded* action must match :attr:`action_features`, so the joint
         targets are mapped through forward kinematics to per-arm end-effector
-        poses (+ gripper). Identity when ``observe_cartesian`` is off. This does
+        poses (+ gripper). Identity when the action space is joint. This does
         not touch what is commanded to the arm — only the value stored in the
         dataset — so teleop keeps its exact joint fidelity.
         """
-        if not self.config.observe_cartesian:
+        if not self.cartesian_actions:
             return action
         left = self._pack_arm(action, self._left_pos_keys)
         right = self._pack_arm(action, self._right_pos_keys)
@@ -843,7 +978,34 @@ class AxolRobot(Robot):
     def _get_synchronized_observation(
         self,
     ) -> tuple[RobotObservation, float, float]:
-        """Build one synchronized observation; return (obs, exposure, state) times.
+        built = self._get_synchronized_observation_data()
+        return dict(built.observation), built.capture_ts, built.state_ts
+
+    @check_if_not_connected
+    def get_observation_with_sensor_timestamps(
+        self,
+    ) -> tuple[RobotObservation, int, dict[str, int]]:
+        """Atomic measured observation with actual sensor times in perf-counter ns.
+
+        Per-camera exposure times are retained even when the observation is
+        re-served from the cache. They are not replaced by its median exposure.
+        """
+        if not self.cameras:
+            raise RuntimeError(
+                "timestamped policy observations require camera/state alignment"
+            )
+        built = self._get_synchronized_observation_data()
+        return (
+            dict(built.observation),
+            round(built.state_ts * 1_000_000_000),
+            {
+                name: round(stamp * 1_000_000_000)
+                for name, stamp in built.camera_capture_ts.items()
+            },
+        )
+
+    def _get_synchronized_observation_data(self) -> _PolicyObservation:
+        """Build one synchronized observation retaining every sensor timestamp.
 
         The frame set is anchored on the **newest exposure every camera has
         already delivered**, not on "now": each camera pipeline (Argus → VIC →
@@ -887,7 +1049,7 @@ class AxolRobot(Robot):
         """
         now = time.perf_counter()
         if not self.cameras:
-            return self._joint_state(), now, now
+            return _PolicyObservation(now, self._joint_state(), now, now)
         cameras = self.cameras
         slowest_fps = min(
             float(getattr(cam, "fps", None) or 30) for cam in cameras.values()
@@ -915,7 +1077,7 @@ class AxolRobot(Robot):
                 )
             age_s = now - recv_ts
             if age_s > max_age_s:
-                raise RuntimeError(
+                raise PolicyObservationNotReady(
                     f"policy camera {cam_key!r} produced no fresh frame: its newest "
                     f"frame is {age_s * 1e3:.0f}ms old (limit {max_age_s * 1e3:.0f}ms)"
                 )
@@ -927,7 +1089,7 @@ class AxolRobot(Robot):
         with self._policy_exposure_lock:
             last = self._last_policy_observation
         if last is not None and anchor_ts <= last.anchor_ts + 0.5 * period_s:
-            return dict(last.observation), last.capture_ts, last.state_ts
+            return last
 
         # 4. Take every camera's retained frame nearest the anchor. The lookup
         #    tolerance is the silence limit, not the alignment limit: a camera
@@ -962,14 +1124,13 @@ class AxolRobot(Robot):
         assert self._axol is not None
         state = self._axol.state_nearest(row_capture_ts)
         if state is None:
-            raise RuntimeError(
-                "no retained robot telemetry brackets policy camera exposure "
-                f"{row_capture_ts:.6f}"
+            raise PolicyObservationNotReady(
+                f"no retained robot telemetry brackets policy camera exposure {row_capture_ts:.6f}"
             )
         left_pos, right_pos, left_trq, right_trq, state_ts = state
         state_skew = abs(state_ts - row_capture_ts)
         if state_skew > _POLICY_STATE_ALIGNMENT_LIMIT_S:
-            raise RuntimeError(
+            raise PolicyObservationNotReady(
                 "nearest robot telemetry is too far from policy camera exposure "
                 f"({state_skew * 1e3:.1f}ms, limit "
                 f"{_POLICY_STATE_ALIGNMENT_LIMIT_S * 1e3:.1f}ms)"
@@ -982,13 +1143,15 @@ class AxolRobot(Robot):
         )
         obs.update(frames)
 
-        built = _PolicyObservation(anchor_ts, obs, row_capture_ts, float(state_ts))
+        built = _PolicyObservation(
+            anchor_ts, obs, row_capture_ts, float(state_ts), capture_ts
+        )
         with self._policy_exposure_lock:
             last = self._last_policy_observation
             if last is None or anchor_ts > last.anchor_ts:
                 self._last_policy_observation = built
 
-        return dict(obs), row_capture_ts, float(state_ts)
+        return built
 
     @staticmethod
     def _newest_policy_exposure(cam_key: str, cam: object) -> tuple[float, float]:
@@ -998,10 +1161,14 @@ class AxolRobot(Robot):
             if latest_capture_ts is not None:
                 stamps = latest_capture_ts()
                 if stamps is None:
-                    raise RuntimeError("camera has published no frame yet")
+                    raise PolicyObservationNotReady(
+                        f"policy camera {cam_key!r} has published no frame yet"
+                    )
                 cap_ts, recv_ts = stamps
             else:
                 _frame, cap_ts, recv_ts = cam.read_latest_with_ts()  # type: ignore[attr-defined]
+        except PolicyObservationNotReady:
+            raise
         except (TimeoutError, RuntimeError) as exc:
             raise RuntimeError(
                 f"policy camera {cam_key!r} produced no fresh frame: {exc}"
@@ -1107,6 +1274,26 @@ class AxolRobot(Robot):
         """
         self._ensure_ik()
 
+    def reset_cartesian_seed(self) -> None:
+        """Re-anchor the Cartesian shapers at measured joints on the next send.
+
+        Call only after the previous control owner has stopped. The IK solve
+        always uses measured joints; dropping these filters also removes the
+        previous owner's joint target and velocity history.
+        """
+        self._cartesian_shapers = None
+        self._cartesian_last_send = 0.0
+
+    def _joint_action(self, left: np.ndarray, right: np.ndarray) -> RobotAction:
+        return {
+            key: float(value)
+            for keys, values in (
+                (self._left_pos_keys, left),
+                (self._right_pos_keys, right),
+            )
+            for key, value in zip(keys, values)
+        }
+
     def _cartesian_action_to_targets(
         self, action: RobotAction
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -1188,11 +1375,15 @@ class AxolRobot(Robot):
         return left, right
 
     @check_if_not_connected
-    def send_action(self, action: RobotAction) -> RobotAction:
+    def send_action(
+        self,
+        action: RobotAction,
+        *,
+        joint_transform: Callable[[RobotAction], RobotAction] | None = None,
+    ) -> RobotAction:
         """Send an action to the arms, running IK first for Cartesian actions.
 
-        Accepts either joint-position targets or — when ``observe_cartesian``
-        is on and the policy emits them — per-arm Cartesian end-effector poses
+        Accepts either joint-position targets or per-arm Cartesian end-effector poses
         (+ gripper), which are resolved to joint targets via inverse
         kinematics. Either way the arm joints go out via impedance control and
         the gripper via position-force control.
@@ -1207,9 +1398,14 @@ class AxolRobot(Robot):
                 (joint mode) or metres + axis-angle radians (Cartesian mode).
 
         Returns:
-            The action as sent (unmodified).
+            The input action, or the resolved joint command when a
+            ``joint_transform`` is supplied. The transform runs after IK and
+            joint shaping, immediately before dispatch, so control handovers
+            can smooth the command without modifying a policy's plan.
         """
         assert self._loop is not None
+        if getattr(self, "_dispatch_untrusted", False):
+            raise HardwareCleanupError("Previous action dispatch did not drain")
 
         # Build the IK solver here, on the caller's thread, so the one-time
         # URDF load + JIT warmup never blocks the robot's event loop (telemetry).
@@ -1220,12 +1416,43 @@ class AxolRobot(Robot):
         is_cartesian = _LEFT_EE_KEYS[0] in action
         if is_cartesian:
             self._ensure_ik()
+        if joint_transform is not None:
+            if is_cartesian:
+                left, right = self._cartesian_action_to_targets(action)
+                action = self._joint_action(left, right)
+            action = joint_transform(action)
 
-        asyncio.run_coroutine_threadsafe(
-            self.send_action_async(action), self._loop
-        ).result(timeout=5.0 if is_cartesian else 1.0)
+        dispatch = self.send_action_async(action)
+        future = asyncio.run_coroutine_threadsafe(dispatch, self._loop)
+        try:
+            future.result(timeout=5.0 if is_cartesian else 1.0)
+        except BaseException:
+            if not future.done():
+                future.cancel()
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._drain_action_dispatch(dispatch), self._loop
+                    ).result(timeout=1.0)
+                except BaseException as drain_error:
+                    self._dispatch_untrusted = True
+                    raise HardwareCleanupError(
+                        "Action dispatch cancelled but robot loop did not drain; "
+                        "hardware handoff is uncertain"
+                    ) from drain_error
+            raise
 
         return action
+
+    @staticmethod
+    async def _drain_action_dispatch(dispatch) -> None:
+        """Join a cancelled dispatch, including its asynchronous finalizers."""
+        for task in asyncio.all_tasks():
+            if task.get_coro() is dispatch:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return
 
     async def send_action_async(self, action: RobotAction) -> RobotAction:
         """Await ``motion_control`` directly on the robot's event loop.
@@ -1256,6 +1483,7 @@ class AxolRobot(Robot):
             right = self._pack_arm(action, self._right_pos_keys)
 
         await self._axol.motion_control(left=left, right=right)
+        self._last_joint_command = np.concatenate((left, right)).astype(np.float32)
 
         return action
 

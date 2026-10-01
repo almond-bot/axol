@@ -87,9 +87,11 @@ import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
+import { DatasetPreview } from "@/components/dataset-preview"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
+import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
@@ -151,6 +153,7 @@ export default function ControlPanel() {
   const [serverHost, setServerHost] = useState<string>(
     () => localStorage.getItem("axolServerHost") ?? ""
   )
+  const [hostHistory, setHostHistory] = useState<string[]>(loadHostHistory)
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
@@ -416,6 +419,7 @@ export default function ControlPanel() {
         setCommands(cmds)
         setConn({ state: "ok" })
         setSetupOpen(false)
+        setHostHistory(recordHost(host))
       } catch (e) {
         if (generation !== connectionGenerationRef.current) return
         setCommands([])
@@ -1472,7 +1476,8 @@ export default function ControlPanel() {
   useEffect(() => {
     if (conn.state !== "ok" || !updating) return
     const target = update?.remoteVersion ?? null
-    const deadline = Date.now() + 5 * 60_000
+    // Upgrade + provision + a possible host reboot (a new camera driver).
+    const deadline = Date.now() + 10 * 60_000
     let active = true
     const t = setInterval(async () => {
       if (Date.now() > deadline) {
@@ -1505,8 +1510,9 @@ export default function ControlPanel() {
         if (target && u.version === target) window.location.reload()
       } catch {
         // Server stopped responding: it exited to relaunch (or is briefly
-        // unreachable). Show "restarting" and keep watching for it to return.
-        if (active) setUpdatePhase("restarting")
+        // unreachable). Show "restarting" (unless the host said it is
+        // rebooting) and keep watching for it to return.
+        if (active) setUpdatePhase((phase) => (phase === "rebooting" ? phase : "restarting"))
       }
     }, 2000)
     return () => {
@@ -1910,6 +1916,13 @@ export default function ControlPanel() {
           onEpisode={handleEpisode}
         />
 
+        <DatasetPreview
+          key={`datasets-${renderedConnectionGeneration}`}
+          connected={conn.state === "ok"}
+          liveDataset={policy?.dataset ?? null}
+          episodesRecorded={policy?.episodesRecorded ?? null}
+        />
+
         <LogConsole lines={lines} />
       </main>
 
@@ -1917,6 +1930,7 @@ export default function ControlPanel() {
         open={setupOpen}
         onClose={() => setSetupOpen(false)}
         host={serverHost}
+        hostHistory={hostHistory}
         onChangeHost={updateServerHost}
         conn={conn}
         onConnect={() => loadServer(serverHost)}

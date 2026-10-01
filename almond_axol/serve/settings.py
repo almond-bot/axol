@@ -1000,10 +1000,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "Frame rate of the recorded dataset (and policy control "
-                    "rate). Recording cameras' capture fps is raised "
-                    "automatically to match when this is set above their "
-                    "default 60 — note the ZED X only supports rates above "
-                    "60 at SVGA resolution."
+                    "rate); default 30. Cameras capture at 60 and are "
+                    "decimated to this before the encoder; 60 doubles the "
+                    "dataset encode/recorder load. A policy must run at the "
+                    "fps it was trained on. Capture fps is raised "
+                    "automatically to match when this is set above 60 — note "
+                    "the ZED X only supports rates above 60 at SVGA resolution."
                 ),
                 targets={
                     "collect-data": ("fps",),
@@ -1110,15 +1112,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Device",
                 type="select",
                 options=("cuda", "cpu", "mps"),
-                help="Device the policy runs on.",
+                help="Device the policy runs on (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.server_host",
                 label="Inference server host",
                 type="text",
                 help=(
-                    "Address of a remote `axol inference-server`. Leave unset "
-                    "to run inference locally."
+                    "Address of a remote `axol inference-server`, or of your "
+                    "endpoint implementing the custom policy interface. "
+                    "Leave unset for local LeRobot inference, or to connect "
+                    "to a custom endpoint on this machine. Start custom "
+                    "endpoints separately."
                 ),
                 effective_default="local — inference runs on this machine",
             ),
@@ -1126,7 +1131,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.server_port",
                 label="Inference server port",
                 type="number",
-                help="Port of the inference server (local or remote).",
+                help=(
+                    "Port of the inference server (local or remote), or of "
+                    "your endpoint implementing the custom policy interface."
+                ),
             ),
             SettingDef(
                 key="inference.episode_time_s",
@@ -1144,7 +1152,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.chunk_size_threshold",
                 label="Chunk size threshold",
                 type="number",
-                help="Queue fraction below which the next chunk is requested.",
+                help=(
+                    "Queue fraction below which the next chunk is requested "
+                    "(LeRobot policies only)."
+                ),
             ),
             SettingDef(
                 key="inference.aggregate_fn",
@@ -1157,13 +1168,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "average",
                     "conservative",
                 ),
-                help="How overlapping action chunks are combined.",
+                help="How overlapping action chunks are combined (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.temporal_ensemble_coeff",
                 label="Temporal ensemble coeff",
                 type="number",
-                help="Exponential weight for the temporal_ensemble aggregation.",
+                help=(
+                    "Exponential weight for the temporal_ensemble aggregation "
+                    "(LeRobot policies only)."
+                ),
             ),
         ),
     ),
@@ -1554,6 +1568,8 @@ class SettingsStore:
                     for key, value in flat.items():
                         for canonical in canonical_keys(key):
                             values[canonical] = value
+                if not self._strict:
+                    self._repair_axol_channels(values)
                 return {"values": values, "cameras": raw.get("cameras")}
         except FileNotFoundError:
             pass
@@ -1562,6 +1578,30 @@ class SettingsStore:
                 raise
             _logger.exception("failed to load %s; starting empty", self._path)
         return {"values": {}, "cameras": None}
+
+    def _repair_axol_channels(self, values: dict[str, Any]) -> None:
+        """Drop a persisted Axol arm map that the store would refuse to save.
+
+        Files written before ``update`` validated the pair (or hand-edited
+        since) can map both arms onto one interface. ``can_channels`` rejects
+        that, and serve resolves it at ``create_app`` — so an invalid pair
+        would crash every restart while the only UI able to fix it is the
+        panel serve hosts. Fall back to the hub's default names (logged, not
+        rewritten until the next save) so the operator can repair it in
+        Settings. The strict CLI/SDK store keeps the values and fails on use.
+        """
+        keys = ("robot.left_channel", "robot.right_channel")
+        try:
+            _axol_channels_from_values(values)
+        except ValueError as exc:
+            _logger.error(
+                "ignoring the Axol CAN channels saved in %s (%s); using the "
+                "defaults until Settings → Robot is corrected",
+                self._path,
+                exc,
+            )
+            for key in keys:
+                values.pop(key, None)
 
     @staticmethod
     def _migrate_v1(raw: dict[str, Any]) -> dict[str, Any]:

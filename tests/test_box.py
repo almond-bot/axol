@@ -540,7 +540,7 @@ class BoxElbowHintsTest(unittest.TestCase):
         worker = _stick_worker()
         worker._config.box_elbow_weight = weight
         worker._solver = types.SimpleNamespace(
-            shoulder_positions=(_SHOULDER_L, _SHOULDER_R),
+            shoulder_positions={"left": _SHOULDER_L, "right": _SHOULDER_R},
             elbow_positions=lambda q: (
                 np.array((0.25, 0.05, 0.42), np.float32),
                 np.array((0.25, -0.05, 0.42), np.float32),

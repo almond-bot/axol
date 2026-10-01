@@ -652,6 +652,12 @@ def _relay_main(
     camera path.
     """
     logging.basicConfig(level=log_level)
+    # aiortc logs every RTP packet it sends at DEBUG — several hundred lines a
+    # second per track — which would bury the relay's own queue/exposure
+    # diagnostics the level was raised for.
+    from ..utils.logquiet import quiet_noisy_loggers
+
+    quiet_noisy_loggers()
 
     # Disable the cyclic garbage collector in the relay. aiortc sends WebRTC media
     # on this process's asyncio loop, and a stop-the-world gen2 GC pause freezes

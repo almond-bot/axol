@@ -1,0 +1,44 @@
+---
+title: "policy.check"
+description: "Exercise a custom policy endpoint without a robot."
+---
+
+Plays the robot's side of a [custom policy](/operations/custom-policy) session against a running endpoint, such as one started with [`almond_axol.policy.serve()`](/api/policy). It needs no robot, cameras or CAN. It uses the same scheduler as [`run-policy`](/cli/run-policy) on a virtual clock:
+
+- Requests go out every `request_interval` ticks.
+- Each reply is adopted `delay_steps` ticks after its request, at the row that's due by then.
+- A reply later than `max_adoption_offset_steps` triggers recovery, as it would on the robot.
+
+Frames are mid-grey, and the simulated arm tracks its commands perfectly.
+
+```bash
+axol policy.check                                  # endpoint on ws://127.0.0.1:8765
+axol policy.check --server_host 192.168.1.99 --delay_steps 4
+axol policy.check --cartesian true --cameras overhead,left_arm,right_arm
+```
+
+The report lists:
+
+- requests sent and replies adopted;
+- every recovery and its reason (a late reply, or a plan that ran out of rows);
+- the endpoint's real round-trip time, against the time between requests;
+- the largest per-tick jumps where one plan hands over to the next, next to the largest steps within a plan.
+
+A policy that continues the motion in progress shows switch jumps no larger than its within-plan steps. The command exits `1` if the endpoint refuses the session or fails a request, and `2` if any recovery happened.
+
+| Flag | Description |
+|---|---|
+| `--server_host HOST` | Endpoint address, or a `ws://` / `wss://` URL (default: `127.0.0.1`) |
+| `--server_port INT` | Endpoint port (default: 8765) |
+| `--ticks INT` | Control ticks to simulate (default: 300, i.e. 10 s at 30 Hz) |
+| `--delay_steps INT` | Simulated reply latency in ticks (default: 2) |
+| `--cartesian BOOL` | Send the Cartesian layout (`observe_cartesian`) instead of joint positions (default: false) |
+| `--cameras LIST` | Comma-separated camera names (default: `overhead`) |
+| `--camera_height INT` / `--camera_width INT` | Frame size (default: 360 × 640) |
+| `--fps INT` | Control rate (default: 30) |
+| `--actions_per_chunk INT` | Horizon (default: 50) |
+| `--request_interval INT` | Rows between requests (default: 5, as run-policy) |
+| `--max_adoption_offset_steps INT` | Latest row a reply may start at (default: 6, as run-policy) |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `WARNING` |
+
+From Python, `check_policy()` returns the same report as a [`CheckReport`](/api/policy#check_policy) for unit tests.

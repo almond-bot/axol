@@ -54,6 +54,17 @@ _BIND_RETRY_DELAY = 0.25  # seconds between attempts
 _owned_listen_sockets: dict[int, socket.socket] = {}
 
 
+def register_listen_socket(port: int, sock: socket.socket) -> None:
+    """Record ``sock`` as this process's listener on ``port``.
+
+    For a caller that wraps the socket :func:`open_listen_socket` returned
+    (e.g. ``socket.socket(fileno=original.detach())``): the detached original
+    no longer owns the fd, so the wrapper must replace it here or a leaked
+    wrapper could never be reclaimed by the next bind.
+    """
+    _owned_listen_sockets[port] = sock
+
+
 def listening_pids(port: int) -> set[int]:
     """PIDs (other than our own) with a LISTEN socket on ``port``.
 
