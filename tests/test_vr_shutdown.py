@@ -250,3 +250,68 @@ def test_failed_forced_shutdown_retains_task_ownership(monkeypatch):
                 await serve_task
 
     asyncio.run(scenario())
+
+
+def test_failed_shutdown_still_frees_the_vr_port(tls_paths, monkeypatch):
+    """A stuck/failed disable keeps the task but must release the listener.
+
+    Under ``axol serve`` the process outlives the operation: a listener kept
+    open here would make every later VR operation fail to bind its port.
+    """
+
+    async def scenario():
+        server = _make_server(tls_paths)
+        await server.enable()
+        port = await _wait_started(server)
+        serve_task = server._server_task
+
+        async def stuck(_server, _task):
+            raise RuntimeError("VR server shutdown did not complete")
+
+        monkeypatch.setattr(server, "_join_server_task", stuck)
+        try:
+            with pytest.raises(RuntimeError, match="did not complete"):
+                await server.disable()
+            assert server._server_task is serve_task  # ownership retained
+            assert server._listen_socket is None
+            with socket.socket() as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                listener.bind(("127.0.0.1", port))
+                listener.listen()
+        finally:
+            with suppress(Exception):
+                await asyncio.wait_for(serve_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+
+def test_wrapped_listener_is_reclaimable_by_the_next_bind(tls_paths):
+    """The fd-owning wrapper, not the detached original, is registered."""
+    from almond_axol.utils import ports
+
+    async def scenario():
+        server = _make_server(tls_paths)
+        await server.enable()
+        await _wait_started(server)
+        try:
+            assert ports._owned_listen_sockets[0] is server._listen_socket
+        finally:
+            await server.disable()
+
+    asyncio.run(scenario())
+
+    # A leaked (still listening) wrapper on a fixed port is closed and rebound.
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    leaked = server_module._ClientTrackingSocket(
+        ports.open_listen_socket("127.0.0.1", port)
+    )
+    ports.register_listen_socket(port, leaked)
+    leaked.listen()
+    rebound = ports.open_listen_socket("127.0.0.1", port)
+    try:
+        assert leaked.fileno() == -1
+    finally:
+        rebound.close()

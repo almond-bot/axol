@@ -14,7 +14,7 @@ class DaggerStdinControl(_StdinPolicyControl):
     """
 
     def __init__(self) -> None:
-        super().__init__(eof_choice="abort", immediate_quit=True)
+        super().__init__(eof_choice="abort", immediate_quit=True, quit_from_holds=True)
         self.abort_requested = False
         self._gate_active = False
         self._gate_result: str | None = None

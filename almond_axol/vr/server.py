@@ -53,7 +53,7 @@ from ..utils.certs import (
     PreparedTLSFiles,
     prepare_tls_files,
 )
-from ..utils.ports import open_listen_socket
+from ..utils.ports import open_listen_socket, register_listen_socket
 from .config import VRServerConfig
 from .control_channel import ControlChannelManager
 from .ice import client_ice_servers
@@ -655,6 +655,9 @@ class VRServer:
         try:
             sock = await asyncio.to_thread(open_listen_socket, "0.0.0.0", self._port)
             sock = _ClientTrackingSocket(sock)
+            # The wrapper now owns the fd; keep in-process leak recovery
+            # (open_listen_socket closing a socket we leaked) pointed at it.
+            register_listen_socket(self._port, sock)
             self._listen_socket = sock
 
             app = self._build_app()
@@ -689,6 +692,65 @@ class VRServer:
         self._tls_files = tls_files
         _logger.info("listening on wss://0.0.0.0:%d/ws", self._port)
 
+    async def _join_server_task(self, server: Any, server_task: asyncio.Task) -> None:
+        """Wait for uvicorn's serve() to finish, aborting stalled connections.
+
+        Raises when it cannot finish; the task stays owned by the caller.
+        """
+        # wait() leaves the owned task alive if this caller is cancelled,
+        # and distinguishes a deadline from an exception raised by serve().
+        done, _ = await asyncio.wait((server_task,), timeout=_SERVER_SHUTDOWN_GRACE_S)
+        if not done:
+            connections = tuple(server.server_state.connections) if server else ()
+            if connections:
+                _logger.info(
+                    "Closing %d VR connection(s) that did not complete shutdown",
+                    len(connections),
+                )
+            # Abort through asyncio's listening servers as well as the
+            # application protocols. A TLS wrapper can lose its reference
+            # to the underlying transport after repeated close() calls;
+            # aborting that wrapper alone then has no effect. This also
+            # retires clients stalled before completing a TLS handshake.
+            if server is not None:
+                for listener in getattr(server, "servers", ()):
+                    abort_clients = getattr(listener, "abort_clients", None)
+                    if abort_clients is not None:
+                        abort_clients()
+                    elif isinstance(self._listen_socket, _ClientTrackingSocket):
+                        self._listen_socket.abort_clients()
+            for connection in connections:
+                connection.transport.abort()
+            done, _ = await asyncio.wait(
+                (server_task,), timeout=_SERVER_SHUTDOWN_ABORT_S
+            )
+            if not done:
+                # Keep ownership visible so the enclosing event-loop owner
+                # can cancel and drain remaining tasks before closing it.
+                raise RuntimeError("VR server shutdown did not complete")
+        await server_task
+
+    def _release_listener(self, server: Any) -> None:
+        """Close the listening socket so the VR port is free for the next bind.
+
+        asyncio's listening servers are closed through their own API first (so
+        the loop unregisters the fd before it is closed); accepted connections
+        are untouched. Idempotent.
+        """
+        for listener in getattr(server, "servers", None) or ():
+            close = getattr(listener, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - freeing the port matters more
+                    _logger.debug("VR listener close failed", exc_info=True)
+        if self._listen_socket is not None:
+            try:
+                self._listen_socket.close()
+            except OSError:
+                pass
+            self._listen_socket = None
+
     async def disable(self) -> None:
         """Gracefully shut down the WSS server."""
         _clear_quest_pose_datum(server=self)
@@ -718,51 +780,21 @@ class VRServer:
             # forever for a half-open TLS connection before task joining begins.
             server.should_exit = True
         if server_task is not None:
-            # wait() leaves the owned task alive if this caller is cancelled,
-            # and distinguishes a deadline from an exception raised by serve().
-            done, _ = await asyncio.wait(
-                (server_task,), timeout=_SERVER_SHUTDOWN_GRACE_S
-            )
-            if not done:
-                connections = tuple(server.server_state.connections) if server else ()
-                if connections:
-                    _logger.info(
-                        "Closing %d VR connection(s) that did not complete shutdown",
-                        len(connections),
-                    )
-                # Abort through asyncio's listening servers as well as the
-                # application protocols. A TLS wrapper can lose its reference
-                # to the underlying transport after repeated close() calls;
-                # aborting that wrapper alone then has no effect. This also
-                # retires clients stalled before completing a TLS handshake.
-                if server is not None:
-                    for listener in getattr(server, "servers", ()):
-                        abort_clients = getattr(listener, "abort_clients", None)
-                        if abort_clients is not None:
-                            abort_clients()
-                        elif isinstance(self._listen_socket, _ClientTrackingSocket):
-                            self._listen_socket.abort_clients()
-                for connection in connections:
-                    connection.transport.abort()
-                done, _ = await asyncio.wait(
-                    (server_task,), timeout=_SERVER_SHUTDOWN_ABORT_S
-                )
-                if not done:
-                    # Keep ownership visible so the enclosing event-loop owner
-                    # can cancel and drain remaining tasks before closing it.
-                    raise RuntimeError("VR server shutdown did not complete")
-            await server_task
+            try:
+                await self._join_server_task(server, server_task)
+            except BaseException:
+                # The stuck/failed server task stays owned for a retry, but the
+                # listener must not: a long-lived process (``axol serve``)
+                # would otherwise keep the VR port bound and every later VR
+                # operation would fail to start.
+                self._release_listener(server)
+                raise
             self._server_task = None
         self._uvicorn_server = None
 
         # uvicorn normally closes the adopted socket. Close our handle too
         # before releasing it; failures above retain ownership for recovery.
-        if self._listen_socket is not None:
-            try:
-                self._listen_socket.close()
-            except OSError:
-                pass
-            self._listen_socket = None
+        self._release_listener(server)
 
         if self._tls_files is not None:
             self._tls_files.close()

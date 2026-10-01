@@ -302,7 +302,11 @@ class _StdinPolicyControl:
     """Terminal episode control: stdin keystrokes + Enter-to-continue prompts."""
 
     def __init__(
-        self, *, eof_choice: str | None = None, immediate_quit: bool = False
+        self,
+        *,
+        eof_choice: str | None = None,
+        immediate_quit: bool = False,
+        quit_from_holds: bool = False,
     ) -> None:
         self._stop: "threading.Event | None" = None
         self._result: dict[str, str | None] = {"choice": None}
@@ -310,14 +314,24 @@ class _StdinPolicyControl:
         self.quit_requested = False
         self._eof_choice = eof_choice
         self._immediate_quit = immediate_quit
+        # ``q`` at a limp contact/discard hold quits (and the arms lose their
+        # gravity-comp support at teardown). Only the custom policy interface
+        # opts in; elsewhere a hold keeps its original "any input returns to
+        # rest" prompt so a stray ``q`` can't drop the arms.
+        self._quit_from_holds = quit_from_holds
 
     def await_continue(
         self, message: str, label: str = "Start episode", phase: str = _GATE_READY
     ) -> bool:
+        quittable = phase == _GATE_READY or self._quit_from_holds
         try:
-            raw = input(f"{message} [Enter]=continue, q=quit: ")
+            raw = input(
+                f"{message} [Enter]=continue, q=quit: "
+                if quittable
+                else f"{message} [Enter] "
+            )
             self.quit_requested = False
-            if raw.strip().lower() == "q":
+            if quittable and raw.strip().lower() == "q":
                 self.quit_requested = phase == _GATE_READY
                 return False
             return True
@@ -2655,8 +2669,16 @@ def _run(
     if stop_event is None:
         stop_event = threading.Event()
     if control is None:
+        # The custom policy interface's terminal contract: EOF aborts the
+        # episode and ``q`` quits from any gate. LeRobot runs keep the original
+        # behaviour (EOF lets the episode run to its cap; holds only continue).
+        terminal_contract = cfg.policy_type == "custom" or getattr(
+            cfg, "soft_park_on_quit", False
+        )
         control = _StdinPolicyControl(
-            eof_choice="abort", immediate_quit=getattr(cfg, "soft_park_on_quit", False)
+            eof_choice="abort" if terminal_contract else None,
+            immediate_quit=getattr(cfg, "soft_park_on_quit", False),
+            quit_from_holds=terminal_contract,
         )
 
     # Import lerobot's RobotClient module first, through the shim that undoes
@@ -3084,9 +3106,12 @@ def _run(
             gc.collect()
             gc.disable()
             _logger.info(
-                "Pre-episode gc.collect: %.0f ms; custom policy interface (v2) waits for fresh sensors "
-                "before its first request",
+                "Pre-episode gc.collect: %.0f ms%s",
                 (time.perf_counter() - gc_t0) * 1000.0,
+                "; custom policy interface (v2) waits for fresh sensors before "
+                "its first request"
+                if custom_policy
+                else "",
             )
             timed_out = False
             interrupted = False
@@ -3329,7 +3354,14 @@ def _run(
         policy_failed = session_error is not None or (
             client is not None and client.fatal_error is not None
         )
-        preserve_position = robot_connected and (policy_failed or soft_park)
+        # Holding the last command after a failure is the custom policy
+        # interface's contract (a remote endpoint's fault must not drop the
+        # arms mid-plan). LeRobot policies keep their original teardown: a
+        # failure disables the motors, as it always has.
+        preserve_on_failure = custom_policy
+        preserve_position = robot_connected and (
+            (policy_failed and preserve_on_failure) or soft_park
+        )
         cleanup_failures: list[tuple[str, BaseException]] = []
         input_stopped = False
         try:
@@ -3340,7 +3372,7 @@ def _run(
         except BaseException as error:
             cleanup_failures.append(("episode input", error))
             policy_failed = True
-            preserve_position = robot_connected
+            preserve_position = robot_connected and (preserve_on_failure or soft_park)
         client_stopped = False
         parking_error: BaseException | None = None
         explicit_quit = normal_quit or getattr(control, "quit_requested", False) is True

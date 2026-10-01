@@ -122,7 +122,11 @@ def test_pre_episode_gc_failure_stops_input_reader_before_cleanup(error):
 @pytest.mark.parametrize("kind", ["stdin", "queue"])
 @pytest.mark.parametrize("entry", ["ready", "contact", "limp", "episode", "time cap"])
 def test_control_surfaces_distinguish_normal_quit_from_contact_abort(kind, entry):
-    control = _StdinPolicyControl() if kind == "stdin" else _QueuePolicyControl(Event())
+    control = (
+        _StdinPolicyControl(quit_from_holds=True)
+        if kind == "stdin"
+        else _QueuePolicyControl(Event())
+    )
     if kind == "queue":
         control.push("q")
     elif entry == "episode":
@@ -167,3 +171,36 @@ def test_stdin_reader_is_joined_before_next_prompt():
     control.end_episode()
     assert control._stop.is_set()
     control._thread.join.assert_called_once_with(timeout=1.0)
+
+
+@pytest.mark.parametrize("phase", ["contact", "limp"])
+def test_default_terminal_holds_keep_return_to_rest_prompt(phase):
+    """Outside the custom contract a stray q at a limp hold can't drop the arms."""
+    control = _StdinPolicyControl()
+    with mock.patch("builtins.input", return_value="q") as prompt:
+        assert control.await_continue("Hold", phase=phase) is True
+    assert prompt.call_args.args[0] == "Hold [Enter] "
+    assert not control.quit_requested
+
+
+@pytest.mark.parametrize(
+    ("policy_type", "eof", "holds"), [("act", None, False), ("custom", "abort", True)]
+)
+def test_run_policy_terminal_contract_follows_policy_type(policy_type, eof, holds):
+    from almond_axol.cli import run_policy
+
+    cfg = run_policy.RunPolicyConfig(policy_type=policy_type, task="t")
+    captured = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_control(**kwargs):
+        captured.update(kwargs)
+        raise Stop
+
+    with mock.patch.object(run_policy, "_StdinPolicyControl", side_effect=fake_control):
+        with pytest.raises(Stop):
+            run_policy._run(cfg)
+    assert captured["eof_choice"] == eof
+    assert captured["quit_from_holds"] is holds

@@ -30,6 +30,7 @@ def run_session(
     pre_episode_error=None,
     episode_time_s=120,
     episode_choices=None,
+    policy_type="custom",
 ):
     events = []
     stopped = Event()
@@ -93,8 +94,12 @@ def run_session(
             else HardwareCleanupError("live observation worker"),
         )
 
+    lerobot = policy_type != "custom"
     cfg = run_policy.RunPolicyConfig(
-        policy_type="custom",
+        policy_type=policy_type,
+        policy_path="org/policy" if lerobot else "",
+        # A remote LeRobot server: no PolicyServer child is spawned.
+        server_host="127.0.0.1" if lerobot else None,
         task="test",
         episode_time_s=episode_time_s,
         robot_config=object(),
@@ -126,6 +131,8 @@ def run_session(
             )
         )
         stack.enter_context(mock.patch.object(run_policy.time, "sleep"))
+        stack.enter_context(mock.patch.object(run_policy, "_check_training_fps"))
+        stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
         if episode_choice is None and fault is None:
             from itertools import count
 
@@ -209,3 +216,21 @@ def test_partial_connect_failure_uses_existing_startup_rollback():
     assert result.raised is error
     assert result.events == ["disable"]
     result.robot.disconnect_preserving_position.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "fault", [RuntimeError("CAN bus error"), ConnectionError("server disconnected")]
+)
+def test_lerobot_policy_fault_keeps_its_original_torque_off_teardown(fault):
+    """Preserving support after a failure is a custom-policy contract only."""
+    result = run_session(fault=fault, policy_type="act")
+    assert result.raised is fault
+    assert result.events == ["workers stopped", "disable"]  # no hold, no gate
+    result.robot.disconnect_preserving_position.assert_not_called()
+    result.control.await_continue.assert_called_once()  # initial scene gate only
+
+
+def test_lerobot_normal_exit_is_unchanged():
+    result = run_session(initial_continue=False, policy_type="act")
+    assert result.raised is None
+    assert result.events == ["disable"]
