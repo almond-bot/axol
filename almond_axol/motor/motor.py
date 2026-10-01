@@ -15,7 +15,7 @@ from typing import Mapping
 
 from ..constants import Joint
 from .bus import CanBus
-from .config import MotorParam
+from .config import MotorParam, ParamSpec
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .errors import MotorError
@@ -413,6 +413,20 @@ class Motor:
         apply the project-wide threshold on ``enable()``.
         """
         await self._driver.set_low_voltage_threshold(volts)
+
+    @property
+    def motor_type(self) -> str:
+        """The driver family, as ``make_driver`` names it (e.g. ``"myactuator"``)."""
+        return type(self._driver).MOTOR_TYPE
+
+    @property
+    def config_params(self) -> Mapping[MotorParam, ParamSpec]:
+        """This motor family's configuration parameter table."""
+        return type(self._driver).PARAMS
+
+    async def config_param_supported(self, param: MotorParam) -> bool:
+        """Whether this motor's firmware implements ``param``."""
+        return await self._driver.param_supported(param)
 
     def resolve_config_param(self, name: str) -> MotorParam:
         """Look a configuration parameter up by name for this motor's family."""

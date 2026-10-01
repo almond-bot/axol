@@ -19,6 +19,10 @@
 //! - the host-damping torque — band-passed velocity damping from the latest
 //!   feedback, using the pose-scheduled coefficients streamed with each
 //!   target and reaching the wire within one core tick;
+//! - a late target is carried forward along the stream's own velocity
+//!   (`filter::Holdover`, ≤ 80 ms, gliding to rest) so a Python tick that
+//!   lost the CPU renders as smooth motion instead of a stop-then-lunge —
+//!   smoothness is not left to the host's scheduler;
 //! - and the last target is held (tracker converges and stays, damping
 //!   live) when targets stop arriving.
 //!
@@ -48,19 +52,31 @@
 //! ## Protocol (length-prefixed messages: u32 LE size, then payload)
 //!
 //! Python -> Rust:
-//! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`
-//!                     keys, one `joint <side> <iface> <name>
+//! - `C` + text        config: a mandatory `proto <n>` line (must equal
+//!                     `CONFIG_PROTO` — the client and this binary must
+//!                     agree on the slot layout below, and a stale build
+//!                     of either fails here, loudly, instead of silently
+//!                     rejecting every target), `loop_hz`/`watchdog_ms`/
+//!                     `max_step_rad` keys, one `joint <side> <iface> <name>
 //!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
 //!                     <fv> <fo>` line per arm joint (tracker limits +
-//!                     friction params), and an optional `gripper <side>
+//!                     friction params; the motor id 1..=7 fixes the
+//!                     joint's target slot, so a bus may carry any subset
+//!                     of the arm), and an optional `gripper <side>
 //!                     <iface> <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
-//!                     clear-errors (torque-neutral; run *before* Python
-//!                     resolves joint offsets, so the wrap state it verifies
-//!                     is the post-reset one; the gripper is never touched)
-//! - `A`               arm: bring-up, enable, hold current pose (the
-//!                     gripper must already be enabled + calibrated in
-//!                     POSITION_FORCE mode by the Python side)
+//!                     clear-errors on every *cold* arm joint (torque-neutral
+//!                     on a disabled motor; run *before* Python resolves
+//!                     joint offsets, so the wrap state it verifies is the
+//!                     post-reset one). Joints found already enabled and
+//!                     holding are skipped — the reset would reboot them and
+//!                     drop the arm — and named in an `L` line; the gripper
+//!                     is never touched
+//! - `A`               arm: bring-up, enable the cold joints, hold current
+//!                     pose (holding joints are attached to without a brake
+//!                     release / enable frame; the gripper must already be
+//!                     enabled + calibrated in POSITION_FORCE mode by the
+//!                     Python side)
 //! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots
 //!                     0-6 are arm-joint tuples (p_des, mode, kp, kd,
 //!                     t_ff, kd_host, damp_w0, damp_q, j_eff) where mode
@@ -121,11 +137,13 @@
 //!   each motor holding its last MIT command on firmware gains — the same
 //!   outcome as a classic Python session dying mid-command.
 //! - Targets stepping more than `max_step_rad` from the previous target
-//!   are rejected (counted, reported) — corruption defense; the Python
-//!   side has its own max-step gate. The gripper slot is exempt (its
-//!   targets legitimately jump, matching the Python gate). Whatever gets
-//!   through, the tracker's velocity/acceleration limits bound what the
-//!   wire can ever see.
+//!   are rejected (counted, and warned about at most every
+//!   `DEGRADED_LOG_INTERVAL` naming the joint and step, since a rejected
+//!   stream leaves the arm parked while the client believes it is moving)
+//!   — corruption defense; the Python side has its own max-step gate. The
+//!   gripper slot is exempt (its targets legitimately jump, matching the
+//!   Python gate). Whatever gets through, the tracker's
+//!   velocity/acceleration limits bound what the wire can ever see.
 //! - There is deliberately **no position-deviation abort**, matching the
 //!   classic Python controller. Position error on a compliant impedance
 //!   controller is not a safety signal: a hand on the arm and a joint that
@@ -164,7 +182,8 @@
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
 //! - Watchdog: no target for `watchdog_ms` holds the last target (the
-//!   tracker converges and stays, damping live). The arms keep holding —
+//!   holdover has glided to rest well before then; the tracker converges
+//!   and stays, damping live). The arms keep holding —
 //!   matching what the firmware itself does if the host dies — until a
 //!   disarm or an operator e-stop.
 //! - Client disconnect while armed, SIGINT/SIGTERM, and protocol errors
@@ -181,7 +200,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -200,6 +219,26 @@ const VEL_CUTOFF: f64 = 80.0;
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
+
+/// How long a late target is carried forward along the stream's velocity
+/// (`filter::Holdover`) before the carried target has glided to rest. Covers
+/// the 15-65 ms Python-tick stalls measured on a loaded host (2026-09-15)
+/// with margin, and sits well inside the 150 ms watchdog: a stream that
+/// really stopped is at rest long before the watchdog names it stalled.
+const HOLDOVER_MAX: f64 = 0.080;
+
+/// Config/target protocol generation the client must declare (`proto <n>`).
+/// Bumped whenever the meaning of the config or target layout changes, so a
+/// Python package and an `axol-rt` binary built from different checkouts
+/// refuse each other at configure time. Silent skew is the failure mode
+/// this guards against: before it existed, a client that slotted joints by
+/// motor id against a core that slotted them by list order armed fine and
+/// then rejected every target on the max-step gate — the arms just held.
+///
+/// - 1 (implicit; never declared): arm joints took slots in list order.
+/// - 2: slots come from the motor id (`slot = motor_id - 1`), so a bus may
+///   carry any subset of the arm.
+const CONFIG_PROTO: u32 = 2;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -784,6 +823,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
+    let mut proto: Option<u32> = None;
 
     let bad = |line: &str| {
         io::Error::new(
@@ -798,6 +838,24 @@ fn parse_config(text: &str) -> io::Result<Config> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         match f[0] {
+            "proto" => {
+                let declared: u32 = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
+                if declared != CONFIG_PROTO {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "config: client speaks proto {declared}, this axol-rt speaks \
+                             proto {CONFIG_PROTO} — the almond-axol package and the axol-rt \
+                             binary must be built from the same checkout (rebuild with \
+                             `axol rt.install`)"
+                        ),
+                    ));
+                }
+                proto = Some(declared);
+            }
             "loop_hz" => {
                 loop_hz = f
                     .get(1)
@@ -857,17 +915,25 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         fo: 0.0,
                     }
                 } else {
+                    let motor_id: u8 = f
+                        .get(4)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| bad(line))?;
+                    // Arm joint motor ids are 1..=7 in Joint enum order, so the
+                    // id fixes the target-tuple slot regardless of which
+                    // joints a bus carries: a bench arm with only its wrist
+                    // motors keeps them in the wrist slots rather than
+                    // sliding down into the shoulders'.
+                    if !(1..=GRIPPER_SLOT as u8).contains(&motor_id) {
+                        return Err(bad(line));
+                    }
                     MotorSpec {
                         joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
-                        motor_id: f
-                            .get(4)
-                            .and_then(|v| v.parse().ok())
-                            .ok_or_else(|| bad(line))?,
+                        motor_id,
                         kp: num(5)?,
                         kd: num(6)?,
                         gripper: false,
-                        // Arm joints arrive in Joint enum order per bus.
-                        slot: bus.2.iter().filter(|s| !s.gripper).count(),
+                        slot: motor_id as usize - 1,
                         max_vel: num(7)?,
                         max_accel: num(8)?,
                         fc: num(9)?,
@@ -876,13 +942,26 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         fo: num(12)?,
                     }
                 };
-                if spec.slot >= N_SLOTS {
+                if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
                     return Err(bad(line));
                 }
                 bus.2.push(spec);
             }
             _ => return Err(bad(line)),
         }
+    }
+    if proto.is_none() {
+        // A client that predates the `proto` line slots arm joints by list
+        // order, which this core no longer does — refuse rather than arm a
+        // layout it would then misinterpret.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "config: no `proto` line — the client predates proto {CONFIG_PROTO}; the \
+                 almond-axol package and the axol-rt binary must be built from the same \
+                 checkout (rebuild with `axol rt.install`)"
+            ),
+        ));
     }
     if buses.is_empty() {
         return Err(io::Error::new(
@@ -1261,7 +1340,8 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "loop_hz 240\n\
+            "proto 2\n\
+             loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
              gripper 0 canL 8\n\
@@ -1282,7 +1362,62 @@ mod tests {
         );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 2\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+    }
+
+    /// A bus carrying only some of the arm joints (a bench wrist assembly)
+    /// keeps each motor in the slot Python's Joint enum assigns it — the
+    /// slot comes from the motor id, not from the order joints are listed.
+    #[test]
+    fn parse_config_subset_keeps_joint_slots() {
+        let cfg = parse_config(
+            "proto 2\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0\n\
+             gripper 0 can0 8\n",
+        )
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![5, 6, GRIPPER_SLOT]
+        );
+        // Arm joint ids outside 1..=7 have no slot; a repeated id would
+        // double-book one.
+        assert!(parse_config("proto 2\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config("proto 2\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0\n").is_err());
+        assert!(parse_config(
+            "proto 2\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n\
+             joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n"
+        )
+        .is_err());
+    }
+
+    /// A client and a core built from different checkouts must fail at
+    /// configure time. Without the guard, a proto-1 core (list-order slots)
+    /// armed against a proto-2 client's subset config and then rejected every
+    /// target on the max-step gate — the arms enabled and never moved.
+    #[test]
+    fn parse_config_requires_matching_proto() {
+        let joint = "joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        let error_of = |text: &str| match parse_config(text) {
+            Ok(_) => panic!("accepted a skewed config: {text:?}"),
+            Err(err) => err.to_string(),
+        };
+        // No `proto` line: a client that predates the slot-by-id layout.
+        let err = error_of(joint);
+        assert!(err.contains("no `proto` line"), "{err}");
+        assert!(err.contains("axol rt.install"), "{err}");
+        // A future client generation this core does not understand.
+        let err = error_of(&format!("proto 3\n{joint}"));
+        assert!(err.contains("proto 3"), "{err}");
+        assert!(err.contains("proto 2"), "{err}");
+        // Malformed declarations are bad lines, not silently accepted.
+        assert!(parse_config(&format!("proto\n{joint}")).is_err());
+        assert!(parse_config(&format!("proto two\n{joint}")).is_err());
+        // Order does not matter; the line just has to be there.
+        assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
     }
 }
 
@@ -1482,10 +1617,21 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 let mut ok = true;
                 for (_, iface, specs) in &cfg.buses {
                     let step = CanSock::open(iface).and_then(|sock| bringup::prep(&sock, specs));
-                    if let Err(err) = step {
-                        send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
-                        ok = false;
-                        break;
+                    match step {
+                        Ok(held) if !held.is_empty() => send_text(
+                            &out_tx,
+                            b'L',
+                            &format!(
+                                "{iface}: already holding, attached without reset: {}",
+                                held.join(", ")
+                            ),
+                        ),
+                        Ok(_) => {}
+                        Err(err) => {
+                            send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
+                            ok = false;
+                            break;
+                        }
                     }
                 }
                 if ok {
@@ -1744,6 +1890,23 @@ fn bus_loop(
         trk[m.slot] = Trapezoid::new(m.max_vel, m.max_accel);
         trk[m.slot].seed(m.hold_pos);
     }
+    // Late-target holdover, per slot: when Python's tick is late the
+    // tracker is given the last target carried forward at the stream's own
+    // velocity instead of a target that stops dead and then jumps (see
+    // filter::Holdover). Reach is bounded by the same corruption limit as a
+    // raw target step. The stream's cadence is learned from arrivals
+    // (filter::Cadence — follows a faster stream at once, a slower one
+    // after a run of long gaps, and ignores isolated late arrivals).
+    let mut hold: Vec<Holdover> = (0..N_SLOTS)
+        .map(|_| Holdover::new(HOLDOVER_MAX, cfg.max_step_rad))
+        .collect();
+    let mut cadence = Cadence::new();
+    // Ticks whose target was late enough for the holdover to carry it, and
+    // the oldest a target has been when a fresh one landed — the host-side
+    // stall the core papered over, for the 5 s stats line.
+    let mut held_ticks: u64 = 0;
+    let mut worst_target_age: f64 = 0.0;
+    let mut carrying = false;
     // In-core command derivatives and host damping, per slot.  The tracker
     // position is differentiated through the same slow chains as classic
     // Python before it drives friction/inertia feedforward.  Host damping
@@ -1781,10 +1944,17 @@ fn bus_loop(
     let mut have_target = false;
     let mut last_seq: Option<u32> = None;
     let mut last_arrival: Option<Instant> = None;
+    // Arrival of the last *accepted* target: the holdover's clock. A
+    // rejected packet feeds the watchdog (the client is alive) but must not
+    // restart the carry — after a stall the catch-up step can exceed
+    // max_step_rad, and resetting the age there would yank the tracker from
+    // the carried pose back onto the last accepted target.
+    let mut last_accepted: Option<Instant> = None;
 
     let period = Duration::from_secs_f64(1.0 / cfg.loop_hz);
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
     let mut rejected: u64 = 0;
+    let mut next_reject_log = Instant::now();
     let mut late: u64 = 0;
     let mut missed: u64 = 0;
     let mut trace_dropped: u64 = 0;
@@ -1940,16 +2110,76 @@ fn bus_loop(
                         // Limp: p_des carries no torque (kp = 0) and follows
                         // the hand-guided arm, so a large step is normal and
                         // the fresh gravity t_ff it carries must not be lost.
-                        let step_ok = is_limp
-                            || t.cmds[..GRIPPER_SLOT]
-                                .iter()
-                                .zip(play.iter())
-                                .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
-                        if step_ok {
-                            play = t.cmds;
-                            have_target = true;
+                        // Only slots with a motor on this bus are gated: an
+                        // absent joint's slot never leaves its default hold,
+                        // so its (meaningless) target would otherwise reject
+                        // every packet. A NaN target is a rejected step too.
+                        let worst = if is_limp {
+                            None
                         } else {
-                            rejected += 1;
+                            motors
+                                .iter()
+                                .filter(|m| !m.gripper)
+                                .map(|m| (m, (t.cmds[m.slot].p_des - play[m.slot].p_des).abs()))
+                                .filter(|(_, step)| step.is_nan() || *step > cfg.max_step_rad)
+                                .max_by(|a, b| a.1.total_cmp(&b.1))
+                        };
+                        // Spacing since the previous *accepted* target — the
+                        // holdover's velocity baseline and the cadence sample.
+                        let gap = last_accepted
+                            .map(|prev| t.arrival.saturating_duration_since(prev).as_secs_f64());
+                        match worst {
+                            None => {
+                                play = t.cmds;
+                                have_target = true;
+                                last_accepted = Some(t.arrival);
+                                if let Some(gap) = gap {
+                                    cadence.observe(gap);
+                                }
+                                for m in &motors {
+                                    let h = &mut hold[m.slot];
+                                    let c = &play[m.slot];
+                                    if m.gripper || is_limp || c.mode < 0.5 {
+                                        // Gripper targets legitimately jump;
+                                        // passthrough/limp targets follow the
+                                        // hand or hold — neither is a
+                                        // trajectory to extrapolate.
+                                        h.reset();
+                                    } else {
+                                        h.observe(c.p_des, gap, cadence.get());
+                                    }
+                                }
+                            }
+                            Some((m, step)) => {
+                                rejected += 1;
+                                // The holdover is left alone: its carry is
+                                // already gliding to rest within HOLDOVER_MAX
+                                // of the last accepted target, and the
+                                // velocity estimate only ever takes accepted
+                                // targets (see last_accepted).
+                                // A rejected target is a hold the client did
+                                // not ask for. One corrupt packet is what the
+                                // gate is for, but a *stream* of rejections
+                                // (a client whose slot layout disagrees with
+                                // this core's, a target frame the offsets
+                                // never lined up with) leaves the arm parked
+                                // while the client believes it is sweeping —
+                                // say so, rate-limited like the other
+                                // degradations; the stats line has the count.
+                                if began >= next_reject_log {
+                                    next_reject_log = began + DEGRADED_LOG_INTERVAL;
+                                    send_text(
+                                        out_tx,
+                                        b'W',
+                                        &format!(
+                                            "{iface}: target rejected — {} steps {:.3} rad from the last accepted target (max_step_rad {:.3}); holding the last accepted target ({rejected} rejected so far)",
+                                            m.joint,
+                                            step,
+                                            cfg.max_step_rad,
+                                        ),
+                                    );
+                                }
+                            }
                         }
                         last_seq = Some(t.seq);
                         last_arrival = Some(t.arrival);
@@ -1986,6 +2216,18 @@ fn bus_loop(
             } else {
                 tick_dt
             };
+            // Age of the latest accepted target this tick, for the holdover.
+            let target_age =
+                last_accepted.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
+            carrying = have_target
+                && !watchdog_frozen
+                && cadence
+                    .get()
+                    .is_some_and(|c| target_age > Holdover::SLACK * c);
+            if carrying {
+                held_ticks += 1;
+                worst_target_age = worst_target_age.max(target_age);
+            }
 
             // The user-facing flight recorder gates the verbose core trace to
             // the same engage segment as IK/cmd/meas. On each new segment the
@@ -2066,8 +2308,17 @@ fn bus_loop(
                     // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
                     // so a later mode switch starts transient-free.
                     let tracked = c.mode >= 0.5;
+                    // The target the tracker chases: the latest streamed
+                    // one, carried forward along the stream's velocity when
+                    // that target is late (identity while the stream is on
+                    // time — see filter::Holdover and the adoption above).
+                    let p_tgt = if tracked {
+                        hold[m.slot].target(c.p_des, target_age, cadence.get())
+                    } else {
+                        c.p_des
+                    };
                     let p_cmd = if tracked {
-                        let (p, _, _) = trk[m.slot].update(c.p_des, cmd_dt);
+                        let (p, _, _) = trk[m.slot].update(p_tgt, cmd_dt);
                         p
                     } else {
                         trk[m.slot].seed(c.p_des);
@@ -2134,7 +2385,7 @@ fn bus_loop(
                             slot: m.slot,
                             motor_id: m.id,
                             mode: c.mode,
-                            target_p: c.p_des,
+                            target_p: p_tgt,
                             cmd_p: p_cmd,
                             cmd_v: v_wire,
                             cmd_a: a_cmd,
@@ -2381,8 +2632,10 @@ fn bus_loop(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {overruns} overruns, {timing_degraded_ticks} timing-degraded ticks in {timing_degraded_episodes} episodes, {missed} missed replies, {degraded_ticks} feedback-degraded ticks in {degraded_episodes} episodes, {rejected} rejected targets, {held_ticks} held-over ticks (oldest target {:.1} ms, cadence {:.1} ms), {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
+                        worst_target_age * 1e3,
+                        cadence.get().unwrap_or(f64::NAN) * 1e3,
                         last_seq,
                     ),
                 );

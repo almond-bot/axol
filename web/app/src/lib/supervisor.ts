@@ -49,12 +49,19 @@ export interface CommandSpec {
   requiresCameras?: boolean
   /** Config keys the panel asks for per run; the rest come from Settings. */
   perRunFields?: string[]
+  /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
+  suggestedFields?: string[]
+  /** Suggested fields whose value must be one of the suggestions (rendered as a select). */
+  strictFields?: string[]
   /** Drives episodes the panel can start / save / discard. */
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
-  /** Arg names that skip the arm-robot gates without being sim (jelly_only). */
+  /** Arg names that skip the arm-robot gates without being sim (mantis). */
   robotFreeFlags?: string[]
+  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
+   * the Robot tab's "Axol arms" switch); null when the op always uses the arms. */
+  armsFlag?: string | null
   /** Whether this operation can run against the Mantis hardware profile. */
   supportsMantis?: boolean
   /** Connected hardware profiles on which this command may be launched. */
@@ -84,8 +91,9 @@ export interface SessionInfo {
 }
 
 /** A submitted form value; vector fields carry one entry per component
- * (numbers once parseable, the raw text while mid-edit). */
-export type FormValue = string | boolean | (number | string)[]
+ * (numbers once parseable, the raw text while mid-edit). Numbers appear when
+ * a form is seeded from stored settings (the server keeps them typed). */
+export type FormValue = string | number | boolean | (number | string)[]
 
 const MAX_LINES = 5000
 
@@ -194,7 +202,7 @@ export async function fetchInfo(): Promise<ServerInfo> {
 export type UpdateState = "idle" | "updating" | "error"
 
 /** Current step while an update is applying; null when not updating. */
-export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
+export type UpdatePhase = "upgrading" | "provisioning" | "restarting" | "rebooting"
 
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
@@ -208,7 +216,7 @@ export interface UpdateStatus {
   /** Safe to restart now (no op running). */
   idle: boolean
   state: UpdateState
-  /** Step while state is "updating" (upgrading/provisioning/restarting); else null. */
+  /** Step while state is "updating" (upgrading/provisioning/restarting/rebooting); else null. */
   phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */
   error: string | null
@@ -282,8 +290,11 @@ export function saveLocalHardwareProfile(profile: HardwareProfile): void {
   }
 }
 
-/** Per-run flags that only make sense on the Axol profile (sim / Jelly-only
- *  drive the arm simulator or Jelly, never the handheld rigs). */
+/** Per-run flags that only make sense on the Axol profile (sim drives the arm
+ *  simulator, never the handheld rigs). `jelly_only` is the retired per-run
+ *  Jelly-only toggle older hosts still list — Jelly is now inferred from the
+ *  attached CAN devices, with the Robot tab's "Axol arms" switch for
+ *  arm-free runs. */
 const AXOL_ONLY_RUN_FLAGS = new Set(["sim", "jelly_only"])
 
 /**
@@ -420,12 +431,27 @@ export interface CanDiscoveryState {
   message?: string
 }
 
+/** Presence of one Jelly device's pinned CAN interface in the host's inventory. */
+export interface CanDevicePresence {
+  /** The interface the device rides on (the lift shares the wheel bus when it
+   *  has no chest adapter of its own). */
+  channel: string
+  present: boolean
+  up: boolean
+  /** This device was manually disconnected on the serve host. */
+  automaticConnectSuppressed?: boolean
+}
+
+export type CanDeviceInventory = Record<JellyDevice, CanDevicePresence>
+
 export interface CanInterfaceInventory {
   /** Opaque app-lifetime identity; omitted by older serve releases. */
   serverInstanceId?: string
   interfaces: CanInterface[]
   /** Omitted by serve releases that predate hardware-aware auto-connect. */
   profiles?: CanProfileInventory
+  /** Jelly wheel/lift bus presence; omitted by serve releases without Jelly links. */
+  devices?: CanDeviceInventory
   /** Omitted by serve releases that predate safe, non-interactive discovery. */
   discovery?: CanDiscoveryState
 }
@@ -438,6 +464,133 @@ export async function fetchCanInterfaces(): Promise<CanInterfaceInventory> {
 export async function discoverCanHardware(force = false): Promise<CanInterfaceInventory> {
   const path = force ? "/api/can/discover?force=true" : "/api/can/discover"
   return json(await fetch(apiUrl(path), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
+// Jelly wheels + lift (detached CAN + 1 Hz status poll)
+// ---------------------------------------------------------------------------
+
+/** Jelly's two auxiliary devices, each on its own idle link. */
+export type JellyDevice = "wheels" | "lift"
+export const JELLY_DEVICES: readonly JellyDevice[] = ["wheels", "lift"]
+export const JELLY_DEVICE_LABELS: Record<JellyDevice, string> = {
+  wheels: "Jelly Wheels",
+  lift: "Jelly Lift",
+}
+
+/** One wheel motor from the idle ping (IDs 1–4, Damiao). */
+export interface WheelMotorHealth {
+  /** "front_left" | "front_right" | "back_left" | "back_right" */
+  name: string
+  id: number
+  /** null while a task owns the bus or the link is down. */
+  reachable: boolean | null
+  status: string | null
+  temperature: number | null
+  voltage: number | null
+}
+
+/** The jelly_legs board's latest status frame. */
+export interface LiftBoardStatus {
+  homed: boolean
+  /** Percent of homed travel (0 = lowered); null until homed. */
+  heightPercent: number | null
+  moving: boolean
+  homing: boolean
+  stallFault: boolean
+  atLower: boolean
+  atUpper: boolean
+  /** Firmware v0.4+ driver health; null on legacy frames. */
+  driversEnabled: boolean | null
+  vmPresent: boolean | null
+  driverFaultMask: number | null
+}
+
+interface JellyLinkStatusBase {
+  state: RobotState
+  connected: boolean
+  error: string | null
+  lastPing: number | null
+  channel: string
+}
+
+export interface JellyWheelsStatus extends JellyLinkStatusBase {
+  motors: WheelMotorHealth[]
+  motorCount: number
+  reachableCount: number
+}
+
+/**
+ * Jelly's battery, estimated from the 24 V rail the lift board measures
+ * (two LiFePO4 packs in parallel; see almond_axol/robot/battery.py).
+ */
+export interface JellyBattery {
+  /** Pack volts (smoothed while resting). */
+  voltage: number
+  /** State of charge, 0-100, from the resting-voltage curve. */
+  percent: number
+  /** Rail held above any resting voltage: a charger is connected. */
+  charging: boolean
+  /** Only a reading taken under lift/wheel load so far: reads low. */
+  underLoad: boolean
+  /** Seconds since the reading, measured on the robot. */
+  ageSeconds: number
+  /** False while a task owns the bus or the board went quiet: last known. */
+  live: boolean
+}
+
+export interface JellyLiftStatus extends JellyLinkStatusBase {
+  /** Whether the board answered recently; null while nobody polls it. */
+  reachable: boolean | null
+  status: LiftBoardStatus | null
+  /** Absent on older hosts; null before a reading, with no pack, or on old firmware. */
+  battery?: JellyBattery | null
+}
+
+export interface JellyStatus {
+  wheels: JellyWheelsStatus
+  lift: JellyLiftStatus
+}
+
+export async function fetchJellyStatus(): Promise<JellyStatus> {
+  return json(await fetch(apiUrl("/api/jelly/status")))
+}
+
+export async function jellyConnect(device: JellyDevice, automatic = false): Promise<JellyStatus> {
+  return json(
+    await fetch(apiUrl(`/api/jelly/${device}/connect`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ automatic }),
+    })
+  )
+}
+
+export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus> {
+  return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
+}
+
+/** Healthy = reachable on CAN and reporting no error status. */
+export function wheelMotorHealthy(m: WheelMotorHealth): boolean {
+  return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+}
+
+/** Faulted wheels while connected: unreachable or in an error state. */
+export function wheelFaults(status: JellyWheelsStatus | null | undefined): WheelMotorHealth[] {
+  if (!status || !status.connected) return []
+  return status.motors.filter((m) => m.reachable != null && !wheelMotorHealthy(m))
+}
+
+/** Lift board problems worth a red dot: silent board, stall, or driver fault. */
+export function liftFaultLabel(status: JellyLiftStatus | null | undefined): string | null {
+  if (!status || status.state !== "connected") return null
+  if (status.reachable === false) return "Lift board not answering"
+  const board = status.status
+  if (!board) return null
+  if (board.stallFault) return "Leg stall fault"
+  if (board.driverFaultMask) return "Lift driver fault"
+  if (board.vmPresent === false) return "Lift motor power absent"
+  return null
 }
 
 /** A busy race, transport interruption, or server fault may retry on the next inventory poll. */
@@ -541,6 +694,64 @@ export interface EpisodeControlSpec {
   /** The current server-side text, prefilled whenever the input (re)appears
    *  so a submitted value survives phase changes and can be edited. */
   value?: string
+  /** Send the text by itself shortly after typing stops (no Enter or submit
+   *  button needed); a click on one of the box's buttons sends pending text
+   *  first. For inputs whose value the op reads later, e.g. the next
+   *  episode's task name read when recording starts. */
+  autoSubmit?: boolean
+}
+
+/** One labelled line of an episode brief; a list value renders one entry per line. */
+export interface EpisodeBriefItem {
+  label: string
+  value: string | string[]
+  /** Call it out (e.g. which arm to use). */
+  emphasis?: boolean
+}
+
+/** One thing drawn in a cell of an episode brief's layout grid. */
+export interface EpisodeBriefPlacement {
+  /** Keys into the grid's `cols` / `rows`. */
+  col: string
+  row: string
+  label: string
+  detail?: string
+  /** How it is drawn: `object` (what the episode manipulates), `target` (where
+   *  it goes), `zone` (an area to keep clear / place into), `reference`,
+   *  `container`, `distractor`. Unknown roles draw neutrally. */
+  role?: string
+  /** Orientation in degrees, counter-clockwise seen from above. */
+  rotation?: number
+}
+
+/** A top-down layout diagram: rows run away from the viewer (first row
+ *  farthest), columns left to right; `footer` names the near edge. */
+export interface EpisodeBriefGrid {
+  cols: { key: string; label: string }[]
+  rows: { key: string; label: string }[]
+  items: EpisodeBriefPlacement[]
+  footer?: string
+}
+
+/**
+ * A structured instruction card for the episode about to record (or
+ * recording): e.g. a scripted scene's setup, so an operator can arrange the
+ * workspace without reading a spreadsheet. Everything but `title` optional.
+ */
+export interface EpisodeBrief {
+  /** Small caption above the title (a section / group name). */
+  eyebrow?: string
+  title: string
+  /** Short status chip beside the title ("Already recorded"). */
+  tag?: string
+  /** `done` tints the card as completed. */
+  tone?: "default" | "done"
+  /** The instruction itself, shown large. */
+  headline?: string
+  items?: EpisodeBriefItem[]
+  note?: string
+  progress?: { done: number; total: number; label?: string }
+  grid?: EpisodeBriefGrid
 }
 
 export interface PolicyState {
@@ -555,6 +766,10 @@ export interface PolicyState {
   /** 1-based number of the episode being recorded next/now, when the op
    *  tracks a dataset episode index (mirrors the headset HUD readout). */
   episode?: number
+  /** The dataset this session records into (the dataset preview follows it). */
+  dataset?: { repoId: string; root: string }
+  /** What to set up / do for this episode, as a card above the status line. */
+  brief?: EpisodeBrief
 }
 
 export interface OpStatus {
@@ -563,7 +778,8 @@ export interface OpStatus {
   /** Present only while an op declaring an episode control is running
    *  (collect-data / run-policy / waypoints); null otherwise. */
   policy: PolicyState | null
-  /** An operation could not confirm it disabled the motors, so the server
+  /** An operation could not confirm it disabled the motors and the server's
+   *  own probe afterwards could not prove them torque-free either, so it
    *  keeps the robot reserved (older hosts omit this). */
   lockout?: boolean
 }
@@ -628,6 +844,122 @@ export interface DatasetInfo {
 export async function fetchDatasets(): Promise<DatasetInfo[]> {
   const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
   return res.datasets ?? []
+}
+
+/** Where one camera's frames for an episode sit inside its mp4 (seconds). */
+export interface EpisodeVideoSpan {
+  from: number
+  to: number
+}
+
+/** One saved episode, as the dataset preview lists it. */
+export interface DatasetEpisode {
+  /** LeRobot's 0-based episode_index. */
+  index: number
+  length: number
+  durationS: number
+  tasks: string[]
+  /** Keyed by camera feature (e.g. observation.images.overhead). */
+  videos: Record<string, EpisodeVideoSpan>
+}
+
+export interface DatasetEpisodes {
+  repoId: string
+  root: string
+  fps: number
+  cameras: string[]
+  /** Every task string in the dataset, in task_index order. */
+  tasks: string[]
+  episodes: DatasetEpisode[]
+  /** meta/episodes files that could not be read (a save in progress). */
+  unreadableFiles: number
+}
+
+/** A dataset's saved episodes (includes a live session's, once saved). */
+export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpisodes> {
+  const q = new URLSearchParams({ repo_id: repoId })
+  return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
+}
+
+/** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
+ *  `dataset_browser.preview_step`; 1 = every frame). */
+export function previewStep(datasetFps: number, previewFps: number): number {
+  if (previewFps <= 0 || datasetFps <= 0) return 1
+  return Math.max(1, Math.round(datasetFps / previewFps))
+}
+
+/** Where a player finds one camera's episode: the URL and its span in it. */
+export interface EpisodeVideoSource {
+  url: string
+  span: EpisodeVideoSpan
+}
+
+/**
+ * One camera's episode video, as the host's player cut: just the episode
+ * (starting at 0), with the mp4's index first so it plays before it has
+ * downloaded, keeping every Nth frame for a `previewFps` below the dataset's
+ * (0 = every frame). The media fragment makes the browser stop at the end.
+ */
+export function episodeVideoSource(
+  repoId: string,
+  episode: DatasetEpisode,
+  camera: string,
+  datasetFps: number,
+  previewFps = 0
+): EpisodeVideoSource {
+  const original = episode.videos[camera]
+  const span = { from: 0, to: original.to - original.from }
+  const q = new URLSearchParams({
+    repo_id: repoId,
+    episode: String(episode.index),
+    camera,
+    fps: String(previewFps > 0 ? previewFps : datasetFps || 1),
+  })
+  const fragment = `#t=${span.from.toFixed(3)},${span.to.toFixed(3)}`
+  return { url: apiUrl(`/api/datasets/video?${q}${fragment}`), span }
+}
+
+/** Rename a saved episode's task (409 while a save holds the dataset). */
+export async function setEpisodeTask(
+  repoId: string,
+  episode: number,
+  task: string
+): Promise<DatasetEpisode> {
+  const res: { episode: DatasetEpisode } = await json(
+    await fetch(apiUrl(`/api/datasets/episodes/${episode}/task`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repoId, task }),
+    })
+  )
+  return res.episode
+}
+
+/** One row of a per-run field's server-side pick list. */
+export interface FieldSuggestionRow {
+  value: string
+  /** Secondary text shown next to the value (e.g. the run it came from). */
+  label: string | null
+}
+
+/**
+ * The pick list a command declares for one per-run field (CommandDef
+ * ``field_suggestions``). A provider failure comes back as an empty list plus
+ * the reason, so the caller can keep the plain input and say why; an
+ * undeclared field (or an older host) is a 404 and throws.
+ */
+export async function fetchFieldSuggestions(
+  command: string,
+  field: string
+): Promise<{ suggestions: FieldSuggestionRow[]; error: string | null }> {
+  const res: { suggestions?: FieldSuggestionRow[]; error?: string | null } = await json(
+    await fetch(
+      apiUrl(
+        `/api/commands/${encodeURIComponent(command)}/suggestions/${encodeURIComponent(field)}`
+      )
+    )
+  )
+  return { suggestions: res.suggestions ?? [], error: res.error ?? null }
 }
 
 /** Which eye(s) of a stereo ZED X to use, per branch. */
@@ -963,11 +1295,14 @@ export async function removeTrackerCalibration(
 }
 
 // ---------------------------------------------------------------------------
-// Shared operator settings (serve/settings.py) — persisted on the serve host
-// at ~/.almond/settings.json and folded into every op start server-side.
+// The robot's shared settings (serve/settings.py) — persisted on the serve
+// host at ~/.almond/settings.json, read by the CLI and SDK too, and folded
+// into every op start server-side. On the wire every value is keyed by its
+// canonical dotted path ("axol.left.elbow.kp"); on disk the same keys form a
+// nested tree (see settings-file.ts).
 // ---------------------------------------------------------------------------
 
-export type SettingValue = string | number | boolean | number[]
+export type SettingValue = string | number | boolean | (number | string)[]
 
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
@@ -1011,13 +1346,12 @@ export interface AdvancedSection {
 }
 
 export interface SettingsSnapshot {
-  /** Stored shared values keyed by canonical setting key (sparse: only set ones). */
+  /** Every stored value keyed by canonical dotted key (sparse: only set
+   * ones) — curated controls and the Advanced tree share this one map; the
+   * server translates each key to every op's own config path. */
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
-  /** Advanced values keyed canonically (e.g. "axol.left.elbow.kp") — one
-   * source of truth, translated to each op's config path server-side. */
-  advanced: Record<string, FormValue>
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1028,8 +1362,6 @@ export interface SettingsPatch {
   cameras?: CameraSpec | null
   /** Must accompany `cameras: null` so clearing is distinguishable from omitting. */
   camerasSet?: boolean
-  /** Per-key merge of canonical advanced values; null resets a key. */
-  advanced?: Record<string, FormValue | null>
 }
 
 export async function fetchSettings(): Promise<SettingsSnapshot> {
@@ -1224,6 +1556,10 @@ export interface OperationMeta {
   description: string
   /** Per-run config keys surfaced in the panel (required + run identity). */
   fields: string[]
+  /** Per-run fields whose values the host suggests (typing stays free-form). */
+  suggestedFields: string[]
+  /** Suggested fields that take only a suggested value: a select, no free typing. */
+  strictFields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
   /** Needs at least one camera serial configured (collect-data / run-policy). */
@@ -1232,9 +1568,13 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
-  /** Args that skip the arm-robot gates without being sim (teleop's jelly_only:
+  /** Args that skip the arm-robot gates without being sim (teleop's mantis:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
+  /** Default-on boolean arg that *off* makes the run arm-free (teleop's `arms`,
+   * folded in from the Robot tab's "Axol arms" setting: the headset then drives
+   * only Jelly). Null when the op always uses the arms. */
+  armsFlag: string | null
   /** Runtime supports the Mantis hardware profile. */
   supportsMantis: boolean
   /** Shows the episode start / save / discard controls while running. */
@@ -1256,11 +1596,14 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Teleoperation",
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["sim"],
+    suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
     robotFreeFlags: ["mantis"],
+    armsFlag: null,
     supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
@@ -1271,11 +1614,14 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Gravity compensation",
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
+    suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1287,11 +1633,14 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["repo_id", "task"],
+    suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: ["mantis"],
+    armsFlag: null,
     supportsMantis: true,
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
@@ -1306,11 +1655,14 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Replay dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop", "interpolate"],
+    suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
@@ -1322,11 +1674,14 @@ export const OPERATIONS: OperationMeta[] = [
     description:
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
+    suggestedFields: [],
+    strictFields: [],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    armsFlag: null,
     supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
@@ -1349,6 +1704,8 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     label: s.label,
     description: s.description,
     fields: s.perRunFields ?? [],
+    suggestedFields: s.suggestedFields ?? [],
+    strictFields: s.strictFields ?? [],
     // Every in-process operation drives the arms; only a sim run doesn't, and
     // that's decided per run from simFlag.
     requiresRobot: true,
@@ -1356,6 +1713,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
+    armsFlag: s.armsFlag ?? null,
     supportsMantis: s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
@@ -1368,14 +1726,41 @@ export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue
   return meta.simFlag != null && Boolean(settings[meta.simFlag])
 }
 
+/** The shared setting behind teleop's `arms` flag (Robot tab → "Axol arms"). */
+export const ARMS_SETTING = "robot.arms"
+
 /**
- * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
- * robot-free flag like teleop's jelly_only. Such a run skips the "Connect
- * Axol" and motor-fault gates; jelly_only still drives real Jelly hardware.
+ * Whether the run's arms flag is off. An explicit value in `args` wins;
+ * otherwise the shared settings snapshot decides, with the flag defaulting
+ * to on. For a *live* session pass `sharedValues: null`: its merged args are
+ * the whole truth (a default-on flag is simply omitted from them), and the
+ * operator flipping the saved switch mid-run must not relabel the run.
  */
-export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
+export function isArmsOffRun(
+  meta: OperationMeta,
+  args: Record<string, FormValue>,
+  sharedValues: Record<string, unknown> | null | undefined
+): boolean {
+  if (meta.armsFlag == null) return false
+  const runValue = args[meta.armsFlag]
+  if (runValue !== undefined && runValue !== null) return runValue === false
+  return sharedValues?.[ARMS_SETTING] === false
+}
+
+/**
+ * Whether this run leaves the arms (and their CAN bus) untouched — sim, a
+ * robot-free flag, or (given the shared settings) the arms switched off. Such
+ * a run skips the "Connect Axol" and motor-fault gates; an arms-off teleop
+ * still drives real Jelly hardware.
+ */
+export function isRobotFreeRun(
+  meta: OperationMeta,
+  settings: Record<string, FormValue>,
+  sharedValues?: Record<string, unknown> | null
+): boolean {
   if (isSimRun(meta, settings)) return true
-  return meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))
+  if (meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))) return true
+  return isArmsOffRun(meta, settings, sharedValues)
 }
 
 /** Curated fields for an op, resolved from the introspected command schema. */
@@ -1403,6 +1788,34 @@ export function perRunFields(
   return [...byKey.values()]
     .filter((f) => runFieldVisible(f.key, profile))
     .sort((a, b) => Number(b.required) - Number(a.required))
+}
+
+/** The `policy_type` value for the custom policy interface. */
+export const CUSTOM_POLICY_TYPE = "custom"
+
+const CUSTOM_POLICY_PATH_HELP =
+  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
+
+/** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
+export function isCustomPolicyRun(values: Record<string, unknown>): boolean {
+  return values.policy_type === CUSTOM_POLICY_TYPE
+}
+
+/**
+ * Per-run field rules that depend on the chosen policy type. A LeRobot policy
+ * needs its checkpoint path; a custom policy endpoint selects its own model,
+ * so the path is unused and is not sent. The host marks `policy_path` optional
+ * so a custom run can start; this re-marks it required for every other policy
+ * type. Ops without a `policy_type` field pass through untouched.
+ */
+export function applyPolicyTypeRules(fields: SchemaField[], custom: boolean): SchemaField[] {
+  if (!fields.some((f) => f.key === "policy_type")) return fields
+  return fields.map((f) => {
+    if (f.key !== "policy_path") return f
+    return custom
+      ? { ...f, required: false, help: CUSTOM_POLICY_PATH_HELP }
+      : { ...f, required: true }
+  })
 }
 
 // ---------------------------------------------------------------------------

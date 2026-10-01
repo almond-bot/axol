@@ -16,7 +16,7 @@ The command keeps a compatible native driver in place. In particular, Linux 6.13
 </Note>
 
 <Info>
-  The vendored driver is the upstream 5.15 `gs_usb` with two backports the Axol Hub requires: per-channel `dev_id` (to tell the left/right arms apart) and bulk endpoint discovery from the USB descriptor (the Hub firmware uses `EP1 IN`/`EP1 OUT`, while the stock 5.15 driver hardcodes `OUT 2`). The module is installed under `/lib/modules/$(uname -r)/updates/` and loads automatically on boot. Requires kernel headers and `build-essential`; both ship with JetPack.
+  The vendored driver is the upstream 5.15 `gs_usb` with two backports the Axol Hub requires — per-channel `dev_id` (to tell the left/right arms apart) and bulk endpoint discovery from the USB descriptor (the Hub firmware uses `EP1 IN`/`EP1 OUT`, while the stock 5.15 driver hardcodes `OUT 2`) — plus robustness fixes for the receive path: RX URBs are re-anchored on resubmit so closing an interface really stops them (in the stock driver their buffers were freed while still in flight, and the next open parsed the first frames from freed memory — a kernel panic on the single-channel wheel/chest adapter), and frames naming a channel the adapter does not have, runt transfers, or frames for a closed channel are dropped instead of dereferencing NULL or detaching the device. See `almond_axol/cli/can/gs_usb/README.md` for the full list. The module is installed under `/lib/modules/$(uname -r)/updates/` and loads automatically on boot. Requires kernel headers and `build-essential`; both ship with JetPack.
 </Info>
 
 <Note>

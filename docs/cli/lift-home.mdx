@@ -16,5 +16,5 @@ The sequence takes **1–2 minutes** and intentionally touches both end stops. P
 </Info>
 
 <Note>
-  Requires the chest CAN bus (`can_alm_axol_c`, named by [`can.setup`](/cli/can-setup)) and a powered lift board. Pass `--channel` to use a different interface. Also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Home the lift**.
+  Requires the lift's CAN bus (named by [`can.setup`](/cli/can-setup)) and a powered lift board. By default the command uses the chest bus `can_alm_axol_c` when that interface exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the motors; pass `--channel` to use a different interface. Also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Home the lift**.
 </Note>

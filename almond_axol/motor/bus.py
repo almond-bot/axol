@@ -142,6 +142,15 @@ class CanBus:
         return self._state == "open" and not self._unavailable()
 
     @property
+    def never_opened(self) -> bool:
+        """True until the first :meth:`start`: no frame has ever left this bus.
+
+        Distinct from "not :attr:`is_open`", which is also true for a bus that
+        was used and then closed — one whose motors may well be holding.
+        """
+        return self._state == "unopened"
+
+    @property
     def stalled(self) -> bool:
         """Whether *this* bus has declared a stall: nothing on the wire is ACKing.
 

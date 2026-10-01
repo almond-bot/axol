@@ -36,7 +36,7 @@ _LOCKDOWN_STATE = Path("/sys/kernel/security/lockdown")
 _USB_DEVICES = Path("/sys/bus/usb/devices")
 _NET_CLASS = Path("/sys/class/net")
 _MIN_NATIVE_HUB_KERNEL = (6, 13)
-_VENDORED_MODULE_VERSION = "almond-5.15.148-hub2"
+_VENDORED_MODULE_VERSION = "almond-5.15.148-hub3"
 _ENUMERATION_TIMEOUT_S = 2.0
 _ENUMERATION_POLL_S = 0.05
 

@@ -21,14 +21,22 @@ Up to four Axol buses, every one of them optional and independent:
     lift controller (listens on 0x420, answers on 0x421 — see
     ``almond_axol.robot.lift``), named can_alm_axol_c.
 
+Jelly's lift may also share the wheel bus instead of having its own chest
+adapter: the jelly_legs IDs (0x420-0x422) are clear of every Damiao range,
+so one single-channel adapter then carries both. That topology is detected
+too (wheels *and* lift answer on the same bus) — the adapter is pinned as
+can_alm_axol_b, no chest interface is configured, and the lift driver
+follows (``almond_axol.robot.lift.resolve_lift_channel``).
+
 The hub is told apart from the single-channel adapters by channel count: it
 always enumerates both channels under one serial, the others exactly one.
 The two single-channel adapters are physically identical, so they are told
 apart by *probing*: a bus whose jelly_legs board answers a GET_STATUS is the
-chest, one whose Damiao motors answer a register read is the wheels; a bus
-where nothing answers (devices unpowered) falls back to asking the operator.
-A Jetson host's built-in system CAN controller (mttcan) has no USB serial
-and is never touched.
+chest, one whose Damiao motors answer a register read is the wheels, one
+where both answer is the shared wheel+lift bus; a bus where nothing answers
+(devices unpowered) falls back to asking the operator. A Jetson host's
+built-in system CAN controller (mttcan) has no USB serial and is never
+touched.
 
 On Raspberry Pi 5 hosts the setup additionally raises the RP1 USB
 controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
@@ -53,6 +61,7 @@ import fcntl
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -63,7 +72,7 @@ from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from ...constants import (
     CAN_BASE,
@@ -111,6 +120,22 @@ _LOCK_LOCAL = threading.local()
 _USB_SERIAL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}\Z")
 
 DualHubIdentity = Literal["axol", "mantis", "silent", "conflict"]
+# What a single-channel adapter's bus turned out to carry: the Damiao wheel
+# motors, the jelly_legs lift controller, or both on one shared bus.
+SingleBusIdentity = Literal["wheels", "chest", "shared"]
+
+
+class SingleBusRoles(NamedTuple):
+    """Single-channel adapter assignment: ``(wheels serial, chest serial, shared)``.
+
+    ``lift_on_wheel_bus`` is True when the jelly_legs lift controller answered
+    on the wheel bus itself, i.e. the lift shares ``can_alm_axol_b`` and no
+    chest adapter is expected.
+    """
+
+    wheels: str | None
+    chest: str | None
+    lift_on_wheel_bus: bool = False
 
 
 @dataclass(frozen=True)
@@ -688,7 +713,9 @@ def attached_hub_state() -> AttachedHubState:
     """Atomic read-only USB snapshot for hosted discovery and inventory.
 
     Candidates are physical devices not covered by one exact, non-conflicting
-    generated profile claim. Their identities remain process-local and are
+    generated claim: an unclaimed dual-channel hub (Axol or Mantis) and an
+    unclaimed single-channel adapter (Jelly's wheel bus or the chest/lift bus)
+    both start hosted discovery. Their identities remain process-local and are
     used only to advance the API's opaque generation counter.
     """
     devices = _attached_supported_usb_devices()
@@ -776,9 +803,14 @@ def attached_hub_state() -> AttachedHubState:
             and _adapter_belongs_to_physical_device(adapter, physical_by_serial[serial])
         ):
             # More than two channels, duplicated IDs, or channels from another
-            # same-serial USB parent remain visibly unresolved. An exact raw
-            # single channel is a legitimate wheel/chest-class adapter and is
-            # intentionally not treated as a hub candidate.
+            # same-serial USB parent remain visibly unresolved.
+            candidates.append(identity)
+        elif serial not in single_claims or claim_counts[serial] != 1:
+            # An exact raw single channel is a wheel/chest-class adapter whose
+            # bus has not been identified yet (or whose serial is pinned to
+            # both roles): hosted discovery probes it for the Damiao wheel
+            # motors / jelly_legs lift controller. A cleanly pinned single
+            # adapter is settled hardware even while its Jelly is unpowered.
             candidates.append(identity)
 
     claim_signature = tuple(
@@ -923,10 +955,11 @@ def _stdin_is_tty() -> bool:
 def _configured_named_serial(name: str) -> str | None:
     """A single-channel adapter's serial as pinned by a previous setup.
 
-    Never auto-detected outside the interactive ``axol can.setup`` flow: a
-    single-channel candlelight adapter is indistinguishable from unrelated
-    hardware without probing, so only a serial the operator has already
-    confirmed — a live named interface or a written udev rule — counts here.
+    Never inferred from a bare scan: a single-channel candlelight adapter is
+    indistinguishable from unrelated hardware without probing its bus, so only
+    a serial an earlier setup (interactive ``axol can.setup`` or the hosted
+    discovery pass) has already pinned — a live named interface or a written
+    udev rule — counts here.
     """
     # Persisted rule authority wins over a transient live occupant. During a
     # stale hub rename, a dual-channel interface can temporarily own a
@@ -1152,9 +1185,11 @@ _JELLY_GET_STATUS = bytes([0x04])
 # the board before expecting its own transmissions to get through.
 _JELLY_SET_RATE_OFF = bytes([0x05, 0x00, 0x00])
 # Damiao register read: 0x7FF [id_lo, id_hi, 0x33, rid, ...]; the motor
-# echoes a 0x33 reply on its feedback ID. Register 60 (VBUS) is read-only.
+# echoes a 0x33 reply on its feedback ID (MST_ID = 0x10 + motor ID). Register
+# 60 (VBUS) is read-only.
 _DAMIAO_CFG_ID = 0x7FF
 _DAMIAO_WHEEL_IDS = (0x01, 0x02, 0x03, 0x04)
+_DAMIAO_FEEDBACK_BASE = 0x10
 _PROBE_ATTEMPTS = 3
 _PROBE_WINDOW_S = 0.4
 
@@ -1258,18 +1293,25 @@ def _probe_chest(iface: str) -> bool:
 
 
 def _probe_wheels(iface: str) -> bool:
-    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``."""
+    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``.
+
+    The reply must arrive on the motor's own feedback ID as well as carry the
+    register-read signature: on a bus shared with the jelly_legs board, a
+    status frame (0x421) whose position/velocity bytes happened to spell
+    ``[id, 0x00, 0x33, ...]`` must not pass as a wheel.
+    """
     frames = [
         (_DAMIAO_CFG_ID, bytes([mid, 0x00, 0x33, 60, 0, 0, 0, 0]))
         for mid in _DAMIAO_WHEEL_IDS
     ]
 
-    def is_reply(_can_id: int, data: bytes) -> bool:
+    def is_reply(can_id: int, data: bytes) -> bool:
         return (
             len(data) == 8
             and data[2] == 0x33
             and data[1] == 0x00
             and data[0] in _DAMIAO_WHEEL_IDS
+            and can_id == _DAMIAO_FEEDBACK_BASE + data[0]
         )
 
     return _probe(iface, frames, is_reply)
@@ -1418,8 +1460,12 @@ def _iface_for_serial(serial: str) -> str | None:
 
 def _identify_adapter(
     serial: str, *, reset: bool = False, recover_silence: bool = True
-) -> str | None:
-    """Probe a single-channel adapter's bus: ``"wheels"``, ``"chest"``, or None.
+) -> SingleBusIdentity | None:
+    """Probe a single-channel adapter's bus.
+
+    Returns ``"wheels"`` (Damiao motors answered), ``"chest"`` (the jelly_legs
+    board answered), ``"shared"`` (both did — the lift is wired onto the wheel
+    bus), or None when nothing answered.
 
     Explicit ``can.setup`` passes ``reset=True`` for a previously identified
     wheel/Jelly or chest/lift adapter. Unknown generic gs_usb devices get a
@@ -1440,7 +1486,7 @@ def _identify_adapter(
         # Silence any jelly_legs board before the wheel probe: the board starts
         # its 50 ms broadcast after the first frame it sees (the wheel probe's
         # own Damiao reads would wake it), and that stream starves the CANable's
-        # TX path — on a combined bus the wheel probe would then go deaf and the
+        # TX path — on a shared bus the wheel probe would then go deaf and the
         # bus would be misclassified as chest-only. Harmless where no board is
         # listening; a frame queued on a dead bus is dropped by the reset.
         _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
@@ -1448,14 +1494,8 @@ def _identify_adapter(
         wheels = _probe_wheels(iface)
         chest = _probe_chest(iface)
         if chest and wheels:
-            # The pre-split combined Jelly bus (jelly_legs next to the wheels).
-            print(
-                f"  WARNING: both the wheel motors and the jelly_legs board "
-                f"answer on {iface} — treating it as the wheel bus. Point the "
-                f"lift at it explicitly (jelly.lift_channel={_CAN_B}) or move "
-                f"the lift onto its own chest bus."
-            )
-            return "wheels"
+            # The lift is wired onto the wheel bus: one adapter, both devices.
+            return "shared"
         if chest:
             return "chest"
         if wheels:
@@ -2269,6 +2309,127 @@ def _bring_up_interfaces_locked(
     print("  Done.")
 
 
+# `tc -s qdisc show dev X` reports the qdisc's pending frames as "<n>p" in its
+# backlog line: `backlog 0b 0p requeues 3`.
+_BACKLOG_RE = re.compile(r"backlog\s+\S+\s+(\d+)p")
+
+
+def _iface_present(channel: str) -> bool:
+    """True when *channel* exists as a network interface on this host."""
+    return (Path("/sys/class/net") / channel).exists()
+
+
+def tx_backlog(channel: str) -> int | None:
+    """Frames queued on *channel* and not yet on the wire (``None`` if unknown).
+
+    A healthy bus drains its queue in microseconds, so anything here at rest
+    is a poisoned queue: motor power died (the e-stop), nothing ACKed, and the
+    kernel parked up to ``txqueuelen`` position commands that will replay the
+    moment the motors come back. Reading it needs no privileges.
+    """
+    tc = shutil.which("tc") or "/usr/sbin/tc"
+    try:
+        shown = subprocess.run(
+            [tc, "-s", "qdisc", "show", "dev", channel],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if shown.returncode != 0:
+        return None
+    matched = _BACKLOG_RE.search(shown.stdout)
+    return int(matched.group(1)) if matched else None
+
+
+# Interfaces the generated bring-up script configures itself, so flapping
+# them is one granted command instead of four ungranted ones.
+_SCRIPT_MANAGED_CHANNELS = frozenset({_CAN_L, _CAN_R, _CAN_B, _CAN_C})
+
+
+def _flap_for_purge(channels: list[str]) -> None:
+    """Cycle *channels* to drop what the kernel has queued on them.
+
+    Prefers the installed bring-up script, which is what the realtime core
+    runs for the same job (``purge_tx_queue`` in
+    ``rust/axol-rt/src/safety.rs``) and what ``axol provision`` grants the
+    operator passwordless use of (:mod:`almond_axol.utils.can_purge`). Going
+    through :func:`bring_up_interfaces` instead would issue four separate
+    privileged ``ip link`` commands — including the ``type can bitrate`` and
+    ``txqueuelen`` forms — and a non-root session that cannot run them all
+    would stop with the interfaces *down*, which is worse than not starting.
+
+    The script is also the safer flap: it takes the dual-channel adapter's
+    two arm channels down and back up together, the only ordering that
+    reliably avoids the TX-only wedge (see :func:`rx_alive_per_arm`).
+
+    Anything the script does not manage — a bench adapter, a renamed
+    ``can0``, a host that has never run ``can.setup`` — falls back to
+    :func:`bring_up_interfaces`, which configures each channel explicitly.
+    """
+    if CAN_BRINGUP_SCRIPT.exists() and set(channels) <= _SCRIPT_MANAGED_CHANNELS:
+        # The script takes its own locks, so this deliberately does not hold
+        # the global setup lock: a caller that did would deadlock it.
+        run_root(["bash", str(CAN_BRINGUP_SCRIPT)], check=True)
+        return
+    # Cycles the whole group, not just the poisoned members: the arm channels
+    # are two halves of one dual-channel adapter.
+    bring_up_interfaces(channels, force_cycle=True)
+
+
+def purge_stale_tx(channels: list[str]) -> list[str]:
+    """Flap *channels* when stale motion commands are still queued on them.
+
+    The realtime core purges the queue itself the moment it declares the bus
+    stalled (``purge_tx_queue`` in ``rust/axol-rt/src/safety.rs``), but only
+    when it can escalate and only when it is still alive to notice — an
+    operator who kills the session, or a host that loses the whole robot
+    PSU, leaves the frames queued with nobody to clear them. This is the
+    second line: every bring-up starts from a queue that is known empty.
+
+    Cheap in the normal case — the backlog read is a ``tc`` call per channel
+    and a clean queue flaps nothing. Missing interfaces and channels whose
+    backlog cannot be read are skipped (a sim or bench setup has neither).
+
+    Returns the channels that had frames queued, empty when there was nothing
+    to purge.
+
+    Raises:
+        RuntimeError: If a poisoned channel could not be cleared — enabling
+            motors into a queue that still holds stale commands is what
+            snaps the arm, so the caller must not proceed.
+    """
+    present = [ch for ch in channels if _iface_present(ch)]
+    poisoned = {
+        channel: queued
+        for channel, queued in ((ch, tx_backlog(ch)) for ch in present)
+        if queued
+    }
+    if not poisoned:
+        return []
+    print(
+        "CAN: stale frames are still queued from a dead bus "
+        f"({', '.join(f'{ch}: {n}' for ch, n in sorted(poisoned.items()))}) — "
+        "motor power was cut (e-stop?) while commands were in flight. Flapping "
+        "the interfaces so they cannot replay on enable."
+    )
+    _flap_for_purge(present)
+    remaining = {
+        channel: queued
+        for channel, queued in ((ch, tx_backlog(ch)) for ch in poisoned)
+        if queued
+    }
+    if remaining:
+        raise RuntimeError(
+            "CAN interfaces still hold queued frames after a flap ("
+            + ", ".join(f"{ch}: {n}" for ch, n in sorted(remaining.items()))
+            + "); refusing to enable motors, which would replay them. Run "
+            "`axol can.setup` and check the adapter."
+        )
+    print("  Done — the queued frames are gone.")
+    return sorted(poisoned)
+
+
 def is_configured() -> bool:
     """True when persistent CAN config has been written by a prior setup.
 
@@ -2362,7 +2523,7 @@ def _ensure_setup_locked(
         _wait_for_dual_channel_serial(configured_usb)
     hub_serial = hub_serial or _resolve_hub_serial()
     if wheels_serial is None and chest_serial is None:
-        wheels_serial, chest_serial = _find_single_serials(
+        wheels_serial, chest_serial, _lift_on_wheel_bus = _find_single_serials(
             hub_serial, _configured_serial(_MANTIS_PROFILE), interactive=False
         )
     else:
@@ -2533,15 +2694,95 @@ def _resolve_headless_hub_roles(
     return selected["axol"], selected["mantis"]
 
 
-def setup_detected_hubs() -> HeadlessHubSetupResult:
-    """Identify and persist attached Axol/Mantis hubs without prompting.
+# Which probe results claim each single-channel bus role. The shared
+# wheel+lift bus takes the wheel role: the lift driver reaches the jelly_legs
+# board through can_alm_axol_b when no chest interface exists.
+_SINGLE_ROLE_IDENTITIES: dict[str, frozenset[SingleBusIdentity]] = {
+    "wheels": frozenset({"wheels", "shared"}),
+    "chest": frozenset({"chest"}),
+}
 
-    Only positive CAN signatures may create or change a role. The complete USB
-    and two-channel netdev topology is snapshotted after driver enumeration and
-    checked again after every probe, before the first root-owned rule is
-    published. Duplicate physical devices reporting one serial, incomplete
-    pairs, silence, conflicting signatures, and duplicate fresh roles stay
-    unassigned for the interactive setup flow.
+
+def _resolve_headless_single_roles(
+    observed: dict[str, SingleBusIdentity | None],
+    *,
+    attached_serials: set[str],
+    configured_wheels: str | None,
+    configured_chest: str | None,
+) -> SingleBusRoles:
+    """Conservatively assign the wheel and chest/lift buses without prompts.
+
+    The single-channel counterpart of :func:`_resolve_headless_hub_roles`,
+    with the same rules the interactive :func:`_find_single_serials` applies
+    minus its operator prompts: a positive response wins over a stale pin; an
+    attached pin that stays silent keeps its role and is not replaced by a
+    second same-role responder; an unplugged pin is preserved; several fresh
+    adapters reporting one role stay unassigned. When the adapter *assigned*
+    the wheel role is one on which both the Damiao wheel motors and the
+    jelly_legs board answered, that is the shared wheel+lift bus, and a chest
+    pin no live board backs is dropped rather than steering the lift driver
+    onto an empty ``can_alm_axol_c`` later. A shared responder that does not
+    win the wheel role (a silent attached wheel pin keeps it) proves nothing
+    about the chest bus and leaves it alone, exactly as the interactive flow
+    does.
+    """
+    configured = {"wheels": configured_wheels, "chest": configured_chest}
+    selected: dict[str, str | None] = {"wheels": None, "chest": None}
+    lift_on_wheel_bus = False
+    # Wheels first: whether the lift rides the wheel bus is a property of the
+    # adapter that actually ends up as the wheel bus.
+    for role in ("wheels", "chest"):
+        if role == "chest":
+            wheels_serial = selected["wheels"]
+            lift_on_wheel_bus = (
+                wheels_serial is not None and observed.get(wheels_serial) == "shared"
+            )
+        wanted = _SINGLE_ROLE_IDENTITIES[role]
+        opposite = _SINGLE_ROLE_IDENTITIES["chest" if role == "wheels" else "wheels"]
+        matches = sorted(
+            serial for serial, found in observed.items() if found in wanted
+        )
+        previous = configured[role]
+        previous_observed = observed.get(previous) if previous is not None else None
+
+        if previous in matches:
+            selected[role] = previous
+        elif role == "chest" and lift_on_wheel_bus:
+            # The lift has provably moved onto the wheel bus; only a board
+            # that positively answered on its own adapter keeps a chest pin.
+            selected[role] = matches[0] if len(matches) == 1 else None
+        elif (
+            previous is not None
+            and previous in attached_serials
+            and previous_observed not in opposite
+        ):
+            selected[role] = previous
+        elif len(matches) == 1:
+            selected[role] = matches[0]
+        elif previous is not None and previous not in attached_serials:
+            selected[role] = previous
+
+    wheels, chest = selected["wheels"], selected["chest"]
+    if wheels is not None and wheels == chest:
+        raise RuntimeError(
+            f"Adapter {wheels} is pinned as both the wheel and chest buses and "
+            "no device answered to resolve it; power the Jelly hardware and "
+            "retry, or run `axol can.setup` to reassign it"
+        )
+    return SingleBusRoles(wheels, chest, lift_on_wheel_bus)
+
+
+def setup_detected_hubs() -> HeadlessHubSetupResult:
+    """Identify and persist attached CAN adapters without prompting.
+
+    Covers every role ``axol can.setup`` manages: the dual-channel Axol and
+    Mantis hubs, and the single-channel adapters carrying Jelly's wheel bus
+    (the base) and the jelly_legs chest/lift bus. Only positive CAN signatures
+    may create or change a role. The complete USB and netdev topology is
+    snapshotted after driver enumeration and checked again after every probe,
+    before the first root-owned rule is published. Duplicate physical devices
+    reporting one serial, incomplete pairs, silence, conflicting signatures,
+    and duplicate fresh roles stay unassigned for the interactive setup flow.
     """
     with _global_setup_lock():
         return _setup_detected_hubs_locked()
@@ -2608,6 +2849,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
     persisted_dual = {
         serial for serial in (configured_axol, configured_mantis) if serial is not None
     }
+    # Exact single-channel adapters (serial -> live netdev name): wheel-bus /
+    # chest-bus candidates, probed for the Damiao motors and the jelly_legs
+    # board below.
+    eligible_single: dict[str, str] = {}
     for identity, serial in usb_devices:
         records = topology_by_serial.get(serial, ())
         expected_identity = identity.partition("@dev")[0]
@@ -2616,7 +2861,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             and records[0][1] == 0
             and records[0][2] == expected_identity
         )
-        if serial in eligible or (exact_single and serial not in persisted_dual):
+        if serial in eligible:
+            continue
+        if exact_single and serial not in persisted_dual:
+            eligible_single[serial] = records[0][0]
             continue
         raise RuntimeError(
             "An attached CAN adapter has an incomplete or ambiguous channel "
@@ -2662,6 +2910,20 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         raise RuntimeError(
             "A configured CAN profile's live interface names do not match its "
             "persisted hardware identity; no roles were written"
+        )
+
+    # Single-channel adapters: a pinned wheel/chest adapter is re-probed so a
+    # live response corrects a stale or swapped pin (and detects the lift
+    # moving onto the wheel bus); an unknown adapter gets one non-disruptive
+    # pass, so unrelated hardware is never flapped merely for being attached.
+    observed_single: dict[str, SingleBusIdentity | None] = {}
+    for serial in sorted(eligible_single):
+        print(f"  {serial}: probing wheel drive / Jelly lift controller...")
+        known = serial in {configured_wheels, configured_chest}
+        observed_single[serial] = (
+            _identify_adapter(serial)
+            if known
+            else _identify_adapter(serial, recover_silence=False)
         )
 
     # USB replacement, duplicate insertion, channel loss, or a rename racing
@@ -2712,6 +2974,29 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         if configured_chest in positively_identified_hubs:
             configured_chest = None
 
+    # Wheel (base) and chest (lift) buses resolve after the hub roles so a
+    # serial a live hub just reclaimed is no longer treated as a single pin.
+    desired_wheels, desired_chest, _lift_on_wheel_bus = _resolve_headless_single_roles(
+        observed_single,
+        attached_serials=attached_serials,
+        configured_wheels=configured_wheels,
+        configured_chest=configured_chest,
+    )
+    single_roles_changed = (desired_wheels, desired_chest) != (
+        configured_wheels,
+        configured_chest,
+    )
+    wheels_changed = desired_wheels is not None and desired_wheels != configured_wheels
+    chest_changed = desired_chest is not None and desired_chest != configured_chest
+    # A positive single-bus identity on a raw (not yet renamed) adapter must
+    # also be repaired in place, exactly like a raw-named hub above.
+    repair_single_names = any(
+        serial is not None
+        and observed_single.get(serial) is not None
+        and eligible_single.get(serial) != name
+        for serial, name in ((desired_wheels, _CAN_B), (desired_chest, _CAN_C))
+    )
+
     stale_axol_claim = (
         configured_axol is not None and observed.get(configured_axol) == "mantis"
     )
@@ -2729,9 +3014,11 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         or clear_axol_aux
         or reapply_axol
         or repair_axol_names
+        or single_roles_changed
+        or repair_single_names
     ):
-        if desired_axol or configured_wheels or configured_chest:
-            _apply_setup(desired_axol, configured_wheels, configured_chest)
+        if desired_axol or desired_wheels or desired_chest:
+            _apply_setup(desired_axol, desired_wheels, desired_chest)
         else:
             _write_udev_rules(None, None, None)
             _reload_udev()
@@ -2746,9 +3033,17 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
         _reload_udev()
         _rename_interfaces(None, profile=_MANTIS_PROFILE)
 
-    configured_count = int(axol_changed) + int(mantis_changed)
+    configured_count = (
+        int(axol_changed)
+        + int(mantis_changed)
+        + int(wheels_changed)
+        + int(chest_changed)
+    )
     final_state = attached_hub_state()
     remaining = final_state.candidate_count
+    # A silent pinned wheel/chest adapter is deliberately not an incumbent
+    # here: an unpowered Jelly is an everyday state on a bench and must never
+    # hold up the arms' automatic connection.
     silent_incumbents = [
         role
         for role, serial in (
@@ -2775,9 +3070,9 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             status="partial",
             configured_count=configured_count,
             message=(
-                "Known Axol or Mantis hardware is ready, but another attached "
-                "CAN adapter remains unassigned. Power its Axol motors or "
-                "Mantis triggers and retry discovery, or run `axol can.setup`."
+                "Known CAN hardware is ready, but another attached CAN adapter "
+                "remains unassigned. Power its Axol motors, Mantis triggers, or "
+                "Jelly base/lift and retry discovery, or run `axol can.setup`."
             ),
             validation_identity=final_state.validation_identity,
         )
@@ -2792,9 +3087,10 @@ def _setup_detected_hubs_locked() -> HeadlessHubSetupResult:
             status="unidentified",
             configured_count=0,
             message=(
-                "No unique Axol or Mantis identity was detected. Ensure the Axol "
-                "motors or Mantis triggers are powered, then retry identification "
-                "or run `axol can.setup`."
+                "No unique Axol, Mantis, or Jelly base/lift identity was detected. "
+                "Ensure the Axol motors, Mantis triggers, or Jelly wheel motors "
+                "and lift controller are powered, then retry identification or "
+                "run `axol can.setup`."
             ),
             validation_identity=final_state.validation_identity,
         )
@@ -2810,7 +3106,7 @@ def _find_single_serials(
     mantis_serial: str | None = None,
     *,
     interactive: bool = True,
-) -> tuple[str | None, str | None]:
+) -> SingleBusRoles:
     """Assign single-channel adapters to the wheel/chest buses.
 
     Every attached candidate is probed. Previously pinned wheel/Jelly and
@@ -2824,7 +3120,13 @@ def _find_single_serials(
     invisible prompt cannot block them. Duplicate unresolved pins are
     rejected. Serials claimed by a dual hub are excluded.
 
-    Returns ``(wheels_serial, chest_serial)``, either of which may be None.
+    A bus on which both the wheel motors and the jelly_legs board answer is
+    the *shared* wheel+lift bus: it takes the wheel role, and — since the
+    lift has provably been found there — a stale chest pin that no live board
+    backs is dropped rather than kept as an unverified fallback.
+
+    Returns :class:`SingleBusRoles` — ``(wheels_serial, chest_serial,
+    lift_on_wheel_bus)``; either serial may be None.
     """
     configured = {
         "wheels": _configured_named_serial(_CAN_B),
@@ -2847,7 +3149,7 @@ def _find_single_serials(
             f"probing{configured_note} (wheel motors / Jelly lift must be "
             "powered)..."
         )
-    detected: dict[str, str | None] = {}
+    detected: dict[str, SingleBusIdentity | None] = {}
     for serial in attached:
         print(f"  {serial}: probing wheel drive / Jelly lift controller...")
         known = serial in configured.values()
@@ -2869,14 +3171,30 @@ def _find_single_serials(
                 "then re-run setup."
             )
 
+    # The shared wheel+lift bus takes the wheel role: the lift driver reaches
+    # the board through can_alm_axol_b when no chest interface exists.
+    role_identities: dict[str, set[SingleBusIdentity]] = {
+        "wheels": {"wheels", "shared"},
+        "chest": {"chest"},
+    }
+
     def detected_for(role: str) -> str | None:
-        matches = sorted(serial for serial, found in detected.items() if found == role)
+        matches = sorted(
+            serial
+            for serial, found in detected.items()
+            if found in role_identities[role]
+        )
         if not matches:
             return None
         configured_serial = configured[role]
         selected = configured_serial if configured_serial in matches else matches[0]
-        label = "Damiao wheel motors" if role == "wheels" else "Jelly lift controller"
-        target = _CAN_B if role == "wheels" else _CAN_C
+        if detected[selected] == "shared":
+            label = "Damiao wheel motors and the Jelly lift controller"
+            target = f"{_CAN_B} (shared wheel + lift bus)"
+        elif role == "wheels":
+            label, target = "Damiao wheel motors", _CAN_B
+        else:
+            label, target = "Jelly lift controller", _CAN_C
         print(f"  {selected}: {label} answered -> {target}")
         for serial in matches:
             if serial != selected:
@@ -2893,6 +3211,14 @@ def _find_single_serials(
     source = {
         role: ("detected" if serial else None) for role, serial in assigned.items()
     }
+    lift_on_wheel_bus = (
+        assigned["wheels"] is not None and detected.get(assigned["wheels"]) == "shared"
+    )
+    if lift_on_wheel_bus and assigned["chest"] is not None:
+        print(
+            f"  WARNING: a second Jelly lift controller answered on {assigned['chest']} "
+            f"as well; the lift driver prefers {_CAN_C} over the shared wheel bus."
+        )
 
     # Keep old pins only when no live response contradicts them. A later
     # operator choice may replace these unverified fallbacks.
@@ -2902,6 +3228,16 @@ def _find_single_serials(
     ):
         old_serial = configured[role]
         if assigned[role] or not old_serial or old_serial == assigned[other_role]:
+            continue
+        if role == "chest" and lift_on_wheel_bus:
+            # The lift was positively found on the wheel bus, so the chest
+            # adapter this pin describes no longer carries it. Keeping the
+            # rule would revive can_alm_axol_c — and steer the lift driver
+            # onto an empty bus — the day that adapter is plugged back in.
+            print(
+                f"  {label}: the lift controller answered on the wheel bus; "
+                f"dropping the configured chest adapter {old_serial}."
+            )
             continue
         # Do not preserve a single-bus pin when that serial is currently
         # attached under a different topology (especially a selected hub).
@@ -2941,8 +3277,9 @@ def _find_single_serials(
             continue
         choice = (
             input(
-                f"    Assign it to the [w]heel/Jelly bus ({_CAN_B}), the "
-                f"[c]hest/lift bus ({_CAN_C}), or leave blank to skip: "
+                f"    Assign it to the [w]heel/Jelly bus ({_CAN_B}; also the lift "
+                f"when it shares that bus), the [c]hest/lift bus ({_CAN_C}), or "
+                "leave blank to skip: "
             )
             .strip()
             .lower()
@@ -2965,7 +3302,7 @@ def _find_single_serials(
     chest = assigned["chest"]
     if wheels and wheels == chest:
         _die(f"Adapter {wheels} cannot be assigned to both wheel and chest buses.")
-    return wheels, chest
+    return SingleBusRoles(wheels, chest, lift_on_wheel_bus)
 
 
 def _pull_factory_calibration(serial: str) -> None:
@@ -3028,7 +3365,7 @@ def _run_locked(args: object = None) -> None:
     configured_chest = _configured_named_serial(_CAN_C)
     interactive = _stdin_is_tty()
     hub_serial, mantis_serial = _find_dual_serials(interactive=interactive)
-    wheels_serial, chest_serial = _find_single_serials(
+    wheels_serial, chest_serial, lift_on_wheel_bus = _find_single_serials(
         hub_serial, mantis_serial, interactive=interactive
     )
     if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
@@ -3094,6 +3431,8 @@ def _run_locked(args: object = None) -> None:
         print(f"  Wheels   : {_CAN_B}")
     if chest_serial:
         print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
+    elif lift_on_wheel_bus:
+        print(f"  Lift     : {_CAN_B} (jelly_legs shares the wheel bus)")
     if hub_serial or wheels_serial or chest_serial:
         print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
         print(

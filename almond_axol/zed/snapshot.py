@@ -16,6 +16,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from .calibration import calibration_hint
+
 if TYPE_CHECKING:
     import multiprocessing.connection
 
@@ -73,7 +75,9 @@ def snapshot_jpeg_inproc(serial: int) -> bytes:
 
     err = cam.open(params)
     if err != sl.ERROR_CODE.SUCCESS:
-        raise ConnectionError(f"failed to open camera {serial}: {err}")
+        raise ConnectionError(
+            f"failed to open camera {serial}: {err}" + calibration_hint(serial)
+        )
     try:
         image = sl.Mat()
         frame = None

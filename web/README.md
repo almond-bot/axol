@@ -4,7 +4,7 @@ The browser front-ends for the Almond Axol robot. This directory lives inside th
 
 - **VR interface** (`/vr`) — WebXR teleoperation. Streams hand/elbow pose from a Meta Quest headset to the Almond Axol SDK over WebSocket. Deployed to Vercel at [axol.almond.bot](https://axol.almond.bot).
 - **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
-- **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles, and diagnostics / calibration script runners with run history. Also served by `axol serve`.
+- **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles (with a MyActuator parameter editor), and diagnostics / calibration script runners with run history. Also served by `axol serve`.
 
 The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control` (the diagnostics dashboard is reached from the control panel's nav bar).
 
@@ -197,11 +197,11 @@ The app is deployed on Vercel. `vercel.json` builds the client package first so 
 {
   "buildCommand": "npm run build --workspace=packages/axol-vr-client && npm run build --workspace=app",
   "outputDirectory": "app/dist",
-  "installCommand": "rm -f package-lock.json && npm install"
+  "installCommand": "npm ci"
 }
 ```
 
-The `installCommand` removes any macOS-generated lock file to avoid missing Linux rollup binaries on the Vercel build machine.
+The `installCommand` installs from the committed `package-lock.json` rather than re-resolving from the version ranges, so a new release outside a peer range (react 19.3.0 vs `@react-three/fiber`'s `<19.3`) can't break the deploy — bump dependencies deliberately and commit the lockfile. The lockfile carries every platform's optional binaries (rollup, tailwind oxide, lightningcss), so one generated on macOS installs fine on the Linux build machine.
 
 ## Python SDK
 

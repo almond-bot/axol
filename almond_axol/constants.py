@@ -32,6 +32,10 @@ CAN_BASE = "can_alm_axol_b"
 # The chest bus (another single-channel adapter): the jelly_legs lift
 # controller — our own PCB replacing the Jiecang control box, driving the
 # telescoping lift legs (see almond_axol/robot/lift.py for the protocol).
+# Optional: a Jelly may instead wire the lift controller onto the wheel bus
+# (its IDs 0x420-0x422 are clear of every Damiao range), in which case this
+# interface does not exist and the lift driver uses CAN_BASE — see
+# almond_axol.robot.lift.resolve_lift_channel.
 CAN_CHEST = "can_alm_axol_c"
 
 # CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter
@@ -48,6 +52,17 @@ CAN_MANTIS_LEFT = "can_mantis_l"
 CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
+
+# Cap on the return-to-rest a flow plays while shutting down, before it torques
+# the arms off. It has to cover the IK plan plus a full return from a raised
+# pose: rest moves play at ``reset_speed`` (0.63 rad/s on the worst joint,
+# 1.5 s minimum), so a shoulder 2 rad up is ~3.2 s of motion alone. The serve
+# runner's 6 s stop grace (``_STOP_GRACE_S``) is not a hard limit on this: past
+# it the runner only kills the op's child processes (IK worker, video relay),
+# and by then the plan is made and playback runs in-process. A park that
+# overruns is abandoned and the arms are torqued off where they are — the
+# pre-existing behaviour — so the cap can never make shutdown worse.
+PARK_TIMEOUT_S: float = 6.0
 
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"

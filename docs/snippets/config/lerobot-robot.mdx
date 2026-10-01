@@ -1,0 +1,12 @@
+export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{children}</code>;
+
+| Flag | Default | Description |
+|---|---|---|
+| <F>--{prefix}left_channel</F> | `can_alm_axol_l` | CAN interface for the left arm. |
+| <F>--{prefix}right_channel</F> | `can_alm_axol_r` | CAN interface for the right arm. |
+| <F>--{prefix}cameras</F> | 3 unassigned slots | Camera slots `overhead`, `left_arm`, `right_arm` — fields below. Pass inline: `--robot_config.cameras "{overhead: {serial: 41234567}}"`. Slots left at serial `0` are dropped. |
+| <F>--{prefix}video_backend</F> | `auto` (`sdk` on run-policy) | Camera backend: `gst` (GPU pipeline, low latency), `sdk` (ZED SDK), or `auto` (prefers `gst`). |
+| <F>--{prefix}observe_torques</F> | `false` | Include joint torques in observations. Must match between collection and inference. |
+| <F>--{prefix}observe_cartesian</F> | `false` | Use end-effector poses instead of joint angles for observations and actions. Must match between collection and inference. |
+| <F>--{prefix}id</F> | `null` | LeRobot bookkeeping, unused by Axol. |
+| <F>--{prefix}calibration_dir</F> | `null` | LeRobot bookkeeping, unused by Axol. |

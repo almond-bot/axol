@@ -8,6 +8,7 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -15,6 +16,7 @@ import secrets
 import socket
 import subprocess
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -35,6 +37,7 @@ from ..constants import (
     CAN_RIGHT,
     URDF_PATH,
 )
+from ..motor.errors import MotorError
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -42,15 +45,23 @@ from ..utils.state_files import mark_privileged_service
 from ..utils.sudo import prime_sudo
 from .commands import (
     COMMANDS,
+    NoSuggestionProvider,
+    check_strict_fields,
     command_specs,
+    field_suggestions,
+    flag_default,
     flag_enabled,
+    flag_value,
     get_schema,
+    is_robot_free,
     normalize_boolean_args,
     operation_ids,
+    safety_flags,
 )
+from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
-from .runner import OperationRunner
+from .runner import OperationRunner, prove_motors_torque_free
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
@@ -125,10 +136,21 @@ class RobotConnectRequest(BaseModel):
     automatic: bool = False
 
 
-class SettingsUpdateRequest(BaseModel):
-    """Partial update of the shared operator settings (serve/settings.py).
+class JellyConnectRequest(BaseModel):
+    """Connect one of Jelly's idle links (the wheel bus or the lift controller).
 
-    ``values`` and ``advanced`` merge per key (``null`` resets a key to its
+    ``automatic`` marks a browser's startup connect so a manual Disconnect of
+    that device stays authoritative across every tab until the operator
+    connects it again by hand.
+    """
+
+    automatic: bool = False
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Partial update of the shared robot settings (serve/settings.py).
+
+    ``values`` merges per canonical dotted key (``null`` resets a key to its
     default); ``cameras`` replaces the stored camera spec wholesale. Omitted
     sections are left untouched.
     """
@@ -137,6 +159,8 @@ class SettingsUpdateRequest(BaseModel):
     cameras: dict[str, Any] | None = None
     # Distinguish "clear the cameras" (null) from "don't touch them" (omitted).
     camerasSet: bool = False
+    # Pre-v2 panels kept the Advanced tree in its own map; still accepted and
+    # merged into ``values`` under the canonical keys.
     advanced: dict[str, Any] | None = None
 
 
@@ -162,6 +186,25 @@ class ProximityRequest(BaseModel):
     """
 
     disabled: bool = True
+
+
+class EpisodeTaskRequest(BaseModel):
+    """Rename one saved episode's task (the dataset preview's task editor)."""
+
+    repoId: str
+    task: str
+
+
+class MotorConfigWriteRequest(BaseModel):
+    """One configuration parameter to write on a motor (the parameter editor).
+
+    ``allowProtected`` is the explicit confirmation a protected parameter
+    (factory, calibration, bus identity) needs before it is written.
+    """
+
+    param: str
+    value: float
+    allowProtected: bool = False
 
 
 class SessionInputRequest(BaseModel):
@@ -634,6 +677,10 @@ _CAN_DISCOVERY_STATUSES = {
     "error",
 }
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
+# Discovery renames interfaces under a udev lock it can lose to a slow or
+# wedged host. Shutdown joins it so the rename is not cut in half, but the
+# join is bounded: systemd kills the service outright if the stop overruns.
+_CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass
@@ -796,6 +843,48 @@ def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
     }
 
 
+async def _wait_for_disconnect(ws: WebSocket) -> None:
+    """Return once the client's close frame arrives."""
+    try:
+        while (await ws.receive())["type"] != "websocket.disconnect":
+            pass
+    except (WebSocketDisconnect, RuntimeError):
+        # Starlette reports the close as a disconnect message on a live socket,
+        # but raises once the connection has already gone: WebSocketDisconnect
+        # from its own helpers, RuntimeError from receiving on a socket whose
+        # disconnect it has already delivered. Every case means the same thing.
+        pass
+
+
+async def _stream_until_disconnect(
+    ws: WebSocket, queue: asyncio.Queue[Any]
+) -> AsyncIterator[Any]:
+    """Yield queued messages until the client disconnects.
+
+    The streaming endpoints only send, so nothing else reads the socket. Without
+    this race the close frame -- including the one uvicorn sends while draining
+    on SIGTERM -- is never observed, and an idle stream holds its handler task
+    (and the server shutdown) open indefinitely.
+    """
+    disconnect = asyncio.ensure_future(_wait_for_disconnect(ws))
+    try:
+        while True:
+            pending = asyncio.ensure_future(queue.get())
+            done, _ = await asyncio.wait(
+                (pending, disconnect), return_when=asyncio.FIRST_COMPLETED
+            )
+            # Check the disconnect first: both can finish in the same wait, and
+            # once ``receive()`` has consumed the close frame uvicorn rejects any
+            # further send with a RuntimeError (not a WebSocketDisconnect), so a
+            # message that raced the close is dropped rather than yielded.
+            if disconnect in done:
+                pending.cancel()
+                return
+            yield pending.result()
+    finally:
+        disconnect.cancel()
+
+
 def create_app(static_dir: Path | None = None) -> FastAPI:
     # ``create_app`` is the public embedding surface as well as the factory
     # used by ``axol serve``. Mark a root embedding before constructing any
@@ -810,8 +899,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # and intentionally regenerated for every app lifetime.
     server_instance_id = secrets.token_hex(16)
     # System setup (Jetson clock pinning, GStreamer install) is owned by the
-    # host installer and its boot service (`axol jetson.setup` runs as an
-    # ExecStartPre on axol.service; `axol provision` runs at install time). The
+    # host installer and its boot service (`axol provision` runs at install
+    # time and applies the Jetson tuning; `axol provision --boot` re-applies
+    # that tuning as an ExecStartPre on axol.service). The
     # one exception is the self-updater (below), which delegates upgrades to
     # the hosted transaction and retains a legacy startup-provision self-heal.
 
@@ -824,7 +914,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     robot = RobotLink(
         left_channel, right_channel, hub=hub, has_gripper=settings.has_gripper
     )
-    runner = OperationRunner(robot, settings=settings)
+    # Jelly's wheel bus and lift controller get their own idle links (status
+    # only; never commanded) so the panel shows them next to Axol and Mantis.
+    jelly = JellyLink()
+    runner = OperationRunner(robot, settings=settings, jelly_link=jelly)
     runs = DiagnosticsRunStore(hub)
     # ZED devices are exclusive. Hold this across preview capture and operation
     # startup so both paths make their idle check while owning one reservation.
@@ -848,6 +941,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     manually_disconnected_target: (
         tuple[Literal["axol", "mantis"], str | None, str | None] | None
     ) = None
+    # Same idea for Jelly: a manual Disconnect of the wheels or the lift pauses
+    # that device's automatic connect (keyed by its interface) server-wide.
+    manually_disconnected_jelly: dict[str, str] = {}
     can_discovery = _CanDiscoveryCache()
     can_discovery_launch = asyncio.Lock()
     can_discovery_task: asyncio.Task[None] | None = None
@@ -946,6 +1042,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             manually_disconnected_target
             == ("mantis", mantis_channels[0], mantis_channels[1])
         )
+        devices: dict[str, Any] = {}
+        for device in JELLY_DEVICES:
+            presence = device_presence(device)
+            presence["automaticConnectSuppressed"] = (
+                manually_disconnected_jelly.get(device) == presence["channel"]
+            )
+            devices[device] = presence
         return {
             "serverInstanceId": server_instance_id,
             "interfaces": interfaces,
@@ -953,6 +1056,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "axol": axol_presence,
                 "mantis": mantis_presence,
             },
+            # Jelly's wheel bus and lift controller: presence follows their
+            # pinned interfaces (can_alm_axol_b / can_alm_axol_c).
+            "devices": devices,
             "discovery": can_discovery.payload(),
         }
 
@@ -968,6 +1074,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 or confirmed.get("connected") is not False
             ):
                 raise RuntimeError("robot link did not prove it released CAN")
+            # Discovery probes and may rename the wheel/chest interfaces too,
+            # so the Jelly links must not hold them open either.
+            jelly_state = await asyncio.to_thread(jelly.disconnect_all)
+            if any(
+                entry.get("state") != "disconnected" for entry in jelly_state.values()
+            ):
+                raise RuntimeError("Jelly link did not prove it released CAN")
 
             from ..cli.can.setup import setup_detected_hubs
 
@@ -1109,6 +1222,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     async def _motor_fault_response(
         scope_args: dict[str, Any] | None = None,
+        *,
+        unselected_joints_only_skip_absent: bool = False,
     ) -> JSONResponse | None:
         """Return the shared motor-fault rejection, or ``None`` when clear.
 
@@ -1116,11 +1231,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         to the motors that run will actually touch — an arm/joint-scoped run
         (guided zeroing of a joint subset, a one-arm ROM test, a single-motor
         tool) must not be blocked by faults on motors it never drives, e.g. a
-        bench arm with only some motors on the bus.
+        bench arm with only some motors on the bus. See
+        :func:`scoped_motor_faults` for ``unselected_joints_only_skip_absent``.
         """
         faults = await asyncio.to_thread(robot.motor_faults)
         if scope_args:
-            faults = scoped_motor_faults(faults, scope_args)
+            faults = scoped_motor_faults(
+                faults,
+                scope_args,
+                unselected_joints_only_skip_absent=unselected_joints_only_skip_absent,
+            )
         if not faults:
             return None
         detail = ", ".join(
@@ -1425,6 +1545,78 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 manually_disconnected_target = target_key
             return result
 
+    # -- Jelly wheels + lift (detached CAN + 1 Hz status poll) ---------------
+
+    @app.get("/api/jelly/status")
+    async def jelly_status() -> dict[str, Any]:
+        """Idle-link status of Jelly's wheel bus and lift controller."""
+        return jelly.status()
+
+    @app.post("/api/jelly/{device}/connect", response_model=None)
+    async def jelly_connect(
+        device: str, req: JellyConnectRequest | None = None
+    ) -> dict[str, Any] | JSONResponse:
+        if device not in JELLY_DEVICES:
+            return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot connect the Jelly link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            automatic = req is not None and req.automatic
+            if automatic and can_discovery.status in {
+                "needed",
+                "running",
+                "unidentified",
+                "error",
+            }:
+                return JSONResponse(
+                    {
+                        "error": "automatic connection is waiting for CAN "
+                        "hardware discovery"
+                    },
+                    status_code=409,
+                )
+            channel = device_presence(device)["channel"]
+            if automatic and manually_disconnected_jelly.get(device) == channel:
+                return JSONResponse(
+                    {
+                        "error": "automatic connection paused after manual disconnect",
+                        "automaticConnectSuppressed": True,
+                    },
+                    status_code=409,
+                )
+            result = await asyncio.to_thread(jelly.connect, device)
+            if not automatic:
+                manually_disconnected_jelly.pop(device, None)
+            return result
+
+    @app.post("/api/jelly/{device}/disconnect", response_model=None)
+    async def jelly_disconnect(device: str) -> dict[str, Any] | JSONResponse:
+        if device not in JELLY_DEVICES:
+            return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "cannot disconnect the Jelly link while an operation "
+                        "or setup/diagnostics session owns hardware"
+                    },
+                    status_code=409,
+                )
+            channel = jelly.status()[device]["channel"]
+            try:
+                result = await asyncio.to_thread(jelly.disconnect, device)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            if result[device]["state"] == "disconnected":
+                manually_disconnected_jelly[device] = channel
+            return result
+
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
         """SocketCAN inventory, trusted profiles, and discovery state."""
@@ -1464,6 +1656,45 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 return JSONResponse({"error": str(exc)}, status_code=409)
         return JSONResponse(details)
 
+    @app.get("/api/robot/motors/{arm}/{joint}/config")
+    async def robot_motor_config(arm: str, joint: str) -> JSONResponse:
+        """Every configuration parameter of one motor, over the idle link."""
+        async with session_launch_reservation:
+            try:
+                config = await asyncio.to_thread(robot.motor_config, arm, joint)
+            except KeyError:
+                return JSONResponse({"error": "unknown motor"}, status_code=404)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(config)
+
+    @app.post("/api/robot/motors/{arm}/{joint}/config")
+    async def robot_motor_config_write(
+        arm: str, joint: str, req: MotorConfigWriteRequest
+    ) -> JSONResponse:
+        """Write one configuration parameter (persisted to flash) and read it back."""
+        async with session_launch_reservation:
+            try:
+                result = await asyncio.to_thread(
+                    robot.set_motor_config,
+                    arm,
+                    joint,
+                    req.param,
+                    req.value,
+                    allow_protected=req.allowProtected,
+                )
+            except KeyError:
+                return JSONResponse({"error": "unknown motor"}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            except (MotorError, TimeoutError) as exc:
+                return JSONResponse(
+                    {"error": f"write failed: {exc or 'timed out'}"}, status_code=502
+                )
+        return JSONResponse(result)
+
     # -- motor telemetry (diagnostics dashboard) -----------------------------
 
     @app.get("/api/telemetry")
@@ -1493,8 +1724,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         queue = hub.subscribe()
         try:
             await ws.send_json({"type": "hello", **hub.snapshot()})
-            while True:
-                await ws.send_json(await queue.get())
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, queue)
+            ) as stream:
+                async for message in stream:
+                    await ws.send_json(message)
         except WebSocketDisconnect:
             pass
         finally:
@@ -1529,7 +1763,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 async with session_launch_reservation:
                     try:
                         if uses_can_bus:
-                            await asyncio.to_thread(robot.reacquire)
+                            try:
+                                await asyncio.to_thread(robot.reacquire)
+                            finally:
+                                await asyncio.to_thread(jelly.reacquire)
                     finally:
                         if uses_can_bus:
                             diagnostic_cleanup_pending.discard(session.id)
@@ -1616,11 +1853,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     for key, value in launch_args.items()
                     if key in valid_scope_keys
                 }
-                if command_id == "diag.rom-enable":
-                    # Its --joints picks which joints are *swept*; the realtime
-                    # core still brings up every motor of each selected arm, so
-                    # a fault anywhere on the arm blocks the run.
-                    fault_scope_args.pop("joints", None)
+                # ROM enable: --joints picks what is *swept*. Its bring-up
+                # probes each bus and brings up every motor that answers, so
+                # an unreachable unselected joint is one the run treats as
+                # absent (a bench wrist assembly on a single adapter) and
+                # must not block it — while any fault on a selected joint, or
+                # an error state on a reachable unselected one, still does.
+                rom_enable = command_id == "diag.rom-enable"
                 if command_id == "diag.lift-cycle":
                     # Lift cycle never touches grippers. Keep its arm/side
                     # scoping, but do not block it on an unrelated gripper
@@ -1637,7 +1876,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         joint.name for joint in ARM_JOINTS
                     )
                 fault_response = await _motor_fault_response(
-                    scope_args=fault_scope_args
+                    scope_args=fault_scope_args,
+                    unselected_joints_only_skip_absent=rom_enable,
                 )
                 if fault_response is not None:
                     return fault_response
@@ -1658,6 +1898,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         },
                         status_code=409,
                     )
+                # The lift helpers and lift cycle open Jelly's buses, so the
+                # idle Jelly links hand theirs over for the run as well.
+                try:
+                    await asyncio.to_thread(jelly.release)
+                except Exception as exc:  # noqa: BLE001 - preserve safety lockout
+                    await asyncio.to_thread(robot.reacquire)
+                    return JSONResponse(
+                        {
+                            "error": "Could not release the Jelly CAN link; the "
+                            "command was not started. Reconnect the Jelly wheels "
+                            f"/ lift before retrying: {exc}"
+                        },
+                        status_code=409,
+                    )
             try:
                 session = await manager.start(
                     command_id, launch_args, stdin_pipe=stdin_pipe
@@ -1665,11 +1919,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             except Exception:
                 if uses_can_bus:
                     await asyncio.to_thread(robot.reacquire)
+                    await asyncio.to_thread(jelly.reacquire)
                 raise
 
             if uses_can_bus:
                 if session.status == "error":
                     await asyncio.to_thread(robot.reacquire)
+                    await asyncio.to_thread(jelly.reacquire)
                 else:
                     diagnostic_cleanup_pending.add(session.id)
             if uses_cameras and session.status != "error":
@@ -2101,7 +2357,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         def inspect() -> dict[str, Any]:
             from ..cli.tracker_install import lighthouse_readiness
-            from ..tracker.lighthouse_survey import load_lighthouse_survey
             from ..cli.tracker_ultimate import (
                 is_ultimate_tracker_key,
                 ultimate_runtime_readiness,
@@ -2118,6 +2373,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 select_quest_transform_key,
             )
             from ..tracker import load_tracker_config
+            from ..tracker.lighthouse_survey import load_lighthouse_survey
             from ..vr.server import get_last_quest_pose_datum
             from .tracker_setup import TrackerSetupError, calibration_snapshot
 
@@ -2297,6 +2553,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
+    def _datasets_base() -> Path | None:
+        """Where ``/api/datasets`` scans (None = the LeRobot cache dir)."""
+        stored_root = settings.snapshot()["values"].get("recording.root")
+        return Path(str(stored_root)).expanduser() if stored_root else None
+
+    def _dataset_root(repo_id: str) -> Path:
+        from ..recording.dataset_browser import resolve_dataset
+        from ..recording.datasets import lerobot_home
+
+        return resolve_dataset(_datasets_base() or lerobot_home(), repo_id)
+
     @app.get("/api/datasets")
     async def get_datasets() -> dict[str, Any]:
         """LeRobot datasets on this host, newest first.
@@ -2305,13 +2572,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         collect-data writes to), otherwise the LeRobot cache dir — the same
         place replay-dataset resolves a bare repo id against.
         """
-        from pathlib import Path
-
         from ..recording.datasets import list_datasets
 
-        stored_root = settings.snapshot()["values"].get("recording.root")
-        base = Path(str(stored_root)).expanduser() if stored_root else None
-        found = await asyncio.to_thread(list_datasets, base)
+        found = await asyncio.to_thread(list_datasets, _datasets_base())
         return {
             "datasets": [
                 {
@@ -2323,6 +2586,112 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 for d in found
             ]
         }
+
+    # -- dataset preview (saved episodes' videos + task, task rename) --------
+    #
+    # Reads the files a recording session has already closed, so it works on
+    # the dataset a live session is recording into (its snapshot names it as
+    # ``dataset``); the take in progress is not listed until it is saved.
+
+    @app.get("/api/datasets/episodes", response_model=None)
+    async def get_dataset_episodes(repo_id: str) -> dict[str, Any] | JSONResponse:
+        """A dataset's saved episodes: length, task(s), each camera's video span."""
+        from ..recording.dataset_browser import DatasetBrowseError, read_episodes
+
+        def _read() -> dict[str, Any]:
+            root = _dataset_root(repo_id)
+            return {
+                "repoId": repo_id,
+                "root": str(root),
+                **read_episodes(root).to_dict(),
+            }
+
+        try:
+            return await asyncio.to_thread(_read)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse(
+                {"error": f"dataset preview needs the lerobot extra ({exc})"},
+                status_code=501,
+            )
+
+    @app.get("/api/datasets/video", response_model=None)
+    async def get_dataset_video(
+        repo_id: str, episode: int, camera: str, fps: int = 0
+    ) -> FileResponse | JSONResponse:
+        """The mp4 holding one camera's frames for an episode (Range-capable).
+
+        The file can hold several episodes (datasets not recorded by axol
+        share chunk files); the episode listing carries the ``from``/``to``
+        span the player seeks within. The mp4s' moov atom is at the end, so
+        browsers rely on Range requests, which FileResponse answers.
+
+        ``fps`` asks for the player's cut instead (what the panel uses): a
+        cached file holding only the episode's span, starting at 0, with its
+        index first so it starts playing before it has downloaded, and every
+        Nth packet for a rate below the dataset's (Axol's all-intra 60 fps
+        cameras are ~21 Mbps each, more than a Wi-Fi or Tailscale link carries
+        for four at once) — see ``dataset_browser.episode_preview``.
+        """
+        from ..recording.dataset_browser import (
+            DatasetBrowseError,
+            PreviewError,
+            episode_preview,
+            episode_video,
+        )
+
+        def _resolve() -> Path:
+            root = _dataset_root(repo_id)
+            if fps > 0:
+                return episode_preview(root, episode, camera, fps)
+            return episode_video(root, episode, camera)[0]
+
+        try:
+            path = await asyncio.to_thread(_resolve)
+        except PreviewError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=501)
+        return FileResponse(path, media_type="video/mp4")
+
+    @app.put("/api/datasets/episodes/{episode}/task", response_model=None)
+    async def put_episode_task(
+        episode: int, req: EpisodeTaskRequest
+    ) -> dict[str, Any] | JSONResponse:
+        """Rename a saved episode's task, also while a session records into it.
+
+        Serialized with the recorder's saves by the dataset's metadata lock
+        (see ``recording.dataset_browser``); a save that holds it longer than
+        the timeout answers 409 and the panel retries.
+        """
+        from ..recording.dataset_browser import (
+            DatasetBrowseError,
+            DatasetBusyError,
+            rename_episode_task,
+        )
+
+        def _rename() -> dict[str, Any]:
+            root = _dataset_root(req.repoId)
+            return rename_episode_task(root, episode, req.task).to_dict()
+
+        try:
+            summary = await asyncio.to_thread(_rename)
+        except DatasetBusyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except ImportError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=501)
+        _logger.info(
+            "Dataset %s: episode %d task set to %r",
+            req.repoId,
+            episode,
+            req.task.strip(),
+        )
+        return {"episode": summary}
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 
@@ -2390,28 +2759,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Lift the hardware-cleanup lockout once the motors read torque-free.
 
         The lockout exists because an operation could not confirm it disabled
-        the motors, so nothing may reopen the CAN buses behind it. Cutting
-        motor power is exactly that case with the torque already gone, so this
-        proves it rather than assuming it: reacquire the idle link, ping every
-        motor, and only release the reservation when each one reads disabled or
-        does not answer at all. A motor that answers and is not disabled is
-        still holding torque nobody supervises, and keeps the lockout.
-
-        The probe borrows the buses. While the lockout stands the failed
-        operation may still hold them, and the idle link is not meant to sit
-        on the same channels for longer than it takes to look: if the lockout
-        is refused, a link this call reconnected is handed back (``busy``)
-        exactly as it was before the probe.
+        the motors and the probe the runner ran right afterwards could not
+        prove them torque-free either, so nothing may reopen the CAN buses
+        behind it. Cutting motor power is exactly that case with the torque
+        already gone, so this re-runs the same probe
+        (:func:`prove_motors_torque_free`) rather than assuming: reacquire the
+        idle link, ping every motor, and only release the reservation when
+        each one reads disabled or does not answer at all. A motor that answers
+        and is not disabled is still holding torque nobody supervises, and
+        keeps the lockout; on refusal a link this call reconnected is handed
+        back (``busy``) exactly as it was before the probe.
         """
-
-        async def refuse(error: str, *, reacquired: bool) -> JSONResponse:
-            if reacquired:
-                try:
-                    await asyncio.to_thread(robot.release)
-                except RuntimeError as exc:
-                    error = f"{error}; also could not hand the buses back: {exc}"
-            return JSONResponse({"error": error}, status_code=409)
-
         async with session_launch_reservation:
             if not runner.hardware_cleanup_lockout():
                 return JSONResponse(
@@ -2423,36 +2781,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     {"error": "an operation is still running — stop it first"},
                     status_code=409,
                 )
-            reacquired = False
-            try:
-                reacquired = await asyncio.to_thread(robot.reacquire)
-                status = await asyncio.to_thread(robot.probe)
-            except RuntimeError as exc:
-                return await refuse(
-                    "could not reach the motors to prove they are disabled; "
-                    f"the lockout stands: {exc}",
-                    reacquired=reacquired,
-                )
-            # ``reachable is False`` is the proof this needs (the motor is
-            # unpowered); ``None`` means the probe produced no reading for it,
-            # which proves nothing and must keep the lockout.
-            live = [
-                m
-                for m in status["motors"]
-                if m["reachable"] is not False and m["status"] != "DISABLED"
-            ]
-            if live:
-                return await refuse(
-                    "these motors still answer and are not disabled, "
-                    "so the lockout stands: "
-                    + ", ".join(
-                        f"{m['arm']} {m['joint'].lower()}"
-                        f" ({str(m['status']).replace('_', ' ').lower()})"
-                        for m in live
-                    ),
-                    reacquired=reacquired,
+            refusal = await asyncio.to_thread(prove_motors_torque_free, robot)
+            if refusal is not None:
+                return JSONResponse(
+                    {"error": f"{refusal}; the lockout stands"}, status_code=409
                 )
             runner.clear_hardware_cleanup_lockout()
+            # The failed run borrowed the Jelly buses too and the lockout kept
+            # them ``busy``; with it lifted, hand them back to the idle links.
+            # A device that fails to reopen shows as ``error`` on its tile,
+            # where Connect can retry — the lockout itself is already proven.
+            try:
+                await asyncio.to_thread(jelly.reacquire)
+            except Exception as exc:  # noqa: BLE001 - devices left in error state
+                _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
             return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
@@ -2473,13 +2815,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
+            # (teleop with the arms switched off) never touches the *arms*, so
+            # both stay allowed.
             cmd = COMMANDS[req.op]
             try:
                 launch_args = normalize_boolean_args(
                     req.op, settings.merged_args(req.op, req.args)
                 )
                 requested_mantis = flag_enabled(launch_args.get("mantis"))
+                # A strict per-run field (a task catalog, say) takes only a
+                # value from its pick list; the provider may do I/O, so it
+                # runs off the loop. Refused here, before any hardware
+                # survey, as a plain form error.
+                await asyncio.to_thread(check_strict_fields, req.op, launch_args)
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -2492,12 +2840,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     status_code=400,
                 )
             mantis_mode = cmd.supports_mantis and requested_mantis
-            is_sim = cmd.sim_flag is not None and flag_enabled(
-                launch_args.get(cmd.sim_flag)
-            )
-            robot_free = is_sim or any(
-                flag_enabled(launch_args.get(flag)) for flag in cmd.robot_free_flags
-            )
+            launch_flags = {
+                flag: flag_value(launch_args.get(flag), flag_default(cmd, flag))
+                for flag in safety_flags(cmd)
+            }
+            robot_free = is_robot_free(cmd, launch_flags)
             hardware_profile = "mantis" if mantis_mode else "axol"
             needs_motor_survey = cmd.uses_can_bus and (
                 not robot_free or hardware_profile == "mantis"
@@ -2613,6 +2960,35 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def get_commands() -> list[dict[str, Any]]:
         return command_specs()
 
+    @app.get("/api/commands/{command_id}/suggestions/{field}")
+    async def get_field_suggestions(command_id: str, field: str) -> JSONResponse:
+        """The pick list a command declares for one of its per-run fields.
+
+        Runs the ``CommandDef.field_suggestions`` provider on a worker thread
+        (it may list a remote registry). A provider failure is a 200 with an
+        empty list and the error text, so the panel keeps its plain input and
+        can say why the list is missing; only an undeclared field is a 404.
+        """
+        try:
+            rows = await asyncio.to_thread(field_suggestions, command_id, field)
+        except NoSuggestionProvider:
+            return JSONResponse(
+                {"error": f"no suggestions declared for {command_id}.{field}"},
+                status_code=404,
+            )
+        except Exception as exc:  # noqa: BLE001 - a provider must not break the form
+            _logger.warning(
+                "suggestions for %s.%s failed: %s: %s",
+                command_id,
+                field,
+                type(exc).__name__,
+                exc,
+            )
+            return JSONResponse(
+                {"suggestions": [], "error": f"{type(exc).__name__}: {exc}"}
+            )
+        return JSONResponse({"suggestions": rows, "error": None})
+
     @app.get("/api/sessions")
     async def get_sessions() -> list[dict[str, Any]]:
         sessions = manager.list()
@@ -2695,12 +3071,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 await ws.send_json({"type": "log", "line": line})
             await ws.send_json({"type": "status", "session": session.to_dict()})
 
-            while True:
-                line = await queue.get()
-                if line is None:
-                    await ws.send_json({"type": "status", "session": session.to_dict()})
-                    break
-                await ws.send_json({"type": "log", "line": line})
+            async with contextlib.aclosing(
+                _stream_until_disconnect(ws, queue)
+            ) as stream:
+                async for line in stream:
+                    if line is None:
+                        await ws.send_json(
+                            {"type": "status", "session": session.to_dict()}
+                        )
+                        break
+                    await ws.send_json({"type": "log", "line": line})
         except WebSocketDisconnect:
             pass
         finally:
@@ -2709,10 +3089,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         if can_discovery_task is not None and not can_discovery_task.done():
-            await asyncio.shield(can_discovery_task)
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(can_discovery_task),
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                _logger.warning(
+                    "CAN hardware discovery did not finish within %.0fs; "
+                    "shutting down without it",
+                    _CAN_DISCOVERY_SHUTDOWN_TIMEOUT_SECONDS,
+                )
         await runner.shutdown()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
+        await asyncio.to_thread(jelly.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

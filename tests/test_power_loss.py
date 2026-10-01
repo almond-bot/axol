@@ -23,7 +23,7 @@ from almond_axol.motor.bus import (
     set_channel_stalled,
     stalled_channels,
 )
-from almond_axol.robot.axol import Axol
+from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.rt.link import RtLink
 from almond_axol.serve import app as app_module
@@ -38,8 +38,7 @@ from almond_axol.serve.runner import STALL_STOP_ERROR, OperationRunner
 
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
-from tests.test_serve_session_reservation import _Manager, _Settings, _Updater
-
+from tests.test_serve_session_reservation import _Jelly, _Manager, _Settings, _Updater
 
 # What the Rust transports put on the wire when nothing ACKs for STALL_DETECT
 # (``proxy.rs`` for the maintenance proxy, ``serve.rs`` for the armed core).
@@ -99,7 +98,7 @@ class _FakeDriver:
         self.accepts_disable = accepts_disable
         self.bus_gone = bus_gone
         self.disable_calls = 0
-        # Firmware gain ceilings Axol.__init__ checks the config against.
+        # Firmware gain ceilings AxolHardware.__init__ checks the config against.
         self.kp_max = 500.0
         self.kd_max = 5.0
 
@@ -123,8 +122,8 @@ class _FakeDriver:
         return MotorStatus.OK
 
 
-def _axol_with_drivers(driver_for: Any) -> tuple[Axol, list[_FakeBus]]:
-    """Build an Axol whose motors are ``driver_for(channel)`` fakes."""
+def _axol_with_drivers(driver_for: Any) -> tuple[AxolHardware, list[_FakeBus]]:
+    """Build an AxolHardware whose motors are ``driver_for(channel)`` fakes."""
     buses: list[_FakeBus] = []
 
     def make_bus(channel: str) -> _FakeBus:
@@ -139,7 +138,7 @@ def _axol_with_drivers(driver_for: Any) -> tuple[Axol, list[_FakeBus]]:
             side_effect=lambda bus, *_args, **_kwargs: driver_for(bus.channel),
         ),
     ):
-        axol = Axol(left_channel="can-left", right_channel="can-right")
+        axol = AxolHardware(left_channel="can-left", right_channel="can-right")
     return axol, buses
 
 
@@ -320,6 +319,8 @@ class _LockedOutLink:
         self.reacquires = 0
         self.releases = 0
         self.probes = 0
+        # Raised by the next probe only, then cleared.
+        self.probe_error: Exception | None = None
 
     def profile(self) -> str:
         return "axol"
@@ -347,6 +348,9 @@ class _LockedOutLink:
 
     def probe(self) -> dict[str, Any]:
         self.probes += 1
+        if self.probe_error is not None:
+            error, self.probe_error = self.probe_error, None
+            raise error
         if self.state != STATE_CONNECTED:
             raise RuntimeError(f"robot link is {self.state}")
         return self.status()
@@ -375,13 +379,22 @@ def _motor(joint: str, *, reachable: bool | None, status: str | None) -> dict[st
 
 class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
     def _locked_out_runner(self, robot: _LockedOutLink) -> OperationRunner:
-        """A runner whose last operation failed to confirm its torque-off."""
+        """A runner whose last operation failed to confirm its torque-off.
+
+        The runner probes the motors itself as that operation ends and only
+        locks out when the probe cannot prove them safe; here that first
+        probe fails to read (the failed op still had the bus), so the
+        lockout stands and *robot*'s motors describe what the operator's
+        later Re-check sees. The probe's own reacquire/release round trip is
+        zeroed so each test counts only the Re-check it issues.
+        """
         from almond_axol.serve.commands import COMMANDS
 
         def fail(_cfg: Any, *, stop_event: threading.Event) -> None:
             del stop_event
             raise HardwareCleanupError("robot disable failed")
 
+        robot.probe_error = RuntimeError("bus still owned by the failed run")
         runner = OperationRunner(robot_link=robot)
         session = Session("cleanup-test", {})
         session.status = "running"
@@ -404,16 +417,71 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
                 manage_bridge=False,
             )
         self.assertTrue(runner.hardware_cleanup_lockout())
+        self.assertIsNone(robot.probe_error)
+        robot.reacquires = robot.releases = robot.probes = 0
         return runner
 
+    def test_the_runner_clears_its_own_lockout_when_the_motors_read_safe(
+        self,
+    ) -> None:
+        # No probe failure staged: the operation's cleanup failed, but the
+        # runner's own probe finds every motor disabled or unpowered, so the
+        # operator is never asked to do anything.
+        from almond_axol.serve.commands import COMMANDS
+
+        def fail(_cfg: Any, *, stop_event: threading.Event) -> None:
+            del stop_event
+            raise HardwareCleanupError("robot disable failed")
+
+        robot = _LockedOutLink(
+            [
+                _motor("SHOULDER_1", reachable=False, status=None),
+                _motor("WRIST_2", reachable=True, status="DISABLED"),
+            ]
+        )
+        runner = OperationRunner(robot_link=robot)
+        session = Session("cleanup-test", {})
+        session.status = "running"
+        runner._session = session
+        command = SimpleNamespace(
+            load_entrypoint=lambda: fail,
+            load_episode_control=lambda: None,
+        )
+        with (
+            patch.dict(COMMANDS, {"cleanup-test": command}),
+            patch("almond_axol.serve.runner._Capture") as capture,
+        ):
+            capture.return_value.__enter__.return_value = None
+            runner._run_thread(
+                session,
+                "cleanup-test",
+                SimpleNamespace(),
+                20,
+                needs_robot=True,
+                manage_bridge=False,
+            )
+
+        self.assertFalse(runner.hardware_cleanup_lockout())
+        self.assertFalse(runner.is_running())
+        self.assertEqual(session.status, "error")
+        self.assertIn("robot disable failed", session.error or "")
+        self.assertEqual(robot.probes, 1)
+        self.assertEqual(robot.state, STATE_CONNECTED)
+
     async def _client(
-        self, runner: OperationRunner, robot: _LockedOutLink
+        self,
+        runner: OperationRunner,
+        robot: _LockedOutLink,
+        jelly: _Jelly | None = None,
     ) -> httpx.AsyncClient:
-        client, _updater = await self._client_and_updater(runner, robot)
+        client, _updater = await self._client_and_updater(runner, robot, jelly)
         return client
 
     async def _client_and_updater(
-        self, runner: OperationRunner, robot: _LockedOutLink
+        self,
+        runner: OperationRunner,
+        robot: _LockedOutLink,
+        jelly: _Jelly | None = None,
     ) -> tuple[httpx.AsyncClient, _Updater]:
         """The API client plus the updater double built with the app's real
         ``_is_idle``, which is what the panel's host tile gates on."""
@@ -429,6 +497,7 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
             patch.object(app_module, "OperationRunner", return_value=runner),
             patch.object(app_module, "SettingsStore", return_value=_Settings()),
             patch.object(app_module, "RobotLink", return_value=robot),
+            patch.object(app_module, "JellyLink", return_value=jelly or _Jelly()),
             patch.object(app_module, "SelfUpdater", side_effect=make_updater),
         ):
             app = app_module.create_app()
@@ -519,6 +588,33 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.reacquires, 1)
         self.assertFalse(runner.hardware_cleanup_lockout())
         self.assertFalse(runner.is_running())
+
+    async def test_clear_lockout_hands_the_jelly_buses_back(self) -> None:
+        # The failed run borrowed the Jelly buses too, and the lockout kept
+        # them ``busy``. Lifting it must give them back — otherwise the wheels
+        # and lift tiles read "in use" with no task to end it.
+        robot = _LockedOutLink([_motor("SHOULDER_1", reachable=False, status=None)])
+        runner = self._locked_out_runner(robot)
+        jelly = _Jelly(states={"wheels": "busy", "lift": "busy"})
+
+        async with await self._client(runner, robot, jelly) as client:
+            response = await client.post("/api/op/clear-lockout")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(jelly.reacquires, 1)
+        self.assertEqual(jelly.states, {"wheels": "connected", "lift": "connected"})
+
+    async def test_clear_lockout_refusal_leaves_the_jelly_buses_reserved(self) -> None:
+        robot = _LockedOutLink([_motor("WRIST_2", reachable=True, status="OK")])
+        runner = self._locked_out_runner(robot)
+        jelly = _Jelly(states={"wheels": "busy", "lift": "busy"})
+
+        async with await self._client(runner, robot, jelly) as client:
+            response = await client.post("/api/op/clear-lockout")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(jelly.reacquires, 0)
+        self.assertEqual(jelly.states, {"wheels": "busy", "lift": "busy"})
 
     async def test_clear_lockout_keeps_the_lockout_when_nothing_was_read(self) -> None:
         robot = _LockedOutLink([_motor("SHOULDER_1", reachable=None, status=None)])

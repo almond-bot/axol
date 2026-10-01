@@ -9,9 +9,12 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
 * ``zed.driver``    — replaces a ZED Box's (Duo or Mini) outdated factory
                       GMSL capture driver with the release pinned for the
-                      ZED SDK (takes effect on the next reboot; never reboots
-                      itself).
+                      ZED SDK (takes effect on the next reboot, see below).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
+* calibration cache — group-shares ``/usr/local/zed/settings`` so calibration
+                      files cached by the root service stay readable from the
+                      operator's own ``axol serve`` / ``axol teleop`` and vice
+                      versa (see :mod:`almond_axol.zed.calibration`).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
                       dropped on every ``uv tool upgrade``).
@@ -24,6 +27,11 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       via rustup if needed; sources fetched at the installed
                       package's ref for tool installs), required by hardware
                       control (see :mod:`almond_axol.rt`).
+* CAN purge grant   — a ``sudoers.d`` drop-in letting a manual ``axol serve``
+                      flap the CAN interfaces without a password when motor
+                      power dies, so the e-stop's queued position commands
+                      cannot replay on the next bring-up (see
+                      :mod:`almond_axol.utils.can_purge`).
 * rtprio grant      — a ``limits.d`` drop-in letting the operator's login run
                       the camera relay's capture chain ``SCHED_FIFO`` from a
                       manual ``axol serve`` (the systemd unit already has
@@ -32,6 +40,14 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       :mod:`almond_axol.utils.rtprio`).
 * ``tracker.install`` — pinned libsurvive + Vive USB permissions for Mantis
                         Lighthouse tracking.
+* host tuning       — the per-boot runtime tuning for the host it runs on
+                      (:func:`tune_host`). On a Jetson (Orin NX, AGX Orin,
+                      Thor): the max ``nvpmodel`` mode, engine + CPU clock
+                      pins, the CAN interrupt steered onto a CAN core, and the
+                      Argus daemon made ``SCHED_FIFO`` on the camera cores
+                      (see :mod:`almond_axol.utils.jetson`). Nothing to tune on
+                      a Raspberry Pi 5 or a workstation; it still logs the
+                      core layout the loops will pin to.
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -43,9 +59,24 @@ command exit non-zero once every other step has had its chance. The hosted
 installer and post-upgrade path pass ``--require-rt`` (accepted for
 compatibility: the required control-core install already fails the command).
 
-It does NOT pin Jetson clocks or steer the CAN adapters' interrupt — that's
-``axol jetson.setup``, a per-boot runtime tweak owned by the systemd
-``ExecStartPre``, not an install step.
+Some steps only take effect at boot (the ZED Box driver, a Jetson power mode
+nvpmodel will only switch across a reboot); they record why in
+:mod:`almond_axol.utils.reboot`. A clean operator run then **reboots the host**
+itself. ``--no-reboot`` leaves the reboot pending for a caller that reboots at
+its own safe point: the hosted installer (which finishes with
+``--apply-reboot``) and the ``axol serve`` self-updater (which reboots only
+while idle). A provision spawned by ``axol serve`` never reboots on its own,
+whatever its flags -- older serve builds don't pass ``--no-reboot``, and a
+reboot under a live robot session drops the arms' supervision. A failed run
+never reboots; the pending marker survives until the reboot, so the retry
+still does.
+
+That tuning resets on every reboot, so ``axol provision --boot`` — the
+tuning step alone, no installs and no update lock — is the systemd unit's
+``ExecStartPre`` and re-applies it at each boot. An operator never runs a
+second command: ``axol provision`` leaves the host fully set up now, and the
+unit keeps it that way. ``axol jetson.setup`` is kept as an alias of
+``--boot`` for units written by older installers.
 """
 
 from __future__ import annotations
@@ -61,13 +92,15 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb, rtprio
+from ..utils import adb, affinity, can_purge, jetson, reboot, rtprio
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
     host_update_lock,
 )
+from ..utils.state_files import privileged_service_active, spawned_by_serve
 from ..utils.sudo import prime_sudo, run_root
+from ..zed import calibration as zed_calibration
 from . import tracker_install
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
@@ -186,7 +219,7 @@ def _neutralize_legacy_can_root_execution() -> bool:
     if scrubbed:
         print(
             "WARNING: Removed legacy root cron/systemd references to "
-            "operator-writable CAN scripts. Run `sudo axol can.setup` with "
+            "operator-writable CAN scripts. Run `axol can.setup` with "
             "the adapters attached to restore boot/hotplug CAN bring-up from "
             "root-owned /etc/almond-axol/can scripts."
         )
@@ -200,7 +233,32 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         help=(
             "Install/refresh the non-PyPI + system pieces "
             "(cameras, adb, Lighthouse tracking, board access, the operator's "
-            "real-time scheduling grant, and the axol-rt control core)."
+            "real-time scheduling grant, and the axol-rt control core), then "
+            "apply this host's real-time tuning (Jetson clocks, CAN interrupt)."
+        ),
+    )
+    parser.add_argument(
+        "--boot",
+        action="store_true",
+        help=(
+            "apply only the per-boot host tuning (Jetson clocks, CAN interrupt, "
+            "camera daemon scheduling) — the systemd unit's ExecStartPre"
+        ),
+    )
+    parser.add_argument(
+        "--no-reboot",
+        action="store_true",
+        help=(
+            "leave a required reboot pending instead of rebooting at the end "
+            "(for callers that reboot at their own safe point)"
+        ),
+    )
+    parser.add_argument(
+        "--apply-reboot",
+        action="store_true",
+        help=(
+            "provision nothing; reboot if an earlier --no-reboot run left a "
+            "reboot pending (the installer's last step)"
         ),
     )
     parser.add_argument(
@@ -263,18 +321,73 @@ def _sudo_held_update_lock() -> Iterator[None]:
         holder.wait()
 
 
-def run(_args: object = None) -> None:
+def tune_host(*, interactive: bool = False) -> bool:
+    """Apply the runtime tuning this host needs; it resets on every reboot.
+
+    Decided by what the host exposes, never by a hard-coded board list: the
+    Jetson steps self-gate on the L4T release file / Tegra devfreq nodes, the
+    clock pins on whichever engine nodes exist (Orin's ``*.nvenc``/``*.gpu``,
+    Thor's ``gpu-gpc-*``/``gpu-nvd-*``), and the interrupt / daemon placement
+    on the online core count (:func:`affinity.core_groups`). The layout is
+    logged *after* the power-mode step, which can online cores.
+
+    Returns True when part of the tuning (the power mode) needs a reboot.
+    """
+    model = jetson.host_model() or "unknown board"
+    reboot_needed = False
+    if jetson._is_jetson():
+        _logger.info("host: %s (Jetson) — applying the real-time tuning", model)
+        reboot_needed = bool(jetson.pin_realtime_clocks(interactive=interactive))
+    else:
+        _logger.info("host: %s — no Jetson tuning to apply", model)
+    _logger.info("core layout: %s", affinity.describe_layout())
+    return reboot_needed
+
+
+def run(args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
     # Surface each step's INFO outcome (what was granted/installed, or already
     # in place) so a run at a customer site is verifiable from its output alone;
     # force=True in case an imported dependency already installed a handler.
     logging.basicConfig(level=logging.INFO, format="%(message)s", force=True)
+    if getattr(args, "boot", False):
+        # Per-boot: nothing to install, nothing that rewrites the tool env, so
+        # no update lock (a boot-time ExecStartPre must never wait on one).
+        # Never reboots, and never records a reboot either: this runs at every
+        # boot, so a request here could loop the host through reboots.
+        tune_host(interactive=sys.stdin.isatty())
+        return
+    # Inside `axol serve` the updater decides when a reboot is safe (idle).
+    auto_reboot = not getattr(args, "no_reboot", False) and not spawned_by_serve()
+    if getattr(args, "apply_reboot", False):
+        _reboot_if_pending(auto_reboot)
+        return
     lock = host_update_lock if os.geteuid() == 0 else _sudo_held_update_lock
     try:
         with lock():
             _run_locked()
     except HostUpdateLockError as exc:
         raise SystemExit(f"Axol provisioning could not start: {exc}") from exc
+    # After the lock is released: a clean run that left a reboot pending.
+    _reboot_if_pending(auto_reboot)
+
+
+def _reboot_if_pending(auto_reboot: bool) -> None:
+    """Reboot for pending reasons, or say that one is still required."""
+    reasons = reboot.pending()
+    if not reasons:
+        reboot.clear_attempt()
+        return
+    summary = "; ".join(reasons)
+    if not auto_reboot:
+        print(f"REBOOT REQUIRED: {summary}. Left pending for the caller.")
+        return
+    print(f"REBOOT REQUIRED: {summary}. Rebooting now.", flush=True)
+    if not reboot.reboot_host(reasons):
+        raise SystemExit(
+            f"A reboot is still required ({summary}) after the last automatic "
+            "reboot; not rebooting again. See the log above."
+        )
 
 
 def _run_locked() -> None:
@@ -311,9 +424,21 @@ def _run_locked() -> None:
     # `axol serve` can run the camera relay's capture chain SCHED_FIFO like
     # the systemd unit does (LimitRTPRIO). Applies at the next login.
     step("rtprio grant (utils.rtprio)", rtprio.install)
+    # Passwordless escalation for the one privileged thing a running session
+    # must do on its own: flapping a CAN interface whose TX queue stalled
+    # because motor power died. Without it a manual `axol serve` cannot purge,
+    # and the e-stop's queued commands replay on the next enable.
+    step("CAN e-stop purge grant (utils.can_purge)", can_purge.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         step("pyzed (zed.install)", zed_install.run)
+        # The SDK caches each camera's calibration under /usr/local/zed/settings
+        # as whichever account opens it first. The hosted service is root, so
+        # without this the operator's own `axol serve` / `axol teleop` can't
+        # read (or refresh) those files and every camera open fails with
+        # CALIBRATION FILE NOT AVAILABLE. Group-share the cache and make the
+        # directory setgid so files created later inherit the group too.
+        step("ZED calibration cache sharing", zed_calibration.share_calibration_files)
     else:
         print("No ZED SDK at /usr/local/zed; skipping pyzed + zed-gstreamer build.")
     step("GStreamer + PyGObject (gst.install)", gst_install.run)
@@ -325,10 +450,40 @@ def _run_locked() -> None:
     # step it is reported rather than aborting the run, and any failure makes
     # the command exit non-zero below.
     step("axol-rt realtime core (rt.install)", rt_install.run)
+    # Last, so the Argus daemon and CAN interfaces the earlier steps may have
+    # (re)installed exist, and so this run leaves the host tuned now rather
+    # than at its next boot. The same step is the unit's per-boot hook.
+    #
+    # Not from inside `axol serve` (the self-updater's post-upgrade pass and
+    # its startup heal): those can overlap a robot session, and moving the
+    # camera daemon or switching the power mode under a live session is what
+    # the boot hook exists to avoid. They need not tune anyway — the update
+    # ends in a service restart and the heal follows one, and axol.service's
+    # ExecStartPre tunes the host before serve starts every time.
+    if privileged_service_active():
+        _logger.info(
+            "host tuning: left to axol.service's ExecStartPre (runs before "
+            "serve starts, including on the restart an update ends with)"
+        )
+    else:
+
+        def tune() -> None:
+            if tune_host(interactive=sys.stdin.isatty()):
+                reboot.request("Jetson maximum power mode")
+
+        step("host tuning (Jetson clocks, CAN interrupt, camera daemon)", tune)
 
     if failed:
+        # Never reboot a half-provisioned host; the pending marker outlives
+        # this run, so the retry reboots once everything succeeds.
+        pending = (
+            " A reboot is also pending; the successful retry performs it."
+            if reboot.pending()
+            else ""
+        )
         raise SystemExit(
             "Provisioning failed for: "
             + ", ".join(failed)
             + ". See the log above, repair the host, and retry."
+            + pending
         )

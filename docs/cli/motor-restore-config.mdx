@@ -15,7 +15,11 @@ Writes a JSON snapshot produced by [`motor.dump-config`](https://docs.almond.bot
 | `--include-protected` | Also write protected parameters — factory calibration, CAN IDs, baud rate (dangerous) |
 | `--yes` | Skip the confirmation prompt |
 
-Parameters already holding the saved value are skipped, so restoring onto a matching motor writes nothing. Read-only parameters are always skipped, and protected ones unless `--include-protected` is passed, since rewriting those can leave a motor unable to commutate or unreachable on the bus. A snapshot taken with `--raw` cannot be restored — its bare indices have no known meaning.
+Parameters already holding the saved value are skipped, so restoring onto a matching motor writes nothing. Read-only parameters are always skipped, and protected ones unless `--include-protected` is passed, since rewriting those can leave a motor unable to commutate or unreachable on the bus. A snapshot taken with `--raw` cannot be restored — its bare indices have no known meaning. Parameters the motor's firmware doesn't implement are skipped too.
+
+<Warning>
+  Don't restore a MyActuator snapshot taken with a release before v0.2.12. The older parameter table was mis-indexed for the fleet firmware, so those snapshots store values under names that now address different settings. Take a fresh `motor.dump-config` snapshot instead.
+</Warning>
 
 ```bash
 axol motor.restore-config --l arm-left.json            # every motor in the snapshot

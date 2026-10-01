@@ -2,9 +2,10 @@
 
 Jelly has four omni wheels mounted at 45° on the corners (an
 x-drive), each driven by a Damiao motor in VELOCITY mode on a dedicated
-CAN bus, plus a telescoping lift driven by the jelly_legs board on its own
-chest CAN bus (see :mod:`almond_axol.robot.lift`). Wheel CAN IDs are
-fixed by convention:
+CAN bus, plus a telescoping lift driven by the jelly_legs board — either on
+its own chest CAN bus or sharing the wheel bus; ``axol can.setup`` detects
+which, and the lift driver follows (see :mod:`almond_axol.robot.lift`).
+Wheel CAN IDs are fixed by convention:
 
     id 1  front-left      id 2  front-right
     id 3  back-left       id 4  back-right
@@ -91,11 +92,21 @@ import os
 import struct
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
-from ..constants import CAN_BASE, CAN_CHEST
+from ..constants import CAN_BASE
 from ..rt.link import find_binary
-from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
+from .battery import BatteryStatus
+from .lift import (
+    DOWN,
+    JOG_SPEED,
+    STOP,
+    UP,
+    Lift,
+    LiftStatus,
+    resolve_lift_channel,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -103,6 +114,10 @@ _logger = logging.getLogger(__name__)
 # ``axol can.setup`` names Jelly's adapter to this and includes it in the
 # @reboot bring-up alongside the arm channels.
 DEFAULT_CHANNEL = CAN_BASE
+
+# Where SocketCAN interfaces appear; a pinned Jelly bus existing here is how
+# detect_jelly() tells that the hardware is plugged in.
+_SYS_NET = Path("/sys/class/net")
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
@@ -117,6 +132,10 @@ SESSION_PMAX = 400.0
 # hold's dynamics are ~1 s, so this resolves them without flooding a console
 # the 50 Hz command loop has to keep up with.
 _YAW_TRACE_HZ = 10.0
+
+# Wheel speed (rad/s) above which the wheels count as a load on the battery
+# rail, so the battery estimate holds its resting value while driving.
+_WHEEL_LOAD_RAD_S = 0.5
 
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before Jelly says the heading hold is dead.
@@ -276,10 +295,16 @@ class JellyConfig:
     """Configuration for Jelly.
 
     Attributes:
-        enabled:         Whether this robot has Jelly. Only
-                         consulted by entry points that support both variants
-                         (``axol teleop``); code constructing a :class:`Jelly`
-                         directly ignores it.
+        wheels:          Use the wheels when their bus is attached. Whether a
+                         robot *has* Jelly is not configured anywhere: entry
+                         points (``axol teleop``, data collection) call
+                         :func:`detect_jelly`, which uses the wheels when this
+                         is on and ``channel`` exists as a SocketCAN interface,
+                         and the lift when ``lift`` is on and its bus exists.
+                         Turning this off keeps the wheels cold even with the
+                         bus attached. Code constructing a :class:`Jelly`
+                         directly ignores it (``channel=None`` is the
+                         wheel-less form there).
         channel:         SocketCAN interface for the wheel motors. ``None``
                          disables the wheels entirely (lift-only Jelly).
         max_speed:       Peak wheel speed (rad/s) at a full-deflection command.
@@ -382,19 +407,23 @@ class JellyConfig:
                          safety layer for a hung or dead host. Cannot be
                          disabled, and must be at least twice the command
                          period so a single late tick does not trip it.
-        lift:            Whether the telescoping lift is present (the
-                         jelly_legs board on the chest CAN bus, see
-                         :mod:`almond_axol.robot.lift`). The chest bus being
-                         down at enable time only disables the lift with a
-                         warning — the buses are independent, so Jelly can
-                         still drive without it.
-        lift_channel:    SocketCAN interface of the chest bus carrying the
-                         jelly_legs lift controller.
+        lift:            Use the telescoping lift (the jelly_legs board, see
+                         :mod:`almond_axol.robot.lift`) when its bus is
+                         attached; off keeps it cold. The lift bus being down
+                         at enable time only disables the lift with a warning,
+                         so Jelly can still drive without it.
+        lift_channel:    SocketCAN interface carrying the jelly_legs lift
+                         controller. ``None`` (the default) follows the
+                         wiring ``axol can.setup`` found: the chest bus
+                         (``can_alm_axol_c``) when that interface exists,
+                         otherwise the wheel bus (``can_alm_axol_b``) the lift
+                         shares with the motors (see
+                         :func:`almond_axol.robot.lift.resolve_lift_channel`).
         lift_speed:      Lift jog speed in encoder counts/s (the firmware's
                          full speed is ~650).
     """
 
-    enabled: bool = False
+    wheels: bool = True
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
@@ -419,7 +448,7 @@ class JellyConfig:
     command_timeout: float = 0.2
     can_timeout_ms: float = 200.0
     lift: bool = True
-    lift_channel: str = CAN_CHEST
+    lift_channel: str | None = None
     lift_speed: int = JOG_SPEED
 
     def __post_init__(self) -> None:
@@ -471,6 +500,34 @@ _STATUS_FMT = struct.Struct(f"<{_STATUS_VALUES}dB")
 # The guard never eases braking below this fraction of ``decel`` (mirrors
 # ``TRACTION_DECEL_FLOOR`` in ``rust/axol-rt/src/ramp.rs``).
 _TRACTION_DECEL_FLOOR = 0.5
+
+
+def detect_jelly(cfg: JellyConfig) -> JellyConfig | None:
+    """Narrow ``cfg`` to the Jelly hardware attached to this host.
+
+    Jelly is inferred from the CAN interfaces present rather than configured:
+    ``axol can.setup`` (and the control panel's automatic CAN discovery) pin
+    the wheel bus to ``can_alm_axol_b`` and the lift's own bus to
+    ``can_alm_axol_c``, so an interface existing under ``/sys/class/net`` is
+    the device being plugged in. The wheels are used when ``cfg.wheels`` is on
+    and ``cfg.channel`` exists; the lift when ``cfg.lift`` is on and its
+    resolved bus (:func:`~almond_axol.robot.lift.resolve_lift_channel`)
+    exists. The ``wheels`` / ``lift`` switches are the operator's opt-out for
+    attached hardware.
+
+    Returns a copy of ``cfg`` with the absent parts switched off
+    (``channel=None`` / ``lift=False``), or ``None`` when neither the wheels
+    nor the lift are available — this robot has no Jelly to drive.
+    """
+    wheels = cfg.wheels and cfg.channel is not None and _iface_exists(cfg.channel)
+    lift = cfg.lift and _iface_exists(resolve_lift_channel(cfg.lift_channel))
+    if not wheels and not lift:
+        return None
+    return replace(cfg, channel=cfg.channel if wheels else None, lift=lift)
+
+
+def _iface_exists(channel: str) -> bool:
+    return (_SYS_NET / channel).exists()
 
 
 def _pack_config(cfg: JellyConfig) -> bytes:
@@ -696,7 +753,7 @@ class Jelly:
 
     Typical usage::
 
-        jelly = Jelly(JellyConfig())
+        jelly = Jelly()          # config from the robot's shared settings
         await jelly.enable()
         jelly.set_command(vx=0.5, vy=0.0, wz=0.0, lift=0)   # from any thread
         ...
@@ -706,9 +763,18 @@ class Jelly:
     control and CAN; a small Python bridge forwards targets and owns the
     separate lift driver. Values are normalized to [-1, 1] (body frame: +x
     forward, +y left, +wz CCW); ``lift`` is +1 up / 0 stop / -1 down.
+
+    ``config=None`` (default) loads the shared ``jelly.*`` settings
+    (``~/.almond/settings.json``, the file the control panel and ``axol
+    teleop`` use; see :mod:`almond_axol.settings`) over the defaults; pass a
+    :class:`JellyConfig` to override.
     """
 
-    def __init__(self, config: JellyConfig = JellyConfig()) -> None:
+    def __init__(self, config: JellyConfig | None = None) -> None:
+        if config is None:
+            from ..settings import shared_config
+
+            config = shared_config(JellyConfig, "teleop", "jelly")
         self._config = config
         self._lift: Lift | None = None
         self._task: asyncio.Task | None = None
@@ -808,6 +874,15 @@ class Jelly:
         """Latest jelly_legs status frame, or None (no lift / board silent)."""
         return self._lift.status if self._lift is not None else None
 
+    @property
+    def battery(self) -> BatteryStatus | None:
+        """Battery estimate from the lift board's rail voltage, or None.
+
+        Read through the lift board, so it needs the lift (``has_lift``) and
+        firmware that answers ``GET_POWER``; see :mod:`almond_axol.robot.battery`.
+        """
+        return self._lift.battery if self._lift is not None else None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -878,11 +953,16 @@ class Jelly:
                 await lift.close()
                 self._lift = None
                 _logger.warning(
-                    "Jelly lift: could not open the chest bus %s (%s) — "
+                    "Jelly lift: could not open the lift bus %s (%s) — "
                     "the lift is disabled for this session",
-                    cfg.lift_channel,
+                    lift.channel,
                     exc,
                 )
+            else:
+                if cfg.channel is not None and lift.channel == cfg.channel:
+                    _logger.info(
+                        "Jelly lift: jelly_legs shares the wheel bus %s", lift.channel
+                    )
 
         if cfg.channel is not None:
             from ..cli.can.setup import bring_up_interfaces, iface_up
@@ -1188,6 +1268,11 @@ class Jelly:
                 self.linked = bool(flags & 8)
                 self.wheel_fault = bool(flags & 16)
                 self._status_event.set()
+                if self._lift is not None:
+                    # Turning wheels sag the rail the battery estimate reads.
+                    self._lift.external_load = any(
+                        abs(speed) > _WHEEL_LOAD_RAD_S for speed in self.wheel_speeds
+                    )
                 if traction_log is not None:
                     traction_log.update(
                         driving=any(abs(c) >= 1e-3 for c in self.body_cmd),

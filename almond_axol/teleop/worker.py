@@ -15,6 +15,7 @@ import multiprocessing.connection
 import os
 import signal
 import time
+from typing import Any
 
 import numpy as np
 
@@ -30,6 +31,14 @@ _logger = logging.getLogger(__name__)
 
 # Up direction of the raw VR world frame (WebXR reference space: +y is up).
 _VR_UP = np.array([0.0, 1.0, 0.0])
+
+# Absolute-engage side-swap guard (see IKWorker._side_swap_rejection): a
+# side counts as facing away from the rest heading when its horizontal
+# gripper heading is more than 120° from the rest FK heading, and only when
+# that heading is far enough from vertical for the comparison to mean
+# anything.
+_SWAP_GUARD_COS = math.cos(math.radians(120.0))
+_SWAP_GUARD_MIN_HORIZONTAL = 0.3
 
 # Freeze handling (see IKWorker._note_solve): when one arm's solver output keeps
 # returning its seed unchanged while that arm's tracked target moves away, the
@@ -263,6 +272,54 @@ class IKWorker:
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
+
+        # Absolute (Mantis) mode state: the world-anchored base transform solved
+        # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
+        # raw VR world frame — plus each controller's rigid controller→TCP
+        # offset ``(p_off, R_off)`` expressed in the controller's local frame.
+        # ``_abs_active`` is the whole-session engage toggle (absolute mode
+        # has no per-arm freeze — both grips engage, both release). Seeded
+        # here, not only in reset(): the first VR frame can arrive before any
+        # reset or engage, and the absolute-mode reply reads this state.
+        self._abs_active: bool = False
+        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
+        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Tracker→gripper transforms (the rig's factory design constants, or
+        # per-unit file overrides — see almond_axol.mantis.calibration), per
+        # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
+        # When present for a side, engage uses it verbatim instead of
+        # absorbing the mount offset into the engage snapshot.
+        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, tf in (
+            ("left", config.tcp_transform_left),
+            ("right", config.tcp_transform_right),
+        ):
+            if tf is not None:
+                self._tcp_transforms[side] = (
+                    np.asarray(tf[:3], dtype=np.float64),
+                    _quat_xyzw_to_matrix(*tf[3:]).astype(np.float64),
+                )
+        # Quaternion sign continuity for the calibrated pose mapping (see
+        # :meth:`_apply_tcp_transform`).
+        self._last_mapped_quat: dict[str, np.ndarray] = {}
+        if self._tcp_transforms and config.absolute_mode:
+            _logger.info(
+                "absolute mode: using calibrated tracker→gripper transforms for %s",
+                sorted(self._tcp_transforms),
+            )
+        # JSON-safe copy of the base transform for the headset (VR world
+        # coords), so the web client can render the URDF at the engage-
+        # calibrated base. ``None`` until the first engage.
+        self.abs_base_msg: dict[str, list[float]] | None = None
+        # Latest absolute-mode TCP target per side, in the robot base frame:
+        # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
+        # tracked ground-truth pose the IK solver chases — Mantis data collection
+        # records it per row so training can use raw TCP trajectories instead
+        # of (or alongside) the IK joint solutions. Holds the last engaged
+        # target while disengaged (mirroring the latched virtual joints);
+        # seeded from rest FK so it is never ``None`` in absolute mode.
+        self.last_tcp_msg: dict[str, list[float]] | None = None
+
         # Tracking glitch detection state (see _frame_snap_verdict): last good
         # raw controller positions, their (effective) timestamp, an EMA
         # velocity per hand, and the in-progress suspect window, if any.
@@ -747,6 +804,10 @@ class IKWorker:
         enabled = frame.l_lock and frame.r_lock
         if not enabled:
             self._abs_active = False
+            if isinstance(self.abs_base_msg, dict) and "rejected" in self.abs_base_msg:
+                # The core has seen the rejection (it disengaged in response);
+                # stop repeating it.
+                self.abs_base_msg = None
             return q_current
 
         if not self._abs_active:
@@ -810,7 +871,10 @@ class IKWorker:
 
         if not self._abs_active:
             self._abs_active = True
-            self._engage_absolute(l_pos, l_rot, r_pos, r_rot)
+            if not self._engage_absolute(l_pos, l_rot, r_pos, r_rot):
+                # Rejected (rigs in the wrong hands): hold the current joints;
+                # the core disengages when it sees the rejection reply.
+                return q_current
             # Anchor the null-space posture at rest (not q_current) so arm
             # configurations stay consistent across operators and episodes.
             self._solver.set_posture_pose(self.get_rest_q())
@@ -824,12 +888,39 @@ class IKWorker:
 
         left_target = self._absolute_target("left", l_pos, l_rot)
         right_target = self._absolute_target("right", r_pos, r_rot)
-        self.last_tcp_msg = self._encode_tcp_msg(left_target, right_target)
+        self.last_tcp_msg = self._encode_tcp_msg(
+            left_target,
+            right_target,
+            out_of_reach=self._out_of_reach(left_target, right_target),
+        )
         return self._solver.ik(
             q_current,
             left_pose=left_target,
             right_pose=right_target,
         )
+
+    def _out_of_reach(
+        self,
+        left_target: tuple[np.ndarray, np.ndarray],
+        right_target: tuple[np.ndarray, np.ndarray],
+    ) -> tuple[str, ...]:
+        """Sides whose absolute target lies beyond the arm's reach soft-clamp.
+
+        On the Mantis rig the recorded pose is the tracked hand, not the
+        (clamped) IK target, so a hand carried past ``reach_soft_start`` from
+        the shoulder records a pose the robot cannot follow on replay. Mantis
+        data collection counts these rows per episode and warns.
+        """
+        limit = float(self._solver.config.reach_soft_start)
+        shoulders = self._solver.shoulder_positions
+        sides: list[str] = []
+        for side, (pos, _rot) in (("left", left_target), ("right", right_target)):
+            dist = float(
+                np.linalg.norm(np.asarray(pos, dtype=np.float64) - shoulders[side])
+            )
+            if dist > limit:
+                sides.append(side)
+        return tuple(sides)
 
     def compute_reset_trajectory(
         self, q_current: np.ndarray, q_target: np.ndarray
@@ -905,8 +996,11 @@ class IKWorker:
         l_rot: np.ndarray,
         r_pos: np.ndarray,
         r_rot: np.ndarray,
-    ) -> None:
+    ) -> bool:
         """Solve the world-anchored base transform + controller→TCP offsets.
+
+        Returns ``False`` (and publishes a ``{"rejected": reason}`` base
+        message) when the fit is refused by :meth:`_side_swap_rejection`.
 
         The operator is holding both grippers at the agreed start pose — the
         pose the robot's grippers occupy at rest, relative to the task scene.
@@ -963,6 +1057,19 @@ class IKWorker:
         t_wb = mid_w - R_wb @ mid_b
         if self._config.base_height is not None:
             t_wb[1] = float(self._config.base_height)
+
+        rejection = self._side_swap_rejection(R_wb, l_rot, r_rot, fk_l[1], fk_r[1])
+        if rejection is not None:
+            # Leave the previous anchor untouched and let the core disengage:
+            # a base fit from swapped rigs would record every pose yawed 180°
+            # and column-swapped, which no later step could detect.
+            _logger.error("absolute engage rejected: %s", rejection)
+            self._abs_base = None
+            self._abs_offset = {}
+            self._abs_active = False
+            self.abs_base_msg = {"rejected": rejection}
+            return False
+
         self._abs_base = (R_wb, t_wb)
         self.abs_base_msg = {
             "pos": [float(v) for v in t_wb],
@@ -987,6 +1094,59 @@ class IKWorker:
             "left": _offset("left", l_pos, l_rot, fk_l),
             "right": _offset("right", r_pos, r_rot, fk_r),
         }
+        return True
+
+    def _side_swap_rejection(
+        self,
+        R_wb: np.ndarray,
+        l_rot: np.ndarray,
+        r_rot: np.ndarray,
+        fk_l_rot: np.ndarray,
+        fk_r_rot: np.ndarray,
+    ) -> str | None:
+        """Detect left/right rigs held in the opposite hands at engage.
+
+        The base yaw comes from the measured right→left gripper direction, so
+        if the tracker bound as "left" is on the rig in the operator's right
+        hand the fitted base faces *backwards*: every recorded pose is yawed
+        180° and the columns are swapped — and nothing downstream can tell.
+        The gripper orientations expose it: with both sides mapped through a
+        tracker→gripper transform, an operator holding the rigs like the
+        robot's rest grippers has each gripper's horizontal heading (its +y
+        axis, which points backwards at rest) well within 120° of the rest
+        FK heading; a swap flips *both* headings by ~180°. Only both sides
+        agreeing counts — one twisted wrist is the operator's business, and
+        an uncalibrated side has its alignment error absorbed anyway.
+        Headings too close to vertical (rig pointed straight up/down) are
+        inconclusive and never reject.
+        """
+        if not ("left" in self._tcp_transforms and "right" in self._tcp_transforms):
+            return None
+        up = np.array([0.0, 0.0, 1.0])
+        flipped: list[str] = []
+        for side, rot, fk_rot in (
+            ("left", l_rot, fk_l_rot),
+            ("right", r_rot, fk_r_rot),
+        ):
+            heading = (R_wb.T @ rot)[:, 1]
+            heading_h = heading - np.dot(heading, up) * up
+            rest = np.asarray(fk_rot)[:, 1]
+            rest_h = rest - np.dot(rest, up) * up
+            n_h, n_r = float(np.linalg.norm(heading_h)), float(np.linalg.norm(rest_h))
+            if n_h < _SWAP_GUARD_MIN_HORIZONTAL or n_r < 1e-6:
+                return None
+            if float(np.dot(heading_h, rest_h)) / (n_h * n_r) > _SWAP_GUARD_COS:
+                return None
+            flipped.append(side)
+        if len(flipped) < 2:
+            return None
+        return (
+            "both grippers face away from the robot's rest heading. The tracker "
+            "bound as LEFT is most likely on the rig in your RIGHT hand (or the "
+            "rigs' gripper channels are swapped): re-run `axol tracker.identify` "
+            "with each tracker on the rig it is mounted to, or swap the rigs, "
+            "then release both grips and engage again."
+        )
 
     def _apply_tcp_transform(
         self, side: str, pos: np.ndarray, quat: np.ndarray
@@ -1015,15 +1175,24 @@ class IKWorker:
     def _encode_tcp_msg(
         left: tuple[np.ndarray, np.ndarray],
         right: tuple[np.ndarray, np.ndarray],
-    ) -> dict[str, list[float]]:
-        """Pack two base-frame ``(pos, rot)`` poses as JSON-safe pos+quat lists."""
+        *,
+        out_of_reach: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Pack two base-frame ``(pos, rot)`` poses as JSON-safe pos+quat lists.
+
+        ``out_of_reach`` lists the sides whose target exceeded the reach
+        soft-clamp (see :meth:`_out_of_reach`); it is omitted when empty.
+        """
 
         def _enc(pose: tuple[np.ndarray, np.ndarray]) -> list[float]:
             pos, rot = pose
             quat = _matrix_to_quat_xyzw(np.asarray(rot, dtype=np.float64))
             return [float(pos[0]), float(pos[1]), float(pos[2]), *quat]
 
-        return {"left": _enc(left), "right": _enc(right)}
+        msg: dict[str, Any] = {"left": _enc(left), "right": _enc(right)}
+        if out_of_reach:
+            msg["out_of_reach"] = list(out_of_reach)
+        return msg
 
     def _absolute_target(
         self, side: str, pos: np.ndarray, rot: np.ndarray
@@ -1322,6 +1491,8 @@ def run_ik_worker(
 
     - ``VRFrame``                      → ``q`` (one solve step)
     - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
+      an explicit joint target for the second (zero) leg of a guarded park.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -1407,10 +1578,23 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                q_target = (
+                    np.asarray(msg[2], dtype=np.float32) if len(msg) == 3 else q_rest
+                )
+                if (
+                    len(msg) not in (2, 3)
+                    or q_current.shape != q_rest.shape
+                    or q_target.shape != q_rest.shape
+                    or not np.isfinite(q_current).all()
+                    or not np.isfinite(q_target).all()
+                ):
+                    raise ValueError(
+                        "reset requires finite current/target joint vectors"
+                    )
+                traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
-                q = traj[-1].copy() if traj else q_rest.copy()
-                conn.send(("reset_traj", q_rest.copy(), traj))
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, tuple) and msg[0] == "sync":
                 pos_l = np.asarray(msg[1], dtype=np.float32)
                 pos_r = np.asarray(msg[2], dtype=np.float32)

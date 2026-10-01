@@ -29,7 +29,6 @@ import argparse
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -39,9 +38,7 @@ from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
-
-if TYPE_CHECKING:
-    from ...rt import RtAxol
+from ...utils.logquiet import quiet_noisy_loggers
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -152,7 +149,7 @@ def _make_motion_command(
 
 
 def _snapshot_q(
-    axol: RtAxol, solver: KinematicsSolver, q_default: np.ndarray
+    axol: Axol, solver: KinematicsSolver, q_default: np.ndarray
 ) -> np.ndarray:
     """Read the *cached* arm positions into a full-N solver vector.
 
@@ -171,7 +168,7 @@ def _snapshot_q(
 
 
 async def _execute(
-    axol: RtAxol,
+    axol: Axol,
     solver: KinematicsSolver,
     trajectory: list[np.ndarray],
     rate_hz: float,
@@ -274,6 +271,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def run(args: argparse.Namespace) -> None:
     """Run the left-arm repeatability test (rest ↔ target cycles)."""
     logging.basicConfig(level=getattr(logging, args.log_level))
+    quiet_noisy_loggers()
     try:
         asyncio.run(_run(args))
     except KeyboardInterrupt:
@@ -334,9 +332,7 @@ async def _run(args: argparse.Namespace) -> None:
         f"rate={args.rate:.0f} Hz. Press Ctrl-C to stop."
     )
 
-    from ...rt import RtAxol as _RtAxol
-
-    async with _RtAxol(Axol(config=axol_config, **axol_kwargs)) as axol:
+    async with Axol(config=axol_config, **axol_kwargs) as axol:
         # Always begin from the planned rest pose. If the operator parked the
         # arm anywhere else, sneak there with a one-off collision-aware plan
         # so the first cycle doesn't snap.

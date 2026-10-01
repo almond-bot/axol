@@ -25,5 +25,5 @@ On any machine that isn't a factory-flashed ZED Box — no `stereolabs-zed*` pac
 </Note>
 
 <Warning>
-  The new driver is a kernel module and only loads at boot, so a **reboot is required** after the upgrade. The command never reboots the box itself — it prints a notice instead — because it runs mid-install over SSH and from the running `axol serve` process.
+  The new driver is a kernel module and only loads at boot, so a **reboot is required** after the upgrade. Run standalone, the command only prints a notice. [`axol provision`](/cli/provision#reboots), the installer, and the `axol serve` self-updater reboot for it at their own safe point (the self-updater only while no operation is running).
 </Warning>

@@ -1,16 +1,30 @@
 ---
 title: "migrate-dataset"
-description: "Migrate Cartesian datasets recorded before the v0.1.32 URDF frame change."
+description: "Repair Cartesian datasets in place: the v0.1.32 URDF frame change and the Mantis tracker→gripper rotation fix."
 ---
 
-`axol migrate-dataset` updates Cartesian LeRobot datasets recorded with axol
-v0.1.31 or earlier so they replay correctly with v0.1.32 and later.
+`axol migrate-dataset` rewrites the Cartesian end-effector poses of a local
+LeRobot dataset in place. It has two migrations, selected by exactly one flag:
 
-In v0.1.32, the URDF root gained a +90° yaw so its world frame is FLU (+x
+| Flag | Applies to |
+|---|---|
+| `--from-version <version>` | Cartesian datasets recorded by axol v0.1.31 or earlier (URDF root yaw). |
+| `--mantis-tcp-rotation` | Mantis datasets recorded by axol 0.2.4 or earlier (Vive tracker→gripper rotation). |
+
+Both migrations update every data parquet, recompute per-episode and global
+statistics, and record what they did in `meta/axol.json` so they cannot run
+twice. Before making changes each backs up every file it will replace under
+`meta/migrations/<migration-id>/`; if the migration fails those files are
+restored automatically, and a later run recovers an interrupted migration
+before retrying. Videos, gripper values, timestamps, and joint-space data are
+never altered.
+
+## URDF frame
+
+`--from-version`. In v0.1.32, the URDF root gained a +90° yaw so its world frame is FLU (+x
 forward, +y left, +z up). Older Cartesian datasets store poses in the previous
 frame. The migration applies that root transform to the position and
-orientation of both end effectors in `action` and `observation.state`. It does
-not alter videos, gripper values, timestamps, or joint-space datasets.
+orientation of both end effectors in `action` and `observation.state`.
 
 ```bash
 # Inspect the dataset and report the scope without changing it
@@ -26,22 +40,71 @@ axol migrate-dataset --repo_id /data/checkers-demo-bimanual \
   --from-version v0.1.29
 ```
 
-The command updates every data parquet, recomputes per-episode and global
-statistics, and writes `meta/axol.json` to prevent accidental double migration.
-Before making changes it backs up every file it will replace under
-`meta/migrations/axol-urdf-root-yaw-v0.1.32/`. If migration fails, those files
-are restored automatically; a later run also recovers an interrupted migration
-before retrying.
-
 Only run this on Cartesian data recorded with axol v0.1.31 or earlier. A
 joint-space dataset does not need migration and is rejected. Legacy datasets do
 not record their axol version, so recording provenance is the reliable way to
-decide whether an unmarked dataset needs it. Fresh Cartesian datasets now write
-their pose-frame provenance to `meta/axol.json` automatically.
+decide whether an unmarked dataset needs it. Fresh Cartesian datasets write
+their pose-frame provenance to `meta/axol.json` automatically, and a dataset
+that already carries it is refused.
 
 `--from-version` is required because datasets made before pose-frame metadata
 was added cannot distinguish pre-v0.1.32 data that needs migration from later
 data that is already correct. The command rejects v0.1.32 and newer values.
+
+## Mantis tracker-gripper rotation
+
+`--mantis-tcp-rotation`. Mantis collection maps every tracker pose to the gripper through the rig's
+tracker→gripper transform before recording it. axol ≤ 0.2.4 shipped that
+transform's rotation as `Rx(+90°)`, which was ~90° off the flat-back Vive
+mount: an operator holding the rig exactly like the robot's rest gripper
+recorded orientations pitched 90° away, and Axol could not replay the dataset
+(the arms barely moved while the IK chased unreachable targets). The constant
+is now `Ry(180°)`; this migration replaces the retired rotation in every
+recorded pose. Positions are unchanged by the rotation fix.
+
+```bash
+axol migrate-dataset --repo_id CooperLiConduit/isolate-5 --mantis-tcp-rotation --dry-run
+axol migrate-dataset --repo_id CooperLiConduit/isolate-5 --mantis-tcp-rotation
+```
+
+Add `--swap-sides` when the session's trackers were bound to the opposite rigs
+— the tracker `tracker.identify` labelled *left* was mounted on the rig held in
+the right hand. The engage fit then faced the robot base backwards, so the
+dataset's `left_ee.*` columns hold the right hand's rig and every pose is yawed
+180°. `--swap-sides` exchanges the two pose column groups and yaws every pose
+180° about the rest-pose gripper midpoint (the pivot the engage fit uses;
+computed from the default rest pose with the URDF forward kinematics). Gripper
+columns are left as recorded: they follow the CAN channel, not the tracker.
+
+```bash
+axol migrate-dataset --repo_id CooperLiConduit/isolate-5 --mantis-tcp-rotation --swap-sides
+```
+
+Tell-tale signs of a swapped session: the hand the operator moved in the video
+is the *other* side in the dataset, and both recorded engage orientations are
+~180° in yaw from the rest pose after the rotation fix alone. From axol 0.2.5
+the engage refuses this configuration outright, so only older datasets need it.
+
+Eligibility is checked before anything is written:
+
+- `robot_type` must be `axol_mantis`; robot-recorded datasets never went
+  through the tracker transform.
+- `meta/axol.json` must exist and be in the v0.1.32+ pose frame (run
+  `--from-version` first otherwise).
+- `meta/axol.json` must **not** already carry a `mantis_tcp_transform` record.
+  Datasets recorded from 0.2.5 on record the transforms they used; one recorded
+  with the corrected constant, or already migrated, is refused. One recorded
+  with per-unit measured transforms (`"id": "measured"`) is refused too — this
+  migration only knows how to undo the factory Vive constant.
+
+Do not run it on a pre-0.2.5 dataset recorded with a per-unit override in
+`~/.almond/mantis/tcp_transform.json` or with a Quest source: those never used
+the retired factory rotation. A dataset mixing Mantis and robot episodes is
+also out of scope (every row is transformed).
+
+After migration the marker records `mantis_tcp_transform.id` as the current
+factory constant, so `collect-data --mantis` can append new episodes to the
+dataset; it refuses to append to an unrepaired one.
 
 ## Options
 
@@ -49,5 +112,7 @@ data that is already correct. The command rejects v0.1.32 and newer values.
 |---|---|
 | `--repo_id <id-or-path>` | Local repo id under `$HF_LEROBOT_HOME`, or a dataset directory path (required) |
 | `--root <path>` | Alternate root containing the repo id |
-| `--from-version <version>` | Axol version that recorded the dataset; must be older than v0.1.32 (required) |
+| `--from-version <version>` | URDF-frame migration: axol version that recorded the dataset; must be older than v0.1.32 |
+| `--mantis-tcp-rotation` | Mantis migration: replace the retired Rx(+90°) Vive tracker→gripper rotation with Ry(180°) |
+| `--swap-sides` | With `--mantis-tcp-rotation`: the left/right trackers were bound to the opposite rigs |
 | `--dry-run` | Validate and report the files/rows that would change without writing |

@@ -10,6 +10,7 @@ import {
   type SchemaNode,
 } from "@/lib/supervisor"
 import { Input } from "@/components/ui/input"
+import { SuggestInput, type FieldSuggestion } from "@/components/suggest-input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { cn, sentenceCase } from "@/lib/utils"
@@ -19,118 +20,6 @@ interface CommonProps {
   disabled: boolean
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
-}
-
-/** One suggestion offered inside a text field (typing stays free-form). */
-export interface FieldSuggestion {
-  value: string
-  /** Secondary text shown next to the value (e.g. "12 episodes"). */
-  label?: string
-}
-
-/**
- * A text input with an attached suggestion dropdown — one visual control, not
- * an input plus a separate picker. Focusing (or typing) opens a styled list
- * of suggestions filtered by the current text; clicking or Enter fills the
- * field, while any free-form text remains valid. Used for dataset repo ids on
- * every operation panel.
- */
-function SuggestInput({
-  id,
-  value,
-  placeholder,
-  disabled,
-  suggestions,
-  onChange,
-}: {
-  id: string
-  value: string
-  placeholder?: string
-  disabled: boolean
-  suggestions: FieldSuggestion[]
-  onChange: (value: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [highlight, setHighlight] = useState(-1)
-
-  // Filter by the typed text; an exact match (a suggestion was just picked,
-  // or the field reopened on a stored value) shows the full list again so
-  // the operator can switch datasets without clearing the field first.
-  const text = value.trim().toLowerCase()
-  const exact = suggestions.some((s) => s.value.toLowerCase() === text)
-  const shown =
-    text === "" || exact
-      ? suggestions
-      : suggestions.filter((s) => s.value.toLowerCase().includes(text))
-
-  function pick(v: string) {
-    onChange(v)
-    setOpen(false)
-    setHighlight(-1)
-  }
-
-  return (
-    <div className="relative">
-      <Input
-        id={id}
-        value={value}
-        placeholder={placeholder}
-        disabled={disabled}
-        autoComplete="off"
-        onChange={(e) => {
-          onChange(e.target.value)
-          setOpen(true)
-          setHighlight(-1)
-        }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => {
-          setOpen(false)
-          setHighlight(-1)
-        }}
-        onKeyDown={(e) => {
-          if (!open || shown.length === 0) return
-          if (e.key === "ArrowDown") {
-            e.preventDefault()
-            setHighlight((h) => (h + 1) % shown.length)
-          } else if (e.key === "ArrowUp") {
-            e.preventDefault()
-            setHighlight((h) => (h <= 0 ? shown.length - 1 : h - 1))
-          } else if (e.key === "Enter" && highlight >= 0) {
-            e.preventDefault()
-            pick(shown[highlight].value)
-          } else if (e.key === "Escape") {
-            setOpen(false)
-            setHighlight(-1)
-          }
-        }}
-      />
-      {open && shown.length > 0 && (
-        <ul className="absolute top-full right-0 left-0 z-20 mt-1 max-h-52 overflow-auto rounded-md border border-white/10 bg-[#1c1c1c] py-1 shadow-xl">
-          {shown.map((s, i) => (
-            <li key={s.value}>
-              <button
-                type="button"
-                // mousedown fires before the input's blur, which would
-                // otherwise close the list under the click.
-                onMouseDown={(e) => {
-                  e.preventDefault()
-                  pick(s.value)
-                }}
-                onMouseEnter={() => setHighlight(i)}
-                className={cn(
-                  "flex w-full items-baseline justify-between gap-3 px-3 py-1.5 text-left text-sm",
-                  i === highlight ? "bg-white/10 text-foreground" : "text-white/80"
-                )}
-              >
-                <span className="truncate">{s.value}</span>
-                {s.label && <span className="shrink-0 text-xs text-white/40">{s.label}</span>}
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
-  )
 }
 
 // -- vector fields (numeric arrays rendered one input per component) ---------
@@ -182,11 +71,14 @@ function setVectorComponent(
 export function CuratedForm({
   fields,
   suggestions,
+  strictKeys,
   ...common
 }: CommonProps & {
   fields: SchemaField[]
   /** Optional suggestions per field key (e.g. datasets on disk under repo_id). */
   suggestions?: Record<string, FieldSuggestion[]>
+  /** Field keys whose value must be one of its suggestions (a select, not a text input). */
+  strictKeys?: string[]
 }) {
   if (fields.length === 0) {
     return <p className="text-sm text-white/40">No settings — just press Start.</p>
@@ -194,9 +86,72 @@ export function CuratedForm({
   return (
     <div className="flex flex-col gap-4">
       {fields.map((f) => (
-        <FieldRow key={f.key} field={f} suggestions={suggestions?.[f.key]} {...common} />
+        <FieldRow
+          key={f.key}
+          field={f}
+          suggestions={suggestions?.[f.key]}
+          strict={strictKeys?.includes(f.key) ?? false}
+          {...common}
+        />
       ))}
     </div>
+  )
+}
+
+/**
+ * A select over a host pick list for a field that takes only a listed value
+ * (CommandDef ``strict_fields``): the panel never lets free text into a
+ * catalog-backed field like a task id. Until the list has loaded the control
+ * is disabled with a placeholder; a stored value the list no longer carries
+ * is shown, marked, so the operator sees what to change (the host refuses it
+ * at Start either way).
+ */
+function StrictSelect({
+  id,
+  value,
+  required,
+  disabled,
+  suggestions,
+  onChange,
+}: {
+  id: string
+  value: string
+  required: boolean
+  disabled: boolean
+  suggestions: FieldSuggestion[] | undefined
+  onChange: (value: string) => void
+}) {
+  const loaded = suggestions !== undefined
+  const listed = loaded && suggestions.some((s) => s.value === value)
+  const stale = loaded && value !== "" && !listed
+  return (
+    <select
+      id={id}
+      value={value}
+      disabled={disabled || !loaded || suggestions.length === 0}
+      onChange={(e) => onChange(e.target.value)}
+      className="h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
+    >
+      {!loaded ? (
+        <option value={value}>Loading options…</option>
+      ) : suggestions.length === 0 ? (
+        <option value={value}>No options available</option>
+      ) : (
+        <>
+          {(required || value === "") && <option value="">Select…</option>}
+          {stale && (
+            <option value={value} className="bg-[#1a1a1a]">
+              {value} (not in the list)
+            </option>
+          )}
+          {suggestions.map((s) => (
+            <option key={s.value} value={s.value} className="bg-[#1a1a1a]">
+              {s.label ? `${s.value} — ${s.label}` : s.value}
+            </option>
+          ))}
+        </>
+      )}
+    </select>
   )
 }
 
@@ -424,6 +379,7 @@ export function FieldRow({
   field,
   showPath,
   suggestions,
+  strict = false,
   overrides,
   disabled,
   onChange,
@@ -433,6 +389,8 @@ export function FieldRow({
   showPath?: boolean
   /** Suggestions offered inside a text input (typing stays free-form). */
   suggestions?: FieldSuggestion[]
+  /** The value must be one of `suggestions`: render a select, not a text input. */
+  strict?: boolean
 }) {
   const has = field.key in overrides
   const value = has ? overrides[field.key] : undefined
@@ -528,6 +486,15 @@ export function FieldRow({
             </option>
           ))}
         </select>
+      ) : strict ? (
+        <StrictSelect
+          id={fieldId}
+          value={text}
+          required={Boolean(field.required)}
+          disabled={disabled}
+          suggestions={suggestions}
+          onChange={(v) => onChange(field.key, v)}
+        />
       ) : suggestions && suggestions.length > 0 ? (
         <SuggestInput
           id={fieldId}

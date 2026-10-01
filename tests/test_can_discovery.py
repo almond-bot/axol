@@ -96,6 +96,26 @@ class AttachedHubStateTest(unittest.TestCase):
                 self.assertEqual(state.candidate_count, 0)
                 self.assertEqual(state.validation_identity, ())
 
+    def test_unpinned_single_channel_adapter_starts_discovery(self) -> None:
+        # A fresh Jelly wheel-bus or chest-bus adapter enumerates as an
+        # anonymous canX; hosted discovery must probe and pin it just like a
+        # fresh hub, so it is a candidate with a validation epoch.
+        state = self._snapshot(
+            devices=(("1-1", "SINGLE"),),
+            adapters={"SINGLE": _adapter("SINGLE", "1-1", ("can0",), (0,))},
+        )
+        self.assertEqual(state.candidate_identities, (("1-1", "SINGLE"),))
+        self.assertTrue(state.validation_identity)
+
+        # Pinned to both buses at once is a conflict that also needs a pass.
+        conflict = self._snapshot(
+            devices=(("1-1", "SINGLE"),),
+            adapters={"SINGLE": _adapter("SINGLE", "1-1", (setup.CAN_BASE,), (0,))},
+            wheels="SINGLE",
+            chest="SINGLE",
+        )
+        self.assertEqual(conflict.candidate_count, 1)
+
     def test_axol_plus_wheel_has_one_trusted_profile_and_no_candidate(self) -> None:
         state = self._snapshot(
             devices=(("1-1", "AXOL"), ("1-2", "WHEEL")),
@@ -201,8 +221,12 @@ class HeadlessHubResolverTest(unittest.TestCase):
         second_topology: object | None = None,
         legacy_mantis: bool = False,
         raw_names: frozenset[str] = frozenset(),
+        single_adapters: dict[str, setup.SingleBusIdentity | None] | None = None,
     ) -> tuple[setup.HeadlessHubSetupResult, dict[str, Mock]]:
-        serials = tuple(observations)
+        # Dual-channel hubs first, then single-channel (wheel/chest-class)
+        # adapters; every serial is one attached supported USB device.
+        single_observations = single_adapters or {}
+        serials = tuple(observations) + tuple(single_observations)
         devices = tuple(
             (f"1-{index + 1}", serial) for index, serial in enumerate(serials)
         )
@@ -214,14 +238,25 @@ class HeadlessHubResolverTest(unittest.TestCase):
                 return setup.CAN_MANTIS_LEFT, setup.CAN_MANTIS_RIGHT
             return f"can{index * 2}", f"can{index * 2 + 1}"
 
+        def single_name(serial: str, index: int) -> str:
+            if serial not in raw_names and serial == wheels:
+                return setup.CAN_BASE
+            if serial not in raw_names and serial == chest:
+                return setup.CAN_CHEST
+            return f"can{index * 2}"
+
         records = tuple(
             (
                 serial,
                 setup._VID,
                 setup._PID,
                 (
-                    (interface_names(serial, index)[0], 0, identity),
-                    (interface_names(serial, index)[1], 1, identity),
+                    ((single_name(serial, index), 0, identity),)
+                    if serial in single_observations
+                    else (
+                        (interface_names(serial, index)[0], 0, identity),
+                        (interface_names(serial, index)[1], 1, identity),
+                    )
                 ),
             )
             for index, (identity, serial) in enumerate(devices)
@@ -264,6 +299,9 @@ class HeadlessHubResolverTest(unittest.TestCase):
             "reload": Mock(),
             "rename": Mock(),
             "remove_legacy": Mock(),
+            "identify_single": Mock(
+                side_effect=lambda serial, **_kwargs: single_observations[serial]
+            ),
         }
         topology_sequence = [topology, second_topology or topology]
         with (
@@ -297,6 +335,7 @@ class HeadlessHubResolverTest(unittest.TestCase):
                 "_identify_dual_adapter",
                 side_effect=lambda serial, **_kwargs: observations[serial],
             ),
+            patch.object(setup, "_identify_adapter", operations["identify_single"]),
             patch.object(setup, "_apply_setup", operations["apply"]),
             patch.object(setup, "_configure_mantis", operations["mantis"]),
             patch.object(setup, "_write_udev_rules", operations["rules"]),
@@ -443,6 +482,188 @@ class HeadlessHubResolverTest(unittest.TestCase):
         changed = ((("9-9", "A"),), ())
         with self.assertRaisesRegex(RuntimeError, "topology changed"):
             self._run({"A": "axol"}, second_topology=changed)
+
+    # -- Jelly base (wheel bus) and lift (chest bus) single-channel adapters --
+
+    def test_fresh_base_and_lift_adapters_are_pinned_with_the_axol_hub(self) -> None:
+        result, calls = self._run(
+            {"A": "axol"},
+            single_adapters={"W": "wheels", "C": "chest"},
+        )
+        self.assertEqual(result.status, "configured")
+        self.assertEqual(result.configured_count, 3)
+        calls["apply"].assert_called_once_with("A", "W", "C")
+        # Unknown adapters get exactly one non-disruptive probe pass.
+        for serial in ("W", "C"):
+            calls["identify_single"].assert_any_call(serial, recover_silence=False)
+
+    def test_base_only_host_is_pinned_without_any_hub(self) -> None:
+        result, calls = self._run({}, single_adapters={"W": "wheels"})
+        self.assertEqual(result.status, "configured")
+        self.assertEqual(result.configured_count, 1)
+        calls["apply"].assert_called_once_with(None, "W", None)
+        calls["mantis"].assert_not_called()
+
+    def test_shared_wheel_lift_bus_takes_wheel_role_and_drops_stale_chest_pin(
+        self,
+    ) -> None:
+        # The lift answered on the wheel bus; the old chest adapter (attached
+        # but silent) no longer carries it and must not revive can_alm_axol_c.
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            chest="OLDC",
+            single_adapters={"W": "shared", "OLDC": None},
+            candidates_after=("OLDC",),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "partial")
+        calls["apply"].assert_called_once_with("A", "W", None)
+
+        # An unplugged chest pin is dropped the same way.
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            chest="GONE",
+            single_adapters={"W": "shared"},
+        )
+        calls["apply"].assert_called_once_with("A", "W", None)
+
+    def test_silent_fresh_single_adapter_is_never_guessed(self) -> None:
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            single_adapters={"S": None},
+            candidates_before=("S",),
+            candidates_after=("S",),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "partial")
+        self.assertIn("Jelly base/lift", result.message or "")
+        calls["apply"].assert_not_called()
+
+        alone, calls = self._run(
+            {}, single_adapters={"S": None}, candidates_after=("S",)
+        )
+        self.assertEqual(alone.status, "unidentified")
+        self.assertIn("Jelly base/lift", alone.message or "")
+        calls["apply"].assert_not_called()
+
+    def test_attached_silent_pinned_base_keeps_its_role_without_rewrite(self) -> None:
+        # An unpowered Jelly on a bench: the pin stays, nothing is rewritten,
+        # and the arms' automatic connection is not held up.
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            single_adapters={"W": None},
+            candidates_before=(),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "ready")
+        calls["apply"].assert_not_called()
+        # A pinned adapter is re-probed with bounded silence recovery.
+        calls["identify_single"].assert_called_once_with("W")
+
+    def test_silent_pinned_base_is_not_replaced_by_a_second_wheel_responder(
+        self,
+    ) -> None:
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            single_adapters={"W": None, "W2": "wheels"},
+            candidates_before=("W2",),
+            candidates_after=("W2",),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "partial")
+        calls["apply"].assert_not_called()
+
+    def test_unassigned_shared_responder_does_not_drop_a_live_chest_pin(
+        self,
+    ) -> None:
+        # The pinned wheel adapter W is attached but silent, so it keeps its
+        # role and the fresh shared responder S is left unassigned. S proving
+        # "wheels + lift on one bus" says nothing about the *assigned* wheel
+        # bus, so the silent chest pin C must survive — no rewrite at all.
+        result, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            chest="C",
+            single_adapters={"W": None, "C": None, "S": "shared"},
+            candidates_before=("S",),
+            candidates_after=("S",),
+            profiles_after={"axol"},
+        )
+        self.assertEqual(result.status, "partial")
+        calls["apply"].assert_not_called()
+
+    def test_shared_response_on_the_assigned_wheel_bus_drops_a_silent_chest_pin(
+        self,
+    ) -> None:
+        # The pinned wheel adapter itself answers shared: the lift has moved
+        # onto the wheel bus, so a chest pin no board backs is dropped.
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            chest="C",
+            single_adapters={"W": "shared", "C": None},
+        )
+        calls["apply"].assert_called_once_with("A", "W", None)
+
+    def test_positive_response_corrects_swapped_base_and_lift_pins(self) -> None:
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="X",
+            chest="Y",
+            single_adapters={"X": "chest", "Y": "wheels"},
+        )
+        calls["apply"].assert_called_once_with("A", "Y", "X")
+
+    def test_raw_named_pinned_base_is_repaired_in_place(self) -> None:
+        # Rules pin W as the wheel bus but its live netdev is still canN.
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="W",
+            single_adapters={"W": "wheels"},
+            raw_names=frozenset({"W"}),
+        )
+        calls["apply"].assert_called_once_with("A", "W", None)
+
+    def test_unplugged_pinned_base_is_preserved_when_lift_is_pinned(self) -> None:
+        _, calls = self._run(
+            {"A": "axol"},
+            strict_axol="A",
+            wheels="GONE",
+            single_adapters={"C": "chest"},
+        )
+        calls["apply"].assert_called_once_with("A", "GONE", "C")
+
+    def test_single_adapter_pinned_to_both_buses_and_silent_is_rejected(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "both the wheel and chest"):
+            self._run(
+                {"A": "axol"},
+                strict_axol="A",
+                wheels="S",
+                chest="S",
+                single_adapters={"S": None},
+            )
+
+    def test_hub_reclaiming_a_stale_single_pin_frees_the_role(self) -> None:
+        # Serial M was pinned as the chest bus but is a live Mantis hub: the
+        # aux pin is cleared and a fresh chest adapter can take the role.
+        _, calls = self._run(
+            {"M": "mantis"},
+            chest="M",
+            single_adapters={"C": "chest"},
+        )
+        calls["apply"].assert_called_once_with(None, None, "C")
+        calls["mantis"].assert_called_once_with("M")
 
     def test_fresh_silent_ensure_setup_never_defaults_to_axol(self) -> None:
         apply = Mock()

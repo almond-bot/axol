@@ -150,9 +150,9 @@ Each grabbed frame carries two timestamps on the local `perf_counter` clock: `ca
 |---|---|
 | `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
 | `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
-| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Collection and policy inference retain the returned exposure PTS and select robot state on that same timeline. |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Collection retains the returned exposure PTS and selects robot state on that same timeline. |
 
-Policy observations do not sample joints before waiting for images. The Rust realtime core retains a bounded 240 Hz feedback history; after all fresh camera frames arrive, `AxolRobot.get_observation()` uses their median sensor-exposure time to select the nearest state (in joint space, before optional FK). Stale camera fallback, unbracketed state, and excessive camera/state skew raise instead of silently producing a train/inference timing mismatch.
+Policy observations do not sample joints before choosing images. `AxolRobot.get_observation()` never waits for an exposure after "now" (each camera pipeline adds its own latency, and waiting it out per camera is what ran the policy loop at a few Hz): it anchors on the newest exposure every camera has *already* delivered and takes each camera's retained frame nearest that anchor — the relay's shared-memory readers keep a short ring of exposures for this (`latest_capture_ts()` / `read_nearest(target, tolerance_s)`), an in-process reader contributes its newest frame. The same frame set is never served twice, so a loop faster than the cameras blocks for at most one frame period. The Rust realtime core retains a bounded 240 Hz feedback history; the frames' median sensor-exposure time selects the nearest state (in joint space, before optional FK). A silent camera (newest frame a couple of periods old), an unbracketed state, and excessive camera/state skew raise instead of silently producing a train/inference timing mismatch.
 
 ## `ZedStereoCamera`
 

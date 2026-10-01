@@ -75,7 +75,7 @@ low-pass, the IK-output EMA, and the Python trapezoid with its engage
 velocity ramp and output guard — also stays: those filters condition the
 *target stream* and live with IK. A command sink hands
 per-joint 9-float tuples `(p_des, mode, kp, kd, t_ff, kd_host, damp_w0,
-damp_q, j_eff)` to `almond_axol.rt.RtAxol`, which ships them to this core
+damp_q, j_eff)` to `almond_axol.robot.Axol`, which ships them to this core
 (~120 Hz) instead of sending CAN from Python. `t_ff` is gravity only in
 tracked mode; `mode 0` (gravity comp) is a tracker-bypassing passthrough
 with `v_des = 0`.
@@ -295,6 +295,14 @@ uv run axol teleop                         # the real thing
 Default interfaces are `can_alm_axol_l` and `can_alm_axol_r`; pass others
 as positional args (`scan` / `bench`). The teleop path finds the binary
 via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
+
+The binary and the Python package must come from the same checkout: every
+config opens with a `proto <n>` line (`CONFIG_PROTO` in `serve.rs`,
+`almond_axol.rt.link.CONFIG_PROTO`) and a core that speaks a different
+generation refuses it and exits, which Python reports as a stale-binary
+error. After pulling changes to this crate in a dev checkout, rebuild
+(`cargo build --release` here, or `axol rt.install`) before running
+anything against hardware.
 
 ## Roadmap
 

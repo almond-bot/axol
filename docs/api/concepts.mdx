@@ -9,13 +9,15 @@ The Axol SDK is organized into focused modules:
 
 ```
 almond_axol/
-├── robot/        Axol (hardware) and Sim (visualizer) — start here
+├── robot/        Axol (the robot) and Sim (visualizer) — start here
+├── rt/           Axol's realtime hardware control core (axol-rt, 240 Hz)
 ├── kinematics/   Bimanual IK solver (JAX + pyroki)
 ├── teleop/       VR headset → IK → robot control loop
 ├── vr/           WebSocket server that receives VR frames
 ├── zed/          Local ZED camera enumeration + daemon control
 ├── motor/        Low-level async CAN motor interface
 ├── serve/        Web control-panel server (FastAPI) behind `axol serve`
+├── policy/       Serve your own model to run-policy (no LeRobot needed)
 └── lerobot/      LeRobot Robot / Teleoperator / Camera wrappers (requires lerobot extra)
     ├── robot/    AxolRobot — LeRobot Robot wrapping the async hardware driver
     ├── teleop/   AxolVRTeleop — LeRobot Teleoperator wrapping VRTeleop
@@ -27,7 +29,7 @@ The browser front-ends live outside the Python package, in `web/`: the [VR teleo
 End-to-end data flow for teleoperation:
 
 ```
-VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → motors
+VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol (axol-rt, 240 Hz) → motors
 ```
 
 End-to-end data flow for LeRobot data collection:

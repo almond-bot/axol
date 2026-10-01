@@ -180,14 +180,35 @@ def _base_collision_safe_step(
     negative floor is valid for conservative capsules that overlap at the
     physically safe home pose. Both the proposed step and any clearance
     correction are scaled along their full joint-space direction to stay
-    within the per-call delta budget and the robot's joint limits.
+    within the per-call delta budget and the robot's joint limits, after
+    dropping any component that pushes a joint already on its limit outward.
     """
 
     guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
+    limit_tol = jnp.array(1e-5, dtype=q_from.dtype)
 
     def bound_step(q_candidate: jax.Array) -> jax.Array:
-        """Shorten a step without changing its joint-space direction."""
+        """Project outward boundary directions, then shorten the step."""
         delta = q_candidate - q_from
+
+        # A solver proposal can point outside a joint limit when q_from is
+        # on that boundary. Remove only that infeasible component so it
+        # cannot make the global limit scale zero for every other joint.
+        # "On" is within a tolerance: a step scaled to reach a limit lands a
+        # rounding error short of it (float32 ulp is ~2.4e-7 near pi), and an
+        # exact comparison would leave that sliver of room driving the scale.
+        outward = jnp.logical_or(
+            jnp.logical_and(
+                q_from - robot.joints.lower_limits <= limit_tol,
+                delta < 0.0,
+            ),
+            jnp.logical_and(
+                robot.joints.upper_limits - q_from <= limit_tol,
+                delta > 0.0,
+            ),
+        )
+        delta = jnp.where(outward, 0.0, delta)
+
         max_abs = jnp.max(jnp.abs(delta))
         rate_scale = jnp.minimum(
             1.0,
@@ -782,6 +803,18 @@ class KinematicsSolver:
         return self.from_pyroki_order(np.asarray(self._posture_pose, dtype=np.float32))
 
     # -- Properties ----------------------------------------------------------
+
+    @property
+    def shoulder_positions(self) -> dict[str, np.ndarray]:
+        """Base-frame shoulder origins the reach soft-clamp is centred on.
+
+        Fixed by the URDF (the shoulder body does not move with the arm
+        joints); the same centres :meth:`ik` clamps its targets around.
+        """
+        return {
+            "left": np.asarray(self._left_shoulder_pos, dtype=np.float64),
+            "right": np.asarray(self._right_shoulder_pos, dtype=np.float64),
+        }
 
     @property
     def joint_names(self) -> list[str]:

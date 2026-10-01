@@ -39,9 +39,13 @@ async def session(name, actions):
         w.write(struct.pack("<I", len(payload)) + payload)
 
     async def recv():
-        (size,) = struct.unpack("<I", await r.readexactly(4))
-        p = await r.readexactly(size)
-        return p[:1], p[1:].decode()
+        # Skip log/warning lines (e.g. the mlockall warning on a host without
+        # CAP_IPC_LOCK) — the checks are about state messages.
+        while True:
+            (size,) = struct.unpack("<I", await r.readexactly(4))
+            p = await r.readexactly(size)
+            if p[:1] not in (b"L", b"W"):
+                return p[:1], p[1:].decode()
 
     result = await actions(send, recv, w)
     w.close()
@@ -53,11 +57,8 @@ async def session(name, actions):
     return proc.returncode, out.decode(), result
 
 
-cfg = (
-    b"C"
-    + b"loop_hz 240\n"
-    + b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
-)
+joint_line = b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
 
 
 async def clean(send, recv, w):
@@ -65,6 +66,15 @@ async def clean(send, recv, w):
     tag, body = await recv()
     assert (tag, body) == (b"S", "config-ok"), (tag, body)
     return "config-ok received"
+
+
+async def stale_client(send, recv, w):
+    # A config from a package that predates the `proto` line (list-order
+    # slots): the core must refuse it and exit rather than arm a layout it
+    # would misinterpret.
+    send(b"C" + b"loop_hz 240\n" + joint_line)
+    await asyncio.sleep(0.5)
+    return "sent proto-less config"
 
 
 async def skewed(send, recv, w):
@@ -117,4 +127,10 @@ rc, out, msg = asyncio.run(session("skewed", skewed))
 print(f"skewed target:    rc={rc} ({msg})")
 print("core output:", out.strip().splitlines()[-1] if out.strip() else "(none)")
 assert rc != 0, "core must exit nonzero on protocol error"
+
+rc, out, msg = asyncio.run(session("stale", stale_client))
+print(f"stale client:     rc={rc} ({msg})")
+print("core output:", out.strip().splitlines()[-1] if out.strip() else "(none)")
+assert rc != 0, "core must exit nonzero on a proto-less config"
+assert "proto" in out, out
 print("protocol-level checks OK")

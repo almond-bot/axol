@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from almond_axol.constants import CAN_LEFT
+from almond_axol.constants import CAN_LEFT, CAN_RIGHT
 from almond_axol.serve.commands import COMMANDS, build_argv, normalize_boolean_args
 from almond_axol.serve.settings import SettingsStore
 from almond_axol.utils import certs, state_files
@@ -22,7 +23,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": "yes",
                 "sim": "OFF",
-                "jelly_only": "no",
+                "arms": "no",
                 "axol.has_gripper": "on",
             },
         )
@@ -32,7 +33,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
             {
                 "mantis": True,
                 "sim": False,
-                "jelly_only": False,
+                "arms": False,
                 "axol.has_gripper": True,
             },
         )
@@ -43,7 +44,7 @@ class DiagnosticSettingsTest(unittest.TestCase):
                 "true",
                 "--sim",
                 "false",
-                "--jelly_only",
+                "--arms",
                 "false",
                 "--axol.has_gripper",
                 "true",
@@ -69,18 +70,267 @@ class DiagnosticSettingsTest(unittest.TestCase):
     def test_boolean_settings_are_canonical_and_strict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
-            store.update(values={"robot.has_gripper": "yes"})
-            self.assertIs(store.snapshot()["values"]["robot.has_gripper"], True)
+            store.update(values={"axol.has_gripper": "yes"})
+            self.assertIs(store.snapshot()["values"]["axol.has_gripper"], True)
             self.assertTrue(store.has_gripper())
 
-            store.update(values={"robot.has_gripper": "off"})
-            self.assertIs(store.snapshot()["values"]["robot.has_gripper"], False)
+            store.update(values={"axol.has_gripper": "off"})
+            self.assertIs(store.snapshot()["values"]["axol.has_gripper"], False)
             self.assertFalse(store.has_gripper())
 
             with self.assertRaisesRegex(
-                ValueError, "robot.has_gripper must be a boolean"
+                ValueError, "axol.has_gripper must be a boolean"
             ):
-                store.update(values={"robot.has_gripper": 1})
+                store.update(values={"axol.has_gripper": 1})
+
+    def test_file_is_a_nested_tree_of_canonical_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = SettingsStore(path)
+            store.update(
+                values={
+                    "axol.left_stiffness": 0.7,
+                    "axol.left.elbow.kp": 60,
+                    "teleop.rest_pose_left": [0, 0.1, 0, 0, 0, 0, 0],
+                    "robot.right_channel": "null",
+                    "recording.root": "/data",
+                },
+                cameras={"serials": {"overhead": "1"}},
+            )
+
+            document = json.loads(path.read_text())
+            self.assertEqual(
+                document,
+                {
+                    "version": 2,
+                    "axol": {
+                        "left": {"elbow": {"kp": 60}},
+                        "left_stiffness": 0.7,
+                    },
+                    "teleop": {"rest_pose_left": [0, 0.1, 0, 0, 0, 0, 0]},
+                    "robot": {"right_channel": "null"},
+                    "recording": {"root": "/data"},
+                    "cameras": {"serials": {"overhead": "1"}},
+                },
+            )
+            # The file leads with the version and follows the section order
+            # the registry declares, so it reads top-down like a config.
+            self.assertEqual(
+                list(document),
+                ["version", "axol", "teleop", "robot", "recording", "cameras"],
+            )
+            self.assertEqual(store.document(), document)
+
+            reloaded = SettingsStore(path)
+            self.assertEqual(reloaded.snapshot(), store.snapshot())
+            self.assertNotIn("advanced", reloaded.snapshot())
+            # The teleop subtree is the same shape as TeleopCmdConfig, so the
+            # merged args are just the flattened file.
+            merged = reloaded.merged_args("teleop", {})
+            self.assertEqual(merged["axol.left.elbow.kp"], 60)
+            self.assertEqual(merged["axol.left_stiffness"], 0.7)
+            self.assertEqual(merged["right_channel"], "null")
+            self.assertNotIn("root", merged)
+
+    def test_version_one_file_migrates_to_canonical_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "values": {
+                            "robot.left_stiffness": 0.7,
+                            "robot.gripper_torque_limit": 0.4,
+                            "robot.has_gripper": False,
+                            "robot.gravity_kd": 0.9,
+                            "teleop.mantis_source": "quest",
+                            "teleop.frequency": 240,
+                            "recording.observe_torques": True,
+                            "teleop.id": "op",
+                        },
+                        "advanced": {
+                            "axol.left.elbow.kp": 60,
+                            "vr_teleop.frequency": 120,
+                            "vr_teleop.hold_to_engage": True,
+                            "lerobot.id": "robot-one",
+                        },
+                        "cameras": None,
+                    }
+                )
+            )
+            store = SettingsStore(path)
+
+            self.assertEqual(
+                store.snapshot()["values"],
+                {
+                    "axol.left_stiffness": 0.7,
+                    "axol.left.gripper.torque_limit": 0.4,
+                    "axol.right.gripper.torque_limit": 0.4,
+                    "axol.has_gripper": False,
+                    "gravity.kd": 0.9,
+                    "mantis.source": "quest",
+                    # The visible curated value wins over the hidden one.
+                    "teleop.frequency": 240,
+                    "lerobot.observe_torques": True,
+                    "lerobot_teleop.id": "op",
+                    "axol.left.elbow.kp": 60,
+                    "teleop.hold_to_engage": True,
+                    "lerobot.id": "robot-one",
+                },
+            )
+            self.assertFalse(store.has_gripper())
+            collect = store.merged_args("collect-data", {"mantis": True})
+            self.assertEqual(collect["mantis_source"], "quest")
+            self.assertEqual(collect["teleop_hz"], 240)
+            self.assertEqual(collect["teleop_config.vr_teleop_config.frequency"], 240)
+            self.assertEqual(collect["robot_config.observe_torques"], True)
+            self.assertEqual(collect["teleop_config.id"], "op")
+            self.assertEqual(
+                collect["robot_config.axol_config.right.gripper.torque_limit"], 0.4
+            )
+            self.assertEqual(store.merged_args("gravity-comp", {})["kd"], 0.9)
+
+            # The next save rewrites the file in the nested layout.
+            store.update(values={"kinematics.pos_weight": 99})
+            document = json.loads(path.read_text())
+            self.assertEqual(document["version"], 2)
+            self.assertNotIn("values", document)
+            self.assertNotIn("advanced", document)
+            self.assertEqual(
+                document["teleop"], {"frequency": 240, "hold_to_engage": True}
+            )
+            self.assertEqual(document["kinematics"], {"pos_weight": 99})
+
+    def test_retired_jelly_switch_is_dropped_and_hardware_toggles_fold(self) -> None:
+        # Jelly used to be opted into by hand (``jelly.enabled``, earlier
+        # ``robot.jelly_enabled``); it is now inferred from the attached CAN
+        # devices, so a saved switch is dropped on load, whatever its value,
+        # and a cached panel sending it is not an error.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "jelly": {"enabled": True, "max_speed": 4.0},
+                        "robot": {"jelly_enabled": False},
+                    }
+                )
+            )
+            store = SettingsStore(path)
+            self.assertEqual(store.snapshot()["values"], {"jelly.max_speed": 4.0})
+            store.update(values={"jelly.enabled": False, "robot.jelly_enabled": True})
+            self.assertEqual(store.snapshot()["values"], {"jelly.max_speed": 4.0})
+            self.assertNotIn("enabled", json.loads(path.read_text())["jelly"])
+
+            # The Robot tab's three switches: arms is teleop's top-level
+            # ``arms`` (and nothing else's), wheels / lift ride the jelly
+            # subtree into teleop and data collection.
+            store.update(
+                values={"robot.arms": "off", "jelly.wheels": False, "jelly.lift": "no"}
+            )
+            teleop = store.merged_args("teleop", {})
+            self.assertIs(teleop["arms"], False)
+            self.assertIs(teleop["jelly.wheels"], False)
+            self.assertIs(teleop["jelly.lift"], False)
+            collect = store.merged_args("collect-data", {})
+            self.assertNotIn("arms", collect)
+            self.assertNotIn("robot_config.arms", collect)
+            self.assertIs(collect["teleop_config.jelly.wheels"], False)
+            self.assertIs(collect["teleop_config.jelly.lift"], False)
+            self.assertNotIn("arms", store.merged_args("gravity-comp", {}))
+            argv = build_argv("teleop", teleop)
+            pairs = {argv[i]: argv[i + 1] for i in range(0, len(argv), 2)}
+            self.assertEqual(pairs["--arms"], "false")
+            self.assertEqual(pairs["--jelly.wheels"], "false")
+            self.assertEqual(pairs["--jelly.lift"], "false")
+            self.assertEqual(pairs["--jelly.max_speed"], "4.0")
+
+    def test_robot_tab_offers_arms_wheels_and_lift_and_no_jelly_only_run_field(
+        self,
+    ) -> None:
+        from almond_axol.serve.settings import advanced_schema, settings_schema
+
+        schema = settings_schema()
+        robot = next(c for c in schema if c["key"] == "robot")
+        robot_keys = [s["key"] for s in robot["settings"]]
+        self.assertIn("robot.arms", robot_keys)
+        # The Jelly switches have their own category (the panel's Jelly
+        # scope), not the Axol robot tab.
+        self.assertNotIn("jelly.wheels", robot_keys)
+        self.assertNotIn("jelly.lift", robot_keys)
+        jelly_category = next(c for c in schema if c["key"] == "jelly")
+        jelly_keys = [s["key"] for s in jelly_category["settings"]]
+        self.assertEqual(jelly_keys, ["jelly.wheels", "jelly.lift"])
+        self.assertNotIn("jelly.enabled", robot_keys + jelly_keys)
+        for setting in (*robot["settings"], *jelly_category["settings"]):
+            if setting["key"] in ("robot.arms", "jelly.wheels", "jelly.lift"):
+                self.assertEqual(setting["type"], "boolean")
+                self.assertIs(setting["default"], True)
+        # Curated keys have one home: the Advanced → Jelly tree no longer
+        # lists the lift switch (nor the retired enable).
+        jelly = next(s for s in advanced_schema() if s["key"] == "jelly")
+
+        def leaves(nodes):  # noqa: ANN001, ANN202
+            for node in nodes:
+                if node["kind"] == "field":
+                    yield node["key"]
+                else:
+                    yield from leaves(node["children"])
+
+        advanced = set(leaves(jelly["nodes"]))
+        self.assertNotIn("jelly.lift", advanced)
+        self.assertNotIn("jelly.wheels", advanced)
+        self.assertNotIn("jelly.enabled", advanced)
+        self.assertIn("jelly.max_speed", advanced)
+
+        teleop = COMMANDS["teleop"]
+        self.assertEqual(teleop.per_run_fields, ("sim",))
+        self.assertEqual(teleop.arms_flag, "arms")
+        self.assertNotIn("jelly_only", teleop.robot_free_flags)
+
+    def test_update_accepts_pre_v2_names_from_cached_panels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            store.update(
+                values={
+                    "robot.gripper_max_speed": 3,
+                    "teleop.mantis_source": "ultimate",
+                },
+                advanced={"vr_teleop.position_multiplier": 1.5},
+            )
+            values = store.snapshot()["values"]
+            self.assertEqual(values["axol.left.gripper.max_speed"], 3)
+            self.assertEqual(values["axol.right.gripper.max_speed"], 3)
+            self.assertEqual(values["mantis.source"], "ultimate")
+            self.assertEqual(values["teleop.position_multiplier"], 1.5)
+
+            store.update(values={"robot.gripper_max_speed": None})
+            values = store.snapshot()["values"]
+            self.assertNotIn("axol.left.gripper.max_speed", values)
+            self.assertNotIn("axol.right.gripper.max_speed", values)
+
+    def test_update_rejects_unknown_sections_and_curated_only_leaves(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            with self.assertRaisesRegex(KeyError, "nope.x"):
+                store.update(values={"nope.x": 1})
+            # Sections whose leaves carry explicit per-op targets accept only
+            # their curated keys …
+            with self.assertRaisesRegex(KeyError, "recording.bogus"):
+                store.update(values={"recording.bogus": 1})
+            with self.assertRaisesRegex(KeyError, "axol"):
+                store.update(values={"axol": 1})
+            # … while any leaf of a grafted subsystem is fine: the op schemas
+            # decide what it means and build_argv drops what they don't know.
+            store.update(values={"axol.left.wrist.kp": 5, "axol.not_a_field": 1})
+            merged = store.merged_args("run-policy", {})
+            self.assertEqual(merged["robot_config.axol_config.left.wrist.kp"], 5)
+            self.assertNotIn(
+                "--robot_config.axol_config.not_a_field",
+                build_argv("run-policy", merged),
+            )
 
     def test_lift_cycle_does_not_inherit_gripper_setting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -132,6 +382,38 @@ class DiagnosticSettingsTest(unittest.TestCase):
 
             store.update(values={"robot.left_channel": "null"})
             self.assertIsNone(store.can_channels()[0])
+
+    def test_invalid_persisted_axol_channels_do_not_prevent_startup(self) -> None:
+        # A file saved before the pair was validated (or hand-edited since)
+        # can map both arms to one interface; serve must still come up so
+        # the operator can fix it from Settings.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "robot": {"left_channel": "can0", "right_channel": "can0"},
+                        "teleop": {"frequency": 120},
+                    }
+                )
+            )
+
+            with self.assertLogs("almond_axol.serve.settings", level="ERROR") as logs:
+                store = SettingsStore(path)
+            self.assertIn("both 'can0'", "\n".join(logs.output))
+            self.assertEqual(store.can_channels(), (CAN_LEFT, CAN_RIGHT))
+            self.assertNotIn("robot.left_channel", store.snapshot()["values"])
+            self.assertEqual(store.snapshot()["values"]["teleop.frequency"], 120)
+            # Not rewritten behind the operator's back until the next save.
+            self.assertEqual(
+                json.loads(path.read_text())["robot"]["left_channel"], "can0"
+            )
+
+            # The strict CLI/SDK store keeps the saved values and fails on use.
+            strict = SettingsStore(path, strict=True)
+            with self.assertRaisesRegex(ValueError, "distinct interfaces"):
+                strict.can_channels()
 
     def test_effective_axol_channels_match_direct_and_nested_operation_args(
         self,
@@ -257,10 +539,8 @@ class DiagnosticSettingsTest(unittest.TestCase):
             store = SettingsStore(Path(directory) / "settings.json")
             store.update(
                 values={
-                    "teleop.id": "../../saved-teleop",
-                    "teleop.calibration_dir": "/etc/saved-teleop",
-                },
-                advanced={
+                    "lerobot_teleop.id": "../../saved-teleop",
+                    "lerobot_teleop.calibration_dir": "/etc/saved-teleop",
                     "vr_server.certfile": "/etc/saved-cert",
                     "vr_server.keyfile": "/etc/saved-key",
                     "lerobot.id": "../../saved-robot",

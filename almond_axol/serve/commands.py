@@ -33,12 +33,18 @@ its id, so registration is the only integration point.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from typing import Any, Callable
 
 from .introspect import Schema, build_argparse_schema, build_schema
 
 # Display order for the catalog's category groups.
 CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
+
+
+# A ``field_suggestions`` provider: no arguments, returns the suggestion rows
+# (``value`` required, ``label`` optional secondary text).
+SuggestionProvider = Callable[[], Sequence[Mapping[str, Any]]]
 
 
 class CommandDef:
@@ -81,11 +87,14 @@ class CommandDef:
         streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
+        arms_flag: str | None = None,
         supports_mantis: bool = False,
         hardware_profiles: tuple[str, ...] = ("axol", "mantis"),
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
+        field_suggestions: Mapping[str, SuggestionProvider] | None = None,
+        strict_fields: tuple[str, ...] = (),
         settings_like: str | None = None,
         module: str = "almond_axol",
         section: str | None = None,
@@ -137,9 +146,14 @@ class CommandDef:
         # robot.
         self.sim_flag = sim_flag
         # Arg names that mean "doesn't touch the arms" without being sim
-        # (teleop's jelly_only): the run skips the robot link and the
-        # motor-fault gate but still drives real, non-arm hardware.
+        # (teleop's mantis): the run skips the robot link and the motor-fault
+        # gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
+        # Boolean arg (default true) that *off* makes the run arm-free — the
+        # inverse of a robot-free flag. Teleop's ``arms``: the Robot tab's
+        # "Axol arms" switch, folded in from the shared settings, so a robot
+        # without arms (Jelly only) starts without an Axol connection.
+        self.arms_flag = arms_flag
         # Mantis is a runtime hardware mode only for plain teleop and data
         # collection. Policy/DAgger may consume datasets produced by Mantis,
         # but they always drive Axol hardware.
@@ -153,11 +167,40 @@ class CommandDef:
         # Lazy loader for an episode-control class, constructed as
         # ``cls(stop_event)`` and handed to the entrypoint as ``control``. It
         # must expose ``push(command: str)`` for API-pushed decisions and
-        # ``snapshot() -> dict`` for the phase the panel renders.
+        # ``snapshot() -> dict`` for the phase the panel renders (the web
+        # app's ``PolicyState``: phase, message, controls, episode, dataset,
+        # and an optional ``brief`` instruction card).
         self._episode_control = episode_control
         # Config keys the panel surfaces per run; everything else comes from
         # the shared settings, folded in server-side.
         self.per_run_fields = per_run_fields
+        # Per-run fields with a server-side pick list: field key → callable
+        # returning ``[{"value": str, "label": str | None}, ...]``. The panel
+        # fetches it (``/api/commands/{id}/suggestions/{field}``) whenever the
+        # op's form is editable and offers the values inside the text input —
+        # typing stays free-form, so the list is a convenience, never a
+        # constraint (unless the field is also in ``strict_fields``).
+        # Providers may block on I/O (a network listing of a remote model
+        # registry); they run on a worker thread, and a failure is reported
+        # alongside an empty list rather than breaking the form. The built-in
+        # repo-id picker (``/api/datasets``) predates this and stays as it is.
+        self.field_suggestions: dict[str, SuggestionProvider] = dict(
+            field_suggestions or {}
+        )
+        # Suggested fields whose value must be one of the suggestions — a
+        # catalog the value is looked up in, not a convenience: the panel
+        # renders them as a select over the provider's rows (no free typing),
+        # and ``check_strict_fields`` refuses a start whose value is not in
+        # the list, so an older panel's text input cannot get past it either.
+        # Emptiness is the schema's business (a required field with no value
+        # is refused by the config parse), so a blank value passes here.
+        missing_provider = [f for f in strict_fields if f not in self.field_suggestions]
+        if missing_provider:
+            raise ValueError(
+                f"{id}: strict field(s) {', '.join(missing_provider)} need a "
+                "field_suggestions provider"
+            )
+        self.strict_fields = tuple(strict_fields)
         # Borrow another op's settings targets. Settings are declared as dotted
         # config paths per op, so an op embedding the same config dataclasses
         # inherits the whole mapping instead of re-declaring it.
@@ -165,9 +208,11 @@ class CommandDef:
         # ``python -m <module>`` target for the subprocess path, so a command
         # registered by a downstream package runs out of that package's CLI.
         self.module = module
-        # Dashboard grouping within the Diagnostics category:
-        # "helper" (utility moves like the lift), "test" (pass/fail checks
-        # like the ROM soak), or "tuning" (the tuning workbench's suites).
+        # Dashboard grouping within the Diagnostics category — each command
+        # renders in exactly one: "test" (pass/fail checks like the ROM
+        # soak), "helper" (utility moves like the lift or the ROM cleanup),
+        # or "tuning" (the tuning workbench's suites). Meaningless outside
+        # that category; leave it None there.
         self.section = section
         self._loader = loader
 
@@ -325,9 +370,10 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or Jelly-only to drive just Jelly. Mantis "
-        "drives the rig grippers from their triggers (no tracking).",
+        "Drive the Axol — and Jelly's wheels and lift when attached — from a "
+        "VR headset. Enable simulation to preview in the browser without "
+        "hardware. Mantis drives the rig grippers from their triggers (no "
+        "tracking).",
         "Operate",
         "draccus",
         _teleop,
@@ -338,13 +384,16 @@ COMMANDS: dict[str, CommandDef] = {
         streams_video=True,
         sim_flag="sim",
         # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
-        # like jelly_only it never touches the arms or their motor faults. It is
-        # not a per-run field: the panel derives it from the system-wide
-        # device selection (settings ``system.hardware_profile``).
-        robot_free_flags=("jelly_only", "mantis"),
+        # it never touches the arms or their motor faults. It is not a per-run
+        # field: the panel derives it from the system-wide device selection
+        # (settings ``system.hardware_profile``).
+        robot_free_flags=("mantis",),
+        # The Robot tab's "Axol arms" switch (settings ``robot.arms``): off
+        # drives just Jelly with the arms untouched.
+        arms_flag="arms",
         supports_mantis=True,
         uses_headset=True,
-        per_run_fields=("sim", "jelly_only"),
+        per_run_fields=("sim",),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -485,7 +534,8 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
         drives_motors=True,
-        section="test",
+        # Cleanup after the soak, not a check of its own.
+        section="helper",
     ),
     "diag.lift-cycle": CommandDef(
         "diag.lift-cycle",
@@ -499,6 +549,7 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        section="test",
     ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
@@ -532,6 +583,7 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_cameras=True,
         hardware_profiles=("axol",),
+        section="test",
     ),
     "tune.pid": CommandDef(
         "tune.pid",
@@ -608,7 +660,6 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=False,
         uses_can_bus=False,
         drives_motors=False,
-        section="helper",
     ),
     "tune.motion": CommandDef(
         "tune.motion",
@@ -895,6 +946,75 @@ def get_schema(command_id: str) -> Schema:
     return _schema_cache[command_id]
 
 
+class NoSuggestionProvider(KeyError):
+    """The command, or its field, declares no ``field_suggestions`` provider.
+
+    Its own class (not a bare ``KeyError``) so the API can tell "undeclared"
+    (a 404) from a provider that raised ``KeyError`` while doing its lookup
+    (a failure to report beside an empty list).
+    """
+
+
+def field_suggestions(command_id: str, field: str) -> list[dict[str, Any]]:
+    """Run a command's suggestion provider for one per-run field.
+
+    Returns the normalized rows (blank values dropped, labels coerced to
+    ``str | None``). Raises :class:`NoSuggestionProvider` when the command or
+    the field has no provider; whatever the provider itself raises propagates,
+    so the API can report it next to an empty list.
+    """
+    cmd = COMMANDS.get(command_id)
+    if cmd is None:
+        raise NoSuggestionProvider(command_id)
+    provider = cmd.field_suggestions.get(field)
+    if provider is None:
+        raise NoSuggestionProvider(field)
+    rows: list[dict[str, Any]] = []
+    for item in provider():
+        value = str(item.get("value", "") or "").strip()
+        if not value:
+            continue
+        label = item.get("label")
+        rows.append(
+            {"value": value, "label": None if label in (None, "") else str(label)}
+        )
+    return rows
+
+
+def check_strict_fields(command_id: str, args: Mapping[str, Any]) -> None:
+    """Refuse a start whose strict per-run field holds a value off its pick list.
+
+    Runs each strict field's suggestion provider (so it may block on I/O like
+    the suggestions endpoint does — call it on a worker thread) and raises
+    ``ValueError`` naming the field, the value and the allowed values when
+    the submitted value is not one of them. A provider that fails leaves the
+    value unverifiable, which is also a refusal: strict means the list is the
+    source of truth, so a form can't get past it while the list is down.
+    Blank values pass — whether the field may be empty is the schema's call.
+    """
+    cmd = COMMANDS.get(command_id)
+    if cmd is None:
+        return
+    for field in cmd.strict_fields:
+        raw = args.get(field)
+        value = "" if raw is None else str(raw).strip()
+        if not value:
+            continue
+        try:
+            allowed = [row["value"] for row in field_suggestions(command_id, field)]
+        except Exception as exc:  # noqa: BLE001 - provider failure: refuse
+            raise ValueError(
+                f"{field}: cannot verify {value!r} against its pick list "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        if value not in allowed:
+            options = ", ".join(allowed) if allowed else "none available"
+            raise ValueError(
+                f"{field}: {value!r} is not one of the available options "
+                f"({options}); pick one from the {cmd.label} form"
+            )
+
+
 def command_specs() -> list[dict[str, Any]]:
     """Serializable specs (including the full form schema) for every command."""
     specs: list[dict[str, Any]] = []
@@ -915,9 +1035,12 @@ def command_specs() -> list[dict[str, Any]]:
             "requiresCameras": cmd.requires_cameras,
             "usesCameras": cmd.uses_cameras,
             "perRunFields": list(cmd.per_run_fields),
+            "suggestedFields": list(cmd.field_suggestions),
+            "strictFields": list(cmd.strict_fields),
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
+            "armsFlag": cmd.arms_flag,
             "supportsMantis": cmd.supports_mantis,
             "hardwareProfiles": list(cmd.hardware_profiles),
             "usesHeadset": cmd.uses_headset,
@@ -970,6 +1093,52 @@ def flag_enabled(value: Any) -> bool:
     if value is None or (isinstance(value, str) and not value.strip()):
         return False
     return parse_boolean(value)
+
+
+def flag_value(value: Any, default: bool) -> bool:
+    """Like :func:`flag_enabled`, but an omitted value keeps ``default``.
+
+    For switches whose config default is *on* (teleop's ``arms``): absent
+    from the launch args means the default applies, not "off".
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return default
+    return parse_boolean(value)
+
+
+def safety_flags(cmd: "CommandDef") -> tuple[str, ...]:
+    """The launch args that decide whether a run touches the arms.
+
+    The sim flag, the robot-free flags and the arms flag, deduplicated. The
+    serve layer classifies a launch from these before touching hardware and
+    requires the parsed config to agree with the submitted args.
+    """
+    return tuple(
+        dict.fromkeys(
+            flag
+            for flag in (cmd.sim_flag, *cmd.robot_free_flags, cmd.arms_flag)
+            if flag is not None
+        )
+    )
+
+
+def flag_default(cmd: "CommandDef", flag: str) -> bool:
+    """The value a safety flag has when the launch omits it."""
+    return flag == cmd.arms_flag
+
+
+def is_robot_free(cmd: "CommandDef", flags: dict[str, bool]) -> bool:
+    """Whether a run with these (resolved) safety flags leaves the arms alone.
+
+    ``flags`` maps every :func:`safety_flags` name to its resolved boolean.
+    A sim run, a robot-free flag that is on, or an arms flag that is off all
+    mean the run skips the robot link and the motor-fault gate.
+    """
+    if cmd.sim_flag is not None and flags.get(cmd.sim_flag, False):
+        return True
+    if any(flags.get(flag, False) for flag in cmd.robot_free_flags):
+        return True
+    return cmd.arms_flag is not None and not flags.get(cmd.arms_flag, True)
 
 
 def normalize_boolean_args(command_id: str, args: dict[str, Any]) -> dict[str, Any]:

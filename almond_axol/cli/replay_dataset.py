@@ -40,6 +40,7 @@ from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
 from ..mantis.smoothing import rotvec_to_quat_xyzw
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ class ReplayDatasetConfig:
     # arms into a limp gravity-comp hold instead of pulling through. Replay
     # has no interactive retry channel, so the hold lasts until the run is
     # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
     # Contact watchdog while the episode itself plays back: the same
     # sustained-torque-residual trip, checked on every command. On a trip
     # playback stops and the arms drop into the limp gravity-comp hold until
@@ -169,11 +170,12 @@ class ReplayDatasetConfig:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and replay the selected episode."""
-    cfg = parse(ReplayDatasetConfig, argv)
+    cfg = parse(ReplayDatasetConfig, argv, settings_op="replay-dataset")
     # force=True: importing lerobot (at module load) installs a root handler and
     # leaves the root level at WARNING, which would otherwise make this a no-op
     # and silently drop every _logger.info() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    quiet_noisy_loggers()
 
     import sys
 

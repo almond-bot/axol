@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "almond-axol"
-version = "0.1.41"
+version = "0.2.13"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
@@ -38,6 +38,8 @@ dependencies = [
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
     "uvicorn[standard]>=0.42.0,<0.43",
+    # Custom policy protocol (almond_axol.policy): the sync client/server API.
+    "websockets>=13,<16",
     "yourdfpy>=0.0.60,<0.1",
     "opencv-python-headless>=4.13.0.92,<4.14",
 ]
@@ -91,4 +93,33 @@ include = [
     "/README.md",
     "/pyproject.toml",
     "/web/app/public/install",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--cov=almond_axol",
+    "--cov-report=term-missing:skip-covered",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["almond_axol"]
+omit = [
+    "almond_axol/lerobot/*",
+]
+
+[tool.coverage.report]
+fail_under = 30
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
 ]

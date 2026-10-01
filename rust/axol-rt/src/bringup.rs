@@ -57,6 +57,11 @@ pub struct ReadyMotor {
     pub ranges: proto::MitRanges,
     /// Measured position at prep time (motor frame, rad).
     pub hold_pos: f64,
+    /// Already enabled and holding torque when found (a previous session
+    /// died or disconnected while live). Such a motor is *attached to*, not
+    /// brought up: no reset, no brake release, no enable — it keeps holding
+    /// its pose until the core's hold stream takes over at that same pose.
+    pub holding: bool,
     pub kp: f64,
     pub kd: f64,
     pub gripper: bool,
@@ -70,16 +75,66 @@ pub struct ReadyMotor {
     pub fo: f64,
 }
 
+/// Status-probe attempts before a silent motor fails the bring-up.
+const HOLDING_PROBE_ATTEMPTS: usize = 3;
+
+/// Read-only "enabled and holding torque" probe — the Python drivers'
+/// `is_holding`, per vendor.
+///
+/// Silence is an error, never "not holding": a motor that does not answer
+/// cannot be classified, and guessing cold would send a possibly-holding
+/// joint the 0x76 reset (the Python `is_holding` likewise raises on a
+/// timeout instead of answering). A few attempts ride out a single missed
+/// frame; an unpowered arm still fails loudly here, as it did in `prepare`.
+pub fn is_holding(sock: &CanSock, spec: &MotorSpec) -> io::Result<bool> {
+    for _ in 0..HOLDING_PROBE_ATTEMPTS {
+        if spec.motor_id <= 5 {
+            let reply = txn::ma_request(
+                sock,
+                spec.motor_id,
+                proto::ma_cmd(proto::MA_READ_STATUS1),
+                TIMEOUT,
+            )?;
+            if let Some((d, _)) = reply {
+                return Ok(proto::ma_is_holding(&d));
+            }
+        } else {
+            let reply = txn::dm_request_feedback(sock, spec.motor_id as u16, TIMEOUT)?;
+            // Only the status nibble is needed; the ranges do not affect it.
+            if let Some((fb, _)) = reply {
+                return Ok(fb[0] >> 4 == proto::DM_STATUS_ENABLED);
+            }
+        }
+    }
+    Err(io::Error::other(format!(
+        "{} (0x{:02X}): no status reply — cannot tell whether it is holding, \
+         not resetting it",
+        spec.joint, spec.motor_id
+    )))
+}
+
 /// Phase 1 of a cold bring-up: MyActuator 0x76 system reset (all motors at
 /// once, one settle) and Damiao clear-errors. Torque-neutral on a disabled
 /// motor. Runs *before* the Python side resolves joint offsets, so the
 /// multi-turn wrap state Python verifies is the post-reset one.
-pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<()> {
+///
+/// Idempotent per motor, like the Python `Axol.enable()`: a joint found
+/// already enabled and holding (a previous session died or disconnected
+/// while live) is skipped — the 0x76 reset reboots a MyActuator, dropping
+/// torque for ~2 s, so it must never reach a holding joint. A joint whose
+/// state cannot be read fails the prep before any reset is sent to it.
+/// Returns the joint names that were left holding, for the caller's log.
+pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<Vec<String>> {
     let mut any_ma = false;
+    let mut held = Vec::new();
     for spec in specs {
         if spec.gripper {
             // The gripper's bring-up (enable, calibration, mode switch) is
             // Python's, and it may be holding an object — never touched here.
+            continue;
+        }
+        if is_holding(sock, spec)? {
+            held.push(spec.joint.clone());
             continue;
         }
         if spec.motor_id <= 5 {
@@ -96,7 +151,7 @@ pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<()> {
         std::thread::sleep(RESET_SETTLE);
     }
     sock.drain()?;
-    Ok(())
+    Ok(held)
 }
 
 /// Phase 2: capability detection, fault checks, range reads, and position
@@ -124,6 +179,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 spec.joint
             )));
         }
+        let holding = proto::ma_is_holding(&s1);
         let Some((pos_frame, _)) =
             txn::ma_request(sock, id, proto::ma_cmd(proto::MA_MULTI_TURN_ANGLE), TIMEOUT)?
         else {
@@ -144,6 +200,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 t_max,
             },
             hold_pos: proto::ma_decode_position(&pos_frame),
+            holding,
             kp: spec.kp,
             kd: spec.kd,
             gripper: false,
@@ -192,6 +249,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 t_max,
             },
             hold_pos: decoded.position,
+            holding: decoded.status == proto::DM_STATUS_ENABLED,
             kp: spec.kp,
             kd: spec.kd,
             gripper: spec.gripper,
@@ -232,6 +290,10 @@ pub fn read_dm_register(sock: &CanSock, motor_id: u16, rid: u8) -> io::Result<f6
     )))
 }
 
+/// Enable every cold motor. Motors found holding by [`prepare`] are left
+/// exactly as they are (no brake release / enable frame), and are excluded
+/// from the rollback: a failed cold bring-up must never drop a pre-existing
+/// hold, only the motors this call itself touched.
 pub fn enable(sock: &CanSock, iface: &str, motors: &[ReadyMotor]) -> io::Result<()> {
     // A full socket buffer must not strand motors that were enabled earlier in
     // this batch or prevent the rollback below from running to completion.
@@ -240,8 +302,10 @@ pub fn enable(sock: &CanSock, iface: &str, motors: &[ReadyMotor]) -> io::Result<
     // reached the controller, even when its acknowledgement did not return.
     let mut attempted = Vec::new();
     for m in motors {
-        if m.gripper {
-            continue; // enabled by the Python side's calibration flow
+        if m.gripper || m.holding {
+            // Gripper: enabled by the Python side's calibration flow.
+            // Holding: attached to, keeps its pose until the hold stream.
+            continue;
         }
         attempted.push(m.clone());
         let result = match m.vendor {

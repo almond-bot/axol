@@ -73,7 +73,7 @@ The easiest way is from the app itself: when you press **Connect** and the certi
       </Step>
 
       <Step title="Start and check the grippers">
-        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or cart option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
+        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or Jelly option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
       </Step>
     </Steps>
 
@@ -111,6 +111,10 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
+  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 6 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
+</Note>
+
+<Note>
   **Contact stop while driving (opt-in).** The return-to-rest guard above is always on; you can also arm a watchdog for the **tracking** phase itself — while you're actively driving the arms. It's **off by default**, since teleop pushes on the scene on purpose. Set the **Teleop contact stop** in the control panel's **Axol settings → Robot** (`--teleop.teleop_torque_threshold` on the CLI; the panel suggests `16` Nm) and a sustained torque past the threshold **disengages tracking** and drops the arms into the same limp gravity-comp hold — hand-guide them clear, then press **X** to return to rest and carry on. `0` (the default) leaves it off. Hardware only.
 </Note>
 
@@ -119,7 +123,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Enable it with the control panel's **Jelly** toggle or [`axol teleop --jelly.enabled true`](/cli/teleop), or drive just Jelly with the arms left untouched using **Jelly only** / [`axol teleop --jelly_only`](/cli/teleop).
+  On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Nothing to enable: Jelly is inferred from the CAN devices attached, and the Robot tab's **Jelly wheels** / **Jelly lift** switches (or [`--jelly.wheels false` / `--jelly.lift false`](/cli/teleop)) opt attached hardware out. Drive just Jelly with the arms left untouched by switching **Axol arms** off (or [`axol teleop --arms false`](/cli/teleop)).
 </Note>
 
 ## Network tip
@@ -154,11 +158,16 @@ If teleop feels too laggy, adjust in this order — one knob at a time, on the r
 
 <Note>
   The jitter buffer (`interp_max_delay_s`) self-regulates — it only adds delay while packet delivery is actually bursty, so lowering its cap mostly changes how much of a bad Wi-Fi episode gets smoothed versus played as a catch-up. If you're chasing network-induced lag, the [USB connection](/guides/quest-over-usb) and the [router settings above](#network-tip) are worth more than any knob here.
+
+  A stall is handled separately from jitter: a pose frame arriving more than `--vr_server.interp_max_lag_s` (default `0.5` s) later than the stream's normal transit is not played. When the headset's Wi-Fi uplink stalls for a few seconds and then drains its backlog, the arms hold instead of performing your motion seconds after you made it, then move to your current pose once on-time frames resume. The teleop log shows a warning when a stall starts (`VR pose stream arriving … late`) and when it ends (`VR pose stream on time again after …`). `0` disables the gate.
 </Note>
 
 ## Next steps
 
 <CardGroup cols={2}>
+  <Card title="Config Parameters" icon="sliders" href="/operations/teleop-config">
+    Every setting for teleop, with its default.
+  </Card>
   <Card title="Remote Teleop" icon="globe" href="/guides/remote-teleop">
     Drive the robot over the internet from anywhere with Tailscale.
   </Card>

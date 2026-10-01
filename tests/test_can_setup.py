@@ -742,7 +742,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             patch("builtins.input") as prompt,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(setup._find_single_serials(None), ("NEW", None))
+            self.assertEqual(setup._find_single_serials(None), ("NEW", None, False))
         identify.assert_called_once_with("NEW", recover_silence=False)
         prompt.assert_not_called()
 
@@ -758,7 +758,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             patch("builtins.input") as prompt,
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(setup._find_single_serials(None), (None, "SERIAL"))
+            self.assertEqual(setup._find_single_serials(None), (None, "SERIAL", False))
         identify.assert_called_once_with("SERIAL", reset=True)
         prompt.assert_not_called()
 
@@ -786,7 +786,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(
-                setup._find_single_serials(None), ("OLD-CHEST", "OLD-WHEEL")
+                setup._find_single_serials(None), ("OLD-CHEST", "OLD-WHEEL", False)
             )
         self.assertEqual(identify.call_count, 2)
         self.assertTrue(
@@ -808,7 +808,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
             patch("builtins.input") as prompt,
             contextlib.redirect_stdout(io.StringIO()) as output,
         ):
-            self.assertEqual(setup._find_single_serials(None), ("SERIAL", None))
+            self.assertEqual(setup._find_single_serials(None), ("SERIAL", None, False))
         prompt.assert_not_called()
         self.assertIn("unverified", output.getvalue())
 
@@ -824,7 +824,9 @@ class CanSetupAssignmentTest(unittest.TestCase):
             patch.object(setup, "_detect_single_serials", return_value=[]),
             contextlib.redirect_stdout(io.StringIO()),
         ):
-            self.assertEqual(setup._find_single_serials(None), ("WHEELS", "LIFT"))
+            self.assertEqual(
+                setup._find_single_serials(None), ("WHEELS", "LIFT", False)
+            )
 
     def test_single_pin_is_not_preserved_when_serial_is_selected_as_hub(self) -> None:
         def configured(name: str) -> str | None:
@@ -840,7 +842,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
                 return_value={"SERIAL": {"dev_ids": {0, 1}}},
             ),
         ):
-            self.assertEqual(setup._find_single_serials("SERIAL"), (None, None))
+            self.assertEqual(setup._find_single_serials("SERIAL"), (None, None, False))
 
     def test_plain_run_migrates_recovered_mantis_out_of_axol_profile(self) -> None:
         with (
@@ -853,7 +855,11 @@ class CanSetupAssignmentTest(unittest.TestCase):
             ),
             patch.object(setup, "_configured_named_serial", return_value=None),
             patch.object(setup, "_find_dual_serials", return_value=(None, "SERIAL")),
-            patch.object(setup, "_find_single_serials", return_value=(None, None)),
+            patch.object(
+                setup,
+                "_find_single_serials",
+                return_value=setup.SingleBusRoles(None, None),
+            ),
             patch.object(setup, "_write_udev_rules") as write_rules,
             patch.object(setup, "_configure_mantis") as configure_mantis,
             patch.object(setup, "_apply_setup") as apply_setup,
@@ -878,7 +884,11 @@ class CanSetupAssignmentTest(unittest.TestCase):
                 side_effect=lambda name: configured_names[name],
             ),
             patch.object(setup, "_find_dual_serials", return_value=(None, "SERIAL")),
-            patch.object(setup, "_find_single_serials", return_value=(None, None)),
+            patch.object(
+                setup,
+                "_find_single_serials",
+                return_value=setup.SingleBusRoles(None, None),
+            ),
             patch.object(setup, "_write_udev_rules") as write_rules,
             patch.object(setup, "_configure_mantis") as configure_mantis,
             patch.object(setup, "_apply_setup") as apply_setup,
@@ -889,6 +899,37 @@ class CanSetupAssignmentTest(unittest.TestCase):
         write_rules.assert_called_once_with(None, None, None)
         configure_mantis.assert_called_once_with("SERIAL")
         apply_setup.assert_not_called()
+
+    def test_plain_run_pins_a_shared_wheel_lift_bus_as_wheels_only(self) -> None:
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup.driver, "ensure_driver", return_value=False),
+            patch.object(setup, "_configured_serial", return_value=None),
+            patch.object(setup, "_configured_named_serial", return_value=None),
+            patch.object(setup, "_find_dual_serials", return_value=(None, None)),
+            patch.object(
+                setup,
+                "_find_single_serials",
+                return_value=setup.SingleBusRoles("COMBO", None, True),
+            ),
+            patch.object(setup, "_apply_setup") as apply_setup,
+            patch.object(setup, "_configure_mantis") as configure_mantis,
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            setup.run(SimpleNamespace())
+
+        # One adapter, one udev name: the lift rides can_alm_axol_b, so no
+        # chest interface is configured and the summary says so.
+        apply_setup.assert_called_once_with(None, "COMBO", None)
+        configure_mantis.assert_not_called()
+        self.assertIn(f"Wheels   : {setup._CAN_B}", output.getvalue())
+        self.assertIn(
+            f"Lift     : {setup._CAN_B} (jelly_legs shares the wheel bus)",
+            output.getvalue(),
+        )
+        self.assertNotIn(setup._CAN_C, output.getvalue())
 
     def test_control_panel_can_recover_a_mantis_stale_pinned_as_axol(self) -> None:
         with (
@@ -1596,7 +1637,7 @@ class FindSingleSerialsTest(unittest.TestCase):
         configured_chest: str | None,
         detected: dict[str, str | None],
         answers: list[str] | None = None,
-    ) -> tuple[tuple[str | None, str | None], Mock, Mock, str]:
+    ) -> tuple[setup.SingleBusRoles, Mock, Mock, str]:
         configured = {
             setup._CAN_B: configured_wheels,
             setup._CAN_C: configured_chest,
@@ -1631,7 +1672,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"wheel": "wheels", "chest": "chest"},
         )
 
-        self.assertEqual(result, ("wheel", "chest"))
+        self.assertEqual(result, ("wheel", "chest", False))
         find.assert_called_once_with({"hub"})
         self.assertEqual(
             identify.call_args_list,
@@ -1647,7 +1688,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"adapter-a": "chest", "adapter-b": "wheels"},
         )
 
-        self.assertEqual(result, ("adapter-b", "adapter-a"))
+        self.assertEqual(result, ("adapter-b", "adapter-a", False))
 
     def test_live_roles_override_one_duplicate_stale_pin(self) -> None:
         result, _, _, _ = self.run_find(
@@ -1659,7 +1700,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             },
         )
 
-        self.assertEqual(result, ("live-wheel", "live-chest"))
+        self.assertEqual(result, ("live-wheel", "live-chest", False))
 
     def test_one_live_role_resolves_duplicate_pin_by_elimination(self) -> None:
         result, _, _, _ = self.run_find(
@@ -1668,7 +1709,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"live-wheel": "wheels"},
         )
 
-        self.assertEqual(result, ("live-wheel", "stale"))
+        self.assertEqual(result, ("live-wheel", "stale", False))
 
     def test_unresolved_duplicate_stale_pin_is_rejected(self) -> None:
         error = io.StringIO()
@@ -1687,7 +1728,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"wheel": None, "chest": None},
         )
 
-        self.assertEqual(result, ("wheel", "chest"))
+        self.assertEqual(result, ("wheel", "chest", False))
         self.assertEqual(output.count("unverified"), 2)
 
     def test_positive_response_replaces_an_unplugged_pin(self) -> None:
@@ -1697,7 +1738,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"new-wheel": "wheels"},
         )
 
-        self.assertEqual(result, ("new-wheel", None))
+        self.assertEqual(result, ("new-wheel", None, False))
 
     def test_unplugged_configured_adapters_keep_their_assignments(self) -> None:
         result, _, identify, output = self.run_find(
@@ -1706,7 +1747,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={},
         )
 
-        self.assertEqual(result, ("wheel", "chest"))
+        self.assertEqual(result, ("wheel", "chest", False))
         identify.assert_not_called()
         self.assertEqual(output.count("is not attached"), 2)
 
@@ -1717,7 +1758,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"adapter": "chest"},
         )
 
-        self.assertEqual(result, (None, "adapter"))
+        self.assertEqual(result, (None, "adapter", False))
 
     def test_duplicate_responses_prefer_the_verified_existing_pin(self) -> None:
         result, _, _, output = self.run_find(
@@ -1726,7 +1767,7 @@ class FindSingleSerialsTest(unittest.TestCase):
             detected={"wheel-a": "wheels", "wheel-b": "wheels"},
         )
 
-        self.assertEqual(result, ("wheel-b", None))
+        self.assertEqual(result, ("wheel-b", None, False))
         self.assertIn("wheel-a: also identified as the wheels bus", output)
 
     def test_operator_can_replace_an_unverified_pin(self) -> None:
@@ -1737,8 +1778,130 @@ class FindSingleSerialsTest(unittest.TestCase):
             answers=["w"],
         )
 
-        self.assertEqual(result, ("unknown", None))
+        self.assertEqual(result, ("unknown", None, False))
         self.assertIn("Replacing unverified configured adapter old-wheel", output)
+
+    def test_shared_bus_takes_the_wheel_role_without_a_chest_pin(self) -> None:
+        result, _, _, output = self.run_find(
+            configured_wheels=None,
+            configured_chest=None,
+            detected={"combo": "shared"},
+        )
+
+        self.assertEqual(result, ("combo", None, True))
+        self.assertTrue(result.lift_on_wheel_bus)
+        self.assertIn(
+            "Damiao wheel motors and the Jelly lift controller answered", output
+        )
+        self.assertIn(f"{setup._CAN_B} (shared wheel + lift bus)", output)
+        self.assertNotIn("Chest bus", output)
+
+    def test_shared_bus_drops_a_stale_unplugged_chest_pin(self) -> None:
+        # The lift used to have its own adapter; it was rewired onto the wheel
+        # bus and the chest adapter unplugged. Keeping that pin would revive
+        # can_alm_axol_c — and steer the lift driver onto an empty bus — the
+        # day the old adapter is plugged back in for something else.
+        result, _, _, output = self.run_find(
+            configured_wheels="wheel",
+            configured_chest="old-chest",
+            detected={"wheel": "shared"},
+        )
+
+        self.assertEqual(result, ("wheel", None, True))
+        self.assertIn("dropping the configured chest adapter old-chest", output)
+        self.assertNotIn("is not attached", output)
+
+    def test_shared_bus_drops_a_stale_silent_chest_pin(self) -> None:
+        result, _, _, output = self.run_find(
+            configured_wheels="wheel",
+            configured_chest="quiet",
+            detected={"wheel": "shared", "quiet": None},
+            answers=[""],  # the operator skips the now-unassigned adapter
+        )
+
+        self.assertEqual(result, ("wheel", None, True))
+        self.assertIn("dropping the configured chest adapter quiet", output)
+        self.assertNotIn("unverified", output)
+        # The now-unassigned silent adapter is offered to the operator, never
+        # silently re-pinned as the chest bus.
+        self.assertIn("quiet: nothing answered", output)
+
+    def test_shared_bus_keeps_a_separately_answering_chest_bus(self) -> None:
+        result, _, _, output = self.run_find(
+            configured_wheels=None,
+            configured_chest=None,
+            detected={"combo": "shared", "lift2": "chest"},
+        )
+
+        self.assertEqual(result, ("combo", "lift2", True))
+        self.assertIn("second Jelly lift controller answered", output)
+
+    def test_shared_bus_corrects_a_stale_chest_pin_on_the_same_adapter(self) -> None:
+        # The adapter was pinned as the chest bus; the wheels have since been
+        # wired onto it too. It becomes the wheel bus and nothing keeps the
+        # stale chest name alive.
+        result, _, _, _ = self.run_find(
+            configured_wheels=None,
+            configured_chest="adapter",
+            detected={"adapter": "shared"},
+        )
+
+        self.assertEqual(result, ("adapter", None, True))
+
+    def test_split_buses_are_not_reported_as_shared(self) -> None:
+        result, _, _, _ = self.run_find(
+            configured_wheels="wheel",
+            configured_chest="chest",
+            detected={"wheel": "wheels", "chest": "chest"},
+        )
+
+        self.assertFalse(result.lift_on_wheel_bus)
+
+
+class IdentifyAdapterTest(unittest.TestCase):
+    def _identify(self, *, wheels: bool, chest: bool) -> str | None:
+        with (
+            patch.object(setup, "_iface_for_serial", return_value=setup.CAN_BASE),
+            patch.object(setup, "iface_up", return_value=True),
+            patch.object(setup, "bring_up_interfaces"),
+            patch.object(setup, "_send_once"),
+            patch.object(setup.time, "sleep"),
+            patch.object(setup, "_probe_wheels", return_value=wheels),
+            patch.object(setup, "_probe_chest", return_value=chest),
+            redirect_stdout(io.StringIO()),
+        ):
+            return setup._identify_adapter("SERIAL", reset=True)
+
+    def test_both_devices_answering_is_the_shared_bus(self) -> None:
+        self.assertEqual(self._identify(wheels=True, chest=True), "shared")
+
+    def test_single_device_roles_are_unchanged(self) -> None:
+        self.assertEqual(self._identify(wheels=True, chest=False), "wheels")
+        self.assertEqual(self._identify(wheels=False, chest=True), "chest")
+
+    def test_wheel_probe_requires_the_motor_feedback_id(self) -> None:
+        # On a shared bus a jelly_legs status frame (0x421) whose payload
+        # happens to spell [id, 0x00, 0x33, ...] must not pass as a Damiao
+        # register reply; the reply has to arrive on MST_ID 0x10 + motor ID.
+        captured: dict[str, object] = {}
+
+        def fake_probe(iface, frames, match):  # noqa: ANN001
+            captured["frames"] = frames
+            captured["match"] = match
+            return False
+
+        with patch.object(setup, "_probe", side_effect=fake_probe):
+            setup._probe_wheels(setup.CAN_BASE)
+
+        match = captured["match"]
+        reply = bytes([0x02, 0x00, 0x33, 60, 0, 0, 0, 0])
+        self.assertTrue(match(0x12, reply))
+        self.assertFalse(match(setup._JELLY_STATUS_ID, reply))
+        self.assertFalse(match(0x11, reply))
+        self.assertEqual(
+            [can_id for can_id, _data in captured["frames"]],
+            [setup._DAMIAO_CFG_ID] * 4,
+        )
 
 
 class RenameInterfacesTest(unittest.TestCase):

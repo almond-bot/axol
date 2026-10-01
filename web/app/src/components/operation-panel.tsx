@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
   ExternalLink,
@@ -10,8 +10,12 @@ import {
 } from "lucide-react"
 import {
   HARDWARE_PROFILE_ARG,
+  applyPolicyTypeRules,
   fetchDatasets,
+  fetchFieldSuggestions,
   fetchTrackerBindings,
+  isArmsOffRun,
+  isCustomPolicyRun,
   isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
@@ -30,14 +34,16 @@ import {
   type SessionInfo,
   type TrackerSourceReadiness,
 } from "@/lib/supervisor"
-import { CuratedForm, type FieldSuggestion } from "@/components/config-form"
+import { CuratedForm } from "@/components/config-form"
+import type { FieldSuggestion } from "@/components/suggest-input"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
+import { EpisodeBriefCard } from "@/components/episode-brief"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
-import { cn } from "@/lib/utils"
+import { cn, sentenceCase } from "@/lib/utils"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -58,6 +64,7 @@ export function OperationPanel({
   settings,
   hardwareProfile,
   mantisSource: configuredMantisSource,
+  sharedValues,
   onChange,
   onReset,
   onResetAll,
@@ -86,6 +93,8 @@ export function OperationPanel({
   hardwareProfile: HardwareProfile
   /** Shared Mantis tracking source used when this is a Mantis run. */
   mantisSource: string
+  /** The shared settings values (Robot tab switches such as "Axol arms"). */
+  sharedValues: Record<string, unknown> | null
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
   onResetAll: () => void
@@ -114,16 +123,20 @@ export function OperationPanel({
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
-  // The device flag is never one of them, and Axol-only run modes (sim /
-  // Jelly-only) disappear while Mantis is selected.
-  const runFields = useMemo(
-    () => (spec ? perRunFields(spec, meta, hardwareProfile) : []),
-    [spec, meta, hardwareProfile]
-  )
+  // The device flag is never one of them, and the Axol-only sim mode
+  // disappears while Mantis is selected.
   const liveArgs = live && session ? session.args : null
   const effectiveSettings: Record<string, FormValue> = liveArgs
     ? { ...settings, ...(liveArgs as Record<string, FormValue>) }
     : settings
+  // Run Policy's policy path is required for a LeRobot checkpoint but optional
+  // for a custom policy server, so the rule follows the selected policy type.
+  const customPolicy = isCustomPolicyRun(effectiveSettings)
+  const runFields = useMemo(
+    () =>
+      spec ? applyPolicyTypeRules(perRunFields(spec, meta, hardwareProfile), customPolicy) : [],
+    [spec, meta, hardwareProfile, customPolicy]
+  )
   // A live run reports the device it was actually started on; otherwise the
   // next run follows the panel-wide selection.
   const mantisMode =
@@ -197,34 +210,113 @@ export function OperationPanel({
       window.clearInterval(timer)
     }
   }, [connected, mantisMode, mantisSource, trackerSource, live])
+  // Host-declared pick lists for the other per-run fields (CommandDef
+  // field_suggestions — run-policy's model ids from a model registry, say):
+  // fetched like the datasets whenever the form is editable, keyed by field.
+  // A provider failure keeps the plain input and surfaces the reason under
+  // the form; an older host without the endpoint leaves the fields alone.
+  const suggestedKeys = useMemo(
+    () => runFields.map((f) => f.key).filter((k) => meta.suggestedFields.includes(k)),
+    [runFields, meta.suggestedFields]
+  )
+  // Strict fields (CommandDef strict_fields) take only a listed value: they
+  // render as a select over the same fetched list, and Start is blocked while
+  // the stored value is not in it (the host refuses such a start too).
+  const strictKeys = useMemo(
+    () => suggestedKeys.filter((k) => meta.strictFields.includes(k)),
+    [suggestedKeys, meta.strictFields]
+  )
+  // The fetched lists are tagged with the operation they were fetched for:
+  // a reply landing after the operator switched panels must not attach to
+  // the next op's field of the same name, and a stale entry from a previous
+  // op is ignored rather than cleared in an effect.
+  const [hostSuggestions, setHostSuggestions] = useState<{
+    op: string
+    rows: Record<string, FieldSuggestion[]>
+    errors: Record<string, string>
+  }>({ op: "", rows: {}, errors: {} })
+  useEffect(() => {
+    if (!connected || suggestedKeys.length === 0 || live) return
+    let cancelled = false
+    for (const key of suggestedKeys) {
+      fetchFieldSuggestions(meta.id, key)
+        .then(({ suggestions: rows, error }) => {
+          if (cancelled) return
+          setHostSuggestions((prev) => {
+            const same = prev.op === meta.id
+            const errors = { ...(same ? prev.errors : {}) }
+            if (error) errors[key] = error
+            else delete errors[key]
+            return {
+              op: meta.id,
+              rows: {
+                ...(same ? prev.rows : {}),
+                [key]: rows.map((r) => ({ value: r.value, label: r.label ?? undefined })),
+              },
+              errors,
+            }
+          })
+        })
+        .catch(() => {})
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [connected, live, meta.id, suggestedKeys])
   const suggestions = useMemo<Record<string, FieldSuggestion[]> | undefined>(() => {
-    if (!wantsDatasets || datasets.length === 0) return undefined
-    return {
-      repo_id: datasets.map((d) => ({
+    const merged: Record<string, FieldSuggestion[]> = {}
+    if (hostSuggestions.op === meta.id) {
+      for (const key of suggestedKeys) {
+        const rows = hostSuggestions.rows[key]
+        // A strict field's select needs to tell "loaded, empty" from "not
+        // loaded yet", so its empty list is kept.
+        if (rows && (rows.length > 0 || strictKeys.includes(key))) merged[key] = rows
+      }
+    }
+    if (wantsDatasets && datasets.length > 0) {
+      merged.repo_id = datasets.map((d) => ({
         value: d.repoId,
         label:
           d.episodes != null ? `${d.episodes} episode${d.episodes === 1 ? "" : "s"}` : undefined,
-      })),
+      }))
     }
-  }, [wantsDatasets, datasets])
+    return Object.keys(merged).length > 0 ? merged : undefined
+  }, [wantsDatasets, datasets, hostSuggestions, meta.id, suggestedKeys, strictKeys])
+  const suggestionNotes = useMemo(() => {
+    if (hostSuggestions.op !== meta.id) return []
+    return suggestedKeys
+      .filter((key) => hostSuggestions.errors[key])
+      .map((key) => ({
+        key,
+        label: runFields.find((f) => f.key === key)?.label ?? key,
+        error: hostSuggestions.errors[key],
+        strict: strictKeys.includes(key),
+      }))
+  }, [suggestedKeys, strictKeys, hostSuggestions, meta.id, runFields])
 
-  // Sim and Jelly-only are Axol run modes: hidden and ignored on Mantis.
+  // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
-  // Sim, Jelly-only, and Mantis runs do not touch the Axol arm motors. Mantis
+  // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
+  // arms and their CAN bus are never touched. A live run is described by its
+  // merged args alone (a default-on flag is omitted from them, so the saved
+  // switch must not be consulted — flipping it mid-run cannot relabel the
+  // run); otherwise the saved setting decides the next start.
+  const savedValues = liveArgs ? null : sharedValues
+  const armsOff = !mantisMode && isArmsOffRun(meta, effectiveSettings, savedValues)
+  // Sim, arms-off, and Mantis runs do not touch the Axol arm motors. Mantis
   // still needs its own live CAN link, however, so `robotFree` only controls
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
-  const robotFree = mantisMode || isRobotFreeRun(meta, effectiveSettings)
+  const robotFree = mantisMode || armsOff || isRobotFreeRun(meta, effectiveSettings, savedValues)
   const robotOk = robot?.state === "connected"
   const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
   const mantisOk = robotOk && robot?.profile === "mantis"
-  const jellyOnly =
-    !mantisMode && meta.fields.includes("jelly_only") && Boolean(effectiveSettings.jelly_only)
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
   // including headset-free Lighthouse/Ultimate Mantis collection. Mantis
-  // teleop is grippers-only: no VR server or cameras run, so no feeds.
-  const showFeeds = meta.usesHeadset && !isSim && !jellyOnly && !(mantisMode && meta.id === "teleop")
+  // teleop is grippers-only: no VR server or cameras run, so no feeds; an
+  // arms-off (Jelly-only) teleop relays no headset video either.
+  const showFeeds = meta.usesHeadset && !isSim && !armsOff && !(mantisMode && meta.id === "teleop")
   const camCount = recordingCameraCount(cameras, mantisMode)
   const currentTrackerReadinessState =
     trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
@@ -327,18 +419,23 @@ export function OperationPanel({
     )
   }
   for (const f of runFields) {
-    if (f.required) {
-      const v = settings[f.key]
-      if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
+    const v = settings[f.key]
+    const empty = v === undefined || String(v).trim() === ""
+    if (f.required && empty) {
+      blockers.push(`Set ${f.label}`)
+    } else if (!empty && strictKeys.includes(f.key)) {
+      // A strict field's stored value must be on the fetched list (a task
+      // removed from the catalog, a value typed into an older panel).
+      const rows = hostSuggestions.op === meta.id ? hostSuggestions.rows[f.key] : undefined
+      if (rows && !rows.some((r) => r.value === String(v).trim())) {
+        blockers.push(`Pick ${f.label} from the list`)
+      }
     }
   }
-  // Teleop's Axol run modes are mutually exclusive (the server refuses the
-  // start too); catch the combination before the Start button instead of after.
-  const modeFlags = ["sim", "jelly_only"].filter(
-    (f) => runFields.some((field) => field.key === f) && Boolean(settings[f])
-  )
-  if (modeFlags.length > 1) {
-    blockers.push("Sim and Jelly only are mutually exclusive — enable only one")
+  // Sim models the arms, so it cannot run with them switched off (the server
+  // refuses the start too); say so before the Start button instead of after.
+  if (isSim && armsOff) {
+    blockers.push("Sim needs the arms — turn on Axol arms in Robot settings or disable sim")
   }
 
   const editedCount = Object.keys(settings).length
@@ -420,12 +517,32 @@ export function OperationPanel({
                     <CuratedForm
                       fields={textFields}
                       suggestions={suggestions}
+                      strictKeys={strictKeys}
                       overrides={settings}
                       disabled={live}
                       onChange={onChange}
                       onReset={onReset}
                     />
                   )}
+                  {customPolicy && (
+                    <p className="text-xs leading-relaxed text-white/45">
+                      Custom policy: start your policy server (
+                      <code className="font-mono text-white/60">almond_axol.policy.serve</code>)
+                      before pressing Start. Run Policy uses the host and port in Settings →
+                      Inference; a blank host connects to this machine on the configured port
+                      (default 8765). Select the model and instruction on the endpoint; the task
+                      labels recordings.
+                    </p>
+                  )}
+                  {!live &&
+                    suggestionNotes.map((note) => (
+                      <p key={note.key} className="text-xs leading-relaxed text-white/45">
+                        {note.strict
+                          ? `${sentenceCase(note.label)} options unavailable — the host cannot read its list, so this field cannot be set.`
+                          : `${sentenceCase(note.label)} suggestions unavailable — type the value.`}{" "}
+                        <span className="break-words text-white/35">{note.error}</span>
+                      </p>
+                    ))}
                   {jointField && (
                     <ArmJointPicker
                       value={settings[jointField.key]}
@@ -463,7 +580,7 @@ export function OperationPanel({
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer, Jelly-only has no video relay, and
+              {/* Sim has the browser viewer, an arms-off run has no video relay, and
                   Mantis teleop is grippers-only (no cameras). Mantis collection
                   still relays its configured wrist-camera feeds even when
                   Lighthouse/Ultimate make the headset unnecessary. */}
@@ -752,7 +869,7 @@ function OperatorDeck({
   )
 }
 
-function EpisodeControls({
+export function EpisodeControls({
   policy,
   onEpisode,
   hud,
@@ -806,7 +923,12 @@ function EpisodeControls({
     ? `Recording starts in ${vrCountdownS} s — controller countdown; press A again to cancel.`
     : status
 
+  // Auto-submitting inputs register a flush, so a button clicked inside the
+  // debounce window still sends the text typed just before it first.
+  const flushes = useRef(new Map<string, () => void>())
+
   function click(control: EpisodeControlSpec) {
+    for (const flush of flushes.current.values()) flush()
     if (control.confirm && armed !== control.command) {
       setArmed(control.command)
       return
@@ -833,6 +955,7 @@ function EpisodeControls({
           {policy?.episodesRecorded ?? 0} saved
         </span>
       </div>
+      {policy?.brief && <EpisodeBriefCard brief={policy.brief} phase={phase} />}
       <span className="text-sm text-white/60">{displayStatus}</span>
       {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
@@ -855,11 +978,15 @@ function EpisodeControls({
           key={`${c.command}:${c.placeholder ?? ""}`}
           control={c}
           onEpisode={onEpisode}
+          flushes={flushes}
         />
       ))}
     </div>
   )
 }
+
+/** How long typing must pause before an `autoSubmit` input sends its text. */
+const AUTO_SUBMIT_MS = 400
 
 /**
  * A server-driven episode control rendered as a text field + submit button
@@ -869,22 +996,53 @@ function EpisodeControls({
  * `value` (the current server-side text), so an earlier submission survives
  * phase changes and can be edited; submit is disabled while the text matches
  * what the server already has.
+ *
+ * With `autoSubmit` there is no button: the text is sent once typing pauses
+ * (Enter sends at once), and a status hint says whether the op has it yet.
+ * Clearing the field sends nothing — the op keeps its last value.
  */
 function EpisodeInputControl({
   control,
   onEpisode,
+  flushes,
 }: {
   control: EpisodeControlSpec
   onEpisode: (command: string) => void
+  flushes: RefObject<Map<string, () => void>>
 }) {
   const [text, setText] = useState(control.value ?? "")
   const serverValue = control.value ?? ""
   const unchanged = text.trim() === serverValue.trim()
+  const auto = control.autoSubmit === true
+  // The text last sent, so the debounce and a flush don't resend it while
+  // the snapshot is still catching up.
+  const sent = useRef(serverValue.trim())
 
   function submit() {
-    if (unchanged || !text.trim()) return
-    onEpisode(`${control.command} ${text.trim()}`)
+    const trimmed = text.trim()
+    if (!trimmed || trimmed === serverValue.trim() || trimmed === sent.current) return
+    sent.current = trimmed
+    onEpisode(`${control.command} ${trimmed}`)
   }
+
+  const submitRef = useRef(submit)
+  useEffect(() => {
+    submitRef.current = submit
+  })
+  useEffect(() => {
+    if (!auto) return
+    const key = control.command
+    const registry = flushes.current
+    registry.set(key, () => submitRef.current())
+    return () => {
+      registry.delete(key)
+    }
+  }, [auto, control.command, flushes])
+  useEffect(() => {
+    if (!auto) return
+    const t = setTimeout(() => submitRef.current(), AUTO_SUBMIT_MS)
+    return () => clearTimeout(t)
+  }, [auto, text])
 
   return (
     <div className="flex items-center gap-2">
@@ -897,9 +1055,15 @@ function EpisodeInputControl({
         }}
         className="h-8 flex-1"
       />
-      <Button variant="outline" size="sm" disabled={unchanged || !text.trim()} onClick={submit}>
-        {control.label}
-      </Button>
+      {auto ? (
+        <span className="w-16 shrink-0 text-right text-xs text-white/45">
+          {text.trim() ? (unchanged ? "Saved" : "Saving…") : ""}
+        </span>
+      ) : (
+        <Button variant="outline" size="sm" disabled={unchanged || !text.trim()} onClick={submit}>
+          {control.label}
+        </Button>
+      )}
     </div>
   )
 }

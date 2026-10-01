@@ -2,16 +2,58 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import can
 
 from almond_axol.cli.can import setup as can_setup
+from almond_axol.constants import CAN_BASE, CAN_CHEST
 from almond_axol.motor import CanBus
 from almond_axol.robot import lift as lift_module
-from almond_axol.robot.lift import Lift, LiftStatus, _decode_status
+from almond_axol.robot.lift import (
+    Lift,
+    LiftStatus,
+    _decode_status,
+    resolve_lift_channel,
+)
+
+
+class ResolveLiftChannelTest(unittest.TestCase):
+    """The lift follows whichever bus ``axol can.setup`` pinned it to."""
+
+    def _resolve(self, present: tuple[str, ...], channel: str | None = None) -> str:
+        with tempfile.TemporaryDirectory() as directory:
+            for name in present:
+                (Path(directory) / name).mkdir()
+            with patch.object(lift_module, "_SYS_NET", Path(directory)):
+                return resolve_lift_channel(channel)
+
+    def test_explicit_channel_wins(self) -> None:
+        self.assertEqual(self._resolve((CAN_CHEST, CAN_BASE), "can9"), "can9")
+        self.assertEqual(self._resolve((), "can9"), "can9")
+
+    def test_own_chest_bus_when_present(self) -> None:
+        self.assertEqual(self._resolve((CAN_CHEST,)), CAN_CHEST)
+        self.assertEqual(self._resolve((CAN_CHEST, CAN_BASE)), CAN_CHEST)
+
+    def test_shares_the_wheel_bus_when_there_is_no_chest_bus(self) -> None:
+        self.assertEqual(self._resolve((CAN_BASE,)), CAN_BASE)
+
+    def test_neither_present_names_the_canonical_chest_bus(self) -> None:
+        # start() then fails with "interface not found: can_alm_axol_c",
+        # pointing at can.setup rather than at the wheel bus.
+        self.assertEqual(self._resolve(()), CAN_CHEST)
+
+    def test_lift_resolves_its_channel_at_construction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / CAN_BASE).mkdir()
+            with patch.object(lift_module, "_SYS_NET", Path(directory)):
+                self.assertEqual(Lift().channel, CAN_BASE)
+                self.assertEqual(Lift("can-test").channel, "can-test")
 
 
 class LiftStatusTest(unittest.TestCase):

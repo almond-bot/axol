@@ -1,13 +1,13 @@
 """Cycle one joint through its limits while holding all others at their start position.
 
-The arms are driven through the Rust realtime core (``RtAxol``) — the same
+The arms are driven through the Rust realtime core (``Axol``) — the same
 control path as teleop — so what this exercises is the production controller
 and its CAN traffic, not a Python-side loop. Every motor of each selected arm
 must be on the bus (the core brings the whole arm up); only the chosen joint
 moves.
 
 ``--target mantis`` drives the Mantis rig's handheld grippers instead
-(``RtMantis`` on ``can_mantis_l`` / ``can_mantis_r``): the core owns the
+(``Mantis`` on ``can_mantis_l`` / ``can_mantis_r``): the core owns the
 gripper buses exactly as it does during a take, and only ``--joint gripper``
 is meaningful there.
 
@@ -42,10 +42,9 @@ from ...constants import (
     CAN_RIGHT,
     Joint,
 )
-from ...robot.axol import GRIPPER_TRAVEL, Axol, arm_limits
+from ...robot.axol import GRIPPER_TRAVEL, arm_limits
 from ...robot.config import AxolConfig
-from ...robot.mantis import Mantis
-from ...rt import RtAxol, RtMantis
+from ...rt import Axol, Mantis
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -285,26 +284,22 @@ async def _run(
     cycle_count = 0
     send_error_count = 0
 
-    robot: RtAxol | RtMantis
+    robot: Axol | Mantis
     if mantis:
         # Grippers-only core on the Mantis buses; ``enable`` (non-deferred)
         # brings the grippers up and arms it, as a take does.
-        robot = RtMantis(
-            Mantis(
-                config=AxolConfig(),
-                left_channel=left_channel if run_left else None,
-                right_channel=right_channel if run_right else None,
-            )
+        robot = Mantis(
+            config=AxolConfig(),
+            left_channel=left_channel if run_left else None,
+            right_channel=right_channel if run_right else None,
         )
     else:
-        # ``resolved()`` applies the default stiffness blend at the ``Axol``
+        # ``resolved()`` applies the default stiffness blend at the hardware
         # construction boundary, so the core runs the same gains teleop does.
-        robot = RtAxol(
-            Axol(
-                config=AxolConfig(),
-                left_channel=left_channel if run_left else None,
-                right_channel=right_channel if run_right else None,
-            )
+        robot = Axol(
+            config=AxolConfig(),
+            left_channel=left_channel if run_left else None,
+            right_channel=right_channel if run_right else None,
         )
     try:
         try:

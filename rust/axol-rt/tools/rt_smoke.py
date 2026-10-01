@@ -1,6 +1,6 @@
 """End-to-end smoke test for the hybrid rt path — no VR needed.
 
-Drives the robot through ``RtAxol``: the full ``motion_control`` math runs in
+Drives the robot through ``Axol``: the full ``motion_control`` math runs in
 Python at 120 Hz, the Rust core owns the bus at 240 Hz. The motion is a hold
 followed by a gentle wrist_3 sinusoid on both arms with a slow gripper
 open/close cycle riding along (empty-jaw safe: it sweeps at most 0.35 of
@@ -23,7 +23,6 @@ import time
 import numpy as np
 
 from almond_axol.robot import Axol
-from almond_axol.rt import RtAxol
 
 WRIST_3 = 6  # Joint enum index
 GRIPPER = 7
@@ -32,7 +31,7 @@ RATE_HZ = 120.0
 
 async def main(secs: float, amp_deg: float, freq_hz: float) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    robot = RtAxol(Axol())
+    robot = Axol()
     await robot.enable()
     try:
         pos_l, pos_r = await robot.get_positions()

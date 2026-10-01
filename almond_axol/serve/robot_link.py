@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import threading
 import time
 from pathlib import Path
@@ -45,7 +46,7 @@ from ..constants import (
     CAN_RIGHT,
 )
 from ..motor import BusObserver, CanBus, Joint, Motor, MotorError
-from ..motor.config import DamiaoParam
+from ..motor.config import Access, DamiaoParam
 from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import MyActuatorMotor, mit_ranges
 from ..teleop_activity import active_teleop
@@ -62,6 +63,11 @@ _logger = logging.getLogger(__name__)
 # timeout is generous so a momentarily-busy bus doesn't flap the indicator.
 _PING_INTERVAL_S = 1.0
 _PING_TIMEOUT_S = 0.5
+
+# Per-parameter budget for a config read/write over the idle link. A write also
+# commits to ROM, so it gets longer than a read.
+_CONFIG_READ_TIMEOUT_S = 0.5
+_CONFIG_WRITE_TIMEOUT_S = 2.0
 
 # Per-read timeout for the fast telemetry sweep. Tighter than the ping's: a
 # skipped sample is invisible on a chart, a flapping health dot is not.
@@ -145,7 +151,10 @@ def _joint_name_for_id(value: Any) -> str | None:
 
 
 def scoped_motor_faults(
-    faults: list[dict[str, Any]], args: dict[str, Any]
+    faults: list[dict[str, Any]],
+    args: dict[str, Any],
+    *,
+    unselected_joints_only_skip_absent: bool = False,
 ) -> list[dict[str, Any]]:
     """Filter faults down to the motors a command launch will actually touch.
 
@@ -155,9 +164,14 @@ def scoped_motor_faults(
     (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
     with only some motors on the bus can then run a scoped test without the
     absent motors' "unreachable" faults blocking the launch — while faults on
-    the motors the run *does* drive still block it. Callers whose ``joints``
-    does not mean bus presence (the ROM soak: the realtime core brings up the
-    whole arm and ``--joints`` only selects what moves) drop that key first.
+    the motors the run *does* drive still block it.
+
+    ``unselected_joints_only_skip_absent`` is for a command whose ``joints``
+    picks what *moves* while every motor that answers on the bus is still
+    brought up and held (the ROM soak): an unreachable unselected joint is
+    one the run treats as absent and never enables, so its fault is dropped,
+    but any other fault on an unselected joint (a reachable motor in an
+    error state) still blocks because the run will energize that motor.
     """
     arm = str(args.get("arm") or "").strip().lower()
     if arm in ("left", "right"):
@@ -176,7 +190,12 @@ def scoped_motor_faults(
         if joint is not None:
             joint_names = {joint}
     if joint_names is not None:
-        faults = [f for f in faults if f["joint"].upper() in joint_names]
+        faults = [
+            f
+            for f in faults
+            if f["joint"].upper() in joint_names
+            or (unselected_joints_only_skip_absent and f["problem"] != "unreachable")
+        ]
     elif flag_enabled(args.get("guided")):
         # Guided zeroing without an explicit subset walks the seven arm
         # joints; the gripper is never touched (it has no zero to set), so
@@ -757,8 +776,8 @@ class RobotLink:
             ),
         }
 
-    def motor_details(self, arm: str, joint_name: str) -> dict[str, Any]:
-        """Full one-motor readout (the ``motor.info`` set) for the dashboard.
+    def _idle_motor(self, arm: str, joint_name: str) -> tuple[_ArmLink, Joint]:
+        """Resolve a motor the link can address right now.
 
         Raises ``RuntimeError`` unless the link currently owns the bus, and
         ``KeyError`` for an unknown arm/joint.
@@ -770,7 +789,50 @@ class RobotLink:
         if arm_link is None:
             raise KeyError(arm)
         joint = Joint[joint_name]
+        if joint not in arm_link.motors:
+            raise KeyError(joint_name)
+        return arm_link, joint
+
+    def motor_details(self, arm: str, joint_name: str) -> dict[str, Any]:
+        """Full one-motor readout (the ``motor.info`` set) for the dashboard.
+
+        Raises ``RuntimeError`` unless the link currently owns the bus, and
+        ``KeyError`` for an unknown arm/joint.
+        """
+        arm_link, joint = self._idle_motor(arm, joint_name)
         return self._submit(_read_motor_details(arm_link, joint))
+
+    def motor_config(self, arm: str, joint_name: str) -> dict[str, Any]:
+        """Every configuration parameter of one motor, for the parameter editor.
+
+        Parameters the motor's firmware doesn't implement are listed with
+        ``supported: false`` and no value, and a parameter that fails to read
+        carries an ``error`` instead of failing the whole readout. Same
+        ownership rules as :meth:`motor_details`.
+        """
+        arm_link, joint = self._idle_motor(arm, joint_name)
+        return self._submit(_read_motor_config(arm_link, joint))
+
+    def set_motor_config(
+        self,
+        arm: str,
+        joint_name: str,
+        name: str,
+        value: float,
+        *,
+        allow_protected: bool = False,
+    ) -> dict[str, Any]:
+        """Write one configuration parameter, persist it, and read it back.
+
+        Raises ``ValueError`` for a request the parameter table refuses (unknown
+        or read-only parameter, a protected one without ``allow_protected``,
+        one this firmware doesn't implement, a non-finite value) and
+        ``MotorError`` if the motor doesn't complete the write.
+        """
+        arm_link, joint = self._idle_motor(arm, joint_name)
+        return self._submit(
+            _write_motor_config(arm_link, joint, name, value, allow_protected)
+        )
 
     def shutdown(self) -> None:
         """Tear down the link and stop the loop thread (server shutdown)."""
@@ -1137,6 +1199,102 @@ class RobotLink:
         _logger.info("CAN setup complete; interfaces brought up.")
 
 
+def _finite(value: float | None) -> float | None:
+    """JSON-safe value: NaN/inf (which a motor can report) become null."""
+    return value if value is not None and math.isfinite(value) else None
+
+
+async def _read_motor_config(arm_link: _ArmLink, joint: Joint) -> dict[str, Any]:
+    """The configuration table of one link-owned motor, read parameter by parameter."""
+    motor = arm_link.motors[joint]
+    params: list[dict[str, Any]] = []
+    async with arm_link.lock(joint):
+        try:
+            firmware = await asyncio.wait_for(
+                motor.get_firmware_version(), timeout=_PING_TIMEOUT_S
+            )
+        except (MotorError, asyncio.TimeoutError):
+            firmware = None
+        for param, spec in motor.config_params.items():
+            entry: dict[str, Any] = {
+                "name": param.name,
+                "index": int(param),
+                "unit": spec.unit,
+                "access": spec.access.name.lower(),
+                "integer": spec.integer,
+                "supported": True,
+                "value": None,
+                "error": None,
+            }
+            params.append(entry)
+            try:
+                supported = await asyncio.wait_for(
+                    motor.config_param_supported(param),
+                    timeout=_CONFIG_READ_TIMEOUT_S,
+                )
+            except (MotorError, asyncio.TimeoutError) as exc:
+                entry["error"] = str(exc) or "timed out"
+                continue
+            if not supported:
+                entry["supported"] = False
+                continue
+            # Retry once: every 0xC0 reply shares a response ID, so a stray
+            # late reply is refused (index-echo check) rather than misread.
+            for _ in range(2):
+                try:
+                    value = await asyncio.wait_for(
+                        motor.read_config(param), timeout=_CONFIG_READ_TIMEOUT_S
+                    )
+                except (MotorError, asyncio.TimeoutError) as exc:
+                    entry["error"] = str(exc) or "timed out"
+                    continue
+                entry["value"] = _finite(value)
+                entry["error"] = None if entry["value"] is not None else "not a number"
+                break
+    return {
+        "arm": arm_link.side,
+        "joint": joint.name,
+        "type": motor.motor_type,
+        "firmware": firmware,
+        "params": params,
+    }
+
+
+async def _write_motor_config(
+    arm_link: _ArmLink,
+    joint: Joint,
+    name: str,
+    value: float,
+    allow_protected: bool,
+) -> dict[str, Any]:
+    """Write one parameter of a link-owned motor and read it back."""
+    motor = arm_link.motors[joint]
+    if not math.isfinite(value):
+        raise ValueError("value must be a finite number")
+    try:
+        param = motor.resolve_config_param(name)
+    except MotorError as exc:
+        raise ValueError(str(exc)) from exc
+    spec = motor.config_params[param]
+    if spec.access is Access.READ_ONLY:
+        raise ValueError(f"{name} is read-only")
+    if spec.access is Access.PROTECTED and not allow_protected:
+        raise ValueError(
+            f"{name} is protected (factory, calibration, or bus identity); "
+            "confirm the protected write to change it"
+        )
+    async with arm_link.lock(joint):
+        if not await motor.config_param_supported(param):
+            raise ValueError(f"{name} is not implemented by this motor's firmware")
+        await asyncio.wait_for(
+            motor.write_config(param, value), timeout=_CONFIG_WRITE_TIMEOUT_S
+        )
+        readback = await asyncio.wait_for(
+            motor.read_config(param), timeout=_CONFIG_READ_TIMEOUT_S
+        )
+    return {"name": param.name, "requested": value, "value": _finite(readback)}
+
+
 async def _read_motor_details(arm_link: _ArmLink, joint: Joint) -> dict[str, Any]:
     """The ``motor.info`` read set against a link-owned motor."""
     motor = arm_link.motors[joint]
@@ -1154,6 +1312,7 @@ async def _read_motor_details(arm_link: _ArmLink, joint: Joint) -> dict[str, Any
         return {
             "arm": arm_link.side,
             "joint": joint.name,
+            "type": motor.motor_type,
             "model": await read(motor.get_model()),
             "firmware": await read(motor.get_firmware_version()),
             "status": getattr(status, "name", None),

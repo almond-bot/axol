@@ -1,5 +1,7 @@
 # Almond Axol SDK
 
+[![CI](https://github.com/almond-bot/axol/actions/workflows/ci.yml/badge.svg)](https://github.com/almond-bot/axol/actions/workflows/ci.yml)
+
 <img src="assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
@@ -62,13 +64,14 @@ The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separate
 axol zed.install
 ```
 
-Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once:
 
 ```bash
 axol gst.install
 axol gst.build-zed   # build the patched ZED source plugins (needs the ZED SDK)
-axol jetson.setup    # Jetson only; no-op elsewhere
 ```
+
+`axol provision` runs both of these and, on a Jetson (Orin NX, AGX Orin, Thor), also pins the NVENC/VIC/GPU and CPU clocks and steers the CAN interrupt for the real-time loops. It is the one command a host needs; the installer's systemd unit re-applies the per-boot part (`axol provision --boot`) at every boot.
 
 Before using any motor or robot commands, initialize the CAN hardware:
 
@@ -87,11 +90,36 @@ npm run build --workspace=app                        # → web/app/dist
 
 See the [installation guide](https://docs.almond.bot/installation) for the full walkthrough.
 
+## Testing
+
+The automated suite is hardware-independent: robot, CAN, ZED, and headset boundaries are exercised through protocol and API contracts, while simulation-capable code is imported with the `sim` extra. Several modules import the `lerobot` extra at import time, so install both. CI enforces aggregate coverage floors of 30% for the Python package and 75% for the tested browser libraries.
+
+```bash
+# Python unit/integration tests, coverage, lint, and package builds
+uv sync --extra sim --extra lerobot --dev
+uv run pytest
+uvx --from ruff==0.9.7 ruff check .
+uvx --from ruff==0.9.7 ruff format --check .
+uv build
+
+# React/TypeScript tests, lint, formatting, and production build
+cd web
+npm ci
+npm test
+npm run lint
+npm run format:check
+npm run build
+```
+
+Pull requests must pass the `Python` and `Web` GitHub Actions checks before merging to `main`.
+
 ## Sitemap
 
 ### Get Started
 
 - [Overview](https://docs.almond.bot)
+- [Hardware Overview](https://docs.almond.bot/hardware) — Axol, the Owl Mount / Ox Cart / Jelly Mobile mounts, the Camera Kit, and the Compute Kit
+- [Hardware Setup](https://docs.almond.bot/hardware-setup) — step-by-step guides for each mount (standalone, Owl Mount, Ox Cart, Jelly) and the cameras
 - [Installation](https://docs.almond.bot/installation)
 
 ### Operations
@@ -103,6 +131,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
 - [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+- [Run Your Own Policy](https://docs.almond.bot/operations/custom-policy) — drive the arms from your own (non-LeRobot) model via the `almond_axol.policy` SDK
 - [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
 ### Mantis
@@ -139,6 +168,8 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)
 - [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable)
+- [`diag.teleop-jitter`](https://docs.almond.bot/cli/diag-teleop-jitter)
+- [`diag.offline`](https://docs.almond.bot/cli/diag-offline)
 - [`diag.lift-cycle`](https://docs.almond.bot/cli/diag-lift-cycle)
 - [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
 - [`diag.base-calibrate`](https://docs.almond.bot/cli/diag-base-calibrate)
@@ -155,7 +186,9 @@ Each operation can be driven from the web control panel or the CLI:
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
+- [`policy.check`](https://docs.almond.bot/cli/policy-check) — exercise a custom policy endpoint without a robot
 - [`provision`](https://docs.almond.bot/cli/provision)
+- [`rt.install`](https://docs.almond.bot/cli/rt-install)
 - [`zed.driver`](https://docs.almond.bot/cli/zed-driver)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
@@ -164,6 +197,12 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
+- [`tune.gravity`](https://docs.almond.bot/cli/tune-gravity)
+- [`tune.factory`](https://docs.almond.bot/cli/tune-factory)
+- [`calibration.pull`](https://docs.almond.bot/cli/tune-factory#calibration-pull)
+- [`tune.motion`](https://docs.almond.bot/cli/tune-motion)
+- [`tune.filter`](https://docs.almond.bot/cli/tune-filter)
+- [`motion.build`](https://docs.almond.bot/cli/motion-build)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
 - [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
 - [`waypoints`](https://docs.almond.bot/cli/waypoints)
@@ -178,3 +217,5 @@ Each operation can be driven from the web control panel or the CLI:
 - [`almond_axol.zed`](https://docs.almond.bot/api/zed)
 - [`almond_axol.motor`](https://docs.almond.bot/api/motor)
 - [`almond_axol.lerobot`](https://docs.almond.bot/api/lerobot)
+- [`almond_axol.policy`](https://docs.almond.bot/api/policy) — serve your own model to `run-policy` / `collect-dagger`: joints + camera frames in, action chunks out
+- [Custom policy interface](https://docs.almond.bot/api/policy-plan) — the wire contract underneath, for endpoints outside Python

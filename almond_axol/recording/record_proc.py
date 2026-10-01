@@ -60,8 +60,13 @@ _ENCODER_THREADS = 2
 # is plenty fine-grained for timestamp-tolerant dataset decode.
 _ENCODER_GOP = 30
 
-# How long the recorder subprocess may take to open cameras' shm + the dataset.
-_READY_TIMEOUT_S = 60.0
+# How long the recorder subprocess may take to import torch/lerobot, open the
+# cameras' shm + the dataset, and answer ``ready``. This guards a wedged child,
+# not a slow one: a normal start is 25-45 s on the Orin and the 2026-09-14
+# DAgger session hit 56 s with the import starved on the relay's cores (see
+# affinity.pin_background_and_ik), which the old 60 s budget turned into a
+# session-ending failure before the operator had started anything.
+_READY_TIMEOUT_S = 180.0
 # How long a save_episode (encoder flush + parquet write + post-episode stats)
 # may take.
 _SAVE_TIMEOUT_S = 180.0
@@ -81,6 +86,66 @@ _ENCODED_START_TIMEOUT_S = 15.0
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
+
+
+class _CaptureGate(threading.Event):
+    """An episode gate whose transitions fence committed rows exactly.
+
+    Sensor reads and row preparation never hold ``commit_lock``. A pause
+    waits only for a row already inside ``add_frame`` to finish; work acquired
+    before a pause cannot commit after it, even if capture resumed meanwhile.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_lock = threading.RLock()
+        self.epoch = 0
+        self.opened_at = float("-inf")
+
+    def set(self) -> None:
+        with self.commit_lock:
+            if not self.is_set():
+                self.epoch += 1
+                self.opened_at = time.perf_counter()
+            super().set()
+
+    def clear(self) -> None:
+        with self.commit_lock:
+            if self.is_set():
+                self.epoch += 1
+            super().clear()
+
+    def transition(self, enabled: bool, counter: dict[str, int]) -> int:
+        """Return the exact row count at this pause/resume boundary."""
+        if not self.commit_lock.acquire(timeout=_CMD_TIMEOUT_S):
+            raise RuntimeError("recorder row commit did not finish before gate timeout")
+        try:
+            if enabled:
+                self.set()
+            else:
+                self.clear()
+            return counter["n"]
+        finally:
+            self.commit_lock.release()
+
+
+def _capture_gate_state(
+    event: threading.Event | None,
+) -> tuple[int | None, bool, float]:
+    if isinstance(event, _CaptureGate):
+        with event.commit_lock:
+            return event.epoch, event.is_set(), event.opened_at
+    return None, event is None or event.is_set(), float("-inf")
+
+
+@contextlib.contextmanager
+def _capture_commit(event: threading.Event | None, epoch: int | None):
+    """Serialize a row append and its accounting against gate transitions."""
+    if isinstance(event, _CaptureGate):
+        with event.commit_lock:
+            yield event.is_set() and event.epoch == epoch
+    else:
+        yield event is None or event.is_set()
 
 
 def _stop_capture_thread(
@@ -193,6 +258,19 @@ _SNAPSHOT_HISTORY_SIZE = 512
 # headroom for lower configured control rates, but surface clock/history failures
 # before they silently contaminate a whole episode.
 _STATE_ALIGNMENT_WARN_S = 0.050
+
+# A Mantis-created dataset declares ``observation.pose_lag`` (see
+# ``recording.datasets.RESUME_FILLABLE_FEATURES``): the signed skew, in
+# seconds, between the row's camera exposure and the state sample written
+# next to it. The recorder owns that column: it is the one place that knows
+# which snapshot it paired with which exposure, so both capture loops stamp
+# it from that pairing whenever the dataset declares it — the publisher never
+# has to (and a value it did publish is replaced). On the rig the snapshot is
+# stamped with the tracker pose's host time, so this is the tracker→image
+# lag; on the arms it is the Rust telemetry sample→image lag. A held state
+# (see ``_RowStatePairer``) shows up as the larger lag it really is.
+_POSE_LAG_FEATURE = "observation.pose_lag"
+_POSE_LAG_KEY = "pose_lag"
 
 # Fail-open recording policy. A take is a scarce, operator-driven artefact; a
 # single imperfect row is not. Both capture loops therefore *mitigate* every
@@ -1491,6 +1569,12 @@ def run_capture_loop(
     DAgger annotation: a per-frame bool, see ``lerobot.rollout``'s DAgger
     strategy), each row is tagged from the snapshot's intervention flag — the
     publisher (the control loop) marks the ticks where a human was driving.
+
+    When it declares ``observation.pose_lag`` (a Mantis-created dataset, or
+    any flow appending to one), each row's ``pose_lag`` is the signed skew
+    between its camera exposure and the snapshot it was paired with — the
+    recorder fills it, the publisher's snapshot need not carry it (see
+    :data:`_POSE_LAG_FEATURE`). Both loops share this contract.
     """
     try:
         import numpy as np
@@ -1499,6 +1583,7 @@ def run_capture_loop(
         from lerobot.utils.visualization_utils import log_rerun_data
 
         tag_intervention = "intervention" in dataset.features
+        stamp_pose_lag = _POSE_LAG_FEATURE in dataset.features
 
         # Wait for the first snapshot *published after this episode started*.
         # The snapshot history persists across episodes, so its newest record
@@ -1548,11 +1633,19 @@ def run_capture_loop(
             label="raw camera exposure", can_drop=True, quality=quality
         )
         cap_last_log = time.perf_counter()
+        capture_epoch: int | None = None
 
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
-            if record_event is not None and not record_event.is_set():
+            row_epoch, recording, capture_floor = _capture_gate_state(record_event)
+            if row_epoch != capture_epoch:
+                recording_start = None
+                state_pairer = _RowStatePairer(
+                    label="raw camera exposure", can_drop=True, quality=quality
+                )
+                capture_epoch = row_epoch
+            if not recording:
                 # Paused: idle without capturing and drop the anchor so the
                 # tick clock re-anchors on resume (no timestamp gap).
                 recording_start = None
@@ -1641,6 +1734,15 @@ def run_capture_loop(
                         f"timestamp at tick {tick}",
                     )
                     break
+                if cap_ts < capture_floor:
+                    # Current readers honor read_at_or_after's lower bound;
+                    # enforce the source boundary here for every raw adapter.
+                    skip_tick = (
+                        f"{cam_key}.ticks_before_resume",
+                        f"camera {cam_key!r} returned a pre-resume exposure "
+                        f"at tick {tick}",
+                    )
+                    break
                 previous = last_capture_ts.get(cam_key)
                 if previous is not None and cap_ts <= previous:
                     skip_tick = (
@@ -1654,6 +1756,8 @@ def run_capture_loop(
                 capture_ts.append(cap_ts)
                 last_capture_ts[cam_key] = cap_ts
 
+            if _capture_gate_state(record_event)[:2] != (row_epoch, True):
+                continue
             if skip_tick is None and capture_ts:
                 camera_skew = max(capture_ts) - min(capture_ts)
                 camera_skew_max = max(camera_skew_max, camera_skew)
@@ -1710,7 +1814,7 @@ def run_capture_loop(
             if snap is None:
                 tick += 1
                 continue
-            joint_obs, action, _snap_ts, intervention = snap
+            joint_obs, action, snap_ts, intervention = snap
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -1718,6 +1822,8 @@ def run_capture_loop(
             for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
                 obs[cam_key] = frame
             obs_processed = robot_obs_proc(obs)
+            if stamp_pose_lag:
+                obs_processed[_POSE_LAG_KEY] = row_capture_ts - snap_ts
 
             obs_frame = build_dataset_frame(
                 dataset.features, obs_processed, prefix=OBS_STR
@@ -1728,11 +1834,14 @@ def run_capture_loop(
             row = {**obs_frame, **act_frame, "task": task}
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
-            dataset.add_frame(row)
-            if frame_counter is not None:
-                frame_counter["n"] += 1
-            if row_times is not None:
-                row_times.append(row_capture_ts)
+            with _capture_commit(record_event, row_epoch) as commit:
+                if not commit:
+                    continue
+                dataset.add_frame(row)
+                if frame_counter is not None:
+                    frame_counter["n"] += 1
+                if row_times is not None:
+                    row_times.append(row_capture_ts)
             frames_added += 1
             tick_cost_sum += time.perf_counter() - body_t0
             ticks_window += 1
@@ -1770,6 +1879,7 @@ def run_encoded_capture_loop(
     heartbeat: Callable[[], None] | None = None,
     row_times: "list[float] | None" = None,
     quality: "dict[str, int] | None" = None,
+    record_event: "threading.Event | None" = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
 
@@ -1779,9 +1889,17 @@ def run_encoded_capture_loop(
 
     ``frame_counter`` and ``row_times`` mirror :func:`run_capture_loop`'s (a
     mutable ``{"n": int}`` incremented per appended row, and one capture-time
-    append per row). There is no ``record_event``
-    on this path: capture rows remain continuous within an episode even though
-    each all-intra AU is independently decodable.
+    append per row).
+
+    ``record_event`` (optional) gates mid-episode capture like
+    :func:`run_capture_loop`'s: while cleared, every arriving AU is discarded
+    (the readers stay drained, nothing is muxed) and the dataset's
+    constant-fps timeline simply does not advance. On resume the loop forgets
+    its cross-row continuity — the unrecorded gap must not read as a
+    concealable hole or a cadence drift — and re-runs the row-zero alignment
+    on the next exposures, so the rows after the gap are as synchronized as
+    an episode's first. Every AU is an IDR, so the mp4 stays decodable across
+    the splice. This is what lets a DAgger freeze pause a relay-encoded take.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
     frame nearest each tick), this loop is driven by the **arrival** of access
@@ -1822,6 +1940,7 @@ def run_encoded_capture_loop(
         from lerobot.utils.visualization_utils import log_rerun_data
 
         tag_intervention = "intervention" in dataset.features
+        stamp_pose_lag = _POSE_LAG_FEATURE in dataset.features
 
         # Flush before the relay valve opens. Arming the cutoff first guarantees
         # that a newly admitted all-intra AU survives into row zero instead of
@@ -1880,6 +1999,7 @@ def run_encoded_capture_loop(
         previous_packets: dict[str, tuple[bytes, float, float]] = {}
         first_capture_ts: dict[str, float] = {}
         capture_intervals: dict[str, int] = {}
+        capture_floor = float("-inf")
 
         def read_usable_au(
             cam_key: str, cam: Any, deadline: float
@@ -1898,6 +2018,10 @@ def run_encoded_capture_loop(
                 if packet is None:
                     return None
                 cap_ts = packet[1]
+                if np.isfinite(cap_ts) and cap_ts < capture_floor:
+                    # A delayed encoder packet may arrive after resume even
+                    # though its exposure belongs to the preceding source.
+                    continue
                 if np.isfinite(cap_ts) and (previous is None or cap_ts > previous):
                     return packet
                 skipped = _note_quality(quality, f"{cam_key}.unusable_aus_skipped")
@@ -1949,10 +2073,64 @@ def run_encoded_capture_loop(
             label="camera exposure", can_drop=row_drop_is_safe, quality=quality
         )
         last_log = time.perf_counter()
+        paused = False
+        capture_epoch: int | None = None
+
+        def discard_queued_aus() -> int:
+            """Drop every AU already delivered; returns how many were dropped."""
+            dropped = 0
+            for cam in cameras.values():
+                while True:
+                    try:
+                        cam.read_next_au(timeout_ms=0)
+                    except TimeoutError:
+                        break
+                    dropped += 1
+            return dropped
 
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
+            row_epoch, recording, capture_floor = _capture_gate_state(record_event)
+            if row_epoch != capture_epoch:
+                if capture_epoch is not None:
+                    # A pause followed by resume can fit inside one blocked
+                    # AU read. Still reset continuity at that exact boundary.
+                    paused = True
+                capture_epoch = row_epoch
+            if not recording:
+                if not paused:
+                    paused = True
+                    _logger.info(
+                        "encoded capture paused at dataset row %d; discarding "
+                        "exposures until resume",
+                        total_rows,
+                    )
+                # Keep the readers drained: the relay keeps encoding through
+                # the pause and a reader whose bounded queue overflows reports
+                # a transport failure, which would end the take.
+                discard_queued_aus()
+                if stop_event.wait(timeout=0.02):
+                    return
+                continue
+            if paused:
+                paused = False
+                # The AUs exposed during the gap were never rows; the next
+                # exposure is this segment's row zero. Forget the continuity
+                # the gap would otherwise trip (a >1 s "hole", a cadence
+                # re-anchor, a held future AU) and let the row-zero alignment
+                # pick one synchronized cluster again.
+                discard_queued_aus()
+                held_packets.clear()
+                previous_packets.clear()
+                previous_capture_ts.clear()
+                first_capture_ts.clear()
+                capture_intervals.clear()
+                primed = False
+                state_pairer = _RowStatePairer(
+                    label="camera exposure", can_drop=row_drop_is_safe, quality=quality
+                )
+                _logger.info("encoded capture resumed at dataset row %d", total_rows)
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
             # serial reads compound (a stalled first camera would hand every
@@ -1995,6 +2173,10 @@ def run_encoded_capture_loop(
 
             if stop_event.is_set():
                 return
+            if _capture_gate_state(record_event)[:2] != (row_epoch, True):
+                # Paused while this row's AUs were being read (a read blocks
+                # up to the row budget). A rapid resume cannot revive them.
+                continue
 
             # Trust but verify the raw-valve barrier using the timestamps that
             # actually reached the recorder. A bounded leaky input queue or a
@@ -2313,7 +2495,7 @@ def run_encoded_capture_loop(
             )
             if snap is None:
                 continue
-            joint_obs, action, _snap_ts, intervention = snap
+            joint_obs, action, snap_ts, intervention = snap
             snapshot_skew_sum += snapshot_skew
             snapshot_skew_max = max(snapshot_skew_max, snapshot_skew)
 
@@ -2324,6 +2506,8 @@ def run_encoded_capture_loop(
             obs_processed = robot_obs_proc(dict(joint_obs))
             for cam_key, au in aus.items():
                 obs_processed[cam_key] = au
+            if stamp_pose_lag:
+                obs_processed[_POSE_LAG_KEY] = row_capture_ts - snap_ts
 
             obs_frame = build_dataset_frame(
                 dataset.features, obs_processed, prefix=OBS_STR
@@ -2334,16 +2518,19 @@ def run_encoded_capture_loop(
             row = {**obs_frame, **act_frame, "task": task}
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
-            dataset.add_frame(row)
-            for event in synthetic_repairs.values():
-                if event["missing_frames"] == 0 and repair_events is not None:
-                    repair_events.append(event)
-                event["missing_frames"] += 1
-                event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
-            if frame_counter is not None:
-                frame_counter["n"] += 1
-            if row_times is not None:
-                row_times.append(row_capture_ts)
+            with _capture_commit(record_event, row_epoch) as commit:
+                if not commit:
+                    continue
+                dataset.add_frame(row)
+                for event in synthetic_repairs.values():
+                    if event["missing_frames"] == 0 and repair_events is not None:
+                        repair_events.append(event)
+                    event["missing_frames"] += 1
+                    event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
+                if frame_counter is not None:
+                    frame_counter["n"] += 1
+                if row_times is not None:
+                    row_times.append(row_capture_ts)
             rows_added += 1
             total_rows += 1
 
@@ -2404,14 +2591,19 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
             fps=int(config["fps"]),
             allowed_extra_features=frozenset(config.get("allowed_resume_features", ())),
         )
-        return LeRobotDataset.resume(
-            repo_id=config["repo_id"],
-            root=config["dataset_root"],
-            image_writer_threads=4,
-            streaming_encoding=True,
-            encoder_threads=_ENCODER_THREADS,
-            rgb_encoder=rgb_encoder,
-        )
+        from .dataset_browser import dataset_metadata_lock
+
+        # The panel's task rename rewrites tasks.parquet / info.json under
+        # this lock; don't load them halfway through one.
+        with dataset_metadata_lock(config["dataset_root"]):
+            return LeRobotDataset.resume(
+                repo_id=config["repo_id"],
+                root=config["dataset_root"],
+                image_writer_threads=4,
+                streaming_encoding=True,
+                encoder_threads=_ENCODER_THREADS,
+                rgb_encoder=rgb_encoder,
+            )
     dataset = LeRobotDataset.create(
         repo_id=config["repo_id"],
         fps=config["fps"],
@@ -2427,11 +2619,17 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     # LeRobot's codebase_version describes the dataset format, not the Axol
     # URDF/world frame.  Record our pose-frame provenance on fresh Cartesian
     # datasets so future migrations can distinguish them without guessing.
+    # A Mantis session also records which tracker→gripper transforms its
+    # poses were mapped through (``mantis_tcp_transform``), for the same
+    # reason.
     action_names = (config["features"].get("action") or {}).get("names") or []
     if any("_ee." in name for name in action_names):
         from .cartesian_frame import write_cartesian_frame_marker
 
-        write_cartesian_frame_marker(config["dataset_root"])
+        write_cartesian_frame_marker(
+            config["dataset_root"],
+            mantis_tcp_transform=config.get("mantis_tcp_transform"),
+        )
     return dataset
 
 
@@ -2754,6 +2952,23 @@ def _discard_episode_buffer(dataset: Any) -> str | None:
         _logger.exception("discarding the buffered episode failed")
         return f"episode discard failed: {type(error).__name__}: {error}"
     return None
+
+
+def _save_episode_locked(dataset: "LeRobotDataset", dataset_root: str) -> None:
+    """``dataset.save_episode()`` under the dataset's metadata lock.
+
+    The panel's dataset preview can rename a saved episode's task while this
+    session still has the dataset open (``dataset_browser.rename_episode_task``).
+    LeRobot's save rewrites ``meta/tasks.parquet`` and ``meta/info.json`` from
+    its in-memory copies, so the save holds the same lock and first reloads the
+    task table from disk: a task the rename appended keeps its index, and this
+    episode's new tasks (if any) are numbered after it.
+    """
+    from .dataset_browser import dataset_metadata_lock, reload_tasks_from_disk
+
+    with dataset_metadata_lock(dataset_root):
+        reload_tasks_from_disk(dataset.meta, dataset_root)
+        dataset.save_episode()
 
 
 def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
@@ -3129,7 +3344,7 @@ class InProcessRecorder:
         self._stop: threading.Event | None = None
         # Mid-episode capture gate + row counter; same semantics as
         # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
-        self._record = threading.Event()
+        self._record = _CaptureGate()
         self._frames: dict[str, int] = {"n": 0}
         # Per-row capture times for the current episode (see trim_episode_after).
         self._row_times: list[float] = []
@@ -3193,14 +3408,12 @@ class InProcessRecorder:
         self._thread.start()
 
     def pause_episode(self) -> int:
-        """Stop capturing mid-episode; returns rows so far. Idempotent."""
-        self._record.clear()
-        return self._frames["n"]
+        """Fence pending rows and return the exact paused count. Idempotent."""
+        return self._record.transition(False, self._frames)
 
     def resume_episode(self) -> int:
         """Resume a paused episode (the capture clock re-anchors). Idempotent."""
-        self._record.set()
-        return self._frames["n"]
+        return self._record.transition(True, self._frames)
 
     def frame_count(self) -> int:
         """Rows captured in the current episode (dataset time = n / fps)."""
@@ -3286,7 +3499,7 @@ class InProcessRecorder:
         except Exception:
             self._dataset.clear_episode_buffer()
             raise
-        self._dataset.save_episode()
+        _save_episode_locked(self._dataset, self._config["dataset_root"])
         # The write succeeded, so shutdown must preserve/finalize this episode
         # even if the durability step below fails. This is an internal cleanup
         # count, not a success acknowledgement to the caller.
@@ -3516,7 +3729,13 @@ def _recorder_main(
 
     # Keep the recorder (+ its NVENC gst children, which inherit this) off the
     # control loop's cores; fall back to a positive nice where affinity isn't
-    # available so it still never preempts the control loop / IK.
+    # available so it still never preempts the control loop / IK. The torch +
+    # lerobot imports below are the one heavy thing this process ever does
+    # (~25 s of CPU): they run widened onto the idle IK core so the relay's
+    # SCHED_FIFO camera threads on the background cores cannot stretch them
+    # past the ready handshake (see affinity.pin_background_and_ik). Whether
+    # the process then narrows to the background cores before any reader
+    # thread exists is the caller's ``share_ik_core`` (below).
     from ..utils import affinity
     from ..utils.stall_diag import (
         GcHold,
@@ -3525,7 +3744,8 @@ def _recorder_main(
         install_gc_pause_logger,
     )
 
-    if not affinity.pin_background():
+    pinned = affinity.pin_background_and_ik()
+    if not pinned:
         try:
             os.nice(5)
         except (AttributeError, OSError):
@@ -3577,6 +3797,16 @@ def _recorder_main(
     else:
         install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
+
+    # Imports done. Unless the caller shares the IK core with this recorder
+    # (the policy ops, whose relay leaves the background cores ~5 % idle —
+    # see affinity.pin_background_and_ik), narrow to the recorder cores
+    # before the readers spawn their gst threads (threads inherit the
+    # spawning thread's affinity), so nothing of the steady state lands on
+    # the IK core. On 12+ core hosts those are two cores of its own, free of
+    # FIFO camera work; elsewhere they are the background cores.
+    if pinned and not config.get("share_ik_core", False):
+        affinity.pin_recorder()
 
     # Build a per-source frame reader matching the relay's chosen transport.
     # gstshm-h264: an EncodedAuReader (shmsrc → gdpdepay → h264parse → appsink)
@@ -3675,11 +3905,8 @@ def _recorder_main(
     capture_quality: dict[str, int] = {}
     episodes_recorded = 0
     save_poisoned = False
-    # Mid-episode capture gate + row counter (see run_capture_loop). The gate
-    # is only supported on the raw transports: pausing the encoded
-    # (gstshm-h264) stream mid-episode would drop access units that later
-    # P-frames reference, corrupting the mp4.
-    record_event = threading.Event()
+    # Exact row-commit fence for raw and all-intra encoded capture.
+    record_event = _CaptureGate()
     frame_counter: dict[str, int] = {"n": 0}
     # Per-row capture times for the current episode (see trim_episode_after).
     row_times: list[float] = []
@@ -3773,8 +4000,7 @@ def _recorder_main(
                     quality=capture_quality,
                 )
                 loop_kwargs["frame_counter"] = frame_counter
-                if not encoded_mode:
-                    loop_kwargs["record_event"] = record_event
+                loop_kwargs["record_event"] = record_event
                 armed = threading.Event()
                 if encoded_mode:
                     loop_kwargs["on_armed"] = armed.set
@@ -3827,31 +4053,9 @@ def _recorder_main(
                     # reply even though the capture thread has already exited.
                     conn.send(("finished", frame_counter["n"], finished_capture_error))
             elif kind == "pause_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "pause_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.clear()
-                    conn.send(("paused", frame_counter["n"]))
+                conn.send(("paused", record_event.transition(False, frame_counter)))
             elif kind == "resume_episode":
-                if encoded_mode:
-                    conn.send(
-                        (
-                            "error",
-                            "resume_episode requires a raw transport; the "
-                            "encoded (gstshm-h264) transport can't gate "
-                            "mid-episode.",
-                        )
-                    )
-                else:
-                    record_event.set()
-                    conn.send(("resumed", frame_counter["n"]))
+                conn.send(("resumed", record_event.transition(True, frame_counter)))
             elif kind == "frame_count":
                 conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
@@ -3897,7 +4101,7 @@ def _recorder_main(
                         conn.send(("error", str(exc)))
                         continue
                     try:
-                        dataset.save_episode()
+                        _save_episode_locked(dataset, config["dataset_root"])
                         # The dataset write happened even if the durability
                         # flush below fails. Count it for shutdown recovery so
                         # finalization verifies/preserves the episode instead
@@ -4012,6 +4216,16 @@ class DatasetRecorderProcess:
     exposes the same interface as :class:`InProcessRecorder`. ``publish`` is the
     only hot-path call (one ~40-float shm write per control tick); the episode
     commands are rare and run on the main thread between episodes.
+
+    ``config["share_ik_core"]`` (default false) keeps the recorder's steady
+    state on the IK core as well as the background cores. Set it from the ops
+    whose relay also runs the policy ring branch (``collect-dagger``, the Pi
+    ``run-policy``): with three VIC branches per camera plus the capture daemon,
+    all real-time, the background cores leave the CFS recorder too little to
+    sustain 60 rows/s and every take ends on ``encoded-AU backlog exceeded``
+    after 25-30 s — see :func:`almond_axol.utils.affinity.pin_background_and_ik`.
+    On 12+ core hosts the recorder has cores of its own free of FIFO camera
+    work, nothing is borrowed, and the flag has no effect.
     """
 
     def __init__(
@@ -4242,9 +4456,9 @@ class DatasetRecorderProcess:
     def _episode_gate(self, command: str, expect: str) -> int:
         """Send a pause/resume/frame-count command; return the row count.
 
-        The reply's count may lag the capture thread by one in-flight row
-        (the gate is checked at tick boundaries) — a ±1-frame slop that is
-        negligible for annotation spans.
+        Pause/resume serialize with row commits, so their returned counts
+        identify exact dataset boundaries. A paused acquisition is discarded
+        even if it finishes after resume. A frame-count query is a live sample.
         """
         with self._lock:
             self._conn.send((command,))
@@ -4258,10 +4472,10 @@ class DatasetRecorderProcess:
     def pause_episode(self) -> int:
         """Stop capturing mid-episode (rows + clock gate); returns rows so far.
 
-        Raw transports only — the encoded (gstshm-h264) transport can't gate
-        mid-episode (raises). On resume the capture clock re-anchors, so the
-        episode's index-based timestamps stay contiguous across the gap.
-        Idempotent.
+        On the raw transports the capture clock re-anchors on resume; on the
+        encoded (gstshm-h264) transport the arriving AUs are discarded and the
+        row-zero alignment re-runs on resume. Either way the episode's
+        index-based timestamps stay contiguous across the gap. Idempotent.
         """
         return self._episode_gate("pause_episode", "paused")
 

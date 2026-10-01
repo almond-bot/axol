@@ -44,8 +44,16 @@ from typing import Any
 
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
+from ..utils.logquiet import quiet_noisy_loggers
 from ..zed import stereo_serials
-from .commands import flag_enabled, normalize_boolean_args
+from .commands import (
+    flag_default,
+    flag_enabled,
+    flag_value,
+    is_robot_free,
+    normalize_boolean_args,
+    safety_flags,
+)
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -205,6 +213,54 @@ def _forward_line(sink: Any, line: str) -> None:
         pass
 
 
+def prove_motors_torque_free(robot: Any) -> str | None:
+    """Prove every motor is torque-free, or say why that could not be shown.
+
+    Used when an operation could not confirm it disabled the motors. Rather
+    than assume, this looks: reacquire the idle link if a task had released
+    it, force one ping sweep, and accept only when each motor reads
+    ``DISABLED`` or does not answer at all (``reachable is False``, i.e. it
+    is unpowered). A motor that answers and is not disabled is holding torque
+    nobody supervises; a motor with no reading (``reachable is None``) proves
+    nothing. Both refuse.
+
+    Returns ``None`` on proof, otherwise the refusal reason. The probe only
+    borrows the buses: the failed operation may still hold them, so on
+    refusal a link this call brought up is handed back (``busy``) exactly as
+    it was before. A link that was already connected is left alone.
+    """
+    reacquired = False
+
+    def refuse(error: str) -> str:
+        if reacquired:
+            try:
+                robot.release()
+            except Exception as exc:  # noqa: BLE001 - report with the refusal
+                error = f"{error}; also could not hand the buses back: {exc}"
+        return error
+
+    try:
+        reacquired = bool(robot.reacquire())
+        status = robot.probe()
+    except Exception as exc:  # noqa: BLE001 - any unread motor keeps the lockout
+        return refuse(f"could not reach the motors to prove they are disabled: {exc}")
+    live = [
+        m
+        for m in status["motors"]
+        if m["reachable"] is not False and m["status"] != "DISABLED"
+    ]
+    if live:
+        return refuse(
+            "these motors still answer and are not disabled: "
+            + ", ".join(
+                f"{m['arm']} {m['joint'].lower()}"
+                f" ({str(m['status']).replace('_', ' ').lower()})"
+                for m in live
+            )
+        )
+    return None
+
+
 class _StreamTee:
     """Mirror a stream to the original fd and emit each completed line."""
 
@@ -320,6 +376,9 @@ class _Capture:
         root = logging.getLogger()
         self._old_root_level = root.level
         root.setLevel(self._level)
+        # A DEBUG op must not unmute aiortc's per-packet lines etc. (the
+        # in-process CLIs do the same right after their basicConfig).
+        quiet_noisy_loggers()
         root.addHandler(self._handler)
         self._old_stdout, self._old_stderr = sys.stdout, sys.stderr
         try:
@@ -454,6 +513,10 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+            # The cap follows the root level: re-derive it for the restored
+            # level so a finished DEBUG op's INFO cap does not outlive it
+            # under a stricter root (nor an ERROR op's cap mute warnings).
+            quiet_noisy_loggers()
         # Before the saved streams close below: handlers must not be left on them.
         self._restore_handlers()
         self._teardown_fd_tee()
@@ -509,8 +572,16 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None, settings: Any = None) -> None:
+    def __init__(
+        self, robot_link: Any = None, settings: Any = None, jelly_link: Any = None
+    ) -> None:
         self._robot_link = robot_link
+        # Idle links to Jelly's wheel bus and lift controller
+        # (serve.jelly_link.JellyLink). Released for every hardware run that
+        # could drive Jelly (teleop drives it whenever it is attached) and
+        # reacquired when the run ends. True while this runner holds them.
+        self._jelly_link = jelly_link
+        self._jelly_released = False
         # Shared operator settings (serve.settings.SettingsStore). Folded into
         # every op start beneath the request's own args, so per-run values win.
         self._settings = settings
@@ -540,12 +611,13 @@ class OperationRunner:
         # loop drains.
         self._episode_control: Any = None
         # A command reported that its hardware disconnect/disable did not
-        # complete.  The command may still own one or both CAN buses, so no
-        # later operation may start and the idle RobotLink does not reacquire
-        # them on its own.  Two ways out: restarting the serve process, or
-        # ``/api/op/clear-lockout``, which borrows the buses just long enough
-        # to prove every motor is torque-free (disabled or unpowered) and
-        # hands them back if it cannot (see clear_hardware_cleanup_lockout).
+        # complete, and the probe ``_finish`` ran right after it could not
+        # prove the motors torque-free (see prove_motors_torque_free).  The
+        # command may still own one or both CAN buses, so no later operation
+        # may start and the idle RobotLink does not reacquire them on its own.
+        # Ways out: ``/api/op/clear-lockout`` re-runs the same probe (after
+        # the operator cuts motor power, typically), or the serve process
+        # restarts.
         self._hardware_cleanup_uncertain = False
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -676,17 +748,11 @@ class OperationRunner:
             # config to describe exactly the same hardware/no-hardware mode.
             # Otherwise (for example) ``mantis: true`` in config_path could
             # borrow an Axol survey and then open the Mantis buses.
-            safety_flags = tuple(
-                dict.fromkeys(
-                    flag
-                    for flag in (cmd.sim_flag, *cmd.robot_free_flags)
-                    if flag is not None
-                )
-            )
             parsed_flags: dict[str, bool] = {}
-            for flag in safety_flags:
-                requested = flag_enabled(args.get(flag))
-                parsed = flag_enabled(getattr(cfg, flag, False))
+            for flag in safety_flags(cmd):
+                default = flag_default(cmd, flag)
+                requested = flag_value(args.get(flag), default)
+                parsed = flag_value(getattr(cfg, flag, default), default)
                 if parsed != requested:
                     raise ValueError(
                         f"{op_id}'s parsed {flag}={parsed} does not match the "
@@ -747,13 +813,11 @@ class OperationRunner:
                         "control panel's Mantis tile"
                     )
 
-            is_sim = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
-            # A robot-free run (sim, or e.g. teleop's jelly_only) never touches
-            # the arms, so the persistent robot link stays connected and its
-            # motor telemetry keeps streaming while the op runs.
-            robot_free = is_sim or any(
-                parsed_flags.get(flag, False) for flag in cmd.robot_free_flags
-            )
+            # A robot-free run (sim, Mantis, or teleop with the arms switched
+            # off) never touches the arms, so the persistent robot link stays
+            # connected and its motor telemetry keeps streaming while the op
+            # runs.
+            robot_free = is_robot_free(cmd, parsed_flags)
             hardware_profile = "mantis" if mantis_mode else "axol"
             link_matches_run = (
                 self._robot_link is not None
@@ -765,6 +829,18 @@ class OperationRunner:
                 cmd.uses_can_bus
                 and link_matches_run
                 and (not robot_free or hardware_profile == "mantis")
+            )
+            # Jelly is inferred from the attached CAN interfaces at run time,
+            # so any real-hardware Axol run on the CAN bus may open the wheel
+            # and lift buses (teleop drives Jelly whenever it is attached; an
+            # arm-free teleop is Jelly-only). Sim never touches Jelly and a
+            # Mantis run owns only the rig's hub.
+            sim_run = cmd.sim_flag is not None and parsed_flags.get(cmd.sim_flag, False)
+            needs_jelly = (
+                cmd.uses_can_bus
+                and not sim_run
+                and not mantis_mode
+                and self._jelly_link is not None
             )
             if (
                 needs_robot
@@ -831,6 +907,28 @@ class OperationRunner:
                     "[serve] error: robot link could not be released; "
                     "operation was not started"
                 )
+                session.close_stream()
+                return session
+        self._jelly_released = False
+        if needs_jelly:
+            try:
+                self._jelly_link.release()
+                self._jelly_released = True
+            except Exception as exc:  # noqa: BLE001
+                session.status = "error"
+                session.error = f"{type(exc).__name__}: {exc}"
+                session.emit(
+                    "[serve] error: Jelly link could not be released; "
+                    "operation was not started"
+                )
+                if needs_robot and self._robot_link is not None:
+                    try:
+                        self._robot_link.reacquire()
+                    except Exception as reacquire_exc:  # noqa: BLE001
+                        session.emit(
+                            f"[serve] error: robot link reacquire failed: "
+                            f"{reacquire_exc}"
+                        )
                 session.close_stream()
                 return session
 
@@ -1170,7 +1268,7 @@ class OperationRunner:
         recording). ``legacy`` reads the old single ``resolution`` key as the
         streaming resolution for back-compat.
         """
-        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS
 
         val = (cameras or {}).get(key)
         if val is None and legacy:
@@ -1238,10 +1336,7 @@ class OperationRunner:
         default raises each recording camera's physical capture rate to match;
         higher rates may still be rejected at large capture resolutions.
         """
-        from ..lerobot.camera.configuration_zed import (
-            ZED_RESOLUTION_DIMS,
-            ZedCameraConfig,
-        )
+        from ..video.zed_sdk import ZED_RESOLUTION_DIMS, ZedSdkCameraConfig
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
@@ -1260,7 +1355,8 @@ class OperationRunner:
             recording_fps = int(float(str(args.get("fps") or 0)))
         except (TypeError, ValueError):
             recording_fps = 0
-        default_capture_fps = ZedCameraConfig.fps or 0
+        # Same default as the LeRobot ZedCameraConfig the op parses this into.
+        default_capture_fps = ZedSdkCameraConfig.fps or 0
 
         for slot, serial in serials.items():
             streams, s_eyes = self._branch(
@@ -1699,14 +1795,31 @@ class OperationRunner:
         cleanup_uncertain: bool = False,
     ) -> None:
         if cleanup_uncertain:
-            with self._lock:
-                self._hardware_cleanup_uncertain = True
-            message = (
-                "hardware cleanup could not be verified; robot ownership remains "
-                "reserved until axol serve is restarted"
-            )
-            self._mark_terminal(session, "error", error=session.error or message)
-            session.emit(f"[serve] safety lockout: {message}")
+            # The operation could not confirm it torqued the motors off.  Do
+            # not make the operator prove it by hand: look now, and only
+            # reserve the robot when the motors really cannot be shown safe.
+            if self._robot_link is None:
+                refusal: str | None = "no robot link to probe the motors with"
+            else:
+                session.emit(
+                    "[serve] hardware cleanup could not be verified; probing the motors"
+                )
+                refusal = prove_motors_torque_free(self._robot_link)
+            if refusal is None:
+                cleanup_uncertain = False
+                session.emit(
+                    "[serve] every motor reads disabled or unpowered; robot released"
+                )
+            else:
+                with self._lock:
+                    self._hardware_cleanup_uncertain = True
+                message = (
+                    f"{refusal}; robot ownership remains reserved. Cut motor "
+                    "power, then use Re-check motors in the control panel "
+                    "(POST /api/op/clear-lockout) to release it"
+                )
+                self._mark_terminal(session, "error", error=session.error or message)
+                session.emit(f"[serve] safety lockout: {message}")
         self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
         if needs_robot and self._robot_link is not None and not cleanup_uncertain:
@@ -1718,4 +1831,12 @@ class OperationRunner:
                 self._mark_terminal(session, "error", error=message)
                 session.emit(f"[serve] error: {message}")
                 _logger.warning("robot reacquire failed: %s", exc)
+        if self._jelly_released and not cleanup_uncertain:
+            self._jelly_released = False
+            try:
+                if self._jelly_link.reacquire():
+                    session.emit("[serve] Jelly link reacquired")
+            except Exception as exc:  # noqa: BLE001 - devices left in error state
+                session.emit(f"[serve] warning: Jelly link reacquire failed: {exc}")
+                _logger.warning("Jelly reacquire failed: %s", exc)
         session.close_stream()

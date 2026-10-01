@@ -9,6 +9,7 @@
  * Many thanks to all socketcan devs!
  */
 
+#include <linux/err.h>
 #include <linux/ethtool.h>
 #include <linux/init.h>
 #include <linux/signal.h>
@@ -193,8 +194,6 @@ struct gs_can {
 
 	struct usb_anchor tx_submitted;
 	atomic_t active_tx_urbs;
-	void *rxbuf[GS_MAX_RX_URBS];
-	dma_addr_t rxbuf_dma[GS_MAX_RX_URBS];
 };
 
 /* usb interface struct */
@@ -205,6 +204,15 @@ struct gs_usb {
 	unsigned int pipe_in;
 	unsigned int pipe_out;
 	u8 active_channels;
+	/* RX URBs are shared by every channel of the device and allocated by
+	 * whichever channel opens first, so their buffers live here rather
+	 * than in that channel's gs_can (backport of upstream 2bda24ef95c0
+	 * "can: gs_usb: gs_usb_open/close(): fix memory leak"): with the
+	 * dual-channel hub the closing channel is otherwise not the one that
+	 * allocated them and they leak on every close.
+	 */
+	void *rxbuf[GS_MAX_RX_URBS];
+	dma_addr_t rxbuf_dma[GS_MAX_RX_URBS];
 };
 
 /* 'allocate' a tx context.
@@ -331,9 +339,36 @@ static void gs_usb_receive_bulk_callback(struct urb *urb)
 		return;
 	}
 
-	/* device reports out of range channel id */
-	if (hf->channel >= GS_MAX_INTF)
-		goto device_detach;
+	/* Runt transfer: the buffer past actual_length is whatever the
+	 * previous completion left there (or never-initialised coherent
+	 * memory on the first one), so nothing in hf can be trusted. Drop
+	 * it and keep polling; the interfaces stay up.
+	 */
+	if (urb->actual_length < sizeof(*hf)) {
+		dev_warn_ratelimited(&usbcan->udev->dev,
+				     "dropping short USB frame (%u of %zu bytes)\n",
+				     urb->actual_length, sizeof(*hf));
+		goto resubmit_urb;
+	}
+
+	/* The frame names a channel this driver never registered: either
+	 * the index is out of range, or it is within GS_MAX_INTF but the
+	 * device exposes fewer channels (a single-channel adapter reporting
+	 * channel 1) so canch[] holds NULL there. Upstream 5.15 detaches the
+	 * whole device for the first case and dereferences NULL for the
+	 * second — that oops runs in softirq context and is a "Fatal
+	 * exception in interrupt" panic, i.e. an unattended reboot of the
+	 * robot host. Such a frame can come from adapter firmware or from
+	 * the stale-URB use-after-free described at resubmit_urb below; in
+	 * neither case may it reboot the host or take the arm buses down
+	 * until a replug, so both cases drop the frame and resubmit.
+	 */
+	if (hf->channel >= GS_MAX_INTF || !usbcan->canch[hf->channel]) {
+		dev_warn_ratelimited(&usbcan->udev->dev,
+				     "dropping frame for unregistered channel %u\n",
+				     hf->channel);
+		goto resubmit_urb;
+	}
 
 	dev = usbcan->canch[hf->channel];
 
@@ -342,6 +377,13 @@ static void gs_usb_receive_bulk_callback(struct urb *urb)
 
 	if (!netif_device_present(netdev))
 		return;
+
+	/* RX URBs are shared by all channels of the device: a frame for a
+	 * channel that has since been closed (tx contexts already reset, skb
+	 * queue stopped) is not ours to deliver or echo any more.
+	 */
+	if (!netif_running(netdev))
+		goto resubmit_urb;
 
 	if (hf->echo_id == -1) { /* normal rx */
 		skb = alloc_can_skb(dev->netdev, &cf);
@@ -415,15 +457,38 @@ static void gs_usb_receive_bulk_callback(struct urb *urb)
 			  usbcan
 			  );
 
+	/* The USB core unanchors a URB before calling its completion, so
+	 * without re-anchoring here every RX URB that has completed once
+	 * escapes usb_kill_anchored_urbs() in gs_can_close() (upstream
+	 * 7352e1d5932a "can: gs_usb: gs_usb_receive_bulk_callback(): fix URB
+	 * memory leak"). In this driver that is worse than a leak: close()
+	 * then frees the coherent buffers those still-pending URBs point at,
+	 * and on the next open() they sit ahead of the fresh URBs in the
+	 * endpoint queue, so the first frames of the new session are DMA'd
+	 * into freed memory and parsed from it — a garbage hf->channel is how
+	 * the single-channel adapter reached the canch[] NULL dereference.
+	 */
+	usb_anchor_urb(urb, &usbcan->rx_submitted);
+
 	rc = usb_submit_urb(urb, GFP_ATOMIC);
+	if (!rc)
+		return;
+
+	/* Leaving a never-submitted URB anchored makes the kill loop in
+	 * gs_can_close() spin forever (upstream 79a6d1bfe114).
+	 */
+	usb_unanchor_urb(urb);
 
 	/* USB failure take down all interfaces */
 	if (rc == -ENODEV) {
- device_detach:
 		for (rc = 0; rc < GS_MAX_INTF; rc++) {
 			if (usbcan->canch[rc])
 				netif_device_detach(usbcan->canch[rc]->netdev);
 		}
+	} else if (rc != -ESHUTDOWN) {
+		dev_info_ratelimited(&usbcan->udev->dev,
+				     "failed to re-submit IN URB: %pe\n",
+				     ERR_PTR(rc));
 	}
 }
 
@@ -590,6 +655,25 @@ static netdev_tx_t gs_can_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
+/* Stop the device-wide RX polling and release its buffers. Only valid once
+ * no channel of the device is open any more (or the opening one failed
+ * before it counted itself in active_channels).
+ */
+static void gs_usb_kill_rx_urbs(struct gs_usb *parent)
+{
+	unsigned int i;
+
+	usb_kill_anchored_urbs(&parent->rx_submitted);
+	for (i = 0; i < GS_MAX_RX_URBS; i++) {
+		usb_free_coherent(parent->udev,
+				  sizeof(struct gs_host_frame),
+				  parent->rxbuf[i],
+				  parent->rxbuf_dma[i]);
+		parent->rxbuf[i] = NULL;
+		parent->rxbuf_dma[i] = 0;
+	}
+}
+
 static int gs_can_open(struct net_device *netdev)
 {
 	struct gs_can *dev = netdev_priv(netdev);
@@ -611,8 +695,10 @@ static int gs_can_open(struct net_device *netdev)
 
 			/* alloc rx urb */
 			urb = usb_alloc_urb(0, GFP_KERNEL);
-			if (!urb)
-				return -ENOMEM;
+			if (!urb) {
+				rc = -ENOMEM;
+				goto out_kill_rx_urbs;
+			}
 
 			/* alloc rx buffer */
 			buf = usb_alloc_coherent(dev->udev,
@@ -623,7 +709,8 @@ static int gs_can_open(struct net_device *netdev)
 				netdev_err(netdev,
 					   "No memory left for USB buffer\n");
 				usb_free_urb(urb);
-				return -ENOMEM;
+				rc = -ENOMEM;
+				goto out_kill_rx_urbs;
 			}
 
 			urb->transfer_dma = buf_dma;
@@ -658,8 +745,8 @@ static int gs_can_open(struct net_device *netdev)
 				break;
 			}
 
-			dev->rxbuf[i] = buf;
-			dev->rxbuf_dma[i] = buf_dma;
+			parent->rxbuf[i] = buf;
+			parent->rxbuf_dma[i] = buf_dma;
 
 			/* Drop reference,
 			 * USB core will take care of freeing it
@@ -669,8 +756,10 @@ static int gs_can_open(struct net_device *netdev)
 	}
 
 	dm = kmalloc(sizeof(*dm), GFP_KERNEL);
-	if (!dm)
-		return -ENOMEM;
+	if (!dm) {
+		rc = -ENOMEM;
+		goto out_kill_rx_urbs;
+	}
 
 	/* flags */
 	ctrlmode = dev->can.ctrlmode;
@@ -708,7 +797,7 @@ static int gs_can_open(struct net_device *netdev)
 		netdev_err(netdev, "Couldn't start device (err=%d)\n", rc);
 		kfree(dm);
 		dev->can.state = CAN_STATE_STOPPED;
-		return rc;
+		goto out_kill_rx_urbs;
 	}
 
 	kfree(dm);
@@ -718,6 +807,17 @@ static int gs_can_open(struct net_device *netdev)
 		netif_start_queue(netdev);
 
 	return 0;
+
+out_kill_rx_urbs:
+	/* Only the first opener submitted RX URBs; a sibling channel that is
+	 * still open keeps them.  Without this unwind a failed open left the
+	 * URBs polling with nobody accounted for them, and the next open
+	 * overwrote rxbuf[] with a fresh set.
+	 */
+	if (!parent->active_channels)
+		gs_usb_kill_rx_urbs(parent);
+	close_candev(netdev);
+	return rc;
 }
 
 static int gs_can_close(struct net_device *netdev)
@@ -725,20 +825,13 @@ static int gs_can_close(struct net_device *netdev)
 	int rc;
 	struct gs_can *dev = netdev_priv(netdev);
 	struct gs_usb *parent = dev->parent;
-	unsigned int i;
 
 	netif_stop_queue(netdev);
 
 	/* Stop polling */
 	parent->active_channels--;
-	if (!parent->active_channels) {
-		usb_kill_anchored_urbs(&parent->rx_submitted);
-		for (i = 0; i < GS_MAX_RX_URBS; i++)
-			usb_free_coherent(dev->udev,
-					  sizeof(struct gs_host_frame),
-					  dev->rxbuf[i],
-					  dev->rxbuf_dma[i]);
-	}
+	if (!parent->active_channels)
+		gs_usb_kill_rx_urbs(parent);
 
 	/* Stop sending URBs */
 	usb_kill_anchored_urbs(&dev->tx_submitted);
@@ -829,6 +922,7 @@ static const struct ethtool_ops gs_usb_ethtool_ops = {
 
 static struct gs_can *gs_make_candev(unsigned int channel,
 				     struct usb_interface *intf,
+				     struct gs_usb *parent,
 				     struct gs_device_config *dconf)
 {
 	struct gs_can *dev;
@@ -893,6 +987,11 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 	dev->iface = intf;
 	dev->netdev = netdev;
 	dev->channel = channel;
+	/* Must be set before register_candev(): the udev hotplug rule
+	 * installed by `axol can.setup` brings the interface up as soon as it
+	 * appears, and gs_can_open() dereferences dev->parent.
+	 */
+	dev->parent = parent;
 
 	init_usb_anchor(&dev->tx_submitted);
 	atomic_set(&dev->active_tx_urbs, 0);
@@ -1036,10 +1135,11 @@ static int gs_usb_probe(struct usb_interface *intf,
 	dev->pipe_out = usb_sndbulkpipe(dev->udev, ep_out->bEndpointAddress);
 
 	for (i = 0; i < icount; i++) {
-		dev->canch[i] = gs_make_candev(i, intf, dconf);
+		dev->canch[i] = gs_make_candev(i, intf, dev, dconf);
 		if (IS_ERR_OR_NULL(dev->canch[i])) {
 			/* save error code to return later */
 			rc = PTR_ERR(dev->canch[i]);
+			dev->canch[i] = NULL;
 
 			/* on failure destroy previously created candevs */
 			icount = i;
@@ -1047,11 +1147,11 @@ static int gs_usb_probe(struct usb_interface *intf,
 				gs_destroy_candev(dev->canch[i]);
 
 			usb_kill_anchored_urbs(&dev->rx_submitted);
+			usb_set_intfdata(intf, NULL);
 			kfree(dconf);
 			kfree(dev);
 			return rc;
 		}
-		dev->canch[i]->parent = dev;
 	}
 
 	kfree(dconf);
@@ -1104,5 +1204,5 @@ MODULE_DESCRIPTION(
 "Socket CAN device driver for Geschwister Schneider Technologie-, "
 "Entwicklungs- und Vertriebs UG. USB2.0 to CAN interfaces\n"
 "and bytewerk.org candleLight USB CAN interfaces.");
-MODULE_VERSION("almond-5.15.148-hub2");
+MODULE_VERSION("almond-5.15.148-hub3");
 MODULE_LICENSE("GPL v2");

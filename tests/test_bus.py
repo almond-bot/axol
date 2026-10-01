@@ -16,12 +16,11 @@ from unittest.mock import patch
 
 import can
 
-from almond_axol.motor import bus as bus_module
-from almond_axol.motor.bus import CanBus
-
 # CanBus.start() imports rt.link lazily; import it up front so the heavy
 # package import (which itself uses subprocess) happens before Popen is faked.
 import almond_axol.rt.link  # noqa: E402,F401
+from almond_axol.motor import bus as bus_module
+from almond_axol.motor.bus import CanBus
 
 
 def _frame(payload: bytes) -> bytes:
