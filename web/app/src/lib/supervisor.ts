@@ -1790,6 +1790,34 @@ export function perRunFields(
     .sort((a, b) => Number(b.required) - Number(a.required))
 }
 
+/** The `policy_type` value for the custom policy interface. */
+export const CUSTOM_POLICY_TYPE = "custom"
+
+const CUSTOM_POLICY_PATH_HELP =
+  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
+
+/** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
+export function isCustomPolicyRun(values: Record<string, unknown>): boolean {
+  return values.policy_type === CUSTOM_POLICY_TYPE
+}
+
+/**
+ * Per-run field rules that depend on the chosen policy type. A LeRobot policy
+ * needs its checkpoint path; a custom policy endpoint selects its own model,
+ * so the path is unused and is not sent. The host marks `policy_path` optional
+ * so a custom run can start; this re-marks it required for every other policy
+ * type. Ops without a `policy_type` field pass through untouched.
+ */
+export function applyPolicyTypeRules(fields: SchemaField[], custom: boolean): SchemaField[] {
+  if (!fields.some((f) => f.key === "policy_type")) return fields
+  return fields.map((f) => {
+    if (f.key !== "policy_path") return f
+    return custom
+      ? { ...f, required: false, help: CUSTOM_POLICY_PATH_HELP }
+      : { ...f, required: true }
+  })
+}
+
 // ---------------------------------------------------------------------------
 // Per-operation settings: localStorage persistence + JSON import/export
 // ---------------------------------------------------------------------------

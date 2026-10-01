@@ -63,6 +63,8 @@ from .config_vr import AxolVRTeleopConfig
 _logger = logging.getLogger(__name__)
 
 _JOINTS = list(Joint)
+_ASYNC_DISCONNECT_TIMEOUT_S = 15.0
+_LOOP_DRAIN_TIMEOUT_S = 2.0
 
 
 class AxolVRTeleop(Teleoperator):
@@ -453,7 +455,7 @@ class AxolVRTeleop(Teleoperator):
                 cleanup_future = asyncio.run_coroutine_threadsafe(
                     cleanup_coroutine, loop
                 )
-                cleanup_future.result(timeout=15)
+                cleanup_future.result(timeout=_ASYNC_DISCONNECT_TIMEOUT_S)
             except BaseException as error:
                 failures.append(("asynchronous cleanup", error))
                 if cleanup_future is None:
@@ -503,6 +505,22 @@ class AxolVRTeleop(Teleoperator):
                         ),
                     )
                 )
+
+        # Future.cancel() requests cancellation but does not join the asyncio
+        # task. Keep the loop running while that coroutine and the server's
+        # connection/lifespan tasks execute their asynchronous finalizers.
+        if loop_thread_alive:
+            drain_coroutine = self._drain_loop_tasks()
+            drain_future: Any | None = None
+            try:
+                drain_future = asyncio.run_coroutine_threadsafe(drain_coroutine, loop)
+                drain_future.result(timeout=_LOOP_DRAIN_TIMEOUT_S + 1.0)
+            except BaseException as error:
+                failures.append(("event-loop task drain", error))
+                if drain_future is None:
+                    drain_coroutine.close()
+                elif not drain_future.done():
+                    drain_future.cancel()
 
         # The event loop is an independently-owned resource.  Always stop and
         # join it, even if Jelly/VR/IK cleanup above raised, so direct SDK
@@ -563,6 +581,43 @@ class AxolVRTeleop(Teleoperator):
 
         self._cleanup_pending = False
         _logger.info("AxolVRTeleop disconnected.")
+
+    async def _drain_loop_tasks(self) -> None:
+        """Join pending work on this teleoperator's dedicated loop before close."""
+        loop = asyncio.get_running_loop()
+        current = asyncio.current_task()
+        deadline = loop.time() + _LOOP_DRAIN_TIMEOUT_S
+        failures: list[BaseException] = []
+
+        async def cancel_pending() -> None:
+            while tasks := asyncio.all_tasks(loop) - {current}:
+                if loop.time() >= deadline:
+                    raise RuntimeError(
+                        "VR event-loop tasks kept spawning during shutdown"
+                    )
+                for task in tasks:
+                    # A second cancel would interrupt an async finally block
+                    # already unwinding the timed-out disconnect coroutine.
+                    if not task.cancelling():
+                        task.cancel()
+                done, pending = await asyncio.wait(
+                    tasks, timeout=max(0.0, deadline - loop.time())
+                )
+                for task in done:
+                    if not task.cancelled() and (error := task.exception()) is not None:
+                        failures.append(error)
+                if pending:
+                    names = ", ".join(sorted(task.get_name() for task in pending))
+                    raise RuntimeError(f"VR event-loop tasks did not stop: {names}")
+
+        # Both task and generator finalizers can schedule more owned work.
+        await cancel_pending()
+        await loop.shutdown_asyncgens()
+        await cancel_pending()
+        if failures:
+            raise RuntimeError(
+                "VR event-loop task failed during shutdown"
+            ) from failures[0]
 
     async def _disconnect_async(self) -> None:
         self._cleanup_pending = True

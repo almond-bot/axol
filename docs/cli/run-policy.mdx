@@ -3,7 +3,9 @@ title: "run-policy"
 description: "Run a trained policy autonomously on the robot with async inference."
 ---
 
-Runs a trained policy autonomously on the robot using locally attached ZED cameras and LeRobot's async inference (`lerobot.async_inference`). The Rust core exclusively owns arm CAN during execution. By default a `PolicyServer` is launched in a child process on localhost; pass `--server_host` to use a remote [`inference-server`](/cli/inference-server) on a more powerful machine instead. Either way the parent drives a thin `RobotClient` subclass that streams observations (joint positions + camera frames) to the server and consumes the returned action chunks. Type `s` on stdin to save the rollout and end the episode, `r` to discard it — the arms drop **limp** for hand-repositioning (a failed rollout usually leaves them somewhere they shouldn't be); clear them, then press **Enter** to return to rest and re-record — or `q` to discard and quit. `--episode_time_s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
+Runs a trained policy autonomously on the robot using locally attached ZED cameras. LeRobot policy types use LeRobot's async inference (`lerobot.async_inference`): a `PolicyServer` child process runs locally unless `--server_host` selects a remote [`inference-server`](/cli/inference-server). `--policy_type custom` connects to an existing endpoint through the [custom policy interface](/api/policy-plan), using compressed observations and accepted-plan continuation. The Rust core exclusively owns arm CAN during execution.
+
+Type `s` on stdin to save the rollout and end the episode, `r` to discard it — the arms drop **limp** for hand-repositioning (a failed rollout usually leaves them somewhere they shouldn't be); clear them, then press **Enter** to return to rest and re-record — or `q` to discard and quit. `--episode_time_s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
 
 <Warning>
   Load only policy checkpoints and existing rollout datasets that you created
@@ -19,24 +21,27 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 
 | Flag | Description |
 |---|---|
-| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
-| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy_path` (required) |
-| `--task TEXT` | Natural language task description (required) |
+| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot,custom}` | Policy type (required). LeRobot types must match `--policy_path`; `custom` selects the [custom policy interface](/api/policy-plan) — see [Run Your Own Policy](/operations/custom-policy) |
+| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required for LeRobot policy types). Unused for `custom`; model selection belongs to the endpoint |
+| `--task TEXT` | Natural language task description (required). With `custom`, labels the dataset and is not sent to the endpoint |
 | `--episode_time_s INT` | Safety cap on episode duration in seconds (default: 120). Episodes normally end on operator keypress |
 | `--fps INT` | Control loop frame rate (default: 30). Must match the fps the policy was trained on (a checkpoint trained on 60 fps data needs `--fps 60`) |
 | `--repo_id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |
 | `--vcodec STR` | Video codec recorded for saved rollout datasets (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Only used with `--repo_id`. |
-| `--device STR` | PyTorch device for policy inference (default: `cuda`). The hosted aarch64/Jetson dependency set has CPU-only PyPI Torch 2.10; use `cpu`, remote inference, or an explicitly managed JetPack-compatible Torch + Torchvision build |
-| `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID) |
-| `--server_port INT` | Policy server port — for the localhost child process or the remote server (default: 8765) |
-| `--actions_per_chunk INT` | Number of actions returned per inference call (default: 50); capped by the policy's max action horizon |
-| `--chunk_size_threshold FLOAT` | Trigger a fresh observation when the action queue drops to this fraction of a chunk (default: 0.9) |
-| `--aggregate_fn {temporal_ensemble,weighted_average,latest_only,average,conservative}` | Action chunk aggregation strategy (default: `temporal_ensemble`, ACT Algorithm 2; gripper indices take the newest chunk). The other choices are upstream scalar blends |
-| `--temporal_ensemble_coeff K` | Decay coefficient for `temporal_ensemble` (default: 0.01, ACT paper). `wᵢ = exp(-K·i)`, `i=0` oldest chunk; `K>0` smoother, `K=0` uniform, `K<0` more reactive |
-| `--ensemble_blend_s FLOAT` | Horizon fade for `temporal_ensemble` (default: 0.2 s). Each chunk's weight tapers to near-zero over the last this-many seconds of its prediction horizon, so the ensemble doesn't step when the oldest chunk's coverage expires mid-queue. `0` disables |
-| `--align_fade_s FLOAT` | Chunk-alignment offset fade (default: 1.0 s). Each incoming chunk's offset from the currently executing trajectory — the stale-observation re-anchor disagreement, which grows with inference latency — is cancelled on arrival and faded back in over this window, removing the ~5 Hz advance/pull-back oscillation while absolute corrections still land. Shape corrections (the actual policy behavior) pass through unfaded. `0` disables |
+| `--device STR` | PyTorch device for LeRobot policy inference (default: `cuda`; unused with `custom`). The hosted aarch64/Jetson dependency set has CPU-only PyPI Torch 2.10; use `cpu`, remote inference, or an explicitly managed JetPack-compatible Torch + Torchvision build |
+| `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID). With `--policy_type custom`, the address of your policy server (default `null` = `127.0.0.1`, nothing is spawned); a `ws://` / `wss://` URL is also accepted |
+| `--server_port INT` | Policy server port — for the localhost child process, the remote server, or your custom policy server (default: 8765) |
+| `--actions_per_chunk INT` | Maximum action horizon per inference call (default: 50). Custom endpoints may return from one row up to this limit; the remaining rows must still cover the adoption point. LeRobot policies cap the request by their supported horizon |
+| `--plan_config.request_interval INT` | Custom policies: request a new plan after this many dispatched rows (default: 5) |
+| `--plan_config.max_adoption_offset_steps INT` | Custom policies: largest permitted reply age in control steps from its saved request origin (default: 6); must be inside the action horizon |
+| `--plan_config.late_policy {abort,blocking_refresh}` | Custom policies: abort, or hold and obtain fresh reset plans when a reply is too late or the accepted horizon expires (default: `blocking_refresh`) |
+| `--chunk_size_threshold FLOAT` | LeRobot policies only: trigger a fresh observation when the queue drops to this fraction of a chunk (default: 0.9) |
+| `--aggregate_fn {temporal_ensemble,weighted_average,latest_only,average,conservative}` | LeRobot policies only: action chunk aggregation strategy (default: `temporal_ensemble`, ACT Algorithm 2; gripper indices take the newest chunk). Custom-policy ensembling belongs to the endpoint |
+| `--temporal_ensemble_coeff K` | LeRobot policies only: decay coefficient for `temporal_ensemble` (default: 0.01, ACT paper). `wᵢ = exp(-K·i)`, `i=0` oldest chunk; `K>0` smoother, `K=0` uniform, `K<0` more reactive |
+| `--ensemble_blend_s FLOAT` | LeRobot policies only: horizon fade for `temporal_ensemble` (default: 0.2 s). Each chunk's weight tapers over the last this-many seconds so coverage expiry does not step the ensemble. `0` disables |
+| `--align_fade_s FLOAT` | LeRobot policies only: chunk-alignment offset fade (default: 1.0 s). An incoming chunk's offset from the executing trajectory is cancelled on arrival and faded back in over this window. `0` disables |
 | `--exec_max_vel FLOAT` | Per-joint velocity limit (rad/s) for the execution filter that shapes every command sent to the arms (default: teleop's velocity ceiling). Legitimate policy motion passes through untouched while chunk-boundary snaps are spread over the ticks the arm needs anyway — a late chunk decelerates to a hold and ramps back out instead of freeze-then-lurch, keeping the arm smooth on any inference platform |
 | `--exec_max_accel FLOAT` | Per-joint acceleration limit (rad/s²) for that execution filter (default: teleop's acceleration limit). Set `--exec_max_vel` or `--exec_max_accel` to `0` to disable the filter |
 | `--reset_torque_threshold FLOAT` | Contact watchdog for the between-episode return-to-rest (default: 6.0 Nm). A joint torque residual (measured minus modeled gravity) sustained above this means the move hit something — it stops and the arms drop into a limp **gravity-compensation hold**. Free them by hand, then continue (Enter / the panel's **Return to rest**) to replan from wherever they were left. `0` disables the watchdog |
@@ -71,5 +76,23 @@ If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format d
 **Stopping parks the arms.** Ending a run — `Ctrl+C`, `q`, or **Stop** in the control panel — plays that same return to rest and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The teardown move is capped at 6 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: when the arms are already at rest, when a limp gravity-comp hold has left them in the operator's hands, when the IK worker that plans the path never came up, when the CAN bus has stopped reporting positions, or when an episode worker has not proved it left the robot. A second `Ctrl+C` cannot interrupt it.
 
 <Info>
-  Action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by the buffered chunks is the exponentially-weighted average across those chunks, with the gripper indices snapped to the newest contributing chunk so bang-bang grasp commands aren't smeared. The control loop and observation send run on separate threads — decoupling the ~60-70 ms ZED-read + gRPC send from the 60 Hz action stream that would otherwise collapse to ~27 Hz on the upstream single-threaded design.
+  LeRobot action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by buffered chunks is the exponentially-weighted average across those chunks, with gripper indices snapped to the newest contributing chunk. Custom policies publish their final plan directly and bypass this aggregation. Both paths keep observation/network work outside the periodic control thread.
 </Info>
+
+## Custom policy interface
+
+`--policy_type custom` selects compressed observations, accepted-plan
+continuation and confirmed dispatch references. The robot executes one
+unchanged plan suffix while inference runs remotely; it skips elapsed rows
+of an arriving plan instead of retiming row zero. No protocol-selection flag
+is needed. The handshake uses `version: 2` to reject endpoints using the
+original custom-policy protocol, with no automatic fallback.
+
+```bash
+axol run-policy --policy_type custom --server_host 192.0.2.10 \
+    --task "Pick the red cube" --actions_per_chunk 30 \
+    --robot_config.cameras "{overhead: {serial: 41234567}}"
+```
+
+Write the endpoint with the [`almond_axol.policy`](/api/policy) SDK (`Policy` + `serve()`) and test it without the robot using [`policy.check`](/cli/policy-check). See the [custom policy interface documentation](/api/policy-plan) for setup,
+timing, continuity, recovery and DAgger semantics.

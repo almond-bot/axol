@@ -880,15 +880,18 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Device",
                 type="select",
                 options=("cuda", "cpu", "mps"),
-                help="Device the policy runs on.",
+                help="Device the policy runs on (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.server_host",
                 label="Inference server host",
                 type="text",
                 help=(
-                    "Address of a remote `axol inference-server`. Leave unset "
-                    "to run inference locally."
+                    "Address of a remote `axol inference-server`, or of your "
+                    "endpoint implementing the custom policy interface. "
+                    "Leave unset for local LeRobot inference, or to connect "
+                    "to a custom endpoint on this machine. Start custom "
+                    "endpoints separately."
                 ),
                 effective_default="local — inference runs on this machine",
             ),
@@ -896,7 +899,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.server_port",
                 label="Inference server port",
                 type="number",
-                help="Port of the inference server (local or remote).",
+                help=(
+                    "Port of the inference server (local or remote), or of "
+                    "your endpoint implementing the custom policy interface."
+                ),
             ),
             SettingDef(
                 key="inference.episode_time_s",
@@ -914,7 +920,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="inference.chunk_size_threshold",
                 label="Chunk size threshold",
                 type="number",
-                help="Queue fraction below which the next chunk is requested.",
+                help=(
+                    "Queue fraction below which the next chunk is requested "
+                    "(LeRobot policies only)."
+                ),
             ),
             SettingDef(
                 key="inference.aggregate_fn",
@@ -927,13 +936,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "average",
                     "conservative",
                 ),
-                help="How overlapping action chunks are combined.",
+                help="How overlapping action chunks are combined (LeRobot policies only).",
             ),
             SettingDef(
                 key="inference.temporal_ensemble_coeff",
                 label="Temporal ensemble coeff",
                 type="number",
-                help="Exponential weight for the temporal_ensemble aggregation.",
+                help=(
+                    "Exponential weight for the temporal_ensemble aggregation "
+                    "(LeRobot policies only)."
+                ),
             ),
         ),
     ),

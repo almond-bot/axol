@@ -10,10 +10,12 @@ import {
 } from "lucide-react"
 import {
   HARDWARE_PROFILE_ARG,
+  applyPolicyTypeRules,
   fetchDatasets,
   fetchFieldSuggestions,
   fetchTrackerBindings,
   isArmsOffRun,
+  isCustomPolicyRun,
   isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
@@ -123,14 +125,18 @@ export function OperationPanel({
   // fields (repo id, task, policy path, episode, …) — required ones first.
   // The device flag is never one of them, and the Axol-only sim mode
   // disappears while Mantis is selected.
-  const runFields = useMemo(
-    () => (spec ? perRunFields(spec, meta, hardwareProfile) : []),
-    [spec, meta, hardwareProfile]
-  )
   const liveArgs = live && session ? session.args : null
   const effectiveSettings: Record<string, FormValue> = liveArgs
     ? { ...settings, ...(liveArgs as Record<string, FormValue>) }
     : settings
+  // Run Policy's policy path is required for a LeRobot checkpoint but optional
+  // for a custom policy server, so the rule follows the selected policy type.
+  const customPolicy = isCustomPolicyRun(effectiveSettings)
+  const runFields = useMemo(
+    () =>
+      spec ? applyPolicyTypeRules(perRunFields(spec, meta, hardwareProfile), customPolicy) : [],
+    [spec, meta, hardwareProfile, customPolicy]
+  )
   // A live run reports the device it was actually started on; otherwise the
   // next run follows the panel-wide selection.
   const mantisMode =
@@ -517,6 +523,16 @@ export function OperationPanel({
                       onChange={onChange}
                       onReset={onReset}
                     />
+                  )}
+                  {customPolicy && (
+                    <p className="text-xs leading-relaxed text-white/45">
+                      Custom policy: start your policy server (
+                      <code className="font-mono text-white/60">almond_axol.policy.serve</code>)
+                      before pressing Start. Run Policy uses the host and port in Settings →
+                      Inference; a blank host connects to this machine on the configured port
+                      (default 8765). Select the model and instruction on the endpoint; the task
+                      labels recordings.
+                    </p>
                   )}
                   {!live &&
                     suggestionNotes.map((note) => (

@@ -20,6 +20,10 @@ class DaggerResumeSchemaTest(unittest.TestCase):
     @staticmethod
     def _config(root: Path) -> SimpleNamespace:
         return SimpleNamespace(
+            policy_type="act",
+            policy_path="unused-test-policy",
+            hold_to_intervene=False,
+            record_joint_actions=False,
             task="pick",
             subtasks=None,
             episode_time_s=10,
