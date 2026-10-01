@@ -95,16 +95,12 @@ _RT_TRACE_COLUMNS = (
     "tf_pct",
     "enc2_p",
     "enc2_t",
-    "tip_ff",
-    "tip_flex",
 )
 # The layout before the cogging cancellation and 0x73 feedforward columns: a
 # CSV a proto-14 core left behind still compacts.
-_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-6]
+_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-4]
 # The layout before the output-encoder columns (AXOL_RT_ENC2).
-_RT_TRACE_COLUMNS_V2 = _RT_TRACE_COLUMNS[:-4]
-# The layout before the in-core tip damper's columns.
-_RT_TRACE_COLUMNS_V3 = _RT_TRACE_COLUMNS[:-2]
+_RT_TRACE_COLUMNS_V2 = _RT_TRACE_COLUMNS[:-2]
 
 
 def resolve_prefix(prefix: str) -> str:
@@ -141,8 +137,6 @@ def compact_rt_trace(prefix: str) -> Path | None:
             has_rows = bool(raw.read(1))
         if header == list(_RT_TRACE_COLUMNS):
             columns = _RT_TRACE_COLUMNS
-        elif header == list(_RT_TRACE_COLUMNS_V3):
-            columns = _RT_TRACE_COLUMNS_V3
         elif header == list(_RT_TRACE_COLUMNS_V2):
             columns = _RT_TRACE_COLUMNS_V2
         elif header == list(_RT_TRACE_COLUMNS_V1):

@@ -30,7 +30,6 @@ mod scan;
 mod serve;
 mod stall;
 mod timing;
-mod tipdamp;
 mod txn;
 
 const DEFAULT_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];

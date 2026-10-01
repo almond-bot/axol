@@ -213,7 +213,6 @@ use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
 use crate::stall;
-use crate::tipdamp;
 
 /// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
 /// `almond_axol.robot.control`.  The slow pole keeps target-rate steps out of
@@ -277,9 +276,7 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
 ///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
 ///   the 240 Hz lane. A proto-15 core would run them all at one rate.
-// 17: the in-core tip damper's `tipkin` / `tipoff` / `tipmodel` / `tipdamp`
-// lines and the `K` on/off message.
-const CONFIG_PROTO: u32 = 17;
+const CONFIG_PROTO: u32 = 16;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -335,164 +332,6 @@ const DEGRADED_RECENT_LATE_TICKS: u32 = 8;
 // degraded stretch are logged (rate-limited), and the stats line counts them.
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Per side, the tip damper's switch as `(generation << 1) | on`: the `K`
-/// message bumps the generation, so a bus thread sees every toggle — a pass
-/// boundary restarts the damper's filters even off → off → on in one tick.
-static TIP_STATE: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-/// The in-core tip damper of one bus: its IMU socket, the damper, the arm's
-/// kinematics and the reference's tracking filters (see `tipdamp.rs`).
-struct TipRuntime {
-    side: usize,
-    damper: tipdamp::TipDamper,
-    chain: tipdamp::PoeChain,
-    offsets: [f64; 7],
-    filters: [Option<tipdamp::TrackingFilter>; 7],
-    sock: std::net::UdpSocket,
-    seen: u64,
-    trip_reported: bool,
-    /// IMU datagrams received, and whether "no IMU" was warned this switch-on.
-    samples: u64,
-    starved_reported: bool,
-    /// The torque the last tick applied, per arm slot, and the flex it
-    /// acted on (for the trace).
-    tau: [f64; 7],
-    flex: f64,
-}
-
-impl TipRuntime {
-    fn open(setup: &TipSetup, fs: f64) -> io::Result<Self> {
-        let sock = std::net::UdpSocket::bind(("127.0.0.1", setup.port))?;
-        sock.set_nonblocking(true)?;
-        let filters = std::array::from_fn(|i| {
-            setup.models[i]
-                .map(|(wn, zeta, wz, tau)| tipdamp::TrackingFilter::new(wn, zeta, wz, tau, fs))
-        });
-        Ok(Self {
-            side: setup.side as usize,
-            damper: tipdamp::TipDamper::new(setup.cfg.clone().expect("checked at parse")),
-            chain: setup.chain.clone().expect("checked at parse"),
-            offsets: setup.offsets.expect("checked at parse"),
-            filters,
-            sock,
-            seen: TIP_STATE[setup.side as usize].load(Ordering::Acquire),
-            trip_reported: false,
-            samples: 0,
-            starved_reported: false,
-            tau: [0.0; 7],
-            flex: 0.0,
-        })
-    }
-
-    /// One tick: take the IMU's new samples, follow the on/off switch, and
-    /// compute the joints' torque from the measured pose (`meas`, motor
-    /// frame, `None` without a fresh reply) and the commanded one (`cmd`,
-    /// motor frame). Returns the torque per arm slot (zero while off,
-    /// tripped, stale or blind).
-    fn tick(
-        &mut self,
-        meas: &[Option<f64>; 7],
-        cmd: &[f64; 7],
-        out_tx: &mpsc::Sender<Vec<u8>>,
-        iface: &str,
-    ) -> [f64; 7] {
-        let now = tipdamp::monotonic_s();
-        let mut buf = [0u8; 64];
-        while let Ok(n) = self.sock.recv(&mut buf) {
-            if let Some((t, acc, gyro)) = tipdamp::decode_imu(&buf[..n]) {
-                self.damper.feed_imu(t, acc, gyro);
-                if self.samples == 0 {
-                    send_text(
-                        out_tx,
-                        b'L',
-                        &format!("{iface}: tip damper: wrist IMU stream up"),
-                    );
-                }
-                self.samples += 1;
-            }
-        }
-        let state = TIP_STATE[self.side].load(Ordering::Acquire);
-        if state != self.seen {
-            self.seen = state;
-            if state & 1 == 1 {
-                self.damper.start(now);
-                for f in self.filters.iter_mut().flatten() {
-                    f.reset();
-                }
-                self.trip_reported = false;
-                self.starved_reported = false;
-            } else {
-                self.damper.stop();
-            }
-        }
-        self.tau = [0.0; 7];
-        if !self.damper.running() {
-            return self.tau;
-        }
-        if self.samples == 0 && !self.starved_reported {
-            // Switched on with nothing from the camera: say so once rather
-            // than damp silently not at all.
-            self.starved_reported = true;
-            send_text(
-                out_tx,
-                b'W',
-                &format!(
-                    "{iface}: tip damper switched on, but no wrist IMU samples have arrived \
-                     (the camera's IMU forwarding: AXOL_IMU_UDP / the patched zedxonesrc)"
-                ),
-            );
-        }
-        let mut q_meas = [0.0; 7];
-        let mut q_cmd = [0.0; 7];
-        for i in 0..7 {
-            let Some(p) = meas[i] else {
-                return self.tau; // blind this tick: no torque from a stale pose
-            };
-            q_meas[i] = p + self.offsets[i];
-            q_cmd[i] = cmd[i] + self.offsets[i];
-        }
-        let (h_meas, jz) = self.chain.height_and_jz(&q_meas);
-        let h_ref = match self.damper.cfg.reference {
-            tipdamp::Reference::Encoder => h_meas,
-            tipdamp::Reference::Command => self.chain.height(&q_cmd),
-            tipdamp::Reference::Model => {
-                let mut q_exp = q_cmd;
-                for (i, f) in self.filters.iter_mut().enumerate() {
-                    if let Some(f) = f {
-                        q_exp[i] = f.step(q_cmd[i]);
-                    }
-                }
-                self.chain.height(&q_exp)
-            }
-        };
-        self.damper.feed_height(now, h_ref);
-        self.tau = self.damper.torque(now, &jz);
-        self.flex = self.damper.flex();
-        if self.damper.tripped && !self.trip_reported {
-            self.trip_reported = true;
-            let (why, level) = self.damper.trip_reason;
-            let reason = if why == 2 {
-                format!(
-                    "the high-band (> 7 Hz) acceleration held {level:.2} m/s² over {:.2}",
-                    self.damper.cfg.trip_hf_acc
-                )
-            } else {
-                format!(
-                    "the flex velocity held {:.0} mm/s over {:.0}",
-                    level * 1e3,
-                    self.damper.cfg.trip_speed * 1e3
-                )
-            };
-            send_text(
-                out_tx,
-                b'W',
-                &format!("{iface}: tip damper switched itself off — {reason} (lower its gain)"),
-            );
-        }
-        self.tau
-    }
-}
 
 extern "C" fn on_signal(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
@@ -1280,10 +1119,6 @@ struct TraceRow {
     /// when it arrived (trace clock), NaN on a motor not in `AXOL_RT_ENC2`.
     enc2_p: f64,
     enc2_t: f64,
-    /// The in-core tip damper's torque on this joint (Nm) and the flex
-    /// velocity it acted on (m/s), 0 without one.
-    tip_ff: f64,
-    tip_flex: f64,
 }
 
 type TraceHandle = JoinHandle<io::Result<()>>;
@@ -1299,7 +1134,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t,tip_ff,tip_flex"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t"
     )?;
     Ok(out)
 }
@@ -1307,7 +1142,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -1340,8 +1175,6 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.tf_pct,
         r.enc2_p,
         r.enc2_t,
-        r.tip_ff,
-        r.tip_flex,
     )
 }
 
@@ -1503,164 +1336,6 @@ struct Config {
     max_step_rad: f64,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
-    /// The in-core tip dampers, one per bus that configures one.
-    tips: Vec<TipSetup>,
-}
-
-/// One bus's in-core tip damper (`tipkin` / `tipoff` / `tipmodel` /
-/// `tipdamp` lines; see `tipdamp.rs` and `almond_axol.rt.tipdamp`).
-#[derive(Clone)]
-struct TipSetup {
-    side: u8,
-    iface: String,
-    chain: Option<tipdamp::PoeChain>,
-    /// Joint-frame offsets of the arm slots: `joint = motor + offset`.
-    offsets: Option<[f64; 7]>,
-    /// Per arm slot: the tracking model (wn, zeta, wz, tau) for the
-    /// `model` reference.
-    models: [Option<(f64, f64, Option<f64>, f64)>; 7],
-    cfg: Option<tipdamp::TipConfig>,
-    port: u16,
-}
-
-impl TipSetup {
-    fn new(side: u8, iface: &str) -> Self {
-        Self {
-            side,
-            iface: iface.to_string(),
-            chain: None,
-            offsets: None,
-            models: [None; 7],
-            cfg: None,
-            port: 0,
-        }
-    }
-}
-
-/// Parse one `tip*` config line into its bus's [`TipSetup`].
-fn parse_tip_line(f: &[&str], line: &str, tips: &mut Vec<TipSetup>) -> io::Result<()> {
-    let bad = || {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("config: bad line: {line}"),
-        )
-    };
-    let side: u8 = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-    let iface = *f.get(2).ok_or_else(bad)?;
-    let num = |i: usize| -> io::Result<f64> {
-        f.get(i)
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .ok_or_else(bad)
-    };
-    let idx = match tips.iter().position(|t| t.side == side && t.iface == iface) {
-        Some(i) => i,
-        None => {
-            tips.push(TipSetup::new(side, iface));
-            tips.len() - 1
-        }
-    };
-    let tip = &mut tips[idx];
-    match f[0] {
-        "tipkin" => {
-            // 7 axes, 7 points, the mount's 4x4 pose: 21 + 21 + 16 numbers.
-            if f.len() != 3 + 58 {
-                return Err(bad());
-            }
-            let mut w = [[0.0; 3]; 7];
-            let mut r = [[0.0; 3]; 7];
-            let mut m = [[0.0; 4]; 4];
-            for i in 0..7 {
-                for k in 0..3 {
-                    w[i][k] = num(3 + 3 * i + k)?;
-                    r[i][k] = num(24 + 3 * i + k)?;
-                }
-            }
-            for i in 0..4 {
-                for k in 0..4 {
-                    m[i][k] = num(45 + 4 * i + k)?;
-                }
-            }
-            tip.chain = Some(tipdamp::PoeChain { w, r, m });
-        }
-        "tipoff" => {
-            if f.len() != 3 + 7 {
-                return Err(bad());
-            }
-            let mut o = [0.0; 7];
-            for (i, v) in o.iter_mut().enumerate() {
-                *v = num(3 + i)?;
-            }
-            tip.offsets = Some(o);
-        }
-        "tipmodel" => {
-            if f.len() != 8 {
-                return Err(bad());
-            }
-            let slot: usize = f.get(3).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-            if slot >= 7 {
-                return Err(bad());
-            }
-            let wz = num(6)?;
-            tip.models[slot] = Some((num(4)?, num(5)?, (wz > 0.0).then_some(wz), num(7)?));
-        }
-        "tipdamp" => {
-            // tipdamp <side> <iface> <port> <gain> <hp> <lp> <lead> <notch>
-            // <notch_q> <max_torque> <ref> <delay> <ramp> <stale>
-            // <trip_speed> <trip_s> <trip_hf_acc> <n> (<slot> <weight> <lp>) × n
-            if f.len() < 19 {
-                return Err(bad());
-            }
-            let port: u16 = f.get(3).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-            let reference = match f.get(11).and_then(|v| v.parse::<u8>().ok()) {
-                Some(0) => tipdamp::Reference::Encoder,
-                Some(1) => tipdamp::Reference::Command,
-                Some(2) => tipdamp::Reference::Model,
-                _ => return Err(bad()),
-            };
-            let n: usize = f.get(18).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-            if n == 0 || f.len() != 19 + 3 * n {
-                return Err(bad());
-            }
-            let mut columns = Vec::with_capacity(n);
-            for k in 0..n {
-                let slot: usize = f
-                    .get(19 + 3 * k)
-                    .and_then(|v| v.parse().ok())
-                    .filter(|s: &usize| *s < 7)
-                    .ok_or_else(bad)?;
-                columns.push(tipdamp::TipColumn {
-                    slot,
-                    weight: num(20 + 3 * k)?,
-                    lp_hz: num(21 + 3 * k)?,
-                });
-            }
-            let max_torque = num(10)?;
-            if !(0.0..=5.0).contains(&max_torque) {
-                return Err(bad()); // a damper, not a drive
-            }
-            tip.port = port;
-            tip.cfg = Some(tipdamp::TipConfig {
-                gain: num(4)?,
-                hp_hz: num(5)?,
-                lp_hz: num(6)?,
-                lead_hz: num(7)?,
-                notch_hz: num(8)?,
-                notch_q: num(9)?,
-                max_torque,
-                reference,
-                delay_s: num(12)?,
-                ramp_s: num(13)?,
-                stale_s: num(14)?,
-                trip_speed: num(15)?,
-                trip_s: num(16)?,
-                trip_hf_acc: num(17)?,
-                columns,
-            });
-        }
-        _ => return Err(bad()),
-    }
-    Ok(())
 }
 
 fn parse_config(text: &str) -> io::Result<Config> {
@@ -1669,7 +1344,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
-    let mut tips: Vec<TipSetup> = Vec::new();
     let mut proto: Option<u32> = None;
 
     let bad = |line: &str| {
@@ -1759,7 +1433,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .ok_or_else(|| bad(line))?;
                 spec.cogging = terms;
             }
-            "tipkin" | "tipoff" | "tipmodel" | "tipdamp" => parse_tip_line(&f, line, &mut tips)?,
             "watchdog_ms" => {
                 watchdog_ms = f
                     .get(1)
@@ -1928,35 +1601,12 @@ fn parse_config(text: &str) -> io::Result<Config> {
     for (_, _, specs) in &buses {
         check_impedance_rate(loop_hz, impedance_hz, specs)?;
     }
-    for tip in &tips {
-        // A damper needs all of it: its settings, the arm's kinematics, the
-        // offsets that put the motor-frame feedback into the joint frame.
-        if tip.cfg.is_none() || tip.chain.is_none() || tip.offsets.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "config: tip damper on {} needs tipdamp, tipkin and tipoff lines",
-                    tip.iface
-                ),
-            ));
-        }
-        if !buses
-            .iter()
-            .any(|(s, i, _)| *s == tip.side && *i == tip.iface)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("config: tip damper on {}, which has no joints", tip.iface),
-            ));
-        }
-    }
     Ok(Config {
         loop_hz,
         impedance_hz,
         watchdog_ms,
         max_step_rad,
         buses,
-        tips,
     })
 }
 
@@ -2512,10 +2162,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 17\ngripper 0 canL 8\n".to_string()
+                "proto 16\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2752,7 +2402,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 16\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2804,39 +2454,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 17\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 16\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2847,7 +2497,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2861,15 +2511,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 17\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2895,12 +2545,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 17"), "{err}");
+        assert!(err.contains("proto 16"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 17\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 16\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2908,157 +2558,9 @@ mod tests {
     /// The 0x73 scale is an optional field after `lead_ms`; `cogging` lines
     /// attach their harmonics to the joint already declared on that bus.
     #[test]
-    fn tip_runtime_damps_from_udp_and_follows_its_switch() {
-        // An arm whose mount sits 0.5 m out along x from a pitch axis at the
-        // origin: shoulder_1 lifts it, ∂z/∂q1 = 0.5 m/rad at q = 0.
-        let mut w = [[0.0; 3]; 7];
-        for axis in w.iter_mut() {
-            *axis = [0.0, -1.0, 0.0];
-        }
-        let mut m = [[0.0; 4]; 4];
-        for (i, row) in m.iter_mut().enumerate() {
-            row[i] = 1.0;
-        }
-        m[0][3] = 0.5;
-        let setup = TipSetup {
-            side: 0,
-            iface: "test".into(),
-            chain: Some(tipdamp::PoeChain {
-                w,
-                r: [[0.0; 3]; 7],
-                m,
-            }),
-            offsets: Some([0.0; 7]),
-            models: [None; 7],
-            cfg: Some(tipdamp::TipConfig {
-                gain: 100.0,
-                hp_hz: 0.3,
-                lp_hz: 40.0,
-                lead_hz: 0.0,
-                notch_hz: 0.0,
-                notch_q: 1.0,
-                max_torque: 2.0,
-                reference: tipdamp::Reference::Command,
-                delay_s: 0.0,
-                ramp_s: 0.2,
-                stale_s: 0.05,
-                trip_speed: 10.0,
-                trip_s: 0.15,
-                trip_hf_acc: 0.0,
-                columns: vec![tipdamp::TipColumn {
-                    slot: 0,
-                    weight: 1.0,
-                    lp_hz: 0.0,
-                }],
-            }),
-            port: 0,
-        };
-        let mut rt = TipRuntime::open(&setup, 240.0).unwrap();
-        let addr = rt.sock.local_addr().unwrap();
-        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        let (out_tx, _out_rx) = mpsc::channel();
-        let meas = [Some(0.0); 7];
-        let cmd = [0.0; 7];
-        let send = |t: f64, az: f64| {
-            let mut d = Vec::new();
-            d.extend_from_slice(&t.to_le_bytes());
-            for v in [0.0f32, 0.0, az as f32, 0.0, 0.0, 0.0] {
-                d.extend_from_slice(&v.to_le_bytes());
-            }
-            tx.send_to(&d, addr).unwrap();
-        };
-        // Off: samples arrive, no torque.
-        send(tipdamp::monotonic_s(), tipdamp::G);
-        std::thread::sleep(Duration::from_millis(5));
-        assert_eq!(rt.tick(&meas, &cmd, &out_tx, "test"), [0.0; 7]);
-        // On: a 2 Hz vertical wobble the command does not have.
-        let slot = &TIP_STATE[0];
-        slot.store(
-            (((slot.load(Ordering::Acquire) >> 1) + 1) << 1) | 1,
-            Ordering::Release,
-        );
-        let mut peak = 0.0f64;
-        for _ in 0..240 {
-            let t = tipdamp::monotonic_s();
-            let a = -0.002
-                * (2.0 * std::f64::consts::PI * 2.0).powi(2)
-                * (2.0 * std::f64::consts::PI * 2.0 * t).sin();
-            send(t, tipdamp::G + a);
-            std::thread::sleep(Duration::from_millis(4));
-            let tau = rt.tick(&meas, &cmd, &out_tx, "test");
-            assert!(tau[1..].iter().all(|&x| x == 0.0));
-            peak = peak.max(tau[0].abs());
-        }
-        assert!(peak > 0.05, "peak {peak}");
-        // A blind tick (no fresh feedback) applies nothing.
-        let mut blind = meas;
-        blind[3] = None;
-        assert_eq!(rt.tick(&blind, &cmd, &out_tx, "test"), [0.0; 7]);
-        // Off again.
-        slot.store(
-            (((slot.load(Ordering::Acquire) >> 1) + 1) << 1),
-            Ordering::Release,
-        );
-        assert_eq!(rt.tick(&meas, &cmd, &out_tx, "test"), [0.0; 7]);
-    }
-
-    #[test]
-    fn parse_config_takes_the_tip_damper() {
-        let kin = {
-            let mut v: Vec<String> = Vec::new();
-            for i in 0..7 {
-                v.push(format!(
-                    "0 {} {}",
-                    if i % 2 == 0 { 1 } else { 0 },
-                    if i % 2 == 0 { 0 } else { 1 }
-                ));
-            }
-            for i in 0..7 {
-                v.push(format!("0 0 {}", 0.1 * i as f64));
-            }
-            v.push("1 0 0 0.5 0 1 0 0 0 0 1 0.8 0 0 0 1".into());
-            v.join(" ")
-        };
-        let base = format!(
-            "proto 17\nloop_hz 240\n\
-             joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
-             tipkin 1 canR {kin}\n\
-             tipoff 1 canR 0.1 0.2 0.3 0.4 0.5 0.6 0.7\n"
-        );
-        let damp =
-            "tipdamp 1 canR 47811 120 0.3 40 0 0 1 1.5 2 0.008 1 0.05 1.0 0.15 1.7 2 0 1 0 3 0.6 6\n";
-        let model = "tipmodel 1 canR 0 14.8 0.6 36.2 0.0036\n";
-        let cfg = parse_config(&format!("{base}{model}{damp}")).unwrap();
-        assert_eq!(cfg.tips.len(), 1);
-        let tip = &cfg.tips[0];
-        assert_eq!(tip.port, 47811);
-        assert_eq!(tip.offsets.unwrap()[6], 0.7);
-        assert_eq!(tip.models[0], Some((14.8, 0.6, Some(36.2), 0.0036)));
-        let c = tip.cfg.as_ref().unwrap();
-        assert_eq!(c.reference, tipdamp::Reference::Model);
-        assert_eq!(c.gain, 120.0);
-        assert_eq!(c.max_torque, 1.5);
-        assert_eq!(c.columns.len(), 2);
-        assert_eq!(
-            (c.columns[1].slot, c.columns[1].weight, c.columns[1].lp_hz),
-            (3, 0.6, 6.0)
-        );
-        assert_eq!(tip.chain.as_ref().unwrap().m[2][3], 0.8);
-        // Incomplete, unknown bus, too much torque, a bad column count.
-        for bad in [
-            format!("proto 17\nloop_hz 240\njoint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n{damp}"),
-            format!("{base}{}", damp.replace("1 canR", "0 canL")),
-            format!("{base}{}", damp.replace(" 1.5 2 ", " 9 2 ")),
-            format!("{base}{}", damp.replace(" 2 0 1 0 3 0.6 6", " 3 0 1 0 3 0.6 6")),
-        ] {
-            assert!(parse_config(&bad).is_err(), "{bad}");
-        }
-    }
-
-    #[test]
     fn parse_config_takes_tf_scale_and_cogging_series() {
         let cfg = parse_config(&format!(
-            "proto 17\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              cogging 1 canR 1 2 198.9 0.3 -0.1 397.8 0 0.2\n"
         ))
@@ -3091,7 +2593,7 @@ mod tests {
             "cogging 0 canR 1 1 198.9 0.3 0\n",
         ] {
             assert!(
-                parse_config(&format!("proto 17\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
+                parse_config(&format!("proto 16\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
                 "{bad}"
             );
         }
@@ -3103,27 +2605,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 17\n{mit}"))
+            parse_config(&format!("proto 16\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 17\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 17\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 16\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -3139,7 +2641,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 17\nloop_hz 480\n{}{}{}{}",
+            "proto 16\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -3527,19 +3029,6 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     break;
                 }
             },
-            b'K' => {
-                // Tip damper on/off: side u8, on u8.
-                if body.len() != 2 || body[0] > 1 {
-                    loop_err = Some(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "bad tip-damper message",
-                    ));
-                    break;
-                }
-                let slot = &TIP_STATE[body[0] as usize];
-                let gen = (slot.load(Ordering::Acquire) >> 1) + 1;
-                slot.store((gen << 1) | u64::from(body[1] != 0), Ordering::Release);
-            }
             b'R' => match parse_record_gate(body) {
                 Ok(None) => trace_enabled.store(false, Ordering::Release),
                 Ok(Some(timestamp)) => {
@@ -4006,34 +3495,6 @@ fn bus_loop(
         period.mul_f64(0.5)
     };
     let mut deadline = start_at + phase;
-    // The in-core tip damper, when this bus configures one. A port that
-    // will not bind leaves the bus running without it (logged).
-    let mut tip: Option<TipRuntime> =
-        match cfg.tips.iter().find(|t| t.side == side && t.iface == iface) {
-            Some(setup) => match TipRuntime::open(setup, cfg.loop_hz) {
-                Ok(rt) => {
-                    send_text(
-                        out_tx,
-                        b'L',
-                        &format!(
-                            "{iface}: tip damper ready on udp {} (off until switched on)",
-                            setup.port
-                        ),
-                    );
-                    Some(rt)
-                }
-                Err(err) => {
-                    send_text(
-                        out_tx,
-                        b'W',
-                        &format!("{iface}: tip damper disabled — udp {}: {err}", setup.port),
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-    let mut tip_tau = [0.0f64; 7];
     let mut trace_epoch = deadline;
     let mut trace_origin_s = f64::from_bits(trace_origin_bits.load(Ordering::Acquire));
     let mut trace_generation_seen = if trace_enabled.load(Ordering::Acquire) {
@@ -4293,15 +3754,6 @@ fn bus_loop(
             expected.fill(0);
             attempted.fill(false);
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
-            if let Some(tip) = tip.as_mut() {
-                let meas: [Option<f64>; 7] = std::array::from_fn(|i| {
-                    latest[i]
-                        .filter(|_| feedback_fresh[i])
-                        .map(|(p, _, _, _)| p)
-                });
-                let cmd: [f64; 7] = std::array::from_fn(|i| play[i].p_des);
-                tip_tau = tip.tick(&meas, &cmd, out_tx, iface);
-            }
             for (motor_index, m) in motors.iter().enumerate() {
                 // An impedance joint on its own 240 Hz cadence runs nothing on
                 // its off-ticks — not the tracker, derivatives, band-pass or
@@ -4521,13 +3973,6 @@ fn bus_loop(
                     } else {
                         0.0
                     };
-                    // The in-core tip damper's share, on tracked MIT ticks
-                    // only (limp forces passthrough, so never while limp).
-                    let tip_ff = if tracked && m.slot < 7 && m.wire == WireMode::Mit {
-                        tip_tau[m.slot]
-                    } else {
-                        0.0
-                    };
                     let t_ff = c.t_ff
                         + friction_ff
                         + stiction_ff
@@ -4535,8 +3980,7 @@ fn bus_loop(
                         + stribeck_ff
                         + inertia_ff
                         + damping_ff
-                        + cogging_ff
-                        + tip_ff;
+                        + cogging_ff;
                     // The 0x73 feedforward for a firmware-loop joint that
                     // takes it: gravity, inertia and the cogging term — not
                     // the host damping band-pass or the friction family,
@@ -4589,8 +4033,6 @@ fn bus_loop(
                             tf_pct,
                             enc2_p: f64::NAN,
                             enc2_t: f64::NAN,
-                            tip_ff,
-                            tip_flex: tip.as_ref().map_or(0.0, |t| t.flex),
                         });
                     }
                     if a4_wire(m.vendor, m.wire, tracked, c.kp) {

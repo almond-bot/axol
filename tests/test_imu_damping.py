@@ -18,12 +18,7 @@ from almond_axol.tuning.imu_damping import (
 
 
 def _structure(
-    c: float,
-    *,
-    seconds: float = 30.0,
-    delay_s: float = 0.012,
-    seed: int = 0,
-    trip_speed: float = 1.0,
+    c: float, *, seconds: float = 30.0, delay_s: float = 0.012, seed: int = 0
 ):
     """Tool height on a 2 Hz, ζ 0.05 mode (2 kg), shaken by a 1-6 Hz force,
     pushed by one joint's torque through a 0.6 m lever. The IMU is tilted,
@@ -40,7 +35,7 @@ def _structure(
         )
         * 3
     )
-    damper = TipDamper(gain=c, columns=(0,), max_torque=2.0, trip_speed=trip_speed)
+    damper = TipDamper(gain=c, columns=(0,), max_torque=2.0)
     damper.start(0.0)
     tilt = np.array([0.1, 0.05, 1.0]) / np.linalg.norm([0.1, 0.05, 1.0])
     z = v = tau = 0.0
@@ -72,12 +67,9 @@ class DamperTest(unittest.TestCase):
         self,
     ) -> None:
         base, _ = _structure(0.0)
-        # A low-frequency runaway (the wrong sign, or far too much gain on
-        # this 2 Hz mode) stays under the default 0.3 m/s backstop once the
-        # clamp bounds it; a tight flex-speed trip catches it.
         for c in (-10.0, 80.0):
             with self.subTest(c=c):
-                rms, d = _structure(c, trip_speed=0.08)
+                rms, d = _structure(c)
                 self.assertTrue(d.tripped)
                 self.assertLess(rms, 6 * base)  # bounded by the trip (unbounded: ~40x)
 
@@ -122,28 +114,6 @@ class DamperTest(unittest.TestCase):
             acc_z = -0.001 * (2 * math.pi * 2) ** 2 * math.sin(2 * math.pi * 2 * t)
             out.append(est.update(t, np.array([0.0, 0.0, G + acc_z])))
         self.assertGreater(np.abs(out[int(5 * fs) :]).max(), 0.009)
-
-
-class HighBandTripTest(unittest.TestCase):
-    def _run(self, amp: float) -> TipDamper:
-        d = TipDamper(gain=50.0, columns=(0,), ramp_s=0.5)
-        d.start(0.0)
-        for i in range(int(5 * 240)):
-            t = i / 240.0
-            if i % 6 < 5:  # ~200 Hz IMU
-                a = amp * math.sin(2 * math.pi * 11.0 * t)
-                d.feed(np.array([[t, 0.0, 0.0, G + a, 0.0, 0.0, 0.0]]))
-            d.feed_height(t, 0.0)
-            d.torque(t, np.array([-0.4, 0, 0, 0, 0, 0, 0]))
-        return d
-
-    def test_a_sustained_11hz_drive_trips_and_an_ordinary_one_does_not(self) -> None:
-        # The runaway on jelly: ~1.8 m/s² of > 7 Hz acceleration over 2 s;
-        # ordinary and fast passes at most ~1.55.
-        hot = self._run(4.0)
-        self.assertTrue(hot.tripped)
-        self.assertIn("high-band acceleration", hot.trip_reason)
-        self.assertFalse(self._run(1.5).tripped)
 
 
 class FlexTest(unittest.TestCase):

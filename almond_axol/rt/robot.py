@@ -71,7 +71,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
-from typing import Any, Self
+from typing import Self
 
 import numpy as np
 
@@ -346,13 +346,10 @@ class Axol(RobotBase):
     def _config_text(self, *, cogging: bool = False) -> str:
         """The core's config.
 
-        ``cogging``: also the lines that need the resolved joint offsets —
-        the joints' ``cogging`` lines (position-periodic torque cancellation:
-        the motor-frame series is the joint-frame one shifted by the offset)
-        and each arm's tip damper (``tipkin`` / ``tipoff`` / ``tipmodel`` /
-        ``tipdamp``: the core turns motor-frame feedback into the joint
-        frame its kinematics work in) — so they go on the second configure,
-        after :meth:`_enable` resolved them.
+        ``cogging``: also the joints' ``cogging`` lines (position-periodic
+        torque cancellation), which need the resolved joint offsets — the
+        motor-frame series is the joint-frame one shifted by the offset — so
+        they go on the second configure, after :meth:`_enable` resolved them.
         """
 
         def _wire_token(mode: str, joint: Joint, motor_id: int) -> str:
@@ -427,32 +424,7 @@ class Axol(RobotBase):
                 lines.append(
                     f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
                 )
-            tip = getattr(arm._arm_config, "tip_damp", None)
-            if cogging and tip is not None:
-                lines.extend(self._tip_lines(side, iface, arm, tip))
         return "\n".join(lines) + "\n"
-
-    def _tip_lines(self, side: int, iface: str, arm: Any, tip: Any) -> list[str]:
-        """One arm's tip-damper config lines (see :mod:`almond_axol.rt.tipdamp`)."""
-        from .tipdamp import config_lines, poe_chain
-
-        chain = tip.chain
-        if chain is None:
-            from ..kinematics.solver import KinematicsSolver
-
-            chain = poe_chain(KinematicsSolver(), "left" if side == 0 else "right")
-            tip.chain = chain
-        offsets = np.asarray(arm._joint_offsets[: len(ARM_JOINTS)], dtype=float)
-        return config_lines(side, iface, tip, chain, offsets)
-
-    def set_tip_damping(self, side: str, on: bool) -> None:
-        """Switch the realtime core's tip damper on one arm on or off (it is
-        configured off; each switch restarts its filters). A no-op for an arm
-        without ``ArmConfig.tip_damp``."""
-        index = 0 if side == "left" else 1
-        for s, arm in self._arms():
-            if s == index and getattr(arm._arm_config, "tip_damp", None) is not None:
-                self._link.set_tip_damping(index, on)
 
     def _warn_wire_modes(self) -> None:
         firmware = [
@@ -633,9 +605,6 @@ class Axol(RobotBase):
             for _side, arm in self._arms()
             for j in ARM_JOINTS
             if j in arm.motors
-        ) or any(
-            getattr(arm._arm_config, "tip_damp", None) is not None
-            for _side, arm in self._arms()
         ):
             await self._link.configure(self._config_text(cogging=True))
 

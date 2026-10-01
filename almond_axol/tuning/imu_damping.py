@@ -37,8 +37,6 @@ from dataclasses import dataclass, field
 import numpy as np
 
 G = 9.80665
-#: How long the high-band acceleration must stay over ``trip_hf_acc``.
-TRIP_HF_HOLD_S = 0.5
 
 
 def _butter_hp2(fc: float, fs: float) -> tuple[np.ndarray, np.ndarray]:
@@ -73,29 +71,13 @@ class VerticalVelocity:
     _hy: list[float] = field(default_factory=lambda: [0.0, 0.0], init=False)
     _lp: float = field(default=0.0, init=False)
     value: float = field(default=0.0, init=False)
-    #: The vertical acceleration above ``hf_hz`` (first-order high-pass), as
-    #: an RMS over ~``hf_tau_s`` — where a damper whose loop phase has
-    #: wrapped drives the arm. Over 2 s on jelly: 1.8-1.9 m/s² (median) when
-    #: it ran away, at most 1.55 on ordinary and fast passes (whose spikes
-    #: reach 2.4 over 0.3 s).
-    hf_hz: float = 7.0
-    hf_tau_s: float = 2.0
-    _hf_x: float = field(default=0.0, init=False)
-    _hf_y: float = field(default=0.0, init=False)
-    _hf_ms: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         self._b, self._a = _butter_hp2(self.hp_hz, self.fs)
 
-    @property
-    def hf_rms(self) -> float:
-        """RMS vertical acceleration above :attr:`hf_hz` (m/s²)."""
-        return math.sqrt(self._hf_ms)
-
     def reset(self) -> None:
         self._up, self._t, self._vi, self._lp, self.value = None, None, 0.0, 0.0, 0.0
         self._hx, self._hy = [0.0, 0.0], [0.0, 0.0]
-        self._hf_x = self._hf_y = self._hf_ms = 0.0
 
     def update(
         self, t: float, acc: np.ndarray, gyro_deg_s: np.ndarray | None = None
@@ -121,10 +103,6 @@ class VerticalVelocity:
         self._up += (acc - self._up) * min(1.0, dt / self.up_tau_s)
         g = float(np.linalg.norm(self._up)) or G
         a_v = float(acc @ self._up) / g - g
-        k = 1.0 / (1.0 + 2 * math.pi * self.hf_hz * dt)
-        self._hf_y = k * (self._hf_y + a_v - self._hf_x)
-        self._hf_x = a_v
-        self._hf_ms += (self._hf_y**2 - self._hf_ms) * min(1.0, dt / self.hf_tau_s)
         self._vi += (a_v - 2 * math.pi * self.leak_hz * self._vi) * dt
         b, a = self._b, self._a
         y = (
@@ -221,12 +199,11 @@ class TipDamper:
         max_torque: Per-joint clamp (Nm).
         ramp_s: Fade-in after :meth:`start` (and after a stale gap).
         stale_s: No IMU sample for this long → torque 0.
-        trip_speed: A flex velocity above this (m/s) for ``trip_s`` — or
-            :attr:`trip_hf_acc` — means the loop is feeding the shake, not
-            damping it (too much gain for the IMU's delay): the damper
+        trip_speed: A flex velocity above this (m/s) for ``trip_s`` means the
+            loop is feeding the shake, not damping it (too much gain for the
+            IMU's delay — the simulation diverged by 80 N·s/m): the damper
             switches itself off for the rest of the pass (:attr:`tripped`).
-            slow_osc's own flex velocity peaks near 60 mm/s undamped, a fast
-            generated motion's past 80.
+            slow_osc's own flex velocity peaks near 60 mm/s undamped.
     """
 
     gain: float
@@ -234,17 +211,8 @@ class TipDamper:
     max_torque: float = 1.0
     ramp_s: float = 1.0
     stale_s: float = 0.05
-    trip_speed: float = 1.0
+    trip_speed: float = 0.08
     trip_s: float = 0.15
-    #: High-band (> 7 Hz, 2 s) vertical acceleration RMS (m/s²) that, held
-    #: for :data:`TRIP_HF_HOLD_S`, means the damper is driving the arm; 0 =
-    #: off. The flex speed (80 mm/s before) tripped on fast motions, whose
-    #: ordinary flex reaches ~0.5 m/s; the runaway's signature is the high
-    #: band. ``trip_speed`` stays as a backstop.
-    trip_hf_acc: float = 1.7
-    #: Why it tripped, for the warning ("" until it does).
-    trip_reason: str = field(default="", init=False)
-    _hf_since: float | None = field(default=None, init=False)
     estimator: VerticalVelocity = field(default_factory=VerticalVelocity)
     encoder: EncoderVelocity = field(default_factory=EncoderVelocity)
     #: Per-column scale on ``gain`` (default 1): on jelly shoulder_1 damps
@@ -291,8 +259,6 @@ class TipDamper:
         self._ramp_from = now
         self._started = now
         self.tripped = False
-        self.trip_reason = ""
-        self._hf_since = None
         self._lead_t = None
         self._nx, self._ny = [0.0, 0.0], [0.0, 0.0]
         self._clp = {}
@@ -358,20 +324,10 @@ class TipDamper:
         if started and abs(self.flex) > self.trip_speed:
             if self._fast_since is None:
                 self._fast_since = now
-            elif now - self._fast_since > self.trip_s and not self.tripped:
+            elif now - self._fast_since > self.trip_s:
                 self.tripped = True
-                self.trip_reason = f"flex velocity {abs(self.flex) * 1e3:.0f} mm/s"
         else:
             self._fast_since = None
-        hf = self.estimator.hf_rms
-        if started and self.trip_hf_acc > 0 and hf > self.trip_hf_acc:
-            if self._hf_since is None:
-                self._hf_since = now
-            elif now - self._hf_since > TRIP_HF_HOLD_S and not self.tripped:
-                self.tripped = True
-                self.trip_reason = f"high-band acceleration {hf:.2f} m/s²"
-        else:
-            self._hf_since = None
         if self.tripped:
             return tau
         if self._last_sample is None or now - self._last_sample > self.stale_s:

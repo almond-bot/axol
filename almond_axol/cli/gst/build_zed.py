@@ -20,14 +20,7 @@ Two reasons this exists rather than relying on a stock plugin install:
    ~delivery-latency too new, and that offset differs from inference (which
    uses the SDK), i.e. a train/inference mismatch.
 
-3. While ``zedxonesrc`` owns a camera nothing else can open it, so a robot
-   streaming the wrist camera (teleop) has no other way to its IMU.
-   ``patches/zed-gstreamer-imu-udp.patch`` adds a sensor thread that, when
-   ``AXOL_IMU_UDP`` names the camera's serial, sends every IMU sample to local
-   UDP ports in ``almond_axol.zed.imu_worker``'s datagram format — the
-   realtime core's tip damper listens on one.
-
-We pin upstream to the exact commit the patches were generated against so the
+We pin upstream to the exact commit the patch was generated against so the
 unified diff always applies cleanly. Idempotence is based on a root-owned
 manifest of the exact plugin paths and bytes GStreamer resolves, not merely a
 source-tree stamp. The manifest also records the ZED SDK version the plugins
@@ -67,21 +60,6 @@ _REPO_URL = "https://github.com/stereolabs/zed-gstreamer.git"
 _PINNED_REF = "4a0a3a3d896b54f9cb23f284b5b44e52b5e1a288"
 
 _PATCH = Path(__file__).parent / "patches" / "zed-gstreamer-sensor-timestamp.patch"
-#: Applied in order on the pinned tree; the second is generated against the
-#: tree the first leaves.
-_PATCHES = (
-    _PATCH,
-    Path(__file__).parent / "patches" / "zed-gstreamer-imu-udp.patch",
-)
-
-
-def _patches_sha256() -> str:
-    """One digest over every patch, in order — the build's identity."""
-    h = hashlib.sha256()
-    for path in _PATCHES:
-        h.update(path.read_bytes())
-    return h.hexdigest()
-
 
 # ZED SDK install (find_package(ZED) + the headers the plugins compile against).
 _ZED_SDK = Path("/usr/local/zed")
@@ -143,7 +121,8 @@ def _src_dir() -> Path:
 
 def _desired_stamp() -> str:
     """Pinned ref + patch digest; changes whenever either is bumped."""
-    return f"{_PINNED_REF}\n{_patches_sha256()}\n"
+    patch_sha = hashlib.sha256(_PATCH.read_bytes()).hexdigest()
+    return f"{_PINNED_REF}\n{patch_sha}\n"
 
 
 def _zed_sdk_version() -> str | None:
@@ -334,7 +313,7 @@ def _manifest_payload(artifacts: dict[str, dict[str, str]]) -> str:
             {
                 "schema": _MANIFEST_SCHEMA,
                 "pinnedRef": _PINNED_REF,
-                "patchSha256": _patches_sha256(),
+                "patchSha256": hashlib.sha256(_PATCH.read_bytes()).hexdigest(),
                 "zedSdk": _zed_sdk_version(),
                 "plugins": artifacts,
             },
@@ -545,11 +524,10 @@ def _sync_source(src: Path) -> bool:
 
 def _apply_patch(src: Path) -> bool:
     git = shutil.which("git")
-    missing = [p for p in _PATCHES if not p.exists()]
-    if git is None or missing:
-        _logger.warning("cannot apply patches (git=%s, missing=%s)", git, missing)
+    if git is None or not _PATCH.exists():
+        _logger.warning("cannot apply patch (git=%s, patch=%s)", git, _PATCH)
         return False
-    return all(_run([git, "apply", str(p)], cwd=src) for p in _PATCHES)
+    return _run([git, "apply", str(_PATCH)], cwd=src)
 
 
 def _build_and_install(src: Path) -> bool:
@@ -623,7 +601,7 @@ def run(_args: object = None) -> None:
     if not _sync_source(src):
         raise SystemExit("Could not fetch zed-gstreamer source; retry the build.")
 
-    print("Applying the sensor-exposure-timestamp and IMU-forwarding patches...")
+    print("Applying the sensor-exposure-timestamp patch...")
     if not _apply_patch(src):
         raise SystemExit(
             "The zed-gstreamer timestamp patch did not apply; check upstream drift."

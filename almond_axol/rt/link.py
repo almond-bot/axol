@@ -41,7 +41,7 @@ _ARM_TIMEOUT_S = 15.0
 #: both together whenever the config or target layout changes meaning — a
 #: package and a binary from different checkouts must fail at configure
 #: time, not arm and then silently reject every target.
-CONFIG_PROTO = 17
+CONFIG_PROTO = 16
 
 
 def config_header() -> list[str]:
@@ -370,11 +370,6 @@ class RtLink:
             struct.pack("<9d", *cmd) for cmd in cmds
         )
         self._send(payload)
-
-    def set_tip_damping(self, side: int, on: bool) -> None:
-        """Switch the core's tip damper on one bus (0 left, 1 right) on or
-        off; each switch restarts its filters (``K``)."""
-        self._send(struct.pack("<cBB", b"K", side, 1 if on else 0))
 
     def set_recording_engaged(self, engaged: bool) -> None:
         """Gate the automatic Rust trace to the current teleop segment."""
