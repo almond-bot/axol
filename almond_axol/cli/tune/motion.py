@@ -693,6 +693,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "through. Needs --gyro-mount",
     )
     p.add_argument(
+        "--enc2",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT",
+        help="Read this MyActuator joint's output-side encoder (0x60) every "
+        "few ticks into the realtime core's trace (columns enc2_p / enc2_t of "
+        "PREFIX_rt.npz; implies --record when none is given) — to compare "
+        "it with the motor-side position under load. Repeatable; the core "
+        "reads one listed joint per tick",
+    )
+    p.add_argument(
         "--gyro-mount-fit",
         metavar="RUN_ID",
         help="Fit the wrist camera's mount rotation from a saved tune.motion "
@@ -1125,6 +1136,32 @@ def _torque_probes(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+def _enable_enc2(args: argparse.Namespace) -> None:
+    """``--enc2``: tell the realtime core which joints' output encoder to
+    read (``AXOL_RT_ENC2``, by motor id) and make sure its trace is kept."""
+    import os
+
+    # CAN ids follow the joint order: shoulder_1 = 1 ... wrist_1 = 5, the
+    # MyActuator joints (the Damiao wrists have no second encoder).
+    names = [j.value for j in ARM_JOINTS[:5]]
+    ids: set[int] = set()
+    for spec in args.enc2:
+        side, _, joint = spec.partition(".")
+        if side not in ("left", "right") or joint not in names:
+            raise SystemExit(
+                f"--enc2 wants SIDE.JOINT for a MyActuator joint "
+                f"({', '.join(names)}), got {spec!r}"
+            )
+        ids.add(names.index(joint) + 1)
+    os.environ["AXOL_RT_ENC2"] = ",".join(str(i) for i in sorted(ids))
+    if args.record is None:
+        args.record = time.strftime("enc2_%Y%m%d-%H%M%S")
+    print(
+        f"  output encoder (0x60): {', '.join(args.enc2)} into the "
+        f"{args.record}_rt.npz trace"
+    )
+
+
 def _fit_gyro_mount(args: argparse.Namespace) -> None:
     """``--gyro-mount-fit``: the camera mount from a saved run, to --gyro-mount."""
     import json
@@ -1495,6 +1532,8 @@ async def _run(args: argparse.Namespace) -> None:
     if args.gyro_mount_fit:
         _fit_gyro_mount(args)
         return
+    if args.enc2:
+        _enable_enc2(args)
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
 

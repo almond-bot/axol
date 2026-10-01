@@ -18,6 +18,11 @@ pub const MA_READ_STATUS1: u8 = 0x9A;
 pub const MA_READ_VERSION: u8 = 0xB2;
 pub const MA_READ_MODEL: u8 = 0xB5;
 pub const MA_MULTI_TURN_ANGLE: u8 = 0x92;
+/// Multi-turn encoder position (0x60): the second, output-side encoder's
+/// count with the zero offset applied, int32 in bytes 4-7. On jelly's X8/X6
+/// joints (ENABLE_2ND_ENCODER 3) it counts 131072 per output revolution and
+/// matched the 0x92 angle at rest (2026-10-01).
+pub const MA_MULTI_TURN_ENCODER: u8 = 0x60;
 pub const MA_MOTOR_STATUS_2: u8 = 0x9C;
 pub const MA_RELEASE_BRAKE: u8 = 0x77;
 pub const MA_SHUTDOWN: u8 = 0x80;
@@ -169,6 +174,13 @@ pub fn ma_decode_a4_reply(data: &[u8; 8]) -> (f64, f64, f64) {
     let speed_dps = i16::from_le_bytes([data[4], data[5]]) as f64;
     let angle_deg = i16::from_le_bytes([data[6], data[7]]) as f64;
     (iq, speed_dps.to_radians(), angle_deg.to_radians())
+}
+
+/// Decode a 0x60 reply: the encoder count (int32, bytes 4-7) as radians at
+/// `counts_per_rev`.
+pub fn ma_decode_encoder(data: &[u8; 8], counts_per_rev: f64) -> f64 {
+    let counts = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    counts as f64 * std::f64::consts::TAU / counts_per_rev
 }
 
 /// Decode a 0x92 reply: multi-turn angle in radians (0.01 deg/LSB).
@@ -367,6 +379,15 @@ pub fn mit_encode(p_des: f64, v_des: f64, kp: f64, kd: f64, t_ff: f64, r: &MitRa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// jelly's right shoulder_1 at rest (2026-10-01): 0x60 answered
+    /// `60 00 00 00 bb 83 ff ff` (-31813 counts) while 0x92 read -87.37°.
+    #[test]
+    fn encoder_reply_decodes_to_the_output_angle() {
+        let data = [0x60, 0, 0, 0, 0xbb, 0x83, 0xff, 0xff];
+        let deg = ma_decode_encoder(&data, 131072.0).to_degrees();
+        assert!((deg - -87.38).abs() < 0.01, "{deg}");
+    }
 
     /// Mirrors `tune.a4`'s `dm_frame`: `struct.pack("<ff", p, v)`.
     #[test]

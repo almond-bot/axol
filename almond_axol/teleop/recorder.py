@@ -93,10 +93,14 @@ _RT_TRACE_COLUMNS = (
     "fb_dt",
     "cogging_ff",
     "tf_pct",
+    "enc2_p",
+    "enc2_t",
 )
 # The layout before the cogging cancellation and 0x73 feedforward columns: a
 # CSV a proto-14 core left behind still compacts.
-_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-2]
+_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-4]
+# The layout before the output-encoder columns (AXOL_RT_ENC2).
+_RT_TRACE_COLUMNS_V2 = _RT_TRACE_COLUMNS[:-2]
 
 
 def resolve_prefix(prefix: str) -> str:
@@ -133,6 +137,8 @@ def compact_rt_trace(prefix: str) -> Path | None:
             has_rows = bool(raw.read(1))
         if header == list(_RT_TRACE_COLUMNS):
             columns = _RT_TRACE_COLUMNS
+        elif header == list(_RT_TRACE_COLUMNS_V2):
+            columns = _RT_TRACE_COLUMNS_V2
         elif header == list(_RT_TRACE_COLUMNS_V1):
             columns = _RT_TRACE_COLUMNS_V1
         else:
@@ -157,7 +163,7 @@ def compact_rt_trace(prefix: str) -> Path | None:
                 array = values[:, index].astype(np.uint32)
             elif source_name in {"slot", "motor_id"}:
                 array = values[:, index].astype(np.uint8)
-            elif source_name == "time_s":
+            elif source_name in {"time_s", "enc2_t"}:
                 # Python monotonic timestamps are large enough that float32
                 # would quantize away the 4.17 ms control-tick spacing.
                 array = values[:, index].astype(np.float64)

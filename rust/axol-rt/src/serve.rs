@@ -1115,6 +1115,10 @@ struct TraceRow {
     cogging_ff: f64,
     /// The 0x73 feedforward sent, % of rated current (0 on other frames).
     tf_pct: f64,
+    /// The output-side encoder's last 0x60 reading (rad, motor frame) and
+    /// when it arrived (trace clock), NaN on a motor not in `AXOL_RT_ENC2`.
+    enc2_p: f64,
+    enc2_t: f64,
 }
 
 type TraceHandle = JoinHandle<io::Result<()>>;
@@ -1130,7 +1134,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t"
     )?;
     Ok(out)
 }
@@ -1138,7 +1142,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -1169,7 +1173,24 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.fb_dt,
         r.cogging_ff,
         r.tf_pct,
+        r.enc2_p,
+        r.enc2_t,
     )
+}
+
+/// `AXOL_RT_ENC2`: comma-separated MyActuator motor ids whose output-side
+/// encoder (0x60) the bus loop reads, one per tick round-robin, for the
+/// trace's `enc2_p`/`enc2_t` columns. A diagnostic: the reads never feed
+/// control. `AXOL_RT_ENC2_RES` overrides the counts per output revolution
+/// (default 131072).
+fn enc2_ids(raw: Option<&str>) -> Vec<u8> {
+    raw.map(|r| {
+        r.split(',')
+            .filter_map(|x| x.trim().parse::<u8>().ok())
+            .filter(|id| proto::MA_IDS.contains(id))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn parse_cpu_set(raw: &str, source: &str) -> io::Result<libc::cpu_set_t> {
@@ -1647,6 +1668,13 @@ fn parse_record_gate(payload: &[u8]) -> io::Result<Option<f64>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn enc2_ids_keep_only_myactuator_ids() {
+        assert_eq!(enc2_ids(Some("1, 4,9,x,6")), vec![1, 4]);
+        assert!(enc2_ids(None).is_empty());
+    }
+
     use super::*;
 
     /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
@@ -3296,6 +3324,36 @@ fn bus_loop(
     // the sample.
     let mut a4_stage: [(f64, f64); N_SLOTS] = [(0.0, 0.0); N_SLOTS];
     let mut a4_follow = vec![false; motors.len()];
+    // Output-encoder reads (`AXOL_RT_ENC2`): the motors in the lane (MIT
+    // joints only — an a4 joint's 0x240 replies carry its own reads), and
+    // each slot's last reading with its arrival time.
+    let enc2_lane: Vec<usize> = {
+        let ids = enc2_ids(std::env::var("AXOL_RT_ENC2").ok().as_deref());
+        motors
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                ids.contains(&m.id) && m.vendor == Vendor::MyActuator && m.wire == WireMode::Mit
+            })
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let enc2_res: f64 = std::env::var("AXOL_RT_ENC2_RES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v: &f64| *v > 0.0)
+        .unwrap_or(131072.0);
+    let mut enc2_last: [Option<(f64, Instant)>; N_SLOTS] = [None; N_SLOTS];
+    if !enc2_lane.is_empty() {
+        eprintln!(
+            "{iface}: reading the output encoder (0x60) of {} at {enc2_res} counts/rev",
+            enc2_lane
+                .iter()
+                .map(|&i| motors[i].joint.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     // Which motors this tick tried to command (a thinned motor's off-tick
     // is not a missed reply; a dropped send still is).
     let mut attempted = vec![false; motors.len()];
@@ -3973,6 +4031,8 @@ fn bus_loop(
                             fb_dt: f64::NAN,
                             cogging_ff,
                             tf_pct,
+                            enc2_p: f64::NAN,
+                            enc2_t: f64::NAN,
                         });
                     }
                     if a4_wire(m.vendor, m.wire, tracked, c.kp) {
@@ -4115,6 +4175,22 @@ fn bus_loop(
                 }
             }
 
+            // Output-encoder lane: one 0x60 read per tick, round-robin. Its
+            // reply is counted apart from the motors' samples (`enc2_wait`),
+            // so it never stands in for feedback or counts as a miss.
+            let mut enc2_wait = false;
+            if !enc2_lane.is_empty() {
+                let idx = enc2_lane[(ticks % enc2_lane.len() as u64) as usize];
+                if let SendOutcome::Sent = guarded_send(
+                    &sock,
+                    proto::MA_REQ + motors[idx].id as u16,
+                    &proto::ma_cmd(proto::MA_MULTI_TURN_ENCODER),
+                    &mut enobufs_since,
+                )? {
+                    enc2_wait = true;
+                }
+            }
+
             // Collect replies. The
             // window begins when this tick actually began, not at its nominal
             // schedule point: a late wake must not discard shoulder feedback
@@ -4126,7 +4202,7 @@ fn bus_loop(
             seen.fill(0);
             bus_last_reply = None;
             let mut pending: usize = expected.iter().map(|&n| n as usize).sum();
-            while pending > 0 {
+            while pending > 0 || enc2_wait {
                 let now = Instant::now();
                 if now >= reply_deadline {
                     break;
@@ -4160,6 +4236,14 @@ fn bus_loop(
                             continue;
                         };
                         let slot = motors[idx].slot;
+                        if frame.data[0] == proto::MA_MULTI_TURN_ENCODER {
+                            enc2_last[slot] = Some((
+                                proto::ma_decode_encoder(&frame.data, enc2_res),
+                                Instant::now(),
+                            ));
+                            enc2_wait = false;
+                            continue;
+                        }
                         match frame.data[0] {
                             0xA4 | proto::MA_TF_CMD => {
                                 let (iq, speed, _) = proto::ma_decode_a4_reply(&frame.data);
@@ -4243,6 +4327,14 @@ fn bus_loop(
                     row.meas_v = meas_v;
                     row.meas_tau = tau;
                     row.fb_dt = fb_dt;
+                    if let Some((p, at)) = enc2_last[motors[idx].slot] {
+                        row.enc2_p = p;
+                        row.enc2_t = trace_origin_s
+                            + at.saturating_duration_since(trace_epoch).as_secs_f64();
+                    } else {
+                        row.enc2_p = f64::NAN;
+                        row.enc2_t = f64::NAN;
+                    }
                     match tx.try_send(TraceMsg::Row(row)) {
                         Ok(()) => {}
                         Err(mpsc::TrySendError::Full(_)) => trace_dropped += 1,

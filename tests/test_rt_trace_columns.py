@@ -1,5 +1,5 @@
-"""The Rust trace CSV grows ``cogging_ff`` / ``tf_pct``; the compactor takes
-the new layout and still the one before it."""
+"""The Rust trace CSV grows ``cogging_ff`` / ``tf_pct``, then ``enc2_p`` /
+``enc2_t``; the compactor takes the new layout and still the ones before it."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def _write(path: Path, columns: tuple[str, ...], rows: int) -> None:
 
 class CompactTest(unittest.TestCase):
     def test_new_and_legacy_layouts_compact_side_by_side(self) -> None:
-        self.assertEqual(recorder._RT_TRACE_COLUMNS[-2:], ("cogging_ff", "tf_pct"))
+        self.assertEqual(recorder._RT_TRACE_COLUMNS[-2:], ("enc2_p", "enc2_t"))
         with tempfile.TemporaryDirectory() as d:
             prefix = str(Path(d) / "run")
             _write(Path(f"{prefix}_rt-left.csv"), recorder._RT_TRACE_COLUMNS, 3)
@@ -34,6 +34,19 @@ class CompactTest(unittest.TestCase):
                 self.assertTrue(np.all(np.isfinite(cog[:3])))
                 self.assertTrue(np.all(np.isnan(cog[3:])))
                 self.assertEqual(list(z["side"]), [0, 0, 0, 1, 1])
+
+    def test_the_pre_encoder_layout_still_compacts(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            prefix = str(Path(d) / "run")
+            _write(Path(f"{prefix}_rt-left.csv"), recorder._RT_TRACE_COLUMNS, 2)
+            _write(Path(f"{prefix}_rt-right.csv"), recorder._RT_TRACE_COLUMNS_V2, 2)
+            out = recorder.compact_rt_trace(prefix)
+            assert out is not None
+            with np.load(out) as z:
+                self.assertEqual(z["enc2_t"].dtype, np.float64)
+                self.assertTrue(np.all(np.isfinite(z["enc2_p"][:2])))
+                self.assertTrue(np.all(np.isnan(z["enc2_p"][2:])))
+                self.assertTrue(np.all(np.isfinite(z["cogging_ff"])))
 
     def test_an_unknown_layout_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as d:
