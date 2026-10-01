@@ -187,6 +187,9 @@ class VRTeleop:
                     VRServerConfig, "teleop", "vr_server", store=store
                 )
         self._robot = robot
+        # The realtime core's tip damper, per arm: on while that arm is
+        # engaged (see _sync_tip_damping).
+        self._tip_on = {"left": False, "right": False}
         self._jelly = jelly
         self._config = config
         self._kinematics_config = kinematics_config
@@ -306,6 +309,25 @@ class VRTeleop:
             # This must be unconditional: it is the completion signal for both
             # successful startup and every failure before the listener is live.
             self._vr_ready.set()
+
+    def _sync_tip_damping(self, force_off: bool = False) -> None:
+        """Switch each arm's in-core tip damper with its engage state (a
+        no-op for a robot or arm without one)."""
+        set_tip = getattr(self._robot, "set_tip_damping", None)
+        if set_tip is None:
+            return
+        for side, engaged in (
+            ("left", self._core.left_enabled),
+            ("right", self._core.right_enabled),
+        ):
+            on = engaged and not force_off
+            if on == self._tip_on[side]:
+                continue
+            self._tip_on[side] = on
+            try:
+                set_tip(side, on)
+            except Exception as exc:  # noqa: BLE001 - never stop teleop for it
+                _logger.warning("teleop: tip damping (%s) switch failed: %s", side, exc)
 
     def _broadcast_tracking(self, enabled: bool) -> None:
         """Push the engage-toggle state to the headset (fire-and-forget).
@@ -444,6 +466,11 @@ class VRTeleop:
         """Teardown implementation, called with repeated SIGINT deferred."""
         cleanup_failures: list[tuple[str, BaseException]] = []
         hardware_failures: list[tuple[str, BaseException]] = []
+        # The in-core tip damper goes off before anything else is torn down.
+        try:
+            self._sync_tip_damping(force_off=True)
+        except Exception as exc:  # noqa: BLE001 - best effort; disarm stops it too
+            _logger.warning("teleop: could not switch tip damping off (%s)", exc)
 
         # Stop new work first, then turn the hardware off before waiting on
         # background workers.  A wedged IK reader must not delay torque-off.
@@ -830,6 +857,7 @@ class VRTeleop:
                 if self._robot_recorder is not None:
                     self._robot_recorder(self._core.teleop_enabled)
                 await self._robot.motion_control(left=left, right=right)
+                self._sync_tip_damping()
 
                 if self._rec is not None:
                     # Segment gate: record only while engaged; the disengage

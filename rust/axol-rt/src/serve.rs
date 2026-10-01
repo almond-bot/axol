@@ -352,6 +352,9 @@ struct TipRuntime {
     sock: std::net::UdpSocket,
     seen: u64,
     trip_reported: bool,
+    /// IMU datagrams received, and whether "no IMU" was warned this switch-on.
+    samples: u64,
+    starved_reported: bool,
     /// The torque the last tick applied, per arm slot, and the flex it
     /// acted on (for the trace).
     tau: [f64; 7],
@@ -375,6 +378,8 @@ impl TipRuntime {
             sock,
             seen: TIP_STATE[setup.side as usize].load(Ordering::Acquire),
             trip_reported: false,
+            samples: 0,
+            starved_reported: false,
             tau: [0.0; 7],
             flex: 0.0,
         })
@@ -397,6 +402,14 @@ impl TipRuntime {
         while let Ok(n) = self.sock.recv(&mut buf) {
             if let Some((t, acc, gyro)) = tipdamp::decode_imu(&buf[..n]) {
                 self.damper.feed_imu(t, acc, gyro);
+                if self.samples == 0 {
+                    send_text(
+                        out_tx,
+                        b'L',
+                        &format!("{iface}: tip damper: wrist IMU stream up"),
+                    );
+                }
+                self.samples += 1;
             }
         }
         let state = TIP_STATE[self.side].load(Ordering::Acquire);
@@ -408,6 +421,7 @@ impl TipRuntime {
                     f.reset();
                 }
                 self.trip_reported = false;
+                self.starved_reported = false;
             } else {
                 self.damper.stop();
             }
@@ -415,6 +429,19 @@ impl TipRuntime {
         self.tau = [0.0; 7];
         if !self.damper.running() {
             return self.tau;
+        }
+        if self.samples == 0 && !self.starved_reported {
+            // Switched on with nothing from the camera: say so once rather
+            // than damp silently not at all.
+            self.starved_reported = true;
+            send_text(
+                out_tx,
+                b'W',
+                &format!(
+                    "{iface}: tip damper switched on, but no wrist IMU samples have arrived \
+                     (the camera's IMU forwarding: AXOL_IMU_UDP / the patched zedxonesrc)"
+                ),
+            );
         }
         let mut q_meas = [0.0; 7];
         let mut q_cmd = [0.0; 7];
@@ -1571,8 +1598,8 @@ fn parse_tip_line(f: &[&str], line: &str, tips: &mut Vec<TipSetup>) -> io::Resul
         "tipdamp" => {
             // tipdamp <side> <iface> <port> <gain> <hp> <lp> <lead> <notch>
             // <notch_q> <max_torque> <ref> <delay> <ramp> <stale>
-            // <trip_speed> <trip_s> <n> (<slot> <weight> <lp>) × n
-            if f.len() < 18 {
+            // <trip_speed> <trip_s> <trip_hf_acc> <n> (<slot> <weight> <lp>) × n
+            if f.len() < 19 {
                 return Err(bad());
             }
             let port: u16 = f.get(3).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
@@ -1582,21 +1609,21 @@ fn parse_tip_line(f: &[&str], line: &str, tips: &mut Vec<TipSetup>) -> io::Resul
                 Some(2) => tipdamp::Reference::Model,
                 _ => return Err(bad()),
             };
-            let n: usize = f.get(17).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
-            if n == 0 || f.len() != 18 + 3 * n {
+            let n: usize = f.get(18).and_then(|v| v.parse().ok()).ok_or_else(bad)?;
+            if n == 0 || f.len() != 19 + 3 * n {
                 return Err(bad());
             }
             let mut columns = Vec::with_capacity(n);
             for k in 0..n {
                 let slot: usize = f
-                    .get(18 + 3 * k)
+                    .get(19 + 3 * k)
                     .and_then(|v| v.parse().ok())
                     .filter(|s: &usize| *s < 7)
                     .ok_or_else(bad)?;
                 columns.push(tipdamp::TipColumn {
                     slot,
-                    weight: num(19 + 3 * k)?,
-                    lp_hz: num(20 + 3 * k)?,
+                    weight: num(20 + 3 * k)?,
+                    lp_hz: num(21 + 3 * k)?,
                 });
             }
             let max_torque = num(10)?;
@@ -1618,6 +1645,7 @@ fn parse_tip_line(f: &[&str], line: &str, tips: &mut Vec<TipSetup>) -> io::Resul
                 stale_s: num(14)?,
                 trip_speed: num(15)?,
                 trip_s: num(16)?,
+                trip_hf_acc: num(17)?,
                 columns,
             });
         }
@@ -2907,6 +2935,7 @@ mod tests {
                 stale_s: 0.05,
                 trip_speed: 10.0,
                 trip_s: 0.15,
+                trip_hf_acc: 0.0,
                 columns: vec![tipdamp::TipColumn {
                     slot: 0,
                     weight: 1.0,
@@ -2988,7 +3017,7 @@ mod tests {
              tipoff 1 canR 0.1 0.2 0.3 0.4 0.5 0.6 0.7\n"
         );
         let damp =
-            "tipdamp 1 canR 47811 120 0.3 40 0 0 1 1.5 2 0.008 1 0.05 0.08 0.15 2 0 1 0 3 0.6 6\n";
+            "tipdamp 1 canR 47811 120 0.3 40 0 0 1 1.5 2 0.008 1 0.05 0.3 0.15 1.4 2 0 1 0 3 0.6 6\n";
         let model = "tipmodel 1 canR 0 14.8 0.6 36.2 0.0036\n";
         let cfg = parse_config(&format!("{base}{model}{damp}")).unwrap();
         assert_eq!(cfg.tips.len(), 1);

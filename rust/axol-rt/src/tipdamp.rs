@@ -60,9 +60,22 @@ pub struct VerticalVelocity {
     hy: [f64; 2],
     lp: f64,
     pub value: f64,
+    // The vertical acceleration above HF_HZ, as a mean square over HF_TAU_S
+    // (`hf_rms`): where a damper whose loop phase has wrapped drives the arm.
+    hf_x: f64,
+    hf_y: f64,
+    hf_ms: f64,
 }
 
+const HF_HZ: f64 = 7.0;
+const HF_TAU_S: f64 = 0.3;
+
 impl VerticalVelocity {
+    /// RMS vertical acceleration above 7 Hz (m/s²).
+    pub fn hf_rms(&self) -> f64 {
+        self.hf_ms.sqrt()
+    }
+
     pub fn new(hp_hz: f64, lp_hz: f64) -> Self {
         let (b, a) = butter_hp2(hp_hz, 200.0);
         Self {
@@ -79,6 +92,9 @@ impl VerticalVelocity {
             hy: [0.0; 2],
             lp: 0.0,
             value: 0.0,
+            hf_x: 0.0,
+            hf_y: 0.0,
+            hf_ms: 0.0,
         }
     }
 
@@ -113,6 +129,10 @@ impl VerticalVelocity {
             g = G;
         }
         let a_v = dot(acc, up) / g - g;
+        let k = 1.0 / (1.0 + 2.0 * PI * HF_HZ * dt);
+        self.hf_y = k * (self.hf_y + a_v - self.hf_x);
+        self.hf_x = a_v;
+        self.hf_ms += (self.hf_y * self.hf_y - self.hf_ms) * (dt / HF_TAU_S).min(1.0);
         self.vi += (a_v - 2.0 * PI * self.leak_hz * self.vi) * dt;
         let (b, a) = (self.b, self.a);
         let y = b[0] * self.vi + b[1] * self.hx[0] + b[2] * self.hx[1]
@@ -447,6 +467,8 @@ pub struct TipConfig {
     pub stale_s: f64,
     pub trip_speed: f64,
     pub trip_s: f64,
+    /// High-band vertical acceleration RMS (m/s²) that trips it; 0 = off.
+    pub trip_hf_acc: f64,
     pub columns: Vec<TipColumn>,
 }
 
@@ -577,7 +599,9 @@ impl TipDamper {
         let mut tau = [0.0; 7];
         let started = self.started.is_some_and(|s| now - s >= self.cfg.ramp_s);
         // The guard waits out the ramp-in (the filters' start-up transient).
-        if started && self.flex().abs() > self.cfg.trip_speed {
+        let fast = self.flex().abs() > self.cfg.trip_speed
+            || (self.cfg.trip_hf_acc > 0.0 && self.imu.hf_rms() > self.cfg.trip_hf_acc);
+        if started && fast {
             match self.fast_since {
                 None => self.fast_since = Some(now),
                 Some(since) if now - since > self.cfg.trip_s => self.tripped = true,
@@ -728,8 +752,9 @@ mod tests {
             delay_s: 0.008,
             ramp_s: 1.0,
             stale_s: 0.05,
-            trip_speed: 0.08,
+            trip_speed: 0.3,
             trip_s: 0.15,
+            trip_hf_acc: 1.4,
             columns: vec![
                 TipColumn {
                     slot: 0,
@@ -782,19 +807,30 @@ mod tests {
 
     #[test]
     fn a_runaway_trips_the_damper_off() {
-        let mut d = damper();
-        d.start(0.0);
-        let jz = [-0.4, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0];
-        // The reference swings 30 mm at 1.5 Hz (~0.28 m/s): |flex| stays
-        // over trip_speed for longer than trip_s each half cycle.
-        for k in 0..(3 * 240) {
-            let now = k as f64 / 240.0;
-            d.feed_height(now, 0.03 * (2.0 * PI * 1.5 * now).sin());
-            d.feed_imu(now, [0.0, 0.0, G], [0.0; 3]);
-            d.torque(now, &jz);
-        }
+        // The runaway on jelly: 1.9-2.7 m/s² of band acceleration at
+        // ~11 Hz; ordinary passes 0.5-0.9.
+        let run = |amp: f64| {
+            let mut d = damper();
+            d.start(0.0);
+            let jz = [-0.4, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0];
+            for k in 0..(4 * 240) {
+                let now = k as f64 / 240.0;
+                d.feed_height(now, 0.0);
+                if k % 6 < 5 {
+                    let a = amp * (2.0 * PI * 11.0 * now).sin();
+                    d.feed_imu(now, [0.0, 0.0, G + a], [0.0; 3]);
+                }
+                d.torque(now, &jz);
+            }
+            d
+        };
+        let mut d = run(3.0);
         assert!(d.tripped);
-        assert_eq!(d.torque(3.0, &jz), [0.0; 7]);
+        assert_eq!(
+            d.torque(4.0, &[-0.4, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0]),
+            [0.0; 7]
+        );
+        assert!(!run(0.8).tripped);
     }
 
     #[test]

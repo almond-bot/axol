@@ -623,7 +623,7 @@ def run(_args: object = None) -> None:
     if not _sync_source(src):
         raise SystemExit("Could not fetch zed-gstreamer source; retry the build.")
 
-    print("Applying the sensor-exposure-timestamp patch...")
+    print("Applying the sensor-exposure-timestamp and IMU-forwarding patches...")
     if not _apply_patch(src):
         raise SystemExit(
             "The zed-gstreamer timestamp patch did not apply; check upstream drift."

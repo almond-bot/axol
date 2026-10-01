@@ -79,11 +79,12 @@ class ConfigLinesTest(unittest.TestCase):
         self.assertEqual(s2[3], "1")  # shoulder_2's arm slot
         self.assertEqual(float(s2[6]), 0.0)  # no zero → 0
         damp = lines[4].split()
-        self.assertEqual(len(damp), 18 + 3 * 2)
+        self.assertEqual(len(damp), 19 + 3 * 2)
         self.assertEqual(damp[3], "47811")
         self.assertEqual(int(damp[11]), REFERENCES["model"])
-        self.assertEqual(damp[17], "2")
-        self.assertEqual(damp[18:], ["0", "1.0", "0.0", "3", "0.6", "6.0"])
+        self.assertEqual(float(damp[17]), 1.4)  # trip_hf_acc
+        self.assertEqual(damp[18], "2")
+        self.assertEqual(damp[19:], ["0", "1.0", "0.0", "3", "0.6", "6.0"])
 
     def test_an_unresolved_offset_and_a_bad_joint_are_refused(self) -> None:
         offsets = np.zeros(7)

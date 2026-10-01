@@ -170,6 +170,6 @@ def config_lines(
         f"{cfg.lp_hz!r} {cfg.lead_hz!r} {cfg.notch_hz!r} {cfg.notch_q!r} "
         f"{cfg.max_torque!r} {REFERENCES[cfg.reference]} {cfg.delay_s!r} "
         f"{cfg.ramp_s!r} {cfg.stale_s!r} {cfg.trip_speed!r} {cfg.trip_s!r} "
-        f"{len(cfg.joints)} {cols}"
+        f"{cfg.trip_hf_acc!r} {len(cfg.joints)} {cols}"
     )
     return lines

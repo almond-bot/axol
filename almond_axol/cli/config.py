@@ -584,6 +584,33 @@ def normalize_bool_flags(argv: list[str], *names: str) -> list[str]:
 
 
 @dataclass
+class TeleopTipDampConfig:
+    """The realtime core's wrist-IMU tip damper during teleop (off unless
+    ``enable``). Each driven arm with a wrist camera (``--cameras``
+    ``left_arm`` / ``right_arm``) gets one, switched on while that arm is
+    engaged. Needs the patched ``zedxonesrc`` (``axol gst.build-zed``): the
+    camera's IMU reaches the core from the video relay that owns it.
+
+    On jelly's right arm (2026-10-01, slow_osc) shoulder_1 at 120 N·s/m with
+    the elbow at 0.4× cut the vertical tool shake 35% for a 10% rise in
+    high-band acceleration; ``tune.motion --imu-damp-core`` tunes it."""
+
+    enable: bool = False
+    """Damp the tool's vertical shake from the wrist IMU."""
+    gain: float = 120.0
+    """N·s/m of vertical damping at the tool."""
+    joints: str = "shoulder_1:1.0,elbow:0.4"
+    """The joints that apply it and their gain scales, ``joint:scale,...``."""
+    reference: str = "command"
+    """``command`` (the commanded tool height) or ``model`` (the commanded
+    joints through their ``tune.tf`` tracking models)."""
+    max_torque: float = 1.5
+    """Per-joint clamp (Nm)."""
+    hp_hz: float = 0.3
+    lp_hz: float = 40.0
+
+
+@dataclass
 class TeleopCmdConfig:
     """Config for ``axol teleop``.
 
@@ -658,6 +685,7 @@ class TeleopCmdConfig:
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
+    tip_damp: TeleopTipDampConfig = field(default_factory=TeleopTipDampConfig)
     camera_eyes: dict[str, str] = field(default_factory=dict)
     resolution: str | None = None
     log_level: LogLevel = "INFO"

@@ -160,6 +160,92 @@ def _stream_eyes_for(cfg: TeleopCmdConfig, name: str) -> tuple[list[str], bool]:
     return _stereo_eyes_for(name)
 
 
+#: UDP port the realtime core's tip damper listens on, per side (as
+#: ``tune.motion --imu-damp-core``).
+_TIP_PORTS = {"left": 47810, "right": 47811}
+
+
+def _configure_tip_damping(cfg: TeleopCmdConfig) -> dict[str, int]:
+    """``--tip_damp.enable``: put each driven arm's tip damper in the core
+    (``ArmConfig.tip_damp``) and have the video relay's patched
+    ``zedxonesrc`` forward that wrist camera's IMU to it (``AXOL_IMU_UDP``,
+    read when the relay starts). Returns ``{side: camera serial}``."""
+    from ..constants import ARM_JOINTS
+    from ..robot.config import TipDampConfig
+
+    tip = cfg.tip_damp
+    if not tip.enable:
+        return {}
+    names = {j.value for j in ARM_JOINTS}
+    joints: dict[str, float] = {}
+    for item in tip.joints.split(","):
+        name, _, scale = item.strip().partition(":")
+        if name not in names:
+            raise SystemExit(f"--tip_damp.joints: unknown arm joint {name!r}")
+        joints[name] = float(scale) if scale else 1.0
+    sides = [
+        side
+        for side, channel in (("left", cfg.left_channel), ("right", cfg.right_channel))
+        if channel is not None
+    ]
+    serials: dict[str, int] = {}
+    for side in sides:
+        serial = cfg.cameras.get(f"{side}_arm")
+        if serial is None:
+            _logger.warning(
+                "teleop: tip damping on the %s arm needs its wrist camera "
+                "(--cameras %s_arm: <serial>) — skipped",
+                side,
+                side,
+            )
+            continue
+        serials[side] = int(serial)
+    if not serials:
+        return {}
+    from ..kinematics.solver import KinematicsSolver
+    from ..rt.tipdamp import check_chain, poe_chain
+    from ..tuning.tracking_model import load_models
+
+    solver = KinematicsSolver()
+    models = load_models() if tip.reference == "model" else {}
+    for side in serials:
+        chain = poe_chain(solver, side)
+        if check_chain(solver, side, chain) > 1e-4:
+            raise SystemExit(
+                f"teleop: the {side} arm's kinematics are not a chain the core's "
+                "tip damper can run"
+            )
+        getattr(cfg.axol, side).tip_damp = TipDampConfig(
+            gain=tip.gain,
+            joints=dict(joints),
+            hp_hz=tip.hp_hz,
+            lp_hz=tip.lp_hz,
+            max_torque=tip.max_torque,
+            reference=tip.reference,
+            imu_port=_TIP_PORTS[side],
+            tracking_models={
+                key.split(".", 1)[1]: m
+                for key, m in models.items()
+                if key.startswith(f"{side}.")
+            },
+            chain=chain,
+        )
+        _logger.info(
+            "teleop: tip damping (%s): %g N·s/m through %s against the %s, "
+            "wrist camera %d → udp %d",
+            side,
+            tip.gain,
+            tip.joints,
+            tip.reference,
+            serials[side],
+            _TIP_PORTS[side],
+        )
+    os.environ["AXOL_IMU_UDP"] = ";".join(
+        f"{serials[side]}:{_TIP_PORTS[side]}" for side in serials
+    )
+    return serials
+
+
 def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
@@ -539,6 +625,7 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
     else:
         # The Rust realtime core is the sole hardware control backend. Python
         # owns VR/IK/model math and streams targets; Rust owns both CAN buses.
+        _configure_tip_damping(cfg)
         robot = Axol(
             config=cfg.axol,
             left_channel=cfg.left_channel,
