@@ -2115,9 +2115,8 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     continue
                 print(
-                    f"  ! IMU damping ({side}) switched itself off: the flex "
-                    f"velocity passed {d.trip_speed * 1e3:.0f} mm/s for "
-                    f"{d.trip_s:g} s — lower --imu-damp"
+                    f"  ! IMU damping ({side}) switched itself off: "
+                    f"{getattr(d, 'trip_reason', '') or 'it ran away'} — lower --imu-damp"
                 )
         return None
 

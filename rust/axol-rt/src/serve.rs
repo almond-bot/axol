@@ -471,14 +471,23 @@ impl TipRuntime {
         self.flex = self.damper.flex();
         if self.damper.tripped && !self.trip_reported {
             self.trip_reported = true;
+            let (why, level) = self.damper.trip_reason;
+            let reason = if why == 2 {
+                format!(
+                    "the high-band (> 7 Hz) acceleration held {level:.2} m/s² over {:.2}",
+                    self.damper.cfg.trip_hf_acc
+                )
+            } else {
+                format!(
+                    "the flex velocity held {:.0} mm/s over {:.0}",
+                    level * 1e3,
+                    self.damper.cfg.trip_speed * 1e3
+                )
+            };
             send_text(
                 out_tx,
                 b'W',
-                &format!(
-                    "{iface}: tip damper switched itself off — the flex velocity passed {:.0} mm/s for {:.2} s (lower its gain)",
-                    self.damper.cfg.trip_speed * 1e3,
-                    self.damper.cfg.trip_s
-                ),
+                &format!("{iface}: tip damper switched itself off — {reason} (lower its gain)"),
             );
         }
         self.tau
@@ -3017,7 +3026,7 @@ mod tests {
              tipoff 1 canR 0.1 0.2 0.3 0.4 0.5 0.6 0.7\n"
         );
         let damp =
-            "tipdamp 1 canR 47811 120 0.3 40 0 0 1 1.5 2 0.008 1 0.05 0.3 0.15 1.4 2 0 1 0 3 0.6 6\n";
+            "tipdamp 1 canR 47811 120 0.3 40 0 0 1 1.5 2 0.008 1 0.05 1.0 0.15 1.7 2 0 1 0 3 0.6 6\n";
         let model = "tipmodel 1 canR 0 14.8 0.6 36.2 0.0036\n";
         let cfg = parse_config(&format!("{base}{model}{damp}")).unwrap();
         assert_eq!(cfg.tips.len(), 1);

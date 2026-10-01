@@ -68,7 +68,9 @@ pub struct VerticalVelocity {
 }
 
 const HF_HZ: f64 = 7.0;
-const HF_TAU_S: f64 = 0.3;
+const HF_TAU_S: f64 = 2.0;
+/// How long the high-band acceleration must stay over `trip_hf_acc`.
+pub const TRIP_HF_HOLD_S: f64 = 0.5;
 
 impl VerticalVelocity {
     /// RMS vertical acceleration above 7 Hz (m/s²).
@@ -478,6 +480,9 @@ pub struct TipDamper {
     pub imu: VerticalVelocity,
     pub height: HeightVelocity,
     pub tripped: bool,
+    /// Why it tripped (0 not yet, 1 flex speed, 2 high band) and the level.
+    pub trip_reason: (u8, f64),
+    hf_since: Option<f64>,
     started: Option<f64>,
     ramp_from: Option<f64>,
     fast_since: Option<f64>,
@@ -500,6 +505,8 @@ impl TipDamper {
             imu,
             height,
             tripped: false,
+            trip_reason: (0, 0.0),
+            hf_since: None,
             started: None,
             ramp_from: None,
             fast_since: None,
@@ -526,6 +533,8 @@ impl TipDamper {
         self.ramp_from = Some(now);
         self.started = Some(now);
         self.tripped = false;
+        self.trip_reason = (0, 0.0);
+        self.hf_since = None;
         self.fast_since = None;
         self.lead_t = None;
         self.nx = [0.0; 2];
@@ -599,16 +608,30 @@ impl TipDamper {
         let mut tau = [0.0; 7];
         let started = self.started.is_some_and(|s| now - s >= self.cfg.ramp_s);
         // The guard waits out the ramp-in (the filters' start-up transient).
-        let fast = self.flex().abs() > self.cfg.trip_speed
-            || (self.cfg.trip_hf_acc > 0.0 && self.imu.hf_rms() > self.cfg.trip_hf_acc);
-        if started && fast {
+        if started && self.flex().abs() > self.cfg.trip_speed {
             match self.fast_since {
                 None => self.fast_since = Some(now),
-                Some(since) if now - since > self.cfg.trip_s => self.tripped = true,
+                Some(since) if now - since > self.cfg.trip_s && !self.tripped => {
+                    self.tripped = true;
+                    self.trip_reason = (1, self.flex().abs());
+                }
                 _ => {}
             }
         } else {
             self.fast_since = None;
+        }
+        let hf = self.imu.hf_rms();
+        if started && self.cfg.trip_hf_acc > 0.0 && hf > self.cfg.trip_hf_acc {
+            match self.hf_since {
+                None => self.hf_since = Some(now),
+                Some(since) if now - since > TRIP_HF_HOLD_S && !self.tripped => {
+                    self.tripped = true;
+                    self.trip_reason = (2, hf);
+                }
+                _ => {}
+            }
+        } else {
+            self.hf_since = None;
         }
         if self.tripped || self.started.is_none() {
             return tau;
@@ -752,9 +775,9 @@ mod tests {
             delay_s: 0.008,
             ramp_s: 1.0,
             stale_s: 0.05,
-            trip_speed: 0.3,
+            trip_speed: 1.0,
             trip_s: 0.15,
-            trip_hf_acc: 1.4,
+            trip_hf_acc: 1.7,
             columns: vec![
                 TipColumn {
                     slot: 0,
@@ -813,7 +836,7 @@ mod tests {
             let mut d = damper();
             d.start(0.0);
             let jz = [-0.4, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0];
-            for k in 0..(4 * 240) {
+            for k in 0..(5 * 240) {
                 let now = k as f64 / 240.0;
                 d.feed_height(now, 0.0);
                 if k % 6 < 5 {
@@ -824,7 +847,7 @@ mod tests {
             }
             d
         };
-        let mut d = run(3.0);
+        let mut d = run(4.0);
         assert!(d.tripped);
         assert_eq!(
             d.torque(4.0, &[-0.4, 0.0, 0.0, -0.3, 0.0, 0.0, 0.0]),

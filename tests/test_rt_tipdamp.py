@@ -82,7 +82,7 @@ class ConfigLinesTest(unittest.TestCase):
         self.assertEqual(len(damp), 19 + 3 * 2)
         self.assertEqual(damp[3], "47811")
         self.assertEqual(int(damp[11]), REFERENCES["model"])
-        self.assertEqual(float(damp[17]), 1.4)  # trip_hf_acc
+        self.assertEqual(float(damp[17]), 1.7)  # trip_hf_acc
         self.assertEqual(damp[18], "2")
         self.assertEqual(damp[19:], ["0", "1.0", "0.0", "3", "0.6", "6.0"])
 

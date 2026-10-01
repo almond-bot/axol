@@ -23,7 +23,7 @@ def _structure(
     seconds: float = 30.0,
     delay_s: float = 0.012,
     seed: int = 0,
-    trip_speed: float = 0.3,
+    trip_speed: float = 1.0,
 ):
     """Tool height on a 2 Hz, ζ 0.05 mode (2 kg), shaken by a 1-6 Hz force,
     pushed by one joint's torque through a 0.6 m lever. The IMU is tilted,
@@ -128,7 +128,7 @@ class HighBandTripTest(unittest.TestCase):
     def _run(self, amp: float) -> TipDamper:
         d = TipDamper(gain=50.0, columns=(0,), ramp_s=0.5)
         d.start(0.0)
-        for i in range(int(4 * 240)):
+        for i in range(int(5 * 240)):
             t = i / 240.0
             if i % 6 < 5:  # ~200 Hz IMU
                 a = amp * math.sin(2 * math.pi * 11.0 * t)
@@ -138,10 +138,12 @@ class HighBandTripTest(unittest.TestCase):
         return d
 
     def test_a_sustained_11hz_drive_trips_and_an_ordinary_one_does_not(self) -> None:
-        # The runaway on jelly: 1.9-2.7 m/s² of band acceleration; ordinary
-        # passes 0.5-0.9.
-        self.assertTrue(self._run(3.0).tripped)
-        self.assertFalse(self._run(0.8).tripped)
+        # The runaway on jelly: ~1.8 m/s² of > 7 Hz acceleration over 2 s;
+        # ordinary and fast passes at most ~1.55.
+        hot = self._run(4.0)
+        self.assertTrue(hot.tripped)
+        self.assertIn("high-band acceleration", hot.trip_reason)
+        self.assertFalse(self._run(1.5).tripped)
 
 
 class FlexTest(unittest.TestCase):

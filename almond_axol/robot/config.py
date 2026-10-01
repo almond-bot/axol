@@ -699,9 +699,9 @@ class TipDampConfig:
     delay_s: float = 0.008
     ramp_s: float = 1.0
     stale_s: float = 0.05
-    trip_speed: float = 0.3
+    trip_speed: float = 1.0
     trip_s: float = 0.15
-    trip_hf_acc: float = 1.4
+    trip_hf_acc: float = 1.7
     imu_port: int = 0
     tracking_models: dict[str, Any] = field(default_factory=dict)
     chain: dict[str, Any] | None = None
