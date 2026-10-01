@@ -230,7 +230,13 @@ class TipDamper:
     #: acceleration does).
     notch_hz: float = 0.0
     notch_q: float = 1.0
+    #: Per-column first-order low-pass (Hz) on that joint's torque, at the
+    #: 240 Hz motion rate: on jelly the elbow damps 3-15 Hz and drives an
+    #: ~11 Hz mode, shoulder_1 damps the 1-3 Hz sway — filter one channel
+    #: without costing the other its phase.
+    column_lp: dict[int, float] = field(default_factory=dict)
     tripped: bool = field(default=False, init=False)
+    _clp: dict[int, float] = field(default_factory=dict, init=False)
     _nx: list[float] = field(default_factory=lambda: [0.0, 0.0], init=False)
     _ny: list[float] = field(default_factory=lambda: [0.0, 0.0], init=False)
     _lead_in: float = field(default=0.0, init=False)
@@ -255,6 +261,7 @@ class TipDamper:
         self.tripped = False
         self._lead_t = None
         self._nx, self._ny = [0.0, 0.0], [0.0, 0.0]
+        self._clp = {}
         self._fast_since = None
 
     def feed(self, rows: np.ndarray) -> None:
@@ -335,13 +342,12 @@ class TipDamper:
         )
         force = -self.gain * self._notch(self._lead(now, self.flex))
         for i in self.columns:
-            tau[i] = float(
-                np.clip(
-                    ramp * self.weights.get(i, 1.0) * jac_z[i] * force,
-                    -self.max_torque,
-                    self.max_torque,
-                )
-            )
+            value = ramp * self.weights.get(i, 1.0) * jac_z[i] * force
+            if i in self.column_lp:
+                alpha = 1.0 - math.exp(-2 * math.pi * self.column_lp[i] / 240.0)
+                value = self._clp.get(i, 0.0) + alpha * (value - self._clp.get(i, 0.0))
+                self._clp[i] = value
+            tau[i] = float(np.clip(value, -self.max_torque, self.max_torque))
         return tau
 
 

@@ -433,6 +433,64 @@ class SessionTest(unittest.TestCase):
             self.assertLessEqual(peak[0], 0.3 + 1e-9)
             self.assertEqual(float(np.delete(peak, 0).max()), 0.0)
 
+    def test_model_reference_damps_through_a_saved_tracking_model(self) -> None:
+        from almond_axol.tuning import tracking_model
+
+        model = tracking_model.TrackingModel(
+            1.0, WN, ZETA, math.inf, DELAY / RATE, 0.3, 8.0, 0.0
+        )
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            store = tmp / "tm.json"
+            tracking_model.save_model("right.shoulder_1", model, store)
+            real = tracking_model.load_models
+            with mock.patch.object(
+                tracking_model, "load_models", lambda path=store: real(store)
+            ):
+                text = self._run(
+                    [
+                        "--imu-damp",
+                        "100",
+                        "--imu-damp-ref",
+                        "model",
+                        "--imu-damp-joint",
+                        "right.shoulder_1",
+                        "--imu-damp-joint",
+                        "right.elbow=0.6",
+                        "--imu-damp-joint-lp",
+                        "right.elbow=8",
+                        "--label",
+                        "model",
+                    ],
+                    tmp,
+                    imu=True,
+                )
+            self.assertIn(
+                "damping reference: the expected path through right.shoulder_1", text
+            )
+            self.assertIn("elbow ×0.6 (lp 8 Hz)", text)
+            with mock.patch.object(
+                tracking_model, "load_models", lambda path=store: real(store)
+            ):
+                text = self._run(
+                    [
+                        "--imu-damp",
+                        "100",
+                        "--imu-damp-source",
+                        "encoder",
+                        "--imu-damp-ref",
+                        "model",
+                        "--imu-damp-joint",
+                        "right.shoulder_1",
+                        "--label",
+                        "encmodel",
+                    ],
+                    tmp,
+                )
+            self.assertIn("encoder height against the expected path", text)
+            applied = [a for a in _FakeAxol.applied if a is not None]
+            self.assertTrue(applied)
+
     def test_invert_streams_through_a_saved_model(self) -> None:
         from almond_axol.tuning import tracking_model
 

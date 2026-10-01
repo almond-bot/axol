@@ -212,5 +212,27 @@ class CliTest(unittest.TestCase):
             np.testing.assert_array_equal(out_stream[:, 12], ref[:, 12])
 
 
+class TrackingFilterTest(unittest.TestCase):
+    def test_matches_the_model_response_and_starts_at_rest(self) -> None:
+        from almond_axol.tuning.tracking_model import TrackingFilter, TrackingModel
+
+        m = TrackingModel(0.93, 2 * math.pi * 2.4, 0.6, 36.0, 0.004, 0.3, 6.0, 0.1)
+        fs = 240.0
+        t = np.arange(0, 20, 1 / fs)
+        for f in (0.5, 2.0, 4.0):
+            x = 0.3 + np.sin(2 * math.pi * f * t)
+            y = TrackingFilter(m, fs).run(x)
+            n = len(t) // 2
+            xs, ys = np.fft.rfft(x[n:] - 0.3), np.fft.rfft(y[n:] - 0.3)
+            k = int(np.argmax(np.abs(xs)))
+            h = ys[k] / xs[k]
+            want = m.response(np.array([f]))[0] / m.k  # DC gain pinned to 1
+            self.assertAlmostEqual(abs(h), abs(want), delta=0.02)
+            self.assertAlmostEqual(math.degrees(np.angle(h / want)), 0.0, delta=2.0)
+        # A constant command stays put from the first sample: no start-up step.
+        y = TrackingFilter(m, fs).run(np.full(50, 1.2))
+        self.assertTrue(np.allclose(y, 1.2))
+
+
 if __name__ == "__main__":
     unittest.main()

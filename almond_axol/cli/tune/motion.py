@@ -749,19 +749,31 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default="imu",
         help="What --imu-damp measures the tool's velocity with: the wrist IMU "
         "(default) or FK of the joint encoders (encoder: no camera needed and "
-        "no IMU latency, but blind to flex past the joints; always against "
-        "the commanded height)",
+        "no IMU latency, but blind to flex past the joints; against the "
+        "commanded height, or the expected one with --imu-damp-ref model)",
+    )
+    p.add_argument(
+        "--imu-damp-joint-lp",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT=HZ",
+        help="First-order low-pass on one damping joint's torque (repeatable) "
+        "— e.g. the elbow's channel against an ~11 Hz mode, leaving "
+        "shoulder_1's 1-3 Hz phase alone",
     )
     p.add_argument(
         "--imu-damp-ref",
-        choices=("encoder", "command"),
+        choices=("encoder", "command", "model"),
         default="encoder",
         help="What --imu-damp measures the tool's velocity against: the "
         "height the joint encoders give (encoder, the default: damp only the "
         "flex past the encoders) or the commanded height (command: damp the "
         "whole deviation from the path, encoder-visible wobble included — on "
         "jelly a shoulder_1 torque probe moved the 1-3 Hz tool height "
-        "coherently while barely moving the hidden flex)",
+        "coherently while barely moving the hidden flex) or the height the "
+        "arm is expected to reach (model: each joint's command through its "
+        "tracking model from tune.tf, ~/.almond/tracking_models.json, so "
+        "the arm's normal ~60 ms lag is not damped as wobble)",
     )
     p.add_argument(
         "--imu-damp-alternate",
@@ -995,6 +1007,14 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
     if args.imu_damp <= 0:
         return {}
     by_encoder = args.imu_damp_source == "encoder"
+    if args.imu_damp_ref == "model":
+        from ...tuning.tracking_model import load_models
+
+        modelled = sorted(load_models())
+        print(
+            "  damping reference: the expected path through "
+            + (", ".join(modelled) if modelled else "no tracking models (= command)")
+        )
     if args.no_imu and not by_encoder:
         raise SystemExit("tune.motion: --imu-damp needs the wrist IMU (drop --no-imu)")
     names = [j.value for j in ARM_JOINTS]
@@ -1019,6 +1039,16 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 cols.append(names.index(joint))
                 if scale:
                     weights[names.index(joint)] = float(scale)
+        column_lp: dict[int, float] = {}
+        for spec in args.imu_damp_joint_lp:
+            name, _, hz = spec.partition("=")
+            s_side, _, joint = name.partition(".")
+            if joint not in names or s_side not in ("left", "right") or not hz:
+                raise SystemExit(
+                    f"--imu-damp-joint-lp wants SIDE.JOINT=HZ, got {spec!r}"
+                )
+            if s_side == side:
+                column_lp[names.index(joint)] = float(hz)
         if cols:
             kind = EncoderTipDamper if by_encoder else TipDamper
             extra = (
@@ -1043,18 +1073,22 @@ def _imu_dampers(args: argparse.Namespace) -> dict[str, Any]:
                 weights=weights,
                 notch_hz=args.imu_damp_notch,
                 notch_q=args.imu_damp_notch_q,
+                column_lp=column_lp,
             )
             print(
                 f"  {'encoder' if by_encoder else 'IMU'} damping ({side}): "
                 + f"{args.imu_damp:g} N·s/m at the tool through "
                 + ", ".join(
-                    names[c] + (f" ×{weights[c]:g}" if c in weights else "")
+                    names[c]
+                    + (f" ×{weights[c]:g}" if c in weights else "")
+                    + (f" (lp {column_lp[c]:g} Hz)" if c in column_lp else "")
                     for c in cols
                 )
                 + f" (clamp {args.imu_damp_max:g} Nm, band {args.imu_damp_hp:g}-"
                 + f"{args.imu_damp_lp:g} Hz, "
                 + (
-                    "encoder height against the command"
+                    "encoder height against the "
+                    + ("expected path" if args.imu_damp_ref == "model" else "command")
                     if by_encoder
                     else f"against the {args.imu_damp_ref} height"
                 )
@@ -1261,6 +1295,23 @@ def _joint_axes(
         a = 0.5 * np.array([d[2, 1] - d[1, 2], d[0, 2] - d[2, 0], d[1, 0] - d[0, 1]])
         axes[c] = a / max(float(np.linalg.norm(a)), 1e-12)
     return rots[0], axes
+
+
+def _expected_waypoints(waypoints: Any, solver: Any, rate: float) -> np.ndarray:
+    """The full-N waypoints each modelled joint is expected to reach: its
+    commanded column through its tracking model (``tune.tf``), run causally
+    from the first waypoint; joints without a model pass through."""
+    from ...tuning.tracking_model import TrackingFilter, load_models
+
+    rows = np.array([np.asarray(q, dtype=float) for q in waypoints])
+    models = load_models()
+    names = [j.value for j in ARM_JOINTS]
+    for side, idx in (("left", solver.left_indices), ("right", solver.right_indices)):
+        for c, joint in enumerate(names):
+            model = models.get(f"{side}.{joint}")
+            if model is not None and len(rows):
+                rows[:, idx[c]] = TrackingFilter(model, rate).run(rows[:, idx[c]])
+    return rows
 
 
 def _ee_rotation(solver: Any, q_full: np.ndarray, side: str) -> np.ndarray:
@@ -1842,6 +1893,11 @@ async def _run(args: argparse.Namespace) -> None:
             imu.poll(side)  # drop what queued between passes
             d.start(t0)
         jac: dict[str, np.ndarray] = {}
+        expected = (
+            _expected_waypoints(waypoints, solver, motion.rate)
+            if active and args.imu_damp_ref == "model"
+            else None
+        )
         for k, q in enumerate(waypoints):
             deadline += period
             left[:7] = q[solver.left_indices]
@@ -1869,7 +1925,21 @@ async def _run(args: argparse.Namespace) -> None:
                         height = _height(solver, q_meas, side)
                     now = time.perf_counter()
                     if isinstance(d, EncoderTipDamper):
-                        d.feed_command(now, _height(solver, np.asarray(q), side))
+                        # Against the commanded path, or (--imu-damp-ref
+                        # model) the path the arm is expected to follow,
+                        # so its normal tracking lag is not damped.
+                        d.feed_command(
+                            now,
+                            _height(
+                                solver,
+                                expected[k] if expected is not None else np.asarray(q),
+                                side,
+                            ),
+                        )
+                    elif expected is not None:
+                        # The height the arm is expected to reach: its
+                        # normal tracking lag is not wobble.
+                        height = _height(solver, expected[k], side)
                     elif args.imu_damp_ref == "command":
                         # The tool height this waypoint commands: the
                         # damper then sees the whole deviation from the path.

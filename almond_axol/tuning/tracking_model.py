@@ -312,3 +312,61 @@ def save_model(
     tmp.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
     tmp.replace(path)
     return path
+
+
+class TrackingFilter:
+    """A :class:`TrackingModel` run causally, one sample at a time: the
+    position a joint is expected to reach given what it was commanded.
+
+    Bilinear (Tustin) discretisation of the second-order section and its
+    zero at ``fs``, the delay rounded to whole samples. The DC gain is pinned
+    to 1 unless ``keep_gain``: a model fitted over 0.3-6 Hz extrapolates its
+    ``k`` to the deliberate motion below that, and a 7% "steady-state error"
+    on a 100° stroke is not what the joint does. The state starts at rest at
+    the first sample.
+    """
+
+    def __init__(self, model: TrackingModel, fs: float, keep_gain: bool = False):
+        c = 2.0 * fs
+        wn, z = model.wn, model.zeta
+        r = c / model.wz if math.isfinite(model.wz) else 0.0
+        k = model.k if keep_gain else 1.0
+        # num(z): k wn² [r (z² - 1) + (z + 1)²]; den(z): c²(z-1)² +
+        # 2ζwn c (z²-1) + wn²(z+1)², both over (z+1)².
+        b = k * wn**2 * np.array([r + 1.0, 2.0, 1.0 - r])
+        a = np.array(
+            [
+                c * c + 2 * z * wn * c + wn**2,
+                -2 * c * c + 2 * wn**2,
+                c * c - 2 * z * wn * c + wn**2,
+            ]
+        )
+        self._b = b / a[0]
+        self._a = a / a[0]
+        self._delay = max(0, int(round(model.tau * fs)))
+        self._buf: list[float] = []
+        self._x = [0.0, 0.0]
+        self._y = [0.0, 0.0]
+        self._started = False
+
+    def step(self, x: float) -> float:
+        x = float(x)
+        if not self._started:
+            # At rest at the first sample: the steady state of the section.
+            gain = float(self._b.sum() / self._a.sum())
+            self._x = [x, x]
+            self._y = [x * gain, x * gain]
+            self._buf = [x] * self._delay
+            self._started = True
+        if self._delay:
+            self._buf.append(x)
+            x = self._buf.pop(0)
+        b, a = self._b, self._a
+        y = b[0] * x + b[1] * self._x[0] + b[2] * self._x[1]
+        y -= a[1] * self._y[0] + a[2] * self._y[1]
+        self._x = [x, self._x[0]]
+        self._y = [y, self._y[0]]
+        return y
+
+    def run(self, xs: np.ndarray) -> np.ndarray:
+        return np.array([self.step(x) for x in np.asarray(xs, dtype=float)])

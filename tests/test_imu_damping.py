@@ -332,5 +332,27 @@ class EncoderTipTest(unittest.TestCase):
         self.assertGreater(np.std(shaky), 0.003)
 
 
+class ColumnLowPassTest(unittest.TestCase):
+    def test_one_channel_is_filtered_and_the_other_is_not(self) -> None:
+        from almond_axol.tuning.imu_damping import EncoderTipDamper
+
+        d = EncoderTipDamper(
+            gain=100.0, columns=(0, 3), ramp_s=0.0, max_torque=10.0, column_lp={3: 3.0}
+        )
+        d.start(0.0)
+        jac = np.array([-0.4, 0, 0, -0.4, 0, 0, 0])
+        taus = []
+        for i in range(int(4 * 240)):
+            t = i / 240.0
+            d.feed_command(t, 0.0)
+            d.feed_height(t, 0.0005 * math.sin(2 * math.pi * 11.0 * t))
+            taus.append(d.torque(t, jac))
+        taus = np.array(taus[240:])
+        # 11 Hz through a 3 Hz pole: ~0.26 of the unfiltered channel.
+        ratio = np.std(taus[:, 3]) / np.std(taus[:, 0])
+        self.assertLess(ratio, 0.35)
+        self.assertGreater(ratio, 0.15)
+
+
 if __name__ == "__main__":
     unittest.main()
