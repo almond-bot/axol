@@ -21,7 +21,7 @@ def _write(path: Path, columns: tuple[str, ...], rows: int) -> None:
 
 class CompactTest(unittest.TestCase):
     def test_new_and_legacy_layouts_compact_side_by_side(self) -> None:
-        self.assertEqual(recorder._RT_TRACE_COLUMNS[-2:], ("enc2_p", "enc2_t"))
+        self.assertEqual(recorder._RT_TRACE_COLUMNS[-1], "dob_ff")
         with tempfile.TemporaryDirectory() as d:
             prefix = str(Path(d) / "run")
             _write(Path(f"{prefix}_rt-left.csv"), recorder._RT_TRACE_COLUMNS, 3)

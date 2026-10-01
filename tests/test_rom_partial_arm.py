@@ -427,6 +427,11 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
                         "0.0",
                         "0.0",
                         "0.0",
+                        # Disturbance observer off (gain, Q Hz, high-pass Hz, clamp).
+                        "0.0",
+                        "6.0",
+                        "0.5",
+                        "1.5",
                     ],
                     line,
                 )

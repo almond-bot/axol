@@ -123,7 +123,7 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
         # the optional 0x73 feedforward scale and cogging lines; 16: the
         # optional per-joint impedance_hz.
         # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
-        self.assertEqual(link.CONFIG_PROTO, 16)
+        self.assertEqual(link.CONFIG_PROTO, 17)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())

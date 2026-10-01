@@ -410,7 +410,9 @@ class Axol(RobotBase):
                     f"{gains.firmware.planner_lead_ms or 0.0} "
                     f"{tf_nm_per_pct(j, gains)} "
                     # This joint's impedance rate (0 = the config-wide one).
-                    f"{gains.impedance_hz or 0.0}"
+                    f"{gains.impedance_hz or 0.0} "
+                    # The disturbance observer (gain 0 = off).
+                    f"{gains.dob_gain} {gains.dob_hz} {gains.dob_hp_hz} {gains.dob_max}"
                 )
                 if cogging and gains.cogging is not None and gains.cogging_gain != 0.0:
                     offset = float(arm._joint_offsets[ARM_JOINTS.index(j)])

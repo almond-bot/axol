@@ -495,9 +495,129 @@ impl Holdover {
     }
 }
 
+/// A joint's disturbance-observer settings (`dob_*` on the joint line).
+/// `gain` 0 = off.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DobParams {
+    /// Fraction of the estimated disturbance fed back (0..1).
+    pub gain: f64,
+    /// Bandwidth of the observer's Q filter (Hz): a second-order low-pass on
+    /// both the torque and the encoder's acceleration. The MIT position's
+    /// 0.022° steps make the acceleration noisy: at 15 Hz the noise is as
+    /// large as the disturbance it should find (~0.25 Nm on shoulder_1), at
+    /// 6 Hz ~0.04 Nm.
+    pub hz: f64,
+    /// High-pass on the estimate (Hz): the slow terms — gravity, sliding
+    /// friction — stay the model's.
+    pub hp_hz: f64,
+    /// Clamp on the feedback (Nm).
+    pub max: f64,
+}
+
+/// Disturbance observer: the torque the joint's model does not account for,
+/// `Q·(τ − g) − J·Q·s²q` — measured motor torque less model gravity, less
+/// inertia × the encoder's acceleration, both through the same Q filter (so
+/// the estimate is the disturbance seen through Q, not a noisy double
+/// derivative) — high-passed. Added back to the command (`+ gain × d̂`) it
+/// cancels friction, stiction and cogging the feedforward misses: on jelly's
+/// slow_osc 55-100% of the 1-3 Hz joint sway was such a disturbance beyond
+/// the joints' tracking models (2026-10-01).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dob {
+    x: f64,
+    xd: f64,
+    u: f64,
+    ud: f64,
+    hp_in: f64,
+    hp_out: f64,
+    primed: bool,
+    /// The last estimate (Nm, high-passed).
+    pub d: f64,
+}
+
+impl Dob {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// One tick: measured position `q` (rad) and motor torque `tau` (Nm),
+    /// model gravity `g` (Nm), inertia `j` (kg·m²). Returns the estimate.
+    pub fn update(&mut self, q: f64, tau: f64, g: f64, j: f64, p: &DobParams, dt: f64) -> f64 {
+        if !self.primed {
+            *self = Self {
+                x: q,
+                u: tau - g,
+                primed: true,
+                ..Self::default()
+            };
+            return 0.0;
+        }
+        if !(dt > 0.0 && dt < 0.1) {
+            return self.d;
+        }
+        let w = 2.0 * std::f64::consts::PI * p.hz;
+        let z = std::f64::consts::FRAC_1_SQRT_2;
+        // Second-order low-pass state-variable filters: `xdd` is Q·s²q.
+        let xdd = w * w * (q - self.x) - 2.0 * z * w * self.xd;
+        self.xd += xdd * dt;
+        self.x += self.xd * dt;
+        let udd = w * w * ((tau - g) - self.u) - 2.0 * z * w * self.ud;
+        self.ud += udd * dt;
+        self.u += self.ud * dt;
+        let raw = self.u - j * xdd;
+        let a = 1.0 / (1.0 + 2.0 * std::f64::consts::PI * p.hp_hz * dt);
+        self.hp_out = a * (self.hp_out + raw - self.hp_in);
+        self.hp_in = raw;
+        self.d = self.hp_out;
+        self.d
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A joint on a PD loop (kp 450, kd 5, J 0.85) pushed by a 2 Hz
+    /// disturbance torque: the observer, fed back at gain 0.8, cuts the
+    /// position error it causes, and with no disturbance adds ~nothing.
+    #[test]
+    fn dob_rejects_a_disturbance_torque() {
+        let run = |gain: f64, amp: f64| -> (f64, f64) {
+            let p = DobParams {
+                gain,
+                hz: 6.0,
+                hp_hz: 0.5,
+                max: 2.0,
+            };
+            let (j, kp, kd, dt) = (0.85, 450.0, 5.0, 1.0 / 240.0);
+            let (mut q, mut v, mut dob, mut ff) = (0.0f64, 0.0f64, Dob::default(), 0.0f64);
+            let (mut err2, mut ff2, mut n) = (0.0, 0.0, 0.0);
+            for k in 0..(20 * 240) {
+                let t = k as f64 * dt;
+                let dist = amp * (2.0 * std::f64::consts::PI * 2.0 * t).sin();
+                let tau = -kp * q - kd * v + ff; // motor torque this tick
+                                                 // the plant, 10 substeps
+                for _ in 0..10 {
+                    let a = (tau - dist) / j;
+                    v += a * dt / 10.0;
+                    q += v * dt / 10.0;
+                }
+                ff = (gain * dob.update(q, tau, 0.0, j, &p, dt)).clamp(-p.max, p.max);
+                if t > 5.0 {
+                    err2 += q * q;
+                    ff2 += ff * ff;
+                    n += 1.0;
+                }
+            }
+            ((err2 / n).sqrt(), (ff2 / n).sqrt())
+        };
+        let (open, _) = run(0.0, 0.3);
+        let (closed, ff) = run(0.8, 0.3);
+        assert!(closed < 0.5 * open, "{closed} vs {open}");
+        assert!(ff > 0.1, "{ff}");
+        let (_, idle) = run(0.8, 0.0);
+        assert!(idle < 1e-6, "{idle}");
+    }
 
     const DT: f64 = 1.0 / 240.0;
 
