@@ -14,6 +14,8 @@ Flashes a firmware image to a single MyActuator motor over CAN. The motor reboot
 | `--frame-delay SECONDS` | Pause between CAN frames; raise if the adapter's TX queue overruns (default: `0`, matching the vendor tool) |
 | `--yes` | Skip the confirmation prompt |
 
+Failures are handled the way the vendor tool handles them: a rejected block aborts the flash rather than being resent, and the bootloader's own failure replies stop it with the vendor tool's explanation — a firmware version mismatch (the image isn't for this motor), the first packet not received, a frame header error, or a flash write failure. The firmware file name may be at most 120 bytes, the vendor tool's limit.
+
 ```bash
 axol motor.flash --l --id 0x01 ./RMD-X6-V4.4.bin
 axol motor.flash --r --id 0x03 ./firmware.bin --yes

@@ -2,8 +2,7 @@
   "setup": [
     "uv sync --extra lerobot --extra sim",
     "source .venv/bin/activate",
-    "axol provision",
-    "axol jetson.setup"
+    "axol provision"
   ],
   "teardown": [],
   "run": [

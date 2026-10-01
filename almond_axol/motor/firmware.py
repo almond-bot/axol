@@ -17,6 +17,11 @@ CRC-16/XMODEM over the payload only. It is split across CAN frames 8 bytes at a
 time; DLC is the only framing, so a packet simply spans ceil(n / 8) frames.
 The handshake is stock YMODEM: the bootloader sends ``C`` to open the transfer,
 block 0 carries ``filename\\0size``, and every block is answered with ACK.
+
+Failures follow the vendor tool, not stock YMODEM: any NAK aborts the transfer
+(it never retransmits), and the bootloader reports a few failures with replies
+of its own — see :data:`_FW_FAILURES`. An aborted flash leaves the motor in its
+bootloader; running the flash again recovers it.
 """
 
 from __future__ import annotations
@@ -47,19 +52,31 @@ _STX = 0x02  # header for a 1024-byte payload
 _EOT = 0x04
 _ACK = 0x06
 _NAK = 0x15
-_CANCEL = 0x18  # two in a row aborts the transfer
+_CANCEL = 0x18
 _CRC_REQ = 0x43  # "C" — receiver asks for a CRC-mode transfer
 _PAD = 0x1A  # fills the tail of a short final block
 
 _SHORT_BLOCK = 128
 _LONG_BLOCK = 1024
 
+# The vendor tool refuses longer file names (block 0 is 128 bytes and also
+# carries the size).
+_FW_MAX_NAME_BYTES = 120
+
 # The vendor tool waits 7 s for every handshake byte; a flash erase before the
 # first "C" is the slowest step and stays well inside that.
 _FW_REPLY_TIMEOUT_S = 7.0
 
-# Blocks rejected with NAK are retransmitted this many times before giving up.
-_FW_BLOCK_RETRIES = 5
+# Replies the bootloader uses to report a failure, with the vendor tool's
+# meaning for each. Every one ends the transfer. A single CANCEL is not in the
+# table: the vendor tool only fails on two in a row (see _await_reply).
+_FW_FAILURES: dict[bytes, str] = {
+    bytes([_NAK]): "checksum error (the bootloader rejected the block)",
+    bytes([0xF1]): "firmware version mismatch (this image is not for this motor)",
+    bytes([0x00, 0x00]): "the bootloader failed to receive the first packet",
+    bytes([_CANCEL, _CANCEL]): "frame header error",
+}
+_FW_FLASH_WRITE_FAILED = "the bootloader failed to write flash"
 
 
 def _make_crc16_table() -> tuple[int, ...]:
@@ -83,10 +100,6 @@ def _crc16(data: bytes) -> int:
     for byte in data:
         crc = ((crc << 8) ^ _CRC16_TABLE[((crc >> 8) ^ byte) & 0xFF]) & 0xFFFF
     return crc
-
-
-class _TransferNak(Exception):
-    """The bootloader NAK-ed a block; the caller should retransmit it."""
 
 
 class FirmwareUpdater:
@@ -140,13 +153,14 @@ class FirmwareUpdater:
     async def _await_reply(self, expected: bytes, timeout: float, step: str) -> None:
         """Block until the bootloader answers with exactly ``expected``.
 
-        Frames that are neither the expected reply nor a protocol control byte
-        are ignored — a retransmitted ACK from the previous step can still be
-        in flight. Raises :class:`_TransferNak` on NAK so the caller can resend.
+        Raises MotorError at once for a failure reply (:data:`_FW_FAILURES`, or
+        two single CANCEL frames in a row), and on timeout. Any other frame is
+        ignored — a retransmitted ACK from the previous step can still be in
+        flight — and breaks a run of CANCELs, as in the vendor tool.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-        cancels = 0
+        cancelled = False
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -160,16 +174,18 @@ class FirmwareUpdater:
                 continue
             if reply == expected:
                 return
-            if reply[:1] == bytes([_NAK]):
-                raise _TransferNak()
-            if reply[:1] == bytes([_CANCEL]) or reply == bytes([_CANCEL, _CANCEL]):
-                cancels += 2 if len(reply) > 1 else 1
-                if cancels >= 2:
-                    raise MotorError(
-                        f"MyActuator motor {self._motor_id:#04x}: bootloader "
-                        f"aborted the transfer during {step}"
-                    )
-                continue
+            failure = _FW_FAILURES.get(reply)
+            if failure is None and reply == bytes([_CANCEL]):
+                if not cancelled:
+                    cancelled = True
+                    continue
+                failure = _FW_FLASH_WRITE_FAILED
+            if failure is not None:
+                raise MotorError(
+                    f"MyActuator motor {self._motor_id:#04x}: firmware update "
+                    f"failed during {step}: {failure}"
+                )
+            cancelled = False
             _logger.debug(
                 "motor %#04x: ignoring %s during %s",
                 self._motor_id,
@@ -200,28 +216,15 @@ class FirmwareUpdater:
     async def _send_block(
         self, block: int, payload: bytes, frame_delay: float, step: str
     ) -> None:
-        """Send one YMODEM block and wait for its ACK, retrying on NAK."""
+        """Send one YMODEM block and wait for its ACK.
+
+        Not retried on NAK: the vendor tool never retransmits, so a rejected
+        block aborts the flash (see :data:`_FW_FAILURES`).
+        """
         header = _SOH if len(payload) == _SHORT_BLOCK else _STX
-        packet = self._packet(header, block, payload)
-        for attempt in range(1, _FW_BLOCK_RETRIES + 1):
-            self._drain()
-            await self._send_stream(packet, frame_delay)
-            try:
-                await self._await_reply(bytes([_ACK]), _FW_REPLY_TIMEOUT_S, step)
-                return
-            except _TransferNak:
-                if attempt == _FW_BLOCK_RETRIES:
-                    raise MotorError(
-                        f"MyActuator motor {self._motor_id:#04x}: bootloader "
-                        f"rejected {step} after {_FW_BLOCK_RETRIES} attempts"
-                    )
-                _logger.warning(
-                    "motor %#04x: NAK on %s, retrying (%d/%d)",
-                    self._motor_id,
-                    step,
-                    attempt,
-                    _FW_BLOCK_RETRIES,
-                )
+        self._drain()
+        await self._send_stream(self._packet(header, block, payload), frame_delay)
+        await self._await_reply(bytes([_ACK]), _FW_REPLY_TIMEOUT_S, step)
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -258,8 +261,10 @@ class FirmwareUpdater:
                          acknowledged block.
 
         Raises:
-            MotorError: The bootloader did not answer, NAK-ed a block too many
-                        times, or aborted the transfer.
+            MotorError: The bootloader did not answer or reported a failure
+                        (a rejected block, a firmware version mismatch, a
+                        flash write failure, ...); the message says which.
+            ValueError: The image is empty or its name is too long.
         """
         if not firmware:
             raise ValueError("firmware image is empty")
@@ -272,7 +277,12 @@ class FirmwareUpdater:
             bytes([_CRC_REQ]), _FW_REPLY_TIMEOUT_S, "bootloader handshake"
         )
 
-        header = name.encode("ascii", errors="replace") + b"\x00" + str(total).encode()
+        encoded_name = name.encode("ascii", errors="replace")
+        if len(encoded_name) > _FW_MAX_NAME_BYTES:
+            raise ValueError(
+                f"firmware name {name!r} is longer than {_FW_MAX_NAME_BYTES} bytes"
+            )
+        header = encoded_name + b"\x00" + str(total).encode()
         if len(header) > _SHORT_BLOCK:
             raise ValueError(f"firmware name {name!r} is too long for YMODEM block 0")
         await self._send_header_block(header, frame_delay)
@@ -300,19 +310,9 @@ class FirmwareUpdater:
     async def _send_header_block(self, header: bytes, frame_delay: float) -> None:
         """Send YMODEM block 0 and consume the ACK + "C" that follows it."""
         payload = header.ljust(_SHORT_BLOCK, b"\x00")
-        packet = self._packet(_SOH, 0, payload)
-        for attempt in range(1, _FW_BLOCK_RETRIES + 1):
-            self._drain()
-            await self._send_stream(packet, frame_delay)
-            try:
-                # Block 0 is answered with ACK and a fresh "C" in one frame.
-                await self._await_reply(
-                    bytes([_ACK, _CRC_REQ]), _FW_REPLY_TIMEOUT_S, "header block"
-                )
-                return
-            except _TransferNak:
-                if attempt == _FW_BLOCK_RETRIES:
-                    raise MotorError(
-                        f"MyActuator motor {self._motor_id:#04x}: bootloader "
-                        f"rejected the header block"
-                    )
+        self._drain()
+        await self._send_stream(self._packet(_SOH, 0, payload), frame_delay)
+        # Block 0 is answered with ACK and a fresh "C" in one frame.
+        await self._await_reply(
+            bytes([_ACK, _CRC_REQ]), _FW_REPLY_TIMEOUT_S, "header block"
+        )

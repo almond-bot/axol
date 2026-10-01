@@ -18,7 +18,13 @@ from typing import Callable
 import can
 
 from .bus import CanBus
-from .config import MYACTUATOR_PARAMS, PARAM_SWEEP_RANGE, MyActuatorParam
+from .config import (
+    MYACTUATOR_FW_V44,
+    MYACTUATOR_PARAMS,
+    PARAM_SWEEP_RANGE,
+    MotorParam,
+    MyActuatorParam,
+)
 from .driver import MotorDriver
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
@@ -72,12 +78,19 @@ _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by 
 #
 # where ``rw`` selects read or write and ``v0..v3`` are a little-endian float32
 # (the value in the parameter's display unit — Volts for the threshold below).
-# A read echoes the frame back with the stored value in bytes 4-7. Writes only
-# land in RAM; 0xC1 commits every parameter written since the last commit to ROM.
+# A read echoes the frame back (so byte 2 carries the index) with the stored
+# value in bytes 4-7. Writes only land in RAM; 0xC1 commits every parameter
+# written since the last commit to ROM.
 _MA_PARAM_ACCESS = 0xC0
 _MA_PARAM_SAVE = 0xC1  # commit 0xC0 writes to ROM; sent with an empty payload
 _MA_PARAM_READ = 0x01  # byte 3 of a 0xC0 frame
 _MA_PARAM_WRITE = 0x00
+
+# Second-encoder resolution (pulses/rev) the setup software writes alongside
+# each ENABLE_2ND_ENCODER mode. Its Save handler sets the resolution only for
+# these two modes and leaves it untouched for 0 (disabled) and 1, so this does
+# the same.
+_MA_2ND_ENCODER_RESOLUTION = {2: 16384.0, 3: 131072.0}
 
 # Undervoltage threshold applied to every motor on enable(). Negative, so the
 # bus voltage can never fall below it and the motor never latches the level-2
@@ -108,7 +121,7 @@ _MA_DEC_VEL_PLAN = 0x03  # velocity planning deceleration
 # silently wrong — e.g. a t_ff encoded for the legacy ±24 Nm range decodes to
 # ~2.5x on V4.4 firmware (±60 Nm on an X6). The active firmware is detected
 # per-motor in enable() via the 0xB2 version read.
-_MA_FW_V44_VERSION = 2026042402
+_MA_FW_V44_VERSION = MYACTUATOR_FW_V44
 
 # Unchanged across firmware versions.
 _MA_V_MAX = 45.0  # rad/s
@@ -344,6 +357,14 @@ class MyActuatorMotor(MotorDriver):
         """
         data = bytes([_MA_PARAM_ACCESS, 0x00, index, _MA_PARAM_READ, 0, 0, 0, 0])
         resp = await self._request(data)
+        # Every 0xC0 reply shares one response ID and command byte, so a late
+        # reply to an earlier read can resolve this one; the index echo in
+        # byte 2 is what tells them apart.
+        if resp[2] != index:
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x}: reply to parameter "
+                f"{index:#04x} echoed {resp[2]:#04x}"
+            )
         return float(struct.unpack_from("<f", resp, 4)[0])
 
     async def _write_param(
@@ -531,6 +552,23 @@ class MyActuatorMotor(MotorDriver):
 
     async def set_low_voltage_threshold(self, volts: float) -> None:
         await self._write_param(MyActuatorParam.LOW_VOLTAGE, volts)
+
+    async def param_supported(self, param: MotorParam) -> bool:
+        minimum = self.PARAMS[param].min_firmware
+        if minimum is None:
+            return True
+        await self._detect_capabilities()
+        assert self._fw_version is not None
+        return self._fw_version >= minimum
+
+    async def write_config(self, param: MotorParam, value: float) -> None:
+        await super().write_config(param, value)
+        if param is MyActuatorParam.ENABLE_2ND_ENCODER and float(value).is_integer():
+            resolution = _MA_2ND_ENCODER_RESOLUTION.get(int(value))
+            if resolution is not None:
+                await super().write_config(
+                    MyActuatorParam.SECOND_ENCODER_RESOLUTION, resolution
+                )
 
     async def _config_read(self, index: int) -> float:
         return await self._read_param(index)

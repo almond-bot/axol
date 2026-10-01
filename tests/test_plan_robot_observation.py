@@ -143,11 +143,12 @@ def test_timed_out_joint_dispatch_joins_cancellation_before_handover(robot_loop)
     assert not robot._dispatch_untrusted
 
 
-def test_reset_readiness_cancels_before_touching_pipe():
+def test_reset_readiness_cancels_without_consuming_the_handshake():
+    # The shared wait (teleop.core.wait_for_ik_ready) polls, then honours the
+    # stop request before reading anything from the worker pipe.
     controller = IKResetController()
-    controller._conn = Mock()
+    controller._conn = Mock(poll=Mock(return_value=False))
     assert controller.wait_ready(stopped=lambda: True) is False
-    controller._conn.poll.assert_not_called()
     controller._conn.recv.assert_not_called()
 
 
@@ -157,6 +158,7 @@ def test_reset_readiness_checks_worker_death_and_timeout():
     controller._proc = SimpleNamespace(is_alive=lambda: False, exitcode=17)
     with pytest.raises(RuntimeError, match="exit code 17"):
         controller.wait_ready()
+    controller._proc = SimpleNamespace(is_alive=lambda: True, exitcode=None)
     with pytest.raises(TimeoutError, match="did not become ready"):
         controller.wait_ready(timeout=0)
 

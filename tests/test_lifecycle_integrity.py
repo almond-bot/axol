@@ -689,7 +689,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
             patch("almond_axol.video.shm_frames.SnapshotReader") as snapshot,
             patch.object(record_proc, "_open_dataset") as open_dataset,
@@ -729,7 +729,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_encoded_dataset_encoder"),
             patch.object(record_proc, "_open_dataset", return_value=dataset),
             patch.object(
@@ -884,7 +884,10 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             recorder._capture_error = None
             recorder._row_times = []
             recorder._dataset = dataset
-            recorder._config = {"smooth_ee_hz": 0.0}
+            recorder._config = {
+                "smooth_ee_hz": 0.0,
+                "dataset_root": str(Path(directory) / "dataset"),
+            }
             recorder._verifier = Mock()
             recorder._episodes_recorded = 0
             recorder._fatal_error = None
@@ -960,7 +963,7 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             patch(
                 "almond_axol.utils.affinity.pin_background_and_ik", return_value=True
             ),
-            patch("almond_axol.utils.affinity.pin_background", return_value=True),
+            patch("almond_axol.utils.affinity.pin_recorder", return_value=True),
             patch.object(record_proc, "install_dataset_encoder"),
             patch.object(record_proc, "_open_dataset", return_value=dataset),
             patch.object(record_proc, "_EpisodeVideoVerifier", return_value=verifier),

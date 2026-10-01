@@ -1,13 +1,21 @@
 ---
-title: "Axol Hardware"
-description: "Overview and setup guide for the Axol dual-arm robot, its mounts, and the Perception Kit."
+title: "Hardware Overview"
+description: "Overview of the Axol dual-arm robot, its mounting options, the Camera Kit, and the Compute Kit."
 ---
 
-Axol is configured at order time from three choices:
+Axol is configured at order time from these choices:
 
-- **Axol** — The dual-arm robot. Every configuration starts here.
-- **Mounting** — Standalone (bolt Axol to your own table or fixture), the **Axol Mount** (rigid table/fixture column), or **Jelly** (height-adjustable mobile base).
-- **Perception Kit** (optional) — Head and wrist cameras plus the compute needed to run Axol.
+- **Axol**: the dual-arm robot. Every configuration starts here.
+- **Mounting**: one of the following.
+  - **Standalone**: bolt Axol to your own table or fixture.
+  - **Owl Mount**: rigid table/fixture column.
+  - **Ox Cart**: height-adjustable mobile cart with a manual lift and leveling casters.
+  - **Jelly Mobile**: powered mobile base with a battery and telescoping lift.
+- **Camera Kit**: 2× ZED X One S Fisheye wrist cameras and 1× ZED X Mini stereo head camera, with mounts and GMSL2 cabling.
+- **Compute Kit**: the onboard Jetson that runs Axol, one of the following.
+  - **ZED Box Orin**: Jetson Orin NX 16GB in the industrial ZED Box.
+  - **Jetson AGX Orin**: 64GB, for running the full Camera Kit.
+  - **Jetson Thor**: 128GB Blackwell, for VLA policies and the full Camera Kit on one box.
 
 ## Axol Overview
 
@@ -15,7 +23,7 @@ Axol is configured at order time from three choices:
   <img src="/assets/axol.png" alt="Almond Axol dual-arm robot" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bolts** that thread in from the bottom — see the [mounting holes diagram](#reference-diagrams) below.
+Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bolts** that thread in from the bottom. See the [mounting holes diagram](#reference-diagrams) below.
 
 The back of the robot exposes the connectors used for power and camera control:
 
@@ -26,227 +34,110 @@ The back of the robot exposes the connectors used for power and camera control:
 ### Reference diagrams
 
 - [Mounting holes](https://www.almond.bot/resources/axol_mounting_holes.pdf) (PDF)
+- [Joint layout drawing](https://www.almond.bot/resources/axol_joint_layout.pdf) (PDF)
 - [Gripper drawing](https://www.almond.bot/resources/gripper.pdf) (PDF)
 - [Gripper CAD model](https://www.almond.bot/resources/gripper.step) (STEP)
 
-## Axol Mount Overview
+## Owl Mount Overview
 
 <Frame>
-  <img src="/assets/axol_mount.png" alt="Almond Axol on the Axol Mount" width="400" style={{ margin: "0 auto" }} />
+  <img src="/assets/owl_mount.png" alt="Almond Axol on the Owl Mount" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Axol Mount is a rigid **400mm 8080 aluminum T-slot extrusion column** that bolts Axol to a table, workbench, or fixture. Its base brackets include clearance holes for **2020, 4040, and 4545** extrusion patterns, so it drops onto most T-slot tables without drilling, and the column's T-slots stay free for cable management and accessories. An Axol mounting plate and all table/fixture hardware are included.
+The Owl Mount is a rigid **400mm 8080 aluminum T-slot extrusion column** that bolts Axol to a table, workbench, or fixture. Its base brackets include clearance holes for **2020, 4040, and 4545** extrusion patterns, so it drops onto most T-slot tables without drilling, and the column's T-slots stay free for cable management and accessories. An Axol mounting plate and all table/fixture hardware are included.
 
 ### Reference diagrams
 
 - [Mount drawing](https://www.almond.bot/resources/static_mount.pdf) (PDF)
+- [Owl Mount product page](https://www.almond.bot/owl-mount)
 
-## Jelly Overview
-
-<Frame>
-  <img src="/assets/jelly.png" alt="Almond Axol on the height-adjustable Jelly" width="400" style={{ margin: "0 auto" }} />
-</Frame>
-
-Jelly is a height-adjustable mobile base with **leveling casters** and a **manual lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height. Its **60x60cm footprint** fits through standard doors, and T-slot mounting keeps it easy to customize.
-
-## Perception Kit Overview
+## Ox Cart Overview
 
 <Frame>
-  <img src="/assets/axol_perception_kit.png" alt="Almond Axol with the Perception Kit cameras and head mount" width="400" style={{ margin: "0 auto" }} />
+  <img src="/assets/ox_cart.png" alt="Almond Axol on the height-adjustable Ox Cart" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Perception Kit adds the cameras and compute for data collection and policy inference:
-
-- **2× ZED X One S** wrist cameras with wrist mounts.
-- **1× ZED X Mini** head camera with a head mount.
-- **1× ZED Box Orin NX 16GB** for onboard compute.
-- **FAKRA GMSL2 cabling** for all three cameras.
-
-### Reference diagrams
-
-- [Wrist Mount](https://www.almond.bot/resources/wrist_mount.step) (STEP)
-- [Head Mount](https://www.almond.bot/resources/head_mount.step) (STEP)
-
-## Installation
-
-Setting up your Axol configuration.
-
-#### Tools required
-
-You'll need hex (Allen) keys for the socket head cap screws used throughout:
-
-| Screw | Hex key |
-|---|---|
-| M8 | 6&nbsp;mm |
-| M4 | 3&nbsp;mm |
-| M3 | 2.5&nbsp;mm |
-| M2 | 1.5&nbsp;mm |
-
-### Mounting Axol
-
-Axol mounts to the Axol Mount, Jelly, or your own fixture with four **M8×12 bolts** and their **locking washers**, threaded in from underneath. See the [mounting holes diagram](#reference-diagrams) for hole positions.
-
-<Warning>
-  We recommend using **two people** to lift and place it on the mount.
-</Warning>
-
-<Steps>
-  <Step title="Gather the hardware">
-    Have the four **M8×12 bolts** and **locking washers** ready, along with a **6&nbsp;mm hex key**.
-  </Step>
-  <Step title="Place Axol on the mount">
-    With two people, lift Axol and set it on the mount, aligning its mounting holes with the holes in the mounting plate.
-  </Step>
-  <Step title="Insert the bolts from below">
-    From underneath the mounting plate, pass each M8×12 bolt (with its locking washer) up through the plate and into Axol's mounting holes.
-
-    <Note>
-      Getting the bolts to catch the threads can be tricky. Gently **wiggling Axol** as you start each bolt helps align the holes and lets the threads bite.
-    </Note>
-  </Step>
-  <Step title="Tighten">
-    Tighten all four bolts with the 6&nbsp;mm hex key to lock Axol in place.
-  </Step>
-</Steps>
-
-### Mounting the cameras
-
-This section applies to configurations with the **Perception Kit**.
-
-<Note>
-  Before mounting each camera, scan the **QR code on the back** to grab its serial ID and note down which camera goes where (left wrist, right wrist, head). You'll need this mapping later to match each camera ID to its position.
-</Note>
-
-#### Wrist cameras
-
-<Steps>
-  <Step title="Mount the camera to the bracket">
-    Fasten each wrist camera to its mount with 4x **M2×8 screws**.
-
-    <Frame>
-      <img src="/assets/wirst_mount.png" alt="Wrist camera mounted to its bracket" width="400" style={{ margin: "0 auto" }} />
-    </Frame>
-  </Step>
-  <Step title="Mount the bracket to the wrist">
-    Attach the camera-and-bracket assembly to the wrist with **M3×8 screws**.
-
-    <Frame>
-      <img src="/assets/wrist_mount_gripper.png" alt="Wrist camera bracket mounted to the gripper" width="400" style={{ margin: "0 auto" }} />
-    </Frame>
-  </Step>
-  <Step title="Remove the lens cap">
-    Remove the lens cap from the wrist camera.
-  </Step>
-</Steps>
-
-#### Head camera
-
-<Steps>
-  <Step title="Mount the camera to the bracket">
-    The head camera screws depend on which model your Perception Kit ships with:
-
-    - **ZED X Mini** - Use 4x **M4×8 screws**.
-    - **ZED X One S (ZX1S)** - Use 4x **M2×8 screws** (same as the wrist cameras).
-
-    <Frame>
-      <img src="/assets/head_mount.png" alt="Head camera mounted to its bracket" width="400" style={{ margin: "0 auto" }} />
-    </Frame>
-  </Step>
-  <Step title="Mount the bracket to the robot">
-    Attach the camera-and-bracket assembly to the head-camera mounting holes on top of Axol with **M4×10 screws**.
-  </Step>
-  <Step title="Remove the lens cap">
-    If your head camera is the **ZED X One S (ZX1S)**, remove its lens cap.
-  </Step>
-</Steps>
-
-### Leveling the casters
-
-This section applies to configurations with **Jelly**.
-
-Each caster has a ratchet with a small lever arm that raises or lowers the wheel. To level Jelly, flip the ratchet switch up or down on each caster and adjust it until the base sits level.
-
-### Raising and lowering the robot
-
-This section applies to configurations with **Jelly**.
-
-Adjust the robot's height with the manual lift: insert the crank into the hole at the top of Jelly and turn it to raise or lower the robot.
-
-<Frame>
-  <img src="/assets/height_adjust.png" alt="Inserting the crank into Jelly to adjust its height" width="400" style={{ margin: "0 auto" }} />
-</Frame>
-
-<Warning>
-  Make sure the crank is inserted **all the way in** before turning it. It's easy to leave it partially seated, which can slip or damage the mechanism.
-</Warning>
-
-### Power
-
-This section applies to every configuration.
-
-Axol is powered at **24V DC, 60A peak** through the XT90 on the back of the robot. Two supplies are available, both 1500W (24V, 62.5A) with an XT90 output:
-
-- **[Standard Power Supply](https://www.almond.bot/standard-power-supply)** — the desktop supply that ships with Axol.
-- **[Industrial Power Supply](https://www.almond.bot/industrial-power-supply)** — an industrial-grade supply with a **dedicated E-Stop**, an **integrated power switch**, and a **brake resistor** that safely dissipates back current from the arms. Built for permanent installations and industrial cells.
+The Ox Cart is a rugged, height-adjustable mobile cart with **four leveling casters** and a **manual crank lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height, from sitting to standing. Its **60x60cm footprint** fits through standard doors, the **powder-coated steel** frame stays stable under demanding workloads, and T-slot mounting keeps it easy to customize. The cart ships with its crank handle and casters.
 
 | | |
 |---|---|
-| **Robot input** | 24V DC, 60A peak, XT90 |
-| **Supply output** | 1500W (24V, 62.5A) |
-| **DC cable** | 1.5m XT90 male–female |
-| **AC** | Power-supply AC cord |
+| **Footprint** | 60 × 60 cm |
+| **Height range** | Sit-to-stand, manual crank |
+| **Wheels** | 4× leveling casters |
+| **Weight** | 54.5 kg |
+| **Mounting** | T-slot extrusion |
 
-<Steps>
-  <Step title="Place the power supply">
-    Set the supply near the robot (on Jelly, if you have one) so the XT90 cable comfortably reaches the back of the robot.
-  </Step>
-  <Step title="Connect DC">
-    Plug the XT90 cable from the robot into the power supply.
-  </Step>
-  <Step title="Connect the E-Stop (Industrial Power Supply only)">
-    Plug the E-Stop into the supply and place it somewhere accessible. The supply will not turn on without the E-Stop connected.
-  </Step>
-  <Step title="Connect AC and power on">
-    Plug the AC cord from the supply into a wall outlet, then switch the supply on. On the Industrial Power Supply, press the integrated power switch to power the robot.
-  </Step>
-</Steps>
+### Reference
 
-<Note>
-  On the Industrial Power Supply, pressing the E-Stop cuts arm power instantly. To restore power, release the E-Stop and press the power switch again.
-</Note>
+- [Ox Cart product page](https://www.almond.bot/ox-cart)
 
-<Note>
-  The supply is 1500W. Use a dedicated wall outlet.
-</Note>
+## Jelly Mobile Overview
 
-<Warning>
-  The Perception Kit's ZED Box is powered separately. Use the DC adapter that ships with it (**12–19V**, up to 60W).
-</Warning>
+<Frame>
+  <img src="/assets/axol_mount_jelly.png" alt="Almond Axol on the Jelly Mobile base" width="400" style={{ margin: "0 auto" }} />
+</Frame>
 
-### Wiring
+Jelly Mobile is a **powered mobile base** with a **holonomic (x-drive omni-wheel) drive**, an integrated **telescoping lift**, and a **2.4 kWh battery** for all-day, untethered operation. It is built for Axol but carries any robot on its universal mounting plate. Its **600 × 600 mm footprint** fits through standard doors.
 
-This section applies to configurations with the **Perception Kit**.
+In teleop the headset thumbsticks drive Jelly's base and lift, and the SDK detects Jelly automatically from the CAN devices attached. See [Jelly in the VR interface guide](/guides/vr-interface#jelly) and [`can.setup`](/cli/can-setup).
 
-Place the ZED Box and the power supply near the robot (on Jelly, when fitted), then connect the cables:
+| | |
+|---|---|
+| **Drive** | Powered holonomic drive, 0.7 m/s |
+| **Lift travel** | 610 mm (2 ft) at 40 mm/s |
+| **Height range** | 760–1,370 mm (2.5–4.5 ft) |
+| **Footprint** | 600 × 600 mm |
+| **Battery** | 2.4 kWh, 4–10 hours runtime |
+| **In the box** | 1× Jelly Mobile base with battery, 1× charger |
 
-<Steps>
-  <Step title="Position the ZED Box">
-    Set the ZED Box down so its camera, USB, and power cables comfortably reach the back of the robot.
-  </Step>
-  <Step title="Connect the head camera">
-    Run the head camera's **GMSL** cable from the camera to the ZED Box.
-  </Step>
-  <Step title="Connect the wrist cameras">
-    Run the shorter **GMSL** cable from the wrist cameras to the GMSL port on the wrist.
-  </Step>
-  <Step title="Connect USB and ZED Box power">
-    From the back of the robot, run the **USB** cable to the ZED Box. Plug the ZED Box into its own DC adapter (see [Power](#power)).
-  </Step>
-</Steps>
+### Reference
+
+- [Outline drawing](https://www.almond.bot/resources/jelly_outline.pdf) (PDF)
+- [Jelly Mobile product page](https://www.almond.bot/jelly-mobile)
+
+## Camera Kit Overview
+
+<Frame>
+  <img src="/assets/axol_perception_kit.png" alt="Almond Axol with the Camera Kit cameras and head mount" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Camera Kit adds the wrist and head cameras for data collection and policy inference:
+
+- **2× ZED X One S Fisheye** wrist cameras (global shutter, 204° FOV) with wrist mounts.
+- **1× ZED X Mini** stereo head camera (global shutter) with a head mount.
+- **FAKRA GMSL2 cabling**: three 1.5 m cables plus two 0.3 m right-angle cables.
+
+The cameras connect to the Compute Kit's GMSL2 inputs.
+
+### Reference
+
+- [Camera Kit product page](https://www.almond.bot/camera-kit)
+- [Wrist Mount](https://www.almond.bot/resources/wrist_mount.step) (STEP)
+- [Head Mount](https://www.almond.bot/resources/head_mount.step) (STEP)
+
+## Compute Kit Overview
+
+The Compute Kit is the onboard NVIDIA Jetson that runs Axol, captures the cameras, and runs policies. Three tiers are offered:
+
+| | ZED Box Orin | Jetson AGX Orin | Jetson Thor |
+|---|---|---|---|
+| **Module** | Jetson Orin NX 16GB | Jetson AGX Orin 64GB | Jetson T5000 (Blackwell) 128GB |
+| **AI performance** | 100 TOPS | 275 TOPS | 2070 FP4 TFLOPS |
+| **Storage** | 256 GB SSD | 500 GB SSD | See product page |
+| **Camera inputs** | 4× GMSL2 | 4× GMSL2 | 8× GMSL2 |
+| **Axol control** | USB-to-CAN | USB-to-CAN | Direct CAN |
+| **Best for** | Runs the full Camera Kit at reduced frame rate | Runs the full Camera Kit at full frame rate | Runs the full Camera Kit at full frame rate + policy inference |
+
+### Reference
+
+- [Compute product page](https://www.almond.bot/compute)
 
 ## Next steps
 
 <CardGroup cols={2}>
+  <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
+    Step-by-step setup for each configuration: standalone, Owl Mount, Ox Cart, or Jelly.
+  </Card>
   <Card title="Installation" icon="download" href="/installation">
     Install Axol on the robot machine and open the web control panel.
   </Card>

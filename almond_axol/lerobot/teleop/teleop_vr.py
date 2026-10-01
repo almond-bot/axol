@@ -54,7 +54,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 from ...constants import Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
-from ...teleop.core import TCPPoseSnapshot, VRTeleopCore
+from ...teleop.core import TCPPoseSnapshot, VRTeleopCore, wait_for_ik_ready
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -378,8 +378,7 @@ class AxolVRTeleop(Teleoperator):
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
-        msg = await loop.run_in_executor(None, parent_conn.recv)
-        assert isinstance(msg, tuple) and msg[0] == "ready"
+        msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
         self._core.set_solution(q_init, left_indices, right_indices)
         self._core.set_initial_grips(
@@ -849,6 +848,40 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.reset_pending
 
+    @property
+    def at_rest(self) -> bool:
+        """True while the last completed move left the arms in the rest pose.
+
+        See :attr:`VRTeleopCore.at_rest`; a teardown park reads it to decide
+        whether a return-to-rest would move the arms at all.
+        """
+        return self._core.at_rest
+
+    @property
+    def ik_paused(self) -> bool:
+        """True while the IK pipeline is frozen for an out-of-band move.
+
+        See :attr:`VRTeleopCore.ik_paused`; the pause brackets every limp
+        gravity-comp hold, so a teardown park reads it to leave hand-guided
+        arms alone.
+        """
+        return self._core.ik_paused
+
+    @property
+    def ik_worker_alive(self) -> bool:
+        """True while the IK subprocess and its dispatch thread are both up.
+
+        The subprocess plans rest moves and the thread hands it the reset
+        request, so without either nothing can plan a return-to-rest and a
+        teardown park skips rather than waits.
+        """
+        return (
+            self._ik_process is not None
+            and self._ik_process.is_alive()
+            and self._ik_thread is not None
+            and self._ik_thread.is_alive()
+        )
+
     def cancel_reset(self) -> None:
         """Abandon a pending, planning, or playing reset move.
 
@@ -878,6 +911,21 @@ class AxolVRTeleop(Teleoperator):
         iteration, planning from the (re-synced) current solution.
         """
         self._core.resume_ik()
+
+    def block_engage(self) -> None:
+        """Ignore the grips until :meth:`unblock_engage`.
+
+        Used by ``collect-data`` while an episode saves: the arms are home
+        and nothing streams the tracking target, so an engage there would
+        snap the arms to the controller once the next episode starts
+        commanding. Afterwards both grips must be released, then squeezed,
+        to engage. Safe from any thread.
+        """
+        self._core.block_engage()
+
+    def unblock_engage(self) -> None:
+        """Lift :meth:`block_engage`. Safe from any thread."""
+        self._core.unblock_engage()
 
     def resync_to_positions(
         self, pos_left: np.ndarray | None, pos_right: np.ndarray | None

@@ -18,6 +18,8 @@ the same episode plumbing without duplicating it:
   capture-instant-aligned observation API.
 - :func:`stdin_watcher` — ``s`` / ``r`` / ``q`` keystroke watcher with
   no-block ``select`` polling.
+- :func:`arms_reporting` — whether the arms still report a pose, the
+  liveness check every flow's teardown return-to-rest starts from.
 
 All four are LeRobot-flavoured: the capture thread depends on
 ``lerobot.datasets.lerobot_dataset.LeRobotDataset``, ``build_dataset_frame``,
@@ -44,6 +46,20 @@ if TYPE_CHECKING:
     from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
+
+
+def arms_reporting(robot: "AxolRobot") -> bool:
+    """True while the arms still report a pose to plan a move from.
+
+    The teardown return-to-rest each flow plays before it torques the motors
+    off asks this first: a closed or stalled bus leaves the position cache
+    unreadable, and a move planned from nothing is worse than no move at all.
+    """
+    try:
+        robot.positions
+    except BaseException:
+        return False
+    return True
 
 
 class IKResetController:
@@ -98,6 +114,17 @@ class IKResetController:
         self._left_indices: list[int] | None = None
         self._right_indices: list[int] | None = None
         self._ready = False
+        self._arms_limp = False
+
+    @property
+    def arms_limp(self) -> bool:
+        """True while the arms were last left limp in a gravity-comp hold.
+
+        Set by every hold this controller streams and cleared by the next
+        play, so a caller winding down can tell whether the arms are its to
+        move or already in the operator's hands.
+        """
+        return self._arms_limp
 
     def start(self) -> None:
         """Spawn the IK worker subprocess. Non-blocking; pair with ``wait_ready``."""
@@ -146,34 +173,27 @@ class IKResetController:
     ) -> bool:
         """Block until the IK worker has finished its startup.
 
-        Poll cancellation and worker liveness during the bounded wait. Solver
-        startup can exceed a minute on the robot, so the default is 300 s.
+        The same wait teleop and collect-data use
+        (:func:`~almond_axol.teleop.core.wait_for_ik_ready`). It used to be a
+        fixed 60 s here, which failed replay-dataset and run-policy on an
+        Orin NX (startup runs past a minute) while teleop came up fine.
+
         Returns True once ready, False if ``stopped`` fired first.
         """
+        from ..teleop.core import IK_READY_TIMEOUT_S, wait_for_ik_ready
+
         if self._ready:
             return True
         if self._conn is None:
             raise RuntimeError("IK reset controller not started")
-        timeout = 300.0 if timeout is None else timeout
-        deadline = time.monotonic() + timeout
-        while True:
-            if stopped is not None and stopped():
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"IK worker did not become ready within {timeout:.0f}s "
-                    "(solver build, rest-pose settle, and startup trajectory)."
-                )
-            if self._conn.poll(min(0.5, remaining)):
-                break
-            if self._proc is not None and not self._proc.is_alive():
-                raise RuntimeError(
-                    f"IK worker exited during startup (exit code {self._proc.exitcode})"
-                )
-        msg = self._conn.recv()
-        if not (isinstance(msg, tuple) and len(msg) == 5 and msg[0] == "ready"):
-            raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
+        msg = wait_for_ik_ready(
+            self._conn,
+            self._proc,
+            timeout=IK_READY_TIMEOUT_S if timeout is None else timeout,
+            stopped=stopped,
+        )
+        if msg is None:
+            return False
         import numpy as np
 
         _, q_init, left_indices, right_indices, _startup_traj = msg
@@ -187,7 +207,7 @@ class IKResetController:
         self,
         robot: "AxolRobot",
         *,
-        torque_threshold: float = 4.0,
+        torque_threshold: float = 6.0,
         gravity_comp_kd: float = 0.25,
         wait_retry: Callable[[], bool] | None = None,
         stopped: Callable[[], bool] | None = None,
@@ -279,7 +299,7 @@ class IKResetController:
         self,
         robot: "AxolRobot",
         *,
-        torque_threshold: float = 4.0,
+        torque_threshold: float = 6.0,
         stopped: Callable[[], bool] | None = None,
         deadline_s: float = 30.0,
     ) -> bool:
@@ -339,6 +359,8 @@ class IKResetController:
         from ..constants import Joint
         from ..robot.control import ContactWatchdog
         from ..teleop.filter import ResetInterpolator
+
+        self._arms_limp = False
 
         assert self._conn is not None
         assert self._q_init is not None
@@ -504,6 +526,7 @@ class IKResetController:
                 "the arms hold where the move stopped."
             )
             return False
+        self._arms_limp = True
         result: dict[str, bool] = {}
         waiter: threading.Thread | None = None
         if wait_retry is not None:

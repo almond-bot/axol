@@ -25,10 +25,10 @@ import math
 from ..motor import ControlMode, Joint, Motor
 from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import (
-    MyActuatorMotor,
     _MA_KD_MAX,
     _MA_KP_MAX,
     _MA_V_MAX,
+    MyActuatorMotor,
 )
 from ..robot.axol import (
     EITHER_STOP_JOINTS,

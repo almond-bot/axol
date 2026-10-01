@@ -355,6 +355,7 @@ class VRServer:
             max_delay_s=config.interp_max_delay_s,
             smooth_window_s=config.interp_smooth_window_s,
             outlier_k=config.interp_outlier_k,
+            max_lag_s=config.interp_max_lag_s,
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()

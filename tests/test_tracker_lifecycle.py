@@ -15,9 +15,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
+from almond_axol.cli import tracker_identify
 from almond_axol.cli.mantis_bridge import managed_mantis_bridge
 from almond_axol.cli.tracker_bridge import run_configured_bridge
-from almond_axol.cli import tracker_identify
 from almond_axol.tracker import ultimate as tracker_ultimate
 from almond_axol.tracker.base import (
     TRACKER_POSE_MAX_AGE_S,

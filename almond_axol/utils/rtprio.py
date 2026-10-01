@@ -27,7 +27,10 @@ Since #312 the control loop refuses to start in that state rather than hitch,
 so writing the file is no longer the whole job — :func:`verify_session` checks
 whether the session running ``provision`` can actually use what was just
 granted, because reporting success while ``ulimit -r`` stays 0 is what cost a
-day on 2026-09-17.
+day on 2026-09-17. When it can't, provision fixes the session itself rather
+than handing the operator a ``prlimit`` command: it raises the limit on every
+ancestor process the operator owns (their shell, and the terminal host above
+it, so new terminals inherit it too) with the same sudo it already holds.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import logging
 import os
 import pwd
 import resource
+import shutil
 from pathlib import Path
 
 from .affinity import MAX_FIFO_PRIORITY
@@ -158,6 +162,58 @@ def _limit_inherited_from() -> str | None:
     return None
 
 
+def _owned_ancestors() -> list[tuple[int, str]]:
+    """``(pid, comm)`` of each ancestor owned by this user, nearest first.
+
+    Stops at the first process another account owns (``sshd``, ``tailscaled``,
+    a root service) -- raising a system daemon's limits is not provision's
+    call -- and at the user's ``systemd`` manager, whose units take their
+    limits from its configuration rather than inheriting them.
+    """
+    uid = os.getuid()
+    found: list[tuple[int, str]] = []
+    pid = os.getppid()
+    for _ in range(32):  # bounded; a login session is never this deep
+        if pid <= 1:
+            break
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            status = Path(f"/proc/{pid}/status").read_text()
+        except OSError:
+            break
+        fields = dict(line.split(":", 1) for line in status.splitlines() if ":" in line)
+        try:
+            owner = int(fields["Uid"].split()[0])
+            parent = int(fields["PPid"].split()[0])
+        except (KeyError, IndexError, ValueError):
+            break
+        if owner != uid or comm == "systemd":
+            break
+        found.append((pid, comm))
+        pid = parent
+    return found
+
+
+def _raise_session_limits() -> list[tuple[int, str]]:
+    """Raise this session's rtprio hard+soft limit in place; what was raised.
+
+    ``RLIMIT_RTPRIO`` is inherited at fork, so raising it on the shell (and
+    the terminal host above it) covers every later ``axol`` started from
+    there, and every new terminal that host opens. It lasts as long as those
+    processes; a fresh ``ssh`` login gets it from the ``limits.d`` grant.
+    """
+    ancestors = _owned_ancestors()
+    prlimit = shutil.which("prlimit") or "/usr/bin/prlimit"
+    if not ancestors or not Path(prlimit).exists() or not prime_sudo():
+        return []
+    ceiling = f"--rtprio={MAX_FIFO_PRIORITY}:{MAX_FIFO_PRIORITY}"
+    raised = []
+    for pid, comm in ancestors:
+        if run_root([prlimit, "--pid", str(pid), ceiling]).returncode == 0:
+            raised.append((pid, comm))
+    return raised
+
+
 def _current_user() -> str | None:
     """This process's effective login name, or None when it cannot be read."""
     try:
@@ -213,6 +269,19 @@ def verify_session(user: str) -> bool:
         _logger.info(
             "this session's rtprio limit is %d — real-time scheduling available",
             limit,
+        )
+        return True
+    raised = _raise_session_limits()
+    if raised:
+        _logger.info(
+            "this session's rtprio limit was %d; raised it to %d in place on %s. "
+            "Commands started from this shell (and new terminals from %s) can "
+            "use real-time scheduling now; a fresh `ssh` login gets it from %s",
+            limit,
+            MAX_FIFO_PRIORITY,
+            ", ".join(f"{comm} ({pid})" for pid, comm in raised),
+            raised[-1][1],
+            LIMITS_PATH,
         )
         return True
     source = _limit_inherited_from()

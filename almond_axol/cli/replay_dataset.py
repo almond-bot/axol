@@ -152,7 +152,7 @@ class ReplayDatasetConfig:
     # arms into a limp gravity-comp hold instead of pulling through. Replay
     # has no interactive retry channel, so the hold lasts until the run is
     # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
     # Contact watchdog while the episode itself plays back: the same
     # sustained-torque-residual trip, checked on every command. On a trip
     # playback stops and the arms drop into the limp gravity-comp hold until

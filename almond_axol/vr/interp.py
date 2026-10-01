@@ -55,6 +55,16 @@ builds after an upgrade race, or a runtime that always reports emulation)
 pass through un-gated, so the mechanism can only ever engage when real
 tracked/untracked transitions are observed.
 
+Buffering smooths jitter; it cannot recover a stream that is simply **late**.
+When the headset's uplink stalls (a starved Wi-Fi link carrying a fraction
+of the frames for seconds, then draining the backlog), every frame arrives
+late, the short-window clock offset follows the growing transit, and playout
+would perform the operator's motion seconds after it happened — after they
+had already stopped. Each frame's transit is therefore also compared with the
+minimum over a longer window (``_LAG_BASELINE_WINDOW_S``); a frame more than
+``max_lag_s`` behind it keeps its control state but is not played, so the
+arms hold through the stall and then follow the current pose.
+
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
 jittery relay adds just enough to stay ahead of the bursts. Control-state fields
@@ -70,6 +80,7 @@ server arrival time, where bursts can't be reconstructed but nothing breaks.
 from __future__ import annotations
 
 import bisect
+import collections
 import logging
 import threading
 import time
@@ -84,6 +95,13 @@ _logger = logging.getLogger(__name__)
 # (e.g. a controller left face-down on a table while engaged) is explained in
 # the logs rather than looking like a dead arm.
 _HOLD_WARN_AFTER_S = 1.0
+
+# How far back the stream's normal transit (headset capture -> host arrival,
+# clock offset included) is remembered for judging a frame late. Longer than
+# the Wi-Fi stalls seen on stations (5-10 s) so a stall is still measured
+# against the latency before it; a lasting latency shift above ``max_lag_s``
+# is adopted as the new normal once this much time has passed.
+_LAG_BASELINE_WINDOW_S = 30.0
 
 
 class PoseInterpolator:
@@ -114,6 +132,16 @@ class PoseInterpolator:
             disables rejection.
         outlier_floor_m: Absolute floor (metres) on the Hampel threshold so a
             perfectly still hand's micro-noise is never flagged as outliers.
+        max_lag_s: A client-stamped frame arriving more than this much later
+            than the stream's normal transit is *late*: its control state
+            (locks, reset, session state) still applies, but its poses are not
+            played. The jitter buffer only reorders what it has; without this
+            gate a network stall (the headset's Wi-Fi uplink starved for
+            seconds, then draining its backlog) is played back in order, and
+            the arms perform the operator's motion seconds after it happened,
+            after the operator has already stopped. With it the arms hold the
+            last on-time pose and move to the current one once on-time frames
+            resume. ``<= 0`` disables the gate.
     """
 
     def __init__(
@@ -127,6 +155,7 @@ class PoseInterpolator:
         smooth_window_s: float = 0.12,
         outlier_k: float = 4.0,
         outlier_floor_m: float = 0.02,
+        max_lag_s: float = 0.5,
     ) -> None:
         self.enabled = enabled
         self._min_delay = float(min_delay_s)
@@ -137,6 +166,7 @@ class PoseInterpolator:
         self._half_smooth = max(0.0, float(smooth_window_s)) / 2.0
         self._outlier_k = float(outlier_k)
         self._outlier_floor = float(outlier_floor_m)
+        self._max_lag = float(max_lag_s)
 
         self._lock = threading.Lock()
         # Incremented whenever buffered timing/ownership state is invalidated.
@@ -157,6 +187,14 @@ class PoseInterpolator:
         # Recent (local_recv_s, transit_s) for jitter/offset estimation.
         self._transits: list[tuple[float, float]] = []
         self._clock_offset: float | None = None
+        # Sliding minimum of (local_recv_s, transit_s) over
+        # _LAG_BASELINE_WINDOW_S: the transit of an on-time frame. Monotonic
+        # deque, so the minimum is its head.
+        self._lag_min: collections.deque[tuple[float, float]] = collections.deque()
+        # Late frames dropped from playout in the current / last late spell.
+        self._late_frames = 0
+        self._late_since: float | None = None
+        self._late_worst = 0.0
         self._delay: float = float(min_delay_s)
         # True once we've seen client timestamps; flipping source resets state.
         self._t_is_client: bool | None = None
@@ -195,6 +233,10 @@ class PoseInterpolator:
             self._vecs.clear()
             self._transits.clear()
             self._clock_offset = None
+            self._lag_min.clear()
+            self._late_frames = 0
+            self._late_since = None
+            self._late_worst = 0.0
             self._delay = self._min_delay
             self._t_is_client = None
             self._latest = None
@@ -229,6 +271,10 @@ class PoseInterpolator:
                 self._vecs.clear()
                 self._transits.clear()
                 self._clock_offset = None
+                self._lag_min.clear()
+                self._late_frames = 0
+                self._late_since = None
+                self._late_worst = 0.0
                 self._delay = self._min_delay
                 self._last_out = None
                 self._last_pos = None
@@ -245,49 +291,115 @@ class PoseInterpolator:
                     self._tracking_loss_seq[side] += 1
                 self._raw_tracking[side] = tracked
 
-            # Jitter / clock-offset estimation over the sliding window.
             transit = local_recv - cap_t
-            self._transits.append((local_recv, transit))
-            cutoff = local_recv - self._window
-            while len(self._transits) > 1 and self._transits[0][0] < cutoff:
-                self._transits.pop(0)
-            ts = [t for _, t in self._transits]
-            self._clock_offset = min(ts)
-            # Host-clock estimate of when this frame's poses were captured
-            # (biased late by the minimum one-way transit, which the min-filter
-            # can't separate from the clock offset — negligible on USB).
-            frame.t_host = cap_t + self._clock_offset
-            jitter = max(ts) - self._clock_offset
-            target_delay = min(max(jitter, self._min_delay), self._max_delay)
-            # Grow the delay immediately (don't let the buffer run dry), shrink
-            # it slowly so we don't reintroduce jitter on a brief calm patch.
-            if target_delay > self._delay:
-                self._delay = target_delay
+            lag = self._note_transit(local_recv, transit) if is_client else 0.0
+            if self._max_lag > 0.0 and lag > self._max_lag:
+                # Late: keep the control state above, skip playout and the
+                # jitter estimate (a stall is not jitter to smooth over).
+                if self._late_since is None:
+                    self._late_since = local_recv
+                    self._late_frames = 0
+                    self._late_worst = 0.0
+                    announce = True
+                else:
+                    announce = False
+                self._late_frames += 1
+                self._late_worst = max(self._late_worst, lag)
+                if self._clock_offset is not None:
+                    frame.t_host = cap_t + self._clock_offset
+                late_event: tuple[str, float, float, int] | None = (
+                    ("late", lag, lag, 0) if announce else None
+                )
             else:
-                self._delay += 0.05 * (target_delay - self._delay)
+                late_event = None
+                if self._late_since is not None:
+                    late_event = (
+                        "recovered",
+                        local_recv - self._late_since,
+                        self._late_worst,
+                        self._late_frames,
+                    )
+                    self._late_since = None
+                self._accept(frame, local_recv, cap_t, transit)
+        if late_event is not None:
+            kind, value, worst, count = late_event
+            if kind == "late":
+                _logger.warning(
+                    "VR pose stream arriving %.1fs late (network stall between "
+                    "the headset and this host); holding the arms instead of "
+                    "replaying the delayed motion",
+                    value,
+                )
+            else:
+                _logger.warning(
+                    "VR pose stream on time again after %.1fs (worst %.1fs "
+                    "late); dropped %d late frame(s), resuming from the "
+                    "current pose",
+                    value,
+                    worst,
+                    count,
+                )
 
-            # Insert in capture-time order (the datachannel may reorder).
-            i = bisect.bisect_right(self._caps, cap_t)
-            self._caps.insert(i, cap_t)
-            self._frames.insert(i, frame)
-            self._vecs.insert(i, _frame_vec(frame))
+    def _note_transit(self, local_recv: float, transit: float) -> float:
+        """Fold ``transit`` into the on-time baseline; return how late it is.
 
-            # Prune: keep a little history behind the current playout point
-            # (which is held an extra half smoothing-window in the past).
-            play = (local_recv - self._clock_offset) - self._delay - self._half_smooth
-            keep_before = play - 0.5
-            drop = 0
-            while drop < len(self._caps) - 2 and self._caps[drop] < keep_before:
-                drop += 1
-            if drop:
-                del self._caps[:drop]
-                del self._frames[:drop]
-                del self._vecs[:drop]
-            extra = len(self._caps) - self._max_frames
-            if extra > 0:
-                del self._caps[:extra]
-                del self._frames[:extra]
-                del self._vecs[:extra]
+        Must be called with the lock held.
+        """
+        q = self._lag_min
+        while q and q[-1][1] >= transit:
+            q.pop()
+        q.append((local_recv, transit))
+        cutoff = local_recv - _LAG_BASELINE_WINDOW_S
+        while q[0][0] < cutoff:
+            q.popleft()
+        return transit - q[0][1]
+
+    def _accept(
+        self, frame: VRFrame, local_recv: float, cap_t: float, transit: float
+    ) -> None:
+        """Buffer an on-time frame for playout. Must be called with the lock held."""
+        # Jitter / clock-offset estimation over the sliding window.
+        self._transits.append((local_recv, transit))
+        cutoff = local_recv - self._window
+        while len(self._transits) > 1 and self._transits[0][0] < cutoff:
+            self._transits.pop(0)
+        ts = [t for _, t in self._transits]
+        self._clock_offset = min(ts)
+        # Host-clock estimate of when this frame's poses were captured
+        # (biased late by the minimum one-way transit, which the min-filter
+        # can't separate from the clock offset — negligible on USB).
+        frame.t_host = cap_t + self._clock_offset
+        jitter = max(ts) - self._clock_offset
+        target_delay = min(max(jitter, self._min_delay), self._max_delay)
+        # Grow the delay immediately (don't let the buffer run dry), shrink
+        # it slowly so we don't reintroduce jitter on a brief calm patch.
+        if target_delay > self._delay:
+            self._delay = target_delay
+        else:
+            self._delay += 0.05 * (target_delay - self._delay)
+
+        # Insert in capture-time order (the datachannel may reorder).
+        i = bisect.bisect_right(self._caps, cap_t)
+        self._caps.insert(i, cap_t)
+        self._frames.insert(i, frame)
+        self._vecs.insert(i, _frame_vec(frame))
+
+        # Prune: keep a little history behind the current playout point
+        # (which is held an extra half smoothing-window in the past).
+        play = (local_recv - self._clock_offset) - self._delay - self._half_smooth
+        keep_before = play - 0.5
+        drop = 0
+        while drop < len(self._caps) - 2 and self._caps[drop] < keep_before:
+            drop += 1
+        if drop:
+            del self._caps[:drop]
+            del self._frames[:drop]
+            del self._vecs[:drop]
+        extra = len(self._caps) - self._max_frames
+        if extra > 0:
+            del self._caps[:extra]
+            del self._frames[:extra]
+            del self._vecs[:extra]
 
     def _update_hold(
         self,

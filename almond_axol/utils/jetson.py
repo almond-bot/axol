@@ -48,9 +48,10 @@ The clock ceilings are themselves capped by the ``nvpmodel`` power mode, so
 :func:`pin_realtime_clocks` first selects MAXN SUPER when the active platform
 configuration provides it (otherwise MAXN) to uncap them, then pins the engine
 and CPU clocks to that max — fixing the latency / rate.
-Best-effort and cleared on reboot, so ``axol jetson.setup`` (which calls
-:func:`pin_realtime_clocks`) is run at boot from the host installer's systemd
-unit — not from teleop / serve.
+Best-effort and cleared on reboot. ``axol provision`` applies it as its last
+step, and ``axol provision --boot`` (alias ``axol jetson.setup``; both call
+:func:`pin_realtime_clocks`) re-applies it at boot from the host installer's
+systemd unit — not from teleop / serve.
 """
 
 from __future__ import annotations
@@ -76,7 +77,29 @@ _JETSON_ENGINE_GLOBS = ("*.nvenc", "*.vic")
 # encode engines plus the GPU the ZED SDK's CUDA processing runs on. The GPU
 # is deliberately not a Jetson marker — other ARM SoCs expose a ``*.gpu``
 # devfreq node too.
+#
+# Orin (nvgpu driver) names them ``<addr>.nvenc`` / ``<addr>.vic`` /
+# ``<addr>.gpu`` and they are pinned with ``min_freq = max_freq``.
 _ENGINE_CLOCK_GLOBS = (*_JETSON_ENGINE_GLOBS, "*.gpu")
+
+# Thor (JetPack 7, OpenRM GPU driver) has no NVENC node of its own: the
+# encoder is clocked by the GPU's multimedia domain ``gpu-nvd-<n>`` and CUDA by
+# ``gpu-gpc-<n>``; only the VIC keeps its ``<addr>.vic`` node (Jetson Linux R38
+# "Jetson Thor" power guide). Both default to ``nvhost_podgov``, the same
+# floor-parking governor as Orin's GPU, but they are pinned differently: by
+# switching them to the ``performance`` governor, which is what that guide
+# prescribes for maximum performance. On these nodes reading ``min_freq`` /
+# ``max_freq`` takes the devfreq lock and ``cur_freq`` calls into the GPU
+# driver, and a JetPack 7.2 Thor report shows ``min_freq`` reads stuck in D
+# state behind a deadlocked ``devfreq_wq`` worker. The ``performance``
+# governor never queues ``devfreq_wq`` work (only polling governors do), and
+# its state is read from ``governor``, which takes neither. Without these two
+# a Thor pinned only its VIC and left encode + CUDA at the floor.
+_GOVERNOR_CLOCK_GLOBS = ("gpu-gpc-*", "gpu-nvd-*")
+_DEVFREQ_GOVERNOR = "performance"
+
+# Board identification, for logging which host ``axol provision`` tuned.
+_DEVICE_TREE_MODEL = Path("/proc/device-tree/model")
 
 # The camera capture daemon(s) in every ZED X frame's path, and the systemd
 # drop-in that makes their realtime scheduling survive a daemon restart. The
@@ -160,6 +183,21 @@ def _is_jetson() -> bool:
         any(Path("/sys/class/devfreq").glob(pattern))
         for pattern in _JETSON_ENGINE_GLOBS
     )
+
+
+def host_model() -> str | None:
+    """The board's device-tree model string, ``None`` when there is none.
+
+    e.g. ``NVIDIA Jetson AGX Orin Developer Kit``, ``NVIDIA Jetson AGX Thor
+    Developer Kit``, ``Raspberry Pi 5 Model B Rev 1.0``. Informational only:
+    every tuning decision keys off what the host exposes (the L4T release
+    file, devfreq nodes, the online core count), never off this name.
+    """
+    try:
+        model = _DEVICE_TREE_MODEL.read_bytes().rstrip(b"\0").decode(errors="replace")
+    except OSError:
+        return None
+    return model.strip() or None
 
 
 class _RootEscalator:
@@ -306,7 +344,7 @@ def _preferred_max_power_mode() -> tuple[str, str]:
     return _MAXN_MODE, "MAXN"
 
 
-def _set_max_power_mode(escalator: _RootEscalator) -> None:
+def _set_max_power_mode(escalator: _RootEscalator) -> bool:
     """Select the strongest configured ``nvpmodel`` power mode.
 
     Jetson-only and best-effort. MAXN SUPER is preferred when the active
@@ -316,18 +354,21 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
     governor merely holds the cores at a lower mode's max. A no-op when already
     in the selected mode (so no needless sudo prompt) or when ``nvpmodel`` is
     absent.
+
+    Returns True when the mode was recorded for the next boot and so needs a
+    reboot to take effect.
     """
     if not _is_jetson():
         _logger.debug("not a Jetson; leaving the nvpmodel power mode unchanged")
-        return
+        return False
     nvpmodel = shutil.which("nvpmodel")
     if nvpmodel is None:
         _logger.debug("nvpmodel not found; leaving the power mode unchanged")
-        return
+        return False
     max_mode, max_mode_name = _preferred_max_power_mode()
     # Skip the (root-only) switch when the selected maximum mode is active.
     if _query_power_mode(nvpmodel) == max_mode:
-        return
+        return False
     # Answer "n" to any confirmation prompt. Once the GPU golden context
     # exists (always, by the time the installer or the boot ExecStartPre gets
     # here — nvpmodel.service runs earlier in boot), switching maximum modes
@@ -344,7 +385,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             max_mode_name,
             max_mode,
         )
-        return
+        return False
     if ok or "reboot" in detail.lower():
         # Declining the reboot prompt CANCELS the switch — nvpmodel records
         # nothing, so left alone the mode would never change, on this boot or
@@ -365,6 +406,7 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
                 max_mode_name,
                 _NVPMODEL_STATUS,
             )
+            return True
         else:
             _logger.warning(
                 "Jetson power mode %s needs a reboot, and recording it for the "
@@ -384,10 +426,17 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             f": {detail}" if detail else "",
             max_mode,
         )
+    return False
 
 
 def _pin_engines(writer: _RootEscalator) -> None:
-    """Set ``min_freq = max_freq`` on the NVENC/VIC/GPU devfreq nodes."""
+    """Hold the camera path's engine clocks at max.
+
+    ``min_freq = max_freq`` on Orin's NVENC/VIC/GPU nodes (and Thor's VIC); the
+    ``performance`` governor on Thor's GPU domains (see
+    ``_GOVERNOR_CLOCK_GLOBS`` for why those never touch ``min_freq``).
+    """
+    _pin_engine_governors(writer)
     for pattern in _ENGINE_CLOCK_GLOBS:
         for node in Path("/sys/class/devfreq").glob(pattern):
             try:
@@ -410,6 +459,43 @@ def _pin_engines(writer: _RootEscalator) -> None:
                     detail or "write failed",
                     max_freq,
                     node / "min_freq",
+                )
+
+
+def _pin_engine_governors(writer: _RootEscalator) -> None:
+    """Switch Thor's GPU clock domains to the ``performance`` devfreq governor."""
+    for pattern in _GOVERNOR_CLOCK_GLOBS:
+        for node in Path("/sys/class/devfreq").glob(pattern):
+            try:
+                if (node / "governor").read_text().strip() == _DEVFREQ_GOVERNOR:
+                    continue
+                available = (node / "available_governors").read_text().split()
+            except OSError as exc:
+                _logger.warning("cannot read %s governor: %s", node.name, exc)
+                continue
+            if _DEVFREQ_GOVERNOR not in available:
+                _logger.warning(
+                    "%s offers no %s governor (%s) — its clock stays under the "
+                    "default governor and parks at its floor between frames.",
+                    node.name,
+                    _DEVFREQ_GOVERNOR,
+                    " ".join(available) or "none listed",
+                )
+                continue
+            ok, detail = writer.write(node / "governor", _DEVFREQ_GOVERNOR)
+            if ok:
+                _logger.info("%s -> %s governor", node.name, _DEVFREQ_GOVERNOR)
+            else:
+                _logger.warning(
+                    "cannot switch %s to the %s governor (%s) — the camera path "
+                    "(hardware encode, ZED SDK CUDA processing) runs at the "
+                    "governor's floor and drops frames under load. Fix manually "
+                    "with: echo %s | sudo tee %s",
+                    node.name,
+                    _DEVFREQ_GOVERNOR,
+                    detail or "write failed",
+                    _DEVFREQ_GOVERNOR,
+                    node / "governor",
                 )
 
 
@@ -867,7 +953,7 @@ def pin_engine_clocks(*, interactive: bool = False) -> None:
     _pin_engines(_RootEscalator(interactive=interactive))
 
 
-def pin_realtime_clocks(*, interactive: bool = False) -> None:
+def pin_realtime_clocks(*, interactive: bool = False) -> bool:
     """Select the maximum power mode, pin clocks, and set the loops' scheduling.
 
     Selects MAXN SUPER when the platform configuration provides it (otherwise
@@ -885,12 +971,16 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     is off the camera cores before any camera thread becomes real-time. Same
     best-effort / ``interactive`` escalation semantics as
     :func:`pin_engine_clocks`; sudo is primed at most once across all of them.
-    Invoked via ``axol jetson.setup`` (host installer + boot service), not from
-    the teleop / collect-data / serve entry points.
+    Invoked via ``axol provision`` (its last step) and ``axol provision
+    --boot`` (the boot service), not from the teleop / collect-data / serve
+    entry points.
+
+    Returns True when the power mode only takes effect after a reboot.
     """
     escalator = _RootEscalator(interactive=interactive)
-    _set_max_power_mode(escalator)
+    reboot_needed = _set_max_power_mode(escalator)
     _pin_engines(escalator)
     _pin_cpu(escalator)
     _steer_can_irq(escalator)
     _prioritize_capture_daemons(escalator)
+    return reboot_needed

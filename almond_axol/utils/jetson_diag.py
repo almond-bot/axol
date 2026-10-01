@@ -13,9 +13,9 @@ when ``tegrastats`` is absent), and logs one compact DEBUG line per period so
 the record-start transition is visible next to the ``diag:`` lines when running
 with ``--log_level DEBUG`` (resource readouts stay out of the default INFO
 output). It
-also re-checks the engine-clock and CPU-governor pins at runtime (the boot-time
-``axol jetson.setup`` is the only thing that sets them, and nothing verified they
-held under load).
+also re-checks the engine-clock and CPU-governor pins at runtime (the
+``axol provision`` tuning, re-applied at boot by ``axol provision --boot``, is
+the only thing that sets them, and nothing verified they held under load).
 """
 
 from __future__ import annotations
@@ -132,11 +132,27 @@ class TegraStatsDiag(threading.Thread):
     def _check_pins(self) -> None:
         """WARN if the NVENC/VIC engine clocks or CPU governor aren't pinned.
 
-        The pins are set at boot by ``axol jetson.setup``
-        (:func:`jetson.pin_realtime_clocks`) and cleared on reboot; this verifies
-        at runtime that they actually held, which directly affects encode latency
-        and IK rate. Reuses the exact engine globs / governor from ``jetson``.
+        The pins are set by ``axol provision`` and at boot by ``axol provision
+        --boot`` (:func:`jetson.pin_realtime_clocks`) and cleared on reboot;
+        this verifies at runtime that they actually held, which directly
+        affects encode latency and IK rate. Reuses the exact engine globs /
+        governor from ``jetson``. Thor's GPU domains are checked by governor
+        name only: their frequency files take the devfreq lock / call into the
+        GPU driver (see ``jetson._GOVERNOR_CLOCK_GLOBS``).
         """
+        for pattern in jetson._GOVERNOR_CLOCK_GLOBS:
+            for node in Path("/sys/class/devfreq").glob(pattern):
+                try:
+                    governor = (node / "governor").read_text().strip()
+                except OSError:
+                    continue
+                if governor != jetson._DEVFREQ_GOVERNOR:
+                    self._logger.warning(
+                        "%s clock not pinned: governor=%s — encode/CUDA latency "
+                        "worse. Re-run `axol provision`.",
+                        node.name,
+                        governor,
+                    )
         for pattern in jetson._ENGINE_CLOCK_GLOBS:
             for node in Path("/sys/class/devfreq").glob(pattern):
                 try:
@@ -147,7 +163,7 @@ class TegraStatsDiag(threading.Thread):
                 if cur != mx:
                     self._logger.warning(
                         "%s clock not pinned: cur=%s max=%s — encode latency ~3x "
-                        "worse. Re-run `axol jetson.setup`.",
+                        "worse. Re-run `axol provision`.",
                         node.name,
                         cur,
                         mx,
@@ -158,7 +174,7 @@ class TegraStatsDiag(threading.Thread):
                 if gov.read_text().strip() != jetson._CPU_GOVERNOR:
                     self._logger.warning(
                         "%s governor is not %s — bursty control loops underclock "
-                        "(~30%% lower IK rate). Re-run `axol jetson.setup`.",
+                        "(~30%% lower IK rate). Re-run `axol provision`.",
                         cpu.name,
                         jetson._CPU_GOVERNOR,
                     )

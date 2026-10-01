@@ -35,12 +35,14 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from ..constants import PARK_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
+    arms_reporting,
 )
 from ..policy.plan_scheduler import PlanRuntimeConfig
 from ..recording import (
@@ -57,6 +59,8 @@ from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, RunPolicyType, parse
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -204,7 +208,7 @@ class RunPolicyConfig:
     # drops the arms into a limp gravity-comp hold instead of pulling
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
-    reset_torque_threshold: float = 4.0
+    reset_torque_threshold: float = 6.0
     # Optional deployment rest goals, in radians (seven arm joints per side).
     # Omitted sides retain the generic teleoperation rest configuration.
     rest_pose_left: list[float] | None = None
@@ -363,6 +367,10 @@ class _StdinPolicyControl:
         # Panel-only readout; the terminal announces episodes via the log.
         pass
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        # Panel-only: names the dataset the panel's preview follows.
+        pass
+
     def poll_gate(self) -> str | None:
         # Terminal collect-dagger opens an episode from the VR record button
         # only, so there is nothing to poll here.
@@ -490,6 +498,9 @@ class _QueuePolicyControl:
         # Instruction + button label of the gate currently open, if any.
         self._gate_message = ""
         self._gate_label = "Start episode"
+        # The dataset this session records into (note_dataset), so the
+        # panel's dataset preview can follow it.
+        self._dataset: dict[str, str] | None = None
 
     def push(self, command: str) -> None:
         self._q.put(command)
@@ -507,6 +518,13 @@ class _QueuePolicyControl:
         with self._state_lock:
             self._episode = episode
 
+    def note_dataset(self, repo_id: str, root: "Path") -> None:
+        """The dataset this session records into (the snapshot's ``dataset``)."""
+        from pathlib import Path
+
+        with self._state_lock:
+            self._dataset = {"repoId": repo_id, "root": str(Path(root).resolve())}
+
     def snapshot(self) -> dict[str, Any]:
         """Thread-safe phase/count/message/buttons for the /api/op/status API."""
         with self._state_lock:
@@ -517,7 +535,7 @@ class _QueuePolicyControl:
             else:
                 message = _POLICY_PHASE_MESSAGES.get(phase, "")
                 controls = [dict(c) for c in _POLICY_PHASE_CONTROLS.get(phase, ())]
-            return {
+            snap: dict[str, Any] = {
                 "phase": phase,
                 # Saves are what number an episode, so a discarded rollout is
                 # re-recorded under the same number — as the log line says.
@@ -532,6 +550,9 @@ class _QueuePolicyControl:
                 "message": message,
                 "controls": controls,
             }
+            if self._dataset is not None:
+                snap["dataset"] = dict(self._dataset)
+            return snap
 
     def _drain(self) -> None:
         import queue
@@ -2741,6 +2762,10 @@ def _run(
     dataset_root: Path | None = None
     if repo_id:
         dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        # Name the dataset for the panel's preview. getattr: a downstream
+        # package may hand in its own control without this hook.
+        if (note_dataset := getattr(control, "note_dataset", None)) is not None:
+            note_dataset(repo_id, dataset_root)
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
@@ -2885,6 +2910,9 @@ def _run(
     robot_connected = False
     normal_quit = False
     abort_requested = False
+    # Disabling raised arms drops them under gravity, so the cleanup below
+    # returns them to rest first — but only when they are somewhere else.
+    arms_at_rest = True
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -2940,16 +2968,39 @@ def _run(
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded() -> bool:
-            """Guarded return to rest; ``False`` when the operator aborted."""
+        def _return_to_rest_guarded(*, final: bool = False) -> bool:
+            """Guarded return to rest; ``False`` when the operator aborted.
+
+            ``final=True`` is the teardown park played on the way out. The
+            stop flag is already set by then, so a deadline bounds the move
+            instead — well inside the caller's stop grace — and there is no
+            operator left to answer a contact retry.
+            """
+            nonlocal arms_at_rest
             assert reset_controller is not None
-            return reset_controller.return_to_rest(
+            if final:
+                deadline = time.perf_counter() + PARK_TIMEOUT_S
+                contact = threading.Event()
+                arms_at_rest = reset_controller.return_to_rest(
+                    robot,
+                    torque_threshold=cfg.reset_torque_threshold,
+                    gravity_comp_kd=cfg.reset_gravity_comp_kd,
+                    # A contact trip ends the park at once rather than holding
+                    # limp until the deadline: the torque-off follows anyway.
+                    stopped=lambda: (
+                        contact.is_set() or time.perf_counter() >= deadline
+                    ),
+                    on_contact=contact.set,
+                )
+                return arms_at_rest
+            arms_at_rest = reset_controller.return_to_rest(
                 robot,
                 torque_threshold=cfg.reset_torque_threshold,
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
                 stopped=stop_event.is_set,
                 wait_retry=control.await_contact_clear,
             )
+            return arms_at_rest
 
         if not custom_policy:
             # A custom server is reached with its own connect (a clear error
@@ -3125,6 +3176,8 @@ def _run(
                     ("observation", obs_thread),
                 ]
                 episode_workers_stopped = False
+                # The policy is about to drive the arms off the rest pose.
+                arms_at_rest = False
                 receiver_thread.start()
                 control_thread.start()
                 obs_thread.start()
@@ -3374,6 +3427,7 @@ def _run(
             policy_failed = True
             preserve_position = robot_connected and (preserve_on_failure or soft_park)
         client_stopped = False
+        soft_parked = False
         parking_error: BaseException | None = None
         explicit_quit = normal_quit or getattr(control, "quit_requested", False) is True
         if (
@@ -3402,6 +3456,7 @@ def _run(
                 ):
                     raise RuntimeError("Soft park did not complete; preserving torque")
                 preserve_position = False
+                soft_parked = True
             except BaseException as error:
                 parking_error = error
                 cleanup_failures.append(("soft park", error))
@@ -3455,6 +3510,38 @@ def _run(
             except BaseException as exc:
                 _logger.exception("policy client cleanup failed")
                 cleanup_failures.append(("policy client", exc))
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
+        #
+        # Skipped when the motors are being left energized instead (a custom
+        # policy fault, or a failed soft park: preserve_position), after a
+        # completed soft park (the arms are parked at zero on purpose), when
+        # the arms are already at rest, when a limp hold left
+        # them in the operator's hands, when the bus no longer reports a pose
+        # to plan from, or when a live episode worker may still be inside the
+        # robot. (``collect-data`` reads the same three states off its teleop
+        # core instead, because its rest moves are planned by the teleop IK
+        # worker rather than by this out-of-band reset controller.)
+        #
+        # Bounded by the deadline ``final=True`` installs, polled once per
+        # control cycle whose own robot call the driver caps at 1 s. Every
+        # failure is swallowed, so the disconnect below happens either way and
+        # a lost park costs only what was lost before it existed.
+        try:
+            if (
+                episode_workers_stopped
+                and not preserve_position
+                and not soft_parked
+                and not arms_at_rest
+                and reset_controller is not None
+                and not reset_controller.arms_limp
+                and arms_reporting(robot)
+            ):
+                _logger.info("Returning to rest before disabling the arms.")
+                _return_to_rest_guarded(final=True)
+        except BaseException:
+            _logger.exception("return to rest before disconnect failed")
+
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses. The one exception

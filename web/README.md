@@ -4,7 +4,7 @@ The browser front-ends for the Almond Axol robot. This directory lives inside th
 
 - **VR interface** (`/vr`) — WebXR teleoperation. Streams hand/elbow pose from a Meta Quest headset to the Almond Axol SDK over WebSocket. Deployed to Vercel at [axol.almond.bot](https://axol.almond.bot).
 - **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
-- **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles, and diagnostics / calibration script runners with run history. Also served by `axol serve`.
+- **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles (with a MyActuator parameter editor), and diagnostics / calibration script runners with run history. Also served by `axol serve`.
 
 The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control` (the diagnostics dashboard is reached from the control panel's nav bar).
 

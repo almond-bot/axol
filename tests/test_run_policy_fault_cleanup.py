@@ -40,6 +40,7 @@ def run_session(
     robot.disconnect_preserving_position.side_effect = lambda: events.append("preserve")
     reset = mock.Mock()
     reset.return_to_rest.return_value = True
+    reset.arms_limp = False
 
     def park(*args, **kwargs):
         assert events[-1] == "client stopped"
@@ -234,3 +235,27 @@ def test_lerobot_normal_exit_is_unchanged():
     result = run_session(initial_continue=False, policy_type="act")
     assert result.raised is None
     assert result.events == ["disable"]
+
+
+def test_completed_soft_park_is_not_undone_by_the_teardown_rest_move():
+    with mock.patch.object(run_policy, "arms_reporting", return_value=True):
+        result = run_session(soft_park=True, quit_requested=True)
+    assert "park" in result.events
+    assert result.events[-1] == "disable"
+    result.reset.return_to_rest.assert_called_once()  # initial setup only
+
+
+def test_lerobot_fault_off_rest_returns_to_rest_before_disabling():
+    """main's park-before-torque-off still applies to LeRobot runs."""
+    with mock.patch.object(run_policy, "arms_reporting", return_value=True):
+        result = run_session(fault=RuntimeError("CAN bus error"), policy_type="act")
+    assert result.events == ["workers stopped", "disable"]
+    assert result.reset.return_to_rest.call_count == 2  # setup + teardown park
+    assert result.reset.return_to_rest.call_args.kwargs["on_contact"] is not None
+
+
+def test_custom_fault_holds_without_a_teardown_rest_move():
+    with mock.patch.object(run_policy, "arms_reporting", return_value=True):
+        result = run_session(fault=ConnectionError("server disconnected"))
+    assert result.events[-1] == "preserve"
+    result.reset.return_to_rest.assert_called_once()  # setup only
