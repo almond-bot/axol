@@ -8,8 +8,7 @@ import pytest
 from almond_axol.cli.run_policy import _QueuePolicyControl, _StdinPolicyControl
 from almond_axol.lerobot.rollout import stdin_watcher
 from almond_axol.policy.plan_scheduler import PlanSchedulingError
-
-from .test_run_policy_fault_cleanup import run_session
+from tests.test_run_policy_fault_cleanup import run_session
 
 
 def test_custom_zero_duration_waits_for_operator_instead_of_timing_out():

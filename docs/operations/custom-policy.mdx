@@ -105,8 +105,12 @@ and action schemas before an episode can start.
 
 In the control panel, assign cameras, select **Run Policy**, choose policy
 type **custom**, and enter the task label. Configure the endpoint under
-**Settings → Inference** and leave the policy path blank. The ordinary
-episode controls and recording options remain available. See
+**Settings → Inference** and leave the policy path blank (a blank host
+connects to this machine on the configured port, default 8765). The panel
+does not start the endpoint: launch your `serve()` process before pressing
+**Start**. Select the model and instruction on the endpoint; the task only
+labels recordings. The ordinary episode controls and recording options
+remain available. See
 [`run-policy`](/cli/run-policy) for the command's controls and settings.
 
 Custom policies use `plan_config.request_interval` (default 5 rows) to schedule inference and `plan_config.max_adoption_offset_steps` (default 6) as the reply deadline.
