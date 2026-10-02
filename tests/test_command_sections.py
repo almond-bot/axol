@@ -54,7 +54,12 @@ class DiagnosticsSectionsTest(unittest.TestCase):
                 by_section[cmd.section].add(cmd_id)
         self.assertEqual(
             by_section["test"],
-            {"diag.rom-enable", "diag.lift-cycle", "diag.zed-cable"},
+            {
+                "diag.rom-enable",
+                "diag.lift-cycle",
+                "diag.zed-cable",
+                "diag.base-calibrate",
+            },
         )
         self.assertEqual(
             by_section["helper"], {"diag.rom-disable", "lift.home", "lift.goto"}

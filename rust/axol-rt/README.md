@@ -42,9 +42,13 @@ Working today:
   engine and Rust-side rolling timing aggregation. Passive dashboard clients
   receive 30 Hz state frames and 10 Hz timing summaries while Rust observes
   every on-wire frame.
-- `axol-rt jelly` — owns Jelly's four wheel motors: enable/disable, 50 Hz
-  vector slew and x-drive mix, command watchdog, gyro heading hold, and the
-  velocity/impedance park state machine.
+- `axol-rt jelly` — owns Jelly's four wheel motors: enable/disable, the 50 Hz
+  jerk-limited vector ramp (asymmetric accel/decel) and its torque-fed
+  traction guard (`ramp.rs`), x-drive mix with per-wheel radius compensation,
+  command watchdog, gyro heading hold, and the velocity/impedance park state
+  machine. Its 20 Hz status packet carries the ramped command, wheel speeds,
+  heading-hold state, and every wheel's position/velocity/torque, which is
+  what `axol diag.base-calibrate` reads to fit `wheel_scale`.
 
 Measured on the robot (2026-08-27):
 

@@ -553,7 +553,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "stick translates, right stick x rotates. Off leaves the "
                     "wheels cold even with the bus present. Operator mobility "
                     "only — Jelly motion is never recorded into datasets and "
-                    "policies never control it. Speeds, slew, and the heading "
+                    "policies never control it. Speeds, ramp, and the heading "
                     "hold live under Jelly → Parameters."
                 ),
             ),

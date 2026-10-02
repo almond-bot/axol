@@ -519,8 +519,9 @@ export function SettingsSection({
                 <div className="flex flex-col gap-4">
                   <p className="text-xs text-white/45">
                     How the wheels and lift respond to the sticks: peak speed, rotation weight,
-                    slew, axis snap, the heading hold, and the parked hold. One value here applies
-                    to <span className="text-white/65">every operation</span> that drives Jelly.
+                    ramp, traction guard, wheel scale, axis snap, the heading hold, and the parked
+                    hold. One value here applies to{" "}
+                    <span className="text-white/65">every operation</span> that drives Jelly.
                   </p>
                   <FlatSchemaForm
                     nodes={jellyParameters.nodes}

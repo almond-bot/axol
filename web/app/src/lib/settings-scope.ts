@@ -25,7 +25,7 @@ export const SETTINGS_SCOPES: { key: SettingsScope; label: string; title: string
 export const AXOL_CATEGORY_KEYS = new Set(["robot", "teleop", "kinematics"])
 /** The Jelly switches (wheels / lift) — the Jelly scope's first tab. */
 export const JELLY_CATEGORY_KEYS = new Set(["jelly"])
-/** The Jelly config tree (speeds, slew, heading hold) rendered as its own
+/** The Jelly config tree (speeds, ramp, heading hold) rendered as its own
  *  tab instead of under General → Advanced. */
 export const JELLY_PARAMETERS_TAB = "jelly-parameters"
 /** The Advanced section key that backs the Jelly → Parameters tab. */
