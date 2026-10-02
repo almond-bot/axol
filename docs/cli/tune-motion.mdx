@@ -9,6 +9,8 @@ Every run persists a tuning-run artifact (full per-joint time series + metrics) 
 
 The arm moves to the motion's start and back to rest on collision-aware planned trajectories; a contact watchdog aborts playback if a sustained torque residual says the arm is pushing on something that isn't in the plan. Arrival at the start pose is checked before playback: a joint more than ~3° off is named and playback is skipped (the arm returns to rest). A `--a4` joint that fails this almost always has a stored planner acceleration that is neither 0 nor 60000 — read it with `scripts/fw_gains.py --id <id>`; anything in between re-plans every streamed target and the joint barely moves (see [`tune.a4`](/cli/tune-a4)).
 
+<Warning>The live wrist-IMU damping flags below (`--imu-damp*`, `--gyro-damp*`, `--torque-probe`) are research diagnostics. Damping from the wrist camera's IMU was evaluated on jelly and rejected: it adds high-frequency oscillation, and its effect depended on how the camera sat on the wrist. Encoder-only damping (`--imu-damp-source encoder`) made the 1–3 Hz sway worse.</Warning>
+
 | Flag | Description |
 |---|---|
 | `--motion NAME` | Committed motion name (`axol motion.list`) or a path to a motion `.npz` (required) |
