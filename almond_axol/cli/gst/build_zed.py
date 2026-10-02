@@ -49,6 +49,7 @@ import subprocess
 from pathlib import Path
 
 from ...utils.jetson import _is_jetson
+from ...utils.packages import failure_detail, run_package_manager
 from ...utils.state_files import secure_atomic_write_text
 from ...utils.sudo import prime_sudo, run_root
 
@@ -481,14 +482,15 @@ def _apt_install_build_deps() -> bool:
         return False
     # An update failure need not block an install from an already-populated apt
     # cache. The install result itself is authoritative.
-    update = run_root(["apt-get", "update"])
+    update = run_package_manager(["apt-get", "update"])
     if update.returncode != 0:
         _logger.warning("apt-get update failed; trying the existing package cache")
-    installed = run_root(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
+    installed = run_package_manager(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
     if installed.returncode != 0:
         _logger.warning(
-            "could not install zed-gstreamer build dependencies; run: "
+            "could not install zed-gstreamer build dependencies (%s); run: "
             "sudo apt-get install -y %s",
+            failure_detail(installed),
             " ".join(_APT_BUILD_DEPS),
         )
         return False

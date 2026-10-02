@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...utils import reboot
+from ...utils.packages import run_package_manager
 from ...utils.state_files import (
     secure_atomic_copy_file,
     secure_ensure_directory,
@@ -320,10 +321,10 @@ def _upgrade(variant: _Variant) -> None:
     # rather than upgrading in place; best-effort since a half-removed
     # package still gets replaced by the install below.
     print(f"Removing the factory {variant.package} package (requires sudo)...")
-    run_root(["dpkg", "-r", variant.package])
+    run_package_manager(["dpkg", "-r", variant.package])
     print(f"Installing {deb.name}...")
     try:
-        run_root(["dpkg", "-i", str(deb)], check=True)
+        run_package_manager(["dpkg", "-i", str(deb)], check=True)
     except RuntimeError:
         # The factory package is already removed at this point, so don't fail
         # silently: tell the operator exactly how to finish the install by

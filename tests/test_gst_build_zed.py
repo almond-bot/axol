@@ -66,17 +66,17 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
 
     def test_apt_install_uses_all_declared_dependencies(self) -> None:
         succeeded = subprocess.CompletedProcess([], 0, "", "")
-        run_root = Mock(return_value=succeeded)
+        run_package_manager = Mock(return_value=succeeded)
         with (
             patch.object(build_zed.shutil, "which", return_value="/usr/bin/apt-get"),
             patch.object(build_zed, "prime_sudo", return_value=True),
-            patch.object(build_zed, "run_root", run_root),
+            patch.object(build_zed, "run_package_manager", run_package_manager),
         ):
             result = build_zed._apt_install_build_deps()  # noqa: SLF001
 
         self.assertTrue(result)
         self.assertEqual(
-            run_root.call_args_list,
+            run_package_manager.call_args_list,
             [
                 call(["apt-get", "update"]),
                 call(
