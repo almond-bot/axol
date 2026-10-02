@@ -676,6 +676,8 @@ _CAN_DISCOVERY_STATUSES = {
     "unidentified",
     "error",
 }
+# Statuses under which no managed CAN interface may connect yet.
+_CAN_DISCOVERY_BLOCKING = frozenset({"needed", "running", "unidentified", "error"})
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
 # Discovery renames interfaces under a udev lock it can lose to a slow or
 # wedged host. Shutdown joins it so the rename is not cut in half, but the
@@ -1213,6 +1215,38 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if channel is not None
         )
 
+    async def _discover_before_manual_connect() -> None:
+        """Run the CAN discovery a manual Connect would otherwise be refused on.
+
+        A root serve revalidates every configured hub once per process, so
+        after any restart (an update, a reinstall, a reboot) discovery must
+        pass before a managed interface connects. A pass that found the
+        motors silent stays failed until retried -- powering them changes
+        nothing USB-visible -- so the operator's Connect is the retry: launch
+        (or join) a forced pass and let the connect's own checks judge the
+        result. Busy and rate-limit refusals fall through to those checks too.
+        """
+        if os.geteuid() != 0:
+            return
+        if not _discovery_running():
+            async with session_launch_reservation:
+                attached = await asyncio.to_thread(_attached_hub_state)
+                _observe_can_state(attached, running=_discovery_running())
+        if can_discovery.status not in _CAN_DISCOVERY_BLOCKING:
+            return
+        task = await _launch_or_join_can_discovery(force=True)
+        if not isinstance(task, JSONResponse):
+            await asyncio.shield(task)
+
+    def _discovery_refusal() -> str:
+        """Why a managed connect is refused while discovery has not passed."""
+        if can_discovery.message:
+            return can_discovery.message
+        return (
+            "CAN discovery has not confirmed this hardware yet. Power its "
+            "motors, then connect again or retry CAN identification."
+        )
+
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
         s = runner.get(session_id)
@@ -1338,6 +1372,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     {"error": "an operation or session is running — stop it first"},
                     status_code=409,
                 )
+            if updater.installing:
+                # Cutting power mid-install can leave dpkg half-configured,
+                # failing every later install until `dpkg --configure -a`.
+                return JSONResponse(
+                    {
+                        "error": "the robot is installing an update or system "
+                        "packages — wait for it to finish"
+                    },
+                    status_code=409,
+                )
 
             def _run() -> tuple[bool, str]:
                 cmd = ["shutdown", flag, "now"]
@@ -1447,6 +1491,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         req: RobotConnectRequest | None = None,
     ) -> dict[str, Any] | JSONResponse:
         nonlocal manually_disconnected_target
+        if req is None or not req.automatic:
+            target = _resolve_robot_connect_target(req)
+            if not isinstance(target, JSONResponse) and _uses_managed_name(target[1]):
+                await _discover_before_manual_connect()
         async with session_launch_reservation:
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
@@ -1494,16 +1542,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         status_code=409,
                     )
                 assert attached is not None
-                if (
-                    profile not in attached.configured_profiles
-                    or can_discovery.status
-                    in {"needed", "running", "unidentified", "error"}
-                ):
+                if can_discovery.status in _CAN_DISCOVERY_BLOCKING:
+                    return JSONResponse(
+                        {"error": _discovery_refusal()}, status_code=409
+                    )
+                if profile not in attached.configured_profiles:
                     return JSONResponse(
                         {
-                            "error": "the managed CAN profile has not passed "
-                            "hardware discovery for this attachment; retry after "
-                            "CAN discovery completes"
+                            "error": f"no configured {profile.capitalize()} CAN "
+                            "hub is attached; plug it in, or run `axol can.setup`"
                         },
                         status_code=409,
                     )
@@ -1558,6 +1605,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any] | JSONResponse:
         if device not in JELLY_DEVICES:
             return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        if req is None or not req.automatic:
+            # A fresh base/lift adapter has no pinned interface until discovery
+            # names it, so a manual Connect runs that pass first.
+            await _discover_before_manual_connect()
         async with session_launch_reservation:
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
