@@ -13,6 +13,8 @@ import os
 import struct
 import subprocess
 
+from almond_axol.rt.link import CONFIG_PROTO
+
 BIN = os.environ.get(
     "AXOL_RT_BIN",
     os.path.join(os.path.dirname(__file__), "..", "target", "release", "axol-rt"),
@@ -57,8 +59,10 @@ async def session(name, actions):
     return proc.returncode, out.decode(), result
 
 
-joint_line = b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
-cfg = b"C" + b"proto 2\n" + b"loop_hz 240\n" + joint_line
+joint_line = (
+    b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 inf\n"
+)
+cfg = b"C" + f"proto {CONFIG_PROTO}\n".encode() + b"loop_hz 240\n" + joint_line
 
 
 async def clean(send, recv, w):
@@ -80,8 +84,8 @@ async def stale_client(send, recv, w):
 async def skewed(send, recv, w):
     send(cfg)
     await recv()
-    # A previous-generation 8-field target against the 9-field core.
-    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<8d", *([0.0] * 8)) * 8)
+    # A previous-generation 9-field target against the 10-field core.
+    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<9d", *([0.0] * 9)) * 8)
     await asyncio.sleep(0.5)
     return "sent skewed target"
 

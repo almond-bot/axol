@@ -354,11 +354,15 @@ def _project_waypoints(q: np.ndarray, rate: float) -> np.ndarray:
     """
     import jax.numpy as jnp
 
+    from ..kinematics.config import KinematicsConfig
     from ..kinematics.model import collision_cost_params
     from ..kinematics.solver import KinematicsSolver
     from ..teleop.trajectory import solve_path_step
 
-    solver = KinematicsSolver()
+    # Projection is an explicit request (--project), so it always uses the
+    # collision model regardless of the teleop default.
+    solver = KinematicsSolver(KinematicsConfig(self_collision=True))
+    assert solver.robot_coll is not None
     starts, widths = collision_cost_params(solver.robot, solver.robot_coll, 0.025)
     starts_jax, widths_jax = jnp.asarray(starts), jnp.asarray(widths)
 

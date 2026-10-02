@@ -26,10 +26,10 @@ from ..kinematics.model import collision_cost_params
 from ..kinematics.solver import KinematicsSolver, _self_collision_cost
 
 
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
+@functools.partial(jax.jit, static_argnames=("max_iterations", "use_self_collision"))
 def solve_path_step(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: pk.collision.RobotCollision | None,
     q_interp: jax.Array,
     q_current: jax.Array,
     rest_weight: float,
@@ -38,26 +38,33 @@ def solve_path_step(
     collision_ramp: jax.Array,
     collision_weight: float,
     max_iterations: int,
+    use_self_collision: bool = True,
 ) -> jax.Array:
     """One IK step toward ``q_interp`` with limit + self-collision costs only.
 
     ``q_interp`` is the smoothstep target for this waypoint; ``q_current``
     is the previous waypoint (or the starting pose for the first step).
-    Returns the projected joint configuration.
+    Returns the projected joint configuration. With ``use_self_collision``
+    false (the solver was built without a collision model) only the joint
+    limits constrain the projection.
     """
     JointVar = robot.joint_var_cls
     costs = [
         pk.costs.rest_cost(JointVar(0), rest_pose=q_interp, weight=rest_weight),
         pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight),
-        _self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            activation_start=collision_start,
-            ramp_width=collision_ramp,
-            weight=collision_weight,
-        ),
     ]
+    if use_self_collision:
+        assert robot_coll is not None
+        costs.append(
+            _self_collision_cost(
+                robot,
+                robot_coll,
+                JointVar(0),
+                activation_start=collision_start,
+                ramp_width=collision_ramp,
+                weight=collision_weight,
+            )
+        )
     var_joints = JointVar(jnp.array([0]))
     initial_vals = jaxls.VarValues.make(
         [var_joints.with_value(q_current[jnp.newaxis, :])]
@@ -133,9 +140,13 @@ def plan_collision_aware_trajectory(
     duration = max(max_dist / speed, min_duration)
     n_steps = max(2, round(duration * rate))
 
-    starts, widths = collision_cost_params(
-        solver.robot, solver.robot_coll, collision_margin
-    )
+    use_collision = solver.robot_coll is not None
+    if use_collision:
+        starts, widths = collision_cost_params(
+            solver.robot, solver.robot_coll, collision_margin
+        )
+    else:
+        starts = widths = np.zeros(0, dtype=np.float32)
     starts_jax, widths_jax = jnp.asarray(starts), jnp.asarray(widths)
 
     trajectory: list[np.ndarray] = []
@@ -155,6 +166,7 @@ def plan_collision_aware_trajectory(
             widths_jax,
             collision_weight,
             max_iterations,
+            use_self_collision=use_collision,
         )
         q = np.asarray(result, dtype=np.float32)
         trajectory.append(solver.from_pyroki_order(q))

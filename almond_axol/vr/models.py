@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, FiniteFloat, model_validator
 
@@ -169,8 +170,27 @@ class VRFrame(BaseModel):
             xr-standard convention, same as a gamepad).
         r_stick_x: Right thumbstick x, [-1, 1], right = +1. Drives Jelly's
             rotation.
+        r_stick_y: Right thumbstick y, [-1, 1], pushed forward = -1. Unused
+            by Jelly; in box mode it tilts the fingertips.
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
+            While a box-mode leader is engaged a single click (and release)
+            of either stick toggles the grasp (flush face / fingers straight,
+            ``box_grasp``) — the sticks themselves set the grip width and
+            tilt, no modifiers; with the pair frozen the sticks drive Jelly
+            as usual. Both sticks clicked
+            *together* toggle **box mode** (handled on the headset, which
+            sends the ``set`` message; see
+            :meth:`almond_axol.vr.server.VRServer.set_on_setting`).
+        box_leader: Server-internal: which controller leads the arm pair in
+            box mode (``"left"`` / ``"right"``). Set by the teleop core on
+            the frame it forwards to the IK worker; headsets leave it unset.
+        reengage: Server-internal: the session's effective **re-engage**
+            behaviour (``"clutch"`` / ``"ramp"``, see
+            :attr:`almond_axol.teleop.config.VRTeleopConfig.reengage`), set
+            by the core on the frame it forwards to the IK worker. Session
+            modes are switched out of band with ``{"type": "set", ...}``
+            messages, not through frames.
     """
 
     l_ee: VRPose
@@ -202,5 +222,8 @@ class VRFrame(BaseModel):
     l_stick_x: FiniteFloat = 0.0
     l_stick_y: FiniteFloat = 0.0
     r_stick_x: FiniteFloat = 0.0
+    r_stick_y: FiniteFloat = 0.0
     l_stick_click: bool = False
     r_stick_click: bool = False
+    box_leader: Literal["left", "right"] | None = None
+    reengage: Literal["clutch", "ramp"] | None = None

@@ -39,6 +39,7 @@ import type { FieldSuggestion } from "@/components/suggest-input"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { EpisodeBriefCard } from "@/components/episode-brief"
+import { SessionSettings } from "@/components/session-settings"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -805,6 +806,9 @@ function OperatorDeck({
   // Relayed headset HUD state (armed confirm popup / record countdown), from
   // the camera-feed socket. Null when nothing is armed or no headset drives.
   const [hud, setHud] = useState<VrHud | null>(null)
+  // The open VR-server socket from the camera-feed card, shared with the live
+  // session-settings card (null while disconnected).
+  const [vrSocket, setVrSocket] = useState<WebSocket | null>(null)
 
   function toggleFullscreen() {
     const next = !fullscreen
@@ -845,8 +849,10 @@ function OperatorDeck({
           expanded={fullscreen}
           onToggleFullscreen={toggleFullscreen}
           onHud={setHud}
+          onSocket={setVrSocket}
         />
       )}
+      {showFeeds && !fullscreen && <SessionSettings socket={vrSocket} />}
       {hud?.confirm && <ConfirmPopup action={hud.confirm} policy={policy} />}
     </>
   )

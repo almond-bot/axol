@@ -90,4 +90,6 @@ class IKWorkerStartupTests(unittest.TestCase):
                         np.testing.assert_allclose(tcp[side][:3], pose[0])
                         self.assertEqual(len(tcp[side]), 7)
                 else:
-                    np.testing.assert_array_equal(reply, q)
+                    actual_q, status = reply
+                    np.testing.assert_array_equal(actual_q, q)
+                    self.assertTrue(status is None or isinstance(status, dict))

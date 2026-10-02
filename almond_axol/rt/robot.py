@@ -70,7 +70,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from typing import Self
 
 import numpy as np
@@ -335,10 +335,12 @@ class Axol(RobotBase):
                 gains = getattr(arm._arm_config, j.value)
                 f = gains.friction
                 motor_id = _JOINT_CONFIG[j].motor_id
+                # torque_limit formats as "inf" when unset; Rust's f64 parser
+                # reads that as +infinity, i.e. no cap.
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} "
                     f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
-                    f"{f.fc} {f.k} {f.fv} {f.fo}"
+                    f"{f.fc} {f.k} {f.fv} {f.fo} {gains.torque_limit}"
                 )
             if arm._has_gripper:
                 lines.append(
@@ -966,6 +968,25 @@ class Axol(RobotBase):
     def reset_command_state(self) -> None:
         """Clear command history on both arms (pure Python state)."""
         self._robot.reset_command_state()
+
+    def set_gripper_open_limit(self, limit_deg: float | None) -> None:
+        """Limit the grippers' opening to ``limit_deg`` from closed, ``None`` for the stop.
+
+        See ``AxolArm.set_gripper_open_limit``. Pure Python state on the arm
+        objects: the next :meth:`motion_control` maps the gripper command
+        over the new span.
+        """
+        self._robot.set_gripper_open_limit(limit_deg)
+
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Live per-joint spring-torque caps on both arms (see ``AxolArm.set_spring_caps``).
+
+        Each tracked command carries its cap to the core, which clamps the
+        wire position to within ``cap / kp`` of measured for that joint —
+        the tighter of this and the configured ``torque_limit``. Applies
+        from the next :meth:`motion_control`.
+        """
+        self._robot.set_spring_caps(caps)
 
     def reset_gravity_hold(self) -> None:
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""

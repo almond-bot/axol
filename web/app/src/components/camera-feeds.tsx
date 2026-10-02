@@ -30,7 +30,9 @@ export interface VrHud {
  *
  * The same socket also carries the relayed headset HUD messages (see VrHud),
  * surfaced through `onHud` so the episode UI can mirror the in-headset
- * popups.
+ * popups — and the live session settings, which is why the open socket is
+ * handed out through `onSocket` (the settings card sends its `set` messages
+ * on it; see `useAxolSettings`).
  *
  * The VR server's self-signed certificate must be accepted per origin, so a
  * connection that keeps failing offers the same authorize-popup flow the VR
@@ -42,6 +44,7 @@ export function CameraFeeds({
   expanded = false,
   onToggleFullscreen,
   onHud,
+  onSocket,
 }: {
   host: string
   vrPort: number
@@ -51,6 +54,11 @@ export function CameraFeeds({
   onToggleFullscreen?: () => void
   /** Relayed headset HUD state (must be referentially stable, e.g. a setState). */
   onHud?: (hud: VrHud | null) => void
+  /**
+   * The VR-server socket once open, null when it drops (must be referentially
+   * stable, e.g. a setState). Lets sibling cards share this connection.
+   */
+  onSocket?: (ws: WebSocket | null) => void
 }) {
   const wsRef = useRef<WebSocket | null>(null)
   const [wsOpen, setWsOpen] = useState(false)
@@ -95,6 +103,7 @@ export function CameraFeeds({
         opened = true
         setWsOpen(true)
         setFailedAttempts(0)
+        onSocket?.(ws)
       }
       // Mirror the headset HUD: the server relays the driving client's
       // popup/countdown state as `hud` messages on this same socket.
@@ -122,6 +131,7 @@ export function CameraFeeds({
         // The HUD publisher is unreachable through a dead socket: drop any
         // mirrored popup rather than leave a stale dialog up.
         onHud?.(null)
+        onSocket?.(null)
         if (closed) return
         setWsOpen(false)
         if (!opened) setFailedAttempts((n) => n + 1)
@@ -139,8 +149,9 @@ export function CameraFeeds({
         ws.onclose = null
         ws.close()
       }
+      onSocket?.(null)
     }
-  }, [hostname, vrPort, onHud])
+  }, [hostname, vrPort, onHud, onSocket])
 
   const { streams, available } = useAxolVideo(wsRef, true)
 
