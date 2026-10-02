@@ -5,7 +5,6 @@ use std::io;
 use std::time::Duration;
 
 use crate::can::CanSock;
-use crate::filter::CogTerm;
 use crate::proto;
 use crate::safety::purge_tx_queue;
 use crate::txn;
@@ -85,10 +84,6 @@ pub struct MotorSpec {
     /// command it every tick of a 480 Hz loop, 240 for the half-rate lane, 0
     /// to follow the config-wide `impedance_hz`. Only meaningful on MIT.
     pub mit_hz: f64,
-    /// Position-periodic torque to cancel (`filter::cogging`), motor frame,
-    /// already scaled by the joint's gain. Empty = none. Arrives on the
-    /// second configure, after the Python side has resolved joint offsets.
-    pub cogging: Vec<CogTerm>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -190,8 +185,6 @@ pub struct ReadyMotor {
     /// `MotorSpec::tf_nm_per_pct` where the firmware takes 0x73, else 0 —
     /// the bus loop sends 0x73 exactly when this is positive.
     pub tf_nm_per_pct: f64,
-    /// See `MotorSpec::cogging`.
-    pub cogging: Vec<CogTerm>,
 }
 
 /// The 0x73 scale a joint actually runs: its configured one on firmware that
@@ -357,7 +350,6 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fw_version: version,
             tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
             mit_hz: spec.mit_hz,
-            cogging: spec.cogging.clone(),
         });
     }
 
@@ -442,7 +434,6 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fw_version: None,
             tf_nm_per_pct: 0.0,
             mit_hz: spec.mit_hz,
-            cogging: spec.cogging.clone(),
         });
     }
     Ok(motors)

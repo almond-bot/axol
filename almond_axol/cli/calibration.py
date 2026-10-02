@@ -162,7 +162,6 @@ def _summarize(document: dict[str, Any]) -> None:
                     ("stribeck", "stribeck_dfs"),
                     ("com", "com"),
                     ("gains", "kp"),
-                    ("cogging", "cogging"),
                 )
                 if k in entry
             ]

@@ -348,14 +348,8 @@ class Axol(RobotBase):
             out.append((1, self._robot.right))
         return out
 
-    def _config_text(self, *, cogging: bool = False) -> str:
-        """The core's config.
-
-        ``cogging``: also the joints' ``cogging`` lines (position-periodic
-        torque cancellation), which need the resolved joint offsets — the
-        motor-frame series is the joint-frame one shifted by the offset — so
-        they go on the second configure, after :meth:`_enable` resolved them.
-        """
+    def _config_text(self) -> str:
+        """The core's config."""
 
         def _wire_token(mode: str, joint: Joint, motor_id: int) -> str:
             token = str(mode).lower()
@@ -417,14 +411,6 @@ class Axol(RobotBase):
                     # This joint's impedance rate (0 = the config-wide one).
                     f"{gains.impedance_hz or 0.0}"
                 )
-                if cogging and gains.cogging is not None and gains.cogging_gain != 0.0:
-                    offset = float(arm._joint_offsets[ARM_JOINTS.index(j)])
-                    if math.isfinite(offset):
-                        terms = gains.cogging.motor_terms(offset, gains.cogging_gain)
-                        lines.append(
-                            f"cogging {side} {iface} {motor_id} {len(terms)} "
-                            + " ".join(f"{w!r} {a!r} {b!r}" for w, a, b in terms)
-                        )
             if arm._has_gripper:
                 lines.append(
                     f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
@@ -601,17 +587,6 @@ class Axol(RobotBase):
                     driver = arm.motors[j]._driver
                     await driver._detect_capabilities()
                     await driver._apply_low_voltage_threshold()
-
-        # The offsets are resolved: hand the core the cogging cancellation,
-        # which lives in the motor frame. Re-sending the config replaces the
-        # one the prep ran from; the bus threads start from this one at arm.
-        if any(
-            getattr(arm._arm_config, j.value).cogging is not None
-            for _side, arm in self._arms()
-            for j in ARM_JOINTS
-            if j in arm.motors
-        ):
-            await self._link.configure(self._config_text(cogging=True))
 
         # Gripper bring-up runs from Python while the bus is still quiet —
         # the exact classic flow (enable/calibrate or attach/restore) the

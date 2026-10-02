@@ -268,11 +268,11 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   follows; a proto-12 core would command it every tick, where it does not.
 /// - 14: an optional `lead_ms` after `cap_track` (`a4_target`).
 /// - 15: `impedance_hz` (240 | 480 — the MyActuator impedance joints every
-///   tick of a 480 Hz loop, wrists on the 240 Hz lane), an optional
-///   `tf_nm_per_pct` after `lead_ms` (0x73 torque feedforward), and
-///   `cogging` lines (position-periodic torque cancellation, sent on a
-///   second configure once joint offsets are known). A proto-14 core would
-///   refuse the new lines — or worse, run 480 Hz impedance at 240.
+///   tick of a 480 Hz loop, wrists on the 240 Hz lane) and an optional
+///   `tf_nm_per_pct` after `lead_ms` (0x73 torque feedforward). A proto-14
+///   core would refuse the new lines — or worse, run 480 Hz impedance at
+///   240. (Proto 15 also carried `cogging` lines; no released package sent
+///   them, and the core no longer takes them.)
 /// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
 ///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
 ///   the 240 Hz lane. A proto-15 core would run them all at one rate.
@@ -1112,7 +1112,6 @@ struct TraceRow {
     damp_q: f64,
     tick_dt: f64,
     fb_dt: f64,
-    cogging_ff: f64,
     /// The 0x73 feedforward sent, % of rated current (0 on other frames).
     tf_pct: f64,
     /// The output-side encoder's last 0x60 reading (rad, motor frame) and
@@ -1134,7 +1133,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,tf_pct,enc2_p,enc2_t"
     )?;
     Ok(out)
 }
@@ -1142,7 +1141,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.6},{:.12},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -1171,7 +1170,6 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.damp_q,
         r.tick_dt,
         r.fb_dt,
-        r.cogging_ff,
         r.tf_pct,
         r.enc2_p,
         r.enc2_t,
@@ -1389,50 +1387,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
             }
-            "cogging" => {
-                // cogging <side> <iface> <motor_id> <n> (<w> <a> <b>) × n —
-                // after that joint's own line; motor frame, gain applied.
-                let side: u8 = f
-                    .get(1)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| bad(line))?;
-                let iface = f.get(2).ok_or_else(|| bad(line))?;
-                let motor_id: u8 = f
-                    .get(3)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| bad(line))?;
-                let n: usize = f
-                    .get(4)
-                    .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| bad(line))?;
-                if f.len() != 5 + 3 * n {
-                    return Err(bad(line));
-                }
-                let num = |i: usize| -> io::Result<f64> {
-                    f.get(i)
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .filter(|v| v.is_finite())
-                        .ok_or_else(|| bad(line))
-                };
-                let mut terms = Vec::with_capacity(n);
-                for k in 0..n {
-                    terms.push(filter::CogTerm {
-                        w: num(5 + 3 * k)?,
-                        a: num(6 + 3 * k)?,
-                        b: num(7 + 3 * k)?,
-                    });
-                }
-                let spec = buses
-                    .iter_mut()
-                    .find(|(s, i, _)| *s == side && i == iface)
-                    .and_then(|(_, _, specs)| {
-                        specs
-                            .iter_mut()
-                            .find(|s| !s.gripper && s.motor_id == motor_id)
-                    })
-                    .ok_or_else(|| bad(line))?;
-                spec.cogging = terms;
-            }
             "watchdog_ms" => {
                 watchdog_ms = f
                     .get(1)
@@ -1505,7 +1459,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         lead_s: 0.0,
                         tf_nm_per_pct: 0.0,
                         mit_hz: 0.0,
-                        cogging: Vec::new(),
                     }
                 } else {
                     let motor_id: u8 = f
@@ -1568,7 +1521,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                             Some(_) => num(28)?,
                             None => 0.0,
                         },
-                        cogging: Vec::new(),
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -1940,7 +1892,6 @@ mod tests {
             fw_version: None,
             tf_nm_per_pct: 0.0,
             mit_hz: 0.0,
-            cogging: Vec::new(),
         }
     }
 
@@ -2555,48 +2506,17 @@ mod tests {
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
 
-    /// The 0x73 scale is an optional field after `lead_ms`; `cogging` lines
-    /// attach their harmonics to the joint already declared on that bus.
+    /// The 0x73 scale is an optional field after `lead_ms`.
     #[test]
-    fn parse_config_takes_tf_scale_and_cogging_series() {
+    fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
             "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
-             joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
-             cogging 1 canR 1 2 198.9 0.3 -0.1 397.8 0 0.2\n"
+             joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
         let specs = &cfg.buses[0].2;
         assert_eq!(specs[0].tf_nm_per_pct, 0.24);
         assert_eq!(specs[1].tf_nm_per_pct, 0.0);
-        assert_eq!(
-            specs[0].cogging,
-            vec![
-                filter::CogTerm {
-                    w: 198.9,
-                    a: 0.3,
-                    b: -0.1
-                },
-                filter::CogTerm {
-                    w: 397.8,
-                    a: 0.0,
-                    b: 0.2
-                },
-            ]
-        );
-        assert!(specs[1].cogging.is_empty());
-        // A cogging line for a joint the bus does not carry, a count that
-        // does not match its terms, or a non-finite coefficient is refused.
-        for bad in [
-            "cogging 1 canR 3 1 198.9 0.3 0\n",
-            "cogging 1 canR 1 2 198.9 0.3 0\n",
-            "cogging 1 canR 1 1 198.9 NaN 0\n",
-            "cogging 0 canR 1 1 198.9 0.3 0\n",
-        ] {
-            assert!(
-                parse_config(&format!("proto 16\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
-                "{bad}"
-            );
-        }
     }
 
     /// `impedance_hz 480` runs the MyActuator impedance joints at a 480 Hz
@@ -3431,7 +3351,7 @@ fn bus_loop(
         if spec.tf_nm_per_pct > 0.0 && m.wire == WireMode::A4 {
             let text = if m.tf_nm_per_pct > 0.0 {
                 format!(
-                    "{iface}: {} on 0x73 — torque feedforward (gravity + inertia + cogging) at {:.4} Nm per % rated current, faded in over {:.1} s",
+                    "{iface}: {} on 0x73 — torque feedforward (gravity + inertia) at {:.4} Nm per % rated current, faded in over {:.1} s",
                     m.joint,
                     m.tf_nm_per_pct,
                     filter::TF_RAMP_S,
@@ -3445,23 +3365,6 @@ fn bus_loop(
                 )
             };
             send_text(out_tx, b'L', &text);
-        }
-        if !m.cogging.is_empty() {
-            let cancels = m.wire == WireMode::Mit || m.tf_nm_per_pct > 0.0;
-            send_text(
-                out_tx,
-                b'L',
-                &format!(
-                    "{iface}: {} cogging cancellation: {} harmonic(s){}",
-                    m.joint,
-                    m.cogging.len(),
-                    if cancels {
-                        ""
-                    } else {
-                        " — NOT applied: a plain-0xA4 joint takes no feedforward (needs 0x73)"
-                    },
-                ),
-            );
         }
     }
     if sched.enabled {
@@ -3959,30 +3862,15 @@ fn bus_loop(
                         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
                     };
                     let damping_ff = c.kd_host * v_damp;
-                    // Position-periodic torque cancellation, on tracked ticks
-                    // only, at where the joint is: the latest reply carried
-                    // one tick along its velocity. Using the tracker position
-                    // instead would put it ~70 ms behind on an a4 joint — a
-                    // third of the 0.905° ripple period at 5 deg/s.
-                    let cogging_ff = if tracked && !m.cogging.is_empty() {
-                        let q = match latest[m.slot] {
-                            Some((pos, vel, _, _)) => pos + vel * tick_dt,
-                            None => p_cmd,
-                        };
-                        filter::cogging(&m.cogging, q)
-                    } else {
-                        0.0
-                    };
                     let t_ff = c.t_ff
                         + friction_ff
                         + stiction_ff
                         + dither_ff
                         + stribeck_ff
                         + inertia_ff
-                        + damping_ff
-                        + cogging_ff;
+                        + damping_ff;
                     // The 0x73 feedforward for a firmware-loop joint that
-                    // takes it: gravity, inertia and the cogging term — not
+                    // takes it: gravity and inertia — not
                     // the host damping band-pass or the friction family,
                     // which exist for the MIT frame (the firmware's speed PI
                     // is the damping and carries friction on this path) —
@@ -3994,7 +3882,7 @@ fn bus_loop(
                         0.0
                     };
                     let tf_pct = if tf_on {
-                        tf_ramp[m.slot] * (c.t_ff + inertia_ff + cogging_ff) / m.tf_nm_per_pct
+                        tf_ramp[m.slot] * (c.t_ff + inertia_ff) / m.tf_nm_per_pct
                     } else {
                         0.0
                     };
@@ -4029,7 +3917,6 @@ fn bus_loop(
                             damp_q: c.damp_q,
                             tick_dt,
                             fb_dt: f64::NAN,
-                            cogging_ff,
                             tf_pct,
                             enc2_p: f64::NAN,
                             enc2_t: f64::NAN,

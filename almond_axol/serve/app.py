@@ -2036,9 +2036,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "stiction_load_gain": jc.stiction_load_gain,
                         "dither_nm": jc.dither_nm,
                         "stribeck_gain": jc.stribeck_gain,
-                        # The cogging ("osc") cancellation's share; the series
-                        # itself is calibration (scripts/cogging_map.py --save).
-                        "cogging_gain": jc.cogging_gain if jc.cogging else None,
                         # Firmware position-loop set (tune.motion's
                         # ``firmware.*`` overrides): the grid's baselines.
                         **{

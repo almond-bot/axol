@@ -32,8 +32,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
-import numpy as np
-
 from ..constants import ARM_JOINTS, Joint
 from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
@@ -159,8 +157,7 @@ class FirmwareGains:
                   ``tune.a4 --tf-probe``). Set, the realtime core sends the
                   joint's position command as **0x73** (protocol V4.4:
                   position control with torque feedforward) carrying the host
-                  feedforward — gravity, inertia and the cogging cancellation
-                  — in the int8 1%-of-rated-current unit the firmware takes,
+                  feedforward — gravity and inertia — in the int8 1%-of-rated-current unit the firmware takes,
                   scaled with the joint's torque constant; faded in over a
                   second so the speed integrator can hand the load over. Only
                   on firmware that implements 0x73 (VersionDate 2026042402 or
@@ -235,67 +232,6 @@ def check_firmware_extras(
         )
     if planner_lead_ms is not None and not 0.0 <= planner_lead_ms <= 50.0:
         raise ValueError(f"planner_lead_ms {planner_lead_ms:g}: must be within 0..50")
-
-
-@dataclass(frozen=True)
-class CoggingModel:
-    """A joint's position-periodic torque (cogging / gear mesh) to cancel.
-
-    A Fourier series in the **joint** angle: harmonic ``(k, a, b)`` adds
-    ``a·cos(2πkθ/P) + b·sin(2πkθ/P)`` Nm, ``P`` = ``period_deg`` — the torque
-    to *add* so the motor cancels the ripple. Fitted from a slow friction
-    sweep (``axol tune.friction --raw-csv`` then ``scripts/cogging_map.py
-    --save``) and stored in the calibration file; the right shoulder_1's is a
-    3.62° series whose 1.81° and 0.905° harmonics carry most of it — the
-    bumps that land at 1–6 Hz in slow motion (2026-09-23).
-    """
-
-    period_deg: float
-    harmonics: tuple[tuple[int, float, float], ...]
-
-    @classmethod
-    def from_dict(cls, entry: dict[str, Any]) -> "CoggingModel":
-        """From a calibration-file ``cogging`` entry."""
-        return cls(
-            period_deg=float(entry["period_deg"]),
-            harmonics=tuple(
-                (int(k), float(a), float(b)) for k, a, b in entry["harmonics"]
-            ),
-        )
-
-    def as_dict(self) -> dict[str, Any]:
-        """The calibration-file form (inverse of :meth:`from_dict`)."""
-        return {
-            "period_deg": self.period_deg,
-            "harmonics": [list(h) for h in self.harmonics],
-        }
-
-    def torque(self, q_joint: float | np.ndarray) -> float | np.ndarray:
-        """The series at joint angle ``q_joint`` (rad), Nm."""
-        period = math.radians(self.period_deg)
-        return sum(
-            a * np.cos(2.0 * math.pi * k * q_joint / period)
-            + b * np.sin(2.0 * math.pi * k * q_joint / period)
-            for k, a, b in self.harmonics
-        )
-
-    def motor_terms(
-        self, offset: float, gain: float = 1.0
-    ) -> list[tuple[float, float, float]]:
-        """The series in the **motor** frame, for the realtime core.
-
-        ``joint = motor + offset``, so each harmonic's phase shifts by its
-        spatial frequency times the offset; torque needs no sign change (the
-        motor frame is the joint frame shifted). Returns ``(w, a', b')`` with
-        ``w`` in rad⁻¹, scaled by ``gain``.
-        """
-        period = math.radians(self.period_deg)
-        out = []
-        for k, a, b in self.harmonics:
-            w = 2.0 * math.pi * k / period
-            c, s = math.cos(w * offset), math.sin(w * offset)
-            out.append((w, gain * (a * c + b * s), gain * (b * c - a * s)))
-        return out
 
 
 @dataclass
@@ -483,17 +419,6 @@ class JointConfig:
                   enable — the position/speed loop gains behind
                   ``wire_mode`` ``a4``. All ``None`` (the default) leaves the
                   motor's stored gains alone; MyActuator joints only.
-        cogging:  :class:`CoggingModel` — the joint's position-periodic torque,
-                  cancelled by feedforward on tracked ticks (the "osc
-                  cancellation"): added to the MIT ``t_ff`` on an impedance
-                  joint, carried by 0x73 on a firmware-loop joint with
-                  ``firmware.tf_rated_current_a`` set (a plain-0xA4 joint
-                  takes no feedforward, so it has no effect there). Evaluated
-                  in the core at the measured angle. ``None`` (default): none.
-                  Loaded from the calibration file.
-        cogging_gain: Fraction of ``cogging`` applied, for A/B runs (``1.0``
-                  default; ``0`` off; ``tune.motion --gain
-                  shoulder_1.cogging_gain=0.5``).
         impedance_hz: This joint's impedance command rate: ``480.0`` commands
                   it every tick of a 480 Hz core loop (its host feedforward,
                   damping and tracker stepped at 480), ``240.0`` keeps it on
@@ -524,8 +449,6 @@ class JointConfig:
     stribeck_vs: float = 0.1
     stribeck_pole: float = 20.0
     firmware: FirmwareGains = field(default_factory=FirmwareGains)
-    cogging: CoggingModel | None = None
-    cogging_gain: float = 1.0
     impedance_hz: float | None = None
 
     def __post_init__(self) -> None:
@@ -721,11 +644,6 @@ class ArmConfig:
             kd_host_q=1.0,
             stribeck_gain=0.8,
             stribeck_pole=40.0,
-            # The cogging series a friction sweep fits for this joint did not
-            # help (the ripple it cancels is a small, speed- and direction-
-            # dependent share of the notch): off by default, even where a
-            # calibration file carries one.
-            cogging_gain=0.0,
             firmware=_X8_STOCK_FIRMWARE_GAINS,
         )
     )
@@ -972,9 +890,6 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     firmware = entry.get("firmware")
     if firmware is not None:
         overrides["firmware"] = FirmwareGains(**firmware)
-    cogging = entry.get("cogging")
-    if cogging is not None:
-        overrides["cogging"] = CoggingModel.from_dict(cogging)
     com = entry.get("com")
     if com is not None:
         # Fitted by ``axol tune.gravity --save``; already per-side (measured

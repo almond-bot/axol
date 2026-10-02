@@ -89,7 +89,6 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     lead_s: 0.0,
                     tf_nm_per_pct: 0.0,
                     mit_hz: 0.0,
-                    cogging: Vec::new(),
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })

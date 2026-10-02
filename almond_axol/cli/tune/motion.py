@@ -127,11 +127,9 @@ _GAIN_FIELDS = (
     "firmware.cap_track",
     "firmware.planner_lead_ms",
     # MyActuator 0x73: the rated current that scales the torque feedforward
-    # (set = the joint's position command carries gravity + inertia +
-    # cogging; unset = plain 0xA4).
+    # (set = the joint's position command carries gravity + inertia; unset =
+    # plain 0xA4).
     "firmware.tf_rated_current_a",
-    # The cogging ("osc") cancellation's share of the calibrated series.
-    "cogging_gain",
     # The gravity model's per-link inertials (the body this joint drives):
     # mass (kg) and centre of mass (m, URDF link frame) — for trying a gravity
     # correction before committing it to calibration.

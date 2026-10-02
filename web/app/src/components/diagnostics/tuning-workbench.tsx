@@ -924,9 +924,6 @@ const OVERRIDE_FIELDS = [
   "stiction_load_gain",
   "dither_nm",
   "stribeck_gain",
-  // Share of the joint's calibrated cogging series fed forward (the "osc
-  // cancellation"; blank = no series calibrated for the joint).
-  "cogging_gain",
   // The firmware position loop (0xA4 / pv), in effect on --a4 joints and
   // under the position controller; written to ROM at enable.
   "firmware.position_kp",
@@ -938,7 +935,7 @@ const OVERRIDE_FIELDS = [
   "firmware.cap_track",
   "firmware.planner_lead_ms",
   // MyActuator 0x73: the rated current that scales the torque feedforward
-  // (gravity + inertia + cogging) on V4.4 firmware; blank = plain 0xA4.
+  // (gravity + inertia) on V4.4 firmware; blank = plain 0xA4.
   "firmware.tf_rated_current_a",
 ]
 

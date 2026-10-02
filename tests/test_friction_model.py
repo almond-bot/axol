@@ -377,6 +377,29 @@ class CalibrationTest(unittest.TestCase):
                     path=path,
                 )
 
+    def test_a_retired_cogging_series_is_ignored_and_scrubbed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            cogging = {"period_deg": 3.66, "harmonics": [[2, 0.06, 0.0]]}
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "hub_serial": "hub1",
+                        "right": {"elbow": {"kp": 200.0, "cogging": cogging}},
+                    }
+                )
+            )
+            got = load_calibration(path, expected_hub_serial="hub1")["right"]["elbow"]
+            self.assertEqual(got, {"kp": 200.0})
+            # The next save of that joint drops it from the file.
+            update_joint_calibration(
+                "right", "elbow", kd=5.0, hub_serial="hub1", path=path
+            )
+            entry = json.loads(path.read_text())["right"]["elbow"]
+            self.assertNotIn("cogging", entry)
+            self.assertEqual(entry["kp"], 200.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,6 @@ from almond_axol.robot.config import (
     IMPEDANCE_RATES,
     MIXED_LOOP_HZ,
     AxolConfig,
-    CoggingModel,
     check_loop_hz,
     impedance_joints,
     position_wire_mode,
@@ -299,40 +298,6 @@ class RealtimeConfigTest(unittest.TestCase):
         # A Damiao wrist has no 0x73: never a scale, whatever is configured.
         self.assertEqual(scale["wrist_2"], 0.0)
 
-    def test_cogging_lines_arrive_only_with_the_offsets(self) -> None:
-        import math
-
-        cfg = AxolConfig()
-        model = CoggingModel(3.62, ((1, 0.03, 0.0), (2, 0.4, -0.2)))
-        cfg.left.shoulder_1.cogging = model
-        cfg.left.shoulder_1.cogging_gain = 0.5
-        cfg.left.elbow.cogging = model
-        cfg.left.elbow.cogging_gain = 0.0  # off: no line at all
-        rt = Axol._wrap(_hardware(cfg))
-        self.assertFalse(
-            [ln for ln in rt._config_text().splitlines() if ln.startswith("cogging")]
-        )
-        lines = [
-            ln.split()
-            for ln in rt._config_text(cogging=True).splitlines()
-            if ln.startswith("cogging")
-        ]
-        self.assertEqual(len(lines), 1)
-        f = lines[0]
-        self.assertEqual(f[:5], ["cogging", "0", "can0", "1", "2"])
-        # The motor-frame series, halved, reproduces the joint-frame one at
-        # joint = motor + offset.
-        offset = float(rt._robot.left._joint_offsets[0])
-        terms = [tuple(map(float, f[5 + 3 * k : 8 + 3 * k])) for k in range(2)]
-        for q_motor in (-0.4, 0.1, 0.77):
-            got = sum(
-                a * math.cos(w * q_motor) + b * math.sin(w * q_motor)
-                for w, a, b in terms
-            )
-            self.assertAlmostEqual(
-                got, 0.5 * float(model.torque(q_motor + offset)), places=9
-            )
-
     def test_a_vendor_mismatched_wire_mode_is_refused(self) -> None:
         cfg = AxolConfig()
         cfg.left.wrist_2.wire_mode = "a4"  # a Damiao wrist has no 0xA4
@@ -484,14 +449,12 @@ class TuneMotionFlagTest(unittest.TestCase):
         got = tune_motion._parse_gain_overrides(
             [
                 "right.shoulder_1.firmware.tf_rated_current_a=12",
-                "right.shoulder_1.cogging_gain=0.5",
             ]
         )
         cfg = AxolConfig()
         tune_motion._apply_gain_overrides(cfg, got)
         self.assertEqual(cfg.right.shoulder_1.firmware.tf_rated_current_a, 12.0)
         self.assertIsNone(cfg.right.shoulder_2.firmware.tf_rated_current_a)
-        self.assertEqual(cfg.right.shoulder_1.cogging_gain, 0.5)
         grav = tune_motion._parse_gain_overrides(
             ["right.shoulder_3.com.z=-0.17", "right.wrist_3.mass=0.9"]
         )

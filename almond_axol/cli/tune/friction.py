@@ -527,9 +527,8 @@ async def _identify_joint(
     plotting the raw friction-vs-velocity curve and comparing arms.
 
     ``raw_csv`` writes every cruise sample (``q``, ``tau``, speed, direction)
-    unbinned — the input for a position-periodic (cogging / gear-mesh) torque
-    analysis, which needs sub-degree resolution the bins do not keep (see
-    ``scripts/cogging_map.py``). ``n_bins`` sets the bin count for the fit.
+    unbinned — the input ``--fit-csv`` re-fits the slow-profile model from.
+    ``n_bins`` sets the bin count for the fit.
     """
     lo, hi = arm_limits(joint, is_left)
     if lo_override is not None:
@@ -1035,9 +1034,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=Path,
         default=None,
         metavar="PATH",
-        help="Write every cruise sample (q, tau, speed, direction) unbinned — the "
-        "input for scripts/cogging_map.py, which looks for position-periodic "
-        "torque (cogging / gear mesh) and builds a feedforward table from it",
+        help="Write every cruise sample (q, tau, speed, direction) unbinned — "
+        "re-fit them later with --fit-csv",
     )
     p.add_argument(
         "--bins",

@@ -91,14 +91,13 @@ _RT_TRACE_COLUMNS = (
     "damp_q",
     "tick_dt",
     "fb_dt",
-    "cogging_ff",
     "tf_pct",
     "enc2_p",
     "enc2_t",
 )
-# The layout before the cogging cancellation and 0x73 feedforward columns: a
-# CSV a proto-14 core left behind still compacts.
-_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-4]
+# The layout before the 0x73 feedforward column: a CSV a proto-14 core left
+# behind still compacts.
+_RT_TRACE_COLUMNS_V1 = _RT_TRACE_COLUMNS[:-3]
 # The layout before the output-encoder columns (AXOL_RT_ENC2).
 _RT_TRACE_COLUMNS_V2 = _RT_TRACE_COLUMNS[:-2]
 
