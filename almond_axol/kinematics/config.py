@@ -14,6 +14,9 @@ class KinematicsConfig:
     functions. Higher values make the solver prioritise that term more strongly.
 
     Attributes:
+        backend: ``"jax"`` keeps the standard teleop solver. ``"mink"`` uses
+            the Cartesian-policy Mink profile for teleop tracking; its QP
+            costs replace the JAX weights below, and elbow hints must be off.
         pos_weight: Weight on end-effector position error.
         ori_weight: Weight on end-effector orientation error.
         elbow_weight: Weight on elbow position hints (position only, no
@@ -173,6 +176,7 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+    backend: str = "jax"
 
 
 # Solver values the Mantis profile forces (see

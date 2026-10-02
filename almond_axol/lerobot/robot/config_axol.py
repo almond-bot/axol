@@ -18,6 +18,7 @@ from ...robot.config import AxolConfig
 # Registered with draccus so it decodes/validates on the CLI.
 VideoBackend = register_literal(Literal["auto", "gst", "sdk"])
 ActionSpace = register_literal(Literal["joint", "cartesian"])
+CartesianController = register_literal(Literal["jax", "mink"])
 
 
 @RobotConfig.register_subclass("axol")
@@ -46,6 +47,9 @@ class AxolRobotConfig(RobotConfig):
                           kinematics in send_action. Default False.
         left_channel:     SocketCAN interface for the left arm.
         right_channel:    SocketCAN interface for the right arm.
+        cartesian_controller: Cartesian IK execution path. "jax" preserves the
+                          default controller; "mink" uses Mink IK followed by
+                          the realtime Rust filters, without a Python joint shaper.
     """
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
@@ -55,6 +59,7 @@ class AxolRobotConfig(RobotConfig):
     # None preserves the original coupled layout. An explicit override allows
     # measured joint observations and Cartesian policy targets independently.
     action_space: ActionSpace | None = None
+    cartesian_controller: CartesianController = "jax"
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
     video_backend: VideoBackend = "auto"

@@ -22,11 +22,13 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from PyPI, with the `lerobot`, `sim`, and `tracker` extras), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with the `lerobot`, `sim`, and default `jax` extras), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
 ```
+
+For a Mink-only installation, use `curl https://axol.almond.bot/install -fsS | AXOL_KINEMATICS=mink bash`. Select the Mink backend in the session configuration; the installer chooses dependencies. Hosted updates preserve the installed kinematics backends.
 
 Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install tracks [releases](https://github.com/almond-bot/axol/releases): when a newer release exists, the control panel shows an update banner, and pressing **Update** reinstalls at the new release and restarts the server once idle.
 
@@ -34,13 +36,13 @@ On aarch64/Jetson, PyPI's pinned Torch 2.10 wheel is CPU-only. Local CUDA policy
 
 ### Development install
 
-Install the package from a clone using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
+Install the package and the default JAX backend from a clone using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI:
 
 ```bash
-uv sync
+uv sync --extra jax
 ```
 
-Then activate the virtual environment so the `axol` CLI is on your path (or prefix every command with `uv run`):
+Then activate the virtual environment so the `axol` CLI is on your path (or use `uv run --no-sync` to preserve the extras you installed):
 
 ```bash
 source .venv/bin/activate
@@ -50,12 +52,15 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
+| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default JAX IK and planning commands |
+| `mink` | Mink, MuJoCo, DAQP | Mink tracking, Cartesian observations, and reset/return planning without JAX |
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 | `tracker` | Lighthouse/Ultimate bridge dependencies | `tracker.bridge`, Mantis tracking |
 
 ```bash
-uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
+uv sync --extra jax --extra lerobot --extra sim   # hosted default
+uv sync --extra mink --extra lerobot --extra sim # Mink-only collection/policy
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
@@ -92,12 +97,12 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 
 ## Testing
 
-The automated suite is hardware-independent: robot, CAN, ZED, and headset boundaries are exercised through protocol and API contracts, while simulation-capable code is imported with the `sim` extra. Several modules import the `lerobot` extra at import time, so install both. CI enforces aggregate coverage floors of 30% for the Python package and 75% for the tested browser libraries.
+The automated suite is hardware-independent: robot, CAN, ZED, and headset boundaries are exercised through protocol and API contracts. Install both kinematics backends plus `sim` and `lerobot` for the full suite. CI also checks Mink in an installation with no JAX packages. It enforces aggregate coverage floors of 30% for the Python package and 75% for the tested browser libraries.
 
 ```bash
 # Python unit/integration tests, coverage, lint, and package builds
-uv sync --extra sim --extra lerobot --dev
-uv run pytest
+uv sync --extra sim --extra lerobot --extra jax --extra mink --dev
+uv run --no-sync pytest
 uvx --from ruff==0.9.7 ruff check .
 uvx --from ruff==0.9.7 ruff format --check .
 uv build

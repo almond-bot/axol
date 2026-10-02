@@ -33,23 +33,28 @@ class VRTeleopConfig:
             loop interpolates between solutions (segment playback + the
             trapezoidal output filter).
         reset_speed: Average joint velocity (rad/s) of the worst-case joint
-            during a return-to-rest move. The smoothstep profile gives a
-            peak joint velocity of ``1.5 * reset_speed``. Determines the
+            during a return-to-rest move. JAX smoothstep peaks at
+            ``1.5 * reset_speed``; Mink's quintic timing and joint cap use
+            ``1.875 * reset_speed``. Determines the
             number of trajectory waypoints based on the distance to the
             rest pose, subject to ``reset_min_duration`` below.
         reset_min_duration: Floor (seconds) on the return-to-rest trajectory
             duration. Prevents near-rest starts from snapping home in a
             handful of frames and gives every reset a consistent minimum
             feel regardless of starting pose. Defaults to ``1.5`` s.
-        reset_rest_weight: Cost weight penalising deviation from the reset
+        reset_rest_weight: JAX-only cost weight penalising deviation from the reset
             target pose during collision-aware trajectory generation.
-        reset_limit_weight: Cost weight penalising joint-limit violations
+        reset_limit_weight: JAX-only cost weight penalising joint-limit violations
             during reset trajectory generation.
-        reset_collision_margin: Minimum clearance (m) enforced between
-            collision bodies during reset trajectory generation.
-        reset_collision_weight: Cost weight on self-collision penalty during
+        reset_collision_margin: JAX-only clearance activation margin (m)
+            for the reset self-collision soft cost.
+        mink_reset_collision_margin: Mink reset hard clearance (m), capped
+            per pair by known home clearance minus 2 mm. Starts inside this
+            buffer must recover monotonically. Defaults to 0.01 m. Shoulder
+            mounts are excluded; no environment-object model is included.
+        reset_collision_weight: JAX-only cost weight on self-collision penalty during
             reset trajectory generation.
-        reset_max_iterations: Maximum solver iterations per reset waypoint.
+        reset_max_iterations: JAX-only maximum solver iterations per reset waypoint.
         reset_torque_threshold: Contact watchdog for guarded return-to-rest
             moves (hardware only). If any arm joint's torque residual
             (measured minus modeled gravity, in the motor's torque units —
@@ -262,6 +267,7 @@ class VRTeleopConfig:
     reset_rest_weight: float = 50.0
     reset_limit_weight: float = 100.0
     reset_collision_margin: float = 0.025
+    mink_reset_collision_margin: float = 0.01
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
     reset_torque_threshold: float = 6.0

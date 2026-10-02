@@ -121,6 +121,11 @@ class GravityCompensator:
         # Scratch buffer for expanding MuJoCo's sparse qM into a dense matrix
         # (see gravity_and_inertia_arm). nv is small (14), so this is cheap.
         self._m_full = np.zeros((self._model.nv, self._model.nv))
+        # 3.10 moved mj_fullM's sparse input behind MjData; 3.11 removed qM.
+        # Select once, rather than probing/catching exceptions in every tick.
+        self._full_mass_uses_data = tuple(
+            int(part) for part in mujoco.__version__.split(".")[:2]
+        ) >= (3, 10)
 
     def _joint_indices(self, names: list[str]) -> tuple[list[int], list[int]]:
         qpos_idx: list[int] = []
@@ -217,9 +222,10 @@ class GravityCompensator:
         gravity = self.gravity_arm(arm_q, is_left=is_left)
         # mj_fwdPosition (run inside gravity()) already computed the sparse
         # factorized mass matrix; expand it and pull this arm's diagonal.
-        # MuJoCo 3.10 changes this call's signature and 3.11 drops qM: the
-        # pyproject `mujoco<3.10` bound is what keeps this valid.
-        mujoco.mj_fullM(self._model, self._m_full, self._data.qM)
+        if self._full_mass_uses_data:
+            mujoco.mj_fullM(self._model, self._data, self._m_full)
+        else:
+            mujoco.mj_fullM(self._model, self._m_full, self._data.qM)
         dof_idx = self._left_dof_idx if is_left else self._right_dof_idx
         inertia = np.array([self._m_full[i, i] for i in dof_idx], dtype=np.float32)
         return gravity, inertia

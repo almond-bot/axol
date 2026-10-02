@@ -7,10 +7,10 @@ The [one-command install](/installation) is the right path for running Axol on t
 
 ## Install from a clone
 
-Install the package from a checkout using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
+Install the package with the default JAX backend from a checkout using [`uv`](https://docs.astral.sh/uv/). Every dependency resolves from PyPI:
 
 ```bash
-uv sync
+uv sync --extra jax
 ```
 
 Then activate the virtual environment so the `axol` CLI is on your path:
@@ -25,16 +25,23 @@ source .venv/bin/activate
 
 ## Optional extras
 
-Install optional dependency groups as needed (the install script includes `lerobot`, `sim`, and `tracker`):
+Install optional dependency groups as needed (the hosted installer defaults to `jax`, `lerobot`, and `sim`):
 
 | Extra | Contents | When to use |
 |---|---|---|
+| `jax` | JAX, jaxlie, almond-pyroki / almond-jaxls | Default JAX IK and planning commands |
+| `mink` | Pinned Mink, MuJoCo, and DAQP | Mink IK and reset/return planning without JAX |
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
-uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
+uv sync --extra jax --extra lerobot --extra sim   # hosted default
+uv sync --extra mink --extra lerobot --extra sim # Mink-only collection/policy
 ```
+
+The backend is selected separately in session configuration. For teleop, set `kinematics.backend="mink"`. For collection and DAgger, set both `teleop_config.kinematics_config.backend="mink"` and `robot_config.cartesian_controller="mink"`. Policy execution selects `robot_config.cartesian_controller="mink"`. See [Mink IK](/operations/mink) for complete configurations. Install the `jax` extra when using the default JAX configuration. Both extras can be installed together for development.
+
+The hosted installer accepts `AXOL_KINEMATICS=mink` (`curl -fsS https://axol.almond.bot/install | AXOL_KINEMATICS=mink bash`), and hosted updates preserve the installed backends. `axol provision` installs system and device dependencies without selecting a kinematics backend.
 
 <Warning>
   PyPI's `torch==2.10.0` wheel is CPU-only on aarch64. On a Jetson, an exact `uv sync` also replaces an out-of-band Torch build with that locked CPU wheel. If local policy inference needs CUDA, manage a JetPack-compatible Torch + Torchvision build explicitly after dependency sync, and do not exact-sync that deployed environment again without a restoration plan. Remote inference and `--device cpu` work with the hosted dependency set.

@@ -226,6 +226,7 @@ def test_real_feedback_guard_checks_every_motor_and_core_health():
 
 
 def test_worker_honors_explicit_zero_target_without_changing_rest_protocol():
+    from almond_axol.kinematics.config import KinematicsConfig
     from almond_axol.teleop import worker as module
 
     rest = np.full(14, 0.2, dtype=np.float32)
@@ -247,7 +248,7 @@ def test_worker_honors_explicit_zero_target_without_changing_rest_protocol():
         mock.patch("almond_axol.utils.affinity.pin_ik"),
         mock.patch.dict(module.os.environ),
     ):
-        module.run_ik_worker(conn, SimpleNamespace(), object())
+        module.run_ik_worker(conn, SimpleNamespace(), KinematicsConfig())
     replies = [args[0][0] for args in conn.send.call_args_list]
     assert replies[0][0] == "ready"
     np.testing.assert_array_equal(replies[1][1], rest)
