@@ -276,8 +276,7 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
 ///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
 ///   the 240 Hz lane. A proto-15 core would run them all at one rate.
-// 17: the joint line's optional disturbance-observer fields (29-32).
-const CONFIG_PROTO: u32 = 17;
+const CONFIG_PROTO: u32 = 16;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -1120,8 +1119,6 @@ struct TraceRow {
     /// when it arrived (trace clock), NaN on a motor not in `AXOL_RT_ENC2`.
     enc2_p: f64,
     enc2_t: f64,
-    /// The disturbance observer's torque on this joint (Nm).
-    dob_ff: f64,
 }
 
 type TraceHandle = JoinHandle<io::Result<()>>;
@@ -1137,7 +1134,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
     let mut out = io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t,dob_ff"
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,stiction_ff,dither_ff,stribeck_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt,cogging_ff,tf_pct,enc2_p,enc2_t"
     )?;
     Ok(out)
 }
@@ -1145,7 +1142,7 @@ fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
 fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
     writeln!(
         out,
-        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9},{:.9}",
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9},{:.12},{:.6},{:.12},{:.9}",
         r.tick,
         r.time_s,
         r.seq,
@@ -1178,7 +1175,6 @@ fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::R
         r.tf_pct,
         r.enc2_p,
         r.enc2_t,
-        r.dob_ff,
     )
 }
 
@@ -1510,7 +1506,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         tf_nm_per_pct: 0.0,
                         mit_hz: 0.0,
                         cogging: Vec::new(),
-                        dob: Default::default(),
                     }
                 } else {
                     let motor_id: u8 = f
@@ -1574,30 +1569,6 @@ fn parse_config(text: &str) -> io::Result<Config> {
                             None => 0.0,
                         },
                         cogging: Vec::new(),
-                        // Optional: the disturbance observer (gain, Q Hz,
-                        // high-pass Hz, clamp Nm); absent = off.
-                        dob: match f.get(29) {
-                            Some(_) => {
-                                let p = filter::DobParams {
-                                    gain: num(29)?,
-                                    hz: num(30)?,
-                                    hp_hz: num(31)?,
-                                    max: num(32)?,
-                                };
-                                // A NaN here would reach the motor command.
-                                let ok =
-                                    [p.gain, p.hz, p.hp_hz, p.max].iter().all(|v| v.is_finite())
-                                        && (0.0..=1.0).contains(&p.gain)
-                                        && p.hz > 0.0
-                                        && p.hp_hz >= 0.0
-                                        && (0.0..=5.0).contains(&p.max);
-                                if !ok {
-                                    return Err(bad(line));
-                                }
-                                p
-                            }
-                            None => filter::DobParams::default(),
-                        },
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -1970,7 +1941,6 @@ mod tests {
             tf_nm_per_pct: 0.0,
             mit_hz: 0.0,
             cogging: Vec::new(),
-            dob: Default::default(),
         }
     }
 
@@ -2192,10 +2162,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 17\ngripper 0 canL 8\n".to_string()
+                "proto 16\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2432,7 +2402,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 16\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2484,39 +2454,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 17\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 16\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2527,7 +2497,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2541,15 +2511,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 17\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 16\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\n\
+            "proto 16\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2575,12 +2545,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 17"), "{err}");
+        assert!(err.contains("proto 16"), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 17\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 16\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2588,37 +2558,9 @@ mod tests {
     /// The 0x73 scale is an optional field after `lead_ms`; `cogging` lines
     /// attach their harmonics to the joint already declared on that bus.
     #[test]
-    fn parse_config_takes_the_disturbance_observer() {
-        let base = "joint 1 canR shoulder_1 1 450 5 9.4 33.0 0 0 0 0 0 0 0 0 0 mit 0 0.3 0.1 0.1 0 20 0 0 0 0";
-        let cfg = parse_config(&format!(
-            "proto 17\nloop_hz 240\n{base} 0.6 6 0.5 1.5\n\
-             joint 1 canR elbow 4 200 5 9.4 33.0 0 0 0 0 0 0 0 0 0 mit 0 0.3 0.1 0.1 0 20\n"
-        ))
-        .unwrap();
-        let specs = &cfg.buses[0].2;
-        assert_eq!(
-            specs[0].dob,
-            filter::DobParams {
-                gain: 0.6,
-                hz: 6.0,
-                hp_hz: 0.5,
-                max: 1.5
-            }
-        );
-        assert_eq!(specs[1].dob, filter::DobParams::default()); // absent = off
-                                                                // Partial or non-finite observer fields are refused.
-        for bad in [format!("{base} 0.6 6\n"), format!("{base} NaN 6 0.5 1.5\n")] {
-            assert!(
-                parse_config(&format!("proto 17\nloop_hz 240\n{bad}")).is_err(),
-                "{bad}"
-            );
-        }
-    }
-
-    #[test]
     fn parse_config_takes_tf_scale_and_cogging_series() {
         let cfg = parse_config(&format!(
-            "proto 17\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              cogging 1 canR 1 2 198.9 0.3 -0.1 397.8 0 0.2\n"
         ))
@@ -2651,7 +2593,7 @@ mod tests {
             "cogging 0 canR 1 1 198.9 0.3 0\n",
         ] {
             assert!(
-                parse_config(&format!("proto 17\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
+                parse_config(&format!("proto 16\nloop_hz 480\n{S1_A4}\n{bad}")).is_err(),
                 "{bad}"
             );
         }
@@ -2663,27 +2605,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 17\n{mit}"))
+            parse_config(&format!("proto 16\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 17\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 17\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 16\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2699,7 +2641,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 17\nloop_hz 480\n{}{}{}{}",
+            "proto 16\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -3382,8 +3324,6 @@ fn bus_loop(
     // the sample.
     let mut a4_stage: [(f64, f64); N_SLOTS] = [(0.0, 0.0); N_SLOTS];
     let mut a4_follow = vec![false; motors.len()];
-    // Per slot: the disturbance observer (`filter::Dob`).
-    let mut dob = [filter::Dob::default(); N_SLOTS];
     // Output-encoder reads (`AXOL_RT_ENC2`): the motors in the lane (MIT
     // joints only — an a4 joint's 0x240 replies carry its own reads), and
     // each slot's last reading with its arrival time.
@@ -4033,27 +3973,6 @@ fn bus_loop(
                     } else {
                         0.0
                     };
-                    // The disturbance observer's share: tracked MIT ticks with a
-                    // fresh reply and a model inertia only; anything else
-                    // starts it over.
-                    let dob_ff = match latest[m.slot] {
-                        Some((pos, _, tau, _))
-                            if tracked
-                                && !overrun
-                                && m.dob.gain != 0.0
-                                && m.wire == WireMode::Mit
-                                && feedback_fresh[m.slot]
-                                && tau.is_finite()
-                                && c.j_eff > 0.0 =>
-                        {
-                            let d = dob[m.slot].update(pos, tau, c.t_ff, c.j_eff, &m.dob, tick_dt);
-                            (m.dob.gain * d).clamp(-m.dob.max, m.dob.max)
-                        }
-                        _ => {
-                            dob[m.slot].reset();
-                            0.0
-                        }
-                    };
                     let t_ff = c.t_ff
                         + friction_ff
                         + stiction_ff
@@ -4061,8 +3980,7 @@ fn bus_loop(
                         + stribeck_ff
                         + inertia_ff
                         + damping_ff
-                        + cogging_ff
-                        + dob_ff;
+                        + cogging_ff;
                     // The 0x73 feedforward for a firmware-loop joint that
                     // takes it: gravity, inertia and the cogging term — not
                     // the host damping band-pass or the friction family,
@@ -4115,7 +4033,6 @@ fn bus_loop(
                             tf_pct,
                             enc2_p: f64::NAN,
                             enc2_t: f64::NAN,
-                            dob_ff,
                         });
                     }
                     if a4_wire(m.vendor, m.wire, tracked, c.kp) {

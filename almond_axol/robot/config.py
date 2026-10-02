@@ -527,18 +527,6 @@ class JointConfig:
     cogging: CoggingModel | None = None
     cogging_gain: float = 1.0
     impedance_hz: float | None = None
-    #: The realtime core's disturbance observer (``filter::Dob``): the torque
-    #: the joint's model misses — measured torque less gravity less inertia ×
-    #: the encoder's acceleration, through a ``dob_hz`` low-pass and a
-    #: ``dob_hp_hz`` high-pass — fed back at ``dob_gain`` (0 = off, ≤ 1),
-    #: clamped to ``dob_max`` Nm. On jelly's slow_osc 55-100% of the 1-3 Hz
-    #: joint sway was such a disturbance (friction and cogging the
-    #: feedforward misses, and on shoulder_1 mostly neither). Impedance (MIT)
-    #: joints only; needs ``j_eff``.
-    dob_gain: float = 0.0
-    dob_hz: float = 6.0
-    dob_hp_hz: float = 0.5
-    dob_max: float = 1.5
 
     def __post_init__(self) -> None:
         # The per-type defaults (_X8_FIRMWARE_GAINS, _ZERO_FRICTION, ...) are

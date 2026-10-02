@@ -105,11 +105,6 @@ _GAIN_FIELDS = (
     "stribeck_load_gain",
     "stribeck_vs",
     "stribeck_pole",
-    # The core's disturbance observer.
-    "dob_gain",
-    "dob_hz",
-    "dob_hp_hz",
-    "dob_max",
     # Friction model, addressed as ``joint.friction.fc`` etc. — the sliding
     # friction feedforward is the other half of every stick-slip A/B.
     "friction.fc",

@@ -5,7 +5,7 @@ use std::io;
 use std::time::Duration;
 
 use crate::can::CanSock;
-use crate::filter::{CogTerm, DobParams};
+use crate::filter::CogTerm;
 use crate::proto;
 use crate::safety::purge_tx_queue;
 use crate::txn;
@@ -89,8 +89,6 @@ pub struct MotorSpec {
     /// already scaled by the joint's gain. Empty = none. Arrives on the
     /// second configure, after the Python side has resolved joint offsets.
     pub cogging: Vec<CogTerm>,
-    /// The disturbance observer (`filter::Dob`); gain 0 = off.
-    pub dob: DobParams,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -194,8 +192,6 @@ pub struct ReadyMotor {
     pub tf_nm_per_pct: f64,
     /// See `MotorSpec::cogging`.
     pub cogging: Vec<CogTerm>,
-    /// See `MotorSpec::dob`.
-    pub dob: DobParams,
 }
 
 /// The 0x73 scale a joint actually runs: its configured one on firmware that
@@ -362,7 +358,6 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
             mit_hz: spec.mit_hz,
             cogging: spec.cogging.clone(),
-            dob: spec.dob,
         });
     }
 
@@ -448,7 +443,6 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             tf_nm_per_pct: 0.0,
             mit_hz: spec.mit_hz,
             cogging: spec.cogging.clone(),
-            dob: spec.dob,
         });
     }
     Ok(motors)
