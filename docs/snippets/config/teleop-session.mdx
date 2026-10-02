@@ -18,7 +18,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}reset_collision_margin</F> | `0.025` | Minimum self-collision clearance (m) when planning a return. |
 | <F>--{prefix}reset_collision_weight</F> | `100.0` | IK weight on self-collision when planning a return. |
 | <F>--{prefix}reset_max_iterations</F> | `10` | IK iterations per return waypoint. |
-| <F>--{prefix}reset_torque_threshold</F> | `4.0` | **Contact stop during return-to-rest** (Nm of unexpected torque). If the arm hits something, the move stops and the arms go limp; press reset to retry. `0` disables. Hardware only. |
+| <F>--{prefix}reset_torque_threshold</F> | `6.0` | **Contact stop during return-to-rest** (Nm of unexpected torque). If the arm hits something, the move stops and the arms go limp; press reset to retry. `0` disables. Hardware only. |
 | <F>--{prefix}teleop_torque_threshold</F> | `0` (off) | **Contact stop while tracking.** Same behaviour; a running episode is discarded. The control panel arms it at `16`. Hardware only. |
 | <F>--{prefix}reset_gravity_comp_kd</F> | `0.25` | Damping (Nm·s/rad) of the limp hold after a contact stop. |
 | <F>--{prefix}engage_max_vel</F> | `0.628` | Joint speed cap (rad/s) right after engaging, so the first move is gentle. |

@@ -158,15 +158,20 @@ class AtomicDownloadTests(unittest.TestCase):
 
 _DUO = driver._VARIANTS_BY_PACKAGE["stereolabs-zedbox-duo"]  # noqa: SLF001
 _MINI = driver._VARIANTS_BY_PACKAGE["stereolabs-zedbox-mini"]  # noqa: SLF001
+_ZEDLINK_DUO = driver._VARIANTS_BY_PACKAGE["stereolabs-zedlink-duo"]  # noqa: SLF001
 
 
 class DriverVariantTests(unittest.TestCase):
     """Every ZED carrier we ship must have its GMSL driver kept in step."""
 
-    def test_pins_cover_duo_and_mini_consistently(self) -> None:
+    def test_pins_cover_every_carrier_consistently(self) -> None:
         self.assertEqual(
             {v.package for v in driver._VARIANTS},  # noqa: SLF001
-            {"stereolabs-zedbox-duo", "stereolabs-zedbox-mini"},
+            {
+                "stereolabs-zedbox-duo",
+                "stereolabs-zedbox-mini",
+                "stereolabs-zedlink-duo",
+            },
         )
         for variant in driver._VARIANTS:  # noqa: SLF001
             with self.subTest(variant.package):
@@ -177,14 +182,24 @@ class DriverVariantTests(unittest.TestCase):
                     f"{variant.package}_{variant.deb_version}_"
                     f"{driver._DEB_ARCHITECTURE}.deb",  # noqa: SLF001
                 )
-                self.assertIn(
-                    f"L4T{driver._L4T_RELEASE}.{driver._L4T_REVISION_MAJOR}.",  # noqa: SLF001
-                    variant.deb_version,
-                )
-                self.assertIn(
-                    f"/R{driver._L4T_RELEASE}.{driver._L4T_REVISION_MAJOR}/",  # noqa: SLF001
-                    variant.url,
-                )
+                release, revision = variant.l4t
+                self.assertIn(f"L4T{release}.{revision}.", variant.deb_version)
+                self.assertIn(f"/R{release}.{revision}/", variant.url)
+
+    def test_zedlink_duo_pin_targets_the_agx_on_l4t_39_2(self) -> None:
+        self.assertEqual(_ZEDLINK_DUO.l4t, ("39", "2"))
+        self.assertEqual(_ZEDLINK_DUO.deb_version, "1.4.4-LI-MAX96712-L4T39.2.0")
+
+    def test_l4t_check_uses_each_variants_own_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            release_file = Path(directory) / "nv_tegra_release"
+            release_file.write_text(
+                "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic\n",
+                encoding="utf-8",
+            )
+            with patch.object(driver, "_L4T_RELEASE_FILE", release_file):
+                self.assertTrue(driver._l4t_matches(_ZEDLINK_DUO))  # noqa: SLF001
+                self.assertFalse(driver._l4t_matches(_DUO))  # noqa: SLF001
 
     @staticmethod
     def _dpkg_query(lines: str) -> Mock:
@@ -217,7 +232,7 @@ class DriverVariantTests(unittest.TestCase):
                 },
             ),
             patch.object(driver, "_is_older", return_value=True),
-            patch.object(driver, "_l4t_matches", return_value=True),
+            patch.object(driver, "_l4t_matches", return_value=True),  # noqa: SLF001
             patch.object(driver, "_upgrade", upgrade),
             patch.object(driver.reboot, "request") as request,
             patch.object(driver.sys, "stdout") as stdout,
@@ -245,6 +260,26 @@ class DriverVariantTests(unittest.TestCase):
             self.assertFalse(driver.ensure_driver())
 
         upgrade.assert_not_called()
+
+    def test_current_zedlink_duo_driver_on_agx_is_left_alone_quietly(self) -> None:
+        # The AGX Orin case: agx-flashing installs the pinned 1.4.4 ZED Link
+        # Duo driver, which used to be reported as an unpinned carrier.
+        upgrade = Mock()
+        with (
+            patch.object(
+                driver,
+                "_installed_driver_packages",
+                return_value={"stereolabs-zedlink-duo": _ZEDLINK_DUO.deb_version},
+            ),
+            patch.object(driver, "_is_older", return_value=False),
+            patch.object(driver, "_upgrade", upgrade),
+            patch.object(driver.sys, "stdout"),
+            patch.object(driver.sys, "stderr") as stderr,
+        ):
+            self.assertFalse(driver.ensure_driver())
+
+        upgrade.assert_not_called()
+        self.assertEqual(stderr.write.call_args_list, [])
 
     def test_unpinned_stereolabs_driver_is_reported_not_ignored(self) -> None:
         upgrade = Mock()

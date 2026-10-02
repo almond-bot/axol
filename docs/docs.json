@@ -70,7 +70,8 @@
             "group": "Run Policy",
             "root": "operations/run-policy",
             "pages": [
-              "operations/run-policy-config"
+              "operations/run-policy-config",
+              "operations/custom-policy"
             ]
           },
           {
@@ -130,6 +131,7 @@
                   "cli/replay-dataset",
                   "cli/run-policy",
                   "cli/inference-server",
+                  "cli/policy-check",
                   "cli/migrate-dataset"
                 ]
               },
@@ -224,7 +226,9 @@
               "api/vr",
               "api/zed",
               "api/motor",
-              "api/lerobot"
+              "api/lerobot",
+              "api/policy",
+              "api/policy-plan"
             ]
           }
         ]
