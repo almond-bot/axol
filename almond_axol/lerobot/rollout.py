@@ -4,8 +4,8 @@ Shared rollout machinery for policy CLIs.
 Pulled out of ``axol run-policy`` so other policy-running CLIs can reuse
 the same episode plumbing without duplicating it:
 
-- :class:`IKResetController` — collision-aware return-to-rest backed by
-  an out-of-process JAX IK worker.
+- :class:`IKResetController` — guarded return-to-rest backed by an
+  out-of-process worker using the selected kinematics backend.
 - :class:`ActionPublisher` — single-slot thread-safe handoff of the most
   recently executed action.
 - :class:`RolloutCaptureThread` — fixed-rate thread that pairs a
@@ -23,7 +23,7 @@ the same episode plumbing without duplicating it:
 
 All four are LeRobot-flavoured: the capture thread depends on
 ``lerobot.datasets.lerobot_dataset.LeRobotDataset``, ``build_dataset_frame``,
-and ``log_rerun_data``; the reset controller talks to the JAX IK worker via
+and ``log_rerun_data``; the reset controller talks to the selected IK worker via
 ``almond_axol.teleop``. The module lives under ``almond_axol/lerobot``
 alongside the other LeRobot adapters.
 """
@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from lerobot.lerobot_types import RobotAction
 
     from .robot.robot_axol import AxolRobot
+    from ..kinematics.config import KinematicsConfig
+    from ..teleop.config import VRTeleopConfig
 
 _logger = logging.getLogger(__name__)
 
@@ -66,12 +68,12 @@ class IKResetController:
     """Collision-aware return-to-rest, backed by an IK worker subprocess.
 
     Mirrors the reset path used by ``AxolVRTeleop`` (collect-data) but
-    without the VR server. ``start()`` spawns ``run_ik_worker`` (JAX +
-    JITed solver: ~30 s on a fast host, over a minute on an Orin NX);
+    without the VR server. ``start()`` spawns ``run_ik_worker`` using the
+    selected backend (Mink requires no JAX import or compilation);
     ``wait_ready()`` blocks on the handshake;
-    ``return_to_rest()`` plans a joint-space trajectory and streams its
-    waypoints to the impedance controller. Spawn before ``client.start()``
-    so the IK JIT overlaps with the policy load.
+    ``return_to_rest()`` plans Cartesian paths for Mink, or joint-space paths
+    for JAX, and streams the resolved joint waypoints to the controller.
+    Spawn before ``client.start()`` to overlap preparation with policy load.
 
     ``rest_pose_left`` and ``rest_pose_right`` optionally select each arm's
     seven joint angles in radians, in ``ARM_JOINTS`` order. An omitted arm
@@ -84,6 +86,8 @@ class IKResetController:
         *,
         rest_pose_left: Sequence[float] | None = None,
         rest_pose_right: Sequence[float] | None = None,
+        kinematics_config: KinematicsConfig | None = None,
+        vr_teleop_config: VRTeleopConfig | None = None,
     ) -> None:
         import numpy as np
 
@@ -106,8 +110,22 @@ class IKResetController:
             if pose.shape != (len(ARM_JOINTS),) or not np.isfinite(pose).all():
                 raise ValueError(error)
             overrides[name] = pose
-        self._vr_cfg = VRTeleopConfig(**overrides)
-        self._kin_cfg = KinematicsConfig()
+        # The policy/operator controller and every lifecycle move must use
+        # the same backend. A Mink session must never spawn a JAX worker.
+        from dataclasses import replace
+
+        self._vr_cfg = (
+            VRTeleopConfig(**overrides)
+            if vr_teleop_config is None
+            else replace(vr_teleop_config, **overrides)
+        )
+        self._kin_cfg = (
+            KinematicsConfig()
+            if kinematics_config is None
+            else replace(kinematics_config)
+        )
+        if self._kin_cfg.backend not in {"jax", "mink"}:
+            raise ValueError("kinematics backend must be 'jax' or 'mink'")
         self._proc: Any | None = None
         self._conn: Any | None = None
         self._q_init: Any | None = None
@@ -399,6 +417,8 @@ class IKResetController:
                 robot.parking_positions()
             check_park()
         result = self._conn.recv()
+        if isinstance(result, tuple) and result[0] == "reset_error":
+            raise RuntimeError(f"Reset trajectory refused: {result[1]}")
         if not (isinstance(result, tuple) and result[0] == "reset_traj"):
             raise RuntimeError(f"Unexpected IK worker response: {result!r}")
         _, q_goal, traj = result

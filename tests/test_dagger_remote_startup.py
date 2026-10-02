@@ -20,8 +20,10 @@ class _ReachedConnect(RuntimeError):
 @pytest.mark.parametrize(
     "ready_result", [True, False, RuntimeError("reset worker failed")]
 )
+@pytest.mark.parametrize("backend", ["jax", "mink"])
+@pytest.mark.parametrize("fps", [15, 30, 60])
 def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
-    tmp_path, ready_result
+    tmp_path, ready_result, backend, fps
 ):
     config = collect_dagger.DaggerConfig(
         policy_type="custom",
@@ -31,9 +33,12 @@ def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
         hold_to_intervene=True,
         record_joint_actions=True,
         start_from_current_pose=True,
+        fps=fps,
     )
     config.robot_config.cameras["overhead"].serial = 1234
     config.robot_config.action_space = "cartesian"
+    config.robot_config.cartesian_controller = backend
+    config.teleop_config.kinematics_config.backend = backend
     config.teleop_config.vr_teleop_config.rest_pose_left = [0.1] * 7
     config.teleop_config.vr_teleop_config.rest_pose_right = [-0.2] * 7
     events = []
@@ -66,7 +71,9 @@ def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
     )
     with (
         patch("almond_axol.zed.stereo_serials", return_value=set()),
-        patch("almond_axol.lerobot.robot.robot_axol.AxolRobot", return_value=robot),
+        patch(
+            "almond_axol.lerobot.robot.robot_axol.AxolRobot", return_value=robot
+        ) as robot_constructor,
         patch(
             "almond_axol.lerobot.teleop.teleop_vr_dagger.DaggerVRTeleop",
             return_value=teleop,
@@ -86,9 +93,14 @@ def test_remote_startup_uses_selected_rest_pose_and_waits_before_connect(
     ):
         collect_dagger._run(config, stop_event=threading.Event(), control=Mock())
 
+    robot_constructor.assert_called_once_with(
+        config.robot_config, **({"mink_solve_hz": fps} if backend == "mink" else {})
+    )
     construct.assert_called_once_with(
         rest_pose_left=[0.1] * 7,
         rest_pose_right=[-0.2] * 7,
+        kinematics_config=config.teleop_config.kinematics_config,
+        vr_teleop_config=config.teleop_config.vr_teleop_config,
     )
     reset.start.assert_called_once_with()
     reset.wait_ready.assert_called_once()

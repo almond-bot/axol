@@ -282,6 +282,7 @@ class VRTeleopCore:
         # trajectory is adopted, so ``is_resetting`` has no false window
         # while the IK worker plans (planning can take seconds).
         self._reset_dispatching: bool = False
+        self._reset_error: str | None = None
         # Set by cancel_reset() while a dispatch is in flight: the planning
         # round trip can't be interrupted, so the dispatch drops its result
         # instead of adopting a trajectory the caller no longer wants.
@@ -1018,11 +1019,14 @@ class VRTeleopCore:
                     )
                     return "contact"
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+            if self._reset_error is not None:
+                announce(f"Reset path rejected: {self._reset_error}")
+                return "blocked"
             return "stopped" if stopped() else "done"
 
         while not stopped():
             outcome = await _play()
-            if outcome != "contact":
+            if outcome not in ("contact", "blocked"):
                 return
             hold = await self._contact_hold_until_reset(
                 gravity_step=gravity_step,
@@ -1183,6 +1187,7 @@ class VRTeleopCore:
                 # planning round trip so callers waiting on it don't observe a
                 # false gap between the latch and the trajectory playback.
                 self._reset_dispatching = True
+                self._reset_error = None
                 try:
                     # Plan from the last *commanded* joints, not the raw IK
                     # solution: the smoothed command lags raw q by the EMA +
@@ -1207,6 +1212,11 @@ class VRTeleopCore:
                         # the owner took the arms out-of-band and re-syncs q
                         # before any next dispatch.
                         pass
+                    elif isinstance(result, tuple) and result[0] == "reset_error":
+                        self._reset_error = str(result[1])
+                        self._disengage_all("Teleop disabled (reset path rejected)")
+                        self._at_rest = False
+                        self._logger.error("Reset path rejected: %s", self._reset_error)
                     elif isinstance(result, tuple) and result[0] == "reset_traj":
                         _, q_default, trajectory = result
                         if trajectory:

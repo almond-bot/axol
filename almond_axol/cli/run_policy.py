@@ -209,6 +209,8 @@ class RunPolicyConfig:
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 6.0
+    # Hard modeled clearance for the Mink reset planner (metres).
+    mink_reset_collision_margin: float = 0.01
     # Optional deployment rest goals, in radians (seven arm joints per side).
     # Omitted sides retain the generic teleoperation rest configuration.
     rest_pose_left: list[float] | None = None
@@ -2034,7 +2036,13 @@ def _build_axol_robot_client(
             }
             performed = self.robot.send_action(action)
             if self._publisher is not None and performed is not None:
-                self._publisher.publish(performed)
+                recorded = performed
+                if any(key not in recorded for key in self.robot.action_features):
+                    # Mink returns the joint commands actually dispatched. A
+                    # Cartesian dataset needs their FK poses, not the original
+                    # policy targets (which IK may not have reached).
+                    recorded = self.robot.action_to_dataset(performed)
+                self._publisher.publish(recorded)
             # Tracking contact watchdog: a torque residual sustained above
             # the threshold means the policy is pushing/pulling on something
             # beyond legitimate task contact — abort the episode so the
@@ -2785,7 +2793,12 @@ def _run(
                 "them in the Cameras dialog."
             )
 
-    robot = AxolRobot(robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(robot_config, **robot_options)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
     # Camera feature shapes must be known before either creating or resuming a
@@ -2960,10 +2973,21 @@ def _run(
                 f"Using remote inference server at {server_host}:{server_port}."
             )
 
-        # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
+        # Prepare lifecycle motion using the policy's selected controller.
+        from ..kinematics.config import KinematicsConfig
+
+        reset_options = {}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink":
+            reset_options["vr_teleop_config"] = VRTeleopConfig(
+                mink_reset_collision_margin=cfg.mink_reset_collision_margin
+            )
         reset_controller = IKResetController(
             rest_pose_left=getattr(cfg, "rest_pose_left", None),
             rest_pose_right=getattr(cfg, "rest_pose_right", None),
+            kinematics_config=KinematicsConfig(
+                backend=getattr(cfg.robot_config, "cartesian_controller", "jax")
+            ),
+            **reset_options,
         )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
@@ -3055,6 +3079,18 @@ def _run(
         if not client.start():
             raise RuntimeError("Failed to connect to policy server / load policy.")
 
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink":
+            rest = VRTeleopConfig()
+            robot.prepare_cartesian_actions()
+            robot.set_cartesian_posture(
+                cfg.rest_pose_left
+                if cfg.rest_pose_left is not None
+                else rest.rest_pose_left,
+                cfg.rest_pose_right
+                if cfg.rest_pose_right is not None
+                else rest.rest_pose_right,
+            )
+
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
@@ -3063,10 +3099,13 @@ def _run(
         # send_action. Build that solver now, before the control loop, so its
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
         # below instead of stalling the first policy action.
-        if getattr(
-            robot.config,
-            "cartesian_actions",
-            getattr(robot.config, "observe_cartesian", False),
+        if (
+            getattr(
+                robot.config,
+                "cartesian_actions",
+                getattr(robot.config, "observe_cartesian", False),
+            )
+            and getattr(cfg.robot_config, "cartesian_controller", "jax") != "mink"
         ):
             _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()

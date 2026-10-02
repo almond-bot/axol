@@ -32,7 +32,8 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from numbers import Real
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -52,6 +53,7 @@ if TYPE_CHECKING:
     from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
+    from ...policy.mink_ik import MinkIK, MinkIKConfig
     from ...rt import Axol, Mantis
 
 _logger = logging.getLogger(__name__)
@@ -239,8 +241,34 @@ class AxolRobot(Robot):
         self,
         config: AxolRobotConfig,
         *,
-        ik_config: "KinematicsConfig | None" = None,
+        ik_config: "KinematicsConfig | MinkIKConfig | None" = None,
+        mink_solve_hz: float | None = None,
     ) -> None:
+        """Create the robot with a fixed Cartesian solver cadence.
+
+        ``mink_solve_hz`` overrides only the cadence in a copied Mink config;
+        omitted, it preserves an explicit config's cadence or the 30 Hz default.
+        Configure this before connecting; a different cadence needs a new robot.
+        """
+        if config.cartesian_controller == "mink":
+            from ...policy.mink_ik import MinkIKConfig
+
+            if ik_config is None:
+                ik_config = MinkIKConfig()
+            if not isinstance(ik_config, MinkIKConfig):
+                raise TypeError("The Mink controller requires MinkIKConfig")
+            rate = ik_config.mink_solve_hz if mink_solve_hz is None else mink_solve_hz
+            if (
+                isinstance(rate, bool)
+                or not isinstance(rate, Real)
+                or not (np.isfinite(rate) and rate > 0)
+            ):
+                raise ValueError("mink_solve_hz must be finite and positive")
+            # The tracker and its speed gate retain this object. Own a snapshot
+            # so later caller edits cannot silently change a warmed solver.
+            ik_config = replace(ik_config, mink_solve_hz=float(rate))
+        elif mink_solve_hz is not None:
+            raise ValueError("mink_solve_hz requires cartesian_controller='mink'")
         super().__init__(config)
         self.config = config
         # Feature keys for the joints this robot actually has: the gripperless
@@ -278,7 +306,10 @@ class AxolRobot(Robot):
         # Full IK solver, built lazily the first time a Cartesian action is sent
         # (run-policy). Collect-data commands joint targets, so it never builds
         # this; only the cheap forward-kinematics helper above runs there.
-        self._ik: KinematicsSolver | None = None
+        self._ik: KinematicsSolver | MinkIK | None = None
+        self._mink_lock = threading.RLock()
+        self._mink_send_lock = threading.Lock()
+        self._last_ik_q: np.ndarray | None = None
         self._last_joint_command: np.ndarray | None = None
         self._dispatch_untrusted = False
         # Post-IK command shapers for Cartesian actions (one per arm), built
@@ -568,7 +599,10 @@ class AxolRobot(Robot):
         if (
             self.config.observe_cartesian or self.cartesian_actions
         ) and self._fk is None:
-            from ...kinematics.fk import AxolForwardKinematics
+            if self._uses_mink:
+                from ...kinematics.mujoco_fk import AxolForwardKinematics
+            else:
+                from ...kinematics.fk import AxolForwardKinematics
 
             self._fk = AxolForwardKinematics()
 
@@ -593,6 +627,7 @@ class AxolRobot(Robot):
             max_vel=VRTeleopConfig.teleop_max_vel,
             max_accel=VRTeleopConfig.teleop_max_accel,
             record=self._control_trace,
+            tracking_profile="mink" if self._uses_mink else "default",
         )
 
     async def _connect_async(self) -> None:
@@ -694,6 +729,7 @@ class AxolRobot(Robot):
         self._loop_thread = None
         self._fk = None
         self._ik = None
+        self._last_ik_q = None
         self._last_joint_command = None
         self._dispatch_untrusted = False
         self._preserve_disconnect_requested = False
@@ -1210,7 +1246,14 @@ class AxolRobot(Robot):
             ) from exc
         return frame, float(cap_ts)
 
-    def _ensure_ik(self) -> KinematicsSolver:
+    @property
+    def _uses_mink(self) -> bool:
+        return (
+            getattr(getattr(self, "config", None), "cartesian_controller", "jax")
+            == "mink"
+        )
+
+    def _ensure_ik(self) -> KinematicsSolver | MinkIK:
         """Lazily build the IK solver used to resolve Cartesian action targets.
 
         Built on first use rather than on connect so the joint-action paths
@@ -1220,6 +1263,19 @@ class AxolRobot(Robot):
         (:func:`default_tracking_ik_config`) — the soft ``KinematicsConfig``
         defaults would systematically distort commanded policy poses by ~9 mm.
         """
+        if self._uses_mink:
+            from ...policy.mink_ik import MinkIK, MinkIKConfig
+
+            with self._mink_lock:
+                if self._ik is None:
+                    config = self._ik_config or MinkIKConfig()
+                    if not isinstance(config, MinkIKConfig):
+                        raise TypeError("The Mink controller requires MinkIKConfig")
+                    _logger.info(
+                        "Building Cartesian controller: Mink IK -> Rust filtering"
+                    )
+                    self._ik = MinkIK(config)
+                return self._ik
         if self._ik is None:
             from ...kinematics.solver import KinematicsSolver
 
@@ -1265,15 +1321,87 @@ class AxolRobot(Robot):
         """
         self._ensure_ik()
 
-    def reset_cartesian_seed(self) -> None:
-        """Re-anchor the Cartesian shapers at measured joints on the next send.
+    def set_cartesian_posture(self, left: np.ndarray, right: np.ndarray) -> None:
+        """Pin Mink's null-space attractor to the session's rest target."""
+        if not self._uses_mink:
+            return
+        q = np.concatenate((np.asarray(left)[:7], np.asarray(right)[:7])).astype(
+            np.float32
+        )
+        if q.shape != (14,) or not np.isfinite(q).all():
+            raise ValueError("Cartesian rest posture needs 14 finite joint angles")
+        with self._mink_lock:
+            self._ensure_ik().set_rest_posture(q)
 
-        Call only after the previous control owner has stopped. The IK solve
-        always uses measured joints; dropping these filters also removes the
-        previous owner's joint target and velocity history.
+    def reset_cartesian_seed(self) -> None:
+        """Re-anchor Mink at the last completed joint send at an episode seam.
+
+        Reset/park joint waypoints count too. Measured joints are only the
+        fallback before a send, or when tracking differs by >= 0.35 rad.
         """
-        self._cartesian_shapers = None
-        self._cartesian_last_send = 0.0
+        if not self._uses_mink:
+            self._cartesian_shapers = None
+            self._cartesian_last_send = 0.0
+            return
+        with self._mink_lock:
+            last = self._last_joint_command
+            self._last_ik_q = (
+                None if last is None else np.concatenate((last[:7], last[8:15]))
+            )
+            if self._ik is not None:
+                self._ik.reset_tracking_state()
+
+    def _mink_action_to_targets(
+        self, action: RobotAction
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve Mink targets using a persistent seed and Rust joint filtering."""
+        from ...policy.mink_ik import pose6_world_to_model
+
+        with self._mink_lock:
+            solver = self._ensure_ik()
+            assert self._axol is not None
+            assert self._axol.left is not None and self._axol.right is not None
+            left_cur = np.asarray(self._axol.left.positions, dtype=np.float32)
+            right_cur = np.asarray(self._axol.right.positions, dtype=np.float32)
+            measured = np.concatenate((left_cur[:7], right_cur[:7])).astype(np.float32)
+            values = np.array(
+                [action[k] for k in (*_LEFT_EE_KEYS, *_RIGHT_EE_KEYS)],
+                dtype=np.float64,
+            )
+            grippers = np.array(
+                [action[_LEFT_GRIPPER_KEY], action[_RIGHT_GRIPPER_KEY]]
+                if self._has_gripper
+                else [0.0, 0.0],
+                dtype=np.float32,
+            )
+            if not all(np.isfinite(v).all() for v in (measured, values, grippers)):
+                raise ValueError(
+                    "Mink requires finite measured joints and action values"
+                )
+            previous = self._last_ik_q
+            seed = (
+                previous
+                if previous is not None
+                and float(np.max(np.abs(previous - measured))) < 0.35
+                else measured
+            )
+            result = np.asarray(
+                solver.solve(
+                    seed,
+                    pose6_world_to_model(values[:6]),
+                    pose6_world_to_model(values[6:]),
+                ),
+                dtype=np.float32,
+            )
+            if result.shape != (14,) or not np.isfinite(result).all():
+                raise ValueError(
+                    "Mink returned an invalid joint command; refusing dispatch"
+                )
+            self._last_ik_q = result.copy()
+            return (
+                np.concatenate((result[:7], grippers[:1])),
+                np.concatenate((result[7:], grippers[1:])),
+            )
 
     def _joint_action(self, left: np.ndarray, right: np.ndarray) -> RobotAction:
         return {
@@ -1299,6 +1427,9 @@ class AxolRobot(Robot):
         the IK solution is. The gripper passes straight through. Returns
         ``(left, right)`` 8-vectors (7 arm joints + gripper) in Joint order.
         """
+        if self._uses_mink:
+            return self._mink_action_to_targets(action)
+
         from ...kinematics.fk import pose6_to_pos_rot
 
         solver = self._ensure_ik()
@@ -1398,6 +1529,38 @@ class AxolRobot(Robot):
         if getattr(self, "_dispatch_untrusted", False):
             raise HardwareCleanupError("Previous action dispatch did not drain")
 
+        if self._uses_mink:
+            self._begin_mink_send()
+            try:
+                if _LEFT_EE_KEYS[0] in action:
+                    left, right = self._cartesian_action_to_targets(action)
+                    action = self._joint_action(left, right)
+                if joint_transform is not None:
+                    action = joint_transform(action)
+                # The only event-loop work here is the resolved joint send.
+                # Retain ownership until cancellation has drained as well:
+                # Future.result(timeout) alone leaves a late motor send alive.
+                dispatch = self._send_action_async(action)
+                future = asyncio.run_coroutine_threadsafe(dispatch, self._loop)
+                try:
+                    return future.result(timeout=1.0)
+                except BaseException:
+                    if not future.done():
+                        future.cancel()
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                self._drain_action_dispatch(dispatch), self._loop
+                            ).result(timeout=1.0)
+                        except BaseException as drain_error:
+                            self._dispatch_untrusted = True
+                            raise HardwareCleanupError(
+                                "Mink dispatch cancelled but robot loop did not drain; "
+                                "hardware handoff is uncertain"
+                            ) from drain_error
+                    raise
+            finally:
+                self._mink_send_lock.release()
+
         # Build the IK solver here, on the caller's thread, so the one-time
         # URDF load + JIT warmup never blocks the robot's event loop (telemetry).
         # A Cartesian send then runs a (warmed) IK solve inline on the loop
@@ -1434,6 +1597,12 @@ class AxolRobot(Robot):
 
         return action
 
+    def _begin_mink_send(self) -> None:
+        if self._dispatch_untrusted:
+            raise HardwareCleanupError("Previous Mink dispatch did not drain")
+        if not self._mink_send_lock.acquire(blocking=False):
+            raise RuntimeError("Mink controller already has an action in flight")
+
     @staticmethod
     async def _drain_action_dispatch(dispatch) -> None:
         """Join a cancelled dispatch, including its asynchronous finalizers."""
@@ -1463,12 +1632,38 @@ class AxolRobot(Robot):
             action: Dict with keys matching action_features.
 
         Returns:
-            The action as sent (unmodified).
+            The resolved joint action for Mink; otherwise the input action.
         """
+        if not self._uses_mink:
+            return await self._send_action_async(action)
+        self._begin_mink_send()
+        try:
+            return await self._send_action_async(action)
+        finally:
+            self._mink_send_lock.release()
+
+    async def _send_action_async(self, action: RobotAction) -> RobotAction:
+        """Dispatch with operation ownership already acquired by the caller."""
         assert self._axol is not None
 
         if _LEFT_EE_KEYS[0] in action:
-            left, right = self._cartesian_action_to_targets(action)
+            if self._uses_mink:
+                worker = asyncio.create_task(
+                    asyncio.to_thread(self._cartesian_action_to_targets, action)
+                )
+                try:
+                    left, right = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    # to_thread cannot cancel an active solve. Join it before
+                    # releasing ownership; no target is sent after cancellation.
+                    try:
+                        await asyncio.shield(worker)
+                    except BaseException:
+                        self._dispatch_untrusted = True
+                    raise
+                action = self._joint_action(left, right)
+            else:
+                left, right = self._cartesian_action_to_targets(action)
         else:
             left = self._pack_arm(action, self._left_pos_keys)
             right = self._pack_arm(action, self._right_pos_keys)

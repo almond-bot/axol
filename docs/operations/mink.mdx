@@ -1,0 +1,163 @@
+---
+title: "Mink IK"
+description: "Run teleoperation, collection and custom policies with Mink IK."
+---
+
+Mink uses MuJoCo and a velocity QP for arm kinematics. A Mink session uses this
+backend for tracking, forward kinematics, startup homing, episode returns and
+shutdown parking. The existing JAX/Pyroki backend remains the default and can be
+installed independently.
+
+## Install and select
+
+For a development checkout:
+
+```bash
+uv sync --extra mink --extra lerobot --extra sim
+```
+
+Run commands through the activated environment or `uv run --no-sync axol …` so
+the installed optional dependencies are retained.
+
+For a package installation, use `almond-axol[mink,lerobot,sim]`. Omit `sim` when a
+browser simulator is unnecessary. The JAX controller is available through the
+`jax` extra. Backend selection is explicit; installing an extra does not change
+saved settings or the default backend.
+
+Select these fields in a command configuration file (alongside your camera and
+dataset settings):
+
+| Operation | Fields |
+| --- | --- |
+| `teleop` | `kinematics.backend: "mink"` |
+| `collect-data` | `teleop_config.kinematics_config.backend: "mink"`, `robot_config.cartesian_controller: "mink"` |
+| `collect-dagger` | Both collection fields above; Cartesian remote policies also set `robot_config.action_space: "cartesian"` |
+| `run-policy` | `robot_config.cartesian_controller: "mink"`, `robot_config.action_space: "cartesian"` |
+
+The robot selector also selects MuJoCo forward kinematics and the Rust
+`mink` execution profile when commands are already in joint space.
+`observe_cartesian` selects observation representation independently of the
+action representation. Elbow hints must be disabled (`elbow_weight: 0`, the
+default) for the Mink tracking profile. Remote DAgger rejects mismatched policy
+and teleop IK backends before opening hardware.
+
+For example, a custom Cartesian endpoint can use this configuration:
+
+```json
+{
+  "policy_type": "custom",
+  "task": "local recording label",
+  "server_host": "gpu-desktop",
+  "server_port": 8765,
+  "fps": 30,
+  "actions_per_chunk": 30,
+  "episode_time_s": 0,
+  "soft_park_on_quit": true,
+  "reset_torque_threshold": 4.0,
+  "plan_config": {
+    "request_interval": 10,
+    "max_adoption_offset_steps": 6
+  },
+  "robot_config": {
+    "type": "axol",
+    "observe_cartesian": false,
+    "action_space": "cartesian",
+    "cartesian_controller": "mink"
+  }
+}
+```
+
+Add the actual camera assignments and geometry expected by the endpoint. The
+interface uses version 2 automatically; there is no `custom_protocol` selector.
+For DAgger, select `hold_to_intervene`, `record_joint_actions`, the matching Mink
+teleop backend, and a dataset destination. Rest poses and contact thresholds for
+collection live under `teleop_config.vr_teleop_config`.
+
+Policy rollout actions are recorded in the configured action space. For Mink
+Cartesian actions, the recorder uses forward kinematics of the dispatched joint
+commands; an unreachable policy target is not substituted for the resolved
+command. Remote DAgger can instead retain joint training actions with
+`record_joint_actions: true`, independently of the policy's action space.
+
+## Execution and coordinate frames
+
+Public Cartesian actions and observations use the current Axol world frame and
+gripper-link pose convention. The tracking solver internally uses the bundled
+model frame; the adapter converts only that boundary. Model assets,
+dependency versions and numerical fixtures are recorded in
+`almond_axol/policy/mink_ik/PROVENANCE.md`.
+
+Mink policy outputs go directly to the Rust tracker without the additional Python
+joint shaper used by JAX Cartesian execution. `mink` tracks literal targets,
+uses measured time across overruns and preserves command derivatives. It retains
+the realtime core's watchdog and command validation. Changing backend therefore
+changes tracking semantics, not just solver speed.
+
+The default policy solver profile is calibrated for 30 Hz execution. `run-policy`
+and `collect-dagger` pass their configured `fps` to Mink's posture speed gate;
+teleop passes its configured IK frequency. SDK callers can pass
+`AxolRobot(config, mink_solve_hz=60)` for a 60 Hz policy. This copies the supplied
+`MinkIKConfig` and changes only its cadence; omitting the keyword preserves an
+explicit config's cadence or the 30 Hz default. The cadence is fixed when the
+robot is constructed. Validate physical tracking at the deployment's chosen
+rate; configuring the correct cadence does not guarantee a solve fits its budget.
+
+To reproduce a deployment, record the effective camera order/resizing, world
+frame, control rates, request interval, rest poses, gains, gripper torque limits,
+and contact thresholds. Upstream defaults are not a deployment profile; in
+particular, the default request interval is five ticks and the default reset
+contact threshold is 6 Nm. The example above explicitly selects ten ticks and
+4 Nm. Policy-specific gain overrides remain session configuration.
+
+## Reset and parking design
+
+Mink resets use straight tool-position paths, shortest-path orientation
+interpolation and smooth time scaling. A dedicated planner uses a separate
+MuJoCo state so planning cannot modify the tracking solver's seed or history.
+It resolves and validates the complete path before returning joint waypoints to
+the existing guarded playback loop.
+
+The planner retains joint-posture goals as well as tool poses. Seven-joint arms
+can reach the same tool pose with different elbows; a successful reset must
+reach the configured joint posture. Parking still performs rest and then the
+zero joint goal, and waits for measured settling before motor release.
+
+This full park applies to explicit quit in remote DAgger and to `run-policy`
+with `soft_park_on_quit: true`. With that policy option enabled, interrupt/error
+exits preserve support instead. Ordinary `collect-data` retains the vendor's
+different shutdown sequence: best-effort return to rest, then disconnect. It does
+not perform the full rest-to-zero park or preserve support on a failed return.
+
+A straight path is not always feasible. Joint limits, modeled self-collision,
+unreachable targets, excessive steps or an unreached endpoint reject the plan.
+Reset planning never retries with collision constraints removed. The model's
+collision geometry does not describe arbitrary objects on the work surface;
+runtime contact monitoring, cancellation and deadlines still guard playback.
+
+Teleop permits hand-guided repositioning and retry after a rejected plan. The
+policy and DAgger CLIs report a planning rejection and end the session through
+their existing cleanup path.
+
+`vr_teleop_config.mink_reset_collision_margin` (or the top-level
+`mink_reset_collision_margin` in `run-policy`) selects the Mink planner's hard
+clearance target (default 0.01 m). The JAX `reset_collision_margin` and reset
+penalty weights configure the JAX planner's soft costs and do not configure
+Mink. Pairs close in the known home pose use home-relative limits. A start inside
+the nominal clearance buffer must recover clearance without moving deeper into
+it; a colliding start or blocked path is rejected.
+
+Selecting Mink uses Cartesian reset paths instead of the JAX joint-space planner.
+Tracking parity does not imply identical reset trajectories or physical behavior.
+
+## Validation and deployment
+
+The test suite covers independent frozen solver outputs, public-frame FK,
+Rust filter vectors, constrained reset planning, backend propagation and
+dispatch ownership. The Mink-only CI job installs no JAX-family packages and
+exercises imports and the lifecycle paths in that environment. The JAX
+backend has separate coverage in the complete test environment.
+
+Hardware acceptance must cover single/two-arm collection, DAgger takeover and
+handback, remote Cartesian execution, blocked/interrupted resets, and rest-to-zero
+parking. Resident sessions can reuse the robot, shared-camera, recording and policy
+lifecycle APIs.

@@ -29,16 +29,18 @@ import argparse
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ...constants import ARM_JOINTS, Joint
-from ...kinematics.solver import KinematicsSolver
 from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
-from ...teleop.trajectory import plan_collision_aware_trajectory
 from ...utils.logquiet import quiet_noisy_loggers
+
+if TYPE_CHECKING:
+    from ...kinematics.solver import KinematicsSolver
 
 _RATE_HZ = (
     250.0  # waypoint density — high for smooth playback (speed is set by --speed)
@@ -116,6 +118,8 @@ def _plan_joint_trajectory(
     limit + self-collision costs so the body never clips the torso during
     the arc. Returns one full ``(N,)`` joint vector per control tick.
     """
+    from ...teleop.trajectory import plan_collision_aware_trajectory
+
     return plan_collision_aware_trajectory(
         solver,
         q_from,
@@ -282,6 +286,8 @@ def run(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
+    from ...kinematics.solver import KinematicsSolver
+
     rest_cfg = VRTeleopConfig()
 
     print("Loading kinematics solver (JIT compile may take a few seconds) ...")

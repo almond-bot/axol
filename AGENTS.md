@@ -8,7 +8,7 @@ Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no p
 
 ### Running the application
 
-- **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --sim`
+- **Sim teleop** (the primary way to exercise the app without hardware): `uv run --extra jax --extra sim axol teleop --sim`
  - Opens a viser 3D viewer at `http://localhost:8002` and a VR WebSocket server on port 8000.
  - With no VR headset connected the arms just hold the rest pose. To actually drive them, either use the `Sim` SDK directly (`sim.motion_control(left=..., right=...)`, see the `Sim` docstring in `almond_axol/robot/sim.py`) or connect a WebSocket client to `wss://localhost:8000/ws` (self-signed cert — disable TLS verification) and stream `VRFrame` JSON with both `l_lock`/`r_lock` true to engage tracking.
  - The viser server persists engage/IK state across teleop restarts only within one process; if a WebSocket client leaves tracking engaged and reconnects, restart the `teleop` process for a clean engage.
@@ -23,21 +23,23 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- Python unit tests live in `tests/` (mostly stdlib `unittest`, with some pytest-style modules): run the whole suite with `uv run pytest`, which also enforces the 30% branch-aware coverage floor from `pyproject.toml`. `uv run python -m unittest discover -s tests` still works for the `unittest` modules. They run without hardware — hardware-facing modules are exercised through mocks — but several import the `lerobot` extra at module level, so run them from `uv sync --extra sim --extra lerobot --dev` (a bare `--extra sim` sync leaves ~9 modules failing to import). Add a `tests/test_<module>.py` alongside behaviour changes. For anything the suite doesn't cover, validate by importing the package and exercising the `Sim`-based code paths.
+- Python unit tests live in `tests/` (mostly stdlib `unittest`, with some pytest-style modules): run the whole suite with `uv run pytest`, which also enforces the 30% branch-aware coverage floor from `pyproject.toml`. `uv run python -m unittest discover -s tests` still works for the `unittest` modules. They run without hardware — hardware-facing modules are exercised through mocks — but several import optional backends and LeRobot at module level, so run them from `uv sync --extra sim --extra lerobot --extra jax --extra mink --dev`. Use `uv run --no-sync pytest` after this sync. The dedicated `Mink without JAX` CI job installs only `sim`, `lerobot`, and `mink` and exercises commands and kinematics without any JAX packages. Add a `tests/test_<module>.py` alongside behaviour changes. For anything the suite doesn't cover, validate by importing the package and exercising the `Sim`-based code paths.
 - Run the web unit/component suite from `web/` with `npm test`; use `npm run lint`, `npm run format:check`, and `npm run build` for the remaining front-end gates. GitHub Actions (`.github/workflows/ci.yml`) runs the Python and Web gates on every PR.
-- MuJoCo is pinned to one API line (`mujoco>=3.8.0,<3.10` in `pyproject.toml`): 3.10 changed the `mj_fullM` signature and 3.11 removed `mjData.qM`, both used by `almond_axol/robot/gravity.py`. `uv.lock` alone does not protect `uv tool install` / `pip install` (they re-resolve), so the upper bound is deliberate. To move to a newer MuJoCo, update the call in `gravity.py`, the bound, and `uv lock` together; `tests/test_gravity.py` guards the pin.
+- MuJoCo supports `>=3.8.0,<3.12`; `almond_axol/robot/gravity.py` selects the 3.8/3.9 or 3.10/3.11 mass-matrix API. The `mink` extra pins MuJoCo 3.11.0 and QP dependencies for solver parity. Update gravity code, dependency bounds, and lock together for another API line; `tests/test_gravity.py` verifies both APIs.
 - The Rust realtime core (`rust/axol-rt`, the required hardware control backend) has a `cargo test` suite: golden filter vectors pinned to the Python originals, wire-protocol round trips, and a damping dissipated-power comparison. `uv run python rust/axol-rt/tools/rt_proto_check.py` exercises the built binary's Unix-socket protocol without CAN. `cargo test stall_detection_live -- --ignored` needs the CAN interfaces up with motors unpowered.
 
 ### Dependency extras
 
 | Extra | Purpose |
 |-------|---------|
+| `jax` | Default JAX IK and planning commands; required when using default kinematics settings |
+| `mink` | Mink tracking, Cartesian observations, and reset/return without JAX; select Mink in session configuration |
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
 | `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras. Not needed for teleop camera streaming: the ZED SDK cameras live in `almond_axol/video/zed_sdk.py` and `almond_axol/lerobot/camera` only wraps them in LeRobot's `Camera`/`CameraConfig` |
 
-For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extra is import-time required by part of the test suite; `--extra sim` alone is enough to run sim teleop).
+For cloud development: `uv sync --extra sim --extra lerobot --extra jax --extra mink --dev`. For a Mink-only deployment, use `uv sync --extra sim --extra lerobot --extra mink` and select the Mink backend in the session configuration. JAX is optional; `jax`, `jaxlib`, `jaxlie`, `jaxls`, and `pyroki` must not be required by Mink workflows.
 
-**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (no `pyzed` for the SDK fallback — teleop logs a `zed.install` hint — and no `gi` for the gst relay) and data collection (`No module named 'lerobot'`). Restore with `uv sync --extra sim --extra lerobot` then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
+**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (no `pyzed` for the SDK fallback — teleop logs a `zed.install` hint — and no `gi` for the gst relay) and data collection (`No module named 'lerobot'`). Restore with `uv sync --extra sim --extra lerobot --extra mink` (or `--extra jax` for a JAX installation) then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
 
 ### Gotchas
 
