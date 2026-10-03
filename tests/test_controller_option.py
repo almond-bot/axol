@@ -382,8 +382,8 @@ class TuneMotionFlagTest(unittest.TestCase):
             ),
         )
         self.assertEqual(cfg.right.shoulder_1.firmware.planner_accel, 60000.0)
-        self.assertEqual(cfg.right.shoulder_2.firmware.planner_accel, 0.0)
-        self.assertEqual(cfg.left.shoulder_1.firmware.planner_accel, 0.0)
+        self.assertIsNone(cfg.right.shoulder_2.firmware.planner_accel)
+        self.assertIsNone(cfg.left.shoulder_1.firmware.planner_accel)
         self.assertEqual(cfg.right.elbow.friction.fc, 0.3)
         self.assertEqual(
             cfg.left.elbow.friction.fc, AxolConfig().left.elbow.friction.fc
@@ -392,7 +392,7 @@ class TuneMotionFlagTest(unittest.TestCase):
             cfg.right.wrist_2.friction.fc, AxolConfig().right.wrist_2.friction.fc
         )
         self.assertEqual(cfg.right.shoulder_1.kd, 2.0)
-        self.assertEqual(AxolConfig().right.shoulder_1.firmware.planner_accel, 0.0)
+        self.assertIsNone(AxolConfig().right.shoulder_1.firmware.planner_accel)
 
     def test_planner_overrides_are_checked_before_the_bus(self) -> None:
         got = tune_motion._parse_gain_overrides(

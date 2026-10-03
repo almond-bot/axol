@@ -366,23 +366,6 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                     spec.joint
                 )));
             }
-        } else {
-            // A wrist runs in the mode its wire wants — MIT (1) or, for
-            // `wire_mode pv`, position-velocity (2). Put it there (RAM
-            // write, effective at once) rather than refusing: a wrist left
-            // in the other mode by the previous session is the normal case
-            // when the controller choice changes between runs.
-            let wanted = spec.wire.dm_mode();
-            if mode != wanted as f64 {
-                write_dm_register(sock, id, proto::DM_REG_CTRL_MODE, wanted.to_le_bytes())?;
-                let now = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
-                if now != wanted as f64 {
-                    return Err(err(format!(
-                        "{} (0x{id:02X}): control mode {now} after asking for {wanted} — not enabling",
-                        spec.joint
-                    )));
-                }
-            }
         }
         let p_max = read_dm_register(sock, id, proto::DM_REG_PMAX)?;
         let v_max = read_dm_register(sock, id, proto::DM_REG_VMAX)?;
@@ -395,6 +378,33 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             )));
         };
         let decoded = proto::dm_decode_feedback(&fb, p_max, v_max, t_max);
+        let holding = decoded.status == proto::DM_STATUS_ENABLED;
+        if !spec.gripper {
+            // A wrist runs in the mode its wire wants — MIT (1) or, for
+            // `wire_mode pv`, position-velocity (2). A cold wrist is put
+            // there (RAM write, effective at once) rather than refused: a
+            // wrist left in the other mode by the previous session is the
+            // normal case when the controller choice changes between runs.
+            // A wrist still holding torque is not switched under load.
+            let wanted = spec.wire.dm_mode();
+            if mode != wanted as f64 {
+                if holding {
+                    return Err(err(format!(
+                        "{} (0x{id:02X}): holding in control mode {mode}, this run needs {wanted} — \
+                         not switching a loaded joint; power-cycle the arm (or disable it) and run again",
+                        spec.joint
+                    )));
+                }
+                write_dm_register(sock, id, proto::DM_REG_CTRL_MODE, wanted.to_le_bytes())?;
+                let now = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
+                if now != wanted as f64 {
+                    return Err(err(format!(
+                        "{} (0x{id:02X}): control mode {now} after asking for {wanted} — not enabling",
+                        spec.joint
+                    )));
+                }
+            }
+        }
         motors.push(ReadyMotor {
             id: spec.motor_id,
             joint: spec.joint.clone(),
@@ -407,7 +417,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
                 t_max,
             },
             hold_pos: decoded.position,
-            holding: decoded.status == proto::DM_STATUS_ENABLED,
+            holding,
             kp: spec.kp,
             kd: spec.kd,
             gripper: spec.gripper,

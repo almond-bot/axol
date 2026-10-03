@@ -9,7 +9,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from almond_axol.constants import Joint
+from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.motor import MotorError
 from almond_axol.motor.damiao import DamiaoMotor
 from almond_axol.motor.myactuator import _MA_PID_IDX, MyActuatorMotor
@@ -32,41 +32,16 @@ _X8 = {
 
 
 class ConfigTest(unittest.TestCase):
-    def test_every_myactuator_joint_carries_its_stock_set(self) -> None:
-        # The arms run impedance, where the firmware loops are inert: every
-        # joint — shoulder_1 and the elbow included — is kept on its motor's
-        # factory loop (2026-09-24). The tuned 0xA4 sets stay defined for an
-        # --a4 run to override with.
-        x8 = {
-            "position_kp": 0.008,
-            "position_kd": 0.1,
-            "speed_kp": 0.03,
-            "speed_ki": 1e-4,
-            "planner_accel": 0.0,
-        }
-        x6 = {
-            "position_kp": 0.06,
-            "position_kd": 0.5,
-            "speed_kp": 0.01,
-            "speed_ki": 1e-4,
-            "planner_accel": 0.0,
-        }
+    def test_every_arm_joint_leaves_its_motor_firmware_alone(self) -> None:
+        # The arms run impedance, where the firmware loops are inert: no joint
+        # carries a firmware set, so bring-up neither writes nor checks the
+        # motors' own loops and they stay as shipped. The tuned 0xA4 sets
+        # stay defined for an --a4 run to override with.
         cfg = AxolConfig()
         for arm in (cfg.left, cfg.right):
-            for joint in (arm.shoulder_1, arm.shoulder_2):
-                self.assertEqual(joint.firmware.as_dict(), x8)
-            for joint in (arm.shoulder_3, arm.elbow, arm.wrist_1):
-                self.assertEqual(joint.firmware.as_dict(), x6)
+            for joint in ARM_JOINTS:
+                self.assertEqual(getattr(arm, joint.value).firmware.as_dict(), {})
         self.assertEqual(_X8_FIRMWARE_GAINS.as_dict(), _X8)
-
-    def test_damiao_wrists_carry_the_stock_profiler_only(self) -> None:
-        cfg = AxolConfig()
-        for arm in (cfg.left, cfg.right):
-            for name in ("wrist_2", "wrist_3"):
-                self.assertEqual(
-                    getattr(arm, name).firmware.as_dict(),
-                    {"position_kp": 54.0, "profile_acc": 2.0},
-                )
 
     def test_the_gripper_has_no_firmware_block(self) -> None:
         self.assertFalse(hasattr(AxolConfig().left.gripper, "firmware"))
@@ -233,10 +208,13 @@ def _arm(
 ) -> SimpleNamespace:
     cfg = AxolConfig()
     # The apply/held tests exercise writes: give shoulder_1 and the elbow the
-    # tuned 0xA4 sets an --a4 run would bring (the config default is stock).
+    # tuned 0xA4 sets an --a4 run would bring, and the Damiao wrists an
+    # explicit KP_APR / profiler set (the config default is none anywhere).
     for arm in (cfg.left, cfg.right):
         arm.shoulder_1.firmware = replace(_X8_FIRMWARE_GAINS)
         arm.elbow.firmware = replace(_X6_ELBOW_FIRMWARE_GAINS)
+        for wrist in (arm.wrist_2, arm.wrist_3):
+            wrist.firmware = FirmwareGains(position_kp=54.0, profile_acc=2.0)
     for j in a4:
         getattr(cfg.left if is_left else cfg.right, j.value).wire_mode = "a4"
     return SimpleNamespace(
@@ -277,16 +255,12 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(motor.store[_MA_PID_IDX["speed_ki"]], 1e-5, 9)
             # position_kd 0.1 is already the stock value: read, never written.
             self.assertNotIn(_MA_PID_IDX["position_kd"], [i for i, _ in motor.writes])
-        # shoulder_2 carries the stock X8 set, which this motor already holds.
-        self.assertEqual(s2.writes, [])
-        # wrist_1 carries the stock X6 roll set: written over the X8 values.
-        self.assertAlmostEqual(w1.store[_MA_PID_IDX["position_kp"]], 0.06, 6)
-        self.assertAlmostEqual(w1.store[_MA_PID_IDX["speed_kp"]], 0.01, 6)
-        self.assertAlmostEqual(w1.store[_MA_PID_IDX["position_kd"]], 0.5, 6)
-        self.assertEqual(sum("written to ROM" in m for m in logs.output), 3)
+        # shoulder_2 and wrist_1 carry no set: never written.
+        self.assertEqual((s2.writes, w1.writes), ([], []))
+        self.assertEqual(sum("written to ROM" in m for m in logs.output), 2)
         # Every motor that took a write is rebooted so its loop loads the new
-        # gains; the untouched one is not.
-        self.assertEqual([s1.resets, s2.resets, elbow.resets, w1.resets], [1, 0, 1, 1])
+        # gains; the untouched ones are not.
+        self.assertEqual([s1.resets, s2.resets, elbow.resets, w1.resets], [1, 0, 1, 0])
 
     async def test_a_provisioned_motor_is_neither_written_nor_reset(self) -> None:
         s1 = _FakeMotor(_stock())
@@ -373,9 +347,9 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         cfg = AxolConfig()
         cfg.left.shoulder_1.wire_mode = "a4"  # the planner is an a4 setting
         cfg.left.shoulder_1.firmware.planner_accel = 60000.0
-        # Each joint owns its block: the shoulder_2 and a fresh config keep 0.
-        self.assertEqual(cfg.left.shoulder_2.firmware.planner_accel, 0.0)
-        self.assertEqual(AxolConfig().left.shoulder_1.firmware.planner_accel, 0.0)
+        # Each joint owns its block: the shoulder_2 and a fresh config keep none.
+        self.assertIsNone(cfg.left.shoulder_2.firmware.planner_accel)
+        self.assertIsNone(AxolConfig().left.shoulder_1.firmware.planner_accel)
         s1 = _FakeMotor(_stock())
         await apply_firmware_gains(
             _arm({Joint.SHOULDER_1: s1}, config=cfg.left), [Joint.SHOULDER_1]
@@ -390,7 +364,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         # A wrist left on the old tuned set (KP_APR 400, ramps 50) goes back
-        # to the stock 54 / 2 the config now carries.
+        # to the stock 54 / 2 the arm is configured with.
         w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 400.0, 28: 0.0, 4: 50.0, 5: -50.0})
         arm = _arm({Joint.WRIST_2: w2})
         with self.assertLogs("almond_axol.robot.axol", level="INFO") as logs:
@@ -405,7 +379,7 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((w2.writes, w2.stores), ([], 0))
 
     async def test_damiao_profile_ramp_writes_acc_and_negative_dec(self) -> None:
-        # Tuned wrists: KP_APR 400, ramps ±50. Config wants stock 54 and 2.
+        # Tuned wrists: KP_APR 400, ramps ±50. The arm wants stock 54 and 2.
         w2 = _FakeDamiao({25: 0.0037, 26: 0.002, 27: 400.0, 28: 0.0, 4: 50.0, 5: -50.0})
         arm = _arm({Joint.WRIST_2: w2})
         with self.assertLogs("almond_axol.robot.axol", level="INFO"):
@@ -422,13 +396,11 @@ class ApplyFirmwareGainsTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(w2.store[5], -2.0)
         self.assertEqual(w2.stores, 1)
 
-    def test_wrists_carry_the_profile_ramp_and_myactuator_joints_do_not(self) -> None:
+    def test_no_joint_carries_a_profile_ramp_by_default(self) -> None:
         cfg = AxolConfig()
         for arm in (cfg.left, cfg.right):
-            self.assertEqual(arm.wrist_2.firmware.profile_acc, 2.0)
-            self.assertEqual(arm.wrist_3.firmware.profile_acc, 2.0)
-            self.assertIsNone(arm.elbow.firmware.profile_acc)
-            self.assertIsNone(arm.shoulder_1.firmware.profile_acc)
+            for joint in ARM_JOINTS:
+                self.assertIsNone(getattr(arm, joint.value).firmware.profile_acc)
 
     async def test_configured_gains_on_a_joint_without_a_loop_warn(self) -> None:
         arm = _arm({Joint.WRIST_2: object()})  # a driver of neither vendor

@@ -10,11 +10,12 @@ use std::time::{Duration, Instant};
 const JOINTS: usize = 8;
 const WINDOW: Duration = Duration::from_secs(2);
 /// The loop rates the core runs at: 240 Hz on the impedance controller,
-/// 400 Hz on the firmware position controller (`AxolConfig.controller`).
+/// 400 Hz on the firmware position controller (`AxolConfig.controller`),
+/// 480 Hz for a mixed arm or fast impedance joints.
 /// The passive observer is not told which; it takes the one nearest the
 /// measured command rate, so deadline misses are counted against the loop
 /// that is actually running.
-const LOOP_RATES_HZ: [f64; 2] = [240.0, 400.0];
+const LOOP_RATES_HZ: [f64; 3] = [240.0, 400.0, 480.0];
 
 /// The nominal loop rate behind a measured command rate (240 Hz until the
 /// measurement exists).
@@ -306,6 +307,7 @@ mod tests {
         assert_eq!(target_hz(None), 240.0);
         assert_eq!(target_hz(Some(238.0)), 240.0);
         assert_eq!(target_hz(Some(396.0)), 400.0);
+        assert_eq!(target_hz(Some(476.0)), 480.0);
         let mut timing = TimingAggregator::new();
         let start = Instant::now();
         for tick in 0..8 {

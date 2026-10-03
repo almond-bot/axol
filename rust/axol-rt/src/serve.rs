@@ -287,6 +287,9 @@ const CONFIG_PROTO: u32 = 16;
 /// and the dataset writer boot on the same host and USB fabric as the CAN
 /// adapters — disabling both arms for it ended otherwise healthy sessions.
 const DEGRADED_RECENT_MISSED_FEEDBACK: u32 = 4;
+/// Per-tick bus-occupancy samples kept between 5 s stats lines (480 Hz ×
+/// 5 s = 2400, plus headroom).
+const BUS_BUSY_CAPACITY: usize = 4096;
 /// A motor that has not replied for this long is treated as gone rather than
 /// lossy. Past this point the session goes limp (see the Safety notes)
 /// rather than streaming stiffness to it blind. Matches the TX-stall e-stop
@@ -3213,7 +3216,9 @@ fn bus_loop(
     // with three a4 joints (two request/reply pairs each) the right arm is
     // estimated near three quarters of a 1 Mbps bus — so it is reported in
     // the 5 s stats line to size any rate change against a measurement.
-    let mut bus_busy: Vec<f64> = Vec::with_capacity(2048);
+    // Sized for 5 s at 480 Hz with headroom for a late stats tick; a sample
+    // past capacity is dropped rather than grow the buffer in the loop.
+    let mut bus_busy: Vec<f64> = Vec::with_capacity(BUS_BUSY_CAPACITY);
     let mut bus_last_reply: Option<Instant> = None;
     // TX-stall (e-stop) tracking — see `guarded_send`. A dead bus skips the
     // motor disable on the way out (nothing is powered to hear it, and the
@@ -4361,7 +4366,7 @@ fn bus_loop(
                 let _ = out_tx.send(build_feedback(side, &latest, Instant::now()));
             }
 
-            if let Some(t) = bus_last_reply {
+            if let Some(t) = bus_last_reply.filter(|_| bus_busy.len() < BUS_BUSY_CAPACITY) {
                 bus_busy.push(t.duration_since(began).as_secs_f64() / period.as_secs_f64());
             }
             if began >= next_stats {

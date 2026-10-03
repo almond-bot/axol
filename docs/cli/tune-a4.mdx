@@ -50,7 +50,7 @@ axol tune.a4 --r --joint shoulder_1 --mode sine --freq 0.3 --accel 0 --position-
 ```
 
 <Note>
-  A winning set does not have to be persisted from here. The robot config carries per-joint `firmware.*` gains (see the [config reference](/cli/configuration)); `enable()` compares them with the motor's ROM while the joint is still disabled and writes only what differs. The X8-P20 shoulders ship configured with `position_kp 0.3`, `position_kd 0.1`, `speed_kp 0.1`, `speed_ki 1e-5` from these sweeps.
+  A winning set does not have to be persisted from here. The robot config carries per-joint `firmware.*` gains (see the [config reference](/cli/configuration)); `enable()` compares them with the motor's ROM while the joint is still disabled and writes only what differs. Every joint's `firmware` block is empty by default (the arms run impedance, where these loops are inert), so set the gains for an `a4` run with `tune.motion --gain SIDE.JOINT.firmware.FIELD=VALUE` or in your config.
 </Note>
 
 <Warning>
