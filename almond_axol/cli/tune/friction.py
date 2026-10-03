@@ -26,10 +26,24 @@ construction, so the values take effect for every operation on this machine
 without touching ``config.py``. Friction is motor-specific — run this per
 joint, per arm, on every robot you build.
 
+Slow profile (``--profile slow``): the calibration for slow, smooth motion.
+The default sweep speeds (7-72°/s) miss where the slow shake lives, and the
+Coulomb-plus-viscous fit cannot hold the Stribeck drop or its load
+dependence. ``--profile slow`` sweeps 1, 2, 3, 5, 8, 15 and 30°/s, the slow
+speeds (under 8°/s) in two windows — one where the joint carries the least
+gravity, one where it carries the most — and fits the realtime core's own
+friction law to all of it (:mod:`almond_axol.tuning.friction_model`):
+sliding friction ``fc + fl·|g|`` with the runtime's k cap, viscous ``fv``,
+and the low-speed excess ``dfs + ls·|g|`` over speed ``vs``. ``--save``
+stores the friction fit and the Stribeck fields (at ``--stribeck-gain``).
+``--fit-csv`` re-fits saved ``--raw-csv`` files without moving anything.
+
 Examples:
     axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
     axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
     axol tune.friction --l --joint wrist_1 --velocities 12 35 60
+    axol tune.friction --r --joint shoulder_1 --profile slow --raw-csv s1.csv --save
+    axol tune.friction --r --joint shoulder_1 --fit-csv s1.csv
 """
 
 import argparse
@@ -38,12 +52,13 @@ import csv
 import math
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable
 
 import numpy as np
 from scipy.optimize import curve_fit
 
 from ...constants import ARM_JOINTS
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
@@ -62,6 +77,9 @@ from ...utils.state_files import (
 )
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
+if TYPE_CHECKING:
+    from ...tuning.friction_model import FrictionFit, Sample
+
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
 _SWEEP_MARGIN = 0.05  # rad — don't sweep all the way to hard limits
@@ -73,6 +91,23 @@ _N_BINS = 40  # position bins for matching fwd/bwd samples
 # Default velocity sweep in deg/s (0.02, 0.05, 0.1, 0.15, 0.2 rev/s exactly).
 # The CLI speaks deg/s; the sweep internals run rad/s.
 DEFAULT_VELOCITIES_DEG = [v * 360.0 for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
+#: ``--profile slow``: down into the speeds slow motion runs at.
+SLOW_VELOCITIES_DEG = [1.0, 2.0, 3.0, 5.0, 8.0, 15.0, 30.0]
+#: Below this speed (deg/s) a slow-profile pass sweeps two windows, not the
+#: whole range: a full range at 1°/s is minutes per direction.
+_WINDOW_BELOW_DEG = 8.0
+#: A window lasts about this long per direction (s), and spans at least
+#: ``_WINDOW_MIN_DEG`` (enough 0.5° bins to average a gear-mesh ripple out).
+_WINDOW_S = 15.0
+_WINDOW_MIN_DEG = 8.0
+#: Default share of the fitted low-speed excess the runtime cancels
+#: (``stribeck_gain``), per joint. On for shoulder_1 and the elbow (right
+#: shoulder_1's creep ripple was lowest at 0.8, 2026-09-24). Off elsewhere:
+#: on the jelly robot's right shoulder_2 / shoulder_3 it raised the slow_osc
+#: ripple 30% / 18% against the same calibration without it — under
+#: shoulder_2's ~17 Nm load the fitted excess is ~2 Nm, driven by the
+#: measured velocity (2026-09-29) — and on the wrists it is untested.
+DEFAULT_STRIBECK_GAIN = {Joint.SHOULDER_1: 0.8, Joint.ELBOW: 0.8}
 
 
 async def _ramp_to(
@@ -131,6 +166,30 @@ async def _ramp_verified(
     joints = list(targets)
     if not joints:
         return
+    # Read before commanding. The read re-derives each fixed-stop joint's
+    # ±360° boot wrap (see JointFrameMotor) — the MyActuator reset that
+    # precedes every ramp can leave a reading a full turn off, and a command
+    # against it drives the motor a full turn (right elbow into its hard
+    # stop at 40 Nm, 2026-09-22). Then refuse anything still implausible.
+    pre = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    bad = []
+    for j, pos in zip(joints, pre):
+        is_left = getattr(motors[j], "_is_left", None)
+        if is_left is None:
+            continue
+        lo, hi = arm_limits(j, is_left)
+        if not (lo - _RAMP_SANITY_SLACK <= pos <= hi + _RAMP_SANITY_SLACK):
+            bad.append(
+                f"{j.value} reads {math.degrees(pos):+.1f}° (limits "
+                f"[{math.degrees(lo):+.0f}, {math.degrees(hi):+.0f}]°)"
+            )
+    if bad:
+        raise RuntimeError(
+            "refusing to ramp — implausible joint reading(s): "
+            + ", ".join(bad)
+            + " — a multi-turn wrap or an unset zero; power-cycle or reset "
+            "the motor and re-run `axol motor.set-zero-pos --guided` if it persists"
+        )
     positions: list[float] = []
     for _attempt in range(2):
         await asyncio.gather(
@@ -162,18 +221,93 @@ async def _ramp_verified(
     )
 
 
+#: A joint this far (rad) from its rest pose still carries gravity load; the
+#: tuners refuse to reset/disable it and leave it holding instead.
+_REST_TOL = math.radians(5.0)
+#: A joint reading this far outside its arm limits is not a position, it is
+#: a wrapped multi-turn count or an unset zero — never ramp from it.
+_RAMP_SANITY_SLACK = math.radians(15.0)
+
+
+async def _safe_torque_off(
+    motors: dict[Joint, JointFrameMotor], raw: dict[Joint, Motor] | None = None
+) -> bool:
+    """Reset every joint to IMPEDANCE and disable — but only when every arm
+    joint is within ``_REST_TOL`` of rest.
+
+    The MyActuator mode switch is a firmware reset (torque drops for ~2 s)
+    and disable is torque-off; a joint that did not make it home would fall.
+    That happened on the elbow after a 0xA4 probe whose return climb stalled
+    on the stock firmware position loop. When a joint is off rest this leaves
+    every motor holding its last command, says which joint and where, and
+    returns ``False`` so the caller can tell the operator what to do.
+    """
+    off_rest: list[str] = []
+    for j, m in motors.items():
+        try:
+            pos = await m.get_position()
+        except MotorError:
+            off_rest.append(f"{j.value} (no position reply)")
+            continue
+        if abs(pos) > _REST_TOL:
+            off_rest.append(f"{j.value} at {math.degrees(pos):+.1f}°")
+    if off_rest:
+        print(
+            "  ! NOT disabling: "
+            + ", ".join(off_rest)
+            + " — still under gravity load. Motors are left holding their last "
+            "command. Home the arm (gravity-comp, or hand-guide it to rest) before "
+            "powering down."
+        )
+        return False
+    await asyncio.gather(
+        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
+    )
+    await asyncio.gather(
+        *[
+            m.disable()
+            for m in (raw or {j: m.motor for j, m in motors.items()}).values()
+        ]
+    )
+    return True
+
+
+#: How far inside its range a joint is parked when its rest pose (0) sits on
+#: a hard stop. Held on a firmware position loop *at* the stop, the loop
+#: leans on the stop, the motor's stall protection cuts its output and the
+#: joint hangs limp: the right elbow (limits −150..0) sagged 2–6° and swung
+#: with whatever else was moving during every wrist run (2026-09-22). Two
+#: degrees inside is still within ``_REST_TOL`` of rest for the torque-off.
+_STOP_STANDOFF = math.radians(2.0)
+
+
+def rest_target(joint: Joint, is_left: bool | None) -> float:
+    """The hold target for a homed joint: 0, or 2° inside a limit that is 0."""
+    if is_left is None:
+        return 0.0
+    lo, hi = arm_limits(joint, is_left)
+    if abs(hi) < _STOP_STANDOFF:
+        return hi - _STOP_STANDOFF
+    if abs(lo) < _STOP_STANDOFF:
+        return lo + _STOP_STANDOFF
+    return 0.0
+
+
 async def _home_all(
     motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
 ) -> None:
-    """Ramp every joint to 0 (the rest pose), one at a time in ``_HOME_ORDER``.
+    """Ramp every joint to rest, one at a time in ``_HOME_ORDER``.
 
-    Joints already at rest verify in one poll, so a mostly-homed arm costs
-    a fraction of a second per joint.
+    Rest is 0, except a joint whose 0 is a hard stop, which parks 2° inside
+    (see :func:`rest_target`). Joints already at rest verify in one poll, so
+    a mostly-homed arm costs a fraction of a second per joint.
     """
     for j in _HOME_ORDER:
         if j == exclude or j not in motors:
             continue
-        await _ramp_verified(motors, {j: 0.0})
+        await _ramp_verified(
+            motors, {j: rest_target(j, getattr(motors[j], "_is_left", None))}
+        )
 
 
 async def _run_sweep_raw(
@@ -379,6 +513,8 @@ async def _identify_joint(
     lo_override: float | None = None,
     hi_override: float | None = None,
     dump_csv: Path | None = None,
+    raw_csv: Path | None = None,
+    n_bins: int = _N_BINS,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run bidirectional multi-velocity sweep over the full joint range.
 
@@ -389,6 +525,10 @@ async def _identify_joint(
     If ``dump_csv`` is given, every matched (fwd, bwd) bin is also written to
     a CSV with the per-velocity, per-position torque values. Useful for
     plotting the raw friction-vs-velocity curve and comparing arms.
+
+    ``raw_csv`` writes every cruise sample (``q``, ``tau``, speed, direction)
+    unbinned — the input ``--fit-csv`` re-fits the slow-profile model from.
+    ``n_bins`` sets the bin count for the fit.
     """
     lo, hi = arm_limits(joint, is_left)
     if lo_override is not None:
@@ -410,9 +550,21 @@ async def _identify_joint(
 
     all_avg: list[tuple[float, float]] = []
     all_halfdiff: list[tuple[float, float]] = []
+    # (q, v, tau_half): the half-difference against the pose it was taken at,
+    # for the load-dependent fit (gear friction grows with gravity torque).
+    all_halfdiff_q: list[tuple[float, float, float]] = []
 
     csv_file = None
     csv_writer = None
+    raw_file = None
+    raw_writer = None
+    if raw_csv is not None:
+        raw_file = secure_open_new_text(raw_csv, newline="")
+        raw_writer = csv.writer(raw_file)
+        raw_writer.writerow(
+            ["joint", "side", "pass", "v_rad_s", "direction", "q_rad", "tau_nm"]
+        )
+        print(f"  Dumping every cruise sample to {raw_csv}")
     if dump_csv is not None:
         csv_file = secure_open_new_text(dump_csv, newline="")
         csv_writer = csv.writer(csv_file)
@@ -431,7 +583,7 @@ async def _identify_joint(
         print(f"  Dumping per-bin samples to {dump_csv}")
 
     try:
-        for v in velocities:
+        for pass_index, v in enumerate(velocities):
             print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
@@ -449,11 +601,27 @@ async def _identify_joint(
 
             bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
             print(f"    bwd: {len(bwd)} samples")
+            if raw_writer is not None:
+                side_name = "left" if is_left else "right"
+                for direction, rows in (("+", fwd), ("-", bwd)):
+                    for q, tau in rows:
+                        raw_writer.writerow(
+                            [
+                                joint.value,
+                                side_name,
+                                pass_index,
+                                f"{v:.6f}",
+                                direction,
+                                f"{q:.6f}",
+                                f"{tau:.6f}",
+                            ]
+                        )
+                raw_file.flush()  # type: ignore[union-attr]
 
-            fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi)
-            bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi)
+            fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi, n_bins)
+            bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi, n_bins)
             matched = sum(1 for q in fwd_bins if q in bwd_bins)
-            print(f"    {matched}/{_N_BINS} position bins matched")
+            print(f"    {matched}/{n_bins} position bins matched")
 
             for q_center, tau_f in fwd_bins.items():
                 if q_center in bwd_bins:
@@ -462,6 +630,7 @@ async def _identify_joint(
                     tau_half = (tau_f - tau_b) / 2.0
                     all_avg.append((q_center, tau_avg))
                     all_halfdiff.append((v, tau_half))
+                    all_halfdiff_q.append((q_center, v, tau_half))
                     if csv_writer is not None:
                         csv_writer.writerow(
                             [
@@ -483,8 +652,306 @@ async def _identify_joint(
     finally:
         if csv_file is not None:
             csv_file.close()
+        if raw_file is not None:
+            raw_file.close()
 
+    _identify_joint.last_halfdiff_q = all_halfdiff_q  # type: ignore[attr-defined]
     return all_avg, all_halfdiff
+
+
+def _fit_load_friction(
+    samples: list[tuple[float, float, float]],
+    joint: Joint,
+    is_left: bool,
+    other_targets: dict[Joint, float],
+    k_fixed: float,
+    fv_fixed: float,
+) -> tuple[float, float, float] | None:
+    """Fit ``(Fc + Fl·|g(q)|)·tanh(0.1·k·v) + Fv·v`` to ``(q, v, tau_half)``.
+
+    ``k`` and ``Fv`` are held at the constant-model fit so the two fits differ
+    only in how the Coulomb level depends on gravity load. Returns
+    ``(Fc0, Fl, load_span)`` — the zero-load Coulomb level, its slope per Nm
+    of gravity torque, and how many Nm of load the sweep spanned. A sweep that
+    stayed within ~3 Nm of load cannot separate the two and returns ``None``.
+    """
+    if len(samples) < 8:
+        return None
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+    load = np.empty(len(samples))
+    for i, (q, _v, _t) in enumerate(samples):
+        arm_q[test_idx] = float(q)
+        load[i] = abs(float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx]))
+    span = float(np.ptp(load))
+    if span < 3.0:
+        return None
+    v = np.array([s[1] for s in samples])
+    tau = np.maximum(np.array([s[2] for s in samples]) - fv_fixed * v, 0.0)
+    sat = np.tanh(0.1 * k_fixed * v)
+    # Linear least squares in (Fc0, Fl): tau ≈ sat·Fc0 + (sat·load)·Fl.
+    A = np.c_[sat, sat * load]
+    coef, _, _, _ = np.linalg.lstsq(A, tau, rcond=None)
+    fc0, fl = float(coef[0]), float(coef[1])
+    return max(fc0, 0.0), max(fl, 0.0), span
+
+
+def sweep_load(
+    joint: Joint, is_left: bool, other_targets: dict[Joint, float]
+) -> "Callable[[float], float]":
+    """|gravity torque| on ``joint`` at angle ``q``, the rest of the arm at
+    the sweep pose."""
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+
+    def load(q: float) -> float:
+        arm_q[test_idx] = float(q)
+        return abs(float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx]))
+
+    return load
+
+
+def slow_windows(
+    lo: float, hi: float, speed: float, load: "Callable[[float], float]"
+) -> list[tuple[float, float]]:
+    """Sweep windows ``(start, end)`` for one slow-profile speed (rad/s).
+
+    Full range at or above ``_WINDOW_BELOW_DEG``; below it, two windows of
+    ``~_WINDOW_S`` of travel centred on the least- and most-loaded angles
+    (clamped into range), so the fit sees the load dependence at every speed
+    without a full-range pass taking minutes.
+    """
+    if math.degrees(speed) >= _WINDOW_BELOW_DEG:
+        return [(lo, hi)]
+    width = max(math.radians(_WINDOW_MIN_DEG), speed * _WINDOW_S)
+    if width >= 0.5 * (hi - lo):
+        return [(lo, hi)]
+    qs = np.linspace(lo, hi, 121)
+    loads = np.array([load(float(q)) for q in qs])
+    out = []
+    for centre in (float(qs[np.argmin(loads)]), float(qs[np.argmax(loads)])):
+        start = min(max(centre - 0.5 * width, lo), hi - width)
+        out.append((start, start + width))
+    if abs(out[0][0] - out[1][0]) < 0.5 * width:
+        # Load barely varies across the range: one window is the same data.
+        out = out[:1]
+    return out
+
+
+def slow_profile_seconds(
+    lo: float, hi: float, speeds: list[float], load: "Callable[[float], float]"
+) -> float:
+    """Rough duration of a slow-profile session (s): the sweeps plus a
+    few seconds of ramp and hold around each."""
+    total = 0.0
+    for v in speeds:
+        for a, b in slow_windows(lo, hi, v, load):
+            total += 2.0 * (b - a) / v + 6.0
+    return total
+
+
+async def _identify_slow(
+    motor: JointFrameMotor,
+    kp: float,
+    kd: float,
+    speeds: list[float],
+    lo: float,
+    hi: float,
+    load: "Callable[[float], float]",
+    joint: Joint,
+    is_left: bool,
+    raw_csv: Path | None,
+) -> dict[str, list]:
+    """Run the slow-profile passes; every cruise sample, labelled."""
+    rows: dict[str, list] = {
+        "speed": [],
+        "direction": [],
+        "q": [],
+        "tau": [],
+        "group": [],
+        "load": [],
+    }
+    raw_file = raw_writer = None
+    if raw_csv is not None:
+        raw_file = secure_open_new_text(raw_csv, newline="")
+        raw_writer = csv.writer(raw_file)
+        raw_writer.writerow(
+            [
+                "joint",
+                "side",
+                "pass",
+                "v_rad_s",
+                "direction",
+                "q_rad",
+                "tau_nm",
+                "load_nm",
+            ]
+        )
+        print(f"  Dumping every cruise sample to {raw_csv}")
+    group = 0
+    try:
+        for v in speeds:
+            for start, end in slow_windows(lo, hi, v, load):
+                print(
+                    f"\n  v = {math.degrees(v):.1f} deg/s over "
+                    f"[{math.degrees(start):.1f}, {math.degrees(end):.1f}]° "
+                    f"(load {load(start):.1f}-{load(end):.1f} Nm) ..."
+                )
+                cur = await motor.get_position()
+                await _ramp_to(
+                    motor, kp, kd, start, duration=abs(start - cur) / _RAMP_SPEED + 1.0
+                )
+                await asyncio.sleep(0.3)
+                fwd = await _run_sweep_raw(motor, kp, kd, start, +v, end)
+                cur = await motor.get_position()
+                await _ramp_to(motor, kp, kd, cur, duration=2.0)
+                bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, start)
+                print(f"    fwd {len(fwd)} / bwd {len(bwd)} samples")
+                for direction, samples in (("+", fwd), ("-", bwd)):
+                    for q, tau in samples:
+                        ld = load(q)
+                        rows["speed"].append(v)
+                        rows["direction"].append(direction)
+                        rows["q"].append(q)
+                        rows["tau"].append(tau)
+                        rows["group"].append(group)
+                        rows["load"].append(ld)
+                        if raw_writer is not None:
+                            raw_writer.writerow(
+                                [
+                                    joint.value,
+                                    "left" if is_left else "right",
+                                    group,
+                                    f"{v:.6f}",
+                                    direction,
+                                    f"{q:.6f}",
+                                    f"{tau:.6f}",
+                                    f"{ld:.4f}",
+                                ]
+                            )
+                if raw_file is not None:
+                    raw_file.flush()
+                group += 1
+                await asyncio.sleep(0.2)
+    finally:
+        if raw_file is not None:
+            raw_file.close()
+    return rows
+
+
+def fit_and_report(
+    rows: dict[str, "np.ndarray | list"],
+    joint: Joint,
+    is_left: bool,
+    other_targets: dict[Joint, float],
+) -> "FrictionFit | None":
+    """Fit the runtime friction law to slow-profile samples and print the
+    per-speed scorecard. ``fo`` comes from the averages against the URDF
+    gravity model at the sweep pose; rows carrying their own load (runs
+    whose other joints were elsewhere) contribute to the friction fit only."""
+    from ...tuning.friction_model import fit_friction, matched_samples, speed_table
+
+    from dataclasses import replace
+
+    load_fn = sweep_load(joint, is_left, other_targets)
+    loads = np.asarray(rows["load"], dtype=float)
+    qs = np.asarray(rows["q"], dtype=float)
+    # A row with a load that is not the sweep pose's (a tune.motion run, via
+    # scripts/runs_to_friction_csv.py) was taken elsewhere: it informs the
+    # friction curve but not fo. A slow-profile sweep records its own
+    # sweep-pose load, which matches.
+    own = np.isfinite(loads)
+    at_pose = own.copy()
+    if own.any():
+        check = np.where(own)[0]
+        ref_load = np.array([load_fn(float(q)) for q in qs[check]])
+        at_pose[check] = np.abs(ref_load - loads[check]) < 0.05
+    own = own & ~at_pose
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q[ARM_JOINTS.index(j)] = float(target)
+
+    def gravity_residual(s: "Sample") -> float:
+        arm_q[test_idx] = float(s.q)
+        return s.average - float(gc.gravity_arm(arm_q, is_left=is_left)[test_idx])
+
+    def pick(mask: np.ndarray, load: "Callable[[float], float] | np.ndarray") -> list:
+        if not mask.any():
+            return []
+        return matched_samples(
+            np.asarray(rows["speed"])[mask],
+            np.asarray(rows["direction"])[mask],
+            np.asarray(rows["q"])[mask],
+            np.asarray(rows["tau"])[mask],
+            load,
+            np.asarray(rows["group"])[mask],
+        )
+
+    # Sweep rows sit at the sweep pose (their gravity comes from the model
+    # and gives fo); rows with their own load came from elsewhere and only
+    # inform the friction curve.
+    sweep_samples = pick(~own, load_fn)
+    samples = sweep_samples + (pick(own, loads[own]) if own.any() else [])
+    try:
+        fit = fit_friction(samples)
+    except ValueError as exc:
+        print(f"  ! Slow-profile fit failed: {exc}")
+        return None
+    if sweep_samples:
+        fit = replace(
+            fit, fo=float(np.mean([gravity_residual(x) for x in sweep_samples]))
+        )
+    print("\n  Friction curve (runtime law), per sweep speed:")
+    print("    speed    bins   |g| Nm   measured   fit")
+    for r in speed_table(fit, samples):
+        print(
+            f"    {r['speed_deg_s']:5.1f}°/s {r['n']:5d}  {r['load_nm']:6.2f}   "
+            f"{r['measured_nm']:7.3f}   {r['fit_nm']:7.3f}"
+        )
+    print(
+        f"\n    sliding  fc = {fit.fc:.4f} Nm + fl = {fit.fl:.4f}·|g|   "
+        f"(k {fit.k:.0f}, fv {fit.fv:.4f} Nm·s/rad, fo {fit.fo:+.4f} Nm)"
+    )
+    print(
+        f"    low-speed excess dfs = {fit.dfs:.4f} Nm + ls = {fit.ls:.4f}·|g| "
+        f"over vs = {fit.vs:.4f} rad/s ({math.degrees(fit.vs):.1f}°/s)"
+    )
+    print(
+        f"    fit: {fit.n} bins over {fit.load_span:.1f} Nm of load, residual "
+        f"{fit.rms:.3f} Nm RMS (R² {fit.r2:.2f} — the rest is position-dependent "
+        "ripple, which the curve cannot hold)"
+    )
+    if fit.load_span < 3.0:
+        print("    (load terms pinned at 0: the data spans < 3 Nm of gravity load)")
+    return fit
+
+
+def _stribeck_gain(args: argparse.Namespace, joint: Joint) -> float:
+    if args.stribeck_gain is not None:
+        return float(args.stribeck_gain)
+    return DEFAULT_STRIBECK_GAIN.get(joint, 0.0)
+
+
+def save_slow_fit(fit: "FrictionFit", side: str, joint: Joint, gain: float) -> Path:
+    path = update_joint_calibration(
+        side,
+        joint.value,
+        friction=fit.friction_params(),
+        stribeck=fit.stribeck_params(gain),
+    )
+    print(f"\n  Saved friction + Stribeck (gain {gain:g}) to {path}")
+    return path
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -516,9 +983,37 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--velocities",
         type=float,
         nargs="+",
-        default=DEFAULT_VELOCITIES_DEG,
+        default=None,
         metavar="DEG_S",
-        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72)",
+        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72; "
+        "--profile slow: 1 2 3 5 8 15 30)",
+    )
+    p.add_argument(
+        "--profile",
+        choices=("standard", "slow"),
+        default="standard",
+        help="standard: full-range sweeps, Coulomb + viscous fit. slow: the "
+        "slow-motion calibration — 1-30°/s, the slow speeds in a low- and a "
+        "high-load window, fitted with the realtime core's own friction law "
+        "(sliding + load + Stribeck excess); --save stores all of it",
+    )
+    p.add_argument(
+        "--stribeck-gain",
+        type=float,
+        default=None,
+        help="Share of the fitted low-speed excess the runtime cancels, saved "
+        "with --profile slow (default 0.8 on shoulder_1 and the elbow, 0 "
+        "elsewhere: on shoulder_2/3 it made slow motion rougher)",
+    )
+    p.add_argument(
+        "--fit-csv",
+        type=Path,
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help="Fit the slow-profile model to saved --raw-csv files (or "
+        "scripts/runs_to_friction_csv.py output) instead of sweeping — no "
+        "motors touched; --save still applies",
     )
     p.add_argument(
         "--lo",
@@ -533,6 +1028,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=None,
         metavar="DEG",
         help="Override upper joint limit for the sweep (degrees)",
+    )
+    p.add_argument(
+        "--raw-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Write every cruise sample (q, tau, speed, direction) unbinned — "
+        "re-fit them later with --fit-csv",
+    )
+    p.add_argument(
+        "--bins",
+        type=int,
+        default=_N_BINS,
+        help=f"Position bins the fwd/bwd matching and fit use (default: {_N_BINS})",
     )
     p.add_argument(
         "--dump-csv",
@@ -590,7 +1099,26 @@ async def _run(args: argparse.Namespace) -> None:
                 label="friction CSV output",
             )
 
+    if args.velocities is None:
+        args.velocities = (
+            SLOW_VELOCITIES_DEG if args.profile == "slow" else DEFAULT_VELOCITIES_DEG
+        )
     velocities_rad = [math.radians(v) for v in args.velocities]
+
+    if args.fit_csv:
+        from ...tuning.friction_model import read_raw_csv
+
+        other_targets, _, _, _ = sweep_safety(joint, is_left)
+        data = read_raw_csv(args.fit_csv)
+        if str(data["joint"]) not in ("", joint.value):
+            raise SystemExit(f"--fit-csv holds {data['joint']}, not {joint.value}")
+        print(f"\nFitting {side_str} {joint.value} from {len(data['q'])} saved samples")
+        fit = fit_and_report(data, joint, is_left, other_targets)
+        if fit is not None and args.save:
+            save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
+        elif fit is not None:
+            print("\n  (re-run with --save to persist)")
+        return
 
     print(f"\nAxol friction identification — {side_str} {joint.value}")
     print(f"  Velocity sweep: {[round(v, 1) for v in args.velocities]} deg/s")
@@ -635,6 +1163,43 @@ async def _run(args: argparse.Namespace) -> None:
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
 
+            if args.profile == "slow":
+                lo, hi = arm_limits(joint, is_left)
+                lo = (
+                    math.radians(args.lo)
+                    if args.lo is not None
+                    else (lo_default if lo_default is not None else lo)
+                )
+                hi = (
+                    math.radians(args.hi)
+                    if args.hi is not None
+                    else (hi_default if hi_default is not None else hi)
+                )
+                lo, hi = lo + _SWEEP_MARGIN, hi - _SWEEP_MARGIN
+                load_fn = sweep_load(joint, is_left, other_targets)
+                print(
+                    f"  Slow profile: {len(velocities_rad)} speeds, about "
+                    f"{slow_profile_seconds(lo, hi, velocities_rad, load_fn) / 60:.0f} min"
+                )
+                rows = await _identify_slow(
+                    motors[joint],
+                    kp,
+                    kd,
+                    velocities_rad,
+                    lo,
+                    hi,
+                    load_fn,
+                    joint,
+                    is_left,
+                    args.raw_csv,
+                )
+                fit = fit_and_report(rows, joint, is_left, other_targets)
+                if fit is not None and args.save:
+                    save_slow_fit(fit, side_str, joint, _stribeck_gain(args, joint))
+                elif fit is not None:
+                    print("\n  (re-run with --save to persist)")
+                return
+
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
                 joint,
@@ -649,6 +1214,8 @@ async def _run(args: argparse.Namespace) -> None:
                 if args.hi is not None
                 else hi_default,
                 dump_csv=dump_csv,
+                raw_csv=args.raw_csv,
+                n_bins=args.bins,
             )
 
             if not avg_samples and not halfdiff_samples:
@@ -667,12 +1234,37 @@ async def _run(args: argparse.Namespace) -> None:
             Fo_out = Fo_result if Fo_result is not None else 0.0
             Fc_out = k_out = Fv_out = 0.0
 
+            Fl_out = 0.0
             if friction_result is not None:
                 Fc_out, k_out, Fv_out = friction_result
                 print("\n  Fitted friction model: τ = Fc·tanh(0.1·k·v) + Fv·v + Fo")
                 print(f"    Fc = {Fc_out:.4f} Nm  (Coulomb)")
                 print(f"    k  = {k_out:.2f}      (tanh steepness)")
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
+                load_fit = _fit_load_friction(
+                    getattr(_identify_joint, "last_halfdiff_q", []),
+                    joint,
+                    is_left,
+                    other_targets,
+                    k_out,
+                    Fv_out,
+                )
+                if load_fit is not None:
+                    fc0, fl, span = load_fit
+                    print(
+                        f"\n  Load-dependent Coulomb (gear friction grows with the torque it carries),\n"
+                        f"  fitted over {span:.1f} Nm of gravity-load variation:\n"
+                        f"    Fc0 = {fc0:.4f} Nm at zero load, Fl = {fl:.4f} Nm per Nm of gravity\n"
+                        f"    → {fc0 + fl * 5:.2f} Nm at 5 Nm, {fc0 + fl * 12:.2f} Nm at 12 Nm "
+                        f"(constant model: {Fc_out:.2f} everywhere)"
+                    )
+                    if fl > 0.0:
+                        Fc_out, Fl_out = fc0, fl
+                else:
+                    print(
+                        "\n  (load-dependent Coulomb not fitted: the sweep spanned < 3 Nm of "
+                        "gravity load — pose the joint under load, e.g. --lo/--hi, to fit fl)"
+                    )
 
             if friction_result is not None or Fo_result is not None:
                 if args.save and friction_result is None:
@@ -693,6 +1285,7 @@ async def _run(args: argparse.Namespace) -> None:
                             "k": round(k_out, 2),
                             "fv": round(Fv_out, 4),
                             "fo": round(Fo_out, 4),
+                            "fl": round(Fl_out, 4),
                         },
                     )
                     print(f"\n  Saved to {path}")
@@ -707,7 +1300,7 @@ async def _run(args: argparse.Namespace) -> None:
                     )
                     print(
                         f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
-                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
+                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}, fl={Fl_out:.4f}),"
                     )
 
             print(f"{'─' * 50}")
@@ -731,9 +1324,6 @@ async def _run(args: argparse.Namespace) -> None:
                 # including the base-collision joints the old flow used to
                 # leave in place.
                 await _home_all(motors, exclude=joint if in_impedance else None)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            await _safe_torque_off(motors)

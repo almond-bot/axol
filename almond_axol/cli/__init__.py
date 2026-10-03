@@ -38,9 +38,11 @@ from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
 from .tune import factory as tune_factory
 from .tune import filter as tune_filter
-from .tune import friction, pid, repeatability
+from .tune import a4 as tune_a4
+from .tune import breakaway, friction, pid, repeatability
 from .tune import gravity as tune_gravity
 from .tune import motion as tune_motion
+from .tune import tf as tune_tf
 from .zed import driver as zed_driver
 from .zed import install as zed_install
 
@@ -169,11 +171,14 @@ def build_parser() -> argparse.ArgumentParser:
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
+    breakaway.add_parser(subparsers)
+    tune_a4.add_parser(subparsers)
     tune_gravity.add_parser(subparsers)
     tune_factory.add_parser(subparsers)
     calibration_cmd.add_parser(subparsers)
     repeatability.add_parser(subparsers)
     tune_motion.add_parser(subparsers)
+    tune_tf.add_parser(subparsers)
     tune_filter.add_parser(subparsers)
     motion_add_parser(subparsers)
     migrate_dataset_cmd.add_parser(subparsers)

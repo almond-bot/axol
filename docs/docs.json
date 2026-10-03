@@ -107,6 +107,7 @@
             ]
           },
           "guides/diagnostics-dashboard",
+          "guides/robot-calibration",
           "guides/vr-interface",
           "guides/quest-over-usb",
           "guides/quest-headless"
@@ -203,9 +204,12 @@
                 "pages": [
                   "cli/tune-pid",
                   "cli/tune-friction",
+                  "cli/tune-breakaway",
+                  "cli/tune-a4",
                   "cli/tune-gravity",
                   "cli/tune-factory",
                   "cli/tune-motion",
+                  "cli/tune-tf",
                   "cli/tune-filter",
                   "cli/motion-build",
                   "cli/tune-repeatability"

@@ -114,7 +114,11 @@ def probe_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, flo
 # Three joints hang axis-vertical and need other joints posed to tilt them.
 # Clearances below were verified against the torso collision model; signal
 # figures are the CAD gravity model's torque variation over the sweep.
-SHOULDER_1_LOAD = math.radians(90.0)  # humerus horizontal for shoulder_3
+# Humerus horizontal for shoulder_3 — a *left-arm* joint-frame value. The
+# shoulder_1 frame is mirrored across arms (left −90..+180, right −180..+90),
+# so the right arm's copy of this pose is −90°: +90° there is the hard stop,
+# and an unmirrored raise drove right shoulder_1 into it (2026-09-22).
+SHOULDER_1_LOAD = math.radians(90.0)
 WRIST_2_LOAD = math.radians(85.0)  # hand off wrist_1's axis (85°: limit is 90)
 WRIST_1_LOAD = math.radians(90.0)  # hand off wrist_2's axis
 # shoulder_3 / wrist_1 sweep cap at their loaded poses: ±90° keeps the bent
@@ -185,13 +189,15 @@ def sweep_safety(
             "the base is inboard."
         )
     elif joint == Joint.SHOULDER_3:
-        clearance[Joint.SHOULDER_1] = SHOULDER_1_LOAD
+        s1_load = SHOULDER_1_LOAD if is_left else -SHOULDER_1_LOAD
+        clearance[Joint.SHOULDER_1] = s1_load
         clearance[Joint.ELBOW] = elbow_mid
         lo_cap, hi_cap = -LOADED_SWEEP_CAP, LOADED_SWEEP_CAP
         notes.append(
-            "Raising shoulder_1 to 90° and bending the elbow so gravity "
-            "loads shoulder_3 (its axis is vertical at rest — zero gravity "
-            "moment there); sweep capped at ±90° to stay clear of the torso."
+            f"Raising shoulder_1 to {math.degrees(s1_load):+.0f}° and bending the "
+            "elbow so gravity loads shoulder_3 (its axis is vertical at rest — "
+            "zero gravity moment there); sweep capped at ±90° to stay clear of "
+            "the torso."
         )
     elif joint == Joint.WRIST_1:
         clearance[Joint.ELBOW] = elbow_mid
