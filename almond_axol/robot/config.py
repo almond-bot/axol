@@ -433,6 +433,11 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
         # Fitted by ``axol tune.gravity --save``; already per-side (measured
         # on this arm), so it replaces the mirrored CAD value as-is.
         overrides["com"] = tuple(com)
+    mass = entry.get("mass")
+    if mass is not None:
+        # The link mass the CoM was fitted against (custom end-effectors
+        # change wrist_3's); mass is not mirrored, so it applies as-is.
+        overrides["mass"] = mass
     return replace(jc, **overrides) if overrides else jc
 
 

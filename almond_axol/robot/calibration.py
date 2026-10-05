@@ -21,6 +21,7 @@ File shape (every level optional)::
           "kd": 3.0,
           "j_eff": 0.0,
           "friction": {"fc": 0.68, "k": 801.3, "fv": 0.87, "fo": -0.25},
+          "mass": 0.25,
           "com": [-0.0251, 0.0, -0.0712],
           "updated_at": "2026-08-16T01:00:00Z"
         }
@@ -34,6 +35,13 @@ tune.gravity --save``. It overrides the CAD value in the gravity model, which
 is what fixes the static droop a few-percent mass/CoM error causes under
 load (parked error = unmodeled torque / kp).
 
+``mass`` is the mass (kg) of that same link, overriding the coded
+``JointConfig.mass``. It is recorded alongside every fitted ``com`` (the
+fit is only meaningful paired with the mass it was made against) and is how
+a custom end-effector's weight travels with the robot: ``wrist_3``'s mass
+includes the gripper, so ``axol tune.factory --mass wrist_3=<kg>`` writes
+it here and into the cloud copy every later machine pulls.
+
 ``kp`` / ``kd`` are the tuned gains — the top of the stiffness blend
 (``s=1.0``, the production default) — exactly like the :class:`JointConfig`
 defaults they replace.
@@ -46,6 +54,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,6 +193,18 @@ def load_calibration(
                         )
                         value /= 10.0
                     clean[field] = value
+            if "mass" in entry:
+                mass = _coerce_float(entry.get("mass"))
+                if mass is not None and math.isfinite(mass) and mass > 0.0:
+                    clean["mass"] = mass
+                else:
+                    _logger.warning(
+                        "Calibration for %s %s has an invalid mass %r (need a "
+                        "positive number of kg); ignoring it.",
+                        side,
+                        joint,
+                        entry.get("mass"),
+                    )
             com = entry.get("com")
             if isinstance(com, (list, tuple)) and len(com) == 3:
                 com_clean = [_coerce_float(v) for v in com]
@@ -264,6 +285,7 @@ def update_joint_calibration(
     kd_host_q: float | None = None,
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
+    mass: float | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -272,7 +294,8 @@ def update_joint_calibration(
     Only the provided fields are touched — saving PID gains or its host
     damping band does not clobber a previously saved friction fit, and vice
     versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
-    ``com`` is the link's fitted centre of mass (metres, URDF link frame).
+    ``com`` is the link's fitted centre of mass (metres, URDF link frame)
+    and ``mass`` its mass (kg, must be positive).
     The document is scoped to ``hub_serial`` (auto-detected when omitted) and
     stale data for another robot is never merged into it. If an existing file
     is unscoped or belongs to another robot, it is preserved in a numbered
@@ -285,6 +308,8 @@ def update_joint_calibration(
         missing = [f for f in _FRICTION_FIELDS if f not in friction]
         if missing:
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
+    if mass is not None and not (math.isfinite(mass) and mass > 0.0):
+        raise ValueError(f"mass must be a positive number of kg, got {mass!r}")
 
     if hub_serial is None:
         hub_serial = current_hub_serial()
@@ -360,6 +385,8 @@ def update_joint_calibration(
         if len(com) != 3:
             raise ValueError(f"com must have 3 components, got {len(com)}")
         entry["com"] = [float(v) for v in com]
+    if mass is not None:
+        entry["mass"] = float(mass)
     entry["updated_at"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )

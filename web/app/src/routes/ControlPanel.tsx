@@ -1476,8 +1476,11 @@ export default function ControlPanel() {
   useEffect(() => {
     if (conn.state !== "ok" || !updating) return
     const target = update?.remoteVersion ?? null
-    // Upgrade + provision + a possible host reboot (a new camera driver).
-    const deadline = Date.now() + 10 * 60_000
+    // The server bounds its own upgrade + provision steps and reports a
+    // timeout as an error, so only an unreachable server is given up on: the
+    // window restarts on every answer and covers a restart or host reboot.
+    const unreachableLimitMs = 10 * 60_000
+    let deadline = Date.now() + unreachableLimitMs
     let active = true
     const t = setInterval(async () => {
       if (Date.now() > deadline) {
@@ -1488,13 +1491,14 @@ export default function ControlPanel() {
           setUpdateAbandoned(true)
           setStartingUpdate(false)
           setUpdatePhase(null)
-          toast.error("Update is taking longer than expected. Reload to retry.")
+          toast.error("The robot has not come back from the update. Reload to retry.")
         }
         return
       }
       try {
         const u = await fetchUpdateStatus()
         if (!active) return
+        deadline = Date.now() + unreachableLimitMs
         setUpdate(u)
         // Real server state is known now — drop the optimistic bridge so a
         // failed status fetch in handleUpdate can't wedge `updating` on.
@@ -1520,6 +1524,19 @@ export default function ControlPanel() {
       clearInterval(t)
     }
   }, [conn.state, updating, update?.remoteVersion, toast])
+
+  // Optional provisioning steps that failed (Lighthouse tracking, camera
+  // plugins): the robot runs without them, so warn once per backend run and
+  // message rather than blocking anything or repeating on every poll.
+  const shownUpdateWarningsRef = useRef(new Set<string>())
+  const updateWarning = update?.warning ?? null
+  useEffect(() => {
+    if (conn.state !== "ok" || !updateWarning) return
+    const key = `${connectionGeneration}:${canServerInstanceId ?? ""}:${updateWarning}`
+    if (shownUpdateWarningsRef.current.has(key)) return
+    shownUpdateWarningsRef.current.add(key)
+    toast.warning(updateWarning)
+  }, [canServerInstanceId, conn.state, connectionGeneration, toast, updateWarning])
 
   const spec = useMemo(() => commands.find((c) => c.id === opId) ?? null, [commands, opId])
 
@@ -1770,6 +1787,7 @@ export default function ControlPanel() {
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
           opRunning={hostBusy}
+          hostInstalling={update?.installing ?? false}
           robot={robot}
           robotBusy={robotBusy}
           canProfiles={canProfiles}
@@ -1794,8 +1812,8 @@ export default function ControlPanel() {
             <p className="min-w-0 flex-1 text-xs text-amber-100/80">
               {canDiscovery?.message ??
                 "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
-              Power the hardware, then retry identification. An idle robot link may disconnect
-              briefly while it is probed.
+              Power the hardware, then connect it or retry identification. An idle robot link may
+              disconnect briefly while it is probed.
             </p>
             <Button
               variant="outline"

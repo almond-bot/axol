@@ -7,7 +7,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
 - [`tracker.install`](/cli/tracker) — a pinned **libsurvive** build and Vive USB permissions for Mantis Lighthouse tracking.
-- [`zed.driver`](/cli/zed-driver) — replaces a ZED Box's outdated factory **GMSL camera driver** (`stereolabs-zedbox-duo` on the Duo, `stereolabs-zedbox-mini` on the Mini) with the release pinned for the ZED SDK. Takes effect at boot, so provisioning ends in a reboot (see below). A no-op off a factory-flashed ZED Box; warns about a Stereolabs driver package it has no pin for.
+- [`zed.driver`](/cli/zed-driver) — replaces a ZED Box's outdated factory **GMSL camera driver** (`stereolabs-zedbox-duo` on the Duo, `stereolabs-zedbox-mini` on the Mini, `stereolabs-zedlink-duo` for a ZED Link Duo card on a Jetson AGX Orin) with the release pinned for the ZED SDK. Takes effect at boot, so provisioning ends in a reboot (see below). A no-op on a host with no Stereolabs driver package installed; warns about a Stereolabs driver package it has no pin for.
 - **board IMU** (`gyro.install`) — grants the `imu` group access to the carrier board's BMI088 sampling timer, [Jelly](/guides/vr-interface#jelly)'s heading-hold yaw reference, so teleop can start it without root. Self-gates on the board driver's presence.
 - **CAN e-stop purge grant** — writes `/etc/sudoers.d/50-axol-can-purge` so a manual `axol serve` / `axol teleop` can flap a CAN interface without a password when motor power dies. The realtime core purges the interface's queued position commands the moment it declares the bus stalled; without this grant that escalation fails on a non-root session, the frames survive, and the arm jerks to its pre-e-stop command on the next bring-up (see [`can.setup`](/cli/can-setup)). The rule covers only the root-owned bring-up script and the named CAN interfaces, and is checked with `visudo` before it is installed. Takes effect immediately.
 - **real-time scheduling grant** — writes `/etc/security/limits.d/50-axol-rtprio.conf` so your login can run the control loop and the camera relay's capture chain `SCHED_FIFO` from a manual `axol serve` / `axol teleop` (the systemd unit already has `LimitRTPRIO`). Login shells otherwise start with an `rtprio` limit of zero, and then:
@@ -45,6 +45,21 @@ non-zero if [`rt.install`](/cli/rt-install) fails. The hosted installer and the
 capability-setup failure aborts installation or blocks the restart onto updated
 code. Both still share this single provisioning path, keeping their steps in
 lockstep.
+
+When only optional steps fail (Lighthouse tracking, the patched zed-gstreamer
+plugins, adb, ...), the last line names them (`Optional provisioning steps
+failed: ...`) and the command exits `3`. The installer then finishes with a
+warning instead of aborting. A provision run by `axol serve` exits `0` in that
+case, so an update still restarts onto the new release, and the control panel
+shows the missing steps as a warning. A failed `rt.install` exits `1`.
+
+Every `apt-get` / `dpkg` run is protected from interruption: it never times
+out, and it runs in its own session and systemd scope, so a stopped or
+restarted `axol.service` or a timed-out update leaves it to finish. A package
+manager killed partway leaves dpkg half-configured, and every later install on
+the host then fails. When apt fails, the log names the package dpkg could not
+process. Repair it with `sudo dpkg --configure -a`, then re-run `axol
+provision`.
 
 Provisioning holds the host-wide update lock, which is root-only. Run from a terminal as a regular user, the steps still execute as that user (their `uv`, download caches, and Python environment) and only a small lock-holder process escalates via `sudo` (one password prompt, shared with the steps that need root). Without a usable `sudo` the command exits with a message instead of a traceback.
 

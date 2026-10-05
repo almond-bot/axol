@@ -204,14 +204,35 @@ def _base_collision_safe_step(
     negative floor is valid for conservative capsules that overlap at the
     physically safe home pose. Both the proposed step and any clearance
     correction are scaled along their full joint-space direction to stay
-    within the per-call delta budget and the robot's joint limits.
+    within the per-call delta budget and the robot's joint limits, after
+    dropping any component that pushes a joint already on its limit outward.
     """
 
     guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
+    limit_tol = jnp.array(1e-5, dtype=q_from.dtype)
 
     def bound_step(q_candidate: jax.Array) -> jax.Array:
-        """Shorten a step without changing its joint-space direction."""
+        """Project outward boundary directions, then shorten the step."""
         delta = q_candidate - q_from
+
+        # A solver proposal can point outside a joint limit when q_from is
+        # on that boundary. Remove only that infeasible component so it
+        # cannot make the global limit scale zero for every other joint.
+        # "On" is within a tolerance: a step scaled to reach a limit lands a
+        # rounding error short of it (float32 ulp is ~2.4e-7 near pi), and an
+        # exact comparison would leave that sliver of room driving the scale.
+        outward = jnp.logical_or(
+            jnp.logical_and(
+                q_from - robot.joints.lower_limits <= limit_tol,
+                delta < 0.0,
+            ),
+            jnp.logical_and(
+                robot.joints.upper_limits - q_from <= limit_tol,
+                delta > 0.0,
+            ),
+        )
+        delta = jnp.where(outward, 0.0, delta)
+
         # ``max_joint_delta`` is per joint (whole-body IK's base and lift have
         # their own budgets); with one uniform budget this is exactly
         # budget / max|delta|.
@@ -222,17 +243,6 @@ def _base_collision_safe_step(
             ),
         )
         delta = delta * rate_scale
-
-        # A joint already on a limit and pushed further out contributes no
-        # room at all, which would zero the whole step below and freeze every
-        # joint: drop just that component. (Whole-body IK starts with the lift
-        # on its fully-raised limit, where this froze the solve outright.)
-        pinned = jnp.where(
-            delta > 0.0,
-            q_from >= robot.joints.upper_limits,
-            q_from <= robot.joints.lower_limits,
-        )
-        delta = jnp.where(pinned, 0.0, delta)
 
         # Find the largest scalar that keeps every component inside its hard
         # joint interval. Scaling the whole vector preserves the tangent

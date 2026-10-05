@@ -88,7 +88,7 @@ Mantis episodes are standard LeRobot datasets with the same schema a robot-colle
     Plug the USB cable from the Mantis Hub into the ZED Box (this is how the host communicates with the grippers) and power both rigs. The host discovers the hub alongside the Axol Hub: it works out which side is which rig, assigns the persistent left/right interface names, and installs a udev rule and hotplug unit so a replug brings the interfaces back up on its own.
   </Step>
   <Step title="Let the control panel identify it">
-    Open the [control panel](/guides/control-panel#connections) and connect the **Axol Host**. When the panel comes online it inventories the host's CAN interfaces; a new hub that still shows as anonymous `can0` / `can1` is identified automatically as long as the rigs are powered. If the probe cannot prove the role (unpowered rig, ambiguous hub), power the hardware and press **Retry CAN identification**, or run [`axol can.setup`](/cli/can-setup) in a terminal as the interactive fallback.
+    Open the [control panel](/guides/control-panel#connections) and connect the **Axol Host**. When the panel comes online it inventories the host's CAN interfaces; a new hub that still shows as anonymous `can0` / `can1` is identified automatically as long as the rigs are powered. If the probe cannot prove the role (unpowered rig, ambiguous hub), power the hardware and press **Connect** or **Retry CAN identification**, or run [`axol can.setup`](/cli/can-setup) in a terminal as the interactive fallback.
   </Step>
 </Steps>
 

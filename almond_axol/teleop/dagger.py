@@ -104,6 +104,12 @@ class DaggerTeleopCore(VRTeleopCore):
         # Worker pipe + robot-position source, attached at connect time.
         self._conn: multiprocessing.connection.Connection | None = None
         self._get_positions: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
+        # Opt-in generic remote DAgger: each grip is a dead-man control.
+        # Keep the original local collector's toggle behavior by default.
+        self.hold_to_intervene = False
+        self.l_lock_raw = False
+        self.r_lock_raw = False
+        self._hold_inhibited = False
 
     def attach(
         self,
@@ -147,10 +153,65 @@ class DaggerTeleopCore(VRTeleopCore):
 
     def force_disengage(self) -> None:
         """Disable teleop (e.g. when an episode ends mid-intervention)."""
+        if self.hold_to_intervene:
+            self._disengage_all()
+            return
         if self.teleop_enabled:
             self._set_engaged(False)
             self._logger.info("Teleop force-disengaged.")
             self._broadcast(False)
+
+    def _disengage_all(self, log_message: str | None = None) -> None:
+        super()._disengage_all(log_message)
+        if self.hold_to_intervene:
+            # A stale link or contact stop cannot re-engage from held grips.
+            # Preserve raw grips so the arbiter retains human ownership until
+            # an explicit release arrives, instead of resuming the policy.
+            self._hold_inhibited = True
+
+    def _update_hold_engage(self, frame: object) -> None:
+        self.l_lock_raw = bool(frame.l_lock)
+        self.r_lock_raw = bool(frame.r_lock)
+        either = self.l_lock_raw or self.r_lock_raw
+        was_enabled = self.teleop_enabled
+        if not either:
+            self._hold_inhibited = False
+        if (
+            not self.intervention_allowed.is_set()
+            or self.is_resetting
+            or self._ik_paused
+        ):
+            self._hold_inhibited = either
+            self._set_engaged(False)
+        elif self._hold_inhibited:
+            self._set_engaged(False)
+        else:
+            if either and not was_enabled:
+                try:
+                    self._sync_to_robot()
+                except Exception:
+                    self._hold_inhibited = True
+                    self._set_engaged(False)
+                    self._logger.exception(
+                        "Robot-pose sync failed; release grips before retrying teleop."
+                    )
+                    return
+            self.left_enabled = self.l_lock_raw
+            self.right_enabled = self.r_lock_raw
+        enabled = self.teleop_enabled
+        if enabled and not was_enabled:
+            self.smooth_left.max_vel = self.config.engage_max_vel
+            self.smooth_right.max_vel = self.config.engage_max_vel
+            self._engage_time = time.perf_counter()
+            self._at_rest = False
+            self._broadcast(True)
+        elif was_enabled and not enabled:
+            self._engage_time = None
+            self._broadcast(False)
+        if self.left_enabled:
+            self.l_grip = frame.l_grip
+        if self.right_enabled:
+            self.r_grip = frame.r_grip
 
     # -- Disabled base behaviours --------------------------------------------
 
@@ -204,6 +265,9 @@ class DaggerTeleopCore(VRTeleopCore):
         disengage together and the worker's per-arm freeze is never
         exercised.
         """
+        if self.hold_to_intervene:
+            self._update_hold_engage(frame)
+            return
         both = frame.l_lock and frame.r_lock
         either = frame.l_lock or frame.r_lock
         allowed = self.intervention_allowed.is_set()

@@ -109,6 +109,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "inference_server",
         "Serve policy inference for run-policy --server_host.",
     ),
+    "policy.check": (
+        "policy_check",
+        "Exercise a custom policy endpoint without a robot.",
+    ),
 }
 
 

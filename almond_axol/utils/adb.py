@@ -27,6 +27,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .packages import run_package_manager
 from .ports import CONTROL_PORT, VR_PORT
 from .rtprio import operator_user
 from .sudo import prime_sudo, run_root
@@ -149,9 +150,11 @@ def install() -> None:
         # `update` refreshes a stale/empty package index (best-effort, like the
         # GStreamer step); `install` is checked so a failure doesn't fall
         # through to claiming success with adb still missing.
-        run_root(["apt-get", "update"])
+        run_package_manager(["apt-get", "update"])
         try:
-            run_root(["apt-get", "install", "-y", *_APT_PACKAGES], check=True)
+            run_package_manager(
+                ["apt-get", "install", "-y", *_APT_PACKAGES], check=True
+            )
         except RuntimeError as exc:
             _logger.warning(
                 "adb install failed (%s); Quest-over-USB unavailable. "

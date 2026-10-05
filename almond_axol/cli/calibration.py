@@ -2,7 +2,8 @@
 axol calibration.pull
 
 Fetch this robot's factory calibration (friction + gravity, all joints —
-written by ``axol tune.factory``) from the cloud and cache it locally.
+including link masses, so a custom gripper's weight comes along — written by
+``axol tune.factory``) from the cloud and cache it locally.
 
 The robot is identified by its Axol hub adapter's USB serial — the hub
 travels with the arms, so the calibration follows the robot across compute
@@ -62,7 +63,9 @@ def _summarize(document: dict[str, Any]) -> None:
             if not isinstance(entry, dict):
                 continue
             tags = [
-                t for t, k in (("friction", "friction"), ("com", "com")) if k in entry
+                t
+                for t, k in (("friction", "friction"), ("mass", "mass"), ("com", "com"))
+                if k in entry
             ]
             parts.append(f"{j.value} ({'+'.join(tags)})" if tags else j.value)
         print(f"  {side}: {', '.join(parts) if parts else '(no data)'}")

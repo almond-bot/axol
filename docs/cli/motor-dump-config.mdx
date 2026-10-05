@@ -15,7 +15,7 @@ Reads every configuration parameter from one motor (or all motors on the bus whe
 | `--out FILE` | Write a JSON snapshot for `motor.restore-config` |
 | `--raw` | Sweep raw parameter indices instead of the known table, to surface indices not yet named (MyActuator only — Damiao's register table is complete) |
 
-Each parameter is printed with its value, unit, and an access tag: `(read-only)` for values the motor reports but won't accept (firmware versions, measured winding constants) and `(protected)` for factory calibration, CAN IDs, and baud rate. A `--raw` snapshot cannot be restored — its keys are bare indices with no known meaning — so it's for identification only.
+Each parameter is printed with its value, unit, and an access tag: `(read-only)` for values the motor reports but won't accept (firmware versions, measured winding constants) and `(protected)` for factory calibration and identity, CAN IDs, and baud rate. MyActuator parameters the motor's firmware doesn't implement (the `0x46`–`0x4A` group, which only `2026042402` firmware has) are left out of the dump rather than reported with junk values. A `--raw` snapshot cannot be restored — its keys are bare indices with no known meaning — so it's for identification only.
 
 ```bash
 axol motor.dump-config --l --id 0x01              # one motor

@@ -78,7 +78,7 @@ Both motor families expose a named configuration table — MyActuator's `0xC0` p
 | `get_can_timeout()` / `set_can_timeout(milliseconds)` | Loss-of-comms alarm time (ms); Damiao only |
 
 <Note>
-  MyActuator motors apply a low undervoltage threshold on `enable()` so a brief bus-voltage sag can't latch the level-2 undervoltage fault. Read-only parameters are never written, and protected ones (factory calibration, CAN IDs, baud rate) are skipped by a restore unless you opt in, since rewriting them can leave a motor unable to commutate or unreachable on the bus.
+  MyActuator motors apply a low undervoltage threshold (`LOW_VOLTAGE`, -2 V) on `enable()` so a brief bus-voltage sag can't latch the level-2 undervoltage fault. Parameters whose `ParamSpec.min_firmware` is newer than the motor's firmware are left out of dumps and restores, and `read_config` / `write_config` raise `MotorError` for them. Read-only parameters are never written, and protected ones (factory calibration and identity, CAN IDs, baud rate) are skipped by a restore unless you opt in, since rewriting them can leave a motor unable to commutate or unreachable on the bus.
 </Note>
 
 ## `ControlMode` values

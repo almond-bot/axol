@@ -272,6 +272,54 @@ class IKWorker:
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
+
+        # Absolute (Mantis) mode state: the world-anchored base transform solved
+        # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
+        # raw VR world frame — plus each controller's rigid controller→TCP
+        # offset ``(p_off, R_off)`` expressed in the controller's local frame.
+        # ``_abs_active`` is the whole-session engage toggle (absolute mode
+        # has no per-arm freeze — both grips engage, both release). Seeded
+        # here, not only in reset(): the first VR frame can arrive before any
+        # reset or engage, and the absolute-mode reply reads this state.
+        self._abs_active: bool = False
+        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
+        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Tracker→gripper transforms (the rig's factory design constants, or
+        # per-unit file overrides — see almond_axol.mantis.calibration), per
+        # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
+        # When present for a side, engage uses it verbatim instead of
+        # absorbing the mount offset into the engage snapshot.
+        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, tf in (
+            ("left", config.tcp_transform_left),
+            ("right", config.tcp_transform_right),
+        ):
+            if tf is not None:
+                self._tcp_transforms[side] = (
+                    np.asarray(tf[:3], dtype=np.float64),
+                    _quat_xyzw_to_matrix(*tf[3:]).astype(np.float64),
+                )
+        # Quaternion sign continuity for the calibrated pose mapping (see
+        # :meth:`_apply_tcp_transform`).
+        self._last_mapped_quat: dict[str, np.ndarray] = {}
+        if self._tcp_transforms and config.absolute_mode:
+            _logger.info(
+                "absolute mode: using calibrated tracker→gripper transforms for %s",
+                sorted(self._tcp_transforms),
+            )
+        # JSON-safe copy of the base transform for the headset (VR world
+        # coords), so the web client can render the URDF at the engage-
+        # calibrated base. ``None`` until the first engage.
+        self.abs_base_msg: dict[str, list[float]] | None = None
+        # Latest absolute-mode TCP target per side, in the robot base frame:
+        # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
+        # tracked ground-truth pose the IK solver chases — Mantis data collection
+        # records it per row so training can use raw TCP trajectories instead
+        # of (or alongside) the IK joint solutions. Holds the last engaged
+        # target while disengaged (mirroring the latched virtual joints);
+        # seeded from rest FK so it is never ``None`` in absolute mode.
+        self.last_tcp_msg: dict[str, list[float]] | None = None
+
         # Tracking glitch detection state (see _frame_snap_verdict): last good
         # raw controller positions, their (effective) timestamp, an EMA
         # velocity per hand, and the in-progress suspect window, if any.
@@ -1443,6 +1491,8 @@ def run_ik_worker(
 
     - ``VRFrame``                      → ``q`` (one solve step)
     - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
+      an explicit joint target for the second (zero) leg of a guarded park.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -1528,10 +1578,24 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                # Reset returns the arms to rest; whole-body IK's base and
-                # lift stay where they are rather than driving back to where
-                # the session started.
-                q_target = q_rest.copy()
+                q_target = (
+                    np.asarray(msg[2], dtype=np.float32)
+                    if len(msg) == 3
+                    else q_rest.copy()
+                )
+                if (
+                    len(msg) not in (2, 3)
+                    or q_current.shape != q_rest.shape
+                    or q_target.shape != q_rest.shape
+                    or not np.isfinite(q_current).all()
+                    or not np.isfinite(q_target).all()
+                ):
+                    raise ValueError(
+                        "reset requires finite current/target joint vectors"
+                    )
+                # A reset moves only the arms; whole-body IK's base and lift
+                # stay where they are rather than driving back to where the
+                # session started.
                 n_arm = len(worker.left_indices) + len(worker.right_indices)
                 q_target[n_arm:] = q_current[n_arm:]
                 traj = worker.compute_reset_trajectory(q_current, q_target)

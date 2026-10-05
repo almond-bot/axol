@@ -88,6 +88,66 @@ _ENCODED_ROW_TIMEOUT_S = 1.0
 _ENCODED_POLL_MS = 100
 
 
+class _CaptureGate(threading.Event):
+    """An episode gate whose transitions fence committed rows exactly.
+
+    Sensor reads and row preparation never hold ``commit_lock``. A pause
+    waits only for a row already inside ``add_frame`` to finish; work acquired
+    before a pause cannot commit after it, even if capture resumed meanwhile.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.commit_lock = threading.RLock()
+        self.epoch = 0
+        self.opened_at = float("-inf")
+
+    def set(self) -> None:
+        with self.commit_lock:
+            if not self.is_set():
+                self.epoch += 1
+                self.opened_at = time.perf_counter()
+            super().set()
+
+    def clear(self) -> None:
+        with self.commit_lock:
+            if self.is_set():
+                self.epoch += 1
+            super().clear()
+
+    def transition(self, enabled: bool, counter: dict[str, int]) -> int:
+        """Return the exact row count at this pause/resume boundary."""
+        if not self.commit_lock.acquire(timeout=_CMD_TIMEOUT_S):
+            raise RuntimeError("recorder row commit did not finish before gate timeout")
+        try:
+            if enabled:
+                self.set()
+            else:
+                self.clear()
+            return counter["n"]
+        finally:
+            self.commit_lock.release()
+
+
+def _capture_gate_state(
+    event: threading.Event | None,
+) -> tuple[int | None, bool, float]:
+    if isinstance(event, _CaptureGate):
+        with event.commit_lock:
+            return event.epoch, event.is_set(), event.opened_at
+    return None, event is None or event.is_set(), float("-inf")
+
+
+@contextlib.contextmanager
+def _capture_commit(event: threading.Event | None, epoch: int | None):
+    """Serialize a row append and its accounting against gate transitions."""
+    if isinstance(event, _CaptureGate):
+        with event.commit_lock:
+            yield event.is_set() and event.epoch == epoch
+    else:
+        yield event is None or event.is_set()
+
+
 def _stop_capture_thread(
     thread: threading.Thread | None,
     stop: threading.Event | None,
@@ -1573,11 +1633,19 @@ def run_capture_loop(
             label="raw camera exposure", can_drop=True, quality=quality
         )
         cap_last_log = time.perf_counter()
+        capture_epoch: int | None = None
 
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
-            if record_event is not None and not record_event.is_set():
+            row_epoch, recording, capture_floor = _capture_gate_state(record_event)
+            if row_epoch != capture_epoch:
+                recording_start = None
+                state_pairer = _RowStatePairer(
+                    label="raw camera exposure", can_drop=True, quality=quality
+                )
+                capture_epoch = row_epoch
+            if not recording:
                 # Paused: idle without capturing and drop the anchor so the
                 # tick clock re-anchors on resume (no timestamp gap).
                 recording_start = None
@@ -1666,6 +1734,15 @@ def run_capture_loop(
                         f"timestamp at tick {tick}",
                     )
                     break
+                if cap_ts < capture_floor:
+                    # Current readers honor read_at_or_after's lower bound;
+                    # enforce the source boundary here for every raw adapter.
+                    skip_tick = (
+                        f"{cam_key}.ticks_before_resume",
+                        f"camera {cam_key!r} returned a pre-resume exposure "
+                        f"at tick {tick}",
+                    )
+                    break
                 previous = last_capture_ts.get(cam_key)
                 if previous is not None and cap_ts <= previous:
                     skip_tick = (
@@ -1679,6 +1756,8 @@ def run_capture_loop(
                 capture_ts.append(cap_ts)
                 last_capture_ts[cam_key] = cap_ts
 
+            if _capture_gate_state(record_event)[:2] != (row_epoch, True):
+                continue
             if skip_tick is None and capture_ts:
                 camera_skew = max(capture_ts) - min(capture_ts)
                 camera_skew_max = max(camera_skew_max, camera_skew)
@@ -1755,11 +1834,14 @@ def run_capture_loop(
             row = {**obs_frame, **act_frame, "task": task}
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
-            dataset.add_frame(row)
-            if frame_counter is not None:
-                frame_counter["n"] += 1
-            if row_times is not None:
-                row_times.append(row_capture_ts)
+            with _capture_commit(record_event, row_epoch) as commit:
+                if not commit:
+                    continue
+                dataset.add_frame(row)
+                if frame_counter is not None:
+                    frame_counter["n"] += 1
+                if row_times is not None:
+                    row_times.append(row_capture_ts)
             frames_added += 1
             tick_cost_sum += time.perf_counter() - body_t0
             ticks_window += 1
@@ -1917,6 +1999,7 @@ def run_encoded_capture_loop(
         previous_packets: dict[str, tuple[bytes, float, float]] = {}
         first_capture_ts: dict[str, float] = {}
         capture_intervals: dict[str, int] = {}
+        capture_floor = float("-inf")
 
         def read_usable_au(
             cam_key: str, cam: Any, deadline: float
@@ -1935,6 +2018,10 @@ def run_encoded_capture_loop(
                 if packet is None:
                     return None
                 cap_ts = packet[1]
+                if np.isfinite(cap_ts) and cap_ts < capture_floor:
+                    # A delayed encoder packet may arrive after resume even
+                    # though its exposure belongs to the preceding source.
+                    continue
                 if np.isfinite(cap_ts) and (previous is None or cap_ts > previous):
                     return packet
                 skipped = _note_quality(quality, f"{cam_key}.unusable_aus_skipped")
@@ -1987,6 +2074,7 @@ def run_encoded_capture_loop(
         )
         last_log = time.perf_counter()
         paused = False
+        capture_epoch: int | None = None
 
         def discard_queued_aus() -> int:
             """Drop every AU already delivered; returns how many were dropped."""
@@ -2003,7 +2091,14 @@ def run_encoded_capture_loop(
         while not stop_event.is_set():
             if heartbeat is not None:
                 heartbeat()
-            if record_event is not None and not record_event.is_set():
+            row_epoch, recording, capture_floor = _capture_gate_state(record_event)
+            if row_epoch != capture_epoch:
+                if capture_epoch is not None:
+                    # A pause followed by resume can fit inside one blocked
+                    # AU read. Still reset continuity at that exact boundary.
+                    paused = True
+                capture_epoch = row_epoch
+            if not recording:
                 if not paused:
                     paused = True
                     _logger.info(
@@ -2032,6 +2127,9 @@ def run_encoded_capture_loop(
                 first_capture_ts.clear()
                 capture_intervals.clear()
                 primed = False
+                state_pairer = _RowStatePairer(
+                    label="camera exposure", can_drop=row_drop_is_safe, quality=quality
+                )
                 _logger.info("encoded capture resumed at dataset row %d", total_rows)
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
             # One shared deadline for the whole row: with per-camera budgets the
@@ -2075,9 +2173,9 @@ def run_encoded_capture_loop(
 
             if stop_event.is_set():
                 return
-            if record_event is not None and not record_event.is_set():
+            if _capture_gate_state(record_event)[:2] != (row_epoch, True):
                 # Paused while this row's AUs were being read (a read blocks
-                # up to the row budget): they belong to the gap, not the take.
+                # up to the row budget). A rapid resume cannot revive them.
                 continue
 
             # Trust but verify the raw-valve barrier using the timestamps that
@@ -2420,16 +2518,19 @@ def run_encoded_capture_loop(
             row = {**obs_frame, **act_frame, "task": task}
             if tag_intervention:
                 row["intervention"] = np.array([intervention], dtype=bool)
-            dataset.add_frame(row)
-            for event in synthetic_repairs.values():
-                if event["missing_frames"] == 0 and repair_events is not None:
-                    repair_events.append(event)
-                event["missing_frames"] += 1
-                event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
-            if frame_counter is not None:
-                frame_counter["n"] += 1
-            if row_times is not None:
-                row_times.append(row_capture_ts)
+            with _capture_commit(record_event, row_epoch) as commit:
+                if not commit:
+                    continue
+                dataset.add_frame(row)
+                for event in synthetic_repairs.values():
+                    if event["missing_frames"] == 0 and repair_events is not None:
+                        repair_events.append(event)
+                    event["missing_frames"] += 1
+                    event["concealed_ms"] = 1e3 * event["missing_frames"] / fps
+                if frame_counter is not None:
+                    frame_counter["n"] += 1
+                if row_times is not None:
+                    row_times.append(row_capture_ts)
             rows_added += 1
             total_rows += 1
 
@@ -3243,7 +3344,7 @@ class InProcessRecorder:
         self._stop: threading.Event | None = None
         # Mid-episode capture gate + row counter; same semantics as
         # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
-        self._record = threading.Event()
+        self._record = _CaptureGate()
         self._frames: dict[str, int] = {"n": 0}
         # Per-row capture times for the current episode (see trim_episode_after).
         self._row_times: list[float] = []
@@ -3307,14 +3408,12 @@ class InProcessRecorder:
         self._thread.start()
 
     def pause_episode(self) -> int:
-        """Stop capturing mid-episode; returns rows so far. Idempotent."""
-        self._record.clear()
-        return self._frames["n"]
+        """Fence pending rows and return the exact paused count. Idempotent."""
+        return self._record.transition(False, self._frames)
 
     def resume_episode(self) -> int:
         """Resume a paused episode (the capture clock re-anchors). Idempotent."""
-        self._record.set()
-        return self._frames["n"]
+        return self._record.transition(True, self._frames)
 
     def frame_count(self) -> int:
         """Rows captured in the current episode (dataset time = n / fps)."""
@@ -3806,11 +3905,8 @@ def _recorder_main(
     capture_quality: dict[str, int] = {}
     episodes_recorded = 0
     save_poisoned = False
-    # Mid-episode capture gate + row counter (see run_capture_loop). The gate
-    # is only supported on the raw transports: pausing the encoded
-    # (gstshm-h264) stream mid-episode would drop access units that later
-    # P-frames reference, corrupting the mp4.
-    record_event = threading.Event()
+    # Exact row-commit fence for raw and all-intra encoded capture.
+    record_event = _CaptureGate()
     frame_counter: dict[str, int] = {"n": 0}
     # Per-row capture times for the current episode (see trim_episode_after).
     row_times: list[float] = []
@@ -3957,11 +4053,9 @@ def _recorder_main(
                     # reply even though the capture thread has already exited.
                     conn.send(("finished", frame_counter["n"], finished_capture_error))
             elif kind == "pause_episode":
-                record_event.clear()
-                conn.send(("paused", frame_counter["n"]))
+                conn.send(("paused", record_event.transition(False, frame_counter)))
             elif kind == "resume_episode":
-                record_event.set()
-                conn.send(("resumed", frame_counter["n"]))
+                conn.send(("resumed", record_event.transition(True, frame_counter)))
             elif kind == "frame_count":
                 conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
@@ -4362,9 +4456,9 @@ class DatasetRecorderProcess:
     def _episode_gate(self, command: str, expect: str) -> int:
         """Send a pause/resume/frame-count command; return the row count.
 
-        The reply's count may lag the capture thread by one in-flight row
-        (the gate is checked at tick boundaries) — a ±1-frame slop that is
-        negligible for annotation spans.
+        Pause/resume serialize with row commits, so their returned counts
+        identify exact dataset boundaries. A paused acquisition is discarded
+        even if it finishes after resume. A frame-count query is a live sample.
         """
         with self._lock:
             self._conn.send((command,))

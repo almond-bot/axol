@@ -66,17 +66,17 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
 
     def test_apt_install_uses_all_declared_dependencies(self) -> None:
         succeeded = subprocess.CompletedProcess([], 0, "", "")
-        run_root = Mock(return_value=succeeded)
+        run_package_manager = Mock(return_value=succeeded)
         with (
             patch.object(build_zed.shutil, "which", return_value="/usr/bin/apt-get"),
             patch.object(build_zed, "prime_sudo", return_value=True),
-            patch.object(build_zed, "run_root", run_root),
+            patch.object(build_zed, "run_package_manager", run_package_manager),
         ):
             result = build_zed._apt_install_build_deps()  # noqa: SLF001
 
         self.assertTrue(result)
         self.assertEqual(
-            run_root.call_args_list,
+            run_package_manager.call_args_list,
             [
                 call(["apt-get", "update"]),
                 call(
@@ -151,6 +151,62 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
 
             self.assertTrue((source / "build").is_dir())
             self.assertFalse(stale.exists())
+
+    def test_every_vendored_patch_is_applied_in_order(self) -> None:
+        source = Path("/tmp/zed-gstreamer")
+        commands: list[list[str]] = []
+
+        def record(command: list[str], **_kwargs: object) -> bool:
+            commands.append(command)
+            return True
+
+        with (
+            patch.object(build_zed.shutil, "which", return_value="/usr/bin/git"),
+            patch.object(build_zed, "_run", side_effect=record),  # noqa: SLF001
+        ):
+            self.assertTrue(build_zed._apply_patches(source))  # noqa: SLF001
+
+        self.assertEqual(
+            commands,
+            [
+                ["/usr/bin/git", "apply", str(patch_file)]
+                for patch_file in build_zed._PATCHES  # noqa: SLF001
+            ],
+        )
+
+    def test_a_patch_that_does_not_apply_stops_the_build(self) -> None:
+        with (
+            patch.object(build_zed.shutil, "which", return_value="/usr/bin/git"),
+            patch.object(build_zed, "_run", side_effect=(True, False)),  # noqa: SLF001
+        ):
+            self.assertFalse(  # noqa: SLF001
+                build_zed._apply_patches(Path("/tmp/zed-gstreamer"))
+            )
+
+    def test_zedxonesrc_is_built_on_l4t_newer_than_36(self) -> None:
+        # Upstream only adds zedxonesrc for L4T 35.3/35.4 and 36.3+, so on
+        # JetPack 7 (L4T 39) the install check would fail without this patch.
+        (newer_l4t,) = (
+            patch_file
+            for patch_file in build_zed._PATCHES  # noqa: SLF001
+            if patch_file.name == "zed-gstreamer-zedxone-newer-l4t.patch"
+        )
+        text = newer_l4t.read_text(encoding="utf-8")
+        self.assertIn('+    elseif(${L4T_RELEASE} GREATER "36")\n', text)
+        self.assertIn("+        add_subdirectory(gst-zedxone-src)\n", text)
+
+    def test_patch_digest_covers_every_vendored_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.patch"
+            second = Path(directory) / "second.patch"
+            first.write_text("a\n", encoding="utf-8")
+            second.write_text("b\n", encoding="utf-8")
+            with patch.object(build_zed, "_PATCHES", (first, second)):  # noqa: SLF001
+                before = build_zed._patches_sha256()  # noqa: SLF001
+                second.write_text("c\n", encoding="utf-8")
+                after = build_zed._patches_sha256()  # noqa: SLF001
+
+        self.assertNotEqual(before, after)
 
 
 class ZedGstreamerInstalledIntegrityTest(unittest.TestCase):
@@ -440,7 +496,7 @@ class ZedGstreamerInstalledIntegrityTest(unittest.TestCase):
                 patch.object(build_zed, "_installed_plugins_ready", return_value=False),  # noqa: SLF001
                 patch.object(build_zed, "_apt_install_build_deps", return_value=True),
                 patch.object(build_zed, "_sync_source", return_value=True),  # noqa: SLF001
-                patch.object(build_zed, "_apply_patch", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_apply_patches", return_value=True),  # noqa: SLF001
                 patch.object(build_zed, "_build_and_install", return_value=True),  # noqa: SLF001
                 patch.object(build_zed, "_collect_plugin_artifacts", return_value=None),  # noqa: SLF001
                 patch.object(build_zed, "_publish_machine_manifest", publish),  # noqa: SLF001
@@ -467,7 +523,7 @@ class ZedGstreamerInstalledIntegrityTest(unittest.TestCase):
                 patch.object(build_zed, "_installed_plugins_ready", return_value=False),  # noqa: SLF001
                 patch.object(build_zed, "_apt_install_build_deps", return_value=True),
                 patch.object(build_zed, "_sync_source", return_value=True),  # noqa: SLF001
-                patch.object(build_zed, "_apply_patch", return_value=True),  # noqa: SLF001
+                patch.object(build_zed, "_apply_patches", return_value=True),  # noqa: SLF001
                 patch.object(build_zed, "_build_and_install", return_value=True),  # noqa: SLF001
                 patch.object(
                     build_zed, "_collect_plugin_artifacts", return_value=artifacts

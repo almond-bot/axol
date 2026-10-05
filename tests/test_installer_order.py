@@ -30,8 +30,16 @@ class InstallerOrderTest(unittest.TestCase):
         provision = _at('"${BIN_DIR}/axol" provision --require-rt --no-reboot')
         restart = _at('systemctl restart "${SERVICE_NAME}"')
         self.assertLess(provision, restart)
-        self.assertIn("|| PROVISION_OK=0", _SCRIPT)
-        self.assertLess(restart, _at('[ "${PROVISION_OK}" -eq 1 ]'))
+        self.assertIn("|| PROVISION_RC=$?", _SCRIPT)
+        self.assertLess(restart, _at('[ "${PROVISION_RC}" -eq 3 ]'))
+
+    def test_optional_step_failures_warn_instead_of_aborting(self) -> None:
+        # Exit 3: only optional features (Lighthouse, camera plugins) failed.
+        optional = _at('[ "${PROVISION_RC}" -eq 3 ]')
+        fatal = _at('elif [ "${PROVISION_RC}" -ne 0 ]; then')
+        self.assertLess(optional, fatal)
+        self.assertLess(_SCRIPT.index("Axol works without them", optional), fatal)
+        self.assertGreater(_SCRIPT.index('die "Provisioning failed', fatal), fatal)
 
     def test_dataset_tree_stays_usable_by_the_user(self) -> None:
         # The root service's umask 027 made calibration/robots/axol root:root
