@@ -301,9 +301,9 @@ left = replace(
 
 Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
 
-`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm), `max_speed` (rad/s), and `close_direction` (`+1` or `-1`: the sign of the motor rotation that closes the jaw — the grippers are a mirrored pair: the left defaults to `-1`, the right to `+1`); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm), `max_speed` (rad/s), and `close_direction` (`+1` or `-1`: the sign of the motor rotation that closes the jaw — `+1` on both arms by default, the two grippers being identical units); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
 
-The gripper has no fixed stroke. On every cold `enable()` it is calibrated against its own hardware: the jaw is swept closed (in `close_direction`) until it stalls on the closed stop, then swept back until it stalls on the open stop, so it finishes **open**. The two measured stops define the `[0 = closed, 1 = open]` normalisation for that session and are persisted for reconnects. If a gripper comes up *closed* after calibration, its `close_direction` is inverted for that unit — flip it, e.g. `--axol.left.gripper.close_direction 1`.
+The gripper has no fixed stroke. On every cold `enable()` it is calibrated against its own hardware: the jaw is swept closed (in `close_direction`) until it stalls on the closed stop, then swept back until it stalls on the open stop, so it finishes **open**. The two measured stops define the `[0 = closed, 1 = open]` normalisation for that session and are persisted for reconnects. If a gripper comes up *closed* after calibration, its `close_direction` is inverted for that unit — flip it, e.g. `--axol.left.gripper.close_direction -1`.
 
 `AxolConfig` also exposes top-level parameters:
 

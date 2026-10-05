@@ -207,12 +207,10 @@ class PositionForceConfig:
         torque_limit:    Peak output torque (Nm).
         max_speed:       Maximum joint speed (rad/s).
         close_direction: Sign of the motor rotation that closes the jaw:
-                         ``+1`` closes toward positive motor angles, ``-1``
-                         toward negative. The two grippers of a mirrored
-                         pair have opposite signs (:meth:`ArmConfig.mirror_to_right`
-                         flips it): the left jaw closes toward negative
-                         angles (the default here), the right toward
-                         positive. The end-stop calibration at enable time
+                         ``+1`` closes toward positive motor angles (both
+                         arms by default: the two grippers are identical
+                         units, not a mirrored pair), ``-1`` toward
+                         negative. The end-stop calibration at enable time
                          sweeps in this direction first to find the closed
                          stop, then back to the open stop — so a wrong sign
                          swaps open/closed and leaves the jaw closed after
@@ -221,7 +219,7 @@ class PositionForceConfig:
 
     torque_limit: float
     max_speed: float
-    close_direction: int = -1
+    close_direction: int = 1
 
     def __post_init__(self) -> None:
         if self.close_direction not in (1, -1):
@@ -392,10 +390,8 @@ class ArmConfig:
         every joint, and ``com.y`` is additionally sign-flipped on
         ``wrist_2`` (because the CAD models the wrist-2 link asymmetrically
         per side rather than as a true mirror — see the URDF for details).
-        The gripper's ``close_direction`` is flipped too: the grippers are a
-        mirrored pair, so the right jaw closes with the opposite motor
-        rotation to the left (positive angles on the right, negative on the
-        left).
+        The gripper's ``close_direction`` is kept: the two grippers are
+        identical units, so both jaws close toward positive motor angles.
         """
         out = replace(
             self,
@@ -406,9 +402,6 @@ class ArmConfig:
             wrist_1=replace(self.wrist_1, com=_flip_x(self.wrist_1.com)),
             wrist_2=replace(self.wrist_2, com=_flip_x_y(self.wrist_2.com)),
             wrist_3=replace(self.wrist_3, com=_flip_x(self.wrist_3.com)),
-            gripper=replace(
-                self.gripper, close_direction=-self.gripper.close_direction
-            ),
         )
         return out
 

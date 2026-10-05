@@ -742,8 +742,8 @@ class AxolArm:
         )
         # Raw motor angles of the gripper's two hard stops. The jaw closes in
         # the configured ``close_direction``, so which of the two is the
-        # numerically larger angle differs between the mirrored left and right
-        # grippers — the [0 = closed, 1 = open] normalisation goes through
+        # numerically larger angle depends on it — the [0 = closed, 1 = open]
+        # normalisation goes through
         # ``_gripper_to_raw`` / ``_gripper_from_raw`` and never assumes an
         # order. Pre-calibration placeholders assume zero is closed and a
         # nominal stroke — do not rely on for actual motion.
