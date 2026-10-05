@@ -97,6 +97,11 @@ _GRIPPER_CALIB_TORQUE_ABORT = 2.0  # Nm
 # shaft advances less than this fraction of a step, this many reads running.
 _GRIPPER_STALL_FRACTION = 0.5
 _GRIPPER_STALL_READS = 2
+# A jaw resting on a stop can need more than the threshold to break free of
+# it, and then both sweeps "find" a stop where it started. A pair of stops
+# closer than _GRIPPER_MIN_TRAVEL is retried at each of these thresholds in
+# turn (Nm, all under _GRIPPER_CALIB_TORQUE_ABORT) before calibration fails.
+_GRIPPER_BREAKAWAY_THRESHOLDS = (_GRIPPER_TORQUE_THRESHOLD, 1.0, 1.5)
 # Two stops closer together than this are not a gripper stroke (jammed jaw,
 # or a sweep that stalled on an obstruction).
 _GRIPPER_MIN_TRAVEL = math.radians(30)
@@ -1129,12 +1134,14 @@ class AxolArm:
         """Raw motor rad → normalised opening (0.0 = closed, 1.0 = open)."""
         return (raw - self._gripper_close) / (self._gripper_open - self._gripper_close)
 
-    async def _seek_gripper_stop(self, direction: int) -> float:
+    async def _seek_gripper_stop(
+        self, direction: int, threshold: float = _GRIPPER_TORQUE_THRESHOLD
+    ) -> float:
         """Step the gripper in ``direction`` (±1) until it stalls on a hard stop.
 
         Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
         and reads the motor torque; the stop is reached once the torque
-        pushing *along* the sweep exceeds ``_GRIPPER_TORQUE_THRESHOLD`` with
+        pushing *along* the sweep exceeds ``threshold`` (Nm) with
         the shaft no longer following the target (``_GRIPPER_STALL_READS``
         reads in a row advancing under ``_GRIPPER_STALL_FRACTION`` of a
         step) — a torque spike on a jaw still moving is not a stop. The
@@ -1165,7 +1172,7 @@ class AxolArm:
             await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
             torque = await motor.get_torque()
             along = torque * direction
-            if along >= _GRIPPER_TORQUE_THRESHOLD:
+            if along >= threshold:
                 position = await motor.get_position()
                 if pressed_at is not None and (
                     (position - pressed_at) * direction
@@ -1230,15 +1237,25 @@ class AxolArm:
         close_direction = self._arm_config.gripper.close_direction
         side = "left" if self._is_left else "right"
 
-        close_pos = await self._seek_gripper_stop(close_direction)
-        open_pos = await self._seek_gripper_stop(-close_direction)
-
-        travel = abs(open_pos - close_pos)
-        if travel < _GRIPPER_MIN_TRAVEL:
+        for threshold in _GRIPPER_BREAKAWAY_THRESHOLDS:
+            close_pos = await self._seek_gripper_stop(close_direction, threshold)
+            open_pos = await self._seek_gripper_stop(-close_direction, threshold)
+            travel = abs(open_pos - close_pos)
+            if travel >= _GRIPPER_MIN_TRAVEL:
+                break
+            _logger.warning(
+                "%s gripper calibration: stops only %.1f° apart at %.1f Nm — "
+                "the jaw may be stuck on the stop it rests on",
+                side,
+                math.degrees(travel),
+                threshold,
+            )
+        else:
             raise MotorError(
                 f"{side} gripper calibration: stops only {math.degrees(travel):.1f}° "
-                f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) — "
-                f"the jaw is jammed or met an obstruction"
+                f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) up to "
+                f"{_GRIPPER_BREAKAWAY_THRESHOLDS[-1]:.1f} Nm — the jaw is jammed or "
+                f"met an obstruction"
             )
         _logger.info(
             "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",

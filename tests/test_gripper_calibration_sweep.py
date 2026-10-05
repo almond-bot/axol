@@ -35,17 +35,24 @@ class _Jaw:
         start: float,
         stiff: tuple[float, float] | None = None,
         spike_nm: float = 0.0,
+        stuck_nm: float = 0.0,
     ) -> None:
         self.lo, self.hi = lo, hi
         self.position = start
         self.target = start
         self.stiff = stiff
         self.spike_nm = spike_nm
+        self.stuck_nm = stuck_nm
         self.torque = 0.0
 
     async def set_impedance(self, p_des, v_des, kp, kd, t_ff) -> None:
         motion = p_des - self.target
         self.target = p_des
+        if self.stuck_nm and abs(kp * (p_des - self.position)) < self.stuck_nm:
+            # Stuck where it rests until the spring pulls hard enough.
+            self.torque = kp * (p_des - self.position)
+            return
+        self.stuck_nm = 0.0
         self.position = min(max(p_des, self.lo), self.hi)
         self.torque = kp * (p_des - self.position)
         if (
@@ -90,6 +97,18 @@ class SweepTest(unittest.IsolatedAsyncioTestCase):
         await arm._calibrate_gripper()
         self.assertAlmostEqual(arm._gripper_close, -2.20, delta=0.01)
         self.assertAlmostEqual(arm._gripper_open, -5.38, delta=0.01)
+
+    async def test_jaw_stuck_on_the_open_stop_is_retried_harder(self) -> None:
+        # Fully open and needing 1.4 Nm to break free: the first pair of
+        # sweeps both stop where the jaw rests, a harder retry frees it.
+        jaw = _Jaw(lo=0.53, hi=3.74, start=3.74, stuck_nm=1.4)
+        arm = AxolHardware(AxolConfig()).right
+        arm.motors[Joint.GRIPPER] = jaw
+        with self.assertLogs(axol_module._logger, "WARNING") as logs:
+            await arm._calibrate_gripper()
+        self.assertIn("stuck on the stop", logs.output[0])
+        self.assertAlmostEqual(arm._gripper_close, 0.53, delta=0.01)
+        self.assertAlmostEqual(arm._gripper_open, 3.74, delta=0.01)
 
     async def test_jaw_resting_on_the_closed_stop_finds_it_at_once(self) -> None:
         jaw = _Jaw(lo=-5.38, hi=-2.20, start=-2.20)
