@@ -48,11 +48,23 @@ class StrokeTest(unittest.TestCase):
         arm = _arm(stroke_deg=180.0, close_direction=1)
         self.assertAlmostEqual(arm._gripper_to_raw(1.0), -math.radians(180.0), places=9)
 
-    def test_both_grippers_close_toward_positive_angles_by_default(self) -> None:
+    def test_left_closes_toward_positive_right_toward_negative(self) -> None:
         cfg = AxolConfig()
         self.assertEqual(cfg.left.gripper.close_direction, 1)
-        self.assertEqual(cfg.right.gripper.close_direction, 1)
-        self.assertEqual(cfg.left.mirror_to_right().gripper.close_direction, 1)
+        self.assertEqual(cfg.right.gripper.close_direction, -1)
+        self.assertEqual(cfg.left.mirror_to_right().gripper.close_direction, -1)
+
+    def test_right_sweep_finishes_on_the_positive_stop(self) -> None:
+        # The right arm's stops as measured on the robot: it rested closed
+        # on the negative one when the sweep called that open.
+        arm = AxolHardware(AxolConfig()).right
+        stops = (0.525, 3.738)
+        close = (
+            max(stops) if arm._arm_config.gripper.close_direction > 0 else min(stops)
+        )
+        arm._set_gripper_range(open_pos=sum(stops) - close, close_pos=close)
+        self.assertAlmostEqual(arm._gripper_to_raw(1.0), 3.738)
+        self.assertAlmostEqual(arm._gripper_to_raw(0.0), 0.525)
 
     def test_default_sweep_finishes_on_the_negative_stop(self) -> None:
         # The left arm's stops as measured on the robot: the more negative

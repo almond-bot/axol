@@ -207,9 +207,11 @@ class PositionForceConfig:
         torque_limit:    Peak output torque (Nm).
         max_speed:       Maximum joint speed (rad/s).
         close_direction: Sign of the motor rotation that closes the jaw:
-                         ``+1`` closes toward positive motor angles (both
-                         arms by default: the two grippers are identical
-                         units, not a mirrored pair), ``-1`` toward
+                         ``+1`` closes toward positive motor angles, ``-1``
+                         toward negative. The two grippers' motors turn
+                         opposite ways to close (:meth:`ArmConfig.mirror_to_right`
+                         flips it): the left jaw closes toward positive
+                         angles (the default here), the right toward
                          negative. The end-stop calibration at enable time
                          sweeps in this direction first to find the closed
                          stop, then back to the open stop — so a wrong sign
@@ -390,8 +392,9 @@ class ArmConfig:
         every joint, and ``com.y`` is additionally sign-flipped on
         ``wrist_2`` (because the CAD models the wrist-2 link asymmetrically
         per side rather than as a true mirror — see the URDF for details).
-        The gripper's ``close_direction`` is kept: the two grippers are
-        identical units, so both jaws close toward positive motor angles.
+        The gripper's ``close_direction`` is flipped too: the right jaw
+        closes with the opposite motor rotation to the left (negative angles
+        on the right, positive on the left).
         """
         out = replace(
             self,
@@ -402,6 +405,9 @@ class ArmConfig:
             wrist_1=replace(self.wrist_1, com=_flip_x(self.wrist_1.com)),
             wrist_2=replace(self.wrist_2, com=_flip_x_y(self.wrist_2.com)),
             wrist_3=replace(self.wrist_3, com=_flip_x(self.wrist_3.com)),
+            gripper=replace(
+                self.gripper, close_direction=-self.gripper.close_direction
+            ),
         )
         return out
 
