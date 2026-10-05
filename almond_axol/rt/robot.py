@@ -1224,12 +1224,24 @@ class Axol(RobotBase):
             await self.disconnect()
             return
         if not self._core_started:
-            if all(bus.never_opened for bus in self._buses()):
+            buses = self._buses()
+            if all(bus.never_opened for bus in buses):
                 _logger.info(
                     "rt: disable() before any CAN bus was opened — no motor "
                     "traffic was sent, nothing to torque off"
                 )
                 return
+            if not all(bus.is_open for bus in buses):
+                # A rolled-back enable() closes the buses it used, leaving
+                # the joints it found holding still holding: the torque-off
+                # needs them reopened, but never under a live core.
+                core_process = self._link._proc
+                if core_process is not None and core_process.poll() is None:
+                    raise HardwareCleanupError(
+                        "rt: core process is still running; refusing to reopen "
+                        "maintenance proxies for the torque-off"
+                    )
+                await self._robot.connect(purge_stale=False)
             await self._robot.disable()
             return
         if self._rec is not None:

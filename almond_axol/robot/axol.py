@@ -91,6 +91,12 @@ _GRIPPER_CALIB_MAX_SWEEP_STEPS = math.ceil(
 # far stop (its reported torque sign disagrees with the commanded motion) —
 # abort rather than wind the impedance target further into the mechanism.
 _GRIPPER_CALIB_TORQUE_ABORT = 2.0  # Nm
+# The threshold alone is not a stop: breaking a jaw free from where it rests
+# (pressed on a stop) or a stiff patch of its travel spikes the torque past
+# it while the shaft still follows. A stop is the threshold held while the
+# shaft advances less than this fraction of a step, this many reads running.
+_GRIPPER_STALL_FRACTION = 0.5
+_GRIPPER_STALL_READS = 2
 # Two stops closer together than this are not a gripper stroke (jammed jaw,
 # or a sweep that stalled on an obstruction).
 _GRIPPER_MIN_TRAVEL = math.radians(30)
@@ -1128,7 +1134,10 @@ class AxolArm:
 
         Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
         and reads the motor torque; the stop is reached once the torque
-        pushing *along* the sweep exceeds ``_GRIPPER_TORQUE_THRESHOLD``. The
+        pushing *along* the sweep exceeds ``_GRIPPER_TORQUE_THRESHOLD`` with
+        the shaft no longer following the target (``_GRIPPER_STALL_READS``
+        reads in a row advancing under ``_GRIPPER_STALL_FRACTION`` of a
+        step) — a torque spike on a jaw still moving is not a stop. The
         signed test matters for the second sweep of a calibration, which
         starts pressed against the stop the first one found: that torque
         points the other way and must not end the sweep early.
@@ -1145,6 +1154,8 @@ class AxolArm:
         motor = self.motors[Joint.GRIPPER]
         side = "left" if self._is_left else "right"
         target = await motor.get_position()
+        pressed_at: float | None = None
+        stalled = 0
 
         for _ in range(_GRIPPER_CALIB_MAX_SWEEP_STEPS):
             target += direction * _GRIPPER_CALIB_STEP
@@ -1155,7 +1166,20 @@ class AxolArm:
             torque = await motor.get_torque()
             along = torque * direction
             if along >= _GRIPPER_TORQUE_THRESHOLD:
-                return await motor.get_position()
+                position = await motor.get_position()
+                if pressed_at is not None and (
+                    (position - pressed_at) * direction
+                    < _GRIPPER_STALL_FRACTION * _GRIPPER_CALIB_STEP
+                ):
+                    stalled += 1
+                    if stalled >= _GRIPPER_STALL_READS:
+                        return position
+                else:
+                    stalled = 0
+                pressed_at = position
+                continue
+            pressed_at = None
+            stalled = 0
             if along <= -_GRIPPER_CALIB_TORQUE_ABORT:
                 await self._unload_gripper_target()
                 raise MotorError(
