@@ -599,7 +599,7 @@ class VRTeleopCore:
             "box_width_speed",
             "box_align_duration",
             "box_tool",
-            "box_tool_open_deg",
+            "box_flush_deg",
             "box_grasp",
             "box_face_left",
             "box_face_right",
@@ -790,30 +790,6 @@ class VRTeleopCore:
         if not self.box_mode or self.is_resetting or not (cap > 0.0):
             return None
         return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
-
-    def gripper_open_limit(self) -> float | None:
-        """How far the grippers may open right now (degrees from closed), ``None`` for the stop.
-
-        The parcel gripper's hinged blade goes all the way to its open
-        stop — wherever the calibration found it; no angle is assumed —
-        in plain teleop and box mode's parallel grasp. In the angled
-        (``"flush"``) grasp it is held at ``config.box_tool_open_deg``
-        (140°) instead, the blade angle the grasp's yaw (``180°`` minus it)
-        lays the flat face along the box side at. Non-``None`` for box mode
-        in the flush grasp with the parcel tool, leading or not. The
-        adapter hands the result to the robot before each control tick
-        (``set_gripper_open_limit``, on change) and clears it when the
-        session ends. Cheap and pure.
-        """
-        cfg = self.config
-        if (
-            self.box_mode
-            and str(getattr(cfg, "box_tool", "urdf")).strip().lower() == "parcel"
-            and str(getattr(cfg, "box_grasp", "straight")).strip().lower() == "flush"
-        ):
-            limit = float(getattr(cfg, "box_tool_open_deg", 0.0))
-            return limit if limit > 0.0 else None
-        return None
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).

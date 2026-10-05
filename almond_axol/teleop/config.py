@@ -149,36 +149,26 @@ class VRTeleopConfig:
         box_tool: Which gripper is fitted, for box mode's contact geometry
             (:class:`~almond_axol.teleop.box.ToolGeometry`). ``"parcel"``
             (the default): the parcel gripper — a fixed blade on the mount
-            axis and a hinged blade that folds back toward the box side to a
-            mechanical stop. Box mode yaws each gripper so the folded
-            blade's flat face lies parallel to the box side (``180° -
-            box_tool_open_deg`` inward) and measures the width between the
-            two faces, so the squeeze is a straight push of a flat patch
-            centred on the wrist. ``"urdf"``: the stock two-finger gripper
+            axis and a hinged blade that folds back toward the box side to
+            its open stop, flat against the fixed blade. The width is
+            measured between the folded blades' faces, and the angled grasp
+            turns each gripper ``box_flush_deg`` inward about its face.
+            ``"urdf"``: the stock two-finger gripper
             the URDF carries — the mounts themselves are ``width`` apart
             and the flat side of the closed fingers faces the box at tilt 0.
             Live-adjustable.
-        box_tool_open_deg: Parcel gripper only: the hinged blade's angle
-            (degrees of motor rotation from closed, closed = 0°) in box
-            mode's angled (``"flush"``) grasp. There the gripper is held at
-            this opening rather than its stop (``VRTeleopCore.gripper_open_limit``
-            → ``AxolArm.set_gripper_open_limit``; the trigger's travel is
-            spread over it) and each gripper is yawed ``180°`` minus this
-            inward, which lays the folded blade's flat face along the box
-            side. Everywhere else — plain teleop, the parallel grasp — the
-            blade goes all the way to its open stop, whose angle is never
-            assumed. If the face won't sit flat in the angled grasp, read
-            the tilt trim at which it does (HUD) and *subtract* it from
-            this value. Live-adjustable.
+        box_flush_deg: Parcel gripper only: how far (degrees) box mode's
+            angled (``"flush"``) grasp turns each gripper inward from the
+            parallel grasp, about the folded blade's contact face — on the
+            arm, mostly a ``wrist_2`` turn. The blade stays at its open stop
+            in this grasp as everywhere else. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
             width between the mount frames — the plain flat-hands grasp,
-            the blade at its stop like everywhere else. ``"flush"``: the
-            fitted tool's contact face along the box side — for the parcel
-            gripper the blade held at ``box_tool_open_deg`` (140°) rather
-            than its stop, with the grippers yawed ``180° -
-            box_tool_open_deg`` inward and the width measured between the
-            faces. Toggled live while a grip is leading by clicking (and
+            the blade at its stop. ``"flush"``: for the parcel gripper,
+            each gripper turned ``box_flush_deg`` (39°) inward about its
+            contact face, the blade still at its stop and the width still
+            measured between the faces. Toggled live while a grip is leading by clicking (and
             releasing) either thumbstick — a click that turns into the
             both-sticks box-mode gesture doesn't count — or from the
             settings; the pair blends into the new grasp over
@@ -327,10 +317,7 @@ class VRTeleopConfig:
             was, about a second after the clamp. Shown as ``trim`` (mean)
             and ``trims`` (``[left, right]``) in the pair status, and
             logged once a second while pressing with each arm's depth,
-            force and toe-out. The blade's own give under the clamp —
-            held at 140° by its motor, short of the stop — is handled on
-            the robot (``PositionForceConfig.hold_trim_deg``).
-            Live-adjustable; realtime-core hardware only.
+            force and toe-out. Live-adjustable; realtime-core hardware only.
         box_squeeze_force: Clamp force cap (N) per arm in box mode; ``0``
             (the default) for none. The squeeze lean above knows the clamp
             force the depth produces (the arm model's stiffness along the
@@ -534,7 +521,7 @@ class VRTeleopConfig:
     box_mode: bool = False
     box_lead_hand: str = "right"
     box_tool: str = "parcel"
-    box_tool_open_deg: float = 140.0
+    box_flush_deg: float = 39.0
     box_grasp: str = "straight"
     box_face_left: str = "auto"
     box_face_right: str = "auto"

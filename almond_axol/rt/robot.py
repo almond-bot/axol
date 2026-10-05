@@ -969,15 +969,6 @@ class Axol(RobotBase):
         """Clear command history on both arms (pure Python state)."""
         self._robot.reset_command_state()
 
-    def set_gripper_open_limit(self, limit_deg: float | None) -> None:
-        """Limit the grippers' opening to ``limit_deg`` from closed, ``None`` for the stop.
-
-        See ``AxolArm.set_gripper_open_limit``. Pure Python state on the arm
-        objects: the next :meth:`motion_control` maps the gripper command
-        over the new span.
-        """
-        self._robot.set_gripper_open_limit(limit_deg)
-
     def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
         """Live per-joint spring-torque caps on both arms (see ``AxolArm.set_spring_caps``).
 

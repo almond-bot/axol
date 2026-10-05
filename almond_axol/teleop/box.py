@@ -26,12 +26,12 @@ optional *tilt* yaws each gripper inward by a few degrees so the wedge-shaped
 finger face lies flush on the box side instead of touching along its heel.
 
 Where on the gripper the box is actually touched is the **tool geometry**
-(:class:`ToolGeometry`): the yaw at which the tool's contact face is
-parallel to the box side and where that face sits relative to the mount.
-``width`` is the separation of the two *contact faces* — the box size — and
-the mounts are placed behind them; ``tilt`` is a trim on top of the tool's
-flush yaw and pivots about the contact face, so trimming keeps the face
-where it is. The stock URDF gripper has a trivial geometry (the mount
+(:class:`ToolGeometry`): where the tool's contact face sits relative to the
+mount, and how far its angled grasp turns the gripper inward. ``width`` is
+the separation of the two *contact faces* — the box size — and the mounts
+are placed behind them; the angled grasp's turn and the ``tilt`` trim on
+top of it pivot about the contact face, so turning keeps the face where it
+is. The stock URDF gripper has a trivial geometry (the mount
 separation is the width, the flat side faces the box at tilt 0); the parcel
 gripper's is derived from its mechanism (:func:`parcel_tool`).
 """
@@ -57,12 +57,12 @@ class ToolGeometry:
     """Where a gripper touches the box side, in its own mount frame.
 
     Attributes:
-        flush_tilt: Inward yaw (rad) at which the tool's contact face is
-            parallel to the box side. Box mode holds each gripper at this
-            yaw plus the operator's tilt trim.
+        flush_tilt: Inward yaw (rad) of the angled (``"flush"``) grasp,
+            about the foot. Box mode holds each gripper at this yaw plus
+            the operator's tilt trim in that grasp.
         foot_fwd: Distance (m) along the fingers (the mount's ``-Z``) from
             the mount origin to the *foot* — the point of the contact face
-            nearest the mount origin, with the gripper at ``flush_tilt``.
+            nearest the mount origin.
         foot_in: The foot's distance (m) toward the box, along the flat
             face turned toward it (the mount's ``±X``, see
             :func:`side_clamp_rotation`).
@@ -106,9 +106,9 @@ class ToolGeometry:
         The width is between the contact faces; the bodies sit
         :attr:`body_in` from the mount axes, and where the faces sit
         relative to those axes depends on the grasp: in ``"flush"`` the
-        parcel gripper's folded blade is ``foot_in`` inboard of the axis —
-        proud of the wrist by a centimetre, so the faces may all but meet
-        — while in ``"straight"`` (and on the stock gripper) the face is
+        parcel gripper's folded blade is ``foot_in`` inboard of the axis,
+        nearly level with the wrist, so the faces may all but meet — while
+        in ``"straight"`` (and on the stock gripper) the face is
         modelled on the axis itself and the bodies close in step with the
         width. Returns the width at which the bodies are ``clearance``
         apart, never less than ``0``; the operator's ``box_width_min`` is
@@ -179,10 +179,15 @@ PARCEL_TIP_IN_M = -0.0335
 # Both blades are plates 60 mm tall at the root (centred on the flange axis)
 # tapering to a point at the tip: the contact face is that triangle.
 PARCEL_FACE_HEIGHT_M = 0.060
+# The hinged blade's angle from closed at its open stop, where it lies flat
+# back against the fixed blade. Contact model only: the gripper is commanded
+# to its calibrated stop, never to this angle.
+PARCEL_BLADE_STOP_DEG = 180.0
 
 
 def parcel_tool(
-    open_deg: float,
+    flush_deg: float,
+    blade_deg: float = PARCEL_BLADE_STOP_DEG,
     pivot_fwd: float = PARCEL_PIVOT_FWD_M,
     face_r: float = PARCEL_FACE_R_M,
 ) -> ToolGeometry:
@@ -191,32 +196,25 @@ def parcel_tool(
     The parcel gripper is two flat blades side by side along the fingers
     direction: a fixed one on the mount axis and a hinged one that swings
     toward the box side, about a vertical hinge ``pivot_fwd`` ahead of the
-    flange, to ``open_deg`` from closed — the angle the angled grasp holds
-    the blade at (``VRTeleopConfig.box_tool_open_deg``, 140°, short of the
-    stop it goes to in every other mode). Folded that far back it lies
-    alongside the wrist, and the box side is clamped by that blade's flat
-    face — a large patch *behind* the hinge, roughly centred on the wrist,
-    so a straight lateral squeeze needs almost no wrist moment to keep it
-    flat. For the face to lie on the box side the fixed blade must point
-    ``180° - open_deg`` inward: that is the flush tilt (40° at 140°).
-    The foot is the point of the folded face nearest the mount origin: the
-    face plane is ``face_r`` from the hinge, so its distance from the mount
-    origin along its normal is ``pivot_fwd * sin(open) + face_r``.
+    flange, to ``blade_deg`` from closed — its open stop, where it lies flat
+    back against the fixed blade, in every mode. The box side is clamped
+    by that blade's flat face. The foot is the point of the folded face
+    nearest the mount origin: the face plane is ``face_r`` from the hinge,
+    so its distance from the mount origin along its normal is
+    ``pivot_fwd * sin(blade) + face_r``.
 
-    The fixed blade's tip is ahead of the hinge and, at 140°, ~11 mm *past*
-    the face plane (it would sit exactly on it at ~146°), so with the face
-    flush it hooks the box's front corner or digs in; the tilt trim backs
-    the face off to touch tip-and-heel instead. Both flush at once needs the
-    blade at ~146° (see the config docs).
+    ``flush_deg`` is how far the angled (``"flush"``) grasp turns each
+    gripper inward from the parallel grasp (``VRTeleopConfig.box_flush_deg``,
+    39°), about that foot so the contact and the width stay put.
     """
-    phi = math.radians(open_deg)
+    phi = math.radians(blade_deg)
     # Face normal toward the box, in (forward, inboard) mount coordinates:
     # the blade closed has its face normal pointing outboard (toward the
     # fixed blade); the fold turns it through ``phi`` toward the box.
     n_fwd, n_in = math.sin(phi), -math.cos(phi)
     c = pivot_fwd * math.sin(phi) + face_r
     return ToolGeometry(
-        flush_tilt=math.pi - phi,
+        flush_tilt=math.radians(flush_deg),
         foot_fwd=c * n_fwd,
         foot_in=c * n_in,
         tip_fwd=PARCEL_TIP_FWD_M,
@@ -463,6 +461,27 @@ def choose_faces(
     return out
 
 
+def contact_feet(
+    left_pos: np.ndarray,
+    right_pos: np.ndarray,
+    rot: np.ndarray,
+    grip_rel: dict[str, np.ndarray],
+    feet: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """World positions of the two contact feet for mounts at these positions.
+
+    Each mount's foot is ``rot @ grip_rel[side] @ feet[side]`` from it (the
+    pair held in its box-mode rotations).
+    """
+    return {
+        side: np.asarray(pos, dtype=np.float64)
+        + np.asarray(rot, dtype=np.float64)
+        @ np.asarray(grip_rel[side], dtype=np.float64)
+        @ np.asarray(feet[side], dtype=np.float64)
+        for side, pos in (("left", left_pos), ("right", right_pos))
+    }
+
+
 def contact_width(
     left_pos: np.ndarray,
     right_pos: np.ndarray,
@@ -472,19 +491,12 @@ def contact_width(
 ) -> float:
     """Lateral separation of the two contact faces for mounts at these positions.
 
-    Each mount's foot is ``rot @ grip_rel[side] @ feet[side]`` from it (the
-    pair held in its box-mode rotations); the width is the distance between
-    the two feet along the box frame's lateral axis. With trivial feet
-    (:data:`URDF_TOOL`) it is the mounts' own lateral separation.
+    The distance between the two :func:`contact_feet` along the box frame's
+    lateral axis. With trivial feet (:data:`URDF_TOOL`) it is the mounts'
+    own lateral separation.
     """
     lat = np.asarray(rot, dtype=np.float64)[:, 1]
-    foot = {
-        side: np.asarray(pos, dtype=np.float64)
-        + np.asarray(rot, dtype=np.float64)
-        @ np.asarray(grip_rel[side], dtype=np.float64)
-        @ np.asarray(feet[side], dtype=np.float64)
-        for side, pos in (("left", left_pos), ("right", right_pos))
-    }
+    foot = contact_feet(left_pos, right_pos, rot, grip_rel, feet)
     return float((foot["left"] - foot["right"]) @ lat)
 
 
@@ -543,8 +555,12 @@ def snap_box(
     clamping faces (:func:`choose_faces`). The starting width is the
     separation the contact faces would have with the mounts where they are,
     so a pair already holding a box keeps its grip through the align blend.
+    The box centre is the midpoint of the contact feet, where
+    :func:`ideal_gripper_poses` puts them: a foot off the mount's lateral
+    line (the angled grasp turns the parcel gripper's foot forward of its
+    mount) would otherwise shift the pair along the box at the snap.
     """
-    center, rot, _width = box_frame(left[0], right[0])
+    _mounts, rot, _width = box_frame(left[0], right[0])
     yaw = tilt + tool.flush_tilt
     face = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
     rel = {
@@ -552,7 +568,9 @@ def snap_box(
         for side, sign in _SIDE_SIGN.items()
     }
     feet = {side: tool.foot(face[side]) for side in _SIDE_SIGN}
-    width = contact_width(left[0], right[0], rot, rel, feet)
+    foot = contact_feet(left[0], right[0], rot, rel, feet)
+    center = (0.5 * (foot["left"] + foot["right"])).astype(np.float32)
+    width = float((foot["left"] - foot["right"]) @ np.asarray(rot, np.float64)[:, 1])
     width = float(np.clip(width, width_min, width_max))
     align_start = {
         side: (

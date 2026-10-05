@@ -118,24 +118,6 @@ def _defer_sigint_during_cleanup():
                 )
 
 
-def _grip_seed(arm: object, positions: np.ndarray | None) -> float | None:
-    """The grip command to seed a session with from an arm's measured positions.
-
-    ``positions[7]`` is the gripper reading, normalised over its whole
-    stroke; the command space is the working opening (the stroke, or the
-    opening limit while one is set), so an ``AxolArm`` converts it
-    (``gripper_command``). The two agree at a session's start — no limit
-    is set yet — but the conversion keeps the seed right whatever the arm
-    is left at. Other robots (the sim) seed the reading as it is. ``None``
-    without an arm reading.
-    """
-    if positions is None or len(positions) <= 7:
-        return None
-    reading = float(positions[7])
-    convert = getattr(arm, "gripper_command", None)
-    return float(convert(reading)) if callable(convert) else reading
-
-
 class VRTeleop:
     """Connects a VR headset and robot into a teleoperation session.
 
@@ -463,8 +445,8 @@ class VRTeleop:
 
         pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
-            _grip_seed(getattr(self._robot, "left", None), pos_l),
-            _grip_seed(getattr(self._robot, "right", None), pos_r),
+            pos_l[7] if pos_l is not None else None,
+            pos_r[7] if pos_r is not None else None,
         )
 
         ctx = multiprocessing.get_context("spawn")
@@ -950,24 +932,14 @@ class VRTeleop:
         # session is not left capped. Sim / classic targets have no caps.
         set_caps = getattr(self._robot, "set_spring_caps", None)
         caps_applied: dict | None = None
-        # Likewise the grippers' opening limit: box mode's angled grasp
-        # holds the parcel gripper's blade at box_tool_open_deg, everything
-        # else opens it to the stop (VRTeleopCore.gripper_open_limit).
-        set_open_limit = getattr(self._robot, "set_gripper_open_limit", None)
-        open_limit_applied: float | None = None
 
         def _sync_squeeze() -> None:
-            nonlocal caps_applied, open_limit_applied
+            nonlocal caps_applied
             if set_caps is not None:
                 want = self._core.spring_caps()
                 if want != caps_applied:
                     set_caps(want)
                     caps_applied = want
-            if set_open_limit is not None:
-                limit = self._core.gripper_open_limit()
-                if limit != open_limit_applied:
-                    set_open_limit(limit)
-                    open_limit_applied = limit
 
         # Tracking-phase contact watchdog (hardware only, opt-in — the
         # threshold defaults to 0 = off): the same sustained-torque trip the
@@ -1156,8 +1128,6 @@ class VRTeleop:
                 self._robot_recorder(False)
             if set_caps is not None and caps_applied:
                 set_caps(None)
-            if set_open_limit is not None and open_limit_applied is not None:
-                set_open_limit(None)
             activity.stop()
             diag.stop()
             tegra.stop()

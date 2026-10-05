@@ -438,33 +438,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help="Maximum joint speed of the right gripper.",
             ),
             SettingDef(
-                key="axol.left.gripper.hold_trim_deg",
-                label="Left gripper blade hold (°)",
-                type="number",
-                help=(
-                    "Box mode's angled grasp holds the blade at 140°, short "
-                    "of its stop, on the motor's position loop alone, and a "
-                    "clamped box folds it back by that loop's error under "
-                    "load. The hold integrates the blade's measured "
-                    "shortfall into the command so it stays where it was "
-                    "told; this is the most it may shift it. 0 turns it off."
-                ),
-            ),
-            SettingDef(
-                key="axol.right.gripper.hold_trim_deg",
-                label="Right gripper blade hold (°)",
-                type="number",
-                help=(
-                    "As for the left gripper: the most the blade hold may "
-                    "shift the right gripper's command to keep its blade at "
-                    "the 140° limit under a clamp. 0 turns it off."
-                ),
-            ),
-            # What a session drives is inferred from the CAN interfaces
-            # attached (arm hub, Jelly wheel bus, lift bus) — this and the
-            # two Jelly switches (in the Jelly category) are the operator's
-            # opt-out for hardware that is plugged in.
-            SettingDef(
                 key="robot.arms",
                 label="Axol arms",
                 type="boolean",
@@ -761,11 +734,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "Which grasp a box-mode session starts in. straight (the "
                     "default): fingers straight forward (0°), width between "
-                    "the mounts. flush: the fitted gripper's contact face "
-                    "along the box side (parcel gripper: the blade held at "
-                    "the 140° blade angle instead of its stop, grippers yawed "
-                    "40° inward so the face lies along the box, width between "
-                    "the faces). In the headset a click of either thumbstick "
+                    "the mounts. flush: the parcel gripper turned 39° inward "
+                    "(Angled yaw) about its contact face, the blade at its "
+                    "stop as everywhere, width between the faces. In the "
+                    "headset a click of either thumbstick "
                     "while leading toggles between the two; the arms blend "
                     "over."
                 ),

@@ -82,7 +82,7 @@ class LeanMathTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         _p, cls.rot, cls.jac = _GC.mount_jacobian(_Q_BOX_L, is_left=True)
         cls.n = np.array([0.0, -1.0, 0.0])  # left gripper: the box is at -y
-        cls.pts = np.asarray(parcel_tool(141.5).contacts("straight"))
+        cls.pts = np.asarray(parcel_tool(39.0).contacts("straight"))
 
     def _delta(self, lean, depth):
         return np.concatenate([depth * self.n + lean.translation, lean.rotation])
@@ -140,7 +140,7 @@ class LeanMathTest(unittest.TestCase):
     def test_the_right_arm_leans_the_other_way(self) -> None:
         _p, rot, jac = _GC.mount_jacobian(_Q_BOX_R, is_left=False)
         n = np.array([0.0, 1.0, 0.0])  # right gripper: the box is at +y
-        pts = np.asarray(parcel_tool(141.5).contacts("straight", -1.0))
+        pts = np.asarray(parcel_tool(39.0).contacts("straight", -1.0))
         lean = squeeze_lean(jac, _KP_R, rot, n, pts, 0.01)
         r_c = pts.mean(axis=0) @ rot.T
         self.assertGreater(float(np.cross(lean.rotation, r_c) @ n), 0.0)
@@ -260,7 +260,7 @@ class WorkerLeanTest(unittest.TestCase):
         w._config = types.SimpleNamespace(
             **{
                 "box_tool": "parcel",
-                "box_tool_open_deg": 141.5,
+                "box_flush_deg": 39.0,
                 "box_grasp": "straight",
                 "box_squeeze_lean": 1.0,
                 "box_squeeze_force": 0.0,
@@ -289,7 +289,7 @@ class WorkerLeanTest(unittest.TestCase):
             align_start={},
             align_t0=0.0,
             align_duration=0.0,
-            tool=parcel_tool(141.5),
+            tool=parcel_tool(39.0),
         )
 
     def _targets(self, q, depth_l: float, depth_r: float):
@@ -353,7 +353,7 @@ class WorkerLeanTest(unittest.TestCase):
         # ~6 N a side.
         self.assertGreater(w.squeeze_force, 4.0)
         self.assertLess(w.squeeze_force, 9.0)
-        tool = parcel_tool(141.5)
+        tool = parcel_tool(39.0)
         for side, normal, face in (
             ("left", [0.0, -1.0, 0.0], 1.0),
             ("right", [0.0, 1.0, 0.0], -1.0),
@@ -479,7 +479,7 @@ class WorkerLeanTest(unittest.TestCase):
 
 class ToolContactsTest(unittest.TestCase):
     def test_parcel_flush_is_face_corners_and_tip(self) -> None:
-        tool = parcel_tool(141.5)
+        tool = parcel_tool(39.0)
         pts = tool.contacts("flush")
         self.assertEqual(len(pts), 3)
         half = np.array([0.0, PARCEL_FACE_HEIGHT_M / 2, 0.0])
@@ -494,7 +494,7 @@ class ToolContactsTest(unittest.TestCase):
         )
 
     def test_parcel_straight_is_the_blade_along_the_box(self) -> None:
-        pts = parcel_tool(141.5).contacts("straight")
+        pts = parcel_tool(39.0).contacts("straight")
         # The root's top and bottom corners (the blade is 60 mm tall there,
         # centred on the mount) and the tip.
         np.testing.assert_allclose(pts[0], [0.0, 0.03, 0.0])
@@ -508,7 +508,7 @@ class ToolContactsTest(unittest.TestCase):
             np.testing.assert_allclose(pts[0], [0.0, 0.0, 0.0])
 
     def test_flush_tilt(self) -> None:
-        self.assertAlmostEqual(math.degrees(parcel_tool(141.5).flush_tilt), 38.5)
+        self.assertAlmostEqual(math.degrees(parcel_tool(39.0).flush_tilt), 39.0)
 
 
 class _Arm:
