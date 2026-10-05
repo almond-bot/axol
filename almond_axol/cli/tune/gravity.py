@@ -540,6 +540,8 @@ def _report_and_save(
         side_str,
         joint.value,
         com=tuple(round(v, 5) for v in com_fit),
+        # Pin the mass the CoM was fitted against: only m·c is identified.
+        mass=jc.mass,
         friction=friction_update,
         hub_serial=hub_serial,
     )

@@ -185,66 +185,61 @@ class ProvisionSafetyTest(unittest.TestCase):
             provision.run()
         step.assert_not_called()
 
-    def test_step_failures_are_aggregated_after_all_repairs_are_attempted(self) -> None:
+    def _run_with_failures(
+        self, failing: set[str], *, under_serve: bool = False
+    ) -> tuple[list[str], SystemExit | None, str]:
+        """Run provision with every step stubbed; ``failing`` steps raise."""
         attempted: list[str] = []
 
-        def fail(label: str) -> None:
+        def step(label: str) -> None:
             attempted.append(label)
-            raise RuntimeError(f"{label} failed")
+            if label in failing:
+                raise RuntimeError(f"{label} failed")
 
-        def succeed(label: str) -> None:
-            attempted.append(label)
+        def stub(label: str) -> Mock:
+            return Mock(side_effect=lambda *_, **__: step(label))
 
-        with (
-            tempfile.TemporaryDirectory() as zed_sdk,
-            patch.object(provision.os, "geteuid", return_value=0),
-            patch.object(
-                provision, "host_update_lock", return_value=contextlib.nullcontext()
-            ),
-            patch.object(provision, "_neutralize_legacy_can_root_execution"),
-            patch.object(provision, "_ZED_SDK", Path(zed_sdk)),
-            patch.object(provision.adb, "install", side_effect=lambda: succeed("adb")),
-            patch.object(
-                provision.tracker_install,
-                "run",
-                side_effect=lambda: fail("tracker"),
-            ),
-            patch.object(
-                provision.zed_driver,
-                "ensure_driver",
-                side_effect=lambda: succeed("driver"),
-            ),
-            patch.object(
-                provision.gyro, "install", side_effect=lambda: succeed("gyro")
-            ),
-            patch.object(
-                provision.zed_install,
-                "run",
-                side_effect=lambda: fail("pyzed"),
-            ),
-            patch.object(
-                provision.zed_calibration,
-                "share_calibration_files",
-                side_effect=lambda: succeed("calibration"),
-            ),
-            patch.object(
-                provision.gst_install,
-                "run",
-                side_effect=lambda: succeed("gst"),
-            ),
-            patch.object(
-                provision.gst_build_zed,
-                "run",
-                side_effect=lambda: succeed("gst-build"),
-            ),
-            patch.object(
-                provision,
-                "tune_host",
-                side_effect=lambda **_: succeed("tuning"),
-            ),
-            self.assertRaises(SystemExit) as raised,
-        ):
-            provision.run()
+        stderr = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            zed_sdk = stack.enter_context(tempfile.TemporaryDirectory())
+            for target, name, value in (
+                (provision.os, "geteuid", Mock(return_value=0)),
+                (
+                    provision,
+                    "host_update_lock",
+                    Mock(return_value=contextlib.nullcontext()),
+                ),
+                (provision, "_neutralize_legacy_can_root_execution", Mock()),
+                (provision, "_ZED_SDK", Path(zed_sdk)),
+                (provision, "privileged_service_active", Mock(return_value=False)),
+                (provision, "spawned_by_serve", Mock(return_value=under_serve)),
+                (provision.adb, "install", stub("adb")),
+                (provision.tracker_install, "run", stub("tracker")),
+                (provision.zed_driver, "ensure_driver", stub("driver")),
+                (provision.gyro, "install", stub("gyro")),
+                (provision.rtprio, "install", stub("rtprio")),
+                (provision.can_purge, "install", stub("can-purge")),
+                (provision.zed_install, "run", stub("pyzed")),
+                (
+                    provision.zed_calibration,
+                    "share_calibration_files",
+                    stub("calibration"),
+                ),
+                (provision.gst_install, "run", stub("gst")),
+                (provision.gst_build_zed, "run", stub("gst-build")),
+                (provision.rt_install, "run", stub("rt")),
+                (provision, "tune_host", stub("tuning")),
+            ):
+                stack.enter_context(patch.object(target, name, value))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            try:
+                provision.run()
+            except SystemExit as exc:
+                return attempted, exc, stderr.getvalue()
+        return attempted, None, stderr.getvalue()
+
+    def test_step_failures_are_aggregated_after_all_repairs_are_attempted(self) -> None:
+        attempted, exc, stderr = self._run_with_failures({"tracker", "pyzed"})
 
         self.assertEqual(
             attempted,
@@ -253,17 +248,55 @@ class ProvisionSafetyTest(unittest.TestCase):
                 "tracker",
                 "driver",
                 "gyro",
+                "rtprio",
+                "can-purge",
                 "pyzed",
                 "calibration",
                 "gst",
                 "gst-build",
+                "rt",
                 "tuning",
             ],
         )
-        message = str(raised.exception)
-        self.assertIn("Lighthouse tracking (tracker.install)", message)
-        self.assertIn("pyzed (zed.install)", message)
-        self.assertNotIn("GStreamer + PyGObject", message)
+        # Only optional features failed: the dedicated exit code lets the
+        # installer finish onto the new release with a warning.
+        assert exc is not None
+        self.assertEqual(exc.code, provision.OPTIONAL_STEPS_FAILED_EXIT)
+        last_line = stderr.strip().splitlines()[-1]
+        self.assertTrue(last_line.startswith("Optional provisioning steps failed"))
+        self.assertIn("Lighthouse tracking (tracker.install)", last_line)
+        self.assertIn("pyzed (zed.install)", last_line)
+        self.assertNotIn("GStreamer + PyGObject", last_line)
+
+    def test_optional_failures_inside_serve_succeed_with_a_warning(self) -> None:
+        # Every released self-updater stays on old code on any non-zero exit.
+        _attempted, exc, stderr = self._run_with_failures(
+            {"tracker", "gst-build"}, under_serve=True
+        )
+
+        self.assertIsNone(exc)
+        self.assertIn(provision.OPTIONAL_FAILURE_PREFIX, stderr)
+        self.assertIn("patched zed-gstreamer plugins (gst.build-zed)", stderr)
+
+    def test_realtime_core_failure_fails_the_command(self) -> None:
+        for under_serve in (False, True):
+            with self.subTest(under_serve=under_serve):
+                _attempted, exc, _stderr = self._run_with_failures(
+                    {"rt", "gst-build"}, under_serve=under_serve
+                )
+                assert exc is not None
+                message = str(exc.code)
+                self.assertTrue(message.startswith("Provisioning failed for: "))
+                self.assertIn("axol-rt realtime core (rt.install)", message)
+
+    def test_realtime_core_failure_names_every_failed_step(self) -> None:
+        _attempted, exc, _stderr = self._run_with_failures({"rt", "gst-build"})
+
+        assert exc is not None
+        message = str(exc.code)
+        self.assertTrue(message.startswith("Provisioning failed for: "))
+        self.assertIn("axol-rt realtime core (rt.install)", message)
+        self.assertIn("patched zed-gstreamer plugins (gst.build-zed)", message)
 
 
 class ProvisionEscalationTest(unittest.TestCase):

@@ -20,6 +20,11 @@ Two reasons this exists rather than relying on a stock plugin install:
    ~delivery-latency too new, and that offset differs from inference (which
    uses the SDK), i.e. a train/inference mismatch.
 
+A second patch (``patches/zed-gstreamer-zedxone-newer-l4t.patch``) builds
+``zedxonesrc`` on L4T releases newer than 36 (JetPack 7, e.g. an AGX Orin on
+L4T 39.2). Upstream only adds it for L4T 35.3/35.4 and 36.3+, so without it
+the build silently leaves ``zedxonesrc`` out and the install check fails.
+
 We pin upstream to the exact commit the patch was generated against so the
 unified diff always applies cleanly. Idempotence is based on a root-owned
 manifest of the exact plugin paths and bytes GStreamer resolves, not merely a
@@ -49,17 +54,25 @@ import subprocess
 from pathlib import Path
 
 from ...utils.jetson import _is_jetson
+from ...utils.packages import failure_detail, run_package_manager
 from ...utils.state_files import secure_atomic_write_text
 from ...utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
 
-# Upstream repo + the exact commit the vendored patch was generated against.
-# Bump both together (regenerate the patch) when picking up upstream changes.
+# Upstream repo + the exact commit the vendored patches were generated against.
+# Bump them together (regenerate the patches) when picking up upstream changes.
 _REPO_URL = "https://github.com/stereolabs/zed-gstreamer.git"
 _PINNED_REF = "4a0a3a3d896b54f9cb23f284b5b44e52b5e1a288"
 
-_PATCH = Path(__file__).parent / "patches" / "zed-gstreamer-sensor-timestamp.patch"
+# Applied in order on pristine upstream; see the module docstring.
+_PATCHES = tuple(
+    Path(__file__).parent / "patches" / name
+    for name in (
+        "zed-gstreamer-sensor-timestamp.patch",
+        "zed-gstreamer-zedxone-newer-l4t.patch",
+    )
+)
 
 # ZED SDK install (find_package(ZED) + the headers the plugins compile against).
 _ZED_SDK = Path("/usr/local/zed")
@@ -119,10 +132,17 @@ def _src_dir() -> Path:
     return Path.home() / ".almond" / "zed-gstreamer"
 
 
+def _patches_sha256() -> str:
+    """One digest over every vendored patch, in the order they are applied."""
+    digest = hashlib.sha256()
+    for patch_file in _PATCHES:
+        digest.update(patch_file.read_bytes())
+    return digest.hexdigest()
+
+
 def _desired_stamp() -> str:
     """Pinned ref + patch digest; changes whenever either is bumped."""
-    patch_sha = hashlib.sha256(_PATCH.read_bytes()).hexdigest()
-    return f"{_PINNED_REF}\n{patch_sha}\n"
+    return f"{_PINNED_REF}\n{_patches_sha256()}\n"
 
 
 def _zed_sdk_version() -> str | None:
@@ -313,7 +333,7 @@ def _manifest_payload(artifacts: dict[str, dict[str, str]]) -> str:
             {
                 "schema": _MANIFEST_SCHEMA,
                 "pinnedRef": _PINNED_REF,
-                "patchSha256": hashlib.sha256(_PATCH.read_bytes()).hexdigest(),
+                "patchSha256": _patches_sha256(),
                 "zedSdk": _zed_sdk_version(),
                 "plugins": artifacts,
             },
@@ -481,14 +501,15 @@ def _apt_install_build_deps() -> bool:
         return False
     # An update failure need not block an install from an already-populated apt
     # cache. The install result itself is authoritative.
-    update = run_root(["apt-get", "update"])
+    update = run_package_manager(["apt-get", "update"])
     if update.returncode != 0:
         _logger.warning("apt-get update failed; trying the existing package cache")
-    installed = run_root(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
+    installed = run_package_manager(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
     if installed.returncode != 0:
         _logger.warning(
-            "could not install zed-gstreamer build dependencies; run: "
+            "could not install zed-gstreamer build dependencies (%s); run: "
             "sudo apt-get install -y %s",
+            failure_detail(installed),
             " ".join(_APT_BUILD_DEPS),
         )
         return False
@@ -522,12 +543,15 @@ def _sync_source(src: Path) -> bool:
     )
 
 
-def _apply_patch(src: Path) -> bool:
+def _apply_patches(src: Path) -> bool:
     git = shutil.which("git")
-    if git is None or not _PATCH.exists():
-        _logger.warning("cannot apply patch (git=%s, patch=%s)", git, _PATCH)
+    missing = [patch_file for patch_file in _PATCHES if not patch_file.exists()]
+    if git is None or missing:
+        _logger.warning("cannot apply patches (git=%s, missing=%s)", git, missing)
         return False
-    return _run([git, "apply", str(_PATCH)], cwd=src)
+    return all(
+        _run([git, "apply", str(patch_file)], cwd=src) for patch_file in _PATCHES
+    )
 
 
 def _build_and_install(src: Path) -> bool:
@@ -601,10 +625,10 @@ def run(_args: object = None) -> None:
     if not _sync_source(src):
         raise SystemExit("Could not fetch zed-gstreamer source; retry the build.")
 
-    print("Applying the sensor-exposure-timestamp patch...")
-    if not _apply_patch(src):
+    print("Applying the sensor-exposure-timestamp and newer-L4T patches...")
+    if not _apply_patches(src):
         raise SystemExit(
-            "The zed-gstreamer timestamp patch did not apply; check upstream drift."
+            "The zed-gstreamer patches did not apply; check upstream drift."
         )
 
     print("Building + installing the patched plugins (this can take a few minutes)...")
