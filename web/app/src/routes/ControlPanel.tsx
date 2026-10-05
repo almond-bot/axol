@@ -1934,12 +1934,14 @@ export default function ControlPanel() {
           onEpisode={handleEpisode}
         />
 
-        <DatasetPreview
-          key={`datasets-${renderedConnectionGeneration}`}
-          connected={conn.state === "ok"}
-          liveDataset={policy?.dataset ?? null}
-          episodesRecorded={policy?.episodesRecorded ?? null}
-        />
+        {DATASET_OPERATIONS.has(meta.id) && (
+          <DatasetPreview
+            key={`datasets-${renderedConnectionGeneration}`}
+            connected={conn.state === "ok"}
+            liveDataset={policy?.dataset ?? null}
+            episodesRecorded={policy?.episodesRecorded ?? null}
+          />
+        )}
 
         <LogConsole lines={lines} />
       </main>
@@ -1956,6 +1958,10 @@ export default function ControlPanel() {
     </div>
   )
 }
+
+/** The operations that record a dataset, so the dataset preview has
+ *  something to show; every other operation hides it. */
+const DATASET_OPERATIONS = new Set(["collect-data", "collect-dagger", "run-policy"])
 
 /** One column per operation on wide screens, spelled out so Tailwind emits the
  *  classes; a host offering more than five wraps rather than shrinking. */
