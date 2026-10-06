@@ -299,6 +299,15 @@ class SessionTest(unittest.TestCase):
         # The second pass never ran.
         self.assertNotIn("pass 2/2", text)
 
+    def test_a_tight_playback_limit_trips_but_the_way_home_uses_the_defaults(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            text = self._run(["--guard-dev-deg", "0.05"], Path(d))
+        self.assertEqual([t.kind for t in self.trips], ["deviation"], text)
+        self.assertIn("Returning to rest", text)
+        self.assertNotIn("HOLDING", text)
+
     def test_a_stable_replay_never_trips(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             self._run(["--repeat", "2"], Path(d))

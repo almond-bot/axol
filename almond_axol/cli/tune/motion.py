@@ -447,7 +447,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "frozen on its base gains, then returned to rest — when a joint leaves "
         "its trajectory (--guard-dev-deg), oscillates (--guard-osc-deg RMS, "
         "1.5-15 Hz) or vibrates (--guard-vib-deg RMS, > 15 Hz). The moves to "
-        "and from the motion get twice the limits.",
+        "and from the motion get twice the limits (never less than twice the "
+        "defaults).",
     )
     p.add_argument(
         "--guard-dev-deg",
@@ -1934,15 +1935,19 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
             for side, arm in (("left", axol.left), ("right", axol.right))
             if arm is not None
         ]
+        # A transit move (guard_scale > 1) never runs tighter than the
+        # defaults: limits sized for a creep replay must not make the move
+        # home after a trip trip again.
+        floor = guard_scale > 1.0
         guard = (
             None
             if args.no_guard
             else MotionGuard(
                 [f"{side}.{j.value}" for side, _ in guard_arms for j in ARM_JOINTS],
                 motion.rate,
-                dev_deg=args.guard_dev_deg,
-                osc_deg=args.guard_osc_deg,
-                vib_deg=args.guard_vib_deg,
+                dev_deg=max(args.guard_dev_deg, DEFAULT_DEV_DEG if floor else 0.0),
+                osc_deg=max(args.guard_osc_deg, DEFAULT_OSC_DEG if floor else 0.0),
+                vib_deg=max(args.guard_vib_deg, DEFAULT_VIB_DEG if floor else 0.0),
             )
         )
         left = np.zeros(8, dtype=np.float32)
