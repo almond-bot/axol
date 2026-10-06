@@ -4,8 +4,9 @@ An impedance arm pressing its gripper into a box exerts, at the gripper
 mount, the wrench its springs make of the run-ahead. A plain lateral
 run-ahead (the width jogged in) is a force at the mount plus the moment it
 takes to hold the mount's orientation against the arm's stiffness coupling
-— and the parcel gripper touches the box at its blade's root beside the
-wrist and its tip 13 cm on, so that moment loads them unevenly: the pinch.
+— and the parcel gripper's angled grasp touches the box with its chamfer
+facet and the fixed blade's tip 7 cm on, so that moment loads them
+unevenly: the pinch.
 ``almond_axol.teleop.box.squeeze_lean`` gives the target offset (mostly an
 inward yaw) that turns the run-ahead into a pure force through the
 contacts' centroid, from the arm's Jacobian and stiffness; the IK worker
@@ -35,7 +36,10 @@ from almond_axol.constants import ARM_JOINTS
 from almond_axol.robot.config import AxolConfig
 from almond_axol.robot.gravity import GravityCompensator
 from almond_axol.teleop.box import (
-    PARCEL_FACE_HEIGHT_M,
+    PARCEL_EDGE_FWD_M,
+    PARCEL_FACET_FWD_M,
+    PARCEL_FACET_IN_M,
+    PARCEL_PLATE_IN_M,
     PARCEL_TIP_FWD_M,
     PARCEL_TIP_IN_M,
     URDF_TOOL,
@@ -82,7 +86,7 @@ class LeanMathTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         _p, cls.rot, cls.jac = _GC.mount_jacobian(_Q_BOX_L, is_left=True)
         cls.n = np.array([0.0, -1.0, 0.0])  # left gripper: the box is at -y
-        cls.pts = np.asarray(parcel_tool(39.0).contacts("straight"))
+        cls.pts = np.asarray(parcel_tool(39.0).contacts())
 
     def _delta(self, lean, depth):
         return np.concatenate([depth * self.n + lean.translation, lean.rotation])
@@ -107,9 +111,10 @@ class LeanMathTest(unittest.TestCase):
         # ... whose moment about the mount is exactly the centroid's lever.
         r_c = self.pts.mean(axis=0) @ self.rot.T
         np.testing.assert_allclose(w[3:], np.cross(r_c, lean.force * self.n), atol=1e-6)
-        # So the three contacts share it evenly with nothing left over.
+        # So the four contacts (the facet's top and bottom, the tip's) share
+        # it evenly with nothing left over.
         forces, res = _contact_split(w, self.rot, self.n, self.pts)
-        np.testing.assert_allclose(forces, np.full(3, lean.force / 3), atol=1e-6)
+        np.testing.assert_allclose(forces, np.full(4, lean.force / 4), atol=1e-6)
         self.assertLess(np.linalg.norm(res), 1e-6)
 
     def test_size_and_direction(self) -> None:
@@ -140,7 +145,7 @@ class LeanMathTest(unittest.TestCase):
     def test_the_right_arm_leans_the_other_way(self) -> None:
         _p, rot, jac = _GC.mount_jacobian(_Q_BOX_R, is_left=False)
         n = np.array([0.0, 1.0, 0.0])  # right gripper: the box is at +y
-        pts = np.asarray(parcel_tool(39.0).contacts("straight", -1.0))
+        pts = np.asarray(parcel_tool(39.0).contacts(-1.0))
         lean = squeeze_lean(jac, _KP_R, rot, n, pts, 0.01)
         r_c = pts.mean(axis=0) @ rot.T
         self.assertGreater(float(np.cross(lean.rotation, r_c) @ n), 0.0)
@@ -148,7 +153,7 @@ class LeanMathTest(unittest.TestCase):
             jac, _KP_R, np.concatenate([0.01 * n + lean.translation, lean.rotation])
         )
         forces, _res = _contact_split(w, rot, n, pts)
-        np.testing.assert_allclose(forces, np.full(3, lean.force / 3), atol=1e-6)
+        np.testing.assert_allclose(forces, np.full(4, lean.force / 4), atol=1e-6)
 
     def test_proportional_to_depth(self) -> None:
         a = squeeze_lean(self.jac, _KP_L, self.rot, self.n, self.pts, 0.01)
@@ -189,7 +194,7 @@ class LeanMathTest(unittest.TestCase):
         )
 
     def test_single_contact_at_the_mount_is_a_pure_force(self) -> None:
-        pts = np.asarray(URDF_TOOL.contacts("straight"))
+        pts = np.asarray(URDF_TOOL.contacts())
         lean = squeeze_lean(self.jac, _KP_L, self.rot, self.n, pts, 0.01)
         w = _wrench(self.jac, _KP_L, self._delta(lean, 0.01))
         np.testing.assert_allclose(w[:3], lean.force * self.n, atol=1e-6)
@@ -261,7 +266,7 @@ class WorkerLeanTest(unittest.TestCase):
             **{
                 "box_tool": "parcel",
                 "box_flush_deg": 39.0,
-                "box_grasp": "straight",
+                "box_grasp": "flush",
                 "box_squeeze_lean": 1.0,
                 "box_squeeze_force": 0.0,
                 **cfg,
@@ -369,7 +374,7 @@ class WorkerLeanTest(unittest.TestCase):
             axis = np.array(
                 [rel[2, 1] - rel[1, 2], rel[0, 2] - rel[2, 0], rel[1, 0] - rel[0, 1]]
             )
-            centroid = np.asarray(tool.contacts("straight", face)).mean(axis=0)
+            centroid = np.asarray(tool.contacts(face)).mean(axis=0)
             r_c = rot0.astype(np.float64) @ centroid
             self.assertGreater(float(np.cross(axis, r_c) @ np.asarray(normal)), 0.0)
             # A millimetre or two of translation, none along the normal
@@ -478,37 +483,55 @@ class WorkerLeanTest(unittest.TestCase):
 
 
 class ToolContactsTest(unittest.TestCase):
-    def test_parcel_flush_is_face_corners_and_tip(self) -> None:
-        tool = parcel_tool(39.0)
-        pts = tool.contacts("flush")
-        self.assertEqual(len(pts), 3)
-        half = np.array([0.0, PARCEL_FACE_HEIGHT_M / 2, 0.0])
-        np.testing.assert_allclose(pts[0], tool.foot(1.0) + half, atol=1e-7)
-        np.testing.assert_allclose(pts[1], tool.foot(1.0) - half, atol=1e-7)
-        np.testing.assert_allclose(pts[2], [PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M])
-        self.assertAlmostEqual(PARCEL_TIP_FWD_M, 0.1385)
-        self.assertAlmostEqual(PARCEL_FACE_HEIGHT_M, 0.060)
-        # The mirrored side.
+    def test_parcel_flush_is_the_facet_and_the_tip(self) -> None:
+        pts = np.asarray(parcel_tool(39.0).contacts())
+        self.assertEqual(len(pts), 4)
+        # The chamfer facet's top and bottom, then the tip edge's, as
+        # (in, up, -forward) on the +X side.
+        np.testing.assert_allclose(pts[:2, 0], PARCEL_FACET_IN_M)
+        np.testing.assert_allclose(pts[:2, 2], -PARCEL_FACET_FWD_M)
+        np.testing.assert_allclose(pts[2:, 0], PARCEL_TIP_IN_M)
+        np.testing.assert_allclose(pts[2:, 2], -PARCEL_TIP_FWD_M)
+        self.assertGreater(pts[0, 1], 0.0)
+        self.assertLess(pts[1, 1], 0.0)
+        np.testing.assert_allclose(pts[2, 1], -pts[3, 1])
+        # The centroid sits halfway between facet and tip: the clamp is
+        # shared evenly between them.
+        self.assertAlmostEqual(
+            float(-pts[:, 2].mean()), 0.5 * (PARCEL_FACET_FWD_M + PARCEL_TIP_FWD_M)
+        )
+        # The mirrored side is the tool rolled 180° about its fingers.
         np.testing.assert_allclose(
-            tool.contacts("flush", -1.0)[2], [-PARCEL_TIP_IN_M, 0.0, -PARCEL_TIP_FWD_M]
+            parcel_tool(39.0).contacts(-1.0), pts * np.array([-1.0, -1.0, 1.0])
         )
 
-    def test_parcel_straight_is_the_blade_along_the_box(self) -> None:
-        pts = parcel_tool(39.0).contacts("straight")
-        # The root's top and bottom corners (the blade is 60 mm tall there,
-        # centred on the mount) and the tip.
-        np.testing.assert_allclose(pts[0], [0.0, 0.03, 0.0])
-        np.testing.assert_allclose(pts[1], [0.0, -0.03, 0.0])
-        np.testing.assert_allclose(pts[2], [0.0, 0.0, -PARCEL_TIP_FWD_M])
+    def test_parcel_straight_is_the_plate_face(self) -> None:
+        pts = np.asarray(parcel_tool(39.0, "straight").contacts())
+        self.assertEqual(len(pts), 4)
+        # The folded plate's face, flat on the box: one plane, from beside
+        # the wrist to just past the hinge, about the mount.
+        np.testing.assert_allclose(pts[:, 0], PARCEL_PLATE_IN_M)
+        fwd = -pts[:, 2]
+        self.assertLess(fwd.min(), -0.05)
+        self.assertGreater(fwd.max(), 0.05)
+        self.assertLess(abs(float(fwd.mean())), 0.005)
+
+    def test_both_grasps_share_the_foot_on_the_face_edge(self) -> None:
+        flush, straight = parcel_tool(39.0), parcel_tool(39.0, "straight")
+        for face in (1.0, -1.0):
+            np.testing.assert_array_equal(flush.foot(face), straight.foot(face))
+        np.testing.assert_allclose(
+            flush.foot(1.0), [PARCEL_PLATE_IN_M, 0.0, -PARCEL_EDGE_FWD_M], atol=1e-7
+        )
 
     def test_urdf_tool_touches_at_the_mount(self) -> None:
-        for grasp in ("flush", "straight"):
-            pts = URDF_TOOL.contacts(grasp)
-            self.assertEqual(len(pts), 1)
-            np.testing.assert_allclose(pts[0], [0.0, 0.0, 0.0])
+        pts = URDF_TOOL.contacts()
+        self.assertEqual(len(pts), 1)
+        np.testing.assert_allclose(pts[0], [0.0, 0.0, 0.0])
 
     def test_flush_tilt(self) -> None:
         self.assertAlmostEqual(math.degrees(parcel_tool(39.0).flush_tilt), 39.0)
+        self.assertEqual(parcel_tool(39.0, "straight").flush_tilt, 0.0)
 
 
 class _Arm:

@@ -94,10 +94,11 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         type="select",
         options=("straight", "flush"),
         help=(
-            "straight: fingers straight forward (0°), width between the "
-            "mounts. flush: the parcel gripper turned inward by the Angled "
-            "yaw (39°) about its contact face, the blade at its stop, width "
-            "between the faces. Also toggled by clicking "
+            "straight: fingers straight forward (0°), the flat face on the "
+            "box. flush: the parcel gripper rolled inward by the Angled yaw "
+            "(39°) about its plate's front edge onto the chamfer facet and "
+            "the fixed tip, the plate at its stop. Width is between the "
+            "contact faces in both. Also toggled by clicking "
             "either thumbstick while a grip leads; the pair blends over to it."
         ),
     ),
@@ -108,9 +109,9 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         options=("parcel", "urdf"),
         help=(
             "Gripper fitted, for box mode's contact geometry. parcel: the "
-            "hinged-blade parcel gripper — the blade folds flat at its stop, "
-            "the width is measured between the two blades' faces, and the "
-            "angled grasp turns each gripper inward about its face. urdf: the stock two-finger "
+            "hinged-plate parcel gripper — the plate folds back along the "
+            "wrist at its stop, its face clamps in the straight grasp and its "
+            "chamfer facet plus the fixed tip in the angled one. urdf: the stock two-finger "
             "gripper — mounts are the width apart, fingers straight forward."
         ),
     ),
@@ -124,8 +125,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         unit="°",
         help=(
             "Parcel gripper: how far the angled grasp (stick click) turns "
-            "each gripper inward from parallel, about its contact face — "
-            "mostly a wrist_2 turn. The blade stays at its open stop."
+            "each gripper inward from parallel, about its plate's front edge "
+            "(the chamfer is 39.2°). The plate stays at its open stop."
         ),
     ),
     LiveSettingDef(

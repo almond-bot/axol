@@ -38,7 +38,6 @@ from .box import (
     parcel_tool,
     rodrigues,
     rotation_angle,
-    side_clamp_rotation,
     smoothstep,
     snap_box,
     squeeze_lean,
@@ -1246,15 +1245,10 @@ class IKWorker:
         else:
             yaw = tilt + tool.flush_tilt
             chosen = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
-            rel = {
-                side: side_clamp_rotation(sign, chosen[side], yaw)
-                for side, sign in (("left", 1.0), ("right", -1.0))
-            }
             width = contact_width(
-                left[0],
-                right[0],
+                left,
+                right,
                 rot,
-                rel,
                 {side: tool.foot(chosen[side]) for side in ("left", "right")},
             )
             aligned = pair_aligned(
@@ -1285,20 +1279,24 @@ class IKWorker:
     def _box_tool(self) -> ToolGeometry:
         """The box-mode contact geometry for the current grasp and tool.
 
-        The ``"straight"`` grasp is the plain flat-hands geometry whatever is
-        fitted — fingers straight forward, width between the mounts
-        (:data:`URDF_TOOL`); ``"flush"`` uses the fitted tool's
-        (``config.box_tool``).
+        The fitted tool's (``config.box_tool``) in the current grasp: for
+        the parcel gripper, its plate's face in ``"straight"`` and its
+        facet and tip, turned ``box_flush_deg`` inward, in ``"flush"``
+        (:func:`parcel_tool`) — the same foot in both, so a grasp switch
+        turns each gripper about it. The stock gripper's
+        (:data:`URDF_TOOL`) is the same in both grasps.
         """
         cfg = self._config
-        if self._box_grasp() == "straight":
-            return URDF_TOOL
         kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
-        if kind not in ("parcel", "urdf"):
+        if kind == "parcel":
+            return parcel_tool(
+                float(getattr(cfg, "box_flush_deg", 39.0)), self._box_grasp()
+            )
+        if kind != "urdf":
             _logger.warning(
                 "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
             )
-        return self._fitted_tool()
+        return URDF_TOOL
 
     def _box_width_min(self) -> float:
         """The smallest grip width the sticks (and an engage snap) allow now.
@@ -1306,30 +1304,17 @@ class IKWorker:
         ``config.box_width_min`` — the operator's floor between the contact
         faces — or, if larger, the width at which the fitted tool's bodies
         would come within ``_BODY_CLEARANCE_M`` of each other in the
-        current grasp (:meth:`ToolGeometry.min_width`). With the parcel
-        gripper the flush grasp's faces are proud of the wrist, so they
-        may close to the operator's floor; in the straight grasp (the face
-        on the mount axis) the wrists meet first, at ~77 mm.
+        current grasp (:meth:`ToolGeometry.min_width`). The parcel
+        gripper's contact faces are proud of everything else on it in both
+        grasps, so they may close to the operator's floor; the stock
+        gripper's face is modelled on the mount axis and its wrists meet
+        first, at ~77 mm.
         """
         cfg = self._config
         return max(
             float(cfg.box_width_min),
-            self._fitted_tool().min_width(self._box_grasp(), _BODY_CLEARANCE_M),
+            self._box_tool().min_width(_BODY_CLEARANCE_M),
         )
-
-    def _fitted_tool(self) -> ToolGeometry:
-        """The contact geometry of the tool actually fitted (``config.box_tool``).
-
-        Unlike :meth:`_box_tool` this does not fall back to the flat-hands
-        geometry in the ``"straight"`` grasp: the squeeze lean wants where
-        the fitted tool touches the box in *either* grasp
-        (:meth:`ToolGeometry.contacts`).
-        """
-        cfg = self._config
-        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
-        if kind == "parcel":
-            return parcel_tool(float(getattr(cfg, "box_flush_deg", 39.0)))
-        return URDF_TOOL
 
     def note_measured(
         self,
@@ -1374,10 +1359,10 @@ class IKWorker:
         run-ahead into the clamp. A plain lateral run-ahead, though, is a
         force at the gripper *mount* plus the moment it takes to hold the
         mount's orientation against the arm's stiffness coupling — and the
-        parcel gripper touches the box at its blade's root beside the wrist
-        and at the fixed blade's tip 13 cm further on, so that moment can
-        only be carried by the contacts loading unevenly: the face digs in
-        as the tip lifts, the pinch. :func:`squeeze_lean` gives, from the
+        parcel gripper touches the box with its plate's face along the
+        wrist, or its chamfer facet and the fixed blade's tip 7 cm further
+        on, so that moment can only be carried by the contacts loading
+        unevenly: the facet digs in as the tip lifts, the pinch. :func:`squeeze_lean` gives, from the
         arm's Jacobian at the commanded pose and its joint stiffness, the
         target offset (a yaw of about a degree per centimetre of depth, a
         touch of roll for the tall face, a millimetre of translation) that
@@ -1508,8 +1493,7 @@ class IKWorker:
             self._lean_force = 0.0
             self._log_clamp(now, depths, {}, toe, still)
             return self._apply_trim(targets, normals, up)
-        grasp = self._box_grasp()
-        tool = self._fitted_tool()
+        tool = self._box_tool()
         kp = {"left": kp_l, "right": kp_r}
         out: dict[str, Pose] = {}
         forces: list[float] = []
@@ -1531,7 +1515,7 @@ class IKWorker:
                 kp[side],
                 rot_cmd,
                 normals[side],
-                np.asarray(tool.contacts(grasp, box.face[side])),
+                np.asarray(tool.contacts(box.face[side])),
                 depth,
                 cap,
             )

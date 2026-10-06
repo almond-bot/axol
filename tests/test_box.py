@@ -11,6 +11,7 @@ import unittest
 import numpy as np
 
 from almond_axol.teleop.box import (
+    PARCEL_FACET_DEG,
     URDF_TOOL,
     BoxState,
     ToolGeometry,
@@ -320,26 +321,74 @@ class ParcelToolTest(unittest.TestCase):
         self.assertEqual(URDF_TOOL.flush_tilt, 0.0)
         np.testing.assert_array_equal(URDF_TOOL.foot(1.0), np.zeros(3))
 
-    def test_the_blade_folded_flat_puts_the_face_beside_the_mount(self) -> None:
-        # At the 180° stop the folded blade lies along the fingers: its face
-        # is the hinge-to-face distance (29 mm) toward the box, level with
-        # the mount, whatever the angled yaw.
+    def test_the_foot_is_the_plate_edge_in_both_grasps(self) -> None:
+        # The folded plate's face is 41.5 mm toward the box; its front edge,
+        # where the chamfer facet starts, 54 mm ahead of the mount.
         for flush_deg in (0.0, 39.0):
-            tool = parcel_tool(flush_deg)
-            self.assertAlmostEqual(tool.foot_fwd, 0.0, places=9)
-            self.assertAlmostEqual(tool.foot_in, 0.029, places=9)
+            for grasp in ("straight", "flush"):
+                tool = parcel_tool(flush_deg, grasp)
+                self.assertAlmostEqual(tool.foot_fwd, 0.0542, places=9)
+                self.assertAlmostEqual(tool.foot_in, 0.0415, places=9)
+
+    def test_the_facet_and_tip_lie_on_the_box_side_at_the_chamfer_angle(self) -> None:
+        # Turned by the chamfer's angle about the edge, the facet's and the
+        # tip's contacts are all on the plane the plate's face was on.
+        tool = parcel_tool(PARCEL_FACET_DEG)
+        ideal = _parcel_pair(0.30, tool, 1.0)
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = ideal[side]
+            for c in tool.contacts(1.0):
+                lateral = float((pos + rot @ c)[1])
+                self.assertAlmostEqual(lateral, sign * 0.15, delta=0.0005)
 
     def test_min_width_keeps_the_bodies_apart(self) -> None:
-        tool = parcel_tool(39.0)
-        # Flush: the folded face is 29 mm inboard of the axis, nearly level
-        # with the 33.5 mm wrist — the wrists a centimetre apart at 19 mm.
-        self.assertAlmostEqual(tool.min_width("flush", 0.01), 0.019, places=9)
-        # Straight: the face sits on the axis and the wrists close with the
-        # width — they are a centimetre apart at 77 mm.
-        self.assertAlmostEqual(tool.min_width("straight", 0.01), 0.077, places=9)
-        self.assertAlmostEqual(URDF_TOOL.min_width("flush", 0.01), 0.077, places=9)
-        self.assertAlmostEqual(URDF_TOOL.min_width("straight", 0.0), 0.067, places=9)
-        self.assertEqual(ToolGeometry(body_in=0.0).min_width("straight", 0.01), 0.01)
+        # The parcel gripper's contact faces are proud of its body in both
+        # grasps: only the clearance is left.
+        for grasp in ("straight", "flush"):
+            tool = parcel_tool(39.0, grasp)
+            self.assertAlmostEqual(tool.min_width(0.01), 0.01, places=9)
+        # The stock gripper's face is on the mount axis and the 67 mm wrists
+        # close with the width — a centimetre apart at 77 mm.
+        self.assertAlmostEqual(URDF_TOOL.min_width(0.01), 0.077, places=9)
+        self.assertAlmostEqual(URDF_TOOL.min_width(0.0), 0.067, places=9)
+        self.assertEqual(ToolGeometry(body_in=0.0).min_width(0.01), 0.01)
+
+    def test_a_grasp_switch_rolls_about_the_edge(self) -> None:
+        # Holding a box in the straight grasp, then snapping to the angled
+        # one: the width is unchanged, the edge stays where it is through
+        # the blend, and the facet and tip end on the box side.
+        straight, flush = parcel_tool(39.0, "straight"), parcel_tool(39.0)
+        held = _parcel_pair(0.30, straight, 1.0)
+        faces = {"left": 1.0, "right": 1.0}
+        state = snap_box(
+            held["left"],
+            held["right"],
+            now=0.0,
+            align_duration=1.0,
+            width_min=0.02,
+            width_max=0.7,
+            tool=flush,
+            faces=faces,
+        )
+        self.assertAlmostEqual(state.width, 0.30, places=6)
+        for t in np.linspace(0.0, 1.0, 11):
+            targets = box_targets(state, state.center, state.rot, now=float(t))
+            for side in ("left", "right"):
+                p0, r0 = held[side]
+                p1, r1 = targets[side]
+                np.testing.assert_allclose(
+                    p0 + r0 @ flush.foot(1.0), p1 + r1 @ flush.foot(1.0), atol=1e-6
+                )
+        done = box_targets(state, state.center, state.rot, now=1.0)
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = done[side]
+            self.assertAlmostEqual(
+                math.degrees(rotation_angle(held[side][1], rot)), 39.0, places=4
+            )
+            for c in flush.contacts(1.0):
+                self.assertAlmostEqual(
+                    float((pos + rot @ c)[1]), sign * 0.15, delta=0.001
+                )
 
     def test_the_angled_grasp_turns_the_grippers_in_about_the_face(self) -> None:
         tool = parcel_tool(39.0)
@@ -995,21 +1044,26 @@ class StickControlTest(unittest.TestCase):
         self.assertAlmostEqual(box.width, 0.1, places=6)
 
     def test_width_floor_follows_the_grasp(self) -> None:
-        # The operator's floor is 2 cm; with the parcel gripper the straight
-        # grasp stops where the wrists would meet, the flush grasp closes
-        # to the floor.
+        # The operator's floor is 2 cm. The parcel gripper's contact faces
+        # are proud of its body in both grasps, so they close to the floor;
+        # the stock gripper stops where its wrists would meet.
         worker = _stick_worker()
         worker._config.box_width_min = 0.02
-        worker._config.box_tool = "parcel"
         worker._config.box_flush_deg = 39.0
         frame = _stick_frame(r_stick_x=-1.0)
-        for grasp, floor in (("straight", 0.077), ("flush", 0.02)):
+        for tool, grasp, floor in (
+            ("parcel", "straight", 0.02),
+            ("parcel", "flush", 0.02),
+            ("urdf", "straight", 0.077),
+            ("urdf", "flush", 0.077),
+        ):
+            worker._config.box_tool = tool
             worker._config.box_grasp = grasp
             box = _box_state()
             worker._integrate_sticks(frame, box, now=0.0)
             for i in range(1, 100):
                 worker._integrate_sticks(frame, box, now=0.1 * i)
-            self.assertAlmostEqual(box.width, floor, places=6, msg=grasp)
+            self.assertAlmostEqual(box.width, floor, places=6, msg=(tool, grasp))
         self.assertEqual(VRTeleopConfig().box_width_min, 0.02)
 
     def test_tilt_seeds_the_next_engage(self) -> None:

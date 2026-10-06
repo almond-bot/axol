@@ -811,9 +811,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "the squeeze builds — about 1.3° of inward yaw per cm "
                     "jogged past contact at 1×, from the arm's stiffness "
                     "model — so the clamp presses evenly on the parcel "
-                    "blade's root and its tip instead of the face digging in "
+                    "gripper's facet and tip instead of the facet digging in "
                     "while the tip lifts. Raise it if the tip still lifts as "
-                    "you squeeze, lower it if the face by the wrist lifts "
+                    "you squeeze, lower it if the facet lifts "
                     "instead; 0 turns it off. Also adjustable live from the "
                     "headset menu (Squeeze lean). Hardware only."
                 ),
