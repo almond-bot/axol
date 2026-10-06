@@ -32,10 +32,13 @@ import numpy as np
 #: Defaults, sized on the jelly robot's saved replays (2026-10-06): healthy
 #: runs peak at ~7° deviation (slow_osc's elbow at 100°/s), ~0.37° RMS at
 #: 1.5-15 Hz and ~0.04° RMS above 15 Hz; the runs that rang reached 11-14°,
-#: 2.0-2.4° and 0.11-0.16°.
+#: 2.0-2.4° and 0.11-0.16°. The vibration limit has margin over a
+#: recorded slow_osc's ~0.10° at shoulder_1's 75°/s peak (the core trace
+#: adds jitter): it is the backstop for a violent buzz, the oscillation
+#: check catches the rings.
 DEFAULT_DEV_DEG = 10.0
 DEFAULT_OSC_DEG = 1.0
-DEFAULT_VIB_DEG = 0.10
+DEFAULT_VIB_DEG = 0.15
 DEFAULT_WINDOW_S = 0.5
 DEFAULT_HOLD_S = 0.05
 

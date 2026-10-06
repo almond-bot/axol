@@ -1939,6 +1939,7 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
         # defaults: limits sized for a creep replay must not make the move
         # home after a trip trip again.
         floor = guard_scale > 1.0
+        guard_prev_cmd: np.ndarray | None = None
         guard = (
             None
             if args.no_guard
@@ -2033,13 +2034,32 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
                 if abs(off) > _FW_DEVIATION_ABORT:
                     raise _Runaway(name, math.degrees(off))
             if guard is not None:
+                # Each joint's measurement is as old as its last feedback
+                # frame (the core refreshes the cache at its own tick):
+                # compare it with the command of that moment, extrapolated
+                # back along the commanded velocity. Against the command
+                # just sent, the varying cache age is a sawtooth of
+                # velocity x age — 0.3° per tick on shoulder_1 at 75°/s —
+                # that reads as a > 15 Hz vibration.
+                now_wall = time.time()
+                cmd_now = np.concatenate(
+                    [(left if side == "left" else right)[:7] for side, _ in guard_arms]
+                ).astype(np.float64)
+                cmd_vel = (
+                    (cmd_now - guard_prev_cmd) / period
+                    if guard_prev_cmd is not None
+                    else np.zeros_like(cmd_now)
+                )
+                guard_prev_cmd = cmd_now
+                age = np.concatenate(
+                    [_feedback_offsets(arm, now_wall) for _, arm in guard_arms]
+                )
                 err = np.concatenate(
                     [
                         np.asarray(arm.positions[:7], dtype=np.float64)
-                        - (left if side == "left" else right)[:7]
-                        for side, arm in guard_arms
+                        for _, arm in guard_arms
                     ]
-                )
+                ) - (cmd_now + cmd_vel * age)
                 trip = guard.update(err, scale=guard_scale)
                 if trip is not None:
                     _clear_extra_torque(axol)
