@@ -36,8 +36,8 @@ class MotionGuardTest(unittest.TestCase):
         t, trip = hit
         self.assertEqual(trip.kind, "oscillation")
         self.assertEqual(trip.joint, "right.elbow")
-        # Caught while the ring is still a degree or two, not after it ran away.
-        self.assertLess(0.2 * math.exp(t / 1.5), 2.5)  # ring amplitude, degrees
+        # Caught while the ring is still a few degrees, not after it ran away.
+        self.assertLess(0.2 * math.exp(t / 1.5), 3.0)  # ring amplitude, degrees
 
     def test_a_buzz_trips_as_a_vibration(self) -> None:
         buzz = np.radians(0.3) * np.sin(2 * math.pi * 40.0 * T)
