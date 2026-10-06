@@ -7,7 +7,6 @@ import math
 import time
 import types
 import unittest
-from unittest import mock
 
 import numpy as np
 
@@ -30,10 +29,8 @@ from almond_axol.teleop.box import (
     snap_box,
     tip_inward_sign,
     toe_out,
-    turn_about_line,
     twist_about,
 )
-from almond_axol.constants import ARM_JOINTS, Joint
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.teleop.live import LiveSettings
@@ -434,13 +431,11 @@ class ParcelToolTest(unittest.TestCase):
             box_face_left="-x",
             box_face_right="auto",
         )
-        # The angle is the wrist_2 turn (_step_box), not a pose tilt.
-        self.assertEqual(worker._fitted_tool().flush_tilt, 0.0)
-        self.assertGreater(worker._fitted_tool().tip_fwd, 0.0)
+        self.assertAlmostEqual(math.degrees(worker._box_tool().flush_tilt), 30.0)
         self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 0.0})
         worker._config.box_tool = "urdf"
         worker._config.box_face_right = "+x"
-        self.assertIs(worker._fitted_tool(), URDF_TOOL)
+        self.assertIs(worker._box_tool(), URDF_TOOL)
         self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 1.0})
 
 
@@ -466,7 +461,6 @@ def _stick_worker(leader: str = "left") -> IKWorker:
         box_elbow_speed=30.0,
     )
     worker._box_leader = leader
-    worker._w2_floor = 0.0
     return worker
 
 
@@ -1002,16 +996,15 @@ class StickControlTest(unittest.TestCase):
 
     def test_width_floor_follows_the_grasp(self) -> None:
         # The operator's floor is 2 cm; with the parcel gripper the straight
-        # grasp stops where the wrists would meet, the flush grasp where the
-        # turned grippers would (the floor its snap set, _turned_floor).
+        # grasp stops where the wrists would meet, the flush grasp closes
+        # to the floor.
         worker = _stick_worker()
         worker._config.box_width_min = 0.02
         worker._config.box_tool = "parcel"
         worker._config.box_flush_deg = 39.0
         frame = _stick_frame(r_stick_x=-1.0)
-        for grasp, floor in (("straight", 0.077), ("flush", 0.22)):
+        for grasp, floor in (("straight", 0.077), ("flush", 0.02)):
             worker._config.box_grasp = grasp
-            worker._w2_floor = 0.22 if grasp == "flush" else 0.0
             box = _box_state()
             worker._integrate_sticks(frame, box, now=0.0)
             for i in range(1, 100):
@@ -1068,9 +1061,6 @@ class _FakeCore:
 class _RecordingSolver:
     """Solver stub for ``_step_box``: fixed FK, ``ik`` records its targets."""
 
-    left_indices = list(range(7))
-    right_indices = list(range(7, 14))
-
     def __init__(self) -> None:
         self.left_pose = (
             np.array((0.40, 0.20, 0.30), np.float32),
@@ -1093,17 +1083,6 @@ class _RecordingSolver:
         self.calls.append(kwargs)
         return np.asarray(q, dtype=np.float32).copy()
 
-    def joint_limits(self, joint: object) -> dict[str, tuple[float, float]]:
-        del joint
-        return {"left": (-1.5708, 1.5708), "right": (-1.5708, 1.5708)}
-
-    def joint_axes(self, q: np.ndarray, joint: object, *, mount_frame: bool = False):
-        """Wrist_2 lines in the mount frame: 9 cm behind it, along its ``Y``."""
-        del q, joint
-        assert mount_frame
-        line = (np.array((0.0, 0.0, 0.09)), np.array((0.0, 1.0, 0.0)))
-        return {"left": line, "right": line}
-
 
 def _box_worker(leader: str = "left") -> IKWorker:
     worker = object.__new__(IKWorker)
@@ -1123,7 +1102,6 @@ def _box_worker(leader: str = "left") -> IKWorker:
         box_elbow_weight=0.0,
     )
     worker._solver = _RecordingSolver()
-    worker._init_wrist_turn()
     worker._rec = None
     worker._active = {"left": True, "right": True}
     worker._hold_fk = {}
@@ -1240,123 +1218,6 @@ class HandTrackingTest(unittest.TestCase):
         self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)) + shift)
 
 
-_W2 = ARM_JOINTS.index(Joint.WRIST_2)
-_W2_INDEX = {"left": _W2, "right": 7 + _W2}
-
-
-class WristTurnTest(unittest.TestCase):
-    """The angled grasp is an exact wrist_2 turn on top of the straight solve."""
-
-    def _step(self, worker: IKWorker, q: np.ndarray, **clicks: bool) -> np.ndarray:
-        frame = _stick_frame(**clicks)
-        frame.box_leader = "left"
-        ctrl = {
-            "left": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
-            "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
-        }
-        return worker._step_box(frame, q, ctrl, ctrl["left"][0], ctrl["right"][0])
-
-    def _flush(self, align: float = 0.0) -> tuple[IKWorker, np.ndarray]:
-        worker = _box_worker()
-        cfg = worker._config
-        cfg.box_tool = "parcel"
-        cfg.box_flush_deg = 39.0
-        cfg.box_grasp = "flush"
-        cfg.box_align_duration = align
-        worker._box = None
-        q = np.linspace(-0.3, 0.3, 14).astype(np.float32)
-        self._step(worker, q)  # snap (holds)
-        return worker, q
-
-    def test_wrist_2_alone_turns_by_the_angle(self) -> None:
-        worker, q = self._flush()
-        out = self._step(worker, q)
-        moved = np.flatnonzero(np.abs(out - q) > 1e-7)
-        self.assertEqual(sorted(moved.tolist()), sorted(_W2_INDEX.values()))
-        for side, index in _W2_INDEX.items():
-            self.assertAlmostEqual(
-                abs(math.degrees(out[index] - q[index])), 39.0, places=4
-            )
-        # The solve itself was the straight grasp's: seeded un-turned, and
-        # aimed at the pair's straight targets.
-        straight = box_targets(worker._box, worker._box.center, worker._box.rot, 0.0)
-        call = worker._solver.calls[-1]
-        for side in ("left", "right"):
-            np.testing.assert_allclose(
-                call[f"{side}_pose"][0], straight[side][0], atol=1e-6
-            )
-            np.testing.assert_allclose(
-                call[f"{side}_pose"][1], straight[side][1], atol=1e-6
-            )
-
-    def test_the_turn_is_not_added_twice(self) -> None:
-        worker, q = self._flush()
-        first = self._step(worker, q)
-        out = first
-        for _ in range(5):
-            out = self._step(worker, out)
-        np.testing.assert_allclose(out, first, atol=1e-6)
-        # A re-snap (leader handover, say) keeps it too.
-        worker._box_leader = "right"
-        out = self._step(worker, out)  # snap
-        out = self._step(worker, out)
-        np.testing.assert_allclose(out, first, atol=1e-6)
-
-    def test_the_fingertips_swing_toward_the_box(self) -> None:
-        worker, _q = self._flush()
-        box = worker._box
-        straight = box_targets(box, box.center, box.rot, 0.0)
-        lateral = box.rot[:, 1]
-        line = worker._solver.joint_axes(None, Joint.WRIST_2, mount_frame=True)
-        for side in ("left", "right"):
-            pos, rot = straight[side]
-            turned = turn_about_line(straight[side], *line[side], worker._w2_goal[side])
-            tip = np.array((0.0, 0.0, -0.1385), np.float32)
-            before = float((pos + rot @ tip - box.center) @ lateral)
-            after = float((turned[0] + turned[1] @ tip - box.center) @ lateral)
-            self.assertLess(abs(after), abs(before) - 0.05, side)
-
-    def test_the_turn_blends_over_the_align_and_back(self) -> None:
-        clock = [100.0]
-        with mock.patch(
-            "almond_axol.teleop.worker.time.perf_counter", lambda: clock[0]
-        ):
-            worker, q = self._flush(align=1.0)
-            clock[0] += 0.5
-            half = self._step(worker, q)  # smoothstep(0.5) = 0.5
-            for index in _W2_INDEX.values():
-                self.assertAlmostEqual(
-                    abs(math.degrees(half[index] - q[index])), 19.5, places=3
-                )
-            clock[0] += 0.6
-            full = self._step(worker, half)
-            for index in _W2_INDEX.values():
-                self.assertAlmostEqual(
-                    abs(math.degrees(full[index] - q[index])), 39.0, places=3
-                )
-            worker.set_config("box_grasp", "straight")
-            self._step(worker, full)  # re-snap: blends back from 39°
-            clock[0] += 2.0
-            back = self._step(worker, full)
-        np.testing.assert_allclose(back, q, atol=1e-6)
-        self.assertEqual(worker._w2_turn, {"left": 0.0, "right": 0.0})
-
-    def test_the_width_floor_keeps_the_turned_grippers_apart(self) -> None:
-        worker, _q = self._flush()
-        straight_floor = parcel_tool(0.0).min_width("straight", 0.01)
-        self.assertGreater(worker._w2_floor, straight_floor + 0.1)
-        self.assertGreaterEqual(worker._box.width, worker._w2_floor)
-        self.assertEqual(worker._box_width_min(), worker._w2_floor)
-
-    def test_engage_reset_drops_the_turn(self) -> None:
-        worker, q = self._flush()
-        self._step(worker, q)
-        self.assertTrue(any(worker._w2_turn.values()))
-        worker.clear_engage()
-        self.assertEqual(worker._w2_turn, {"left": 0.0, "right": 0.0})
-        self.assertEqual(worker._w2_floor, 0.0)
-
-
 class GraspToggleTest(unittest.TestCase):
     """A single stick click (and release) while leading flips box mode's grasp
     between flush and straight, and the pair re-snaps into it; the both-sticks
@@ -1397,11 +1258,9 @@ class GraspToggleTest(unittest.TestCase):
         self._step(worker)  # release: to flush (39°) ...
         self.assertEqual(worker._config.box_grasp, "flush")
         self._step(worker)
-        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
-        for side in ("left", "right"):
-            self.assertAlmostEqual(
-                abs(math.degrees(worker._w2_goal[side])), 39.0, places=6
-            )
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 39.0, places=6
+        )
         self._step(worker, l_stick_click=True)
         self._step(worker)  # ... and back
         self.assertEqual(worker._config.box_grasp, "straight")
@@ -1413,11 +1272,9 @@ class GraspToggleTest(unittest.TestCase):
         worker._box = None
         self._step(worker)  # snap (flush)
         self._step(worker)
-        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
-        for side in ("left", "right"):
-            self.assertAlmostEqual(
-                abs(math.degrees(worker._w2_goal[side])), 39.0, places=6
-            )
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 39.0, places=6
+        )
         n_solves = len(worker._solver.calls)
         self._step(worker, l_stick_click=True)  # press: armed, no toggle yet
         self.assertEqual(worker._config.box_grasp, "flush")
@@ -1427,7 +1284,7 @@ class GraspToggleTest(unittest.TestCase):
         self.assertIsNone(worker._box)
         self._step(worker)  # re-snap in the straight grasp
         self.assertIsNotNone(worker._box)
-        self.assertEqual(worker._w2_goal, {"left": 0.0, "right": 0.0})
+        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
         status = worker.pair_status(np.zeros(14))
         self.assertEqual(status["grasp"], "straight")
         self.assertEqual(status["elbow"], worker._config.box_elbow_out)

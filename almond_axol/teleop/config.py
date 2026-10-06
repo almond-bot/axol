@@ -150,30 +150,25 @@ class VRTeleopConfig:
             (:class:`~almond_axol.teleop.box.ToolGeometry`). ``"parcel"``
             (the default): the parcel gripper — a fixed blade on the mount
             axis and a hinged blade that folds back toward the box side to
-            its open stop, flat against the fixed blade; the angled grasp
-            turns each gripper's ``wrist_2`` by ``box_flush_deg``.
-            ``"urdf"``: the stock two-finger gripper the URDF carries —
-            the flat side of the closed fingers faces the box at tilt 0,
-            and there is no angled grasp. Either way the mounts are
-            ``width`` apart; the tool sets where the clamp presses (the
-            squeeze lean) and how close the grippers may come.
+            its open stop, flat against the fixed blade. The width is
+            measured between the folded blades' faces, and the angled grasp
+            turns each gripper ``box_flush_deg`` inward about its face.
+            ``"urdf"``: the stock two-finger gripper
+            the URDF carries — the mounts themselves are ``width`` apart
+            and the flat side of the closed fingers faces the box at tilt 0.
             Live-adjustable.
         box_flush_deg: Parcel gripper only: how far (degrees) box mode's
-            angled (``"flush"``) grasp turns each arm's ``wrist_2`` motor
-            from the straight grasp, fingertips inward — exactly that joint
-            and nothing else: the IK solves the straight grasp and the turn
-            is added to the ``wrist_2`` command. The gripper swings about
-            that joint's axis, behind the mount, so the tips come in toward
-            each other (~13 cm each at 39°) and the width floor rises to
-            keep them apart. The blade stays at its open stop in this grasp
-            as everywhere else. Live-adjustable.
+            angled (``"flush"``) grasp turns each gripper inward from the
+            parallel grasp, about the folded blade's contact face — on the
+            arm, mostly a ``wrist_2`` turn. The blade stays at its open stop
+            in this grasp as everywhere else. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
             width between the mount frames — the plain flat-hands grasp,
             the blade at its stop. ``"flush"``: for the parcel gripper,
-            the straight grasp with each ``wrist_2`` turned
-            ``box_flush_deg`` (39°) fingertips inward, the blade still at
-            its stop and the width still between the mounts. Toggled live while a grip is leading by clicking (and
+            each gripper turned ``box_flush_deg`` (39°) inward about its
+            contact face, the blade still at its stop and the width still
+            measured between the faces. Toggled live while a grip is leading by clicking (and
             releasing) either thumbstick — a click that turns into the
             both-sticks box-mode gesture doesn't count — or from the
             settings; the pair blends into the new grasp over
@@ -187,23 +182,26 @@ class VRTeleopConfig:
             the box (the blade folds away from it) or its motor cap
             downward, pin that arm to the other side. Live-adjustable.
         box_grip_tilt: Fixed inward yaw trim (degrees) of each gripper in
-            box mode, about the mount, under the angled grasp's ``wrist_2``
-            turn. ``0`` holds the gripper's flat side parallel to the box
-            side (for the URDF gripper that is fingers
+            box mode, on top of the grasp's yaw (``straight`` 0°, ``flush``
+            the tool's flush tilt). ``0`` holds the tool's contact face
+            parallel to the box side (for the URDF gripper that is fingers
             straight forward; its closed fingers are a wedge that narrows
             toward the tip, so ~20° there lies the finger face flush instead
             of touching along its heel). Positive turns the fingertips
-            toward the box centre, negative splays them outward. A
-            calibration constant, not a live control —
+            toward the box centre, negative splays them outward; the gripper
+            pivots about its contact face, so the trim doesn't move the
+            point of contact. A calibration constant, not a live control —
             the sticks no longer change it.
         box_width_speed: Rate (m/s) the grip width changes at full stick
             deflection in box mode.
-        box_width_min: Smallest grip width (m, between the two gripper
-            mount frames) the box-mode sticks allow. The fitted tool raises
-            it to where the two grippers would come a centimetre apart:
-            ~77 mm in the straight grasp (the wrists meeting,
-            ``ToolGeometry.min_width``), and in the angled grasp wherever
-            the turned fingertips would (~0.22 m at 39°). Clamping a box means
+        box_width_min: Smallest grip width (m, between the two grippers'
+            contact faces — for the URDF gripper, between the mount frames)
+            the box-mode sticks allow. A floor for thin parcels: the
+            fitted tool raises it, per grasp, to where the two grippers'
+            bodies would meet (``ToolGeometry.min_width`` — with the parcel
+            gripper the flush grasp's faces are proud of the wrists and
+            may close to this value, while the straight grasp stops at
+            ~77 mm, the wrists a centimetre apart). Clamping a box means
             jogging the width *past* its size, so this sits well under the
             thinnest parcel.
         box_width_max: Largest grip width (m) the box-mode sticks allow.

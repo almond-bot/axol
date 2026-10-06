@@ -19,7 +19,6 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, Joint
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
@@ -45,7 +44,6 @@ from .box import (
     squeeze_lean,
     tip_inward_sign,
     toe_out_sides,
-    turn_about_line,
     twist_about,
 )
 from .config import VRTeleopConfig
@@ -165,10 +163,6 @@ def _dz(v: float) -> float:
 # Clearance (m) kept between the two grippers' bodies when the width is
 # closed with nothing between them (see ToolGeometry.min_width).
 _BODY_CLEARANCE_M = 0.01
-# A fingertip point for choosing the angled grasp's turn direction on a tool
-# modelled without one (m along the fingers): only the direction it swings
-# matters.
-_NOMINAL_TIP_M = 0.1
 # Range (degrees from straight down) the sticks jog ``box_elbow_out`` over:
 # elbows hanging under the shoulder-wrist line to held out level.
 _ELBOW_OUT_MIN = 0.0
@@ -453,13 +447,6 @@ class IKWorker:
         self._box_snap: (
             tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None
         ) = None
-        # The angled grasp is a turn of each wrist_2 motor on top of the
-        # straight grasp's solve (_step_box). ``_w2_turn`` is the turn (rad,
-        # signed motor angle) in the last command — so in q_current —
-        # ``_w2_from`` / ``_w2_goal`` the blend the pair runs from its snap,
-        # and ``_w2_floor`` the grip width the turned grippers need (0 when
-        # the goal is no turn).
-        self._init_wrist_turn()
         # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
         # and joint stiffness as last reported by the core (``("meas", ...)``,
         # hardware only — the sim reports none), the low-passed clamp depth
@@ -748,9 +735,6 @@ class IKWorker:
                 lp,
                 rp,
             )
-        # The per-arm path solves from q_current as it is: any wrist_2 turn
-        # box mode left in it is just part of the pose now.
-        self._clear_wrist_turn()
         if self._box is not None:
             # Box tracking ended without a lock-less frame in between (mode
             # switched while engaged): the per-arm path below re-engages each
@@ -1240,8 +1224,9 @@ class IKWorker:
         would blend it (see :func:`~almond_axol.teleop.box.pair_aligned`) —
         and the gap is inside the box-mode width range, so switching to box
         mode from here costs (almost) no alignment blend. ``width`` is the
-        grip width in metres — the separation of the gripper mounts, the
-        angled grasp's wrist_2 turn taken out — ``grasp`` the grasp in
+        grip width in metres — the separation the fitted tool's contact
+        faces would have with the mounts where they are (the mount
+        separation itself for the URDF gripper) — ``grasp`` the grasp in
         force (``"straight"`` / ``"flush"``) and ``elbow`` the elbows-out
         angle (degrees, ``config.box_elbow_out``) the sticks may have jogged.
         ``squeeze`` is the clamp force (N, per arm) the last box-mode solve
@@ -1250,8 +1235,8 @@ class IKWorker:
         added to the gripper targets on top of the lean, ``trims`` the two
         arms' own (``[left, right]``).
         """
-        left, right = self._solver.fk(self._unturned(q))
-        tool = URDF_TOOL
+        left, right = self._solver.fk(q)
+        tool = self._box_tool()
         faces = self._box_faces()
         tilt = math.radians(self._config.box_grip_tilt)
         _c, rot, sep = box_frame(left[0], right[0])
@@ -1297,132 +1282,54 @@ class IKWorker:
         raw = str(getattr(self._config, "box_grasp", "straight")).strip().lower()
         return "flush" if raw == "flush" else "straight"
 
+    def _box_tool(self) -> ToolGeometry:
+        """The box-mode contact geometry for the current grasp and tool.
+
+        The ``"straight"`` grasp is the plain flat-hands geometry whatever is
+        fitted — fingers straight forward, width between the mounts
+        (:data:`URDF_TOOL`); ``"flush"`` uses the fitted tool's
+        (``config.box_tool``).
+        """
+        cfg = self._config
+        if self._box_grasp() == "straight":
+            return URDF_TOOL
+        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
+        if kind not in ("parcel", "urdf"):
+            _logger.warning(
+                "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
+            )
+        return self._fitted_tool()
+
     def _box_width_min(self) -> float:
         """The smallest grip width the sticks (and an engage snap) allow now.
 
-        ``config.box_width_min`` — the operator's floor between the mounts —
-        or, if larger, the width at which the fitted tool's bodies would
-        come within ``_BODY_CLEARANCE_M`` of each other with the fingers
-        straight (:meth:`ToolGeometry.min_width`, ~77 mm, the wrists
-        meeting) or turned by the angled grasp (:meth:`_turned_floor`, set
-        at each snap).
+        ``config.box_width_min`` — the operator's floor between the contact
+        faces — or, if larger, the width at which the fitted tool's bodies
+        would come within ``_BODY_CLEARANCE_M`` of each other in the
+        current grasp (:meth:`ToolGeometry.min_width`). With the parcel
+        gripper the flush grasp's faces are proud of the wrist, so they
+        may close to the operator's floor; in the straight grasp (the face
+        on the mount axis) the wrists meet first, at ~77 mm.
         """
         cfg = self._config
         return max(
             float(cfg.box_width_min),
-            self._fitted_tool().min_width("straight", _BODY_CLEARANCE_M),
-            self._w2_floor,
+            self._fitted_tool().min_width(self._box_grasp(), _BODY_CLEARANCE_M),
         )
 
     def _fitted_tool(self) -> ToolGeometry:
         """The contact geometry of the tool actually fitted (``config.box_tool``).
 
-        Where it touches the box (:meth:`ToolGeometry.contacts`, for the
-        squeeze lean) and how far it reaches toward the other gripper (the
-        width floors); the pair itself is placed by its mounts in either
-        grasp.
+        Unlike :meth:`_box_tool` this does not fall back to the flat-hands
+        geometry in the ``"straight"`` grasp: the squeeze lean wants where
+        the fitted tool touches the box in *either* grasp
+        (:meth:`ToolGeometry.contacts`).
         """
         cfg = self._config
         kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
         if kind == "parcel":
-            return parcel_tool(0.0)
-        if kind != "urdf":
-            _logger.warning(
-                "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
-            )
+            return parcel_tool(float(getattr(cfg, "box_flush_deg", 39.0)))
         return URDF_TOOL
-
-    def _init_wrist_turn(self) -> None:
-        """Start with no wrist_2 turn; look up the joint's indices and limits."""
-        self._clear_wrist_turn()
-        w2 = ARM_JOINTS.index(Joint.WRIST_2)
-        self._w2_index = {
-            "left": int(self._solver.left_indices[w2]),
-            "right": int(self._solver.right_indices[w2]),
-        }
-        self._w2_limits = self._solver.joint_limits(Joint.WRIST_2)
-
-    def _unturned(self, q: np.ndarray) -> np.ndarray:
-        """``q`` with the angled grasp's wrist_2 turn (``_w2_turn``) taken back out."""
-        out = np.asarray(q, dtype=np.float32).copy()
-        for side, turn in self._w2_turn.items():
-            out[self._w2_index[side]] -= turn
-        return out
-
-    def _clear_wrist_turn(self) -> None:
-        """Forget the wrist_2 turn: the next command carries none on top of q."""
-        self._w2_turn = {"left": 0.0, "right": 0.0}
-        self._w2_from = {"left": 0.0, "right": 0.0}
-        self._w2_goal = {"left": 0.0, "right": 0.0}
-        self._w2_floor = 0.0
-
-    def _snap_wrist_turn(self, box: BoxState, q_current: np.ndarray) -> None:
-        """Set the wrist_2 turn the pair blends to from a snap, and its width floor.
-
-        With the parcel gripper fitted (``config.box_tool``; the stock one
-        has no angled grasp) the angled grasp turns each wrist_2 by
-        ``config.box_flush_deg``, in
-        the sense that swings the fingertip in toward the box (the joint's
-        axis is nearly the gripper's vertical in the side clamp), from
-        wherever the turn is now; the straight grasp turns it back to 0.
-        The width is not changed for the turn beyond the floor the turned
-        grippers need: the fingers swing in toward each other about the
-        joint, behind the mount.
-        """
-        self._w2_from = dict(self._w2_turn)
-        self._w2_goal = {"left": 0.0, "right": 0.0}
-        self._w2_floor = 0.0
-        if self._box_grasp() != "flush":
-            return
-        tool = self._fitted_tool()
-        angle = math.radians(float(getattr(self._config, "box_flush_deg", 0.0)))
-        if not angle or tool is URDF_TOOL:
-            return
-        lines = self._solver.joint_axes(
-            self._unturned(q_current), Joint.WRIST_2, mount_frame=True
-        )
-        for side in ("left", "right"):
-            face = box.face[side]
-            point, axis = lines[side]
-            tip = (
-                np.asarray(tool.tip(face), dtype=np.float64)
-                if tool.tip_fwd
-                else np.array((0.0, 0.0, -_NOMINAL_TIP_M))
-            )
-            swing = float(np.cross(axis, tip - point)[0]) * face
-            self._w2_goal[side] = angle if swing >= 0.0 else -angle
-        self._w2_floor = self._turned_floor(tool, box.face, lines)
-        box.width = max(box.width, self._w2_floor)
-
-    def _turned_floor(
-        self,
-        tool: ToolGeometry,
-        faces: dict[str, float],
-        lines: dict[str, tuple[np.ndarray, np.ndarray]],
-    ) -> float:
-        """Mount separation at which the turned grippers are ``_BODY_CLEARANCE_M`` apart.
-
-        Each gripper turns ``_w2_goal`` about its wrist_2 axis (``lines``,
-        mount frame), so its fingertip (where the tool has one), its
-        contact foot and its body's inboard edge at the mount (``body_in``
-        across the mount axis) move in or out of the gap; the floor is the
-        clearance plus how far each side's innermost point then reaches
-        from its mount axis toward the other gripper.
-        """
-        reach = 0.0
-        for side in ("left", "right"):
-            face = faces[side]
-            inward = np.array((face, 0.0, 0.0))
-            point, axis = lines[side]
-            points = [
-                np.array((face * tool.body_in, 0.0, 0.0)),
-                np.asarray(tool.foot(face), dtype=np.float64),
-            ]
-            if tool.tip_fwd:
-                points.append(np.asarray(tool.tip(face), dtype=np.float64))
-            turn = rodrigues(axis, self._w2_goal[side]).astype(np.float64)
-            reach += max(float((point + turn @ (pt - point)) @ inward) for pt in points)
-        return _BODY_CLEARANCE_M + reach
 
     def note_measured(
         self,
@@ -1741,7 +1648,6 @@ class IKWorker:
         self._box = None
         self._box_leader = None
         self._box_snap = None
-        self._clear_wrist_turn()
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
@@ -1818,8 +1724,7 @@ class IKWorker:
             # Engage snap, or the leading hand changed: (re)anchor to the
             # live pose. A handover mid-align simply restarts the blend from
             # wherever the grippers are, so nothing jumps.
-            l_fk, r_fk = self._solver.fk(self._unturned(q_current))
-            self._w2_floor = 0.0
+            l_fk, r_fk = self._solver.fk(q_current)
             self._box = snap_box(
                 l_fk,
                 r_fk,
@@ -1828,10 +1733,9 @@ class IKWorker:
                 width_min=self._box_width_min(),
                 width_max=cfg.box_width_max,
                 tilt=math.radians(cfg.box_grip_tilt),
-                tool=URDF_TOOL,
+                tool=self._box_tool(),
                 faces=self._box_faces(),
             )
-            self._snap_wrist_turn(self._box, q_current)
             self._box_leader = leader
             self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
             self._ramp = {}
@@ -1839,7 +1743,7 @@ class IKWorker:
             self._hold_fk = {}
             self._hold_elbow_fk = {}
             self._clear_freeze()
-            self._solver.set_posture_pose(self._unturned(q_current))
+            self._solver.set_posture_pose(q_current)
             self._last_solve_t = None
             # A stick already held at the snap can't be the start of a grasp
             # toggle (see _stick_click_toggle).
@@ -1888,38 +1792,8 @@ class IKWorker:
         rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)
-        # The angled grasp: the IK solves the straight grasp and each wrist_2
-        # command gets the turn on top, so the motor turns by exactly the
-        # grasp's angle and no other joint moves for it (a pose-space turn
-        # left wrist_2 at ~31° of 39°, the rest spread over the shoulder
-        # and wrist_3). The squeeze lean works on the real poses — the
-        # straight targets turned about each joint's axis — and its offsets
-        # are turned back for the solve.
-        alpha = box.align_alpha(now)
-        turn = {
-            side: self._w2_from[side]
-            + (self._w2_goal[side] - self._w2_from[side]) * alpha
-            for side in ("left", "right")
-        }
-        q_seed = self._unturned(q_current)
-        lines = (
-            self._solver.joint_axes(q_seed, Joint.WRIST_2, mount_frame=True)
-            if any(turn.values())
-            else None
-        )
-        if lines is not None:
-            targets = {
-                side: turn_about_line(pose, *lines[side], turn[side])
-                for side, pose in targets.items()
-            }
         targets = self._squeeze_lean(box, targets, q_current, now)
-        ik_targets = targets
-        if lines is not None:
-            ik_targets = {
-                side: turn_about_line(pose, *lines[side], -turn[side])
-                for side, pose in targets.items()
-            }
-        elbows = self._box_elbow_hints(q_seed, ik_targets)
+        elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
         # cost well short of the target — posture_weight 5 against pos_weight
@@ -1930,7 +1804,7 @@ class IKWorker:
         # doesn't need one: rest damping holds it where it is, the arm/torso
         # collision model keeps it off the base, and the optional elbow hint
         # (box_elbow_weight > 0) steers it explicitly.
-        self._solver.set_posture_pose(q_seed)
+        self._solver.set_posture_pose(q_current)
 
         delta_scale = 1.0
         if self._last_solve_t is not None:
@@ -1940,9 +1814,9 @@ class IKWorker:
 
         solve_t0 = time.perf_counter()
         q_new = self._solver.ik(
-            q_seed,
-            left_pose=ik_targets["left"],
-            right_pose=ik_targets["right"],
+            q_current,
+            left_pose=targets["left"],
+            right_pose=targets["right"],
             left_elbow_pos=elbows["left"] if elbows else None,
             right_elbow_pos=elbows["right"] if elbows else None,
             delta_scale=delta_scale,
@@ -1950,11 +1824,6 @@ class IKWorker:
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
-        for side, index in self._w2_index.items():
-            lo, hi = self._w2_limits[side]
-            turned = float(np.clip(q_new[index] + turn[side], lo, hi))
-            self._w2_turn[side] = turned - float(q_new[index])
-            q_new[index] = turned
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
