@@ -27,7 +27,7 @@ The upload merges over what the cloud already stores, so a one-arm re-run never 
 | `--left-channel IFACE` / `--right-channel IFACE` | CAN interface overrides (default: the Axol hub's persistent names) |
 | `--profile {slow,standard}` | `slow` (default): the slow-motion friction calibration above. `standard`: the old 7–72°/s Coulomb + viscous fit (no load or low-speed terms) |
 | `--velocities DEG_S …` | Sweep speeds in deg/s (default: slow `1 2 3 5 8 15 30`; standard `7.2 18 36 54 72`) |
-| `--stribeck-gain G` | Stribeck share saved for every joint (default `0.8` on `shoulder_1` and `elbow`, `0` elsewhere) |
+| `--stribeck-gain G` | Stribeck share saved for every joint (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere) |
 | `--raw-dir DIR` | Write each joint's raw sweep samples to `DIR/<side>-<joint>.csv` — re-fit them any time with `tune.friction --fit-csv` |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
 

@@ -11,8 +11,8 @@ One bidirectional multi-velocity sweep per joint yields both fits. The default
 fitted with the realtime core's own friction law (sliding ``fc + fl·|g|``,
 viscous, and the low-speed Stribeck excess ``dfs + ls·|g|`` over ``vs``),
 with the full-range passes' averaged torques feeding the gravity fit; the
-Stribeck share cancelled is saved per joint (0.8 on shoulder_1 and the
-elbow, 0 elsewhere). ``--profile standard`` is the old 7-72 deg/s sweep with
+Stribeck share cancelled is saved per joint (0.8 on shoulder_1,
+shoulder_2 and the elbow, 0 elsewhere). ``--profile standard`` is the old 7-72 deg/s sweep with
 a Coulomb + viscous fit (the same sweep ``tune.friction`` and
 ``tune.gravity`` run individually):
 
@@ -151,7 +151,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         default=None,
         help="Stribeck share saved for every joint (slow profile; default 0.8 "
-        "on shoulder_1 and the elbow, 0 elsewhere)",
+        "on shoulder_1, shoulder_2 and the elbow, 0 elsewhere)",
     )
     p.add_argument(
         "--raw-dir",

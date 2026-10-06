@@ -101,13 +101,17 @@ _WINDOW_BELOW_DEG = 8.0
 _WINDOW_S = 15.0
 _WINDOW_MIN_DEG = 8.0
 #: Default share of the fitted low-speed excess the runtime cancels
-#: (``stribeck_gain``), per joint. On for shoulder_1 and the elbow (right
-#: shoulder_1's creep ripple was lowest at 0.8, 2026-09-24). Off elsewhere:
-#: on the jelly robot's right shoulder_2 / shoulder_3 it raised the slow_osc
-#: ripple 30% / 18% against the same calibration without it — under
-#: shoulder_2's ~17 Nm load the fitted excess is ~2 Nm, driven by the
-#: measured velocity (2026-09-29) — and on the wrists it is untested.
-DEFAULT_STRIBECK_GAIN = {Joint.SHOULDER_1: 0.8, Joint.ELBOW: 0.8}
+#: (``stribeck_gain``), per joint. On for shoulder_1, shoulder_2 and the
+#: elbow (right shoulder_1's creep ripple was lowest at 0.8, 2026-09-24;
+#: shoulder_2's at kp 500 with its host damper, 2026-10-06 — at its old kp
+#: 250 the term raised its slow_osc ripple 30%, 2026-09-29). Off elsewhere:
+#: on shoulder_3 it raised the wrist IMU's creep sway 39% (2026-10-06), and
+#: on wrist_1 its small joint gain came with more wrist IMU sway.
+DEFAULT_STRIBECK_GAIN = {
+    Joint.SHOULDER_1: 0.8,
+    Joint.SHOULDER_2: 0.8,
+    Joint.ELBOW: 0.8,
+}
 
 
 async def _ramp_to(
@@ -1002,7 +1006,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         default=None,
         help="Share of the fitted low-speed excess the runtime cancels, saved "
-        "with --profile slow (default 0.8 on shoulder_1 and the elbow, 0 "
+        "with --profile slow (default 0.8 on shoulder_1, shoulder_2 and the elbow, 0 "
         "elsewhere: on shoulder_2/3 it made slow motion rougher)",
     )
     p.add_argument(

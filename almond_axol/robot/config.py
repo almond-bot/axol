@@ -594,16 +594,21 @@ class ArmConfig:
             # cancellation on — with the slow_osc wrist shake down 44% and
             # shoulder_1's ripple down 66% from the untuned 250/3.5/40 set.
             # 480 Hz on the joint made no difference once friction was
-            # calibrated (same-session A/B, 2026-09-29).
+            # calibrated (same-session A/B, 2026-09-29). The host damper then
+            # moved to 2.6 Hz at 110 (from 3.2 Hz at 70) after the overnight
+            # per-joint sweep (2026-10-06): s1_creep ripple -29% at 3°/s and
+            # -17% at 6°/s over interleaved repeats, and slow_osc's 1-3 Hz
+            # wrist sway -15% on its own (the joint's creep error peaks at
+            # 1.2-1.6 Hz, below the old centre; 2.2 Hz and 140 were no better).
             kp=450.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_host=70.0,
-            kd_host_hz=3.2,
-            # Q 1.0 (the band ±1.6 Hz around 3.2): the old pose-tracked Q=3
+            kd_host=110.0,
+            kd_host_hz=2.6,
+            # Q 1.0 (the band ±1.3 Hz around 2.6): the old pose-tracked Q=3
             # was confined to keep the damper off a ~13 Hz mast/forearm mode
             # the wide Q=0.8 band once fed on the reference robot (0.551 Nm /
             # +0.0255 W, a whole-arm shudder). At Q 1.0 the band is down to
@@ -616,13 +621,26 @@ class ArmConfig:
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Overnight per-joint sweep on the jelly robot's right arm
+            # (2026-10-06, s2_creep, interleaved repeats): shoulder_2 carries
+            # the arm's largest friction (2.1-2.6 Nm at creep speeds) and was
+            # the roughest joint (190 mdeg p2p at 3°/s) and the second source
+            # of the tool's 1-3 Hz sway in slow_osc. Stiffest kp (the
+            # encoding's 500), firmware kd at its maximum, more host damping
+            # on the pose-tracked band and the Stribeck cancellation: creep
+            # ripple -57% at 3°/s and -28% at 6°/s. At the tool it is small
+            # (slow_osc's 1-3 Hz wrist sway -4%, acceleration -5%, alone);
+            # with shoulder_1's damper change the sway is about -10% over
+            # three interleaved slow_osc rounds.
+            kp=500.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=35.0,
+            kd_host=70.0,
+            stribeck_gain=0.8,
+            stribeck_pole=40.0,
         )
     )
     shoulder_3: JointConfig = field(
@@ -797,9 +815,10 @@ _RIGHT_FRICTION = _ArmFriction(
 )
 
 # The same sweeps' low-speed (Stribeck) excess, per side: ``(stribeck_dfs,
-# stribeck_load_gain, stribeck_vs)``. Only shoulder_1 and the elbow cancel
-# it (``stribeck_gain`` on their JointConfig); on shoulder_2/3 cancelling it
-# made slow motion rougher, and the wrists are untested.
+# stribeck_load_gain, stribeck_vs)``. shoulder_1, shoulder_2 and the elbow
+# cancel it (``stribeck_gain`` on their JointConfig; shoulder_2 only since
+# its stiffer, more damped 2026-10-06 gains); on shoulder_3 cancelling it
+# made slow motion rougher, and on the wrists it is untested in slow_osc.
 _LEFT_STRIBECK: dict[str, tuple[float, float, float]] = {
     "shoulder_1": (0.9814, 0.0485, 0.1),
     "shoulder_2": (0.6142, 0.0389, 0.0989),

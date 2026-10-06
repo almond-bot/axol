@@ -21,7 +21,7 @@ axol tune.factory
 
 or **Factory calibration (all joints)** in the [diagnostics dashboard](/guides/diagnostics-dashboard). It sweeps every joint of both arms (distal → proximal, about 6 minutes per joint, ~1.5 h in all) at slow and moderate speeds and fits, per joint:
 
-- **friction** in the realtime core's own law — sliding friction growing with the gravity load, viscous drag, an offset, and the low-speed Stribeck excess (cancelled on `shoulder_1` and the `elbow`);
+- **friction** in the realtime core's own law — sliding friction growing with the gravity load, viscous drag, an offset, and the low-speed Stribeck excess (cancelled on `shoulder_1`, `shoulder_2` and the `elbow`);
 - **gravity**: the link's centre of mass.
 
 See [`tune.factory`](/cli/tune-factory) for the flags (one arm, raw sweep capture, the older quick profile).
