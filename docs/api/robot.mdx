@@ -157,6 +157,8 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 | `set_gains(left, right)` | Write PID gains; persisted to flash |
 | `set_zero_position(left, right)` | Save current shaft position as encoder zero (calibrated at a mechanical end stop, not the rest position) |
 | `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
+| `set_payload(side, mass, com=(0, 0, 0))` | Tell the gravity model what a gripper is holding — see [Payloads](#payloads). Model state only (no CAN), so it works enabled or not |
+| `payload(side)` | The payload currently set on `"left"` or `"right"`: `(mass_kg, com_m)` |
 
 Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.
 
@@ -297,6 +299,7 @@ left = replace(
 | `kd_host` | `float` (default `0.0`) | Host-side velocity damping (Nm·s/rad): `τ = kd_host · (v_des − v_meas)` added to `t_ff`, with `v_meas` differentiated from measured positions at the command rate. Needed on the high-inertia shoulders, where the motor firmware's velocity estimate is too filtered to damp the ~2 Hz closed-loop resonance (firmware `kd` delivers ~10× less damping than nominal there); the elbow uses a small dose for the same reason. Zero for the wrists and `shoulder_3`, whose firmware `kd` works. Never raise it past the highest value verified stable on hardware — the shipped shoulder 45s are that ceiling; host damping runs on a one-cycle-stale velocity and destabilizes joints that ring above ~10 Hz. A `kd` beyond the firmware's 0–5 range is clamped by the command encoding (with a warning at arm construction), never converted into host damping. |
 | `kd_host_hz` | `float \| None` (default `None`) | Centre frequency (Hz) of the band-pass that confines `kd_host` to the joint's resonance band — a damper centred on the wrong mode arrives rolled-off and out of phase. `None` makes the centre track the pose (the shoulders' impedance mode `√(kp/J(q))` moves ~2.2 → 5.4 Hz between rest and raised-to-the-side); set an explicit value for structural modes that √(kp/J) can't predict (the elbow rings at 6.7–12.5 Hz under load, so it pins 9.5 Hz). The control internals convert to rad/s once at arm construction. |
 | `kd_host_q` | `float \| None` (default `None`) | Quality factor of that band-pass (bandwidth = centre/q). `None` uses the shared 0.8, about an octave wide either side — right for a pose-tracked centre that only estimates the mode, but wide enough to reach into the sub-1.5 Hz intentional-motion band when the centre sits low, where the damping drags the joint's final approach (measured on shoulder_1 as a step that never enters its settle band — a sub-Hz wander, not a ring). When `kd_host_hz` is pinned on a *measured* ring frequency, q ≈ 2–3 confines the damping to the ring and releases the approach. |
+| `zero_offset` | `float` (default `0.0`) | Per-robot trim (rad) added to the joint's reported angle and removed from every command, so FK, IK, recordings, and waypoints all use the corrected joint frame. A joint's zero is set by the mechanical end stop its encoder was zeroed against, and that stop's build tolerance is a constant angle error in every pose. Identify it externally (motion capture, a probe) and save it to the [calibration file](/cli/configuration) — see [Joint zero offsets](#joint-zero-offsets). Bounded to ±5°: an error that large is a mis-set encoder zero, fixed with [`motor.set-zero-pos`](/cli/motor-set-zero-pos). |
 
 Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
 
@@ -339,3 +342,39 @@ async with Axol(config=config) as axol: ...
 ```
 
 See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.
+
+### Payloads
+
+The link masses above describe the robot itself. Whatever a gripper picks up is added at runtime with `set_payload`, so the arm carrying it holds its commanded pose instead of sagging by `unmodelled torque / kp`, gravity-comp hand-guiding stays weightless, and `torque_residuals()` does not read the load as a contact:
+
+```python
+import asyncio
+
+from almond_axol.constants import GRIPPER_TIP_OFFSET
+from almond_axol.robot import Axol
+
+
+async def main() -> None:
+    async with Axol() as axol:
+        # ... close the left gripper on a 400 g part ...
+        axol.set_payload("left", 0.4, GRIPPER_TIP_OFFSET)
+        # ... carry it, then open the gripper ...
+        axol.set_payload("left", 0.0)
+
+
+asyncio.run(main())
+```
+
+The payload is a point mass rigidly attached to the gripper: `com` is in metres in the gripper link frame — the end-effector frame forward kinematics reports — and `GRIPPER_TIP_OFFSET` is where the fingers close. Use `"both"` for one object carried between the two grippers, giving each arm its share of the mass. The feedforward changes on the next control cycle, so call it when the grasp actually closes and clear it when it opens: a payload the gripper is not yet carrying lifts the arm slightly until it is. Masses above 5 kg (and CoMs more than 0.5 m from the gripper) are refused as unit slips. A payload is not persisted; a permanently heavier end-effector belongs in the calibration instead ([`tune.factory --mass wrist_3=<kg>`](/cli/tune-factory)). `Sim.set_payload` validates the same arguments and changes nothing, so a script runs identically in sim.
+
+### Joint zero offsets
+
+Each joint's zero comes from the mechanical end stop its encoder was zeroed against, so on a sheet-metal or printed build any tolerance in that stop is a constant angle error that shows up in every forward- and inverse-kinematics result. If you measure it — with motion capture or a probe — save the per-joint correction as `zero_offset` (radians, positive when the joint really sits further along its positive direction than it reported) and every later `Axol` uses it:
+
+```python
+from almond_axol.robot.calibration import update_joint_calibration
+
+update_joint_calibration("left", "elbow", zero_offset=0.0042)
+```
+
+This writes `~/.almond/calibration.json` for the attached robot, merging with whatever else is saved there. Values beyond ±5° are refused.

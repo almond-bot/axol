@@ -215,6 +215,36 @@ describe("supervisor pure helpers", () => {
     expect(defaultString(optional)).toBe("false")
   })
 
+  it("attaches the host's widget hints to per-run fields", () => {
+    const speed: SchemaField = {
+      kind: "field",
+      key: "speed_scale",
+      label: "Speed scale",
+      type: "number",
+      default: 1,
+      required: false,
+    }
+    const slider = { widget: "slider" as const, min: 0.1, max: 1, step: 0.05 }
+    const command = {
+      id: "waypoints",
+      label: "Waypoints",
+      description: "",
+      simCapable: true,
+      requiresHardware: false,
+      available: true,
+      error: null,
+      schema: [speed, optional],
+      required: [],
+      cli: "waypoints",
+      category: "Operate",
+      isOperation: true,
+      perRunFields: ["speed_scale", "sim"],
+      fieldUi: { speed_scale: slider },
+    } satisfies CommandSpec
+    const [meta] = operationsFromCommands([command])
+    expect(perRunFields(command, meta)).toEqual([{ ...speed, ui: slider }, optional])
+  })
+
   it("round-trips per-operation settings and drops the stale device flag", () => {
     const op = "teleop" as OperationId
     expect(loadOpSettings(op)).toEqual({})

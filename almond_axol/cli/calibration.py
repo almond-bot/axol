@@ -62,11 +62,7 @@ def _summarize(document: dict[str, Any]) -> None:
             entry = joints.get(j.value)
             if not isinstance(entry, dict):
                 continue
-            tags = [
-                t
-                for t, k in (("friction", "friction"), ("mass", "mass"), ("com", "com"))
-                if k in entry
-            ]
+            tags = [k for k in ("friction", "mass", "com", "zero_offset") if k in entry]
             parts.append(f"{j.value} ({'+'.join(tags)})" if tags else j.value)
         print(f"  {side}: {', '.join(parts) if parts else '(no data)'}")
 

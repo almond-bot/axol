@@ -23,6 +23,7 @@ File shape (every level optional)::
           "friction": {"fc": 0.68, "k": 801.3, "fv": 0.87, "fo": -0.25},
           "mass": 0.25,
           "com": [-0.0251, 0.0, -0.0712],
+          "zero_offset": 0.0042,
           "updated_at": "2026-08-16T01:00:00Z"
         }
       },
@@ -41,6 +42,15 @@ fit is only meaningful paired with the mass it was made against) and is how
 a custom end-effector's weight travels with the robot: ``wrist_3``'s mass
 includes the gripper, so ``axol tune.factory --mass wrist_3=<kg>`` writes
 it here and into the cloud copy every later machine pulls.
+
+``zero_offset`` (rad) trims the joint's zero: every reported angle gets it
+added, and every commanded angle has it removed, so FK, IK, recordings and
+waypoints all see the corrected joint frame. A joint's zero comes from the
+mechanical end stop its encoder was zeroed against, so build tolerance in
+that stop is a constant angle error — typically under a degree, identified
+externally (motion capture, a probe). Values beyond ±``MAX_ZERO_OFFSET_RAD``
+are rejected: an error that large means the encoder zero itself is wrong and
+needs ``axol motor.set-zero-pos``, not a trim.
 
 ``kp`` / ``kd`` are the tuned gains — the top of the stiffness blend
 (``s=1.0``, the production default) — exactly like the :class:`JointConfig`
@@ -77,6 +87,9 @@ _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
 _SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
+# Largest accepted ``zero_offset`` magnitude (5°). Mount and end-stop
+# tolerances are well under that; anything bigger is a mis-set encoder zero.
+MAX_ZERO_OFFSET_RAD = math.radians(5.0)
 
 # A corrupt file must never take the robot down, but silently ignoring it
 # would make a bad calibration mysterious — warn once per process.
@@ -109,6 +122,12 @@ def _coerce_float(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _valid_zero_offset(value: float | None) -> bool:
+    return (
+        value is not None and math.isfinite(value) and abs(value) <= MAX_ZERO_OFFSET_RAD
+    )
 
 
 def load_calibration(
@@ -205,6 +224,19 @@ def load_calibration(
                         joint,
                         entry.get("mass"),
                     )
+            if "zero_offset" in entry:
+                zero = _coerce_float(entry.get("zero_offset"))
+                if _valid_zero_offset(zero):
+                    clean["zero_offset"] = zero
+                else:
+                    _logger.warning(
+                        "Calibration for %s %s has an invalid zero_offset %r "
+                        "(need radians within ±%.1f°); ignoring it.",
+                        side,
+                        joint,
+                        entry.get("zero_offset"),
+                        math.degrees(MAX_ZERO_OFFSET_RAD),
+                    )
             com = entry.get("com")
             if isinstance(com, (list, tuple)) and len(com) == 3:
                 com_clean = [_coerce_float(v) for v in com]
@@ -286,6 +318,7 @@ def update_joint_calibration(
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
     mass: float | None = None,
+    zero_offset: float | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -295,7 +328,8 @@ def update_joint_calibration(
     damping band does not clobber a previously saved friction fit, and vice
     versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
     ``com`` is the link's fitted centre of mass (metres, URDF link frame)
-    and ``mass`` its mass (kg, must be positive).
+    and ``mass`` its mass (kg, must be positive). ``zero_offset`` is the
+    joint's zero trim (rad, within ±``MAX_ZERO_OFFSET_RAD``).
     The document is scoped to ``hub_serial`` (auto-detected when omitted) and
     stale data for another robot is never merged into it. If an existing file
     is unscoped or belongs to another robot, it is preserved in a numbered
@@ -310,6 +344,11 @@ def update_joint_calibration(
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
     if mass is not None and not (math.isfinite(mass) and mass > 0.0):
         raise ValueError(f"mass must be a positive number of kg, got {mass!r}")
+    if zero_offset is not None and not _valid_zero_offset(zero_offset):
+        raise ValueError(
+            f"zero_offset must be radians within ±"
+            f"{math.degrees(MAX_ZERO_OFFSET_RAD):.1f}°, got {zero_offset!r}"
+        )
 
     if hub_serial is None:
         hub_serial = current_hub_serial()
@@ -387,6 +426,8 @@ def update_joint_calibration(
         entry["com"] = [float(v) for v in com]
     if mass is not None:
         entry["mass"] = float(mass)
+    if zero_offset is not None:
+        entry["zero_offset"] = float(zero_offset)
     entry["updated_at"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )

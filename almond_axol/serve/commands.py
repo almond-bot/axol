@@ -93,6 +93,7 @@ class CommandDef:
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
+        field_ui: Mapping[str, Mapping[str, Any]] | None = None,
         field_suggestions: Mapping[str, SuggestionProvider] | None = None,
         strict_fields: tuple[str, ...] = (),
         settings_like: str | None = None,
@@ -174,6 +175,18 @@ class CommandDef:
         # Config keys the panel surfaces per run; everything else comes from
         # the shared settings, folded in server-side.
         self.per_run_fields = per_run_fields
+        # Widget hints for per-run fields, field key → the same shape as a
+        # shared setting's ``ui`` (``{"widget": "slider", "min", "max",
+        # "step"}``). Presentation only: the command validates its own
+        # values, so an older panel's plain input cannot get past it.
+        unknown_ui = [f for f in field_ui or {} if f not in per_run_fields]
+        if unknown_ui:
+            raise ValueError(
+                f"{id}: field_ui for non-per-run field(s) {', '.join(unknown_ui)}"
+            )
+        self.field_ui: dict[str, dict[str, Any]] = {
+            k: dict(v) for k, v in (field_ui or {}).items()
+        }
         # Per-run fields with a server-side pick list: field key → callable
         # returning ``[{"value": str, "label": str | None}, ...]``. The panel
         # fetches it (``/api/commands/{id}/suggestions/{field}``) whenever the
@@ -416,7 +429,8 @@ COMMANDS: dict[str, CommandDef] = {
         "Waypoints",
         "Hand-guide the arms in gravity comp to record waypoints, then replay "
         "them as straight-line moves solved with inverse kinematics. Enable "
-        "simulation to preview a saved path in the browser.",
+        "simulation to preview a saved path in the browser, and lower the "
+        "speed scale to try a new path slowly on the robot.",
         "Operate",
         "draccus",
         _waypoints,
@@ -427,7 +441,10 @@ COMMANDS: dict[str, CommandDef] = {
         # The gravity-comp side of a session takes the same config shape
         # (axol.*, channels, kd, rates), so the settings table is inherited.
         settings_like="gravity-comp",
-        per_run_fields=("file", "loops", "play_only", "sim"),
+        per_run_fields=("file", "loops", "speed_scale", "play_only", "sim"),
+        field_ui={
+            "speed_scale": {"widget": "slider", "min": 0.1, "max": 1.0, "step": 0.05}
+        },
     ),
     "collect-data": CommandDef(
         "collect-data",
@@ -1015,6 +1032,7 @@ def command_specs() -> list[dict[str, Any]]:
             "requiresCameras": cmd.requires_cameras,
             "usesCameras": cmd.uses_cameras,
             "perRunFields": list(cmd.per_run_fields),
+            "fieldUi": cmd.field_ui,
             "suggestedFields": list(cmd.field_suggestions),
             "strictFields": list(cmd.strict_fields),
             "episodeControl": cmd.has_episode_control,

@@ -19,7 +19,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import can
 import numpy as np
@@ -47,7 +47,7 @@ from .control import (
     Differentiator,
     compute_friction,
 )
-from .gravity import GravityCompensator
+from .gravity import GravityCompensator, PayloadSide, payload_sides
 
 _logger = logging.getLogger(__name__)
 
@@ -738,16 +738,31 @@ class AxolArm:
         # normalisation and is calibrated against torque, not an end stop.
         # An absent joint has no motor frame to offset: it reads and is
         # commanded at 0.0 (the rest pose) in both frames.
-        self._joint_offsets = np.array(
+        # Every present arm joint's offset also carries its per-robot
+        # ``zero_offset`` trim (JointConfig, from the calibration file): the
+        # end stop that defines the zero has build tolerance of its own.
+        self._zero_trim = np.array(
             [
                 0.0
                 if j == Joint.GRIPPER or j not in present
-                else math.nan
-                if j in EITHER_STOP_JOINTS
-                else closer_end_stop(j, is_left)[0]
+                else getattr(self._arm_config, j.value).zero_offset
                 for j in joints
             ],
             dtype=float,
+        )
+        self._joint_offsets = (
+            np.array(
+                [
+                    0.0
+                    if j == Joint.GRIPPER or j not in present
+                    else math.nan
+                    if j in EITHER_STOP_JOINTS
+                    else closer_end_stop(j, is_left)[0]
+                    for j in joints
+                ],
+                dtype=float,
+            )
+            + self._zero_trim
         )
         self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS) & present
         # Fixed-stop joints whose encoder zero has not been sanity-checked
@@ -846,7 +861,9 @@ class AxolArm:
             side = "left" if self._is_left else "right"
             for joint in pending:
                 offset, pos = await self._detect_stop_side(joint, side)
-                self._joint_offsets[joint_index[joint]] = offset
+                self._joint_offsets[joint_index[joint]] = (
+                    offset + self._zero_trim[joint_index[joint]]
+                )
                 self._unresolved_offsets.discard(joint)
                 _logger.info(
                     "%s %s zero detected at the %+.0f° end stop "
@@ -860,7 +877,9 @@ class AxolArm:
             for joint in pending_verify:
                 correction = await self._verify_fixed_stop_zero(joint, side)
                 self._joint_offsets[joint_index[joint]] = (
-                    closer_end_stop(joint, self._is_left)[0] + correction
+                    closer_end_stop(joint, self._is_left)[0]
+                    + correction
+                    + self._zero_trim[joint_index[joint]]
                 )
                 self._unverified_zeros.discard(joint)
                 if correction:
@@ -2727,6 +2746,28 @@ class AxolHardware(RobotBase):
             self.left.reset_gravity_hold()
         if self.right is not None:
             self.right.reset_gravity_hold()
+
+    def set_payload(
+        self,
+        side: PayloadSide,
+        mass: float,
+        com: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Tell the gravity model what the gripper is holding.
+
+        See :meth:`almond_axol.robot.Axol.set_payload` for the full contract.
+        Pure model state — no CAN traffic — so it is safe at any time,
+        enabled or not; it takes effect on the next control cycle.
+        """
+        for is_left in payload_sides(side):
+            self._gravity_comp.set_payload(mass, com, is_left=is_left)
+
+    def payload(self, side: PayloadSide) -> tuple[float, np.ndarray]:
+        """The payload set on one arm: ``(mass_kg, com_m)`` in the gripper frame."""
+        if side == "both":
+            raise ValueError("payload() reads one arm: pass 'left' or 'right'")
+        (is_left,) = payload_sides(side)
+        return self._gravity_comp.payload(is_left=is_left)
 
     def reset_command_state(self) -> None:
         """Clear cached command history on both arms after an out-of-band move.

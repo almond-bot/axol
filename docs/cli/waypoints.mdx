@@ -62,6 +62,7 @@ Grip force is the gripper's `torque_limit`, shared with every other operation an
 | `--loops INT` | Times to run the path; `0` replays until stopped. Default 1 |
 | `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.25 |
 | `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 1.2 |
+| `--speed_scale FLOAT` | Speed override in `(0, 1]` that slows every move of the session by one factor: `--speed`, `--ang_speed`, the approach to the first waypoint, and the return to rest. It can only slow playback down. The control panel shows it as a slider. Default 1.0 |
 | `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
 | `--grip_time FLOAT` | Seconds spent working the grippers to a waypoint's opening. Skipped where a waypoint leaves them as they are. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
@@ -84,11 +85,14 @@ axol waypoints --play_only --loops 0            # replay it until stopped
 axol waypoints --sim --file pick_place.json     # preview it in the browser
 axol waypoints --speed 0.03 --dwell 2           # slow, with a long pause
 axol waypoints --speed 0.5                      # brisk
+axol waypoints --play_only --speed_scale 0.25   # first run of a new path at quarter pace
 ```
 
 ### Choosing a speed
 
 The default puts the gripper at the same 0.47 m/s the robot already reaches driving itself between poses, and the straight lines are just as straight at any speed — the solver samples a leg by distance travelled, not by clock, so its accuracy does not change when you speed it up. What changes is acceleration, which grows with the square of the speed: 2 m/s² at the default, 8 at `--speed 0.5`, 16 at `--speed 0.7`. Past that a leg is over in a fraction of a second and the dwell at each waypoint dominates the cycle anyway.
+
+Lowering `--speed` alone does not slow a leg that is mostly reorientation, since `--ang_speed` may set its pace. `--speed_scale` (the **Speed scale** slider in the control panel) scales both, along with the moves to the first waypoint and back to rest, so it is the one knob for trying a new path slowly.
 
 <Warning>
   A fast leg carries real momentum, and a stiff arm will not yield if the path meets something unexpected — work up to a speed with the workspace clear.
