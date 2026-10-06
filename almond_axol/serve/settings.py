@@ -714,12 +714,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 options=("parcel", "urdf"),
                 help=(
                     "Which gripper is fitted, for box mode's contact "
-                    "geometry. parcel: the hinged-blade parcel gripper — each "
-                    "gripper is yawed so the folded blade's flat face lies "
-                    "along the box side and the grip width is measured "
-                    "between the two faces. urdf: the stock two-finger "
-                    "gripper — mounts are the width apart, fingers straight "
-                    "forward. Also switchable live from the headset menu."
+                    "geometry. parcel: the hinged-blade parcel gripper — the "
+                    "angled grasp turns each wrist_2 by the Angled yaw. "
+                    "urdf: the stock two-finger gripper, fingers straight "
+                    "forward, no angled grasp. Mounts are the width apart "
+                    "either way. Also switchable live from the headset menu."
                 ),
                 targets={
                     "teleop": ("teleop.box_tool",),
@@ -734,9 +733,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "Which grasp a box-mode session starts in. straight (the "
                     "default): fingers straight forward (0°), width between "
-                    "the mounts. flush: the parcel gripper turned 39° inward "
-                    "(Angled yaw) about its contact face, the blade at its "
-                    "stop as everywhere, width between the faces. In the "
+                    "the mounts. flush: the parcel gripper's wrist_2 turned "
+                    "39° (Angled yaw), fingertips inward, the blade at its "
+                    "stop as everywhere, width still between the mounts. In the "
                     "headset a click of either thumbstick "
                     "while leading toggles between the two; the arms blend "
                     "over."

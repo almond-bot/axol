@@ -30,10 +30,12 @@ from ..constants import (
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
+    urdf_joint_name,
 )
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
+    _load_urdf,
     collision_cost_params,
     shared_robot,
     shared_robot_collision,
@@ -928,6 +930,55 @@ class KinematicsSolver:
             np.asarray(jaxlie.SE3(fk[self.l_elbow_idx]).translation(), np.float32),
             np.asarray(jaxlie.SE3(fk[self.r_elbow_idx]).translation(), np.float32),
         )
+
+    def joint_axes(
+        self, q: np.ndarray, joint: Joint, *, mount_frame: bool = False
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Axis line of one arm joint on each side.
+
+        Args:
+            q: Full ``(N,)`` joint array in radians.
+            joint: Which joint.
+            mount_frame: Give each line in its arm's gripper mount frame at
+                ``q`` (the frame :meth:`fk` returns) instead of the world.
+
+        Returns:
+            ``{"left": (point, axis), "right": (point, axis)}`` — a point on
+            the joint's axis (its URDF origin) and the unit axis direction,
+            the sense a positive joint angle turns the child link about.
+            The world line depends only on the joints upstream of ``joint``;
+            turning ``joint`` itself leaves the mount-frame line unchanged.
+        """
+        fk = self.robot.forward_kinematics(jnp.asarray(self.to_pyroki_order(q)))
+        urdf = _load_urdf()
+        names = self.robot.links.names
+        out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, is_left, ee_idx in (
+            ("left", True, self.l_ee_idx),
+            ("right", False, self.r_ee_idx),
+        ):
+            urdf_joint = urdf.joint_map[urdf_joint_name(joint, is_left=is_left)]
+            pos, rot = _se3_to_pose(jaxlie.SE3(fk[names.index(urdf_joint.child)]))
+            point = np.asarray(pos, dtype=np.float64)
+            axis = np.asarray(rot, dtype=np.float64) @ np.asarray(
+                urdf_joint.axis, dtype=np.float64
+            )
+            if mount_frame:
+                ee_pos, ee_rot = _se3_to_pose(jaxlie.SE3(fk[ee_idx]))
+                ee_rot = np.asarray(ee_rot, dtype=np.float64)
+                point = ee_rot.T @ (point - np.asarray(ee_pos, dtype=np.float64))
+                axis = ee_rot.T @ axis
+            out[side] = (point, axis / np.linalg.norm(axis))
+        return out
+
+    def joint_limits(self, joint: Joint) -> dict[str, tuple[float, float]]:
+        """``{"left": (lower, upper), "right": ...}`` URDF limits (rad) of one arm joint."""
+        urdf = _load_urdf()
+        out: dict[str, tuple[float, float]] = {}
+        for side, is_left in (("left", True), ("right", False)):
+            limit = urdf.joint_map[urdf_joint_name(joint, is_left=is_left)].limit
+            out[side] = (float(limit.lower), float(limit.upper))
+        return out
 
     def ik(
         self,

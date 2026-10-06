@@ -87,6 +87,17 @@ class _SeedLeftSolver:
         out[self.right_indices[0]] += 0.01
         return out
 
+    def joint_limits(self, joint: object) -> dict[str, tuple[float, float]]:
+        del joint
+        return {"left": (-1.5708, 1.5708), "right": (-1.5708, 1.5708)}
+
+    def joint_axes(self, q: np.ndarray, joint: object, *, mount_frame: bool = False):
+        """Wrist_2 lines in the mount frame: 9 cm behind it, along its ``Y``."""
+        del q, joint
+        assert mount_frame
+        line = (np.array((0.0, 0.0, 0.09)), np.array((0.0, 1.0, 0.0)))
+        return {"left": line, "right": line}
+
 
 def _step_worker() -> IKWorker:
     worker = object.__new__(IKWorker)
@@ -98,6 +109,7 @@ def _step_worker() -> IKWorker:
         absolute_mode=False,
     )
     worker._solver = _SeedLeftSolver()
+    worker._init_wrist_turn()
     worker._use_elbow = False
     worker._active = {"left": True, "right": True}
     worker._hold_fk = {}

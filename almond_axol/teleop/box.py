@@ -27,13 +27,15 @@ finger face lies flush on the box side instead of touching along its heel.
 
 Where on the gripper the box is actually touched is the **tool geometry**
 (:class:`ToolGeometry`): where the tool's contact face sits relative to the
-mount, and how far its angled grasp turns the gripper inward. ``width`` is
-the separation of the two *contact faces* — the box size — and the mounts
-are placed behind them; the angled grasp's turn and the ``tilt`` trim on
-top of it pivot about the contact face, so turning keeps the face where it
-is. The stock URDF gripper has a trivial geometry (the mount
-separation is the width, the flat side faces the box at tilt 0); the parcel
-gripper's is derived from its mechanism (:func:`parcel_tool`).
+mount. With a geometry's foot off the mount axis, ``width`` is the
+separation of the two *contact faces* and the mounts are placed behind
+them, the ``tilt`` trim pivoting about the face. The stock URDF gripper has
+a trivial geometry (the mount separation is the width, the flat side faces
+the box at tilt 0) and box mode places the pair with it in both grasps —
+the angled grasp is a ``wrist_2`` turn on top, made by the IK worker; the
+parcel gripper's geometry (:func:`parcel_tool`, from its mechanism) is
+where the squeeze lean puts the clamp force and how close the grippers may
+come.
 """
 
 from __future__ import annotations
@@ -203,9 +205,9 @@ def parcel_tool(
     so its distance from the mount origin along its normal is
     ``pivot_fwd * sin(blade) + face_r``.
 
-    ``flush_deg`` is how far the angled (``"flush"``) grasp turns each
-    gripper inward from the parallel grasp (``VRTeleopConfig.box_flush_deg``,
-    39°), about that foot so the contact and the width stay put.
+    ``flush_deg`` is an inward yaw about that foot (:attr:`ToolGeometry.flush_tilt`)
+    for a pose-space angled grasp; box mode's angled grasp is a ``wrist_2``
+    turn instead (``VRTeleopConfig.box_flush_deg``) and passes ``0``.
     """
     phi = math.radians(blade_deg)
     # Face normal toward the box, in (forward, inboard) mount coordinates:
@@ -229,6 +231,25 @@ def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
     k = np.array(((0.0, -z, y), (z, 0.0, -x), (-y, x, 0.0)), dtype=np.float64)
     r = np.eye(3) + math.sin(angle) * k + (1.0 - math.cos(angle)) * (k @ k)
     return r.astype(np.float32)
+
+
+def turn_about_line(
+    pose: Pose, point: np.ndarray, axis: np.ndarray, angle: float
+) -> Pose:
+    """``pose`` turned ``angle`` (rad) about a line fixed in its own frame.
+
+    ``point`` and the unit ``axis`` give the line in the pose's frame (a
+    joint axis upstream of it, say). A frame turned about such a line keeps
+    the line's coordinates in it, so ``-angle`` undoes the turn.
+    """
+    pos = np.asarray(pose[0], dtype=np.float64)
+    rot = np.asarray(pose[1], dtype=np.float64)
+    c = pos + rot @ np.asarray(point, dtype=np.float64)
+    turn = rodrigues(rot @ np.asarray(axis, dtype=np.float64), angle).astype(np.float64)
+    return (
+        (c + turn @ (pos - c)).astype(np.float32),
+        (turn @ rot).astype(np.float32),
+    )
 
 
 def approach_axis(rot: np.ndarray) -> np.ndarray:
