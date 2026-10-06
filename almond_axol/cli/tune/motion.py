@@ -446,7 +446,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "tracking error is watched each sample, and playback aborts — the arm "
         "frozen on its base gains, then returned to rest — when a joint leaves "
         "its trajectory (--guard-dev-deg), oscillates (--guard-osc-deg RMS, "
-        "0.3-15 Hz) or vibrates (--guard-vib-deg RMS, > 15 Hz). The moves to "
+        "1.5-15 Hz) or vibrates (--guard-vib-deg RMS, > 15 Hz). The moves to "
         "and from the motion get twice the limits.",
     )
     p.add_argument(
@@ -459,7 +459,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--guard-osc-deg",
         type=float,
         default=DEFAULT_OSC_DEG,
-        help=f"Guard: 0.3-15 Hz error RMS limit (default {DEFAULT_OSC_DEG:g}°)",
+        help=f"Guard: 1.5-15 Hz error RMS limit (default {DEFAULT_OSC_DEG:g}°)",
     )
     p.add_argument(
         "--guard-vib-deg",

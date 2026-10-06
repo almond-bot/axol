@@ -47,9 +47,9 @@ class MotionGuardTest(unittest.TestCase):
 
     def test_a_deviation_must_persist_and_scale_relaxes_it(self) -> None:
         err = LAG.copy()
-        err[500:503] = np.radians(10.0)  # three samples: a glitch, not a departure
+        err[500:503] = np.radians(15.0)  # three samples: a glitch, not a departure
         self.assertIsNone(_first_trip(err, osc_deg=100, vib_deg=100))
-        err[1000:1100] = np.radians(10.0)
+        err[1000:1100] = np.radians(15.0)
         hit = _first_trip(err, osc_deg=100, vib_deg=100)
         assert hit is not None
         self.assertEqual(hit[1].kind, "deviation")

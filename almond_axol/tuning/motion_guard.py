@@ -8,15 +8,18 @@ watches every driven joint's tracking error (measured minus commanded, joint
 frame) sample by sample and names the first joint that:
 
 - **leaves its trajectory:** ``|error|`` above ``dev_deg`` for ``hold_s``;
-- **oscillates:** the error's 0.3-15 Hz band above ``osc_deg`` RMS over
-  ``window_s`` — the joint ringing at its impedance modes (1-10 Hz);
+- **oscillates:** the error's 1.5-15 Hz band above ``osc_deg`` RMS over
+  ``window_s`` — the joint ringing at its impedance or structural modes;
 - **vibrates:** the error above 15 Hz over ``vib_deg`` RMS over
   ``window_s`` — a buzz.
 
-The bands are one-pole splits of the error (a 0.3 Hz high-pass, a 15 Hz
-split), so slow tracking lag is never mistaken for an oscillation. Limits are
-in degrees. ``scale`` relaxes all three together, for the transit moves to
-and from the motion, which run faster than the reference motions.
+The bands are 2nd-order Butterworth sections. The 1.5 Hz low edge keeps the
+lag of the motion itself out of the oscillation check: ``slow_osc`` swings
+the elbow at up to 100°/s, and its tracking lag fills a 0.3-15 Hz band to
+~4.6° RMS on a healthy run, but a 1.5-15 Hz band to only ~0.37° — against
+2.0-2.4° on the IMU-damping runs that rang (2026-10-01). Limits are in
+degrees; ``scale`` relaxes all three together, for the transit moves to and
+from the motion.
 """
 
 from __future__ import annotations
@@ -26,17 +29,54 @@ from dataclasses import dataclass
 
 import numpy as np
 
-#: Defaults, from the saved replays on the jelly robot (2026-10-06): normal
-#: slow motions keep the 0.3-15 Hz error under ~0.15° RMS and the >15 Hz
-#: under ~0.02°; the deviation is lag, under 1° at teleop speeds.
-DEFAULT_DEV_DEG = 6.0
-DEFAULT_OSC_DEG = 0.6
-DEFAULT_VIB_DEG = 0.15
+#: Defaults, sized on the jelly robot's saved replays (2026-10-06): healthy
+#: runs peak at ~7° deviation (slow_osc's elbow at 100°/s), ~0.37° RMS at
+#: 1.5-15 Hz and ~0.04° RMS above 15 Hz; the runs that rang reached 11-14°,
+#: 2.0-2.4° and 0.11-0.16°.
+DEFAULT_DEV_DEG = 10.0
+DEFAULT_OSC_DEG = 1.0
+DEFAULT_VIB_DEG = 0.10
 DEFAULT_WINDOW_S = 0.5
 DEFAULT_HOLD_S = 0.05
 
-_SLOW_HZ = 0.3
+_OSC_LO_HZ = 1.5
 _SPLIT_HZ = 15.0
+
+
+class _Biquad:
+    """A 2nd-order Butterworth section (RBJ), vectorised over joints."""
+
+    def __init__(self, kind: str, hz: float, rate: float, n: int) -> None:
+        w0 = 2.0 * math.pi * min(hz, 0.45 * rate) / rate
+        alpha = math.sin(w0) / (2.0 * math.sqrt(0.5))
+        cw = math.cos(w0)
+        if kind == "low":
+            b = ((1 - cw) / 2, 1 - cw, (1 - cw) / 2)
+        else:
+            b = ((1 + cw) / 2, -(1 + cw), (1 + cw) / 2)
+        a0 = 1 + alpha
+        self.b = tuple(x / a0 for x in b)
+        self.a = (-2 * cw / a0, (1 - alpha) / a0)
+        self.z1 = np.zeros(n)
+        self.z2 = np.zeros(n)
+
+    def step(self, x: np.ndarray, ok: np.ndarray) -> np.ndarray:
+        """Transposed direct form II; joints without a sample keep their state."""
+        y = self.b[0] * x + self.z1
+        z1 = self.b[1] * x - self.a[0] * y + self.z2
+        z2 = self.b[2] * x - self.a[1] * y
+        self.z1 = np.where(ok, z1, self.z1)
+        self.z2 = np.where(ok, z2, self.z2)
+        return np.where(ok, y, 0.0)
+
+    def prime(self, x: np.ndarray, mask: np.ndarray) -> None:
+        """Start ``mask`` joints at steady state on ``x`` (no step transient)."""
+        # Steady state for a constant input x: y = H(1)·x, H(1) = 1 (low) / 0
+        # (high), with z1 = y - b0·x and z2 = b2·x - a2·y.
+        dc = 1.0 if self.b[1] > 0 else 0.0
+        y = dc * x
+        self.z1 = np.where(mask, y - self.b[0] * x, self.z1)
+        self.z2 = np.where(mask, self.b[2] * x - self.a[1] * y, self.z2)
 
 
 @dataclass(frozen=True)
@@ -51,7 +91,7 @@ class GuardTrip:
     def __str__(self) -> str:
         what = {
             "deviation": "left its trajectory",
-            "oscillation": "oscillating (0.3-15 Hz)",
+            "oscillation": "oscillating (1.5-15 Hz)",
             "vibration": "vibrating (> 15 Hz)",
         }[self.kind]
         unit = "°" if self.kind == "deviation" else "° RMS"
@@ -84,18 +124,15 @@ class MotionGuard:
         self.vib = math.radians(vib_deg)
         self.window = max(1, int(round(window_s * rate)))
         self.hold = max(1, int(round(hold_s * rate)))
-        dt = 1.0 / rate
-        self._a_slow = 1.0 - math.exp(-2.0 * math.pi * _SLOW_HZ * dt)
-        self._a_split = 1.0 - math.exp(-2.0 * math.pi * _SPLIT_HZ * dt)
         self.reset()
 
     def reset(self) -> None:
         """Forget the filters (a new segment: the error restarts from its own value)."""
         n = len(self.names)
-        self._primed = False
         self._seen = np.zeros(n, dtype=bool)
-        self._slow = np.zeros(n)
-        self._mid = np.zeros(n)
+        self._osc_hp = _Biquad("high", _OSC_LO_HZ, self.rate, n)
+        self._osc_lp = _Biquad("low", _SPLIT_HZ, self.rate, n)
+        self._vib_hp = _Biquad("high", _SPLIT_HZ, self.rate, n)
         self._osc_sq = np.zeros((self.window, n))
         self._vib_sq = np.zeros((self.window, n))
         self._k = 0
@@ -106,35 +143,28 @@ class MotionGuard:
         """Feed one sample of tracking error (rad, one per name).
 
         Returns the first trip, or ``None``. NaN entries (a joint with no
-        feedback yet) are skipped for that sample.
+        feedback yet, or a missed sample) are skipped: the joint's filters
+        hold, and its first sample after a gap starts them afresh rather than
+        reading the gap as a jump.
         """
         e = np.asarray(error, dtype=np.float64)
         ok = np.isfinite(e)
-        if not self._primed:
-            if not ok.any():
-                return None
-            self._slow[:] = np.where(ok, e, 0.0)
-            self._mid[:] = self._slow
-            self._seen = ok.copy()
-            self._primed = True
-        # A joint's first sample, or one after a gap, primes its filters
-        # instead of stepping them: a missing reading is not a jump.
+        x = np.where(ok, e, 0.0)
         fresh = ok & ~self._seen
-        self._slow[fresh] = e[fresh]
-        self._mid[fresh] = e[fresh]
-        self._seen |= ok
-        e = np.where(ok, e, self._mid)
-        self._slow += np.where(ok, self._a_slow * (e - self._slow), 0.0)
-        self._mid += np.where(ok, self._a_split * (e - self._mid), 0.0)
-        band = self._mid - self._slow  # 0.3-15 Hz
-        high = e - self._mid  # > 15 Hz
+        if fresh.any():
+            for f in (self._osc_hp, self._vib_hp):
+                f.prime(x, fresh)
+            self._osc_lp.prime(np.zeros_like(x), fresh)
+        self._seen = ok
+        band = self._osc_lp.step(self._osc_hp.step(x, ok), ok)
+        high = self._vib_hp.step(x, ok)
         i = self._k % self.window
-        self._osc_sq[i] = np.where(ok, band * band, 0.0)
-        self._vib_sq[i] = np.where(ok, high * high, 0.0)
+        self._osc_sq[i] = band * band
+        self._vib_sq[i] = high * high
         self._k += 1
         self._filled = min(self._filled + 1, self.window)
 
-        over = ok & (np.abs(e) > self.dev * scale)
+        over = ok & (np.abs(x) > self.dev * scale)
         self._over = np.where(over, self._over + 1, 0)
         hit = np.flatnonzero(self._over >= self.hold)
         if hit.size:
@@ -142,7 +172,7 @@ class MotionGuard:
             return GuardTrip(
                 self.names[j],
                 "deviation",
-                math.degrees(abs(e[j])),
+                math.degrees(abs(x[j])),
                 math.degrees(self.dev * scale),
             )
         if self._filled < self.window:
