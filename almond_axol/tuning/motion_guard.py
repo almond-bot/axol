@@ -7,7 +7,9 @@ deviation abort only covers ``a4`` / ``pv`` joints. :class:`MotionGuard`
 watches every driven joint's tracking error (measured minus commanded, joint
 frame) sample by sample and names the first joint that:
 
-- **leaves its trajectory:** ``|error|`` above ``dev_deg`` for ``hold_s``;
+- **leaves its trajectory:** ``|error|`` above ``dev_deg`` plus ``lag_s`` of
+  the commanded speed (a joint tracks fast moves late: normal lag is not a
+  departure) for ``hold_s``;
 - **oscillates:** the error's 1.5-15 Hz band above ``osc_deg`` RMS over
   ``window_s`` — the joint ringing at its impedance or structural modes;
 - **vibrates:** the error above 15 Hz over ``vib_deg`` RMS over
@@ -42,6 +44,9 @@ DEFAULT_OSC_DEG = 1.5
 DEFAULT_VIB_DEG = 0.15
 DEFAULT_WINDOW_S = 0.5
 DEFAULT_HOLD_S = 0.05
+#: Lag allowed on top of ``dev_deg`` at speed: a teleop recording's 170°/s
+#: wrist swing ran shoulder_3 10.4° behind on a healthy run (2026-10-06).
+DEFAULT_LAG_S = 0.1
 
 _OSC_LO_HZ = 1.5
 _SPLIT_HZ = 15.0
@@ -118,6 +123,7 @@ class MotionGuard:
         vib_deg: float = DEFAULT_VIB_DEG,
         window_s: float = DEFAULT_WINDOW_S,
         hold_s: float = DEFAULT_HOLD_S,
+        lag_s: float = DEFAULT_LAG_S,
     ) -> None:
         if rate <= 0.0:
             raise ValueError(f"rate must be positive, got {rate}")
@@ -128,6 +134,7 @@ class MotionGuard:
         self.vib = math.radians(vib_deg)
         self.window = max(1, int(round(window_s * rate)))
         self.hold = max(1, int(round(hold_s * rate)))
+        self.lag_s = float(lag_s)
         self.reset()
 
     def reset(self) -> None:
@@ -143,8 +150,16 @@ class MotionGuard:
         self._filled = 0
         self._over = np.zeros(n, dtype=int)
 
-    def update(self, error: np.ndarray, scale: float = 1.0) -> GuardTrip | None:
+    def update(
+        self,
+        error: np.ndarray,
+        scale: float = 1.0,
+        speed: np.ndarray | None = None,
+    ) -> GuardTrip | None:
         """Feed one sample of tracking error (rad, one per name).
+
+        ``speed`` is each joint's commanded speed (rad/s) for the lag
+        allowance; ``None`` allows none.
 
         Returns the first trip, or ``None``. NaN entries (a joint with no
         feedback yet, or a missed sample) are skipped: the joint's filters
@@ -168,7 +183,10 @@ class MotionGuard:
         self._k += 1
         self._filled = min(self._filled + 1, self.window)
 
-        over = ok & (np.abs(x) > self.dev * scale)
+        allow = self.dev * scale + (
+            0.0 if speed is None else self.lag_s * np.abs(np.asarray(speed, float))
+        )
+        over = ok & (np.abs(x) > allow)
         self._over = np.where(over, self._over + 1, 0)
         hit = np.flatnonzero(self._over >= self.hold)
         if hit.size:
@@ -177,7 +195,7 @@ class MotionGuard:
                 self.names[j],
                 "deviation",
                 math.degrees(abs(x[j])),
-                math.degrees(self.dev * scale),
+                math.degrees(float(np.broadcast_to(allow, x.shape)[j])),
             )
         if self._filled < self.window:
             return None

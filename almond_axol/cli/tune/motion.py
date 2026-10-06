@@ -2060,7 +2060,7 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
                         for _, arm in guard_arms
                     ]
                 ) - (cmd_now + cmd_vel * age)
-                trip = guard.update(err, scale=guard_scale)
+                trip = guard.update(err, scale=guard_scale, speed=cmd_vel)
                 if trip is not None:
                     _clear_extra_torque(axol)
                     raise _GuardTripped(trip)

@@ -61,6 +61,29 @@ class MotionGuardTest(unittest.TestCase):
             )
         )
 
+    def test_lag_on_a_fast_move_is_allowed_but_a_stuck_joint_is_not(self) -> None:
+        # 170°/s with 12° of lag: within 10° + 0.1 s x 170°/s.
+        speed = np.full(len(T), math.radians(170.0))
+        err = np.full(len(T), np.radians(12.0))
+        g = MotionGuard(["j"], RATE, osc_deg=100, vib_deg=100)
+        self.assertIsNone(
+            next(
+                (
+                    t
+                    for e, v in zip(err, speed)
+                    if (t := g.update(np.array([e]), speed=np.array([v])))
+                ),
+                None,
+            )
+        )
+        # The same 12° with the command at rest: a departure.
+        g = MotionGuard(["j"], RATE, osc_deg=100, vib_deg=100)
+        trip = next(
+            (t for e in err if (t := g.update(np.array([e]), speed=np.zeros(1)))), None
+        )
+        assert trip is not None
+        self.assertEqual(trip.kind, "deviation")
+
 
 if __name__ == "__main__":
     unittest.main()
