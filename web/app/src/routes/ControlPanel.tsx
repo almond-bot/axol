@@ -88,6 +88,7 @@ import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
+import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
@@ -1934,7 +1935,7 @@ export default function ControlPanel() {
           onEpisode={handleEpisode}
         />
 
-        {DATASET_OPERATIONS.has(meta.id) && (
+        {showsDatasetPreview(meta.id) && (
           <DatasetPreview
             key={`datasets-${renderedConnectionGeneration}`}
             connected={conn.state === "ok"}
@@ -1958,10 +1959,6 @@ export default function ControlPanel() {
     </div>
   )
 }
-
-/** The operations that record a dataset, so the dataset preview has
- *  something to show; every other operation hides it. */
-const DATASET_OPERATIONS = new Set(["collect-data", "collect-dagger", "run-policy"])
 
 /** One column per operation on wide screens, spelled out so Tailwind emits the
  *  classes; a host offering more than five wraps rather than shrinking. */
