@@ -57,7 +57,8 @@ q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 | `left_indices` / `right_indices` | Indices into the full `q` array for each arm — `[0…6]` and `[7…13]`, kept as a readable way to split a full vector |
 | `fk(q)` | Forward kinematics → `((pos_3, rot_3x3), (pos_3, rot_3x3))` — the same format `ik` takes |
 | `elbow_positions(q)` | World-frame elbow positions → `(left_3, right_3)` |
-| `ik(q_current, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK from the current joint vector; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
+| `elbow_swivel(q)` | Per side, an `ElbowSwivel`: the shoulder centre (where the three shoulder axes meet), the elbow, the wrist centre (forearm roll ∩ `wrist_2`) in the gripper mount frame, and the unit direction the elbow moves in as the arm swings with its mount held (from the arm's Jacobian null space — the wrist is not spherical, so the swing is not a circle) |
+| `ik(q_current, left_pose, right_pose, left_elbow_pos, right_elbow_pos, ..., pose_weight_scale)` | IK from the current joint vector; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays; `pose_weight_scale` (`(position, orientation)`, default `(1, 1)`) multiplies `pos_weight` / `ori_weight` for one solve — box mode uses `(2, 4)` |
 | `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
 | `to_pyroki_order(q)` / `from_pyroki_order(q)` | Convert to/from the internal pyroki joint ordering — only needed when driving `solver.robot` / `solver.robot_coll` directly |
 

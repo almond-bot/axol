@@ -15,6 +15,7 @@ every public boundary and callers never see it.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 import math
@@ -27,9 +28,11 @@ import numpy as np
 import pyroki as pk
 
 from ..constants import (
+    ARM_JOINTS,
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
+    urdf_joint_name,
 )
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
@@ -37,6 +40,7 @@ from .model import (
     collision_cost_params,
     shared_robot,
     shared_robot_collision,
+    shared_urdf,
 )
 
 _logger = logging.getLogger(__name__)
@@ -49,6 +53,30 @@ Pose = tuple[np.ndarray, np.ndarray]
 The format :meth:`KinematicsSolver.fk` returns and :meth:`KinematicsSolver.ik`
 takes, so a pose can be read, edited, and solved for without conversion.
 """
+
+
+@dataclasses.dataclass(frozen=True)
+class ElbowSwivel:
+    """One arm's elbow swivel (:meth:`KinematicsSolver.elbow_swivel`).
+
+    Attributes:
+        shoulder: Shoulder centre, world frame — where the three shoulder
+            axes meet; fixed.
+        elbow: Elbow position, world frame (as
+            :meth:`KinematicsSolver.elbow_positions`).
+        wrist_in_mount: Wrist centre — where the forearm roll meets
+            ``wrist_2`` — in the gripper *mount* frame at these joints, to
+            place it on a target pose.
+        direction: Unit world-frame direction the elbow moves in as the arm
+            swings with its gripper mount held (either sense; zeros at a
+            singular pose).
+    """
+
+    shoulder: np.ndarray
+    elbow: np.ndarray
+    wrist_in_mount: np.ndarray
+    direction: np.ndarray
+
 
 # Convenience aliases for URDF link / joint names. The single source of
 # truth for these strings lives in :mod:`almond_axol.constants`; the helpers
@@ -110,6 +138,53 @@ def _bounded_manipulability_residual(
 
 
 _bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residual)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ArmSwivel:
+    """One arm's fixed geometry for :meth:`KinematicsSolver.elbow_swivel`."""
+
+    axes: tuple[tuple[int, np.ndarray], ...]  # (child link, local axis) per joint
+    shoulder: np.ndarray  # shoulder centre, world
+    wrist_link: int
+    wrist_local: np.ndarray  # wrist centre in wrist_link's frame
+    elbow_joints: int  # joints upstream of the elbow link
+
+
+def _pose_np(wxyz_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(rotation (3, 3), position (3,))`` of a jaxlie ``wxyz_xyz`` link pose."""
+    w, x, y, z = wxyz_xyz[:4]
+    rot = np.array(
+        (
+            (1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)),
+            (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+            (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
+        )
+    )
+    return rot, np.asarray(wxyz_xyz[4:7], np.float64)
+
+
+def _axis_line(
+    poses: np.ndarray, link: int, axis: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """World ``(point, direction)`` of a joint axis given its child link's pose."""
+    rot, pos = _pose_np(poses[link])
+    return pos, rot @ axis
+
+
+def _axes_meet(
+    p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.ndarray
+) -> np.ndarray:
+    """Midpoint of the closest approach of two lines (point, direction)."""
+    w = p1 - p2
+    a, b, c = d1 @ d1, d1 @ d2, d2 @ d2
+    d, e = d1 @ w, d2 @ w
+    den = a * c - b * b
+    if abs(den) < 1e-12:
+        return p1.copy()
+    s = (b * e - c * d) / den
+    t = (a * e - b * d) / den
+    return 0.5 * ((p1 + s * d1) + (p2 + t * d2))
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +401,13 @@ def _project_elbow(
 
     The operator's elbow (different arm proportions, position-multiplier
     scaling) generally lies off the sphere the robot's elbow actually lives on
-    (|shoulder->elbow| at the current configuration — the radius varies a few
-    cm with shoulder pose, so it is measured from FK rather than fixed). The
+    (|shoulder->elbow| at the current configuration, measured from FK). The
     radial component of the raw target is unreachable by construction and
     would inject a permanent residual that fights the EE cost through the
-    shared shoulder joints; only the swivel direction is kept.
+    shared shoulder joints; only the swivel direction is kept. ``shoulder``
+    is the shoulder's centre, where its three axes meet: the radius is fixed
+    about it, and box mode's swivel hints (already on the sphere) pass
+    through unchanged.
     """
     r = jnp.linalg.norm(current_elbow_pos - shoulder)
     d = elbow.translation() - shoulder
@@ -788,6 +865,36 @@ class KinematicsSolver:
         self._left_shoulder_jax = jnp.asarray(self._left_shoulder_pos)
         self._right_shoulder_jax = jnp.asarray(self._right_shoulder_pos)
 
+        # The elbow's swivel (see elbow_swivel): each arm's joint axes (the
+        # child link and the axis in it, ARM_JOINTS order), its shoulder
+        # centre — the three shoulder axes meet at one point, fixed in the
+        # world — and its wrist centre, where the forearm roll (wrist_1)
+        # meets wrist_2, fixed in wrist_2's link.
+        urdf = shared_urdf()
+        fk0_np = np.asarray(fk0, np.float64)
+        self._swivel: dict[str, _ArmSwivel] = {}
+        for side, is_left in (("left", True), ("right", False)):
+            axes = []
+            for joint in ARM_JOINTS:
+                j = urdf.joint_map[urdf_joint_name(joint, is_left=is_left)]
+                axes.append((names.index(j.child), np.asarray(j.axis, np.float64)))
+            lines = [_axis_line(fk0_np, link, axis) for link, axis in axes]
+            shoulder = _axes_meet(*lines[0], *lines[1])
+            wrist = _axes_meet(*lines[4], *lines[5])
+            w2_link = axes[5][0]
+            rot, pos = _pose_np(fk0_np[w2_link])
+            self._swivel[side] = _ArmSwivel(
+                axes=tuple(axes),
+                shoulder=shoulder,
+                wrist_link=w2_link,
+                wrist_local=rot.T @ (wrist - pos),
+                elbow_joints=ARM_JOINTS.index(Joint.ELBOW) + 1,
+            )
+        self._left_swivel_jax = jnp.asarray(self._swivel["left"].shoulder, jnp.float32)
+        self._right_swivel_jax = jnp.asarray(
+            self._swivel["right"].shoulder, jnp.float32
+        )
+
         # Public joint vectors are left-then-right in ARM_JOINTS order (the
         # robot's own ordering); pyroki reorders the actuated joints
         # internally (topologically — alphabetical for this URDF). The
@@ -929,6 +1036,58 @@ class KinematicsSolver:
             np.asarray(jaxlie.SE3(fk[self.r_elbow_idx]).translation(), np.float32),
         )
 
+    def elbow_swivel(self, q: np.ndarray) -> dict[str, ElbowSwivel]:
+        """Each arm's elbow swivel at joint positions ``q``.
+
+        With its gripper mount held, a 7-joint arm still has one free
+        motion: the elbow swinging round. Each arm's shoulder axes meet at
+        one point and its forearm roll meets ``wrist_2`` at another, and
+        the swing is roughly a circle about the line between the two — but
+        only roughly, since ``wrist_3`` is offset from that wrist centre
+        and has to turn with it, so the exact motion is
+        :attr:`ElbowSwivel.direction`, from the arm's Jacobian. A wrist
+        turned far from straight (box mode's angled grasp) bends the motion
+        well off the circle.
+
+        Args:
+            q: Full ``(N,)`` joint array in radians.
+
+        Returns:
+            Per side (``"left"``, ``"right"``), an :class:`ElbowSwivel`.
+        """
+        poses = np.asarray(
+            self.robot.forward_kinematics(jnp.asarray(self.to_pyroki_order(q))),
+            np.float64,
+        )
+        out: dict[str, ElbowSwivel] = {}
+        for side, ee, elbow_idx in (
+            ("left", self.l_ee_idx, self.l_elbow_idx),
+            ("right", self.r_ee_idx, self.r_elbow_idx),
+        ):
+            geo = self._swivel[side]
+            ee_rot, ee_pos = _pose_np(poses[ee])
+            elbow = _pose_np(poses[elbow_idx])[1]
+            w_rot, w_pos = _pose_np(poses[geo.wrist_link])
+            wrist = w_pos + w_rot @ geo.wrist_local
+            jac = np.zeros((6, len(geo.axes)))
+            elbow_jac = np.zeros((3, len(geo.axes)))
+            for i, (link, axis) in enumerate(geo.axes):
+                origin, a = _axis_line(poses, link, axis)
+                jac[:3, i] = np.cross(a, ee_pos - origin)
+                jac[3:, i] = a
+                if i < geo.elbow_joints:
+                    elbow_jac[:, i] = np.cross(a, elbow - origin)
+            null = np.linalg.svd(jac)[2][-1]
+            direction = elbow_jac @ null
+            norm = float(np.linalg.norm(direction))
+            out[side] = ElbowSwivel(
+                shoulder=geo.shoulder.copy(),
+                elbow=elbow,
+                wrist_in_mount=ee_rot.T @ (wrist - ee_pos),
+                direction=direction / norm if norm > 1e-9 else np.zeros(3),
+            )
+        return out
+
     def ik(
         self,
         q_current: np.ndarray,
@@ -938,6 +1097,7 @@ class KinematicsSolver:
         right_elbow_pos: np.ndarray | None = None,
         delta_scale: float = 1.0,
         elbow_weight: float | None = None,
+        pose_weight_scale: tuple[float, float] = (1.0, 1.0),
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -972,6 +1132,11 @@ class KinematicsSolver:
                 :func:`almond_axol.teleop.box.elbow_swivel_hint`) rather than
                 the headset's inferred elbow the fade exists for. ``None``
                 keeps the configured behaviour.
+            pose_weight_scale: ``(position, orientation)`` multipliers on
+                ``config.pos_weight`` / ``config.ori_weight`` for this solve.
+                The other costs (manipulability, an elbow hint) settle where
+                they balance a small pose error; a caller that needs the
+                pose held to a fraction of a degree raises these.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -1051,10 +1216,10 @@ class KinematicsSolver:
             self._posture_pose,
             self._left_idx_jax,
             self._right_idx_jax,
-            self._left_shoulder_jax,
-            self._right_shoulder_jax,
-            cfg.pos_weight,
-            cfg.ori_weight,
+            self._left_swivel_jax,
+            self._right_swivel_jax,
+            cfg.pos_weight * float(pose_weight_scale[0]),
+            cfg.ori_weight * float(pose_weight_scale[1]),
             cfg.rest_weight,
             cfg.posture_weight,
             cfg.manipulability_weight,

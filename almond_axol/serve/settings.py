@@ -769,7 +769,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "IK weight steering box mode's elbows to the angle above "
-                    "(the grippers' own weight is 50; 10 is the default). 0 "
+                    "(box mode holds the grippers at 100 for position and "
+                    "40 for orientation; 10 is the default). 0 "
                     "turns the hint off: the elbows are left where they fall "
                     "— the arm/torso collision model keeps them off the base "
                     "— and the thumbsticks' elbow control does nothing."

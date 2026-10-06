@@ -42,6 +42,7 @@ from .box import (
     smoothstep,
     snap_box,
     squeeze_lean,
+    swivel_step,
     tip_inward_sign,
     toe_out_sides,
     twist_about,
@@ -171,6 +172,15 @@ _BODY_CLEARANCE_M = 0.01
 # elbows hanging under the shoulder-wrist line to held out level.
 _ELBOW_OUT_MIN = 0.0
 _ELBOW_OUT_MAX = 90.0
+# Longest step (m) along its swivel an elbow hint asks for (swivel_step): the
+# swivel is a curve, and a longer step's chord leaves it.
+_ELBOW_HINT_STEP_M = 0.03
+# Box mode's (position, orientation) IK weight multipliers. A clamp needs each
+# gripper's yaw to a fraction of a degree — half a degree tip-out holds the
+# angled grasp's tip a millimetre off the box — and at the arm weights the
+# manipulability cost and the elbow hint settle against a pose error that
+# size (0.3-0.5° tip-out in the angled grasp); these hold it under 0.05°.
+_BOX_POSE_WEIGHT_SCALE = (2.0, 4.0)
 
 
 def _dominant_axis(x: float, y: float) -> tuple[float, float]:
@@ -1854,6 +1864,7 @@ class IKWorker:
             right_elbow_pos=elbows["right"] if elbows else None,
             delta_scale=delta_scale,
             elbow_weight=cfg.box_elbow_weight if elbows else None,
+            pose_weight_scale=_BOX_POSE_WEIGHT_SCALE,
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
@@ -1890,25 +1901,37 @@ class IKWorker:
 
         Box mode's gripper targets fix each wrist but leave the elbow swivel
         free, and as the grippers close on the box the nearest solution
-        swings the elbows into the torso. Each hint is the arm's current
-        elbow rotated about its shoulder-wrist line to ``config.box_elbow_out``
-        degrees outboard of straight down (:func:`elbow_swivel_hint`), fed to
-        the solver at ``config.box_elbow_weight``. The wrist used is the
-        gripper *target*, not the measured pose, so the hint leads the motion
-        the same way the pose target does.
+        swings the elbows into the torso. Each hint's goal is the arm's
+        current elbow rotated about its shoulder-to-wrist-centre line
+        (:meth:`KinematicsSolver.elbow_swivel`) to ``config.box_elbow_out``
+        degrees outboard of straight down (:func:`elbow_swivel_hint`), with
+        the wrist centre placed on the gripper *target*, not the measured
+        pose, so the hint leads the motion the same way the pose target
+        does. The hint fed to the solver (at ``config.box_elbow_weight``)
+        is the step toward that goal along the arm's own swivel motion
+        (:func:`swivel_step`): the circle is only approximate, and a hint
+        on it — swung about the gripper mount, as it once was — is out of
+        reach in the angled grasp, where at its weight it pulled each
+        gripper half a degree tip-out of its target, the tip off the box
+        from the first touch.
         """
         cfg = self._config
         if cfg.box_elbow_weight <= 0.0:
             return None
         angle = math.radians(cfg.box_elbow_out)
-        shoulders = self._solver.shoulder_positions
-        elbows = dict(zip(("left", "right"), self._solver.elbow_positions(q_current)))
-        return {
-            side: elbow_swivel_hint(
-                shoulders[side], elbows[side], targets[side][0], sign, angle
+        swivel = self._solver.elbow_swivel(q_current)
+        hints: dict[str, np.ndarray] = {}
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            arm = swivel[side]
+            pos, rot = targets[side]
+            wrist = np.asarray(pos, np.float64) + np.asarray(
+                rot, np.float64
+            ) @ np.asarray(arm.wrist_in_mount, np.float64)
+            goal = elbow_swivel_hint(arm.shoulder, arm.elbow, wrist, sign, angle)
+            hints[side] = swivel_step(
+                arm.elbow, goal, arm.direction, _ELBOW_HINT_STEP_M
             )
-            for side, sign in (("left", 1.0), ("right", -1.0))
-        }
+        return hints
 
     def _stick_click_toggle(self, frame: VRFrame, box: BoxState) -> bool:
         """Flip ``config.box_grasp`` on a single stick click; True if it flipped.

@@ -28,6 +28,7 @@ from almond_axol.teleop.box import (
     rotation_angle,
     side_clamp_rotation,
     snap_box,
+    swivel_step,
     tip_inward_sign,
     toe_out,
     twist_about,
@@ -35,7 +36,12 @@ from almond_axol.teleop.box import (
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.teleop.live import LiveSettings
-from almond_axol.teleop.worker import IKWorker, _dominant_axis
+from almond_axol.teleop.worker import (
+    _BOX_POSE_WEIGHT_SCALE,
+    _ELBOW_HINT_STEP_M,
+    IKWorker,
+    _dominant_axis,
+)
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
 _UP = np.array((0.0, 0.0, 1.0))
@@ -583,16 +589,57 @@ class ElbowSwivelHintTest(unittest.TestCase):
         )
 
 
+class SwivelStepTest(unittest.TestCase):
+    """The hint keeps only the reachable part of the goal: along the swivel."""
+
+    elbow = np.array((0.25, 0.05, 0.42))
+
+    def test_keeps_the_part_along_the_swivel(self) -> None:
+        goal = self.elbow + np.array((0.004, 0.01, -0.02))
+        hint = swivel_step(self.elbow, goal, np.array((0.0, 0.0, -1.0)), 0.03)
+        np.testing.assert_allclose(hint, self.elbow + (0.0, 0.0, -0.02), atol=1e-6)
+
+    def test_either_sense_of_the_direction(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.0, -0.02))
+        np.testing.assert_allclose(
+            swivel_step(self.elbow, goal, np.array((0.0, 0.0, 1.0)), 0.03),
+            swivel_step(self.elbow, goal, np.array((0.0, 0.0, -1.0)), 0.03),
+            atol=1e-6,
+        )
+
+    def test_capped(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.2, 0.0))
+        hint = swivel_step(self.elbow, goal, np.array((0.0, 1.0, 0.0)), 0.03)
+        np.testing.assert_allclose(hint, self.elbow + (0.0, 0.03, 0.0), atol=1e-6)
+
+    def test_no_swivel_holds_the_elbow(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.2, 0.0))
+        np.testing.assert_allclose(
+            swivel_step(self.elbow, goal, np.zeros(3), 0.03), self.elbow, atol=1e-6
+        )
+
+
 class BoxElbowHintsTest(unittest.TestCase):
     def _worker(self, weight: float = 10.0) -> IKWorker:
         worker = _stick_worker()
         worker._config.box_elbow_weight = weight
+        wrist = np.array((0.0, 0.0, 0.03), np.float64)
+        # Swivel directions of either sense: the hint picks the one toward its goal.
         worker._solver = types.SimpleNamespace(
-            shoulder_positions={"left": _SHOULDER_L, "right": _SHOULDER_R},
-            elbow_positions=lambda q: (
-                np.array((0.25, 0.05, 0.42), np.float32),
-                np.array((0.25, -0.05, 0.42), np.float32),
-            ),
+            elbow_swivel=lambda q: {
+                "left": types.SimpleNamespace(
+                    shoulder=_SHOULDER_L,
+                    elbow=np.array((0.25, 0.05, 0.42)),
+                    wrist_in_mount=wrist,
+                    direction=np.array((0.0, -1.0, 0.0)),
+                ),
+                "right": types.SimpleNamespace(
+                    shoulder=_SHOULDER_R,
+                    elbow=np.array((0.25, -0.05, 0.42)),
+                    wrist_in_mount=wrist,
+                    direction=np.array((0.0, -1.0, 0.0)),
+                ),
+            },
         )
         return worker
 
@@ -603,13 +650,17 @@ class BoxElbowHintsTest(unittest.TestCase):
             "right": (np.array((0.5, -0.15, 0.5), np.float32), eye),
         }
 
-    def test_hints_for_both_arms_point_outboard(self) -> None:
+    def test_hints_step_both_elbows_outboard_along_their_swivel(self) -> None:
         hints = self._worker()._box_elbow_hints(
             np.zeros(14, np.float32), self._targets()
         )
         self.assertIsNotNone(hints)
-        self.assertGreater(hints["left"][1], _SHOULDER_L[1])
-        self.assertLess(hints["right"][1], _SHOULDER_R[1])
+        np.testing.assert_allclose(
+            hints["left"], (0.25, 0.05 + _ELBOW_HINT_STEP_M, 0.42), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            hints["right"], (0.25, -0.05 - _ELBOW_HINT_STEP_M, 0.42), atol=1e-6
+        )
 
     def test_zero_weight_disables(self) -> None:
         self.assertIsNone(
@@ -1226,6 +1277,13 @@ class HandTrackingTest(unittest.TestCase):
         worker = _box_worker()
         left, right = self._targets(worker, np.zeros(3), np.eye(3))
         self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)))
+
+    def test_the_box_solve_holds_the_pose_harder(self) -> None:
+        worker = _box_worker()
+        self._targets(worker, np.zeros(3), np.eye(3))
+        scale = worker._solver.calls[-1]["pose_weight_scale"]
+        self.assertEqual(scale, _BOX_POSE_WEIGHT_SCALE)
+        self.assertGreater(scale[1], 1.0)
 
     def test_pitching_or_rolling_the_controller_changes_nothing(self) -> None:
         worker = _box_worker()

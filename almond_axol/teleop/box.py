@@ -848,6 +848,9 @@ def elbow_swivel_hint(
     changes — same shoulder-to-elbow radius, same elbow angle — the hint is
     exactly reachable, so the IK's elbow cost pulls the free motion without
     fighting the gripper pose (see ``KinematicsSolver.ik(elbow_weight=...)``).
+    That holds only for a spherical wrist; Axol's ``wrist_3`` is offset, so
+    the arm's real swivel bends off this circle as the wrist turns, and
+    :func:`swivel_step` keeps only the reachable part of the hint.
 
     Degenerate cases return the current elbow: a wrist at the shoulder, a
     perfectly straight arm (no swivel to speak of), or an axis parallel to the
@@ -872,3 +875,22 @@ def elbow_swivel_hint(
     if w < 1e-6:
         return elbow.astype(np.float32)
     return (shoulder + along * a + r * (want / w)).astype(np.float32)
+
+
+def swivel_step(
+    elbow: np.ndarray, goal: np.ndarray, direction: np.ndarray, max_step: float
+) -> np.ndarray:
+    """An elbow hint toward ``goal`` that moves the elbow only along its swivel.
+
+    ``goal`` (:func:`elbow_swivel_hint`) lies on a circle the arm's real
+    swivel only approximates, and the solver meets a hint off that motion
+    halfway — pulling the gripper off its target. This keeps the part of
+    ``goal - elbow`` along ``direction`` (the arm's swivel motion,
+    ``KinematicsSolver.elbow_swivel``), at most ``max_step`` (m), so the
+    hint is reachable to first order and goes to the elbow itself where
+    the swivel comes closest to the goal.
+    """
+    elbow = np.asarray(elbow, dtype=np.float64)
+    d = np.asarray(direction, dtype=np.float64)
+    along = float((np.asarray(goal, dtype=np.float64) - elbow) @ d)
+    return (elbow + float(np.clip(along, -max_step, max_step)) * d).astype(np.float32)

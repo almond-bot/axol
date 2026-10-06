@@ -227,9 +227,12 @@ class VRTeleopConfig:
             mirrored back here, so it outlasts the pair and shows in the
             settings panel (also adjustable there, and from the headset
             menu as **Elbows out**).
-        box_elbow_weight: IK weight on that elbow hint (compare
-            ``KinematicsConfig.pos_weight`` 50 for the grippers). ``10``
-            (the default) follows the angle. ``0`` disables the hint — the
+        box_elbow_weight: IK weight on that elbow hint (compare the
+            grippers' pose weights, which box mode raises to twice
+            ``KinematicsConfig.pos_weight`` and four times ``ori_weight``).
+            The hint only steps each elbow along the arm's own swivel, so
+            it doesn't pull a gripper off its target. ``10`` (the default)
+            follows the angle. ``0`` disables the hint — the
             swivel is then left alone: rest damping holds it and the
             arm/torso collision model (``KinematicsConfig.self_collision``)
             keeps it off the base — and the sticks' elbow control does
