@@ -36,8 +36,13 @@ class _Jaw:
         stiff: tuple[float, float] | None = None,
         spike_nm: float = 0.0,
         stuck_nm: float = 0.0,
+        spring: float = 0.0,
+        inverted: bool = False,
     ) -> None:
         self.lo, self.hi = lo, hi
+        self.spring = spring
+        self.inverted = inverted
+        self.sprung = 0
         self.position = start
         self.target = start
         self.stiff = stiff
@@ -53,7 +58,17 @@ class _Jaw:
             self.torque = kp * (p_des - self.position)
             return
         self.stuck_nm = 0.0
+        on_stop = self.position in (self.lo, self.hi)
         self.position = min(max(p_des, self.lo), self.hi)
+        if self.spring and on_stop and self.lo < self.position < self.hi:
+            # Leaving a stop it was pressed on: the jaw springs off it,
+            # ``spring`` rad ahead of the target, for a few steps.
+            self.sprung = 3
+        if self.sprung:
+            self.sprung -= 1
+            self.position = min(
+                max(p_des + math.copysign(self.spring, motion), self.lo), self.hi
+            )
         self.torque = kp * (p_des - self.position)
         if (
             self.stiff is not None
@@ -63,7 +78,7 @@ class _Jaw:
             self.torque = math.copysign(self.spike_nm, motion)
 
     async def get_torque(self) -> float:
-        return self.torque
+        return -self.torque if self.inverted else self.torque
 
     async def get_position(self) -> float:
         return self.position
@@ -122,6 +137,25 @@ class SweepTest(unittest.IsolatedAsyncioTestCase):
         arm = _arm_with(jaw)
         await arm._seek_gripper_stop(1)
         self.assertLess(jaw.torque, axol_module._GRIPPER_CALIB_TORQUE_ABORT)
+
+    async def test_jaw_springing_off_the_closed_stop_is_not_an_abort(self) -> None:
+        # The right arm on the robot: leaving the closed stop it was pressed
+        # on, the jaw sprang ~2.6° ahead of the target and the hold braked
+        # it at -2.27 Nm, which aborted the opening sweep.
+        jaw = _Jaw(lo=0.53, hi=3.74, start=2.0, spring=0.0454)
+        arm = AxolHardware(AxolConfig()).right
+        arm.motors[Joint.GRIPPER] = jaw
+        await arm._calibrate_gripper()
+        self.assertAlmostEqual(arm._gripper_close, 0.53, delta=0.06)
+        self.assertAlmostEqual(arm._gripper_open, 3.74, delta=0.01)
+
+    async def test_inverted_torque_sign_still_aborts(self) -> None:
+        jaw = _Jaw(lo=-5.38, hi=-2.20, start=-3.0, inverted=True)
+        arm = _arm_with(jaw)
+        with self.assertRaisesRegex(MotorError, "against the sweep"):
+            await arm._calibrate_gripper()
+        # The failed sweep leaves the hold at the shaft, not wound up.
+        self.assertEqual(jaw.target, jaw.position)
 
     async def test_jammed_jaw_still_fails(self) -> None:
         jaw = _Jaw(lo=-3.0, hi=-2.9, start=-2.95)

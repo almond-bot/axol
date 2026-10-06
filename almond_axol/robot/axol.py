@@ -87,9 +87,13 @@ _GRIPPER_CALIB_MAX_SWEEP_STEPS = math.ceil(
     _GRIPPER_CALIB_MAX_SWEEP / _GRIPPER_CALIB_STEP
 )
 # A stop is only recognised from torque pushing *along* the sweep. Torque
-# building up against the sweep means the motor is already stalled on the
-# far stop (its reported torque sign disagrees with the commanded motion) —
-# abort rather than wind the impedance target further into the mechanism.
+# this far against the sweep with the shaft lagging the target by at least
+# half what it takes to make it at the calibration stiffness (abort / kp),
+# two reads running, means the reported torque sign disagrees with the
+# commanded motion — abort rather than wind the impedance target further
+# into the mechanism. Against
+# torque with the shaft *ahead* of the target is the hold braking a jaw that
+# sprang off the stop it was pressed on, and the sweep goes on.
 _GRIPPER_CALIB_TORQUE_ABORT = 2.0  # Nm
 # The threshold alone is not a stop: breaking a jaw free from where it rests
 # (pressed on a stop) or a stiff patch of its travel spikes the torque past
@@ -1147,22 +1151,25 @@ class AxolArm:
         step) — a torque spike on a jaw still moving is not a stop. The
         signed test matters for the second sweep of a calibration, which
         starts pressed against the stop the first one found: that torque
-        points the other way and must not end the sweep early.
+        points the other way and must not end the sweep early — nor does
+        the hold braking the jaw as it springs off that stop ahead of the
+        target, which reads against the sweep too.
 
         Returns:
             The measured shaft position at the stop (raw motor rad).
 
         Raises:
-            MotorError: If torque builds up *against* the sweep (the motor
-                reports pushing opposite to its commanded motion — stalled on
-                the stop it should be leaving, or an inverted torque sign),
-                or no stop is met within ``_GRIPPER_CALIB_MAX_SWEEP``.
+            MotorError: If torque builds up *against* the sweep while the
+                shaft lags the target (the motor reports pushing opposite to
+                its commanded motion — an inverted torque sign), or no stop
+                is met within ``_GRIPPER_CALIB_MAX_SWEEP``.
         """
         motor = self.motors[Joint.GRIPPER]
         side = "left" if self._is_left else "right"
         target = await motor.get_position()
         pressed_at: float | None = None
         stalled = 0
+        against = 0
 
         for _ in range(_GRIPPER_CALIB_MAX_SWEEP_STEPS):
             target += direction * _GRIPPER_CALIB_STEP
@@ -1173,6 +1180,7 @@ class AxolArm:
             torque = await motor.get_torque()
             along = torque * direction
             if along >= threshold:
+                against = 0
                 position = await motor.get_position()
                 if pressed_at is not None and (
                     (position - pressed_at) * direction
@@ -1187,14 +1195,22 @@ class AxolArm:
                 continue
             pressed_at = None
             stalled = 0
-            if along <= -_GRIPPER_CALIB_TORQUE_ABORT:
+            if along > -_GRIPPER_CALIB_TORQUE_ABORT:
+                against = 0
+                continue
+            lag = (target - await motor.get_position()) * direction
+            if lag < 0.5 * _GRIPPER_CALIB_TORQUE_ABORT / _GRIPPER_CALIB_KP:
+                against = 0
+                continue
+            against += 1
+            if against >= _GRIPPER_STALL_READS:
                 await self._unload_gripper_target()
                 raise MotorError(
                     f"{side} gripper calibration: torque {torque:+.2f} Nm builds "
                     f"up against the sweep (direction {direction:+d}) — the motor "
-                    f"reports pushing opposite to its commanded motion, so it is "
-                    f"stalled on the stop the sweep should be leaving (or its "
-                    f"torque sign is inverted); the jaw must be free to move"
+                    f"reports pushing opposite to its commanded motion while the "
+                    f"shaft lags {math.degrees(lag):.1f}° behind it — its torque "
+                    f"sign looks inverted, or the jaw is held back"
                 )
 
         await self._unload_gripper_target()
