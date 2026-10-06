@@ -741,6 +741,40 @@ def squeeze_lean(
     )
 
 
+def joint_force_limit(
+    jac: np.ndarray,
+    rotation: np.ndarray,
+    normal: np.ndarray,
+    contacts: np.ndarray,
+    joint_caps: np.ndarray,
+) -> float:
+    """Largest even clamp (N) the arm's torque-capped joints can hold.
+
+    The clamp :func:`squeeze_lean` renders is a force along ``normal``
+    through the contacts' centroid; statics puts ``|J^T w|`` of it on each
+    joint. A joint with a spring-torque cap (``joint_caps``, Nm, ``inf``
+    for none — the wrists' 5 Nm) can't deliver more than that, and the
+    joint that saturates first is the one holding the moment that keeps the
+    far contact pressed (``wrist_2``, ~0.13 Nm per N for the parcel
+    gripper's facet and tip): past it every extra newton goes where that
+    joint adds no torque — its own axis, behind the facet — so the tip
+    unloads and the facet takes it all, the pinch. Returns the force at
+    which the first capped joint saturates (``inf`` if none is loaded).
+    """
+    pts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
+    if pts.shape[0] == 0:
+        return math.inf
+    n = np.asarray(normal, dtype=np.float64)
+    r_c = pts.mean(axis=0) @ np.asarray(rotation, dtype=np.float64).T
+    unit_wrench = np.concatenate([n, np.cross(r_c, n)])
+    per_newton = np.abs(np.asarray(jac, dtype=np.float64).T @ unit_wrench)
+    caps = np.asarray(joint_caps, dtype=np.float64)
+    loaded = np.isfinite(caps) & (per_newton > 1e-9)
+    if not np.any(loaded):
+        return math.inf
+    return float(np.min(caps[loaded] / per_newton[loaded]))
+
+
 def tip_inward_sign(rot: np.ndarray, normal: np.ndarray, up: np.ndarray) -> float:
     """``+1`` if a positive yaw about ``up`` swings this gripper's tip toward the box.
 

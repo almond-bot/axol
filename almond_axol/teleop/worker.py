@@ -34,6 +34,7 @@ from .box import (
     choose_faces,
     contact_width,
     elbow_swivel_hint,
+    joint_force_limit,
     pair_aligned,
     parcel_tool,
     rodrigues,
@@ -127,6 +128,10 @@ _TRIM_STILL_SPEED = 0.03
 _TRIM_STILL_S = 0.3
 # While the grippers press, a line of clamp diagnostics this often (s).
 _CLAMP_LOG_PERIOD_S = 1.0
+# Share of a torque-capped joint's cap the even clamp may use (see
+# joint_force_limit): the rest is left for what else that joint carries —
+# the squeeze trim's extra yaw, a held box's weight, the pair's own moves.
+_JOINT_CAP_MARGIN = 0.8
 # The robot's up (FLU +z), for box-frame rotations.
 _UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
 # The room's up in the frame the controller rotations are held in. Those
@@ -471,10 +476,26 @@ class IKWorker:
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
         self._lean_model = None
+        # Each arm's spring-torque caps (Nm, ARM_JOINTS order; inf for none):
+        # the clamp is held under the force at which they saturate.
+        self._joint_caps: dict[str, np.ndarray] | None = None
         try:
+            from ..constants import ARM_JOINTS
+            from ..robot.config import AxolConfig
             from ..robot.gravity import GravityCompensator
 
             self._lean_model = GravityCompensator()
+            robot_cfg = AxolConfig()
+            self._joint_caps = {
+                side: np.array(
+                    [
+                        getattr(getattr(robot_cfg, side), j.value).torque_limit
+                        for j in ARM_JOINTS
+                    ],
+                    dtype=np.float64,
+                )
+                for side in ("left", "right")
+            }
         except Exception:  # noqa: BLE001 - the lean is optional
             _logger.exception("arm model unavailable; box mode's squeeze lean is off")
 
@@ -1384,7 +1405,13 @@ class IKWorker:
         this replaces did exactly that and cost the pair its alignment).
         With ``config.box_squeeze_force`` > 0 the depth is capped at that
         force's, the targets pulled back out along the normals to hold it
-        — the same on both arms, so the pair stays a pair.
+        — the same on both arms, so the pair stays a pair. The arms' own
+        torque caps set a second, automatic cap (:func:`joint_force_limit`,
+        ``_JOINT_CAP_MARGIN`` of it, the lower arm's for both): ``wrist_2``
+        holds the moment that keeps the tip pressed and saturates first,
+        at ~39 N of even clamp at its 5 Nm, and squeezing past that only
+        unloads the tip onto the facet — so the clamp stops there, both
+        contacts pressed, however far the width is jogged.
 
         The model's lean is open loop, and the arm is not quite the model:
         gear backlash, the wrist's own compliance, and the gripper flexing
@@ -1498,11 +1525,11 @@ class IKWorker:
         out: dict[str, Pose] = {}
         forces: list[float] = []
         per_side_force: dict[str, float] = {}
+        models: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for side, indices in (
             ("left", self.left_indices),
             ("right", self.right_indices),
         ):
-            pos, rot = targets[side]
             arm_q = np.asarray(q_current, dtype=np.float64)[indices]
             try:
                 _p, rot_cmd, jac = model.mount_jacobian(arm_q, is_left=(side == "left"))
@@ -1510,14 +1537,30 @@ class IKWorker:
                 _logger.exception("squeeze lean failed; targets unchanged")
                 self._lean_model = None
                 return self._apply_trim(targets, normals, up)
+            models[side] = (rot_cmd, jac, np.asarray(tool.contacts(box.face[side])))
+        joint_limit = math.inf
+        caps = getattr(self, "_joint_caps", None)
+        if caps is not None:
+            for side, (rot_cmd, jac, pts) in models.items():
+                joint_limit = min(
+                    joint_limit,
+                    _JOINT_CAP_MARGIN
+                    * joint_force_limit(jac, rot_cmd, normals[side], pts, caps[side]),
+                )
+        force_cap = cap if cap > 0.0 else math.inf
+        limited = joint_limit < force_cap
+        force_cap = min(force_cap, joint_limit)
+        for side in ("left", "right"):
+            pos, rot = targets[side]
+            rot_cmd, jac, pts = models[side]
             lean = squeeze_lean(
                 jac,
                 kp[side],
                 rot_cmd,
                 normals[side],
-                np.asarray(tool.contacts(box.face[side])),
+                pts,
                 depth,
-                cap,
+                force_cap if math.isfinite(force_cap) else 0.0,
             )
             forces.append(lean.force)
             per_side_force[side] = lean.force
@@ -1530,7 +1573,9 @@ class IKWorker:
                 new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
             out[side] = (new_pos, new_rot)
         self._lean_force = 0.5 * sum(forces)
-        self._log_clamp(now, depths, per_side_force, toe, still)
+        self._log_clamp(
+            now, depths, per_side_force, toe, still, joint_limit if limited else None
+        )
         return self._apply_trim(out, normals, up)
 
     def _pair_still(self, targets: dict[str, Pose], now: float) -> bool:
@@ -1563,6 +1608,7 @@ class IKWorker:
         forces: dict[str, float],
         toe: dict[str, float],
         still: bool,
+        joint_limit: float | None = None,
     ) -> None:
         """Rate-limited clamp diagnostics while the grippers press."""
         if now - self._clamp_log_t < _CLAMP_LOG_PERIOD_S:
@@ -1570,7 +1616,7 @@ class IKWorker:
         self._clamp_log_t = now
         _logger.info(
             "box clamp: depth L %.1f / R %.1f mm, force L %.1f / R %.1f N, "
-            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s",
+            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s%s",
             depths["left"] * 1e3,
             depths["right"] * 1e3,
             forces.get("left", 0.0),
@@ -1580,6 +1626,9 @@ class IKWorker:
             math.degrees(self._lean_trim["left"]),
             math.degrees(self._lean_trim["right"]),
             "" if still else " (pair moving: trims held)",
+            ""
+            if joint_limit is None
+            else f" (held at the wrists' even-clamp limit, {joint_limit:.0f} N)",
         )
 
     def _apply_trim(

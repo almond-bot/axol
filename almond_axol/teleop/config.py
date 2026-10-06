@@ -337,7 +337,12 @@ class VRTeleopConfig:
             gripper by equal amounts, so the pair stays a pair. ``8`` N a
             side holds a light parcel with margin; raise it if boxes slip,
             lower it to be gentler. Live-adjustable; realtime-core hardware
-            only.
+            only. Whatever it is set to, the clamp is also held under what
+            the wrists can press evenly with: ``wrist_2`` carries the moment
+            that keeps the tip on the box and, at its 5 Nm cap, saturates
+            at ~39 N of even clamp, after which squeezing harder only lifts
+            the tip — so the worker stops the clamp at 80% of that (~31 N
+            a side at a box-carrying pose).
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest

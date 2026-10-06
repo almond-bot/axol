@@ -45,6 +45,7 @@ from almond_axol.teleop.box import (
     URDF_TOOL,
     BoxState,
     ideal_gripper_poses,
+    joint_force_limit,
     parcel_tool,
     rodrigues,
     side_clamp_rotation,
@@ -54,12 +55,18 @@ from almond_axol.teleop.box import (
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore, measured_arms
 from almond_axol.teleop.live import LiveSettings
-from almond_axol.teleop.worker import _LEAN_TAU_S, IKWorker
+from almond_axol.teleop.worker import _JOINT_CAP_MARGIN, _LEAN_TAU_S, IKWorker
 
 _CFG = AxolConfig()
 _GC = GravityCompensator(_CFG)
 _KP_L = np.array([float(getattr(_CFG.left, j.value).kp) for j in ARM_JOINTS])
 _KP_R = np.array([float(getattr(_CFG.right, j.value).kp) for j in ARM_JOINTS])
+_CAPS = {
+    side: np.array(
+        [getattr(getattr(_CFG, side), j.value).torque_limit for j in ARM_JOINTS]
+    )
+    for side in ("left", "right")
+}
 # Elbow bent, hand ahead of the shoulder at about box height.
 _Q_BOX_L = np.array([0.4, -0.15, 0.1, 1.2, 0.0, 0.3, 0.0])
 _Q_BOX_R = np.array([0.4, 0.15, -0.1, 1.2, 0.0, -0.3, 0.0])
@@ -191,6 +198,38 @@ class LeanMathTest(unittest.TestCase):
         self.assertEqual(
             squeeze_lean(self.jac, np.zeros(7), self.rot, self.n, self.pts, 0.01).force,
             0.0,
+        )
+
+    def test_the_wrist_cap_limits_the_even_clamp(self) -> None:
+        limit = joint_force_limit(self.jac, self.rot, self.n, self.pts, _CAPS["left"])
+        # wrist_2 holds the moment that keeps the tip pressed: at its 5 Nm
+        # the even clamp is a few tens of newtons.
+        self.assertGreater(limit, 20.0)
+        self.assertLess(limit, 80.0)
+        # At that force the clamp wrench puts exactly a cap on one capped
+        # joint and no more on any.
+        r_c = self.pts.mean(axis=0) @ self.rot.T
+        tau = np.abs(
+            self.jac.T @ (limit * np.concatenate([self.n, np.cross(r_c, self.n)]))
+        )
+        capped = np.isfinite(_CAPS["left"])
+        self.assertTrue(np.all(tau[capped] <= _CAPS["left"][capped] + 1e-6))
+        self.assertAlmostEqual(
+            float(np.max(tau[capped] - _CAPS["left"][capped])), 0.0, places=5
+        )
+        # The binding one is wrist_2.
+        ratio = np.where(capped, tau / _CAPS["left"], 0.0)
+        self.assertEqual(ARM_JOINTS[int(np.argmax(ratio))].value, "wrist_2")
+        # A tip further out needs more wrist: a lower limit.
+        far = self.pts.copy()
+        far[2:, 2] -= 0.05
+        self.assertLess(
+            joint_force_limit(self.jac, self.rot, self.n, far, _CAPS["left"]), limit
+        )
+        # No caps, no limit.
+        self.assertEqual(
+            joint_force_limit(self.jac, self.rot, self.n, self.pts, np.full(7, np.inf)),
+            math.inf,
         )
 
     def test_single_contact_at_the_mount_is_a_pure_force(self) -> None:
@@ -440,6 +479,40 @@ class WorkerLeanTest(unittest.TestCase):
         self.assertAlmostEqual(w0.squeeze_force, 4.0, places=6)
         np.testing.assert_allclose(out0["left"][1], targets["left"][1], atol=1e-7)
         self.assertGreater(float(out0["left"][0][1] - targets["left"][0][1]), 0.015)
+
+    def test_a_hard_squeeze_is_held_at_the_wrists_limit(self) -> None:
+        q = _q_full()
+        w = self._worker()
+        w._joint_caps = _CAPS
+        w.note_measured(q[0:8], q[8:16], _KP_L, _KP_R)
+        targets = self._targets(q, 0.12, 0.12)  # 12 cm in: far past the wrists
+        out = self._settle(w, self._box(), targets, q)
+        tool = parcel_tool(39.0)
+        limits = []
+        for side, idx, normal, face in (
+            ("left", slice(0, 7), np.array([0.0, -1.0, 0.0]), 1.0),
+            ("right", slice(8, 15), np.array([0.0, 1.0, 0.0]), -1.0),
+        ):
+            _p, rot, jac = _GC.mount_jacobian(q[idx], is_left=(side == "left"))
+            pts = np.asarray(tool.contacts(face))
+            limits.append(joint_force_limit(jac, rot, normal, pts, _CAPS[side]))
+        held = _JOINT_CAP_MARGIN * min(limits)
+        self.assertAlmostEqual(w.squeeze_force, held, places=3)
+        # Both targets pulled back out to hold it, the pair still a pair.
+        back_l = float(out["left"][0][1] - targets["left"][0][1])
+        back_r = float(targets["right"][0][1] - out["right"][0][1])
+        self.assertGreater(back_l, 0.03)
+        self.assertAlmostEqual(back_l, back_r, delta=0.01)
+        # Under the limit nothing changes.
+        light = self._worker()
+        light._joint_caps = _CAPS
+        light.note_measured(q[0:8], q[8:16], _KP_L, _KP_R)
+        plain = self._worker()
+        plain.note_measured(q[0:8], q[8:16], _KP_L, _KP_R)
+        a = self._settle(light, self._box(), self._targets(q, 0.01, 0.01), q)
+        b = self._settle(plain, self._box(), self._targets(q, 0.01, 0.01), q)
+        np.testing.assert_allclose(a["left"][0], b["left"][0], atol=1e-7)
+        self.assertLess(light.squeeze_force, held)
 
     def test_the_depth_is_low_passed(self) -> None:
         q = _q_full()
