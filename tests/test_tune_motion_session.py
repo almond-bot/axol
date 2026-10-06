@@ -24,6 +24,7 @@ from unittest import mock
 import numpy as np
 
 from almond_axol.constants import ARM_JOINTS
+from almond_axol.robot.config import AxolConfig
 from almond_axol.tuning.motion import ReferenceMotion, save_motion
 
 RATE = 240.0
@@ -58,6 +59,10 @@ class _Arm:
         self.positions = np.zeros(8, dtype=np.float32)
         self.torques = np.zeros(8, dtype=np.float32)
         self.motors = {j: SimpleNamespace(_feedback_ts=None) for j in ARM_JOINTS}
+        self._arm_config = AxolConfig().right
+        # Rings itself up (negative damping) until frozen: a gain under test
+        # that made the joint unstable.
+        self.unstable = False
         self._publish()
 
     def _publish(self) -> None:
@@ -70,7 +75,8 @@ class _Arm:
         self.queue.append(np.asarray(cmd[:7], dtype=float).copy())
         u = self.queue.pop(0)
         dt = 1.0 / RATE
-        acc = WN * WN * (u - self.y) - 2 * ZETA * WN * self.v
+        zeta = -0.3 if self.unstable else ZETA
+        acc = WN * WN * (u - self.y) - 2 * zeta * WN * self.v
         self.v += acc * dt
         self.y += self.v * dt
         self._publish()
@@ -98,8 +104,14 @@ class _FakeAxol:
         return None
 
     applied: list = []
+    #: Make the right arm unstable after this many commands (None: never).
+    destabilize_after: int | None = None
+    calls = 0
 
     async def motion_control(self, left=None, right=None) -> None:
+        _FakeAxol.calls += 1
+        if _FakeAxol.calls == _FakeAxol.destabilize_after:
+            self.right.unstable = True
         if left is not None and self.left is not None:
             self.left.step(left)
         if right is not None:
@@ -109,6 +121,19 @@ class _FakeAxol:
 
     def set_recording_engaged(self, on: bool) -> None:
         pass
+
+    frozen = 0
+
+    def reset_gravity_hold(self) -> None:
+        pass
+
+    async def gravity_compensate(self, free_joints=None) -> None:
+        # A stiff hold on the base gains: the ring dies.
+        _FakeAxol.frozen += 1
+        for arm in (self.left, self.right):
+            if arm is not None:
+                arm.unstable = False
+                arm.v[:] = 0.0
 
 
 def _plan(solver, q_from, q_to, speed, rate, min_duration):
@@ -192,6 +217,8 @@ class SessionTest(unittest.TestCase):
             ee_rotations=_ee_rotations,
         )
         _FakeAxol.applied = []
+        _FakeAxol.calls = 0
+        _FakeAxol.frozen = 0
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers()
         cli.add_parser(sub)
@@ -237,7 +264,12 @@ class SessionTest(unittest.TestCase):
                 )
             )
             stack.enter_context(contextlib.redirect_stdout(out))
-            asyncio.run(cli._run(args))
+            stack.enter_context(
+                mock.patch.object(
+                    cli.os, "_exit", mock.Mock(side_effect=AssertionError("_exit"))
+                )
+            )
+            self.trips = asyncio.run(cli._run(args))
         self.runs_dir = runs_dir
         return out.getvalue()
 
@@ -247,6 +279,31 @@ class SessionTest(unittest.TestCase):
             for line in text.splitlines()
             if "learning: pass" in line and "band error" in line
         ]
+
+    def test_an_unstable_joint_trips_the_guard_freezes_and_returns_to_rest(
+        self,
+    ) -> None:
+        _FakeAxol.destabilize_after = int(3 * RATE)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                text = self._run(["--repeat", "2"], Path(d))
+        finally:
+            _FakeAxol.destabilize_after = None
+        self.assertEqual(len(self.trips), 1, text)
+        trip = self.trips[0]
+        self.assertEqual(trip.kind, "oscillation")
+        self.assertTrue(trip.joint.startswith("right."))
+        self.assertIn("GUARD TRIP", text)
+        self.assertGreater(_FakeAxol.frozen, 0)
+        self.assertIn("Returning to rest", text)
+        # The second pass never ran.
+        self.assertNotIn("pass 2/2", text)
+
+    def test_a_stable_replay_never_trips(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            self._run(["--repeat", "2"], Path(d))
+        self.assertEqual(self.trips, [])
+        self.assertEqual(_FakeAxol.frozen, 0)
 
     def test_learning_cuts_the_repeatable_error_and_the_correction_replays(
         self,

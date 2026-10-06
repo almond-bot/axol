@@ -47,7 +47,9 @@ import asyncio
 import itertools
 import logging
 import math
+import os
 import time
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,13 @@ from ...tuning import save_run, tracking_metrics
 from ...tuning.imu_damping import EncoderTipDamper, GyroFlexDamper, TorqueProbe
 from ...tuning.learning import LEARN_BAND, CommandLearner
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+from ...tuning.motion_guard import (
+    DEFAULT_DEV_DEG,
+    DEFAULT_OSC_DEG,
+    DEFAULT_VIB_DEG,
+    GuardTrip,
+    MotionGuard,
+)
 from ...tuning.runs import load_run
 from ...tuning.wrist_imu import WristImu, format_imu
 from ...utils.logquiet import quiet_noisy_loggers
@@ -429,6 +438,34 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--no-save-run",
         action="store_true",
         help="Don't persist the run artifact (dry run)",
+    )
+    p.add_argument(
+        "--no-guard",
+        action="store_true",
+        help="Disable the tracking guard. By default every driven joint's "
+        "tracking error is watched each sample, and playback aborts — the arm "
+        "frozen on its base gains, then returned to rest — when a joint leaves "
+        "its trajectory (--guard-dev-deg), oscillates (--guard-osc-deg RMS, "
+        "0.3-15 Hz) or vibrates (--guard-vib-deg RMS, > 15 Hz). The moves to "
+        "and from the motion get twice the limits.",
+    )
+    p.add_argument(
+        "--guard-dev-deg",
+        type=float,
+        default=DEFAULT_DEV_DEG,
+        help=f"Guard: tracking deviation limit (default {DEFAULT_DEV_DEG:g}°)",
+    )
+    p.add_argument(
+        "--guard-osc-deg",
+        type=float,
+        default=DEFAULT_OSC_DEG,
+        help=f"Guard: 0.3-15 Hz error RMS limit (default {DEFAULT_OSC_DEG:g}°)",
+    )
+    p.add_argument(
+        "--guard-vib-deg",
+        type=float,
+        default=DEFAULT_VIB_DEG,
+        help=f"Guard: > 15 Hz error RMS limit (default {DEFAULT_VIB_DEG:g}°)",
     )
     p.add_argument(
         "--a4",
@@ -813,9 +850,16 @@ def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level))
     quiet_noisy_loggers()
     try:
-        asyncio.run(_run(args))
+        trips = asyncio.run(_run(args))
     except KeyboardInterrupt:
         print("\nExiting tune.motion ...")
+        return
+    if trips:
+        # A distinct status for unattended sweeps: the run aborted on the
+        # tracking guard (the arm is back at rest unless the log says it
+        # was left holding).
+        print(f"\nGUARD TRIPS: {len(trips)} — " + "; ".join(str(t) for t in trips))
+        raise SystemExit(3)
 
 
 def _print_metrics_table(per_joint: dict[str, dict[str, float]]) -> None:
@@ -1608,10 +1652,10 @@ def _learn_step_imu(
     )
 
 
-async def _run(args: argparse.Namespace) -> None:
+async def _run(args: argparse.Namespace) -> list[GuardTrip]:
     if args.gyro_mount_fit:
         _fit_gyro_mount(args)
-        return
+        return []
     if args.enc2:
         _enable_enc2(args)
     motion = _load_motion_or_exit(args.motion)
@@ -1637,6 +1681,8 @@ async def _run(args: argparse.Namespace) -> None:
         right_stiffness=args.stiffness,
         has_gripper=not args.no_gripper,
     )
+    # The gains before this run's overrides: what a guard trip falls back to.
+    base_config = deepcopy(config.resolved())
     _apply_gain_overrides(config, overrides)
     for (side, joint, fld), value in overrides.items():
         print(f"  gain override: {side}.{joint}.{fld} = {value}")
@@ -1823,6 +1869,7 @@ async def _run(args: argparse.Namespace) -> None:
     log_damp: list[np.ndarray] = []
 
     watchdog = ContactWatchdog(args.torque_threshold)
+    guard_trips: list[GuardTrip] = []
     # Firmware-loop joints, as (side, index in the arm's 7, name), for the
     # deviation guard in execute().
     resolved_cfg = config.resolved()
@@ -1866,6 +1913,7 @@ async def _run(args: argparse.Namespace) -> None:
         record: bool = False,
         refs: np.ndarray | None = None,
         damp: bool = False,
+        guard_scale: float = 1.0,
     ) -> tuple[str, float] | None:
         """Stream full-N waypoints at the motion rate with deadline pacing.
 
@@ -1876,8 +1924,27 @@ async def _run(args: argparse.Namespace) -> None:
         reference logged as the scoring target when the streamed waypoints
         are a corrupted/filtered version of it; the streamed rows are then
         logged separately as ``sent``. Returns the watchdog trip or ``None``.
+        Raises :class:`_GuardTripped` when the tracking guard trips
+        (``guard_scale`` multiplies its limits: 2 for the moves to and from
+        the motion).
         """
         period = 1.0 / motion.rate
+        guard_arms = [
+            (side, arm)
+            for side, arm in (("left", axol.left), ("right", axol.right))
+            if arm is not None
+        ]
+        guard = (
+            None
+            if args.no_guard
+            else MotionGuard(
+                [f"{side}.{j.value}" for side, _ in guard_arms for j in ARM_JOINTS],
+                motion.rate,
+                dev_deg=args.guard_dev_deg,
+                osc_deg=args.guard_osc_deg,
+                vib_deg=args.guard_vib_deg,
+            )
+        )
         left = np.zeros(8, dtype=np.float32)
         right = np.zeros(8, dtype=np.float32)
         t0 = time.perf_counter()
@@ -1960,6 +2027,18 @@ async def _run(args: argparse.Namespace) -> None:
                 off = float(arm.positions[i]) - cmd
                 if abs(off) > _FW_DEVIATION_ABORT:
                     raise _Runaway(name, math.degrees(off))
+            if guard is not None:
+                err = np.concatenate(
+                    [
+                        np.asarray(arm.positions[:7], dtype=np.float64)
+                        - (left if side == "left" else right)[:7]
+                        for side, arm in guard_arms
+                    ]
+                )
+                trip = guard.update(err, scale=guard_scale)
+                if trip is not None:
+                    _clear_extra_torque(axol)
+                    raise _GuardTripped(trip)
             if record:
                 row_a = np.full(14, np.nan, dtype=np.float32)
                 row_tq = np.full(14, np.nan, dtype=np.float32)
@@ -2066,7 +2145,7 @@ async def _run(args: argparse.Namespace) -> None:
             q_now = snapshot(axol)
             if float(np.max(np.abs(q_now - q_start))) > 0.02:
                 print("Moving to the motion start pose ...")
-                contact = await execute(axol, plan(q_now, q_start))
+                contact = await execute(axol, plan(q_now, q_start), guard_scale=2.0)
                 if contact is not None:
                     raise _Contact(contact)
                 await asyncio.sleep(0.5)
@@ -2095,7 +2174,9 @@ async def _run(args: argparse.Namespace) -> None:
                         q_now = snapshot(axol)
                         if float(np.max(np.abs(q_now - q_start))) > 0.02:
                             print("Back to the motion start pose ...")
-                            contact = await execute(axol, plan(q_now, q_start))
+                            contact = await execute(
+                                axol, plan(q_now, q_start), guard_scale=2.0
+                            )
                             if contact is not None:
                                 raise _Contact(contact)
                         stragglers = start_pose_stragglers(
@@ -2185,6 +2266,13 @@ async def _run(args: argparse.Namespace) -> None:
                 f"firmware loop (limit {math.degrees(_FW_DEVIATION_ABORT):.0f}°) — it "
                 "has left its target; playback aborted, returning to rest"
             )
+        except _GuardTripped as exc:
+            guard_trips.append(exc.trip)
+            print(
+                f"\n  ! GUARD TRIP: {exc.trip} — playback aborted; holding on the "
+                "base gains, then returning to rest"
+            )
+            await _freeze(axol, base_config)
         except _Contact as exc:
             joint, residual = exc.trip
             print(
@@ -2206,7 +2294,32 @@ async def _run(args: argparse.Namespace) -> None:
                 q_now = snapshot(axol)
                 if float(np.max(np.abs(q_now - q_rest))) > 0.02:
                     print("Returning to rest ...")
-                    await execute(axol, plan(q_now, q_rest))
+                    await execute(axol, plan(q_now, q_rest), guard_scale=2.0)
+            except _GuardTripped as exc:
+                guard_trips.append(exc.trip)
+                print(
+                    f"\n  ! GUARD TRIP on the way to rest: {exc.trip} — holding, "
+                    "then retrying on the base gains"
+                )
+                await _freeze(axol, base_config)
+                try:
+                    await execute(axol, plan(snapshot(axol), q_rest), guard_scale=4.0)
+                except _GuardTripped as again:
+                    # Neither the base gains nor relaxed limits get the arm
+                    # home. Disabling would drop it where it stands: leave it
+                    # holding its last (frozen, stiff, gravity-fed) command
+                    # with the core gone, and stop without the disabling
+                    # teardown.
+                    guard_trips.append(again.trip)
+                    print(
+                        f"\n  ! GUARD TRIP again on the way to rest: {again.trip} — "
+                        "leaving the arm HOLDING where it is (motors energized) "
+                        "and exiting; power-cycle or re-enable to recover",
+                        flush=True,
+                    )
+                    await _freeze(axol, base_config)
+                    await axol.disconnect()
+                    os._exit(4)
             except Exception:  # noqa: BLE001 - best-effort teardown
                 logging.getLogger(__name__).warning(
                     "return-to-rest failed", exc_info=True
@@ -2217,7 +2330,7 @@ async def _run(args: argparse.Namespace) -> None:
     imu.stop()
     if not log_t:
         print("No playback samples recorded — nothing to score.")
-        return
+        return guard_trips
     if not passes_run:
         passes_run.append((0, len(log_t)))
 
@@ -2272,6 +2385,7 @@ async def _run(args: argparse.Namespace) -> None:
         summary: dict[str, Any] = {
             "per_joint": per_joint,
             "completed": bool(b - a >= len(sent)),
+            "guard_trips": [str(t) for t in guard_trips],
         }
         if pass_index < len(pass_damped):
             summary["imu_damp"] = args.imu_damp if pass_damped[pass_index] else 0.0
@@ -2372,6 +2486,49 @@ async def _run(args: argparse.Namespace) -> None:
                 f"{sm.get('worst_joint', 'hold')}"
                 + ("" if sm["completed"] else "  (cut short)")
             )
+    return guard_trips
+
+
+class _GuardTripped(Exception):
+    """Internal: the tracking guard tripped (see :mod:`...tuning.motion_guard`)."""
+
+    def __init__(self, trip: GuardTrip) -> None:
+        super().__init__(str(trip))
+        self.trip = trip
+
+
+#: Seconds a guard trip holds the arm still before moving it again.
+_FREEZE_S = 1.5
+
+
+async def _freeze(axol: Axol, base_config: AxolConfig) -> None:
+    """Stop an oscillating arm: base gains, then a stiff hold where it is.
+
+    The run's gain overrides go back to ``base_config`` (stiffness, firmware
+    damping, host damping and inertia gain, all read per command), and the
+    arm holds its current pose through the gravity-comp path with every
+    joint held — a passthrough command, so the core adds none of its
+    tracked-tick terms (friction, Stribeck, stiction, dither, host damping)
+    that a test may have changed. The return to rest then runs on the base
+    gains.
+    """
+    for side, arm in (("left", axol.left), ("right", axol.right)):
+        if arm is None:
+            continue
+        for j in ARM_JOINTS:
+            base = getattr(getattr(base_config, side), j.value)
+            live = getattr(arm._arm_config, j.value)
+            for fld in ("kp", "kd", "kd_host", "j_eff"):
+                setattr(live, fld, getattr(base, fld))
+    _clear_extra_torque(axol)
+    try:
+        axol.reset_gravity_hold()
+        end = time.perf_counter() + _FREEZE_S
+        while time.perf_counter() < end:
+            await axol.gravity_compensate(free_joints=set())
+            await asyncio.sleep(0.01)
+    except Exception:  # noqa: BLE001 - the freeze is best effort
+        logging.getLogger(__name__).warning("guard freeze failed", exc_info=True)
 
 
 class _Runaway(Exception):
