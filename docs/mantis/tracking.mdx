@@ -35,7 +35,7 @@ The Tracking tab walks each source through a **step-by-step flow**. Each step re
       </Step>
     </Steps>
 
-    The client sends `gripSpace` poses (with `targetRaySpace` only as an older-runtime fallback), works without body/elbow tracking, and preserves lost optical tracking per side so the server can hold safely. Quest has **no factory tracker→gripper transform**: production collection needs a bench-measured transform for both controllers under the exact saved key; see [Transforms](#transforms).
+    The client sends `gripSpace` poses (with `targetRaySpace` only as an older-runtime fallback), works without body/elbow tracking, and preserves lost optical tracking per side so the server can hold safely. Quest 3 Touch Plus controllers in the standard cradle use a **built-in factory tracker→gripper transform**; other controllers need a bench-measured transform for both sides under the exact saved key. See [Transforms](#transforms).
   </Tab>
 
   <Tab title="Lighthouse">
@@ -117,12 +117,15 @@ Absolute (Mantis) IK solves the world yaw and translation at engage time, but it
 
 | Source | Transform |
 |---|---|
-| Lighthouse (Tracker 3.0) | Built-in factory value `[0, 0.0355, -0.092, 0, 1, 0, 0]` (`Ry(180°)` flat-back mount rotation) for both sides, applied automatically after Identify. |
-| Ultimate | Built-in factory value `[0, 0.0465, -0.092, 0, 1, 0, 0]` for both sides (Tracker 3.0's mount rotation with the 11 mm origin rise), approved for the pinned `wxyz` / z-up convention. |
-| Quest | No factory value: measure the gripper TCP in each controller's grip frame and save it under the exact `quest:<reported-profile>:grip` key for both sides. |
+| Lighthouse (Tracker 3.0) | Built-in factory value `[0, 0.035, 0.047, 0, 1, 0, 0]` (`Ry(180°)` flat-back mount rotation; tracker 47 mm behind and 35 mm above the gripper motor face) for both sides, applied automatically after Identify. |
+| Ultimate | Built-in factory value `[0, 0.046, 0.047, 0, 1, 0, 0]` for both sides (Tracker 3.0's mount rotation with the 11 mm origin rise), approved for the pinned `wxyz` / z-up convention. |
+| Quest 3 (Touch Plus) | Built-in factory values for `quest:meta-quest-touch-plus:grip`, mirrored between the left and right cradles (grip origin 62 mm behind and 45 mm above the gripper motor face), selected automatically when no Quest entry is saved. |
+| Other Quest controllers | No factory value: measure the gripper TCP in each controller's grip frame and save it under the exact `quest:<reported-profile>:grip` key for both sides. |
 
 <Warning>
 Mantis datasets recorded with axol ≤ 0.2.4 used an `Rx(+90°)` Vive rotation that pitched every recorded gripper ~90° away from the operator's hold; Axol could not replay them. Repair them with [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation) before replay or training.
+
+axol 0.2.5–0.2.16 shipped a Vive translation (`[0, 0.0355, -0.092]` / `[0, 0.0465, -0.092]`) that put the tracker 92 mm in front of the gripper instead of 47 mm behind it. `collect-data` refuses to append to a dataset recorded with it; record to a new `repo_id`.
 </Warning>
 
 Overrides and Quest measurements live in `~/.almond/mantis/tcp_transform.json`, keyed per side by the identified device (`survive:<codename>`, `ultimate:<mac>`, or `quest:<profile>:grip`). `pos` is the gripper TCP origin in the tracker's local frame in **metres**; `quat` is the TCP orientation in that frame as **`[qx, qy, qz, qw]`**. The file is edited directly (or via `PUT /api/tracker/calibration/<source>`); the panel does not edit transforms. The full schema, the Ultimate convention rules, and the bring-up route for a missing constant (`--mantis_allow_uncalibrated true` for a calibration-only capture) are in the [tracker CLI reference](/cli/tracker#transform-file). Production `collect-data` refuses to start with a missing, stale, or unapproved transform on either side.
