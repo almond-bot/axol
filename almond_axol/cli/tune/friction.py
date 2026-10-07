@@ -61,7 +61,6 @@ from ...constants import ARM_JOINTS
 from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
-from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
 from ...tuning import (
     JointFrameMotor,
@@ -113,6 +112,28 @@ DEFAULT_STRIBECK_GAIN = {
     Joint.ELBOW: 0.8,
 }
 
+#: Fixed impedance gains the calibration tools hold, move and sweep every
+#: joint with — the long-standing set the factory swept with before the
+#: slow-motion tuning, never the production config. Production shoulder
+#: gains (kp 450-500) are tuned to run with the realtime core's host damping
+#: and feedforward, which the calibration path does not have.
+CAL_GAINS: dict[Joint, tuple[float, float]] = {
+    Joint.SHOULDER_1: (250.0, 3.5),
+    Joint.SHOULDER_2: (250.0, 3.5),
+    Joint.SHOULDER_3: (180.0, 5.0),
+    Joint.ELBOW: (130.0, 5.0),
+    Joint.WRIST_1: (180.0, 1.7),
+    Joint.WRIST_2: (130.0, 2.25),
+    Joint.WRIST_3: (130.0, 2.0),
+}
+#: Rate the impedance moves are streamed at, and the motors' mode-switch
+#: settle (a MyActuator 0x76 reset ignores commands for ~2 s).
+_MOVE_HZ = 100.0
+_RESET_SETTLE_S = 2.5
+#: Arrival tolerance (rad) and how long a move may take to settle into it.
+_ARRIVE_TOL = 0.05
+_ARRIVE_TIMEOUT_S = 3.0
+
 
 async def _ramp_to(
     motor: JointFrameMotor,
@@ -135,6 +156,7 @@ async def _ramp_to(
         differentiate=False,
         feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8),
     )
+    motor.hold = target
 
 
 # Homing order: distal to proximal. This ordering is what makes commanding
@@ -155,33 +177,107 @@ _HOME_ORDER: tuple[Joint, ...] = (
 )
 
 
+_GRAVITY: list[GravityCompensator] = []
+
+
+def _gravity_torques(
+    motors: dict[Joint, JointFrameMotor], q: dict[Joint, float]
+) -> dict[Joint, float]:
+    """The arm's gravity torque (Nm) at joint-frame pose ``q``, per joint.
+
+    Zero for an arm whose side is unknown (test doubles).
+    """
+    sides = {getattr(m, "_is_left", None) for m in motors.values()}
+    if len(sides) != 1 or None in sides:
+        return {j: 0.0 for j in q}
+    if not _GRAVITY:
+        _GRAVITY.append(GravityCompensator())
+    arm_q = np.array([q.get(j, 0.0) for j in ARM_JOINTS])
+    g = _GRAVITY[0].gravity_arm(arm_q, is_left=sides.pop())
+    return {j: float(g[i]) for i, j in enumerate(ARM_JOINTS) if j in q}
+
+
+async def _send_holds(
+    motors: dict[Joint, JointFrameMotor],
+    q: dict[Joint, float],
+    v: dict[Joint, float] | None = None,
+) -> None:
+    """One impedance command per joint: hold ``q`` (joint frame) at the
+    calibration gains with the arm's gravity at that pose fed forward."""
+    tau = _gravity_torques(motors, q)
+    await asyncio.gather(
+        *[
+            motors[j].set_impedance(
+                q[j],
+                (v or {}).get(j, 0.0),
+                *CAL_GAINS.get(j, (100.0, 2.0)),
+                tau.get(j, 0.0),
+            )
+            for j in q
+        ]
+    )
+
+
+async def _hold_all(motors: dict[Joint, JointFrameMotor]) -> None:
+    """Hold every joint where it is now."""
+    joints = list(motors)
+    positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    q = dict(zip(joints, positions))
+    for j, pos in q.items():
+        motors[j].hold = pos
+    await _send_holds(motors, q)
+
+
+async def _enter_impedance_hold(motors: dict[Joint, JointFrameMotor]) -> None:
+    """Put every joint on the impedance frame and hold it before anything moves.
+
+    The calibration tools never use the motors' own position loops (0xA4 /
+    Damiao position-velocity): every hold and move is an impedance command
+    at :data:`CAL_GAINS` with gravity fed forward. And no joint is left
+    free: they once homed one joint at a time on 0xA4 with every other
+    joint reset, brake released and unheld until its turn — a free
+    shoulder swung while the joints below it moved (2026-10-07). The mode
+    switch's reset drops torque for ~2 s with nothing moving; then every
+    joint is held at once.
+    """
+    await asyncio.gather(
+        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
+    )
+    await asyncio.sleep(_RESET_SETTLE_S)
+    await _hold_all(motors)
+
+
 async def _ramp_verified(
     motors: dict[Joint, JointFrameMotor], targets: dict[Joint, float]
 ) -> None:
-    """Command joint-frame POSITION_VELOCITY targets and verify arrival.
+    """Move joints to joint-frame targets on impedance and verify arrival.
 
-    Arrival is verified, not assumed: a position command sent right after
-    ``set_control_mode`` can be silently dropped (the MyActuator reset drops
-    torque and ignores commands for ~2 s), and a sweep started from an
-    unverified pose is how wrist_2 once met the base with its elbow
-    clearance move never executed. A dropped command gets one resend; a
-    joint still off target after that raises instead of moving on.
+    Every other joint keeps holding its pose (its last hold, or where it is),
+    with the arm's gravity recomputed along the way. The moving joints follow
+    a raised-cosine profile together, peaking at ``_RAMP_SPEED``; arrival is
+    verified, not assumed, and a joint still off target raises instead of
+    letting anything run from an unsafe pose.
+
+    Read before commanding: the read re-derives each fixed-stop joint's ±360°
+    boot wrap (see JointFrameMotor) — the MyActuator reset can leave a
+    reading a full turn off, and a command against it drives the motor a full
+    turn (right elbow into its hard stop at 40 Nm, 2026-09-22). Then refuse
+    anything still implausible.
     """
     joints = list(targets)
     if not joints:
         return
-    # Read before commanding. The read re-derives each fixed-stop joint's
-    # ±360° boot wrap (see JointFrameMotor) — the MyActuator reset that
-    # precedes every ramp can leave a reading a full turn off, and a command
-    # against it drives the motor a full turn (right elbow into its hard
-    # stop at 40 Nm, 2026-09-22). Then refuse anything still implausible.
-    pre = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    every = list(motors)
+    pre = dict(
+        zip(every, await asyncio.gather(*[motors[j].get_position() for j in every]))
+    )
     bad = []
-    for j, pos in zip(joints, pre):
+    for j in joints:
         is_left = getattr(motors[j], "_is_left", None)
         if is_left is None:
             continue
         lo, hi = arm_limits(j, is_left)
+        pos = pre[j]
         if not (lo - _RAMP_SANITY_SLACK <= pos <= hi + _RAMP_SANITY_SLACK):
             bad.append(
                 f"{j.value} reads {math.degrees(pos):+.1f}° (limits "
@@ -194,33 +290,51 @@ async def _ramp_verified(
             + " — a multi-turn wrap or an unset zero; power-cycle or reset "
             "the motor and re-run `axol motor.set-zero-pos --guided` if it persists"
         )
-    positions: list[float] = []
-    for _attempt in range(2):
-        await asyncio.gather(
-            *[motors[j].set_position_velocity(targets[j], _RAMP_SPEED) for j in joints]
-        )
-        positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
-        max_dist = max(
-            (abs(pos - targets[j]) for j, pos in zip(joints, positions)),
-            default=0.0,
-        )
-        timeout = max_dist / _RAMP_SPEED + 2.0
+    held = {
+        j: (getattr(motors[j], "hold", None) if j not in targets else None)
+        for j in every
+    }
+    base = {j: (held[j] if held[j] is not None else pre[j]) for j in every}
+    dist = max(abs(targets[j] - pre[j]) for j in joints)
+    if dist > 1e-3:
+        # Raised cosine: the peak speed is pi/2 x the mean, held to _RAMP_SPEED.
+        duration = max(dist * math.pi / (2.0 * _RAMP_SPEED), 0.5)
+        n = max(2, math.ceil(duration * _MOVE_HZ))
         t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            await asyncio.sleep(0.1)
-            positions = await asyncio.gather(
-                *[motors[j].get_position() for j in joints]
-            )
-            if all(abs(pos - targets[j]) < 0.05 for j, pos in zip(joints, positions)):
-                return
+        for i in range(1, n + 1):
+            s_frac = 0.5 - 0.5 * math.cos(math.pi * i / n)
+            ds = 0.5 * math.pi / duration * math.sin(math.pi * i / n)
+            q = dict(base)
+            v = {}
+            for j in joints:
+                span = targets[j] - pre[j]
+                q[j] = pre[j] + s_frac * span
+                v[j] = ds * span
+            await _send_holds(motors, q, v)
+            await asyncio.sleep(max(0.0, t0 + i / _MOVE_HZ - time.monotonic()))
+    for j in joints:
+        motors[j].hold = targets[j]
+    final = {j: (targets[j] if j in targets else base[j]) for j in every}
+    await _send_holds(motors, final)
+    positions: list[float] = []
+    deadline = time.monotonic() + _ARRIVE_TIMEOUT_S
+    while True:
+        await asyncio.sleep(0.1)
+        positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
+        if all(
+            abs(pos - targets[j]) < _ARRIVE_TOL for j, pos in zip(joints, positions)
+        ):
+            return
+        if time.monotonic() > deadline:
+            break
     stragglers = ", ".join(
         f"{j.value} at {math.degrees(pos):+.1f}° "
         f"(target {math.degrees(targets[j]):+.1f}°)"
         for j, pos in zip(joints, positions)
-        if abs(pos - targets[j]) >= 0.05
+        if abs(pos - targets[j]) >= _ARRIVE_TOL
     )
     raise RuntimeError(
-        f"joints never reached their target after a resend: {stragglers} "
+        f"joints never reached their target: {stragglers} "
         f"— aborting before anything runs from an unsafe pose"
     )
 
@@ -978,10 +1092,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--kp",
         type=float,
         default=None,
-        help="Proportional gain (default: from config)",
+        help="Proportional gain (default: the calibration gains, CAL_GAINS)",
     )
     p.add_argument(
-        "--kd", type=float, default=None, help="Derivative gain (default: from config)"
+        "--kd",
+        type=float,
+        default=None,
+        help="Derivative gain (default: the calibration gains)",
     )
     p.add_argument(
         "--velocities",
@@ -1078,14 +1195,10 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
-    # ``resolved()`` bakes in the default stiffness blend so the fallback
-    # kp/kd match what the robot actually runs (stiffness is applied at the
-    # ``Axol`` boundary now, not in ``AxolConfig.__post_init__``).
-    resolved = AxolConfig().resolved()
-    arm_cfg: ArmConfig = resolved.left if is_left else resolved.right
-    config_gains = getattr(arm_cfg, joint.value)
-    kp = args.kp if args.kp is not None else config_gains.kp
-    kd = args.kd if args.kd is not None else config_gains.kd
+    # Fixed calibration gains unless overridden — never the production
+    # config's, which rely on the realtime core's host damping (CAL_GAINS).
+    kp = args.kp if args.kp is not None else CAL_GAINS[joint][0]
+    kd = args.kd if args.kd is not None else CAL_GAINS[joint][1]
 
     dump_csv: Path | None = None
     if args.dump_csv == "__auto__":
@@ -1137,19 +1250,11 @@ async def _run(args: argparse.Namespace) -> None:
         # poses, and park targets below are joint frame (0 = rest), so wrap
         # the motors in the frame conversion before any position I/O.
         motors = await joint_frame_motors(raw_motors, is_left)
-        # Everything (test joint included) starts in POSITION_VELOCITY so the
-        # whole arm can be homed to the rest pose first — every run then
-        # starts from a known pose instead of wherever the operator (or a
-        # previous run) left the base-collision joints. The test joint
-        # switches to IMPEDANCE only after homing and the clearance move,
-        # because the MyActuator mode switch is a ~2 s reset that silently
-        # drops commands sent during it.
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Everything on impedance and held where it is before anything moves;
+        # then the whole arm homes to the rest pose, so every run starts from
+        # a known pose instead of wherever the operator (or a previous run)
+        # left the base-collision joints.
+        await _enter_impedance_hold(motors)
 
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
@@ -1163,9 +1268,6 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
-
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
 
             if args.profile == "slow":
                 lo, hi = arm_limits(joint, is_left)
@@ -1313,21 +1415,10 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            # The test joint gets an impedance ramp only if it actually made
-            # it into IMPEDANCE mode (a homing failure aborts before the
-            # switch, and a Damiao in POSITION_VELOCITY ignores impedance
-            # frames); otherwise _home_all covers it like any other joint.
-            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
-            if in_impedance:
-                try:
-                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-                except Exception:
-                    pass
             try:
-                # Home the rest in the safe distal-to-proximal order,
-                # including the base-collision joints the old flow used to
-                # leave in place.
-                await _home_all(motors, exclude=joint if in_impedance else None)
+                # Home every joint in the safe distal-to-proximal order,
+                # the others held on impedance throughout.
+                await _home_all(motors)
             except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
                 print(f"  ! return to rest did not complete: {exc}")
             await _safe_torque_off(motors)

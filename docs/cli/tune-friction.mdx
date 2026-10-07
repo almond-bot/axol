@@ -16,8 +16,8 @@ Friction is motor-specific — the shared defaults in `config.py` were measured 
 | `--l` / `--r` | Arm side (required) |
 | `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
-| `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
-| `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
+| `--kp FLOAT` | Proportional gain (default: the calibration gains, below) |
+| `--kd FLOAT` | Derivative gain (default: the calibration gains) |
 | `--velocities V [V ...]` | Velocity setpoints in deg/s (default: 7.2, 18, 36, 54, 72; `--profile slow`: 1, 2, 3, 5, 8, 15, 30) |
 | `--profile {standard,slow}` | `slow` is the calibration for slow, smooth motion: 1–30°/s, the speeds under 8°/s swept in two windows (the joint's least- and most-loaded angles, ~15 s of travel each way), fitted with the realtime core's own friction law — sliding `fc + fl·\|g\|` (with the runtime's k cap), viscous `fv`, and the low-speed Stribeck excess `dfs + ls·\|g\|` over `vs`. `--save` stores the friction fit **and** the `stribeck_*` fields. About 5–8 min per joint |
 | `--stribeck-gain G` | Share of the fitted low-speed excess the runtime cancels, saved with `--profile slow` (default `0.8` on `shoulder_1` and `elbow`, `0` elsewhere — on the jelly robot's shoulder_2 / shoulder_3 it made slow_osc 30% / 18% rougher than the same friction fit without it) |
@@ -26,6 +26,10 @@ Friction is motor-specific — the shared defaults in `config.py` were measured 
 | `--hi DEG` | Override upper joint limit for the sweep (degrees) |
 | `--save` | Save the fitted parameters to `~/.almond/calibration.json` |
 | `--dump-csv [PATH]` | Write per-bin `(v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff)` rows to a CSV for offline plotting / arm-vs-arm comparison. Pass without a value to auto-name as `logs/friction_<side>_<joint>_<timestamp>.csv` |
+
+<Note>
+  Every calibration tool (`tune.factory`, `tune.friction`, `tune.gravity`, `tune.breakaway`) holds and moves the arm on impedance only, at fixed calibration gains (kp/kd 250/3.5 on the shoulders, 180/5 shoulder_3, 130/5 elbow, 180/1.7 wrist_1, 130/2.25 and 130/2 the Damiao wrists) with gravity fed forward — never the motors' own position loops (0xA4), and never the production gains, which rely on the realtime core's host damping. Every joint is held before anything moves.
+</Note>
 
 ```bash
 axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8

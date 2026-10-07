@@ -85,7 +85,13 @@ from ...tuning import (
     sweep_safety,
 )
 from ..motor import add_side_and_channel_arguments, resolve_channel
-from .friction import _home_all, _ramp_verified, _safe_torque_off
+from .friction import (
+    CAL_GAINS,
+    _enter_impedance_hold,
+    _home_all,
+    _ramp_verified,
+    _safe_torque_off,
+)
 
 _RATE_HZ = 100.0
 #: Drift (rad) over one trim hold below which the joint counts as standing
@@ -403,7 +409,8 @@ async def _run(args: argparse.Namespace) -> None:
     resolved = AxolConfig().resolved()
     arm_cfg: ArmConfig = resolved.left if is_left else resolved.right
     gains = getattr(arm_cfg, joint.value)
-    kp, kd = gains.kp, gains.kd
+    # Fixed calibration gains for the holds (see friction.CAL_GAINS).
+    kp, kd = CAL_GAINS[joint]
     fc = gains.friction.fc
     fc_ref = max(fc, _FC_FLOOR_NM)
     peaks = peak_schedule(fc, args.max_torque)
@@ -457,12 +464,8 @@ async def _run(args: argparse.Namespace) -> None:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Every joint on impedance and held where it is before anything moves.
+        await _enter_impedance_hold(motors)
         motor = motors[joint]
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
@@ -471,8 +474,6 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
-            await motor.set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
             # Prime the feedback cache at the current pose before any kp = 0.
             here = await motor.get_position()
             await _hold(motor, here, kp, kd, gravity_fn(here), 0.3)

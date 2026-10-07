@@ -67,6 +67,9 @@ class JointFrameMotor:
         self._is_left = is_left
         #: ±2π correction the last read said the motor frame needs (0 if none).
         self.wrap = 0.0
+        #: Joint-frame pose the calibration tools are holding this joint at
+        #: (``None``: not held yet) — see ``tune.friction._ramp_verified``.
+        self.hold: float | None = None
 
     @property
     def joint(self) -> Joint:

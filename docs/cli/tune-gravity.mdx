@@ -22,7 +22,7 @@ Sweep safety otherwise matches [`tune.friction`](/cli/tune-friction): shoulder_2
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
 | `--velocity DEG_S` | Sweep velocity in deg/s (default: 18). Keep ≤25 so shoulder torque telemetry stays clean |
 | `--lo DEG` / `--hi DEG` | Override the sweep limits (degrees) |
-| `--kp FLOAT` / `--kd FLOAT` | Sweep-hold gains (default: from `AxolConfig`) |
+| `--kp FLOAT` / `--kd FLOAT` | Sweep-hold gains (default: the calibration gains — see [`tune.friction`](/cli/tune-friction)) |
 | `--save` | Write the fitted CoM (and refit `Fo`) to `~/.almond/calibration.json`; the gravity model then uses it everywhere on this machine |
 | `--save-run` | Persist the sweep (measured vs model torque per angle) as a tuning run for the dashboard charts |
 | `--label NOTE` | Free-form note stored with the saved run |

@@ -51,7 +51,7 @@ from typing import Any
 import numpy as np
 
 from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, Joint, Motor
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.calibration_cloud import (
     fetch_calibration,
@@ -77,10 +77,13 @@ from .friction import (
     sweep_load,
     _compare_to_gravity_model,
     _fit_friction_halfdiff,
+    CAL_GAINS,
+    _enter_impedance_hold,
     _home_all,
     _identify_joint,
     _ramp_to,
     _ramp_verified,
+    _safe_torque_off,
 )
 from .gravity import fit_com
 
@@ -95,8 +98,6 @@ _CAL_ORDER: tuple[Joint, ...] = (
     Joint.SHOULDER_2,
     Joint.SHOULDER_1,
 )
-# MyActuator mode switches are a ~2 s reset that silently drops commands.
-_MODE_SWITCH_SETTLE_S = 2.5
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -192,7 +193,8 @@ async def _calibrate_joint(
     side_str = "left" if is_left else "right"
     resolved = AxolConfig().resolved()
     jc = getattr(resolved.left if is_left else resolved.right, joint.value)
-    kp, kd = jc.kp, jc.kd
+    # Fixed calibration gains, not the production config's (see CAL_GAINS).
+    kp, kd = CAL_GAINS[joint]
     print(f"\n{'=' * 60}")
     print(f"  {side_str} {joint.value}  (Kp={kp:g}  Kd={kd:g})")
     print(f"{'=' * 60}")
@@ -208,8 +210,6 @@ async def _calibrate_joint(
     for stage in ramp_stages(other_targets):
         await _ramp_verified(motors, stage)
 
-    await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-    await asyncio.sleep(1.0)
     if args is not None and args.profile == "slow":
         return await _calibrate_joint_slow(
             motors,
@@ -237,15 +237,12 @@ async def _calibrate_joint(
             hi_override=hi_default,
         )
     finally:
-        # Park and hand the joint back to POSITION_VELOCITY so the next
-        # joint's homing/clearance ramps can drive it.
+        # Park the joint, then re-verify the whole arm at rest (returns the
+        # clearance joints too) — all on impedance, every joint held.
         try:
             await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
         except Exception:
             pass
-        await motors[joint].set_control_mode(ControlMode.POSITION_VELOCITY)
-        await asyncio.sleep(_MODE_SWITCH_SETTLE_S)
-        # Re-verify the whole arm at rest (returns the clearance joints too).
         await _home_all(motors)
 
     if len(avg_samples) < 8:
@@ -320,13 +317,11 @@ async def _calibrate_joint(
 async def _park_joint(
     motors: dict[Joint, JointFrameMotor], joint: Joint, kp: float, kd: float
 ) -> None:
-    """Park the swept joint, hand it back to POSITION_VELOCITY, home the arm."""
+    """Park the swept joint and home the arm, every joint held on impedance."""
     try:
         await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
     except Exception:
         pass
-    await motors[joint].set_control_mode(ControlMode.POSITION_VELOCITY)
-    await asyncio.sleep(_MODE_SWITCH_SETTLE_S)
     await _home_all(motors)
 
 
@@ -471,12 +466,8 @@ async def _calibrate_arm(
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Every joint on impedance and held where it is before anything moves.
+        await _enter_impedance_hold(motors)
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
@@ -490,12 +481,10 @@ async def _calibrate_arm(
             print("  Returning to rest and disabling ...")
             try:
                 await _home_all(motors)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            # Disables only at rest: a joint off rest would fall.
+            await _safe_torque_off(motors)
 
 
 async def _run(args: argparse.Namespace) -> None:

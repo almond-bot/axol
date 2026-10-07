@@ -31,6 +31,10 @@ The upload merges over what the cloud already stores, so a one-arm re-run never 
 | `--raw-dir DIR` | Write each joint's raw sweep samples to `DIR/<side>-<joint>.csv` — re-fit them any time with `tune.friction --fit-csv` |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
 
+<Note>
+  Every calibration tool (`tune.factory`, `tune.friction`, `tune.gravity`, `tune.breakaway`) holds and moves the arm on impedance only, at fixed calibration gains (kp/kd 250/3.5 on the shoulders, 180/5 shoulder_3, 130/5 elbow, 180/1.7 wrist_1, 130/2.25 and 130/2 the Damiao wrists) with gravity fed forward — never the motors' own position loops (0xA4), and never the production gains, which rely on the realtime core's host damping. Every joint is held before anything moves.
+</Note>
+
 ```bash
 axol tune.factory                     # both arms, upload if credentials exist
 axol tune.factory --arms left
