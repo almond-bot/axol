@@ -165,18 +165,6 @@ class JointConfig:
                   q=3 on both arms even with its pose-tracked centre: hardware
                   traces found a separate 12.5-13.6 Hz mast/forearm mode that
                   the old wide band could feed.
-        zero_offset: Per-robot trim (rad) added to this joint's reported
-                  angle: ``joint = motor + end-stop offset + zero_offset``.
-                  A joint's zero is defined by the mechanical end stop its
-                  encoder was zeroed against, so any build tolerance in that
-                  stop is a constant angle error in every pose — and in
-                  every FK/IK result downstream. An external measurement
-                  (motion capture, a probe) identifies it; it is written to
-                  the calibration file (see
-                  :func:`almond_axol.robot.calibration.update_joint_calibration`)
-                  and bounded to ±:data:`~almond_axol.robot.calibration.
-                  MAX_ZERO_OFFSET_RAD`. Positive means the joint really sits
-                  further along its positive direction than it reported.
     """
 
     kp: float
@@ -188,7 +176,6 @@ class JointConfig:
     kd_host: float = 0.0
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
-    zero_offset: float = 0.0
 
 
 @dataclass
@@ -435,15 +422,7 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
-        for f in (
-            "kp",
-            "kd",
-            "j_eff",
-            "kd_host",
-            "kd_host_hz",
-            "kd_host_q",
-            "zero_offset",
-        )
+        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
         if f in entry
     }
     friction = entry.get("friction")
