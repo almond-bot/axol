@@ -214,6 +214,46 @@ def merge_cloud_document(
     return merged
 
 
+def _keep_gravity(args: argparse.Namespace | None) -> bool:
+    return bool(getattr(args, "keep_gravity", False))
+
+
+def settings_link_overrides(sides: list[str]) -> dict[str, dict[str, LinkOverride]]:
+    """The link masses / CoMs this robot's shared settings set (the panel's
+    Advanced → Axol, ``~/.almond/settings.json``), per side and joint.
+
+    Teleop and the SDK run the gravity model with these on top of the
+    calibration file, but ``tune.factory`` builds its model from the file
+    alone — so a hand-tuned gravity comp has to be handed to the fits, or
+    ``fo`` and the load terms would be fitted against a model the robot
+    never runs. Only the links the settings actually change are returned.
+    """
+    from ...settings import shared_axol_config
+
+    shared = shared_axol_config()
+    bare = AxolConfig()
+    out: dict[str, dict[str, LinkOverride]] = {}
+    for side in sides:
+        for j in ARM_JOINTS:
+            mine = getattr(getattr(shared, side), j.value)
+            base = getattr(getattr(bare, side), j.value)
+            link: LinkOverride = {}
+            if not math.isclose(float(mine.mass), float(base.mass), abs_tol=1e-9):
+                link["mass"] = float(mine.mass)
+            if any(
+                not math.isclose(float(a), float(b), abs_tol=1e-9)
+                for a, b in zip(mine.com, base.com)
+            ):
+                link["com"] = (
+                    float(mine.com[0]),
+                    float(mine.com[1]),
+                    float(mine.com[2]),
+                )
+            if link:
+                out.setdefault(side, {})[j.value] = link
+    return out
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register the ``tune.factory`` subcommand."""
     p = subparsers.add_parser(
@@ -282,6 +322,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="SERIAL",
         help="Robot identity for the cloud upload (default: the attached "
         "Axol hub adapter's USB serial)",
+    )
+    p.add_argument(
+        "--keep-gravity",
+        action="store_true",
+        help="Keep this robot's gravity model: every fit runs against the link "
+        "masses / CoMs set in the panel's settings (Advanced → Axol) on top of "
+        "the calibration file, and no CoM or mass is fitted or saved — friction, "
+        "Stribeck and Fo only. For robots whose gravity comp was tuned by hand.",
     )
     p.add_argument(
         "--mass",
@@ -395,13 +443,14 @@ async def _calibrate_joint(
     tau_meas = np.array([s[1] for s in avg_samples])
     order = np.argsort(q_bins)
     q_bins, tau_meas = q_bins[order], tau_meas[order]
-    try:
-        gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
-    except RuntimeError as exc:
-        # An implausible fit means bad sweep data — keep the CAD CoM but
-        # don't lose the friction fit over it.
-        print(f"  ! Gravity fit rejected: {exc}")
-        gravity_fit = None
+    gravity_fit = None
+    if not _keep_gravity(args):
+        try:
+            gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+        except RuntimeError as exc:
+            # An implausible fit means bad sweep data — keep the CAD CoM but
+            # don't lose the friction fit over it.
+            print(f"  ! Gravity fit rejected: {exc}")
 
     com_fit = None
     if gravity_fit is not None:
@@ -559,7 +608,7 @@ async def _calibrate_joint_slow(
     )
     com_fit = None
     fo = None
-    if len(avg) >= 8:
+    if len(avg) >= 8 and not _keep_gravity(args):
         by_bin: dict[float, list[float]] = {}
         for smp in avg:
             by_bin.setdefault(round(smp.q, 6), []).append(smp.average)
@@ -682,6 +731,20 @@ async def _run(args: argparse.Namespace) -> None:
         )
     except ValueError as exc:
         raise SystemExit(f"ERROR: {exc}")
+    side_names = [side for side, _ in sides]
+    try:
+        from_settings = settings_link_overrides(side_names)
+    except Exception as exc:  # noqa: BLE001 - an unreadable settings file
+        if args.keep_gravity:
+            raise SystemExit(
+                f"ERROR: --keep-gravity could not read the shared settings: {exc}"
+            )
+        from_settings = {}
+    if args.keep_gravity:
+        for side_str, joints in from_settings.items():
+            for joint_name, link in joints.items():
+                given = overrides.get(side_str, {}).get(joint_name, {})
+                overrides.setdefault(side_str, {})[joint_name] = {**link, **given}
 
     creds = supabase_credentials()
     print("\nAxol factory calibration — friction + gravity, all joints")
@@ -691,6 +754,20 @@ async def _run(args: argparse.Namespace) -> None:
         f"{[round(v, 1) for v in args.velocities]} deg/s"
     )
     print(f"  Robot id (hub serial): {serial or 'not detected'}")
+    if args.keep_gravity:
+        print(
+            "  Gravity: kept — fits run against this robot's model "
+            "(calibration + panel settings); no CoM or mass is fitted or saved."
+        )
+    elif from_settings:
+        links = ", ".join(
+            f"{s} {j}" for s, joints in from_settings.items() for j in joints
+        )
+        print(
+            f"  ! The panel settings override link mass/CoM ({links}): teleop runs "
+            "those, so fitted CoMs there are shadowed and Fo is fitted against a "
+            "different model. Pass --keep-gravity to keep the hand-tuned gravity."
+        )
     if creds is None:
         print(
             "  Supabase: no write key (AXOL_SUPABASE_KEY, plus "

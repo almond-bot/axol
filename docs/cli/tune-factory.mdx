@@ -34,6 +34,14 @@ axol tune.factory --mass wrist_3=1.1                                          # 
 axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14    # one arm, seeded CoM
 ```
 
+### Keeping a hand-tuned gravity model
+
+If the robot's gravity comp was tuned by hand in the panel (Settings → Advanced → Axol: per-link `mass` / `com`), run with `--keep-gravity`. Teleop and the SDK run those settings on top of the calibration file, but the factory otherwise models gravity from the file alone — so the fitted `Fo` and load terms would be against a model the robot never runs, and fitted CoMs on links the settings don't touch would mix in. With `--keep-gravity` the settings' link masses and CoMs are handed to every fit (written to the calibration file first, like `--mass` / `--com`, which still win over them), and no CoM or mass is fitted or saved: the run saves friction, Stribeck and `Fo` only. Without the flag, a robot whose settings override link mass or CoM gets a warning at start.
+
+```bash
+axol tune.factory --keep-gravity
+```
+
 The resulting document (local file and cloud copy) carries `mass` (kg) next to `friction` and `com` for each joint:
 
 ```json
@@ -59,6 +67,7 @@ The resulting document (local file and cloud copy) carries `mass` (kg) next to `
 | `--stribeck-gain G` | Stribeck share saved for every joint (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere) |
 | `--raw-dir DIR` | Write each joint's raw sweep samples to `DIR/<side>-<joint>.csv` — re-fit them any time with `tune.friction --fit-csv` |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
+| `--keep-gravity` | Keep the [hand-tuned gravity model](#keeping-a-hand-tuned-gravity-model) from the panel settings: fit against it, save friction, Stribeck and `Fo` only |
 | `--mass [SIDE.]JOINT=KG` | Link mass for a [custom end-effector](#custom-end-effectors), repeatable (e.g. `wrist_3=1.1` for both arms, `left.wrist_3=1.1`). Saved and uploaded with the calibration |
 | `--com SIDE.JOINT=X,Y,Z` | Starting link CoM in metres (that arm's URDF link frame), repeatable. The gravity fit refines it; uploaded as-is if the fit is rejected |
 
