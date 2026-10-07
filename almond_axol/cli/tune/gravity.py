@@ -72,7 +72,6 @@ from .friction import (
     _enter_impedance_hold,
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
     _safe_torque_off,
 )
@@ -415,10 +414,6 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            try:
-                await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-            except Exception:  # noqa: BLE001 - _home_all below still covers it
-                pass
             try:
                 await _home_all(motors)
             except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding

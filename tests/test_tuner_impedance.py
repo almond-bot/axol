@@ -156,6 +156,34 @@ class ImpedanceOnlyTest(unittest.IsolatedAsyncioTestCase):
         for q in held:
             self.assertAlmostEqual(math.degrees(q), -5.0, 6)
 
+    async def test_factory_parks_a_far_swept_joint_smoothly(self) -> None:
+        # After a sweep leaves shoulder_2 far out, parking is one smooth
+        # raised-cosine ramp (no fixed-duration lurch), and the elbow is
+        # never sent at its 0 hard stop.
+        from almond_axol.cli.tune import factory
+
+        log: list = []
+        motors = _arm({Joint.SHOULDER_2: -120.0, Joint.ELBOW: 40.0}, log)
+        await friction._enter_impedance_hold(motors)
+        log.clear()
+        lurch = mock.AsyncMock()
+        with mock.patch.object(factory, "_ramp_to", lurch, create=True):
+            await factory._park_joint(motors, Joint.SHOULDER_2, 250.0, 3.5)
+        lurch.assert_not_called()
+        peak_step = math.pi / 2 * friction._RAMP_SPEED / friction._MOVE_HZ
+        for j in (Joint.SHOULDER_2, Joint.ELBOW):
+            m = motors[j]
+            q = [e[2] + m.frame_offset for e in log if e[1] == j]
+            steps = [abs(b - a) for a, b in zip(q, q[1:])]
+            self.assertLessEqual(max(steps), peak_step * 1.01, j)
+            self.assertAlmostEqual(q[-1], friction.rest_target(j, True), 6)
+        elbow = motors[Joint.ELBOW]
+        rest = friction.rest_target(Joint.ELBOW, True)
+        self.assertGreater(rest, 0.0)
+        for e in log:
+            if e[1] == Joint.ELBOW:
+                self.assertGreaterEqual(e[2] + elbow.frame_offset, rest - 1e-9)
+
     async def test_holds_feed_the_arms_gravity_forward(self) -> None:
         log: list = []
         motors = _arm({Joint.SHOULDER_1: -90.0}, log)  # arm out: loaded shoulder

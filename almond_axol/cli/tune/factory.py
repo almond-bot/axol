@@ -81,7 +81,6 @@ from .friction import (
     _enter_impedance_hold,
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
     _safe_torque_off,
 )
@@ -237,12 +236,8 @@ async def _calibrate_joint(
             hi_override=hi_default,
         )
     finally:
-        # Park the joint, then re-verify the whole arm at rest (returns the
+        # Park the joint and re-verify the whole arm at rest (returns the
         # clearance joints too) — all on impedance, every joint held.
-        try:
-            await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-        except Exception:
-            pass
         await _home_all(motors)
 
     if len(avg_samples) < 8:
@@ -317,11 +312,15 @@ async def _calibrate_joint(
 async def _park_joint(
     motors: dict[Joint, JointFrameMotor], joint: Joint, kp: float, kd: float
 ) -> None:
-    """Park the swept joint and home the arm, every joint held on impedance."""
-    try:
-        await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-    except Exception:
-        pass
+    """Park the swept joint and home the arm, every joint held on impedance.
+
+    ``_home_all`` alone: a smooth ramp at ``_RAMP_SPEED`` with gravity fed
+    forward, distal to proximal, so the swept joint parks before the
+    clearance joints proximal to it. A fixed 4 s linear ramp to 0 used to
+    run first — up to ~44 deg/s from a standing start with no velocity
+    feedforward, which lurched the shoulders back from the far end of their
+    sweeps (2026-10-07), and drove the elbow at its 0 hard stop.
+    """
     await _home_all(motors)
 
 
