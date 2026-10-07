@@ -1057,8 +1057,10 @@ class MantisFlowTest(unittest.TestCase):
             _validate_mantis_calibration(config)
 
     def test_factory_vive_transforms_authorize_collection(self) -> None:
-        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["survive"], (47.0, 0.0, 35.0))
-        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], (47.0, 0.0, 46.0))
+        # Tracker origins in the gripper frame: 47 mm behind the motor face
+        # (+z) and 35 / 46 mm above it (-y).
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["survive"], (0.0, -35.0, 47.0))
+        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], (0.0, -46.0, 47.0))
         with mock.patch(
             "almond_axol.mantis.calibration.current_ultimate_pose_convention",
             return_value=("wxyz", "z"),
@@ -1066,7 +1068,8 @@ class MantisFlowTest(unittest.TestCase):
             survive = design_transform_for("left", "survive:T20")
             self.assertIsNotNone(survive)
             assert survive is not None
-            ultimate = [0.0, 0.0465, -0.092, 0.0, 1.0, 0.0, 0.0]
+            self.assertEqual(survive, [0.0, 0.035, 0.047, 0.0, 1.0, 0.0, 0.0])
+            ultimate = [0.0, 0.046, 0.047, 0.0, 1.0, 0.0, 0.0]
             self.assertEqual(
                 design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
                 ultimate,
@@ -1096,22 +1099,16 @@ class MantisFlowTest(unittest.TestCase):
                     design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff")
                 )
 
-            # Origins are expressed in the shared gripper/CAD frame G, while
-            # the stored translation is the TCP origin in tracker frame T.
-            # The translation (and this delta) were derived under the mount
-            # CAD convention, where the +11 mm CAD-z origin shift becomes
-            # +11 mm of tracker-y translation; the rotation fix above did not
-            # touch the translation (bench verification pending).
-            origin_delta_m = (
-                np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"])
-                - np.asarray(VIVE_TRACKER_CAD_ORIGINS_MM["survive"])
-            ) / 1000.0
-            np.testing.assert_allclose(origin_delta_m, [0.0, 0.0, 0.011], atol=1e-9)
-            np.testing.assert_allclose(
-                np.asarray(ultimate[:3]) - np.asarray(survive[:3]),
-                [0.0, 0.011, 0.0],
-                atol=1e-9,
-            )
+            # The stored translation is the gripper origin in the tracker
+            # frame: inverting it must land each tracker back on its CAD
+            # origin in the gripper frame (behind and above the motor face).
+            for family, transform in (("survive", survive), ("ultimate", ultimate)):
+                rot = quat_xyzw_to_matrix(np.asarray(transform[3:]))
+                np.testing.assert_allclose(
+                    -rot.T @ np.asarray(transform[:3]) * 1000.0,
+                    VIVE_TRACKER_CAD_ORIGINS_MM[family],
+                    atol=1e-6,
+                )
 
             config = VRTeleopConfig()
             with (
@@ -1456,6 +1453,57 @@ class MantisFlowTest(unittest.TestCase):
         self.assertEqual(config.tcp_transform_left, identity)
         self.assertEqual(config.tcp_transform_right, identity)
         self.assertTrue(config.urdf_viewer_world_aligned)
+
+    def test_quest_3_factory_transform_is_selected_without_a_saved_entry(
+        self,
+    ) -> None:
+        key = "quest:meta-quest-touch-plus:grip"
+        left = design_transform_for("left", key)
+        right = design_transform_for("right", key)
+        assert left is not None and right is not None
+        mirror = np.diag([-1.0, 1.0, 1.0])
+        right_rot = quat_xyzw_to_matrix(np.asarray(right[3:]))
+        left_rot = quat_xyzw_to_matrix(np.asarray(left[3:]))
+        # Inverting the right-hand value recovers the cradle CAD: the grip
+        # origin 62 mm behind and 45 mm above the motor face, the grip axes
+        # at Rz(180°) from the gripper's plus a ~10° cradle tilt.
+        np.testing.assert_allclose(
+            -right_rot.T @ np.asarray(right[:3]) * 1000.0,
+            [0.0, -45.0, 62.0],
+            atol=1e-5,
+        )
+        np.testing.assert_allclose(
+            right_rot.T,
+            quat_xyzw_to_matrix(
+                np.asarray([-0.066552, 0.053497, -0.996292, 0.010540])
+                / np.linalg.norm([-0.066552, 0.053497, -0.996292, 0.010540])
+            ),
+            atol=1e-9,
+        )
+        tilt = right_rot @ np.diag([-1.0, -1.0, 1.0])
+        tilt_deg = math.degrees(math.acos((np.trace(tilt) - 1.0) / 2.0))
+        self.assertAlmostEqual(tilt_deg, 9.87, places=1)
+        # The left cradle is the right one's mirror image across the
+        # gripper's y-z plane.
+        np.testing.assert_allclose(
+            np.asarray(left[:3]), mirror @ np.asarray(right[:3]), atol=1e-9
+        )
+        np.testing.assert_allclose(left_rot, mirror @ right_rot @ mirror, atol=1e-9)
+        # Other controller generations and the aim pose have no factory value.
+        self.assertIsNone(design_transform_for("left", "quest:oculus-touch-v3:grip"))
+        self.assertIsNone(
+            design_transform_for("left", "quest:meta-quest-touch-plus:target-ray")
+        )
+
+        config = VRTeleopConfig()
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="quest")
+        self.assertEqual(config.tracker_key, key)
+        self.assertEqual(config.quest_controller_profile, "meta-quest-touch-plus")
+        self.assertEqual(config.tcp_transform_left, left)
+        self.assertEqual(config.tcp_transform_right, right)
 
     def test_external_tracker_world_hides_unregistered_quest_overlay(self) -> None:
         config = VRTeleopConfig()
