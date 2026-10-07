@@ -76,6 +76,7 @@ from ...tuning import (
     step_metrics,
 )
 from ...tuning.wrist_imu import WristImu, format_imu
+from .friction import _enter_impedance_hold
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 
@@ -92,8 +93,9 @@ def _print_chatter(m: dict) -> None:
 def _print_holder_wobble(wobble: dict[str, float]) -> None:
     """One line on how still the non-test joints stayed during the probe.
 
-    The holders run the firmware's own position servo, so under a clean test
-    they should barely register above encoder noise (~0.1°). Anything past
+    The holders hold their pose on impedance (the firmware's own position
+    servo with ``--a4-holders``), so under a clean test they should barely
+    register above encoder noise (~0.1°). Anything past
     0.5° means the structure was genuinely moving under the reaction torque
     and part of the test joint's ring came from a compliant neighbour — worth
     knowing before blaming kp/kd.
@@ -294,6 +296,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "The hold runs production gains, so a config kd_host that is "
         "unstable at the frozen pose will jitter the holders even when the "
         "test joint itself is clean — cap it here to test a fix.",
+    )
+    p.add_argument(
+        "--a4-holders",
+        action="store_true",
+        help="Hold the non-test joints on their motors' own position loops "
+        "(MyActuator 0xA4, Damiao position-velocity) instead of impedance — "
+        "the stiffer, pre-2026-10 behaviour. With the arm held stiff that way, "
+        "the 0xA4 loop has set a shoulder oscillating; use with a hand on the "
+        "e-stop.",
     )
     p.add_argument(
         "--pose-by-hand",
@@ -675,16 +686,21 @@ async def _run(args: argparse.Namespace) -> None:
         # centers, gravity poses) is joint frame (0 = rest), so wrap the
         # motors in the frame conversion before any position I/O.
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                motors[j].set_control_mode(
-                    ControlMode.IMPEDANCE
-                    if (j == joint or args.pose_by_hand)
-                    else ControlMode.POSITION_VELOCITY
-                )
-                for j in motors
-            ]
-        )
+        if args.pose_by_hand or args.a4_holders:
+            await asyncio.gather(
+                *[
+                    motors[j].set_control_mode(
+                        ControlMode.IMPEDANCE
+                        if (j == joint or args.pose_by_hand)
+                        else ControlMode.POSITION_VELOCITY
+                    )
+                    for j in motors
+                ]
+            )
+        else:
+            # Every joint on impedance and held where it is before anything
+            # moves; the holders stay on impedance for the whole probe.
+            await _enter_impedance_hold(motors)
 
         # ---- --pose-by-hand machinery -------------------------------- #
         # All joints stay in impedance mode for the whole session (no mode
@@ -973,7 +989,7 @@ async def _run(args: argparse.Namespace) -> None:
                     host_kd_hz=host_kd_hz,
                     host_kd_q=host_kd_q,
                 )
-                # Verify the POSITION_VELOCITY holds actually stay put while
+                # Verify the holds actually stay put while
                 # the test joint shakes the structure — a wobbling holder
                 # contaminates the ring and the test joint's log can't show it.
                 monitor = HolderMonitor(motors, exclude=joint)

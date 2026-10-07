@@ -20,7 +20,7 @@ import time
 import numpy as np
 
 from ..constants import ARM_JOINTS
-from ..motor import Joint, MotorError
+from ..motor import ControlMode, Joint, MotorError
 from ..robot.axol import arm_limits
 from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
 from .feedforward import FeedForward
@@ -363,9 +363,31 @@ async def ramp_joints_to(
     motors: dict[Joint, JointFrameMotor],
     targets: dict[Joint, float],
 ) -> None:
-    """Ramp POSITION_VELOCITY-mode joints to joint-frame targets, poll until arrival."""
+    """Ramp joints to joint-frame targets and wait for arrival.
+
+    Joints on impedance (the default) take a host-side ramp with every other
+    joint held (``tune.friction``'s ``_ramp_verified``). Only joints a tool
+    explicitly put on the firmware position loop (``tune.pid --a4-holders``)
+    get one 0xA4 / position-velocity target and a poll — that loop, with the
+    rest of the arm stiff on its own firmware loops, set left shoulder_1
+    oscillating (2026-10-07).
+    """
     joints = list(targets)
     if not joints:
+        return
+    if any(
+        getattr(motors[j].motor, "mode", None) != ControlMode.POSITION_VELOCITY
+        for j in joints
+    ):
+        from ..cli.tune.friction import _ramp_verified
+
+        # Hold every other joint where it is now: a probe since the last
+        # ramp moved the test joint off any earlier hold.
+        others = [j for j in motors if j not in targets]
+        now = await asyncio.gather(*[motors[j].get_position() for j in others])
+        for j, pos in zip(others, now):
+            motors[j].hold = pos
+        await _ramp_verified(motors, targets)
         return
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max((abs(p - targets[j]) for j, p in zip(joints, pos_vals)), default=0.0)
@@ -422,8 +444,8 @@ def cached_meas(motor: JointFrameMotor) -> tuple[float, float] | None:
 class HolderMonitor:
     """Round-robin wobble sampler for the non-test joints during a probe.
 
-    The holders sit in firmware POSITION_VELOCITY holds — the stiffest mode
-    the motors offer — but stiff is not *proven quiet*: a holder wobbling at
+    The holders sit in impedance holds (or, with ``tune.pid --a4-holders``,
+    firmware position-loop holds) — and held is not *proven quiet*: a holder wobbling at
     its own resonance feeds structure motion straight back into the test
     joint's ring, and the test joint's encoder alone can never show that.
     One extra position read per command cycle, rotating through the holders

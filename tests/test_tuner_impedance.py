@@ -135,12 +135,45 @@ class ImpedanceOnlyTest(unittest.IsolatedAsyncioTestCase):
         first_s1 = next(e for e in log if e[1] == Joint.SHOULDER_1)
         self.assertAlmostEqual(math.degrees(first_s1[2] + s1.frame_offset), -2.5, 6)
 
+    async def test_tune_pid_ramps_on_impedance_unless_asked_for_firmware_holds(
+        self,
+    ) -> None:
+        # tune.pid's pose ramps (runner.ramp_joints_to) on an impedance arm:
+        # host ramps with every other joint held, never a 0xA4 target.
+        from almond_axol.tuning.runner import ramp_joints_to
+
+        log: list = []
+        motors = _arm({Joint.SHOULDER_1: -5.0, Joint.ELBOW: 30.0}, log)
+        await friction._enter_impedance_hold(motors)
+        log.clear()
+        await ramp_joints_to(motors, {Joint.ELBOW: math.radians(60.0)})
+        self.assertAlmostEqual(
+            math.degrees(await motors[Joint.ELBOW].get_position()), 60.0, 6
+        )
+        s1 = motors[Joint.SHOULDER_1]
+        held = [e[2] + s1.frame_offset for e in log if e[1] == Joint.SHOULDER_1]
+        self.assertTrue(held)
+        for q in held:
+            self.assertAlmostEqual(math.degrees(q), -5.0, 6)
+
     async def test_holds_feed_the_arms_gravity_forward(self) -> None:
         log: list = []
         motors = _arm({Joint.SHOULDER_1: -90.0}, log)  # arm out: loaded shoulder
         await friction._enter_impedance_hold(motors)
         s1 = [e for e in log if e[0] == "imp" and e[1] == Joint.SHOULDER_1][-1]
         self.assertGreater(abs(s1[5]), 1.0)  # Nm of gravity at the shoulder
+
+    def test_tune_pid_firmware_holders_are_opt_in(self) -> None:
+        import argparse
+
+        from almond_axol.cli.tune import pid
+
+        parser = argparse.ArgumentParser()
+        pid.add_parser(parser.add_subparsers())
+        base = ["tune.pid", "--joint", "elbow", "--r"]
+        args = parser.parse_args(base)
+        self.assertFalse(args.a4_holders)
+        self.assertTrue(parser.parse_args(base + ["--a4-holders"]).a4_holders)
 
     def test_no_calibration_tool_sends_a_position_loop_command(self) -> None:
         root = Path(friction.__file__).parent
