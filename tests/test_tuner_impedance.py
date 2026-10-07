@@ -120,6 +120,21 @@ class ImpedanceOnlyTest(unittest.IsolatedAsyncioTestCase):
         for e in s1_during:
             self.assertAlmostEqual(e[2] + s1.frame_offset, math.radians(-20.0), 9)
 
+    async def test_homing_after_an_interrupted_sweep_holds_where_the_joint_is(
+        self,
+    ) -> None:
+        # A sweep moves shoulder_1 off its last hold (its ramp target) and is
+        # cut short; homing must not step it back to that stale target.
+        log: list = []
+        motors = _arm({Joint.SHOULDER_1: -8.0}, log)
+        await friction._enter_impedance_hold(motors)
+        s1 = motors[Joint.SHOULDER_1]
+        s1.motor.position = math.radians(-2.5) - s1.frame_offset  # mid-sweep
+        log.clear()
+        await friction._home_all(motors)
+        first_s1 = next(e for e in log if e[1] == Joint.SHOULDER_1)
+        self.assertAlmostEqual(math.degrees(first_s1[2] + s1.frame_offset), -2.5, 6)
+
     async def test_holds_feed_the_arms_gravity_forward(self) -> None:
         log: list = []
         motors = _arm({Joint.SHOULDER_1: -90.0}, log)  # arm out: loaded shoulder

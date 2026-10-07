@@ -419,7 +419,17 @@ async def _home_all(
     Rest is 0, except a joint whose 0 is a hard stop, which parks 2° inside
     (see :func:`rest_target`). Joints already at rest verify in one poll, so
     a mostly-homed arm costs a fraction of a second per joint.
+
+    Every joint's hold is first re-anchored where it is: homing usually
+    follows an experiment (a sweep, or one cut short by Ctrl-C) that left
+    the joint somewhere other than its last hold, and holding the old
+    target stepped it back at full stiffness — left shoulder_1 jumped 5.7°
+    to its pre-sweep start, overshot to -10.9° and rang (2026-10-07).
     """
+    joints = list(motors)
+    now = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    for j, pos in zip(joints, now):
+        motors[j].hold = pos
     for j in _HOME_ORDER:
         if j == exclude or j not in motors:
             continue
