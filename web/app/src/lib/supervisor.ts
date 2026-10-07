@@ -220,6 +220,14 @@ export interface UpdateStatus {
   phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */
   error: string | null
+  /**
+   * Optional provisioning steps (Lighthouse tracking, camera plugins) the last
+   * provision could not install; the robot runs without them. Absent on older
+   * hosts.
+   */
+  warning?: string | null
+  /** A reinstall or `axol provision` is running; power actions are refused. Absent on older hosts. */
+  installing?: boolean
 }
 
 /**

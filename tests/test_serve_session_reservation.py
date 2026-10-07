@@ -378,6 +378,7 @@ class _Updater:
         self.version = "test"
         self.commit = "test"
         self.release_install = True
+        self.installing = False
 
     def ensure_provisioned(self) -> None:
         self.provision_calls += 1

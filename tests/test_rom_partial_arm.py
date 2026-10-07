@@ -164,6 +164,12 @@ def _partial_axol(joints: set[Joint], config: Any = None) -> AxolHardware:
         )
 
 
+def _wrap_rt(axol: AxolHardware) -> Axol:
+    """``Axol._wrap`` without a built ``axol-rt``: nothing here spawns it."""
+    with patch("almond_axol.rt.link.find_binary", return_value="/fake/axol-rt"):
+        return Axol._wrap(axol)
+
+
 class PartialAxolArmTest(unittest.IsolatedAsyncioTestCase):
     def test_only_present_motors_exist_and_arrays_keep_their_shape(self) -> None:
         arm = _partial_axol(set(WRIST_KIT)).left
@@ -290,7 +296,7 @@ class PartialArmTelemetryCaptureTest(unittest.IsolatedAsyncioTestCase):
 
 class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
     def test_config_lists_only_present_motors(self) -> None:
-        rt = Axol._wrap(_partial_axol(set(WRIST_KIT)))
+        rt = _wrap_rt(_partial_axol(set(WRIST_KIT)))
         lines = rt._config_text().splitlines()
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
@@ -306,7 +312,7 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gripper 0 can0 8", lines)
 
     async def test_feedback_feed_fills_present_slots_and_ignores_the_rest(self) -> None:
-        rt = Axol._wrap(_partial_axol(set(WRIST_KIT)))
+        rt = _wrap_rt(_partial_axol(set(WRIST_KIT)))
         rt._armed = True  # the core's feed is what fills the caches
         arm = rt.left
         assert arm is not None
@@ -394,7 +400,7 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(kd3, 0.9)
         self.assertEqual((t_ff3, kd_host3, j_eff3), (0.0, 0.0, 0.0))
         # The core's friction model rides the config; the bench config zeroes it.
-        rt = Axol._wrap(axol)
+        rt = _wrap_rt(axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
                 self.assertEqual(line.split()[9:13], ["0.0", "0.0", "0.0", "0.0"], line)

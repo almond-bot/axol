@@ -19,7 +19,36 @@ AXOL_SUPABASE_URL=https://<project>.supabase.co   # only if not baked into calib
 
 One-time Supabase setup: create a Storage bucket named `axol-calibrations` and mark it **public**. No table or RLS policies are needed — write access comes from the service key.
 
-The upload merges over what the cloud already stores, so a one-arm re-run never wipes the other arm's data. An interrupted run keeps (and uploads) every joint that completed.
+The upload merges over what the cloud already stores — per joint and per field — so a one-arm re-run never wipes the other arm's data, and a joint whose gravity fit is rejected this time keeps its previously uploaded `com` / `mass`. An interrupted run keeps (and uploads) every joint that completed.
+
+## Custom end-effectors
+
+The gravity fit only identifies each link's first moment (mass × CoM) and keeps the mass fixed, so a gripper much heavier or longer than stock either pushes the fitted CoM shift past the 60 mm plausibility cap (the fit is rejected) or leaves the proximal joints that carry it unmodeled. Give the link mass up front instead: the gripper is lumped into `wrist_3`, so `--mass wrist_3=<kg>` sets that link's mass, and `--com` optionally seeds its starting CoM (metres, in that arm's URDF link frame).
+
+Both are written to `~/.almond/calibration.json` **before** the sweeps, so every fit — including the proximal joints carrying the gripper — runs against the custom numbers, and they are uploaded with the calibration even if a fit fails. Every fitted CoM (here and from `tune.gravity --save`) is stored with the mass it was fitted against, so the pair stays consistent on every machine that runs [`calibration.pull`](#calibration-pull). To go back to a standard gripper, pass the stock mass (`--mass wrist_3=0.75`) and refit.
+
+A `--mass` without a side applies to every arm being calibrated. `--com` must name its side (`left.` / `right.`), because CoMs mirror between the arms. Naming an arm that isn't being calibrated, an unknown joint, or a non-positive mass is an error before anything moves.
+
+```bash
+axol tune.factory --mass wrist_3=1.1                                          # custom gripper on both arms
+axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14    # one arm, seeded CoM
+```
+
+The resulting document (local file and cloud copy) carries `mass` (kg) next to `friction` and `com` for each joint:
+
+```json
+{
+  "version": 1,
+  "hub_serial": "004800345542501420373234",
+  "left": {
+    "wrist_3": {
+      "friction": {"fc": 0.12, "k": 900.0, "fv": 0.05, "fo": -0.02},
+      "mass": 1.1,
+      "com": [-0.03, 0.0, -0.14]
+    }
+  }
+}
+```
 
 | Flag | Description |
 |---|---|
@@ -30,6 +59,8 @@ The upload merges over what the cloud already stores, so a one-arm re-run never 
 | `--stribeck-gain G` | Stribeck share saved for every joint (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere) |
 | `--raw-dir DIR` | Write each joint's raw sweep samples to `DIR/<side>-<joint>.csv` — re-fit them any time with `tune.friction --fit-csv` |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
+| `--mass [SIDE.]JOINT=KG` | Link mass for a [custom end-effector](#custom-end-effectors), repeatable (e.g. `wrist_3=1.1` for both arms, `left.wrist_3=1.1`). Saved and uploaded with the calibration |
+| `--com SIDE.JOINT=X,Y,Z` | Starting link CoM in metres (that arm's URDF link frame), repeatable. The gravity fit refines it; uploaded as-is if the fit is rejected |
 
 <Note>
   Every calibration tool (`tune.factory`, `tune.friction`, `tune.gravity`, `tune.breakaway`) holds and moves the arm on impedance only, at fixed calibration gains (kp/kd 250/3.5 on the shoulders, 180/5 shoulder_3, 130/5 elbow, 180/1.7 wrist_1, 130/2.25 and 130/2 the Damiao wrists) with gravity fed forward — never the motors' own position loops (0xA4), and never the production gains, which rely on the realtime core's host damping. Every joint is held before anything moves.
@@ -53,7 +84,7 @@ axol calibration.push
 
 ## calibration.pull
 
-Fetches a robot's factory calibration from the public bucket into the local cache (`~/.almond/factory_calibration.json`) — **no credentials needed**. It also runs automatically at the end of [`can.setup`](/cli/can-setup), so a fresh machine picks up its robot's calibration during first-time setup without any extra step. Run it manually to refresh:
+Fetches a robot's factory calibration (friction, link masses and CoMs — so a custom gripper's weight comes along) from the public bucket into the local cache (`~/.almond/factory_calibration.json`) — **no credentials needed**. It also runs automatically at the end of [`can.setup`](/cli/can-setup), so a fresh machine picks up its robot's calibration during first-time setup without any extra step. Run it manually to refresh:
 
 ```bash
 axol calibration.pull                 # identity from the attached hub adapter

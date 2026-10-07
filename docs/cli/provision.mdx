@@ -46,6 +46,21 @@ capability-setup failure aborts installation or blocks the restart onto updated
 code. Both still share this single provisioning path, keeping their steps in
 lockstep.
 
+When only optional steps fail (Lighthouse tracking, the patched zed-gstreamer
+plugins, adb, ...), the last line names them (`Optional provisioning steps
+failed: ...`) and the command exits `3`. The installer then finishes with a
+warning instead of aborting. A provision run by `axol serve` exits `0` in that
+case, so an update still restarts onto the new release, and the control panel
+shows the missing steps as a warning. A failed `rt.install` exits `1`.
+
+Every `apt-get` / `dpkg` run is protected from interruption: it never times
+out, and it runs in its own session and systemd scope, so a stopped or
+restarted `axol.service` or a timed-out update leaves it to finish. A package
+manager killed partway leaves dpkg half-configured, and every later install on
+the host then fails. When apt fails, the log names the package dpkg could not
+process. Repair it with `sudo dpkg --configure -a`, then re-run `axol
+provision`.
+
 Provisioning holds the host-wide update lock, which is root-only. Run from a terminal as a regular user, the steps still execute as that user (their `uv`, download caches, and Python environment) and only a small lock-holder process escalates via `sudo` (one password prompt, shared with the steps that need root). Without a usable `sudo` the command exits with a message instead of a traceback.
 
 - **host tuning** — last, the runtime tuning for the host it runs on, detected from what the host exposes. On a Jetson (Orin NX 16GB, AGX Orin, Thor T5000): the max power mode, the NVENC/VIC/GPU and CPU clock pins, the CAN adapters' interrupt steered onto a CAN core, and the Argus camera daemon run `SCHED_FIFO` on the camera cores — see [`jetson.setup`](/cli/jetson-setup) for why each matters. On a Raspberry Pi 5 or a workstation there is nothing to tune. Either way it logs the board and the CPU core layout the control, IK, CAN, camera and recorder work will pin to, e.g. `core layout: 14 cores online: CAN 12-13, control 2, IK 3, relay 4-5, recorder 10-11, camera 0-1,5-9`.

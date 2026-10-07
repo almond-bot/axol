@@ -133,6 +133,44 @@ class SlowFactoryTest(unittest.TestCase):
                 )
         self.assertEqual(saved["stribeck"]["stribeck_gain"], 0.8)
         self.assertEqual(saved["hub_serial"], "hub1")
+        # A fitted CoM travels with the mass it was fitted against.
+        self.assertEqual(entry["mass"], jc.mass)
+        self.assertEqual(saved["mass"], jc.mass)
+
+    def test_custom_link_reaches_the_entry_when_the_sweep_fails(self) -> None:
+        from almond_axol.cli.tune import factory
+
+        joint, is_left = Joint.WRIST_3, True
+        other, lo_d, hi_d, _ = sweep_safety(joint, is_left)
+
+        async def no_rows(*_a):
+            return {k: [] for k in ("speed", "direction", "q", "tau", "group", "load")}
+
+        jc = AxolConfig().resolved().left.wrist_3
+        args = argparse.Namespace(profile="slow", raw_dir=None, stribeck_gain=None)
+        with (
+            mock.patch.object(factory, "_identify_slow", no_rows),
+            mock.patch.object(factory, "_park_joint", mock.AsyncMock()),
+            redirect_stdout(io.StringIO()),
+        ):
+            entry = asyncio.run(
+                factory._calibrate_joint_slow(
+                    {joint: None},
+                    joint,
+                    is_left,
+                    [math.radians(v) for v in (1, 2, 3)],
+                    "hub1",
+                    args,
+                    jc,
+                    130.0,
+                    2.0,
+                    other,
+                    lo_d,
+                    hi_d,
+                    {"mass": 1.1, "com": (-0.03, 0.0, -0.14)},
+                )
+            )
+        self.assertEqual(entry, {"mass": jc.mass, "com": [-0.03, 0.0, -0.14]})
 
 
 if __name__ == "__main__":

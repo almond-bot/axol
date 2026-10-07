@@ -39,6 +39,8 @@ from typing import Any
 import numpy as np
 
 from .plan_protocol import (
+    Continuation,
+    LastDispatched,
     PlanActions,
     PlanObservation,
     PlanSpec,
@@ -48,6 +50,7 @@ from .plan_protocol import (
     encode_actions,
     encode_ready,
     encode_reset,
+    validate_actions,
 )
 from .protocol import (
     MAX_MESSAGE_BYTES,
@@ -82,6 +85,14 @@ class Observation:
         state_time_ns: Robot-monotonic time the state was sampled.
         image_time_ns: Robot-monotonic capture time per camera.
         request_id: This request's id (also the id of the plan you publish).
+        continuation: Raw accepted-plan reference, for indexing model-specific
+            cached state that cannot be reconstructed from ``plan``.
+        last_dispatched: Independently negotiated reference to the last row
+            whose local dispatch call completed. This is not a motor
+            acknowledgement, measured pose, or confirmation of arrival.
+        last_dispatched_action: Exact published action row named by
+            ``last_dispatched``, as a read-only copy in action-name order.
+            Includes server ensembling, before downstream robot filtering.
     """
 
     state: np.ndarray
@@ -93,6 +104,19 @@ class Observation:
     image_time_ns: Mapping[str, int]
     request_id: str
     _state_dict: dict[str, float] | None = field(default=None, repr=False)
+    continuation: Continuation | None = None
+    last_dispatched: LastDispatched | None = None
+    last_dispatched_action: np.ndarray | None = None
+
+    @property
+    def state_sample_time_ns(self) -> int:
+        """Alias for ``state_time_ns``, matching :class:`PlanObservation`."""
+        return self.state_time_ns
+
+    @property
+    def image_capture_time_ns(self) -> Mapping[str, int]:
+        """Alias for ``image_time_ns``, matching :class:`PlanObservation`."""
+        return self.image_time_ns
 
     @property
     def joints(self) -> dict[str, float]:
@@ -103,6 +127,22 @@ class Observation:
                 for name, value in zip(self.state_names, self.state, strict=True)
             }
         return self._state_dict
+
+
+@dataclass(frozen=True)
+class Prediction:
+    """An action chunk with an optional tighter adoption deadline.
+
+    ``actions`` accepts the same arrays, tensors, and dictionary rows as
+    :meth:`Policy.infer`. ``max_adoption_offset_steps`` limits the age at which
+    the robot may adopt this reply, measured in control ticks from its request
+    origin. It must fit the returned horizon and cannot relax the negotiated
+    bound. ``None`` uses the session's bound. Request correlation is owned by
+    the server; policies do not choose the reply ID.
+    """
+
+    actions: Any
+    max_adoption_offset_steps: int | None = None
 
 
 class Policy:
@@ -149,7 +189,8 @@ class Policy:
             ``(D,)`` action; or a list of ``{action_name: value}`` dicts.
             Joint targets are radians, the gripper is ``0`` (closed) to ``1``
             (open), as in a recorded dataset's ``action``. Rows beyond
-            ``spec.actions_per_chunk`` are dropped.
+            ``spec.actions_per_chunk`` are dropped. Wrap the result in
+            :class:`Prediction` to set a tighter adoption deadline.
         """
         raise NotImplementedError
 
@@ -178,6 +219,14 @@ def _snap_indices(action_names: Sequence[str]) -> tuple[int, ...]:
     )
 
 
+@dataclass(frozen=True)
+class _PublishedPlan:
+    origin: int
+    published: np.ndarray
+    raw: np.ndarray
+    timeline: str
+
+
 class _Session:
     """Published-plan history for one robot session, cleared on reset.
 
@@ -194,40 +243,100 @@ class _Session:
         self.spec = spec
         self.ensemble = ensemble
         self.snap = _snap_indices(spec.action_names)
-        # request_id -> (origin, published rows, raw prediction rows)
-        self.plans: dict[str, tuple[int, np.ndarray, np.ndarray]] = {}
+        self.plans: dict[str, _PublishedPlan] = {}
+        self._pinned: set[str] = set()
+        self._timeline: str | None = None
+        # IDs are unique within a reset generation even after action arrays
+        # are evicted. Keep only the small IDs for that validation.
+        self._seen_ids: set[str] = set()
 
     def clear(self) -> None:
         self.plans.clear()
+        self._pinned.clear()
+        self._seen_ids.clear()
+        self._timeline = None
 
-    def resolve(self, obs: PlanObservation) -> tuple[int, np.ndarray | None]:
-        """Return this request's origin and the accepted rows still executing."""
-        if obs.continuation is None:
-            # Nothing is executing: whatever came before no longer conditions.
-            self.clear()
-            return 0, None
-        entry = self.plans.get(obs.continuation.prediction_id)
+    def _reference(self, prediction_id: str, row: int, label: str) -> _PublishedPlan:
+        entry = self.plans.get(prediction_id)
         if entry is None:
             raise PolicyProtocolError(
-                f"The robot is executing plan {obs.continuation.prediction_id!r}, "
+                f"{label} references plan {prediction_id!r}, "
                 "which this server did not publish in the current session."
             )
-        origin, published, _ = entry
-        start = obs.continuation.from_row
-        if start >= len(published):
-            raise PolicyProtocolError("Continuation row is past the end of its plan.")
-        remaining = published[start:].copy()
-        remaining.flags.writeable = False
-        return origin + start, remaining
+        if not 0 <= row < len(entry.published):
+            raise PolicyProtocolError(f"{label} row is past the end of its plan.")
+        return entry
+
+    @staticmethod
+    def _readonly_copy(value: np.ndarray) -> np.ndarray:
+        result = value.copy()
+        result.flags.writeable = False
+        return result
+
+    def resolve(
+        self, obs: PlanObservation
+    ) -> tuple[int, np.ndarray | None, np.ndarray | None]:
+        """Validate both references before changing history or calling the model."""
+        if obs.request_id in self._seen_ids:
+            raise PolicyProtocolError(
+                f"Duplicate prediction request_id: {obs.request_id}"
+            )
+        continuation = obs.continuation
+        dispatched = obs.last_dispatched
+        accepted = (
+            None
+            if continuation is None
+            else self._reference(
+                continuation.prediction_id, continuation.from_row, "Continuation"
+            )
+        )
+        sent = (
+            None
+            if dispatched is None
+            else self._reference(
+                dispatched.prediction_id, dispatched.row, "Last dispatch"
+            )
+        )
+        self._seen_ids.add(obs.request_id)
+        self._pinned = {
+            ref.prediction_id for ref in (continuation, dispatched) if ref is not None
+        }
+        # No continuation starts a fresh ensemble timeline, but an independent
+        # dispatch reference can still name an older published plan.
+        self._timeline = obs.request_id if accepted is None else accepted.timeline
+        origin = 0
+        remaining = None
+        if accepted is not None:
+            origin = accepted.origin + continuation.from_row
+            remaining = self._readonly_copy(accepted.published[continuation.from_row :])
+        last_action = (
+            None
+            if sent is None
+            else self._readonly_copy(sent.published[dispatched.row])
+        )
+        return origin, remaining, last_action
 
     def publish(self, request_id: str, origin: int, raw: np.ndarray) -> np.ndarray:
+        assert self._timeline is not None
+        # A model may return a reused ndarray or tensor buffer. History must
+        # preserve the exact bytes sent, regardless of later model mutations.
+        raw = self._readonly_copy(raw)
         published = raw if self.ensemble is None else self._ensemble(origin, raw)
-        self.plans[request_id] = (origin, published, raw)
-        # Drop plans that ended before this one began, then cap the history.
-        for key in [k for k, (o, p, _) in self.plans.items() if o + len(p) <= origin]:
-            del self.plans[key]
+        published = as_action_chunk(published, self.spec.action_names)
+        published.flags.writeable = False
+        self.plans[request_id] = _PublishedPlan(origin, published, raw, self._timeline)
+        protected = self._pinned | {request_id}
+        # Age/cap eviction never removes either live reference, even when the
+        # robot keeps rejecting candidates while an old plan is still accepted.
+        for key, entry in list(self.plans.items()):
+            if key not in protected and (
+                entry.timeline != self._timeline
+                or entry.origin + len(entry.published) <= origin
+            ):
+                del self.plans[key]
         while len(self.plans) > self.MAX_PLANS:
-            del self.plans[next(iter(self.plans))]
+            oldest = next(key for key in self.plans if key not in protected)
+            del self.plans[oldest]
         return published
 
     def _ensemble(self, origin: int, raw: np.ndarray) -> np.ndarray:
@@ -238,7 +347,12 @@ class _Session:
         Snap dims (grippers, rotation vectors) take the newest prediction.
         """
         contributors = sorted(
-            ((o, r) for o, _, r in self.plans.values()), key=lambda item: item[0]
+            (
+                (entry.origin, entry.raw)
+                for entry in self.plans.values()
+                if entry.timeline == self._timeline
+            ),
+            key=lambda item: item[0],
         )
         contributors.append((origin, raw))
         out = raw.astype(np.float64)
@@ -385,7 +499,7 @@ class PolicyServer:
     def _infer(self, session: _Session, header: Any, payload: memoryview) -> bytes:
         spec = session.spec
         request = decode_observation(header, payload, spec)
-        origin, plan = session.resolve(request)
+        origin, plan, last_action = session.resolve(request)
         obs = Observation(
             state=request.state,
             state_names=spec.state_names,
@@ -395,11 +509,27 @@ class PolicyServer:
             state_time_ns=request.state_sample_time_ns,
             image_time_ns=request.image_capture_time_ns,
             request_id=request.request_id,
+            continuation=request.continuation,
+            last_dispatched=request.last_dispatched,
+            last_dispatched_action=last_action,
         )
-        chunk = as_action_chunk(self.policy.infer(obs), spec.action_names)
+        result = self.policy.infer(obs)
+        prediction = result if isinstance(result, Prediction) else Prediction(result)
+        chunk = as_action_chunk(prediction.actions, spec.action_names)
         chunk = chunk[: spec.actions_per_chunk]
-        published = session.publish(request.request_id, origin, chunk)
-        return encode_actions(PlanActions(request.request_id, published), spec)
+        # Check metadata against the actual truncated horizon before changing
+        # published history; rejected replies must never become referenceable.
+        reply = validate_actions(
+            PlanActions(
+                request.request_id, chunk, prediction.max_adoption_offset_steps
+            ),
+            spec,
+        )
+        published = session.publish(request.request_id, origin, reply.actions)
+        return encode_actions(
+            PlanActions(request.request_id, published, reply.max_adoption_offset_steps),
+            spec,
+        )
 
 
 def serve(

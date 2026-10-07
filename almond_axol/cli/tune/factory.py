@@ -26,6 +26,16 @@ fit is saved before the next joint sweeps, so proximal sweeps see the
 already-corrected distal links — the ordering ``tune.gravity`` asks the
 operator to keep by hand, kept automatically here.
 
+Custom end-effectors: the gravity fit only identifies each link's first
+moment (mass x CoM) and keeps the mass fixed, so a gripper heavier or
+longer than stock needs its link mass given up front. ``--mass`` sets a
+link's mass (the gripper is lumped into ``wrist_3``) and ``--com`` seeds its
+CoM; both are written to the calibration file *before* the sweeps, so every
+fit — including the proximal joints that carry the gripper — runs against
+the custom numbers, and they ride along in the cloud document. A fitted CoM
+is always uploaded with the mass it was fitted against. Pass the stock mass
+(``--mass wrist_3=0.75``) to go back after refitting a standard gripper.
+
 Results land in ``~/.almond/calibration.json`` (this machine uses them
 immediately) and, when the Supabase write key is configured
 (``AXOL_SUPABASE_KEY`` in the environment or a ``.env``), the same document
@@ -40,13 +50,15 @@ Examples:
     axol tune.factory                       # both arms, slow profile
     axol tune.factory --arms left           # one arm only
     axol tune.factory --profile standard --velocities 18 36   # the old, quick sweep
+    axol tune.factory --mass wrist_3=1.1    # custom gripper on both arms
+    axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14
 """
 
 import argparse
 import asyncio
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import numpy as np
 
@@ -97,6 +109,109 @@ _CAL_ORDER: tuple[Joint, ...] = (
     Joint.SHOULDER_2,
     Joint.SHOULDER_1,
 )
+_SIDES = ("left", "right")
+
+
+class LinkOverride(TypedDict, total=False):
+    """Operator-supplied inertial numbers for one link (custom end-effector)."""
+
+    mass: float
+    com: tuple[float, float, float]
+
+
+def _parse_link_target(spec: str, flag: str) -> tuple[str | None, str, str]:
+    """Split ``[side.]joint=value`` into ``(side or None, joint, value)``."""
+    target, sep, value = spec.partition("=")
+    if not sep or not value.strip():
+        raise ValueError(f"{flag} {spec!r}: expected [left.|right.]JOINT=VALUE")
+    side, dot, joint = target.strip().rpartition(".")
+    if not dot:
+        side = None
+    elif side not in _SIDES:
+        raise ValueError(f"{flag} {spec!r}: side must be left or right")
+    valid = [j.value for j in ARM_JOINTS]
+    if joint not in valid:
+        raise ValueError(
+            f"{flag} {spec!r}: unknown joint {joint!r} (one of {', '.join(valid)})"
+        )
+    return side, joint, value.strip()
+
+
+def parse_link_overrides(
+    mass_specs: list[str], com_specs: list[str], sides: list[str]
+) -> dict[str, dict[str, LinkOverride]]:
+    """Parse ``--mass`` / ``--com`` into ``{side: {joint: LinkOverride}}``.
+
+    A ``--mass`` without a side applies to every arm being calibrated (mass
+    is the same on both). ``--com`` must name its side: CoMs are expressed
+    in each arm's own link frame, which mirrors between the arms. Naming an
+    arm that is not being calibrated is an error rather than a silent no-op.
+    """
+    out: dict[str, dict[str, LinkOverride]] = {}
+
+    def targets(side: str | None, spec: str, flag: str) -> list[str]:
+        if side is None:
+            return list(sides)
+        if side not in sides:
+            raise ValueError(f"{flag} {spec!r}: the {side} arm is not being calibrated")
+        return [side]
+
+    for spec in mass_specs:
+        side, joint, raw = _parse_link_target(spec, "--mass")
+        try:
+            mass = float(raw)
+        except ValueError:
+            raise ValueError(f"--mass {spec!r}: {raw!r} is not a number") from None
+        if not (math.isfinite(mass) and mass > 0.0):
+            raise ValueError(f"--mass {spec!r}: mass must be positive (kg)")
+        for s in targets(side, spec, "--mass"):
+            out.setdefault(s, {}).setdefault(joint, {})["mass"] = mass
+
+    for spec in com_specs:
+        side, joint, raw = _parse_link_target(spec, "--com")
+        if side is None:
+            raise ValueError(
+                f"--com {spec!r}: name the side (left.{joint}=... / "
+                f"right.{joint}=...) — CoMs mirror between the arms"
+            )
+        try:
+            com = tuple(float(v) for v in raw.split(","))
+        except ValueError:
+            raise ValueError(f"--com {spec!r}: expected X,Y,Z in metres") from None
+        if len(com) != 3 or not all(math.isfinite(v) for v in com):
+            raise ValueError(f"--com {spec!r}: expected X,Y,Z in metres")
+        for s in targets(side, spec, "--com"):
+            out.setdefault(s, {}).setdefault(joint, {})["com"] = (
+                com[0],
+                com[1],
+                com[2],
+            )
+    return out
+
+
+def merge_cloud_document(
+    existing: dict[str, Any], document: dict[str, Any], hub_serial: str
+) -> dict[str, Any]:
+    """Merge this session's results over the stored cloud document.
+
+    Per joint and per field, like the local calibration file: a one-arm run
+    keeps the other arm, and a joint whose gravity fit was rejected this
+    time keeps its previously uploaded ``com`` / ``mass``.
+    """
+    merged: dict[str, Any] = {"version": 1, "hub_serial": hub_serial}
+    for s in _SIDES:
+        old = existing.get(s)
+        new = document.get(s)
+        side_doc = dict(old) if isinstance(old, dict) else {}
+        if isinstance(new, dict):
+            for joint, entry in new.items():
+                prev = side_doc.get(joint)
+                side_doc[joint] = (
+                    {**prev, **entry} if isinstance(prev, dict) else dict(entry)
+                )
+        if side_doc:
+            merged[s] = side_doc
+    return merged
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -168,6 +283,24 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Robot identity for the cloud upload (default: the attached "
         "Axol hub adapter's USB serial)",
     )
+    p.add_argument(
+        "--mass",
+        action="append",
+        default=[],
+        metavar="[SIDE.]JOINT=KG",
+        help="Link mass for a custom end-effector (repeatable), e.g. "
+        "wrist_3=1.1 (both arms) or left.wrist_3=1.1. The gripper's mass is "
+        "lumped into wrist_3. Saved and uploaded with the calibration.",
+    )
+    p.add_argument(
+        "--com",
+        action="append",
+        default=[],
+        metavar="SIDE.JOINT=X,Y,Z",
+        help="Starting link CoM in metres, that arm's URDF link frame "
+        "(repeatable), e.g. left.wrist_3=-0.03,0,-0.14. The gravity fit "
+        "refines it; it is uploaded as-is if the fit is rejected.",
+    )
     p.set_defaults(func=run)
 
 
@@ -183,11 +316,15 @@ async def _calibrate_joint(
     velocities_rad: list[float],
     hub_serial: str,
     args: argparse.Namespace | None = None,
+    override: LinkOverride | None = None,
 ) -> dict[str, Any] | None:
     """Sweep one joint, fit friction + CoM, save both, return the entry.
 
     The config is re-read per joint so each fit sees the CoMs already saved
-    by the more-distal joints of this same session.
+    by the more-distal joints of this same session. ``override`` holds the
+    operator's custom-link numbers (already in the calibration file); they
+    are kept in the returned entry even when a fit fails, so the cloud copy
+    always carries them.
     """
     side_str = "left" if is_left else "right"
     resolved = AxolConfig().resolved()
@@ -223,6 +360,7 @@ async def _calibrate_joint(
             other_targets,
             lo_default,
             hi_default,
+            override,
         )
     try:
         avg_samples, halfdiff_samples = await _identify_joint(
@@ -240,9 +378,16 @@ async def _calibrate_joint(
         # clearance joints too) — all on impedance, every joint held.
         await _home_all(motors)
 
+    # What the operator set must reach the cloud even if the fits fail.
+    base: dict[str, Any] = {}
+    if override:
+        base["mass"] = jc.mass
+        if "com" in override:
+            base["com"] = list(override["com"])
+
     if len(avg_samples) < 8:
         print(f"  ! Too few samples on {joint.value} — skipping its fits.")
-        return None
+        return base or None
 
     friction_fit = _fit_friction_halfdiff(halfdiff_samples)
 
@@ -279,7 +424,7 @@ async def _calibrate_joint(
         )
         fo = fo_result if fo_result is not None else 0.0
 
-    entry: dict[str, Any] = {}
+    entry: dict[str, Any] = dict(base)
     if friction_fit is not None:
         fc, k, fv = friction_fit
         entry["friction"] = {
@@ -296,6 +441,9 @@ async def _calibrate_joint(
         print(f"  ! Friction fit failed on {joint.value} — not saving friction.")
     if com_fit is not None:
         entry["com"] = [round(v, 5) for v in com_fit]
+        # Only m·c is identified: pin the mass the CoM was fitted against so
+        # the pair stays consistent wherever the document is pulled.
+        entry["mass"] = jc.mass
 
     if not entry:
         return None
@@ -304,6 +452,7 @@ async def _calibrate_joint(
         joint.value,
         friction=entry.get("friction"),
         com=tuple(entry["com"]) if "com" in entry else None,
+        mass=entry.get("mass"),
         hub_serial=hub_serial,
     )
     return entry
@@ -337,9 +486,13 @@ async def _calibrate_joint_slow(
     other_targets: dict[Joint, float],
     lo_default: float | None,
     hi_default: float | None,
+    override: LinkOverride | None = None,
 ) -> dict[str, Any] | None:
     """The slow-profile sweep of one joint: runtime-law friction + Stribeck
-    from every pass, gravity (CoM) from the full-range passes' averages."""
+    from every pass, gravity (CoM) from the full-range passes' averages.
+
+    ``override`` is the operator's custom-link numbers, carried into the
+    returned entry as in :func:`_calibrate_joint`."""
     from dataclasses import replace
 
     from ...robot.axol import arm_limits
@@ -374,9 +527,17 @@ async def _calibrate_joint_slow(
         )
     finally:
         await _park_joint(motors, joint, kp, kd)
+
+    # What the operator set must reach the cloud even if the fits fail.
+    base: dict[str, Any] = {}
+    if override:
+        base["mass"] = jc.mass
+        if "com" in override:
+            base["com"] = list(override["com"])
+
     if len(rows["q"]) < 50:
         print(f"  ! Too few samples on {joint.value} — skipping its fits.")
-        return None
+        return base or None
 
     # Gravity: the averaged fwd/bwd torque of the passes that swept the whole
     # range (the windowed slow passes cover only part of it), pooled per bin.
@@ -421,12 +582,12 @@ async def _calibrate_joint_slow(
     if fit is None:
         print(f"  ! Friction fit failed on {joint.value} — not saving friction.")
         if com_fit is None:
-            return None
+            return base or None
     elif fo is not None:
         # fo against the corrected CoM, not the CAD one.
         fit = replace(fit, fo=float(fo))
 
-    entry: dict[str, Any] = {}
+    entry: dict[str, Any] = dict(base)
     stribeck = None
     if fit is not None:
         entry["friction"] = fit.friction_params()
@@ -434,12 +595,16 @@ async def _calibrate_joint_slow(
         entry.update(stribeck)
     if com_fit is not None:
         entry["com"] = [round(v, 5) for v in com_fit]
+        # Only m·c is identified: pin the mass the CoM was fitted against so
+        # the pair stays consistent wherever the document is pulled.
+        entry["mass"] = jc.mass
     update_joint_calibration(
         side_str,
         joint.value,
         friction=entry.get("friction"),
         stribeck=stribeck,
         com=tuple(entry["com"]) if "com" in entry else None,
+        mass=entry.get("mass"),
         hub_serial=hub_serial,
     )
     return entry
@@ -452,6 +617,7 @@ async def _calibrate_arm(
     results: dict[str, dict[str, Any]],
     hub_serial: str,
     args: argparse.Namespace | None = None,
+    overrides: dict[str, LinkOverride] | None = None,
 ) -> None:
     """Home the arm, calibrate all 7 joints distal->proximal, park, disable.
 
@@ -472,7 +638,13 @@ async def _calibrate_arm(
             await _home_all(motors)
             for joint in _CAL_ORDER:
                 entry = await _calibrate_joint(
-                    motors, joint, is_left, velocities_rad, hub_serial, args
+                    motors,
+                    joint,
+                    is_left,
+                    velocities_rad,
+                    hub_serial,
+                    args,
+                    (overrides or {}).get(joint.value),
                 )
                 if entry:
                     results[joint.value] = entry
@@ -504,6 +676,12 @@ async def _run(args: argparse.Namespace) -> None:
         "left": [("left", args.left_channel)],
         "right": [("right", args.right_channel)],
     }[args.arms]
+    try:
+        overrides = parse_link_overrides(
+            args.mass, args.com, [side for side, _ in sides]
+        )
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}")
 
     creds = supabase_credentials()
     print("\nAxol factory calibration — friction + gravity, all joints")
@@ -519,6 +697,24 @@ async def _run(args: argparse.Namespace) -> None:
             "AXOL_SUPABASE_URL if not baked in) — results will be saved "
             "locally only."
         )
+    # Write the custom-link numbers first: every sweep's fit (proximal
+    # joints carry the end-effector too) reads them back from the file.
+    for side_str, joints in overrides.items():
+        for joint_name, override in joints.items():
+            com = override.get("com")
+            update_joint_calibration(
+                side_str,
+                joint_name,
+                mass=override.get("mass"),
+                com=com,
+                hub_serial=serial,
+            )
+            shown = ", ".join(
+                f"{k}={v}"
+                for k, v in (("mass", override.get("mass")), ("com", com))
+                if v is not None
+            )
+            print(f"  Custom link: {side_str} {joint_name} {shown}")
 
     document: dict[str, Any] = {"version": 1, "hub_serial": serial}
     try:
@@ -532,6 +728,7 @@ async def _run(args: argparse.Namespace) -> None:
                 side_results,
                 serial,
                 args,
+                overrides.get(side_str, {}),
             )
     except KeyboardInterrupt:
         print("\n  Interrupted — keeping what completed.")
@@ -550,15 +747,7 @@ async def _run(args: argparse.Namespace) -> None:
     # the other arm's stored data.
     try:
         existing = fetch_calibration(serial) or {}
-        merged: dict[str, Any] = {"version": 1, "hub_serial": serial}
-        for s in ("left", "right"):
-            old = existing.get(s)
-            new = document.get(s)
-            side_doc = dict(old) if isinstance(old, dict) else {}
-            if isinstance(new, dict):
-                side_doc.update(new)
-            if side_doc:
-                merged[s] = side_doc
+        merged = merge_cloud_document(existing, document, serial)
         push_calibration(creds, serial, merged)
         print(f"  Uploaded to Supabase as {serial}.")
     except RuntimeError as exc:

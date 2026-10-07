@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
@@ -67,6 +68,10 @@ from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
 _logger = logging.getLogger(__name__)
+
+# Grace between acknowledging a host shutdown/restart and running it, so the
+# response reaches the panel before the server goes down with the host.
+_HOST_POWER_DELAY_S = 0.5
 
 
 class RunRequest(BaseModel):
@@ -676,6 +681,8 @@ _CAN_DISCOVERY_STATUSES = {
     "unidentified",
     "error",
 }
+# Statuses under which no managed CAN interface may connect yet.
+_CAN_DISCOVERY_BLOCKING = frozenset({"needed", "running", "unidentified", "error"})
 _CAN_DISCOVERY_FORCE_RETRY_SECONDS = 2.0
 # Discovery renames interfaces under a udev lock it can lose to a slow or
 # wedged host. Shutdown joins it so the rename is not cut in half, but the
@@ -1213,6 +1220,38 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if channel is not None
         )
 
+    async def _discover_before_manual_connect() -> None:
+        """Run the CAN discovery a manual Connect would otherwise be refused on.
+
+        A root serve revalidates every configured hub once per process, so
+        after any restart (an update, a reinstall, a reboot) discovery must
+        pass before a managed interface connects. A pass that found the
+        motors silent stays failed until retried -- powering them changes
+        nothing USB-visible -- so the operator's Connect is the retry: launch
+        (or join) a forced pass and let the connect's own checks judge the
+        result. Busy and rate-limit refusals fall through to those checks too.
+        """
+        if os.geteuid() != 0:
+            return
+        if not _discovery_running():
+            async with session_launch_reservation:
+                attached = await asyncio.to_thread(_attached_hub_state)
+                _observe_can_state(attached, running=_discovery_running())
+        if can_discovery.status not in _CAN_DISCOVERY_BLOCKING:
+            return
+        task = await _launch_or_join_can_discovery(force=True)
+        if not isinstance(task, JSONResponse):
+            await asyncio.shield(task)
+
+    def _discovery_refusal() -> str:
+        """Why a managed connect is refused while discovery has not passed."""
+        if can_discovery.message:
+            return can_discovery.message
+        return (
+            "CAN discovery has not confirmed this hardware yet. Power its "
+            "motors, then connect again or retry CAN identification."
+        )
+
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
         s = runner.get(session_id)
@@ -1320,6 +1359,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- host power ----------------------------------------------------------
 
+    def _host_power_refusal() -> JSONResponse | None:
+        """Why the host can't be powered off right now, or None when it can."""
+        if not _is_idle():
+            return JSONResponse(
+                {"error": "an operation or session is running — stop it first"},
+                status_code=409,
+            )
+        if updater.installing:
+            # Cutting power mid-install can leave dpkg half-configured,
+            # failing every later install until `dpkg --configure -a`.
+            return JSONResponse(
+                {
+                    "error": "the robot is installing an update or system "
+                    "packages — wait for it to finish"
+                },
+                status_code=409,
+            )
+        return None
+
     async def _host_power(flag: str, verb: str) -> JSONResponse:
         """Run ``shutdown <flag> now`` on the serve host.
 
@@ -1328,33 +1386,54 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
 
+        The command runs only after the acknowledgement is sent (a response
+        background task, ``_HOST_POWER_DELAY_S`` later): run inline, it takes
+        this server down before the response leaves and the panel reports an
+        API error for a shutdown that worked. Every refusal (busy, installing,
+        no root) is still decided up front, and the launch reservation stays
+        held until the command has run so no session can start in the gap.
+
         A hardware-cleanup lockout does not refuse it (see :func:`_is_idle`):
         restarting the host is one of the two documented ways out of it (the
         other is ``/api/op/clear-lockout``).
         """
-        async with session_launch_reservation:
-            if not _is_idle():
-                return JSONResponse(
-                    {"error": "an operation or session is running — stop it first"},
-                    status_code=409,
-                )
-
-            def _run() -> tuple[bool, str]:
-                cmd = ["shutdown", flag, "now"]
-                if os.geteuid() != 0:
-                    if not prime_sudo():
-                        return False, "root required (no passwordless sudo)"
+        await session_launch_reservation.acquire()
+        try:
+            refusal = _host_power_refusal()
+            cmd = ["shutdown", flag, "now"]
+            if refusal is None and os.geteuid() != 0:
+                if await asyncio.to_thread(prime_sudo):
                     cmd = ["sudo", "-n", *cmd]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
+                else:
+                    refusal = JSONResponse(
+                        {
+                            "error": f"{verb} failed: root required (no passwordless sudo)"
+                        },
+                        status_code=500,
+                    )
+        except BaseException:
+            session_launch_reservation.release()
+            raise
+        if refusal is not None:
+            session_launch_reservation.release()
+            return refusal
 
-            ok, detail = await asyncio.to_thread(_run)
-        if not ok:
-            return JSONResponse(
-                {"error": f"{verb} failed: {detail or 'unknown error'}"},
-                status_code=500,
-            )
-        return JSONResponse({"ok": True})
+        async def _run_after_ack() -> None:
+            try:
+                await asyncio.sleep(_HOST_POWER_DELAY_S)
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True
+                )
+                if proc.returncode != 0:
+                    _logger.error(
+                        "host %s failed: %s",
+                        verb,
+                        (proc.stderr or proc.stdout).strip() or "unknown error",
+                    )
+            finally:
+                session_launch_reservation.release()
+
+        return JSONResponse({"ok": True}, background=BackgroundTask(_run_after_ack))
 
     @app.post("/api/host/shutdown")
     async def host_shutdown() -> JSONResponse:
@@ -1447,6 +1526,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         req: RobotConnectRequest | None = None,
     ) -> dict[str, Any] | JSONResponse:
         nonlocal manually_disconnected_target
+        if req is None or not req.automatic:
+            target = _resolve_robot_connect_target(req)
+            if not isinstance(target, JSONResponse) and _uses_managed_name(target[1]):
+                await _discover_before_manual_connect()
         async with session_launch_reservation:
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
@@ -1494,16 +1577,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         status_code=409,
                     )
                 assert attached is not None
-                if (
-                    profile not in attached.configured_profiles
-                    or can_discovery.status
-                    in {"needed", "running", "unidentified", "error"}
-                ):
+                if can_discovery.status in _CAN_DISCOVERY_BLOCKING:
+                    return JSONResponse(
+                        {"error": _discovery_refusal()}, status_code=409
+                    )
+                if profile not in attached.configured_profiles:
                     return JSONResponse(
                         {
-                            "error": "the managed CAN profile has not passed "
-                            "hardware discovery for this attachment; retry after "
-                            "CAN discovery completes"
+                            "error": f"no configured {profile.capitalize()} CAN "
+                            "hub is attached; plug it in, or run `axol can.setup`"
                         },
                         status_code=409,
                     )
@@ -1558,6 +1640,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any] | JSONResponse:
         if device not in JELLY_DEVICES:
             return JSONResponse({"error": "unknown Jelly device"}, status_code=404)
+        if req is None or not req.automatic:
+            # A fresh base/lift adapter has no pinned interface until discovery
+            # names it, so a manual Connect runs that pass first.
+            await _discover_before_manual_connect()
         async with session_launch_reservation:
             if runner.is_running() or _diagnostic_session_active():
                 return JSONResponse(
