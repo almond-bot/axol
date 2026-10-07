@@ -436,12 +436,13 @@ def has_conflicting_transform_override(
     transforms: Mapping[str, Mapping[str, object]],
     entry_statuses: Mapping[tuple[str, str], str] | None = None,
 ) -> bool:
-    """Whether saved state must suppress a hardware factory fallback.
+    """Whether saved state must suppress a factory fallback.
 
     An exact active-device entry is handled by the caller. Legacy, bare-family,
     and same-family entries for a different device may describe a non-standard
     mount, so silently replacing them after a rebind would be unsafe. Overrides
-    for another tracker family do not conflict.
+    for another tracker family do not conflict. For Quest, a bare ``quest``
+    entry or the same controller profile under another pose space conflicts.
     """
     saved_keys: set[str] = {
         key for key in transforms.get(side, {}) if isinstance(key, str)
@@ -455,6 +456,22 @@ def has_conflicting_transform_override(
     if LEGACY_TRACKER_KEY in saved_keys:
         return True
     family = tracker_key.split(":", 1)[0]
+    if family == "quest":
+        # A bare ``quest`` entry predates profile scoping and may describe a
+        # non-standard cradle; the same profile under another pose space is a
+        # measurement of this controller against a different datum. Either
+        # must suppress the Quest factory value. Other controller generations
+        # are different devices and do not conflict.
+        datum = parse_quest_tracker_key(tracker_key)
+        return "quest" in saved_keys or (
+            datum is not None
+            and any(
+                (saved := parse_quest_tracker_key(key)) is not None
+                and saved[0] == datum[0]
+                and key != tracker_key
+                for key in saved_keys
+            )
+        )
     if family not in {"survive", "ultimate"}:
         return False
     for saved_key in saved_keys:
@@ -487,14 +504,20 @@ def select_quest_transform_key(
 
     Multiple common profiles are deliberately ambiguous; callers need an
     explicit ``tracker_key`` in that case instead of guessing which connected
-    controller generation the operation will report.
+    controller generation the operation will report. A factory Quest profile
+    stands in only when no Quest entry is saved at all: a bare ``quest`` key
+    or a one-sided measurement may describe a non-standard cradle, so it
+    must fail closed rather than be silently replaced by the factory value.
     """
-    common = set(transforms.get("left", {})) & set(transforms.get("right", {}))
-    scoped = sorted(key for key in common if parse_quest_tracker_key(key) is not None)
-    if not scoped:
-        # Only with nothing measured does a factory profile stand in, so a
-        # saved calibration for another controller generation is never made
-        # ambiguous by the factory one.
+    saved = [set(transforms.get(side, {})) for side in ("left", "right")]
+    if any(
+        key == "quest" or key.startswith("quest:") for keys in saved for key in keys
+    ):
+        common = saved[0] & saved[1]
+        scoped = sorted(
+            key for key in common if parse_quest_tracker_key(key) is not None
+        )
+    else:
         scoped = sorted(
             key
             for key, sides in DESIGN_TCP_TRANSFORMS.items()

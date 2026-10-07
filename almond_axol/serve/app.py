@@ -2564,6 +2564,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     "measured"
                     if quest_key is not None
                     and quest_key in saved_transforms.get(side, {})
+                    else "missing"
+                    if quest_key is not None
+                    and has_conflicting_transform_override(
+                        side,
+                        quest_key,
+                        saved_transforms,
+                        transform_entry_statuses,
+                    )
                     else "factory"
                     if quest_key is not None
                     and design_transform_for(side, quest_key) is not None

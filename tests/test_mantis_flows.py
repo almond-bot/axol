@@ -26,7 +26,9 @@ from almond_axol.mantis.calibration import (
     VIVE_TRACKER_CAD_ORIGINS_MM,
     candidate_transform_for,
     design_transform_for,
+    has_conflicting_transform_override,
     load_tcp_transforms,
+    select_quest_transform_key,
     validate_tcp_transform,
 )
 from almond_axol.mantis.relative import quat_xyzw_to_matrix
@@ -1504,6 +1506,48 @@ class MantisFlowTest(unittest.TestCase):
         self.assertEqual(config.quest_controller_profile, "meta-quest-touch-plus")
         self.assertEqual(config.tcp_transform_left, left)
         self.assertEqual(config.tcp_transform_right, right)
+
+    def test_saved_quest_entries_suppress_the_quest_factory_value(self) -> None:
+        key = "quest:meta-quest-touch-plus:grip"
+        identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        for saved in (
+            # Bare pre-profile key: may describe a non-standard cradle.
+            {"left": {"quest": identity}, "right": {"quest": identity}},
+            # One-sided measurement for another controller generation.
+            {"left": {"quest:oculus-touch-v3:grip": identity}},
+            # The same controller measured against the aim pose.
+            {
+                "left": {"quest:meta-quest-touch-plus:target-ray": identity},
+                "right": {"quest:meta-quest-touch-plus:target-ray": identity},
+            },
+        ):
+            with self.subTest(saved=saved):
+                if "quest:meta-quest-touch-plus:target-ray" not in saved["left"]:
+                    # Never auto-selected over saved state; a both-sided
+                    # target-ray entry is selected and rejected by the
+                    # collection gate instead.
+                    self.assertIsNone(select_quest_transform_key(saved))
+                config = VRTeleopConfig(tracker_key=key)
+                with mock.patch(
+                    "almond_axol.mantis.calibration.load_tcp_transforms",
+                    return_value=saved,
+                ):
+                    apply_mantis_teleop_profile(config, tracker_source="quest")
+                if "quest:oculus-touch-v3:grip" not in saved["left"]:
+                    # Conflicting state fails closed instead of the factory.
+                    self.assertIsNone(config.tcp_transform_left)
+                    self.assertIsNone(config.tcp_transform_right)
+        # Another generation saved on both sides is not a conflict for the
+        # Quest 3 key when that key is explicitly selected.
+        other = {
+            "left": {"quest:oculus-touch-v3:grip": identity},
+            "right": {"quest:oculus-touch-v3:grip": identity},
+        }
+        self.assertEqual(
+            select_quest_transform_key(other), "quest:oculus-touch-v3:grip"
+        )
+        self.assertFalse(has_conflicting_transform_override("left", key, other))
+        self.assertEqual(select_quest_transform_key({}), key)
 
     def test_external_tracker_world_hides_unregistered_quest_overlay(self) -> None:
         config = VRTeleopConfig()
