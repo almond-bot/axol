@@ -20,7 +20,7 @@ Friction is motor-specific — the shared defaults in `config.py` were measured 
 | `--kd FLOAT` | Derivative gain (default: the calibration gains) |
 | `--velocities V [V ...]` | Velocity setpoints in deg/s (default: 7.2, 18, 36, 54, 72; `--profile slow`: 1, 2, 3, 5, 8, 15, 30) |
 | `--profile {standard,slow}` | `slow` is the calibration for slow, smooth motion: 1–30°/s, the speeds under 8°/s swept in two windows (the joint's least- and most-loaded angles, ~15 s of travel each way), fitted with the realtime core's own friction law — sliding `fc + fl·\|g\|` (with the runtime's k cap), viscous `fv`, and the low-speed Stribeck excess `dfs + ls·\|g\|` over `vs`. `--save` stores the friction fit **and** the `stribeck_*` fields. About 5–8 min per joint |
-| `--stribeck-gain G` | Share of the fitted low-speed excess the runtime cancels, saved with `--profile slow` (default `0.8` on `shoulder_1` and `elbow`, `0` elsewhere — on the jelly robot's shoulder_2 / shoulder_3 it made slow_osc 30% / 18% rougher than the same friction fit without it) |
+| `--stribeck-gain G` | Share of the fitted low-speed excess the runtime cancels, saved with `--profile slow` (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere — on the jelly robot's shoulder_2 / shoulder_3 it made slow_osc 30% / 18% rougher than the same friction fit without it) |
 | `--fit-csv PATH [PATH ...]` | Fit the slow-profile model to saved `--raw-csv` files (or `scripts/runs_to_friction_csv.py` output from creep runs) without moving anything; `--save` still applies |
 | `--lo DEG` | Override lower joint limit for the sweep (degrees) |
 | `--hi DEG` | Override upper joint limit for the sweep (degrees) |
