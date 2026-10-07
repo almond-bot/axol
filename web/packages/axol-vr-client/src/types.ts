@@ -108,7 +108,9 @@ export type AxolSettingDef = {
  * (from any client). Change one with `{"type":"set","key","value"}` — see
  * `useAxolSettings`; a boolean key also takes the value `"toggle"`, flipped
  * server-side against the value the server holds. The value set includes at
- * least `box_mode` (boolean) and `reengage` (`AxolReengage`).
+ * least `reengage` (`AxolReengage`); `box_mode` (boolean) and the other
+ * `box_*` keys only when the robot has the parcel gripper (box mode exists
+ * only there).
  */
 export type AxolSettings = {
   schema: AxolSettingDef[]

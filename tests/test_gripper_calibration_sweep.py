@@ -85,7 +85,7 @@ class _Jaw:
 
 
 def _arm_with(jaw: _Jaw):
-    arm = AxolHardware(AxolConfig()).left
+    arm = AxolHardware(AxolConfig(gripper="parcel")).left
     arm.motors[Joint.GRIPPER] = jaw
     return arm
 
@@ -117,7 +117,7 @@ class SweepTest(unittest.IsolatedAsyncioTestCase):
         # Fully open and needing 1.4 Nm to break free: the first pair of
         # sweeps both stop where the jaw rests, a harder retry frees it.
         jaw = _Jaw(lo=0.53, hi=3.74, start=3.74, stuck_nm=1.4)
-        arm = AxolHardware(AxolConfig()).right
+        arm = AxolHardware(AxolConfig(gripper="parcel")).right
         arm.motors[Joint.GRIPPER] = jaw
         with self.assertLogs(axol_module._logger, "WARNING") as logs:
             await arm._calibrate_gripper()
@@ -143,7 +143,7 @@ class SweepTest(unittest.IsolatedAsyncioTestCase):
         # on, the jaw sprang ~2.6° ahead of the target and the hold braked
         # it at -2.27 Nm, which aborted the opening sweep.
         jaw = _Jaw(lo=0.53, hi=3.74, start=2.0, spring=0.0454)
-        arm = AxolHardware(AxolConfig()).right
+        arm = AxolHardware(AxolConfig(gripper="parcel")).right
         arm.motors[Joint.GRIPPER] = jaw
         await arm._calibrate_gripper()
         self.assertAlmostEqual(arm._gripper_close, 0.53, delta=0.06)
@@ -162,6 +162,57 @@ class SweepTest(unittest.IsolatedAsyncioTestCase):
         arm = _arm_with(jaw)
         with self.assertRaisesRegex(MotorError, "apart"):
             await arm._calibrate_gripper()
+
+
+class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.enterContext(patch.object(axol_module.asyncio, "sleep", AsyncMock()))
+        self.enterContext(patch.object(axol_module, "_save_gripper_calibration"))
+
+    async def test_parallel_jaws_both_close_toward_positive(self) -> None:
+        # The stock gripper's ~290° stroke, open at the negative stop on
+        # both sides.
+        hw = AxolHardware(AxolConfig(gripper="parallel"))
+        for arm in (hw.left, hw.right):
+            jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(290), start=-4.0)
+            arm.motors[Joint.GRIPPER] = jaw
+            await arm._calibrate_gripper()
+            self.assertAlmostEqual(arm._gripper_open, -6.0, delta=0.01)
+            self.assertAlmostEqual(arm._gripper_close, jaw.hi, delta=0.01)
+            self.assertEqual(jaw.position, jaw.lo)
+
+    async def test_parcel_stroke_under_the_parallel_setting_fails(self) -> None:
+        jaw = _Jaw(lo=0.53, hi=3.74, start=2.0)
+        arm = AxolHardware(AxolConfig(gripper="parallel")).right
+        arm.motors[Joint.GRIPPER] = jaw
+        with self.assertRaisesRegex(
+            MotorError, "parcel gripper's.*--axol.gripper parcel"
+        ):
+            await arm._calibrate_gripper()
+        self.assertEqual(jaw.target, jaw.position)
+        axol_module._save_gripper_calibration.assert_not_called()
+
+    async def test_parallel_stroke_under_the_parcel_setting_fails(self) -> None:
+        jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(290), start=-4.0)
+        arm = AxolHardware(AxolConfig(gripper="parcel")).left
+        arm.motors[Joint.GRIPPER] = jaw
+        with self.assertRaisesRegex(MotorError, "parallel gripper's"):
+            await arm._calibrate_gripper()
+
+    async def test_restore_rejects_the_other_types_calibration(self) -> None:
+        arm = AxolHardware(AxolConfig(gripper="parcel")).left
+        arm.motors[Joint.GRIPPER] = _Jaw(lo=-6.0, hi=-1.0, start=-5.0)
+        with patch.object(
+            axol_module,
+            "_load_gripper_calibration",
+            return_value=(-6.0, -6.0 + math.radians(290)),
+        ):
+            with self.assertRaisesRegex(MotorError, "parallel gripper's"):
+                await arm._restore_gripper_calibration()
+
+    def test_unknown_type_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "gripper must be one of"):
+            AxolConfig(gripper="claw")
 
 
 if __name__ == "__main__":

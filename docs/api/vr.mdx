@@ -96,7 +96,6 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 |-----|------|---------|
 | `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
 | `box_grasp` | `"straight"` / `"flush"` | fingers straight forward (the default) vs. the tool's contact face along the box side; a live pair blends over to it. Also toggled by a stick click, which the worker reports back so the value stays in sync |
-| `box_tool` | `"parcel"` / `"urdf"` | which gripper box mode places (its [contact geometry](/guides/vr-interface#box-tool)); read at the next engage |
 | `box_flush_deg` | number, ° | how far the angled (`flush`) grasp turns each gripper inward from the parallel grasp, about the parcel plate's front edge (39°); read at the next engage or grasp switch |
 | `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
 | `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
@@ -104,6 +103,8 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | `gripper_torque` | number, Nm | both grippers' `torque_limit` (read on every gripper command). Hardware only — hidden in sim |
 | `position_multiplier` | number, × | hand-motion scale (forwarded to the IK worker) |
 | `teleop_max_vel` | number, rev/s | joint velocity cap while tracking |
+
+The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`, mirrored from `AxolConfig.gripper`): with the parallel gripper they are left out of both `schema` and `values` and a `set` of one is rejected, so clients show box mode only when `box_mode` is in `values`.
 
 Core-side settings are queued (`VRTeleopCore.set_live()`) and applied on the IK thread before the next frame — or while idle, so the panel can change them with no headset connected; IK-worker fields are mirrored to the worker subprocess as `("set", key, value)` messages.
 

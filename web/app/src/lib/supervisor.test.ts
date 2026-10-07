@@ -27,12 +27,16 @@ import {
   saveLocalHardwareProfile,
   saveOpSettings,
   serverHttpBase,
+  settingShown,
+  visibleAdvancedSections,
+  type AdvancedSection,
   type CameraSpec,
   type CommandSpec,
   type DatasetEpisode,
   type OperationId,
   type SchemaField,
   type SchemaNode,
+  type SettingsCategory,
 } from "./supervisor"
 
 const required: SchemaField = {
@@ -287,5 +291,54 @@ describe("dataset preview sources", () => {
     const full = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 0)
     expect(new URL(full.url, "http://host").searchParams.get("fps")).toBe("60")
     expect(full.span).toEqual({ from: 0, to: 2 })
+  })
+})
+
+describe("showWhen gates", () => {
+  const parcelOnly = { key: "axol.gripper", equals: "parcel" }
+  const schema: SettingsCategory[] = [
+    {
+      key: "robot",
+      label: "Robot",
+      description: "",
+      settings: [
+        {
+          key: "axol.gripper",
+          label: "Gripper",
+          type: "select",
+          help: "",
+          options: ["parallel", "parcel"],
+          default: "parallel",
+          ui: {},
+          targets: {},
+        },
+      ],
+    },
+  ]
+  const advanced: AdvancedSection[] = [
+    {
+      key: "teleop",
+      label: "Teleop",
+      nodes: [
+        { ...optional, key: "teleop.frequency" },
+        { ...optional, key: "teleop.box_flush_deg", showWhen: parcelOnly },
+      ],
+    },
+  ]
+
+  it("reads the staged value, else the default", () => {
+    expect(settingShown(undefined, {}, schema)).toBe(true)
+    expect(settingShown(parcelOnly, {}, schema)).toBe(false)
+    expect(settingShown(parcelOnly, { "axol.gripper": "parcel" }, schema)).toBe(true)
+  })
+
+  it("prunes gated Advanced fields", () => {
+    const keys = (sections: AdvancedSection[]) =>
+      sections.flatMap((s) => flattenFields(s.nodes)).map((f) => f.key)
+    expect(keys(visibleAdvancedSections(advanced, {}, schema))).toEqual(["teleop.frequency"])
+    expect(keys(visibleAdvancedSections(advanced, { "axol.gripper": "parcel" }, schema))).toEqual([
+      "teleop.frequency",
+      "teleop.box_flush_deg",
+    ])
   })
 })

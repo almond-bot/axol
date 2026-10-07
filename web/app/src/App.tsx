@@ -1052,7 +1052,9 @@ function ToolsRow({
   onToggleGhost: () => void
   onOpenSettings: () => void
 }) {
-  const boxMode = settings ? settings.values.box_mode === true : null
+  // The server only offers box mode with the parcel gripper.
+  const boxMode =
+    settings && "box_mode" in settings.values ? settings.values.box_mode === true : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
   const boxDetail = [grasp, squeeze > 0 ? `${squeeze} N` : "", trim !== 0 ? `${trim}° in` : ""]
     .filter(Boolean)
@@ -1257,11 +1259,13 @@ function HelpPanel({
   onDismiss,
   mode,
   boxMode,
+  boxAvailable,
   poseSourceKind,
 }: {
   onDismiss: () => void
   mode: AxolMode | null
   boxMode: boolean
+  boxAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const W = 0.44
@@ -1283,7 +1287,7 @@ function HelpPanel({
             "[Stick ↑↓]  Elbows",
             "[Stick Click]  Flush / Straight",
           ]
-        : ["[Grip]  Engage / Freeze Arm", "[Both Clicks]  Box Mode"]),
+        : ["[Grip]  Engage / Freeze Arm", ...(boxAvailable ? ["[Both Clicks]  Box Mode"] : [])]),
   ].join("\n")
   const leftRows = [
     "[Y]  Exit VR",
@@ -1390,10 +1394,12 @@ function HelpPanel({
 function HelpIcon({
   mode,
   boxMode,
+  boxAvailable,
   poseSourceKind,
 }: {
   mode: AxolMode | null
   boxMode: boolean
+  boxAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const [open, setOpen] = useState(false)
@@ -1418,6 +1424,7 @@ function HelpIcon({
           onDismiss={() => setOpen(false)}
           mode={mode}
           boxMode={boxMode}
+          boxAvailable={boxAvailable}
           poseSourceKind={poseSourceKind}
         />
       )}
@@ -1613,6 +1620,8 @@ export default function App() {
     step: stepSetting,
   } = useAxolSettings(wsRef, status === AxolConnectionStatus.Open)
   const boxMode = settings?.values.box_mode === true
+  // Offered by the server only with the parcel gripper.
+  const boxAvailable = settings != null && "box_mode" in settings.values
   const reengage = settings ? String(settings.values.reengage ?? "") : null
   const [xrError, setXrError] = useState<string | null>(null)
 
@@ -1853,7 +1862,7 @@ export default function App() {
                                     ] as [string, string][])
                                   : []),
                               ] as [string, string][])),
-                          ...(settings
+                          ...(boxAvailable
                             ? ([["Both stick clicks", "Toggle box mode"]] as [string, string][])
                             : []),
                         ]
@@ -1932,7 +1941,12 @@ export default function App() {
             <ImmersiveCameraFeed wsRef={wsRef} />
             <XRHud>
               <ExitButton />
-              <HelpIcon mode={vrMode} boxMode={boxMode} poseSourceKind={poseSourceKind} />
+              <HelpIcon
+                mode={vrMode}
+                boxMode={boxMode}
+                boxAvailable={boxAvailable}
+                poseSourceKind={poseSourceKind}
+              />
               <StateDisplay
                 state={vrState}
                 isRecordingPending={recordingPendingAt !== null}

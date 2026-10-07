@@ -36,7 +36,7 @@ class EngageBlockTest(unittest.TestCase):
     def _core(self, **config: object) -> tuple[VRTeleopCore, list[dict]]:
         sent: list[dict] = []
         core = VRTeleopCore(
-            VRTeleopConfig(**config),
+            VRTeleopConfig(**{"gripper": "parcel", **config}),
             logging.getLogger(__name__),
             lambda _enabled: None,
             broadcast_json=sent.append,

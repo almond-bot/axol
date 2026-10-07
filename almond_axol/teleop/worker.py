@@ -1310,22 +1310,18 @@ class IKWorker:
     def _box_tool(self) -> ToolGeometry:
         """The box-mode contact geometry for the current grasp and tool.
 
-        The fitted tool's (``config.box_tool``) in the current grasp: for
+        The fitted gripper's (``config.gripper``) in the current grasp: for
         the parcel gripper, its plate's face in ``"straight"`` and its
         facet and tip, turned ``box_flush_deg`` inward, in ``"flush"``
         (:func:`parcel_tool`) — the same foot in both, so a grasp switch
-        turns each gripper about it. The stock gripper's
-        (:data:`URDF_TOOL`) is the same in both grasps.
+        turns each gripper about it. Box mode only runs with the parcel
+        gripper; anything else gets the trivial :data:`URDF_TOOL` (the
+        mounts themselves, the same in both grasps).
         """
         cfg = self._config
-        kind = str(getattr(cfg, "box_tool", "urdf")).strip().lower()
-        if kind == "parcel":
+        if getattr(cfg, "gripper", "parallel") == "parcel":
             return parcel_tool(
                 float(getattr(cfg, "box_flush_deg", 39.0)), self._box_grasp()
-            )
-        if kind != "urdf":
-            _logger.warning(
-                "Unknown box_tool %r; using the URDF gripper geometry", cfg.box_tool
             )
         return URDF_TOOL
 
@@ -1742,8 +1738,8 @@ class IKWorker:
         On engage the pair is snapped from FK (:func:`snap_box`), the leader
         controller's pose is anchored, and the grippers are blended into the
         side-clamping grasp (level, the fitted tool's contact face along the
-        box side — ``config.box_tool``, read at each engage together with
-        the pinned faces) over ``box_align_duration``. Afterwards the leader hand
+        box side — the grasp, read at each engage together with the pinned
+        faces) over ``box_align_duration``. Afterwards the leader hand
         drives the pair through the usual per-arm clutch mapping
         (:func:`_relative_target_np`, so moving the hand feels exactly like
         normal teleop) with two of its six degrees of freedom dropped: the

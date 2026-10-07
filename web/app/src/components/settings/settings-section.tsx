@@ -14,6 +14,8 @@ import {
   HARDWARE_PROFILE_SETTING,
   flattenFields,
   setQuestProximityDisabled,
+  settingShown,
+  visibleAdvancedSections,
   type AdvancedSection,
   type CameraDevice,
   type CameraSlot,
@@ -316,7 +318,11 @@ export function SettingsSection({
   // The Jelly config tree has its own tab; everything else stays in Advanced.
   const advancedSections = snapshot?.advancedSchema ?? []
   const jellyParameters = advancedSections.find((s) => s.key === JELLY_ADVANCED_SECTION) ?? null
-  const generalAdvancedSections = advancedSections.filter((s) => s.key !== JELLY_ADVANCED_SECTION)
+  const generalAdvancedSections = visibleAdvancedSections(
+    advancedSections.filter((s) => s.key !== JELLY_ADVANCED_SECTION),
+    draft?.values ?? {},
+    schema
+  )
 
   function selectScope(next: SettingsScope) {
     onOpenChange(true)
@@ -543,6 +549,7 @@ export function SettingsSection({
             ) : activeCategory ? (
               <CategoryPanel
                 category={activeCategory}
+                schema={schema}
                 values={draft.values}
                 onChange={setValue}
                 excludeKeys={
@@ -784,17 +791,23 @@ function UsbPanel({
 /** One settings category rendered as proper controls (not bare text boxes). */
 function CategoryPanel({
   category,
+  schema,
   values,
   onChange,
   excludeKeys = [],
 }: {
   category: SettingsCategory
+  /** Every category, to resolve the defaults `showWhen` gates read. */
+  schema: SettingsCategory[]
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
   excludeKeys?: string[]
 }) {
   const fields = category.settings.filter(
-    (s) => s.ui.widget !== "pose" && !excludeKeys.includes(s.key)
+    (s) =>
+      s.ui.widget !== "pose" &&
+      !excludeKeys.includes(s.key) &&
+      settingShown(s.ui.showWhen, values, schema)
   )
   return (
     <div className="flex flex-col gap-4">

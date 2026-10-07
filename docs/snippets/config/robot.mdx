@@ -5,6 +5,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}left_stiffness</F> | `1.0` | How stiff the left arm is, from `0` (soft, hand-guidable) to `1` (the tuned gains). Lower values only add compliance — the arm tracks a little less tightly but yields more to obstacles. One number applies to every joint; a 7-element list sets each joint in the order `shoulder_1, shoulder_2, shoulder_3, elbow, wrist_1, wrist_2, wrist_3`. |
 | <F>--{prefix}right_stiffness</F> | `1.0` | Same, for the right arm. |
 | <F>--{prefix}has_gripper</F> | `true` | Set `false` on the gripperless model. The gripper motors are never enabled and datasets record 7 channels per arm instead of 8. |
+| <F>--{prefix}gripper</F> | `parallel` | Which gripper is fitted: `parallel` (the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Sets which way each jaw closes for the bring-up calibration, which refuses a gripper whose measured stroke is the other type's. Box mode exists only with `parcel`. |
 | <F>--{prefix}max_step_rad</F> | `0.5` | Largest joint move (rad) allowed between two consecutive commands. Bigger moves are dropped with a warning. `inf` disables. |
 | <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force — peak gripper torque (Nm). |
 | <F>--{prefix}left.gripper.max_speed</F> | `10.0` | Maximum gripper speed (rad/s). |

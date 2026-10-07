@@ -30,7 +30,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Literal, get_args
 
 from ..constants import ARM_JOINTS
 from .calibration import (
@@ -204,30 +204,35 @@ class PositionForceConfig:
     """Position-force control parameters.
 
     Attributes:
-        torque_limit:    Peak output torque (Nm).
-        max_speed:       Maximum joint speed (rad/s).
-        close_direction: Sign of the motor rotation that closes the jaw:
-                         ``+1`` closes toward positive motor angles, ``-1``
-                         toward negative. The two grippers' motors turn
-                         opposite ways to close (:meth:`ArmConfig.mirror_to_right`
-                         flips it): the left jaw closes toward positive
-                         angles (the default here), the right toward
-                         negative. The end-stop calibration at enable time
-                         sweeps in this direction first to find the closed
-                         stop, then back to the open stop — so a wrong sign
-                         swaps open/closed and leaves the jaw closed after
-                         bring-up.
+        torque_limit: Peak output torque (Nm).
+        max_speed:    Maximum joint speed (rad/s).
     """
 
     torque_limit: float
     max_speed: float
-    close_direction: int = 1
 
-    def __post_init__(self) -> None:
-        if self.close_direction not in (1, -1):
-            raise ValueError(
-                f"gripper close_direction must be +1 or -1, got {self.close_direction!r}"
-            )
+
+GripperType = Literal["parallel", "parcel"]
+GRIPPER_TYPES: tuple[str, ...] = get_args(GripperType)
+
+
+def gripper_close_direction(gripper: str, is_left: bool) -> int:
+    """Sign of the motor rotation that closes one arm's jaw.
+
+    ``+1`` closes toward positive motor angles, ``-1`` toward negative. Both
+    jaws of the stock parallel gripper close toward positive angles; on the
+    parcel gripper the right motor is mounted the other way round, so its
+    jaw closes toward negative ones. The end-stop calibration at enable time
+    sweeps in this direction first to find the closed stop, then back to the
+    open stop — so a wrong sign swaps open/closed and leaves the jaw closed
+    after bring-up (and the measured stroke then gives the wrong
+    ``AxolConfig.gripper`` away).
+    """
+    if gripper not in GRIPPER_TYPES:
+        raise ValueError(
+            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
+        )
+    return -1 if gripper == "parcel" and not is_left else 1
 
 
 # Placeholder used in :class:`ArmConfig` defaults. Real per-arm friction
@@ -392,9 +397,6 @@ class ArmConfig:
         every joint, and ``com.y`` is additionally sign-flipped on
         ``wrist_2`` (because the CAD models the wrist-2 link asymmetrically
         per side rather than as a true mirror — see the URDF for details).
-        The gripper's ``close_direction`` is flipped too: the right jaw
-        closes with the opposite motor rotation to the left (negative angles
-        on the right, positive on the left).
         """
         out = replace(
             self,
@@ -405,9 +407,6 @@ class ArmConfig:
             wrist_1=replace(self.wrist_1, com=_flip_x(self.wrist_1.com)),
             wrist_2=replace(self.wrist_2, com=_flip_x_y(self.wrist_2.com)),
             wrist_3=replace(self.wrist_3, com=_flip_x(self.wrist_3.com)),
-            gripper=replace(
-                self.gripper, close_direction=-self.gripper.close_direction
-            ),
         )
         return out
 
@@ -742,6 +741,17 @@ class AxolConfig:
                          (the last element of every ``(8,)`` joint array) are
                          ignored, and gripper reads report ``0.0``. The array
                          shapes of the public API are unchanged.
+        gripper:         Which gripper is fitted to both arms: ``"parallel"``
+                         (the default — the stock two-finger gripper, ~290°
+                         of motor stroke, both jaws closing toward positive
+                         motor angles) or ``"parcel"`` (the hinged-plate
+                         parcel gripper, ~185° of stroke, the right jaw
+                         closing toward negative angles — see
+                         :func:`gripper_close_direction`). The enable-time
+                         end-stop calibration checks the stroke it measures
+                         against this and refuses to bring up a gripper
+                         that looks like the other type. Teleop's box mode
+                         is only available with ``"parcel"``.
         max_step_rad:    Maximum allowed change in any arm joint (rad)
                          between consecutive ``motion_control`` calls.
                          Commands that exceed this are dropped and a warning
@@ -776,9 +786,16 @@ class AxolConfig:
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
     has_gripper: bool = True
+    gripper: GripperType = "parallel"
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
+
+    def __post_init__(self) -> None:
+        if self.gripper not in GRIPPER_TYPES:
+            raise ValueError(
+                f"gripper must be one of {list(GRIPPER_TYPES)}, got {self.gripper!r}"
+            )
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.

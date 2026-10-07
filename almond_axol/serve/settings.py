@@ -133,6 +133,8 @@ SECTIONS: tuple[Section, ...] = (
         targets={"teleop": "teleop", "collect-data": _VRT},
         ref_op="teleop",
         ref_prefix="teleop",
+        # A mirror of axol.gripper, copied in by the CLIs.
+        drop_children=("gripper",),
     ),
     Section(
         key="kinematics",
@@ -350,6 +352,12 @@ def _lerobot_dataset_root() -> str:
         return "~/.cache/huggingface/lerobot"
 
 
+def _parcel_only() -> dict[str, Any]:
+    """``ui`` hint for box mode's settings: shown only while the parcel
+    gripper is selected (the only gripper with box mode)."""
+    return {"showWhen": {"key": "axol.gripper", "equals": "parcel"}}
+
+
 SETTINGS: tuple[SettingCategory, ...] = (
     SettingCategory(
         key="robot",
@@ -411,6 +419,21 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "calibrated, gripper commands are ignored, and gripper "
                     "channels are dropped from recorded datasets. The gripper "
                     "torque/speed settings below then have no effect."
+                ),
+            ),
+            SettingDef(
+                key="axol.gripper",
+                label="Gripper",
+                type="select",
+                options=("parallel", "parcel"),
+                help=(
+                    "Which gripper is fitted to both arms. parallel: the stock "
+                    "two-finger gripper. parcel: the hinged-plate parcel "
+                    "gripper, whose right jaw closes the other way — and the "
+                    "only one with box mode, whose settings appear in Teleop "
+                    "once it is selected. Bring-up checks the stroke it "
+                    "measures against this and refuses a gripper that looks "
+                    "like the other type."
                 ),
             ),
             SettingDef(
@@ -673,6 +696,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_mode",
+                ui=_parcel_only(),
                 label="Box mode at startup",
                 type="boolean",
                 help=(
@@ -693,6 +717,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_lead_hand",
+                ui=_parcel_only(),
                 label="Box-mode lead hand",
                 type="select",
                 options=("right", "left"),
@@ -708,26 +733,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="teleop.box_tool",
-                label="Box-mode gripper",
-                type="select",
-                options=("parcel", "urdf"),
-                help=(
-                    "Which gripper is fitted, for box mode's contact "
-                    "geometry. parcel: the hinged-blade parcel gripper — each "
-                    "gripper is yawed so the folded blade's flat face lies "
-                    "along the box side and the grip width is measured "
-                    "between the two faces. urdf: the stock two-finger "
-                    "gripper — mounts are the width apart, fingers straight "
-                    "forward. Also switchable live from the headset menu."
-                ),
-                targets={
-                    "teleop": ("teleop.box_tool",),
-                    "collect-data": (f"{_VRT}.box_tool",),
-                },
-            ),
-            SettingDef(
                 key="teleop.box_grasp",
+                ui=_parcel_only(),
                 label="Box-mode grasp",
                 type="select",
                 options=("straight", "flush"),
@@ -748,6 +755,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_elbow_out",
+                ui=_parcel_only(),
                 label="Box-mode elbows out (°)",
                 type="number",
                 help=(
@@ -765,6 +773,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_elbow_weight",
+                ui=_parcel_only(),
                 label="Box-mode elbow hint weight",
                 type="number",
                 help=(
@@ -782,6 +791,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_squeeze_torque",
+                ui=_parcel_only(),
                 label="Box squeeze cap (Nm)",
                 type="number",
                 help=(
@@ -805,6 +815,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_squeeze_lean",
+                ui=_parcel_only(),
                 label="Box squeeze lean (×)",
                 type="number",
                 help=(
@@ -825,6 +836,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_squeeze_trim",
+                ui=_parcel_only(),
                 label="Box squeeze trim (°)",
                 type="number",
                 help=(
@@ -844,6 +856,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_squeeze_force",
+                ui=_parcel_only(),
                 label="Box squeeze force (N)",
                 type="number",
                 help=(
@@ -1256,6 +1269,8 @@ _LEGACY_KEYS: dict[str, tuple[str, ...]] = {
     # The Advanced tree's old name for the teleop subsystem, and the Quest
     # datum that used to be buried in it.
     "vr_teleop.tracker_key": ("mantis.quest_tracker_key",),
+    # Box mode's tool select, superseded by the robot-wide axol.gripper.
+    "teleop.box_tool": (),
 }
 
 
@@ -1357,6 +1372,8 @@ def _rekey_nodes(
             if new_key in managed:
                 continue
             out.append({**node, "key": new_key})
+            if new_key.startswith("teleop.box_"):
+                out[-1].update(_parcel_only())
         else:
             children = _rekey_nodes(
                 node["children"], old_prefix, new_prefix, managed, ()

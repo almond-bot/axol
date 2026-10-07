@@ -103,19 +103,6 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
-        key="box_tool",
-        label="Box tool",
-        type="select",
-        options=("parcel", "urdf"),
-        help=(
-            "Gripper fitted, for box mode's contact geometry. parcel: the "
-            "hinged-plate parcel gripper — the plate folds back along the "
-            "wrist at its stop, its face clamps in the straight grasp and its "
-            "chamfer facet plus the fixed tip in the angled one. urdf: the stock two-finger "
-            "gripper — mounts are the width apart, fingers straight forward."
-        ),
-    ),
-    LiveSettingDef(
         key="box_flush_deg",
         label="Angled yaw",
         type="number",
@@ -356,6 +343,9 @@ class LiveSettings:
         return callable(getattr(self._robot, "set_spring_caps", None))
 
     def _hidden(self, d: LiveSettingDef) -> bool:
+        if d.key.startswith("box_") and not self._core.box_available:
+            # Box mode exists only with the parcel gripper.
+            return True
         if d.key == "gripper_torque":
             return not self._has_gripper_torque()
         if d.key == "box_squeeze_torque":

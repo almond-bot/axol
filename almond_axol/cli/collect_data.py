@@ -1385,6 +1385,9 @@ def _run_session(
         and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+        cfg.teleop_config.vr_teleop_config.gripper = (
+            cfg.robot_config.axol_config.gripper
+        )
 
         # Keep the optional teleop flight recorder coherent across Python and
         # Rust. An explicit name enables every stage; the documented ``None``

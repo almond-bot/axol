@@ -13,23 +13,23 @@ import math
 import unittest
 
 from almond_axol.robot.axol import AxolArm, AxolHardware
-from almond_axol.robot.config import AxolConfig, PositionForceConfig
+from almond_axol.robot.config import (
+    AxolConfig,
+    PositionForceConfig,
+    gripper_close_direction,
+)
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 
 
-def _arm(stroke_deg: float, close_direction: int = -1) -> AxolArm:
-    """The left arm with a calibrated gripper of the given stroke (offline)."""
-    cfg = AxolConfig()
-    for side in (cfg.left, cfg.right):
-        side.gripper = PositionForceConfig(
-            torque_limit=0.5, max_speed=10.0, close_direction=close_direction
-        )
-    arm = AxolHardware(cfg).left
-    # As the calibration sweep would: the jaw closes in close_direction,
+def _arm(stroke_deg: float, left: bool = False) -> AxolArm:
+    """A parcel-gripper arm calibrated to the given stroke (offline)."""
+    hw = AxolHardware(AxolConfig(gripper="parcel"))
+    arm = hw.left if left else hw.right
+    # As the calibration sweep would: the jaw closes in its close direction,
     # so the open stop is the other way, ``stroke`` away.
     arm._set_gripper_range(
-        open_pos=-close_direction * math.radians(stroke_deg), close_pos=0.0
+        open_pos=-arm._close_direction * math.radians(stroke_deg), close_pos=0.0
     )
     return arm
 
@@ -45,23 +45,23 @@ class StrokeTest(unittest.TestCase):
             self.assertEqual(arm._gripper_to_raw(0.0), 0.0)
 
     def test_mirrored_gripper_closes_the_other_way(self) -> None:
-        arm = _arm(stroke_deg=180.0, close_direction=1)
+        arm = _arm(stroke_deg=180.0, left=True)
         self.assertAlmostEqual(arm._gripper_to_raw(1.0), -math.radians(180.0), places=9)
 
-    def test_left_closes_toward_positive_right_toward_negative(self) -> None:
-        cfg = AxolConfig()
-        self.assertEqual(cfg.left.gripper.close_direction, 1)
-        self.assertEqual(cfg.right.gripper.close_direction, -1)
-        self.assertEqual(cfg.left.mirror_to_right().gripper.close_direction, -1)
+    def test_close_direction_follows_the_gripper_type(self) -> None:
+        self.assertEqual(gripper_close_direction("parcel", is_left=True), 1)
+        self.assertEqual(gripper_close_direction("parcel", is_left=False), -1)
+        self.assertEqual(gripper_close_direction("parallel", is_left=True), 1)
+        self.assertEqual(gripper_close_direction("parallel", is_left=False), 1)
+        hw = AxolHardware(AxolConfig())
+        self.assertEqual((hw.left._close_direction, hw.right._close_direction), (1, 1))
 
     def test_right_sweep_finishes_on_the_positive_stop(self) -> None:
         # The right arm's stops as measured on the robot: it rested closed
         # on the negative one when the sweep called that open.
-        arm = AxolHardware(AxolConfig()).right
+        arm = AxolHardware(AxolConfig(gripper="parcel")).right
         stops = (0.525, 3.738)
-        close = (
-            max(stops) if arm._arm_config.gripper.close_direction > 0 else min(stops)
-        )
+        close = max(stops) if arm._close_direction > 0 else min(stops)
         arm._set_gripper_range(open_pos=sum(stops) - close, close_pos=close)
         self.assertAlmostEqual(arm._gripper_to_raw(1.0), 3.738)
         self.assertAlmostEqual(arm._gripper_to_raw(0.0), 0.525)
@@ -69,11 +69,9 @@ class StrokeTest(unittest.TestCase):
     def test_default_sweep_finishes_on_the_negative_stop(self) -> None:
         # The left arm's stops as measured on the robot: the more negative
         # one is open, as the open-stop-only sweep always found it.
-        arm = AxolHardware(AxolConfig()).left
+        arm = AxolHardware(AxolConfig(gripper="parcel")).left
         stops = (-5.378, -2.204)
-        close = (
-            max(stops) if arm._arm_config.gripper.close_direction > 0 else min(stops)
-        )
+        close = max(stops) if arm._close_direction > 0 else min(stops)
         arm._set_gripper_range(open_pos=sum(stops) - close, close_pos=close)
         self.assertAlmostEqual(arm._gripper_to_raw(1.0), -5.378)
         self.assertAlmostEqual(arm._gripper_to_raw(0.0), -2.204)

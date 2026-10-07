@@ -481,14 +481,14 @@ class ParcelToolTest(unittest.TestCase):
         worker = object.__new__(IKWorker)
         worker._config = types.SimpleNamespace(
             box_grasp="flush",
-            box_tool="parcel",
+            gripper="parcel",
             box_flush_deg=30.0,
             box_face_left="-x",
             box_face_right="auto",
         )
         self.assertAlmostEqual(math.degrees(worker._box_tool().flush_tilt), 30.0)
         self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 0.0})
-        worker._config.box_tool = "urdf"
+        worker._config.gripper = "parallel"
         worker._config.box_face_right = "+x"
         self.assertIs(worker._box_tool(), URDF_TOOL)
         self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 1.0})
@@ -704,7 +704,7 @@ class SticksDriveJellyTest(unittest.TestCase):
 
     def _core(self) -> VRTeleopCore:
         core = VRTeleopCore(
-            VRTeleopConfig(box_mode=True),
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
         )
@@ -776,7 +776,7 @@ class BoxExitTest(unittest.TestCase):
     def _core(self, **cfg) -> tuple[VRTeleopCore, list[tuple[str, object]]]:
         modes: list[tuple[str, object]] = []
         core = VRTeleopCore(
-            VRTeleopConfig(box_mode=True, box_tool="parcel", **cfg),
+            VRTeleopConfig(box_mode=True, gripper="parcel", **cfg),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
             broadcast_mode=lambda key, value: modes.append((key, value)),
@@ -900,7 +900,7 @@ class ModeSwitchEngagesTest(unittest.TestCase):
 
     def _core(self, **cfg) -> VRTeleopCore:
         return VRTeleopCore(
-            VRTeleopConfig(**cfg),
+            VRTeleopConfig(**{"gripper": "parcel", **cfg}),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
         )
@@ -1105,10 +1105,10 @@ class StickControlTest(unittest.TestCase):
         for tool, grasp, floor in (
             ("parcel", "straight", 0.02),
             ("parcel", "flush", 0.02),
-            ("urdf", "straight", 0.077),
-            ("urdf", "flush", 0.077),
+            ("parallel", "straight", 0.077),
+            ("parallel", "flush", 0.077),
         ):
-            worker._config.box_tool = tool
+            worker._config.gripper = tool
             worker._config.box_grasp = grasp
             box = _box_state()
             worker._integrate_sticks(frame, box, now=0.0)
@@ -1138,12 +1138,13 @@ class StickControlTest(unittest.TestCase):
 
 
 class _FakeCore:
+    box_available = True
+
     def __init__(self) -> None:
         self.values = {
             "box_mode": True,
             "box_lead_hand": "right",
             "box_grasp": "flush",
-            "box_tool": "parcel",
             "box_flush_deg": 39.0,
             "box_face_left": "auto",
             "box_face_right": "auto",
@@ -1198,7 +1199,7 @@ def _box_worker(leader: str = "left") -> IKWorker:
         box_align_duration=0.0,
         box_width_min=0.1,
         box_width_max=0.7,
-        box_tool="urdf",
+        gripper="parallel",
         box_face_left="auto",
         box_face_right="auto",
         box_grip_tilt=0.0,
@@ -1348,7 +1349,7 @@ class GraspToggleTest(unittest.TestCase):
 
     def _worker(self) -> IKWorker:
         worker = _box_worker()
-        worker._config.box_tool = "parcel"
+        worker._config.gripper = "parcel"
         worker._config.box_flush_deg = 39.0
         worker._config.box_grasp = "flush"
         return worker
@@ -1356,7 +1357,7 @@ class GraspToggleTest(unittest.TestCase):
     def test_a_session_starts_straight_and_a_click_goes_flush(self) -> None:
         self.assertEqual(VRTeleopConfig().box_grasp, "straight")
         worker = _box_worker()
-        worker._config.box_tool = "parcel"
+        worker._config.gripper = "parcel"
         worker._config.box_flush_deg = 39.0
         self.assertFalse(hasattr(worker._config, "box_grasp"))  # the fallback
         self.assertEqual(worker._box_grasp(), "straight")
@@ -1441,7 +1442,7 @@ class GraspToggleTest(unittest.TestCase):
     def test_core_mirrors_the_workers_grasp(self) -> None:
         notified: list[tuple[str, object]] = []
         core = VRTeleopCore(
-            VRTeleopConfig(box_mode=True),
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
             broadcast_mode=lambda key, value: notified.append((key, value)),
@@ -1468,7 +1469,7 @@ class GraspToggleTest(unittest.TestCase):
     def test_core_mirrors_the_workers_elbow_angle(self) -> None:
         notified: list[tuple[str, object]] = []
         core = VRTeleopCore(
-            VRTeleopConfig(box_mode=True),
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
             broadcast_mode=lambda key, value: notified.append((key, value)),
@@ -1538,7 +1539,7 @@ class BoxExitRampTest(unittest.TestCase):
         cfg.box_align_duration = 0.0
         cfg.box_width_min = 0.02
         cfg.box_width_max = 0.7
-        cfg.box_tool = "urdf"
+        cfg.gripper = "parallel"
         cfg.box_face_left = "auto"
         cfg.box_face_right = "auto"
         cfg.box_grip_tilt = 0.0

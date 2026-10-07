@@ -38,7 +38,7 @@ from ..settings import SHARED
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
 from .base import RobotBase, mark_hardware_cleanup_uncertain
-from .config import AxolConfig
+from .config import AxolConfig, gripper_close_direction
 from .control import (
     DAMP_BP_Q,
     DAMP_BP_W0,
@@ -75,6 +75,14 @@ LIMITS: dict[Joint, tuple[float, float]] = {
 # as the stroke from its calibrated open stop.
 GRIPPER_TRAVEL = math.radians(290)
 _GRIPPER_NOMINAL_TRAVEL = GRIPPER_TRAVEL
+# Nominal stroke of each ``AxolConfig.gripper`` type (rad). The two are far
+# enough apart that a measured stroke tells them apart: calibration refuses a
+# stroke nearer the other type's, which is what a wrong setting measures (on
+# the right arm it would also have swapped open and closed).
+_GRIPPER_NOMINAL_STROKE = {
+    "parallel": GRIPPER_TRAVEL,
+    "parcel": math.radians(185),
+}
 
 # Gripper end-stop calibration parameters.
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — pushing this hard into a stop ends a sweep
@@ -756,17 +764,17 @@ class AxolArm:
             dtype=float,
         )
         # Raw motor angles of the gripper's two hard stops. The jaw closes in
-        # the configured ``close_direction``, so which of the two is the
-        # numerically larger angle depends on it — the [0 = closed, 1 = open]
-        # normalisation goes through
+        # ``_close_direction`` (set by the fitted gripper type and the side),
+        # so which of the two is the numerically larger angle depends on it —
+        # the [0 = closed, 1 = open] normalisation goes through
         # ``_gripper_to_raw`` / ``_gripper_from_raw`` and never assumes an
         # order. Pre-calibration placeholders assume zero is closed and a
         # nominal stroke — do not rely on for actual motion.
+        self._close_direction = gripper_close_direction(config.gripper, is_left)
         self._gripper_open: float = 0.0
         self._gripper_close: float = 0.0
         self._set_gripper_range(
-            open_pos=-self._arm_config.gripper.close_direction
-            * _GRIPPER_NOMINAL_TRAVEL,
+            open_pos=-self._close_direction * _GRIPPER_NOMINAL_STROKE[config.gripper],
             close_pos=0.0,
         )
 
@@ -1235,22 +1243,24 @@ class AxolArm:
     async def _calibrate_gripper(self) -> None:
         """Measure both gripper hard stops and leave the jaw open.
 
-        Sweeps the jaw closed first (in the configured
-        ``ArmConfig.gripper.close_direction``) until it stalls on the closed
-        stop, then back the other way until it stalls on the open stop, so the
-        gripper finishes open. The stroke is whatever the two stops measure —
-        nothing about it is assumed. Adopts the pair for the [0, 1]
-        normalisation and raw clipping (see :meth:`_set_gripper_range`) and
-        persists it so a later reconnecting :meth:`enable` can restore it
-        without moving the gripper.
+        Sweeps the jaw closed first (in the fitted gripper's close direction,
+        :func:`~almond_axol.robot.config.gripper_close_direction`) until it
+        stalls on the closed stop, then back the other way until it stalls on
+        the open stop, so the gripper finishes open. The stroke is whatever
+        the two stops measure, checked only for which ``AxolConfig.gripper``
+        type it looks like (:meth:`_check_gripper_stroke`). Adopts the pair
+        for the [0, 1] normalisation and raw clipping (see
+        :meth:`_set_gripper_range`) and persists it so a later reconnecting
+        :meth:`enable` can restore it without moving the gripper.
 
         Must be called with the gripper motor already enabled and in IMPEDANCE mode.
 
         Raises:
-            MotorError: If a stop is not found (see :meth:`_seek_gripper_stop`)
-                or the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``.
+            MotorError: If a stop is not found (see :meth:`_seek_gripper_stop`),
+                the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``,
+                or the stroke is the other gripper type's.
         """
-        close_direction = self._arm_config.gripper.close_direction
+        close_direction = self._close_direction
         side = "left" if self._is_left else "right"
 
         for threshold in _GRIPPER_BREAKAWAY_THRESHOLDS:
@@ -1280,8 +1290,39 @@ class AxolArm:
             open_pos,
             math.degrees(travel),
         )
+        try:
+            self._check_gripper_stroke(travel)
+        except MotorError:
+            await self._unload_gripper_target()
+            raise
         self._set_gripper_range(open_pos, close_pos)
         _save_gripper_calibration(self._is_left, open_pos, close_pos)
+
+    def _check_gripper_stroke(self, travel: float) -> None:
+        """Refuse a measured stroke that belongs to the other gripper type.
+
+        Raises:
+            MotorError: If ``travel`` (rad) is nearer another type's nominal
+                stroke (``_GRIPPER_NOMINAL_STROKE``) than the configured
+                ``AxolConfig.gripper``'s.
+        """
+        configured = self._config.gripper
+        nearest = min(
+            _GRIPPER_NOMINAL_STROKE,
+            key=lambda kind: abs(_GRIPPER_NOMINAL_STROKE[kind] - travel),
+        )
+        if nearest == configured:
+            return
+        side = "left" if self._is_left else "right"
+        raise MotorError(
+            f"{side} gripper measured a {math.degrees(travel):.0f}° stroke, which "
+            f"is the {nearest} gripper's "
+            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[nearest]):.0f}°), but the "
+            f"robot is configured for the {configured} gripper "
+            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[configured]):.0f}°) — set "
+            f"the gripper type to {nearest} (--axol.gripper {nearest}, control "
+            f"panel Robot → Gripper) and enable again"
+        )
 
     async def enable(self, hold: bool = True) -> None:
         """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode.
@@ -1426,20 +1467,23 @@ class AxolArm:
         and drop anything held.
 
         Raises:
-            MotorError: If no calibration was persisted, it disagrees with the
-                configured ``close_direction``, or it no longer matches the
-                encoder (motor re-zeroed or power-cycled).
+            MotorError: If no calibration was persisted, it was measured for
+                the other gripper type (opposite close direction or the other
+                type's stroke), or it no longer matches the encoder (motor
+                re-zeroed or power-cycled).
         """
         side = "left" if self._is_left else "right"
         open_pos, close_pos = _load_gripper_calibration(self._is_left)
-        close_direction = self._arm_config.gripper.close_direction
+        close_direction = self._close_direction
         if (close_pos - open_pos) * close_direction <= 0:
             raise MotorError(
                 f"Persisted {side} gripper calibration (open {open_pos:.2f} rad, "
-                f"closed {close_pos:.2f} rad) was measured with the opposite "
-                f"close_direction to the configured {close_direction:+d} — "
-                f"empty the gripper, then disable() and enable() to recalibrate"
+                f"closed {close_pos:.2f} rad) was measured closing the opposite "
+                f"way to the configured {self._config.gripper} gripper "
+                f"({close_direction:+d}) — empty the gripper, then disable() and "
+                f"enable() to recalibrate"
             )
+        self._check_gripper_stroke(abs(close_pos - open_pos))
         lo = min(open_pos, close_pos)
         hi = max(open_pos, close_pos)
         current = await self.motors[Joint.GRIPPER].get_position()

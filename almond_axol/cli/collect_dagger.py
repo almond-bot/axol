@@ -1311,6 +1311,9 @@ def _run(
         cfg.teleop_config, AxolVRTeleopConfig
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+        cfg.teleop_config.vr_teleop_config.gripper = (
+            cfg.robot_config.axol_config.gripper
+        )
 
     robot = AxolRobot(cfg.robot_config)
     teleop = DaggerVRTeleop(cfg.teleop_config)

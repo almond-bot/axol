@@ -374,8 +374,14 @@ class VRTeleopCore:
         # both arms. ``box_mode`` is the live mode (seeded from the config,
         # switched by :meth:`set_box_mode`); ``_box_leader`` is the leading
         # side while engaged in that mode. Mutated on the IK thread like the
-        # engage state.
-        self.box_mode: bool = bool(config.box_mode)
+        # engage state. Only the parcel gripper has box mode
+        # (:attr:`box_available`).
+        if config.box_mode and not self.box_available:
+            logger.warning(
+                "Box mode needs the parcel gripper (gripper=%r); starting with it off",
+                config.gripper,
+            )
+        self.box_mode: bool = bool(config.box_mode) and self.box_available
         self._box_leader: str | None = None
         # Box mode hands the thumbsticks back to Jelly while nobody leads
         # (the pair is frozen holding the box) — but not until the operator
@@ -563,6 +569,12 @@ class VRTeleopCore:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
         self._reset_latched = True
 
+    @property
+    def box_available(self) -> bool:
+        """Whether this session has box mode: only with the parcel gripper
+        (``VRTeleopConfig.gripper``)."""
+        return self.config.gripper == "parcel"
+
     def set_box_mode(self, enabled: bool) -> None:
         """Switch box mode on/off (headset HUD / control panel / SDK). Safe
         from any thread.
@@ -572,6 +584,10 @@ class VRTeleopCore:
         a deliberate engage. Switching off while a led pair holds the angled
         grasp levels it first (``_begin_box_exit``); a return-to-rest
         (:meth:`request_reset`, the headset's X) switches box mode off itself.
+
+        Raises:
+            ValueError: Switching it on without the parcel gripper
+                (:attr:`box_available`).
         """
         self.set_live("box_mode", bool(enabled))
 
@@ -598,7 +614,6 @@ class VRTeleopCore:
             "reengage_ramp_min_s",
             "box_width_speed",
             "box_align_duration",
-            "box_tool",
             "box_flush_deg",
             "box_grasp",
             "box_face_left",
@@ -621,12 +636,17 @@ class VRTeleopCore:
         ``_LIVE_WORKER_FIELDS``. Safe from any thread; applied on the IK
         thread before the next frame (see :meth:`_apply_live_requests`).
         Unknown keys raise ``KeyError`` so callers can't silently misspell a
-        field.
+        field; switching box mode on without the parcel gripper raises
+        ``ValueError``.
         """
         if key not in ("box_mode", "reengage") and not (
             key in self._LIVE_CORE_FIELDS or key in self._LIVE_WORKER_FIELDS
         ):
             raise KeyError(f"{key!r} is not a live-adjustable teleop setting")
+        if key == "box_mode" and value and not self.box_available:
+            raise ValueError(
+                f"box mode needs the parcel gripper (gripper={self.config.gripper!r})"
+            )
         with self._live_lock:
             self._live_requests[key] = value
 

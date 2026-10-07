@@ -41,7 +41,7 @@ def _core(**overrides) -> VRTeleopCore:
     # tests exercise it, so turn it on unless a test says otherwise.
     overrides.setdefault("box_squeeze_torque", 6.0)
     return VRTeleopCore(
-        VRTeleopConfig(**overrides),
+        VRTeleopConfig(**{"gripper": "parcel", **overrides}),
         logging.getLogger("test"),
         broadcast_tracking=lambda _enabled: None,
     )
@@ -75,7 +75,7 @@ class CoreDecisionTest(unittest.TestCase):
         # is the pose-consistent limit; the cap is an opt-in backstop.
         self.assertEqual(VRTeleopConfig().box_squeeze_torque, 0.0)
         core = VRTeleopCore(
-            VRTeleopConfig(box_mode=True),
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
         )

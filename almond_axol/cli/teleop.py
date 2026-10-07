@@ -86,6 +86,8 @@ def main(argv: list[str]) -> None:
             settings_op="teleop",
             settings_args={"mantis": True},
         )
+    # The fitted gripper is a robot setting; teleop mirrors it (box mode).
+    cfg.teleop.gripper = cfg.axol.gripper
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.

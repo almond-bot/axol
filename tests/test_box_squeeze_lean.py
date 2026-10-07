@@ -303,7 +303,7 @@ class WorkerLeanTest(unittest.TestCase):
         w = object.__new__(IKWorker)
         w._config = types.SimpleNamespace(
             **{
-                "box_tool": "parcel",
+                "gripper": "parcel",
                 "box_flush_deg": 39.0,
                 "box_grasp": "flush",
                 "box_squeeze_lean": 1.0,
@@ -651,7 +651,7 @@ class MeasuredArmsTest(unittest.TestCase):
 
 def _core(**overrides) -> VRTeleopCore:
     return VRTeleopCore(
-        VRTeleopConfig(**overrides),
+        VRTeleopConfig(**{"gripper": "parcel", **overrides}),
         logging.getLogger("test"),
         broadcast_tracking=lambda _enabled: None,
     )
@@ -834,7 +834,7 @@ class WorkerTrimTest(unittest.TestCase):
         w = object.__new__(IKWorker)
         w._config = types.SimpleNamespace(
             **{
-                "box_tool": "urdf",
+                "gripper": "parallel",
                 "box_grasp": "straight",
                 "box_squeeze_lean": 0.0,
                 "box_squeeze_trim": 5.0,
