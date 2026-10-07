@@ -153,8 +153,14 @@ def run_session(
             run_policy._run(cfg, stop_event=stopped, control=control)
         except BaseException as exc:
             raised = exc
+        from almond_axol.kinematics.config import KinematicsConfig
+
         reset_constructor.assert_called_once_with(
-            rest_pose_left=cfg.rest_pose_left, rest_pose_right=cfg.rest_pose_right
+            rest_pose_left=cfg.rest_pose_left,
+            rest_pose_right=cfg.rest_pose_right,
+            kinematics_config=KinematicsConfig(
+                backend=getattr(cfg.robot_config, "cartesian_controller", "jax")
+            ),
         )
     return SimpleNamespace(
         robot=robot,

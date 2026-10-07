@@ -205,6 +205,7 @@ def test_start_guards_and_debounced_refresh(monkeypatch) -> None:
 def test_successful_update_and_provision(monkeypatch) -> None:
     async def exercise() -> None:
         updater = _updater(monkeypatch)
+        monkeypatch.setattr(update, "_installed_extras", lambda: "lerobot,sim,jax")
         updater._remote_tag = "v2.0.0"
         updater._remote_version = "2.0.0"
         commands: list[tuple[str, ...]] = []
@@ -217,7 +218,7 @@ def test_successful_update_and_provision(monkeypatch) -> None:
         exits: list[int] = []
         monkeypatch.setattr(update.os, "_exit", exits.append)
         await updater._run_update()
-        assert commands[0][-1] == "almond-axol[lerobot,sim]==2.0.0"
+        assert commands[0][-1] == "almond-axol[lerobot,sim,jax]==2.0.0"
         # The post-reinstall provision is strict: the realtime core must be
         # current before the service restarts onto the new code.
         assert commands[1] == ("/bin/axol", "provision", "--no-reboot", "--require-rt")
@@ -226,6 +227,25 @@ def test_successful_update_and_provision(monkeypatch) -> None:
         assert exits == [0]
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [
+        ({"jax"}, "lerobot,sim,jax"),
+        ({"mink"}, "lerobot,sim,mink"),
+        ({"jax", "mink"}, "lerobot,sim,jax,mink"),
+        (set(), "lerobot,sim,jax"),
+    ],
+)
+def test_update_preserves_kinematics_backends(monkeypatch, installed, expected) -> None:
+    def dist(name):
+        if name not in installed:
+            raise update.PackageNotFoundError(name)
+        return _Dist(None)
+
+    monkeypatch.setattr(update, "distribution", dist)
+    assert update._installed_extras() == expected
 
 
 @pytest.mark.parametrize(

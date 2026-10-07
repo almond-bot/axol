@@ -200,7 +200,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, TrackingProfile, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -814,6 +814,7 @@ struct Config {
     loop_hz: f64,
     watchdog_ms: f64,
     max_step_rad: f64,
+    tracking_profile: TrackingProfile,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
 }
@@ -822,6 +823,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut loop_hz = 240.0;
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
+    let mut tracking_profile = TrackingProfile::Default;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
     let mut proto: Option<u32> = None;
 
@@ -873,6 +875,14 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .get(1)
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
+            }
+            "tracking_profile" => {
+                // Optional and strict: a pre-profile core rejects this line
+                // rather than silently running different control physics.
+                tracking_profile = match f.as_slice() {
+                    ["tracking_profile", "mink"] => TrackingProfile::Mink,
+                    _ => return Err(bad(line)),
+                };
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
@@ -973,6 +983,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
         loop_hz,
         watchdog_ms,
         max_step_rad,
+        tracking_profile,
         buses,
     })
 }
@@ -1418,6 +1429,31 @@ mod tests {
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
         assert!(parse_config(&format!("{joint}proto 2\n")).is_ok());
+    }
+
+    #[test]
+    fn tracking_profile_is_explicit_and_strict() {
+        let base = "proto 2\njoint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0\n";
+        assert_eq!(
+            parse_config(base).unwrap().tracking_profile,
+            TrackingProfile::Default
+        );
+        assert_eq!(
+            parse_config(&format!("{base}tracking_profile mink\n"))
+                .unwrap()
+                .tracking_profile,
+            TrackingProfile::Mink,
+        );
+        for line in [
+            "tracking_profile",
+            "tracking_profile mink extra",
+            "tracking_profile future",
+            // Existing binaries fail the same strict unknown-directive gate
+            // on `tracking_profile`; unknown semantics must never be ignored.
+            "future_tracking_profile mink",
+        ] {
+            assert!(parse_config(&format!("{base}{line}\n")).is_err(), "{line}");
+        }
     }
 }
 
@@ -2211,15 +2247,14 @@ fn bus_loop(
             // re-seeded (below) instead of differentiated across it.
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
             prev_tick = Some(began);
-            let cmd_dt = if overrun {
-                period.as_secs_f64()
-            } else {
-                tick_dt
-            };
+            let cmd_dt = cfg
+                .tracking_profile
+                .command_dt(tick_dt, period.as_secs_f64(), overrun);
             // Age of the latest accepted target this tick, for the holdover.
             let target_age =
                 last_accepted.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
-            carrying = have_target
+            carrying = cfg.tracking_profile == TrackingProfile::Default
+                && have_target
                 && !watchdog_frozen
                 && cadence
                     .get()
@@ -2313,7 +2348,12 @@ fn bus_loop(
                     // that target is late (identity while the stream is on
                     // time — see filter::Holdover and the adoption above).
                     let p_tgt = if tracked {
-                        hold[m.slot].target(c.p_des, target_age, cadence.get())
+                        cfg.tracking_profile.target(
+                            &hold[m.slot],
+                            c.p_des,
+                            target_age,
+                            cadence.get(),
+                        )
                     } else {
                         c.p_des
                     };
@@ -2326,7 +2366,7 @@ fn bus_loop(
                     };
                     let d = &mut damp[m.slot];
                     let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) =
-                        if tracked && overrun {
+                        if tracked && cfg.tracking_profile.reset_derivatives(overrun) {
                             // The gap since the last command is not a trajectory
                             // segment the motor followed — it held. Re-prime the
                             // derivative chains at rest here so the first tick

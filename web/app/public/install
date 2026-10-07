@@ -4,7 +4,7 @@
 #   curl https://axol.almond.bot/install -fsS | bash
 #
 # Installs uv, installs the axol CLI from PyPI as a uv tool (pinned to the latest
-# GitHub release tag, all extras), provisions the camera stack, adb, the
+# GitHub release tag, hosted extras), provisions the camera stack, adb, the
 # required axol-rt control core, and the host's real-time tuning (Jetson Orin
 # NX / AGX Orin / Thor: power mode, clocks, CAN interrupt, camera daemon), and
 # registers a root systemd service that re-applies that tuning at every boot
@@ -22,7 +22,10 @@ REPO_URL="https://github.com/almond-bot/axol"
 # (GStreamer NVENC + PyGObject + the patched zed-gstreamer source plugins),
 # provisioned below by `axol provision`, not via a PyPI extra (see
 # pyproject.toml). WebRTC transport itself is aiortc, a normal core dependency.
-EXTRAS="lerobot,sim"
+# Select the installed solver without pulling JAX into a Mink deployment:
+# curl -fsS https://axol.almond.bot/install | AXOL_KINEMATICS=mink bash
+AXOL_KINEMATICS="${AXOL_KINEMATICS:-jax}"
+EXTRAS="lerobot,sim,${AXOL_KINEMATICS}"
 PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
@@ -42,13 +45,18 @@ export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR UV_TOOL_BIN_DIR
 say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
 
+case "${AXOL_KINEMATICS}" in
+    jax|mink) ;;
+    *) die "AXOL_KINEMATICS must be jax or mink." ;;
+esac
+
 [ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
 
 # The systemd service runs as root, so install everything as root. When piped
 # into a non-root shell, re-fetch ourselves and re-run elevated.
 if [ "$(id -u)" -ne 0 ]; then
     say "Root privileges are required (systemd service); re-running with sudo..."
-    exec sudo bash -c "curl -fsS ${INSTALL_URL} | bash"
+    exec sudo env AXOL_KINEMATICS="${AXOL_KINEMATICS}" bash -c "curl -fsS ${INSTALL_URL} | bash"
 fi
 
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."

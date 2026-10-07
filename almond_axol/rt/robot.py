@@ -141,6 +141,7 @@ class Axol(RobotBase):
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
+        tracking_profile: str = "default",
         record: str | None = None,
     ) -> None:
         """Construct the dual-arm interface.
@@ -179,6 +180,10 @@ class Axol(RobotBase):
                 ``VRTeleopConfig.teleop_max_vel``.
             max_accel: Teleop joint-acceleration cap (rad/s²), same
                 treatment.
+            tracking_profile: ``default`` keeps target holdover and overrun
+                smoothing. ``mink`` selects literal targets,
+                measured-time tracking and uninterrupted
+                command derivatives; all core safety checks remain active.
             record: Teleop flight-recorder prefix. When set, measured
                 position/torque is captured from the core's feedback packets
                 at its native ``loop_hz`` instead of the Python target rate.
@@ -195,6 +200,7 @@ class Axol(RobotBase):
             watchdog_ms=watchdog_ms,
             max_vel=max_vel,
             max_accel=max_accel,
+            tracking_profile=tracking_profile,
             record=record,
         )
 
@@ -207,6 +213,7 @@ class Axol(RobotBase):
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
+        tracking_profile: str = "default",
         record: str | None = None,
     ) -> Self:
         """Build the robot around an already-constructed low-level object.
@@ -222,6 +229,7 @@ class Axol(RobotBase):
             watchdog_ms=watchdog_ms,
             max_vel=max_vel,
             max_accel=max_accel,
+            tracking_profile=tracking_profile,
             record=record,
         )
         return self
@@ -234,8 +242,12 @@ class Axol(RobotBase):
         watchdog_ms: float,
         max_vel: float,
         max_accel: float,
+        tracking_profile: str,
         record: str | None,
     ) -> None:
+        if tracking_profile not in {"default", "mink"}:
+            raise ValueError(f"Unknown realtime tracking profile: {tracking_profile!r}")
+        self._tracking_profile = tracking_profile
         self._robot = hardware
         # ``_core_started``: an ``axol-rt`` process exists for this session
         # (from ``enable`` until teardown) — teardown must go through the
@@ -322,6 +334,10 @@ class Axol(RobotBase):
             # in motion_control is the real per-command limit.
             f"max_step_rad {max_step}",
         ]
+        # Omit the default so existing clients retain identical wire config.
+        # Older cores reject this optional directive before opening CAN.
+        if self._tracking_profile != "default":
+            lines.append(f"tracking_profile {self._tracking_profile}")
         trk_vel = self._TRACKER_HEADROOM * self._max_vel
         trk_acc = self._TRACKER_HEADROOM * self._max_accel
         for side, arm in self._arms():

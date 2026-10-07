@@ -1189,6 +1189,13 @@ def _run(
             raise ValueError("handover_duration_s must be finite and nonnegative")
         if not isinstance(cfg.teleop_config, AxolVRTeleopConfig):
             raise ValueError("Remote DAgger requires Axol VR teleop")
+        if (
+            isinstance(cfg.robot_config, AxolRobotConfig)
+            and cfg.robot_config.cartesian_actions
+            and cfg.teleop_config.kinematics_config.backend
+            != cfg.robot_config.cartesian_controller
+        ):
+            raise ValueError("Policy and teleop must use the same IK backend")
     else:
         if not cfg.policy_path.strip():
             raise ValueError("Local DAgger requires policy_path")
@@ -1312,7 +1319,12 @@ def _run(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-    robot = AxolRobot(cfg.robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(cfg.robot_config, **robot_options)
     teleop = DaggerVRTeleop(cfg.teleop_config)
     teleop.set_hold_to_intervene(cfg.hold_to_intervene)
     from ..recording.datasets import (
@@ -1382,17 +1394,29 @@ def _run(
         if rerun_ip:
             init_rerun(session_name="axol_dagger", ip=rerun_ip, port=rerun_port)
 
-        # Start the IK reset worker once the policy schema has been proven. Its
-        # JAX JIT overlaps with robot connect and the teleop's own IK worker
-        # JIT. It owns collision-aware homing between episodes.
+        # Start the selected reset worker once the policy schema has been
+        # proven, overlapping preparation with robot and teleop startup.
         if remote_policy:
             vr_cfg = cfg.teleop_config.vr_teleop_config
             reset_controller = IKResetController(
                 rest_pose_left=vr_cfg.rest_pose_left,
                 rest_pose_right=vr_cfg.rest_pose_right,
+                kinematics_config=cfg.teleop_config.kinematics_config,
+                vr_teleop_config=vr_cfg,
             )
         else:
-            reset_controller = IKResetController()
+            reset_controller = IKResetController(
+                kinematics_config=(
+                    cfg.teleop_config.kinematics_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+                vr_teleop_config=(
+                    cfg.teleop_config.vr_teleop_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+            )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
@@ -1636,6 +1660,9 @@ def _run(
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
+        if remote_policy and isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+            vr_cfg = cfg.teleop_config.vr_teleop_config
+            robot.set_cartesian_posture(vr_cfg.rest_pose_left, vr_cfg.rest_pose_right)
 
         # Connect the VR teleop stack: the position source lets takeovers
         # sync the IK worker to the robot's measured pose, and the current

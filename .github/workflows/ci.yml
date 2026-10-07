@@ -31,13 +31,35 @@ jobs:
       - name: Install Python 3.13 and locked dependencies
         run: |
           uv python install 3.13
-          uv sync --locked --extra sim --extra lerobot --dev
+          uv sync --locked --extra sim --extra lerobot --extra jax --extra mink --dev
       - name: Lint and format check
         run: |
           uvx --from ruff==0.9.7 ruff check .
           uvx --from ruff==0.9.7 ruff format --check .
+      - name: Generate native expectations from the pinned independent reference solver
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          PYTHONPATH: .
+        run: |
+          # The independent numerical reference is bundled with its assets
+          # and licenses, so replay requires no external source checkout.
+          reference_root="$RUNNER_TEMP/mink-reference-source"
+          native_fixture="$RUNNER_TEMP/mink-reference-native"
+          mkdir -p "$reference_root"
+          echo "a3a5095000f6be84db92efc880cbe7f723f4cc0d3710bf145cfac0c1bada2642  tests/data/mink_ik_reference/reference-source.tar.gz" | sha256sum --check
+          tar -xzf tests/data/mink_ik_reference/reference-source.tar.gz -C "$reference_root"
+          # Verify every reference source/asset hash before import, replay the
+          # frozen inputs, then compare reference and production output exactly on this CPU.
+          uv run --no-sync python tests/tools/mink_ik_reference.py \
+            --reference-root "$reference_root/mink_reference" \
+            --replay-fixture --write-fixture "$native_fixture"
+          echo "AXOL_MINK_REFERENCE_FIXTURE=$native_fixture" >> "$GITHUB_ENV"
       - name: Unit and integration tests
-        run: uv run pytest --junitxml=pytest.xml
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+        run: uv run --no-sync pytest --junitxml=pytest.xml
       - name: Build distributable packages
         run: |
           uv build
@@ -49,6 +71,53 @@ jobs:
           name: python-test-report
           path: pytest.xml
           if-no-files-found: ignore
+      - name: Upload native numerical reference
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mink-reference-native-reference
+          path: ${{ runner.temp }}/mink-reference-native
+          if-no-files-found: ignore
+
+  mink-without-jax:
+    name: Mink without JAX
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Mink, collection, and simulation dependencies
+        run: uv sync --locked --extra sim --extra lerobot --extra mink --dev
+      - name: Exercise Mink without any JAX packages installed
+        env:
+          AXOL_EXPECT_NO_JAX: "1"
+        run: >-
+          uv run --no-sync pytest --no-cov
+          tests/test_mink_no_jax.py
+          tests/test_mink_trajectory.py
+          tests/test_mink_lifecycle.py
+          tests/test_mink_robot_controller.py
+          tests/test_mink_policy_cadence.py
+
+  rust:
+    name: Rust realtime core
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: rust/axol-rt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --check
+      - name: Unit tests and independent tracking vectors
+        run: cargo test --locked
 
   web:
     name: Web
