@@ -14,6 +14,8 @@ export interface SchemaField {
   required: boolean
   /** Optional one-line help (argparse commands carry their flag help). */
   help?: string | null
+  /** Widget hint for a per-run field (CommandSpec.fieldUi), e.g. a slider. */
+  ui?: SettingsFieldUI
 }
 
 /** A nested config section (a dataclass / dict in the config tree). */
@@ -49,6 +51,8 @@ export interface CommandSpec {
   requiresCameras?: boolean
   /** Config keys the panel asks for per run; the rest come from Settings. */
   perRunFields?: string[]
+  /** Widget hints for per-run fields (CommandDef ``field_ui``), by field key. */
+  fieldUi?: Record<string, SettingsFieldUI>
   /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
   suggestedFields?: string[]
   /** Suggested fields whose value must be one of the suggestions (rendered as a select). */
@@ -1795,6 +1799,7 @@ export function perRunFields(
   }
   return [...byKey.values()]
     .filter((f) => runFieldVisible(f.key, profile))
+    .map((f) => (spec.fieldUi?.[f.key] ? { ...f, ui: spec.fieldUi[f.key] } : f))
     .sort((a, b) => Number(b.required) - Number(a.required))
 }
 

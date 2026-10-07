@@ -88,6 +88,7 @@ import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
+import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
@@ -1934,12 +1935,14 @@ export default function ControlPanel() {
           onEpisode={handleEpisode}
         />
 
-        <DatasetPreview
-          key={`datasets-${renderedConnectionGeneration}`}
-          connected={conn.state === "ok"}
-          liveDataset={policy?.dataset ?? null}
-          episodesRecorded={policy?.episodesRecorded ?? null}
-        />
+        {showsDatasetPreview(meta.id) && (
+          <DatasetPreview
+            key={`datasets-${renderedConnectionGeneration}`}
+            connected={conn.state === "ok"}
+            liveDataset={policy?.dataset ?? null}
+            episodesRecorded={policy?.episodesRecorded ?? null}
+          />
+        )}
 
         <LogConsole lines={lines} />
       </main>

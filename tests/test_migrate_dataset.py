@@ -21,7 +21,7 @@ from almond_axol.cli.migrate_dataset import (
     migrate_mantis_tcp_rotation,
 )
 from almond_axol.mantis.calibration import (
-    DESIGN_TCP_TRANSFORM_ID,
+    LEGACY_DESIGN_TCP_TRANSFORM_ID,
     LEGACY_VIVE_TCP_ROTATION_QUAT,
     VIVE_TCP_ROTATION_QUAT,
 )
@@ -233,7 +233,7 @@ class MantisMigrationTest(unittest.TestCase):
         assert marker is not None
         self.assertEqual(marker["recorded_by_axol_version"], "0.2.4")
         self.assertEqual(
-            marker[MANTIS_TCP_TRANSFORM_KEY]["id"], DESIGN_TCP_TRANSFORM_ID
+            marker[MANTIS_TCP_TRANSFORM_KEY]["id"], LEGACY_DESIGN_TCP_TRANSFORM_ID
         )
         self.assertTrue(marker[MANTIS_TCP_TRANSFORM_KEY]["migrated"])
         self.assertEqual(marker["migrations"][0]["id"], _MANTIS_TCP_MIGRATION_ID)
@@ -278,7 +278,7 @@ class MantisMigrationTest(unittest.TestCase):
             robot_type="axol_mantis",
             marker={
                 **_legacy_marker(),
-                MANTIS_TCP_TRANSFORM_KEY: {"id": DESIGN_TCP_TRANSFORM_ID},
+                MANTIS_TCP_TRANSFORM_KEY: {"id": LEGACY_DESIGN_TCP_TRANSFORM_ID},
             },
         )
         with self.assertRaisesRegex(ValueError, "nothing to fix"):

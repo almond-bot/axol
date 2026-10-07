@@ -316,8 +316,14 @@ class AxolRobot(Robot):
         ``<name>_right`` so the rest of the pipeline treats the two eyes as
         ordinary cameras.
         """
+        # Logged because the two paths deliver visibly different frames: a
+        # policy run through a different path than its dataset was recorded
+        # through sees images it was never trained on.
+        backend = getattr(self.config, "video_backend", "auto")
         if self._use_gst_cameras():
+            _logger.info("Cameras: gst pipeline (video_backend=%s).", backend)
             return self._build_gst_cameras()
+        _logger.info("Cameras: ZED SDK (video_backend=%s).", backend)
         return self._build_sdk_cameras()
 
     def _use_gst_cameras(self) -> bool:

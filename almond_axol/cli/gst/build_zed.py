@@ -102,8 +102,12 @@ _GST_FILENAME_RE = re.compile(r"^\s*Filename\s+(.+?)\s*$", re.MULTILINE)
 # at configure time). The ZED SDK's own zed-config.cmake unconditionally calls
 # ``find_package(BLAS REQUIRED)`` and links the unversioned libusb library, so
 # their *development* packages are required even when the corresponding runtime
-# libraries already happen to be installed. NVENC + the Jetson multimedia
-# headers ship with the L4T BSP.
+# libraries already happen to be installed. NVENC + the ``libnvbufsurface``
+# runtime ship with the L4T BSP, but the Jetson Multimedia API *headers* the
+# plugins include unconditionally on L4T (``nvbufsurface.h``, from the
+# hardcoded ``/usr/src/jetson_multimedia_api/include``) are a separate package
+# that a minimal flash leaves out (e.g. an AGX Thor on L4T 38.2). The package
+# name is the same on every JetPack, and ``run`` only gets here on a Jetson.
 _APT_BUILD_DEPS = (
     "build-essential",
     "cmake",
@@ -114,6 +118,7 @@ _APT_BUILD_DEPS = (
     "libgstreamer-plugins-base1.0-dev",
     "libblas-dev",
     "libusb-1.0-0-dev",
+    "nvidia-l4t-jetson-multimedia-api",
 )
 
 

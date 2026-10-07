@@ -70,7 +70,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Self
 
 import numpy as np
@@ -86,6 +86,7 @@ from ..robot.base import (
     mark_hardware_cleanup_uncertain,
 )
 from ..robot.config import AxolConfig
+from ..robot.gravity import PayloadSide
 from ..settings import SHARED
 from .link import FeedbackSlot, RtLink, config_header
 
@@ -982,6 +983,53 @@ class Axol(RobotBase):
     def reset_gravity_hold(self) -> None:
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""
         self._robot.reset_gravity_hold()
+
+    def set_payload(
+        self,
+        side: PayloadSide,
+        mass: float,
+        com: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Tell the gravity model what the gripper is holding.
+
+        The payload is added to the gravity feedforward every joint gets, so
+        an arm carrying it holds its commanded pose instead of sagging by
+        ``unmodelled torque / kp`` — and gravity-comp hand-guiding stays
+        weightless, and contact detection (:meth:`torque_residuals`) does not
+        read the load as a collision. It is modelled as a point mass rigidly
+        attached to the gripper, on top of the calibrated link masses.
+
+        Call it when a grasp closes on the object, and ``set_payload(side, 0.0)``
+        when it lets go: the feedforward changes on the next control cycle,
+        so setting a payload the gripper is not yet carrying lifts the arm
+        slightly (by the same ``torque / kp``) until it is.
+
+        Pure model state — no CAN traffic — so it can be called at any time,
+        enabled or not. It is not persisted: a permanently heavier
+        end-effector belongs in the calibration instead
+        (``axol tune.factory --mass wrist_3=<kg>``).
+
+        Args:
+            side: The arm holding it: ``"left"``, ``"right"``, or ``"both"``
+                for one object carried between the two grippers (give each
+                arm its share of the mass).
+            mass: Payload mass in kg, ``0`` to
+                :data:`~almond_axol.robot.gravity.MAX_PAYLOAD_KG`. ``0``
+                removes the payload.
+            com: Payload centre of mass in metres, in the gripper link frame —
+                the end-effector frame forward kinematics reports. Where the
+                fingers close is
+                :data:`~almond_axol.constants.GRIPPER_TIP_OFFSET`.
+
+        Raises:
+            ValueError: An out-of-range mass, a CoM that is not three finite
+                numbers within 0.5 m of the gripper, or an unknown side.
+        """
+        self._robot.set_payload(side, mass, com)
+
+    def payload(self, side: PayloadSide) -> tuple[float, np.ndarray]:
+        """The payload set on one arm: ``(mass_kg, com_m)`` in the gripper frame."""
+        return self._robot.payload(side)
 
     # -- State reads ------------------------------------------------------------
     #

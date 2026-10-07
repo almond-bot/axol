@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -150,6 +151,23 @@ class Sim(RobotBase):
         with self._condition:
             self._latest_q = q
             self._condition.notify()
+
+    def set_payload(
+        self,
+        side: str,
+        mass: float,
+        com: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Accept a payload like :meth:`Axol.set_payload` does; nothing to model.
+
+        The viewer is kinematic, so a payload changes nothing here — but it is
+        validated the same way, so a script written against the robot runs
+        (and fails) identically in sim.
+        """
+        from .gravity import payload_sides, validate_payload
+
+        payload_sides(side)
+        validate_payload(mass, com)
 
     def _build_q(self) -> np.ndarray:
         """Build the arm joint angle array (radians), left then right, no gripper."""
