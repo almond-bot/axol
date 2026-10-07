@@ -16,7 +16,7 @@ from almond_axol.tuning.joint_frame import joint_frame_motors
 async def main(arm: str, joint: Joint, start_deg: float) -> None:
     async with CanBus(f"can_alm_axol_{arm[0]}") as bus:
         raw = Motor(bus, joint)
-        await raw.enable()  # 0x77 brake release
+        await raw.enable()  # 0x77 (a no-op without a brake)
         m = (await joint_frame_motors({joint: raw}, arm == "left"))[joint]
         await m.set_control_mode(ControlMode.POSITION_VELOCITY)  # 0x76 reset
         # Re-read after the reset: refreshes the ±360° boot-wrap correction.
