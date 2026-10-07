@@ -19,6 +19,8 @@ async def main(arm: str, start_deg: float) -> None:
             Joint.SHOULDER_1
         ]
         await m.set_control_mode(ControlMode.POSITION_VELOCITY)  # 0x76 reset
+        # Re-read after the reset: refreshes the ±360° boot-wrap correction.
+        print(f"start {math.degrees(await m.get_position()):+7.2f}°")
         for target in (math.radians(start_deg), 0.0):
             await m.set_position_velocity(target, 0.25)
             for _ in range(100):  # 10 s
