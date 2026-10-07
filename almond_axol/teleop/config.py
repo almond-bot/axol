@@ -91,10 +91,10 @@ class VRTeleopConfig:
         reengage: What happens to an arm's controller↔arm mapping when its
             grip re-engages (after a freeze, a disengage, or a pause in which
             the operator walked away or the arm was moved by hand).
-            ``"clutch"`` re-snaps: the arm stays where it is and
+            ``"clutch"`` (default) re-snaps: the arm stays where it is and
             the controller's *current* pose becomes the new origin — the
             operator brings the controller to (roughly) match the arm before
-            gripping, and nothing moves at the grip. ``"ramp"`` (default) keeps
+            gripping, and nothing moves at the grip. ``"ramp"`` keeps
             the mapping from the arm's previous engage as a session anchor and
             eases the arm out to where that mapping says the controller now
             is — the arm comes to the hand, over ``reengage_ramp_min_s`` or
@@ -527,7 +527,7 @@ class VRTeleopConfig:
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
-    reengage: ReengageMode = "ramp"
+    reengage: ReengageMode = "clutch"
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
