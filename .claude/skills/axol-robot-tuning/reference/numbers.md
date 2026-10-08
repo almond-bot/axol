@@ -1,0 +1,52 @@
+# What normal looks like (jelly, 2026-10-07)
+
+Measured on Almond's jelly robot with the shipped gains and a fresh
+`tune.factory` calibration. Use them as orders of magnitude, not targets —
+compare a robot mainly with itself (interleaved) and its two arms with each
+other.
+
+## Creep ripple at 3 °/s (mdeg RMS, `rip3_rms_mdeg`) and wrist-IMU sway
+
+| Joint | right ripple | left ripple | right IMU 1–3 Hz (mm) | left IMU (mm) |
+|---|---|---|---|---|
+| shoulder_1 | 16–34 | 15–17 | ~0.95 | ~0.54 |
+| shoulder_2 | 23–50 | 18–30 | ~0.8 | ~0.5 |
+| shoulder_3 | 19–32 | 19–27 | ~0.5 | ~0.19 |
+| elbow | 20–23 | ~28 | ~1.0 | ~0.85 |
+| wrist_1 | ~35 | ~22 | 0.37–0.59 | ~0.15 |
+| wrist_2 | ~21 | ~28 | — | — |
+| wrist_3 | ~27 | — | — | — |
+
+A joint at 2× these, or one arm at 2× the other on the same joint, is worth
+a look. Shoulder ripple swings run to run (see known-issues).
+
+## Bus recording (`can_trace.py summary`)
+
+- Quiet joint in teleop or a creep: `err_band_mdeg` (1.5–15 Hz) ~5–40.
+- Verdict threshold 100 mdeg RMS; `STRONG` at ≥ 300 (visible at the hand).
+- Homing on impedance tracks within ~0.4°; holds within ~0.2°.
+
+## Calibration (`tune.factory`)
+
+- ~6 min per joint, ~1 h 40 min both arms; ~2.5 s torque-off at start.
+- Friction fit vs measured: within ~10% at 2–15 °/s; −22…−36% at 1 °/s and
+  +4…+33% at 30 °/s are normal.
+- Typical `fc` (Nm): shoulders 0.35–1.2, shoulder_3 / elbow 0.3–0.6, wrists
+  0.1–0.5. `Fo` up to ~±1 Nm on the shoulders (it absorbs the gravity model's
+  constant error, sign mirrored between the arms).
+- Gravity: 0–7 of 14 joints rejected is normal.
+
+## Shipped gains (impedance, 240 Hz)
+
+| Joint | kp | kd | host damper | Stribeck gain |
+|---|---|---|---|---|
+| shoulder_1 | 450 | 5 | 110 at 2.6 Hz, Q 1 | 0.8 |
+| shoulder_2 | 500 | 5 | 70 (pose-tracked) | 0.8 |
+| shoulder_3 | 180 | 5 | — | 0 |
+| elbow | 200 | 5 | 10 at 1.6 Hz, Q 1.5 | 0.8 |
+| wrist_1 | 180 | 1.7 | — | 0 |
+| wrist_2 / wrist_3 | 130 | 2.25 / 2.0 | — | 0 |
+
+Calibration tools hold and sweep at fixed calibration gains instead
+(s1/s2 250/3.5, s3 180/5, elbow 130/5, wrists as above). `robot_report.py`
+→ `effective_config` shows what a given robot actually runs.
