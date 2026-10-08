@@ -218,6 +218,39 @@ def _keep_gravity(args: argparse.Namespace | None) -> bool:
     return bool(getattr(args, "keep_gravity", False))
 
 
+def _warn_stock_gravity(
+    sides: list[str], overrides: dict[str, dict[str, LinkOverride]]
+) -> list[str]:
+    """Tell the operator when a gripperless robot still runs the stock
+    gripper's wrist_3 mass (and no ``--mass`` gives one): its own gravity
+    comp isn't set, and every fit would run against the wrong load."""
+    from ...robot.config import STOCK_GRAVITY_WARNING, stock_gravity_sides
+    from ...settings import shared_axol_config
+
+    try:
+        cfg = shared_axol_config()
+    except Exception:  # noqa: BLE001 - unreadable settings: nothing to judge
+        return []
+    stock = [
+        side
+        for side in stock_gravity_sides(cfg)
+        if side in sides
+        and "mass" not in overrides.get(side, {}).get(Joint.WRIST_3.value, {})
+    ]
+    if stock:
+        mass = getattr(cfg, stock[0]).wrist_3.mass
+        print("\n" + "!" * 72)
+        print(
+            "  ! " + STOCK_GRAVITY_WARNING.format(sides=" and ".join(stock), mass=mass)
+        )
+        print(
+            "  ! Set it first (panel Advanced → Axol, or calibration.json), or pass "
+            "--mass wrist_3=KG; Ctrl-C now to stop."
+        )
+        print("!" * 72 + "\n")
+    return stock
+
+
 def settings_link_overrides(sides: list[str]) -> dict[str, dict[str, LinkOverride]]:
     """The link masses / CoMs this robot's shared settings set (the panel's
     Advanced → Axol, ``~/.almond/settings.json``), per side and joint.
@@ -754,6 +787,7 @@ async def _run(args: argparse.Namespace) -> None:
         f"{[round(v, 1) for v in args.velocities]} deg/s"
     )
     print(f"  Robot id (hub serial): {serial or 'not detected'}")
+    _warn_stock_gravity(side_names, overrides)
     if args.keep_gravity:
         print(
             "  Gravity: kept — fits run against this robot's model "

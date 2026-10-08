@@ -1403,3 +1403,28 @@ class AxolConfig:
             left_stiffness=1.0,
             right_stiffness=1.0,
         )
+
+
+#: What a gripperless robot still on the stock gripper's gravity is told.
+STOCK_GRAVITY_WARNING = (
+    "{sides}: no gripper, but wrist_3 still has the stock gripper's mass "
+    "({mass:g} kg) — this robot's own gravity comp (link mass / CoM for its "
+    "end-effector) isn't in the panel settings or calibration.json, so gravity "
+    "compensation, calibration fits and the contact watchdog use the wrong load."
+)
+
+
+def stock_gravity_sides(config: AxolConfig) -> list[str]:
+    """The arms of a gripperless robot (``has_gripper`` false) whose wrist_3
+    still has the coded default mass — the stock gripper's, lumped into the
+    link. Such a robot's gravity comp for its own end-effector (or none)
+    belongs in the panel settings or ``calibration.json``; the gravity fits
+    never change a mass, so a default one means nobody set it."""
+    if config.has_gripper:
+        return []
+    stock = ArmConfig().wrist_3.mass
+    return [
+        side
+        for side in ("left", "right")
+        if math.isclose(getattr(config, side).wrist_3.mass, stock, abs_tol=1e-9)
+    ]

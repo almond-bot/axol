@@ -96,6 +96,7 @@ Check the report before anything moves:
 
 | Report field | Problem | Do |
 |---|---|---|
+| `warnings` non-empty | something the person must hear first (e.g. gravity comp not set) | tell them, in plain words, before anything moves |
 | `code.commit` | lacks `scripts/tuning_queue.py` | update the checkout (`git pull`), see known-issues "Updating" |
 | `core.stale` true | core older than `rust/` sources | `cd rust/axol-rt && cargo build --release`, then re-grant real-time |
 | `core.realtime_caps` false | `tune.motion` / teleop refuse to arm ("cannot enter SCHED_FIFO") | `sudo setcap cap_sys_nice,cap_ipc_lock=ep <core.binary>` or `axol rt.install` |
@@ -177,9 +178,18 @@ re-derive it; keep it through calibration:
   file is updated field by field, so their mass and CoM stay; without the
   flag the fit would replace their CoM with its own.
 - Neither set, and `effective_config.wrist_3.mass` is the default 0.75 kg?
-  Then the robot runs the stock gripper's gravity. Ask the person where
-  they set theirs (another machine, an SDK script, a file not yet copied
-  over) before calibrating; don't calibrate against the stock model.
+  Then the robot runs the stock gripper's gravity. **Tell the person
+  plainly, before anything moves**: their gravity comp for this
+  end-effector isn't loaded, so gravity compensation, the calibration fits
+  and the contact watchdog all assume the stock gripper — teleop included,
+  not just tuning. Ask where they set theirs (another machine, an SDK
+  script, a file not yet copied over) and get it in place first. If they
+  choose to go on anyway, note it, and repeat it in the wrap-up and the
+  note to Almond: any tuning done on the wrong gravity is suspect. On a
+  gripperless robot the tools say it too: `robot_report.py` → `warnings`,
+  and a `WARNING` / `!` banner at the start of `tune.motion` and
+  `tune.factory` (they can't tell when a gripper flag is still on with a
+  different end-effector attached — that case is yours to ask about).
 - Signs their gravity is off: `Fo` beyond ~±1 Nm on the shoulders /
   elbow, the arm sagging or drifting when it holds, `contact: … torque
   residual` trips in `tune.motion`. Report it; adjusting it is theirs or
@@ -366,7 +376,8 @@ the person whether it *feels* better.
 
 - Restart anything you stopped (`sudo systemctl start axol.service`).
 - Tell the person exactly what changed (settings keys and values, files
-  rewritten, backups made).
+  rewritten, backups made) — and anything still wrong that they chose to
+  live with (e.g. gravity comp not set for their end-effector).
 - Send Almond: `python scripts/robot_report.py --bundle ~/axol_report.tar.gz`,
   the recordings (`~/issue.log`, `~/factory.log`), the session dirs
   (`~/tuning/*`: queue, results, logs, HALTED), and a short note of the

@@ -176,6 +176,20 @@ def calibration() -> dict:
     return out
 
 
+def warnings() -> list[str]:
+    """Things the operator must be told before tuning."""
+    from almond_axol.robot.config import STOCK_GRAVITY_WARNING, stock_gravity_sides
+    from almond_axol.settings import shared_axol_config
+
+    cfg = shared_axol_config()
+    out = []
+    stock = stock_gravity_sides(cfg)
+    if stock:
+        mass = getattr(cfg, stock[0]).wrist_3.mass
+        out.append(STOCK_GRAVITY_WARNING.format(sides=" and ".join(stock), mass=mass))
+    return out
+
+
 def effective() -> dict:
     """The per-joint values the robot runs (settings over calibration over
     defaults), both arms side by side — asymmetries stand out."""
@@ -225,6 +239,7 @@ def recent_runs(n: int = 10) -> list[dict]:
 def report() -> dict:
     return {
         "generated": time.strftime("%F %T"),
+        "warnings": _section(warnings),
         "code": _section(code),
         "core": _section(core),
         "system": _section(system),

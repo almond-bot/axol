@@ -67,10 +67,12 @@ from ...robot.config import (
     FAST_IMPEDANCE_HZ,
     IMPEDANCE_LOOP_HZ,
     IMPEDANCE_RATES,
+    STOCK_GRAVITY_WARNING,
     AxolConfig,
     check_firmware_extras,
     check_loop_hz,
     fast_impedance_joints,
+    stock_gravity_sides,
 )
 from ...robot.control import ContactWatchdog
 from ...settings import shared_axol_config
@@ -375,6 +377,13 @@ def _run_config(args: argparse.Namespace) -> AxolConfig:
         )
     if args.no_gripper:
         config = replace(config, has_gripper=False)
+    stock = stock_gravity_sides(config)
+    if stock:
+        mass = getattr(config, stock[0]).wrist_3.mass
+        print(
+            "WARNING: "
+            + STOCK_GRAVITY_WARNING.format(sides=" and ".join(stock), mass=mass)
+        )
     stiff = {config.left_stiffness, config.right_stiffness}
     print(
         "Config: "
