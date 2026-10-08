@@ -63,8 +63,9 @@ before Phase 2.
    drive the arms.
 9. **Customer hardware:** never repeat a reproduction that risks damage once
    the person says it's dangerous — record instead (Phase 1), or hand off.
-10. **No live feedback from the camera IMU** and nothing that only works
-    with a camera: the fix must work on robots without one.
+10. **No live feedback from the camera IMU** (or any IMU) and nothing that
+    only works with a camera: the fix must work on robots without one. An
+    IMU is for measuring, never in the control loop.
 
 ## Phase 0 — Intake (no motion)
 
@@ -87,7 +88,9 @@ Ask the person, and write the answers down:
 - **What is on each wrist**: the stock gripper, nothing, or their own
   end-effector — then its mass (weighed, in kg), length past the wrist, and
   whether it flexes. **Wrist cameras**: yes / no (the report's
-  `settings.wrist_cameras`).
+  `settings.wrist_cameras`). No cameras: do they have, or can they get,
+  an IMU to mount on the end-effector (next section)? Ask early: it is the
+  difference between measuring the tool and guessing at it.
 
 Check the report before anything moves:
 
@@ -101,7 +104,7 @@ Check the report before anything moves:
 | `calibration["calibration.json"].matches_this_hub` false | the file belongs to another robot and is ignored | recalibrate (Phase 2) |
 | `settings.link_mass_com_overrides` non-empty | hand-tuned gravity in the panel | always run the factory with `--keep-gravity` |
 | `settings.has_gripper` false, or no gripper on the arm | gripperless robot | panel `axol.has_gripper` must be false (`tune.motion` follows it); see the section below |
-| `settings.wrist_cameras` null on an arm | no wrist IMU there | decide on the encoder sway (section below) |
+| `settings.wrist_cameras` null on an arm | no wrist IMU there | ask them to mount their own IMU (section below); else the encoder sway |
 | `effective_config.wrist_3.mass` vs the real end-effector | default 0.75 kg is the stock gripper + camera | a different end-effector needs its mass in (Phase 2, `--mass`) |
 | `settings.axol_overrides` | per-joint gains set in the panel | they win over calibration; note them, they may be the cause |
 | `effective_config` | the two arms differ on a joint | asymmetry is a lead |
@@ -109,7 +112,38 @@ Check the report before anything moves:
 
 ## Robots without cameras or with their own end-effector
 
-**No wrist camera (no IMU).** Everything still works; only the deciding
+**No wrist camera: encourage their own IMU on the end-effector.** It is the
+measurement every decision here rests on, and any IMU will do: a small
+board (an MPU-6050/BMI/ICM breakout on a microcontroller), a phone in a
+rigid clamp, a wired industrial sensor. What it needs:
+- **Rigid** on the end-effector, near the tool tip (screws or a clamp — no
+  tape, foam or a loose phone case); the cable strain-relieved so it
+  doesn't tug the arm. Same place on both arms if both are measured; don't
+  move it during a session.
+- **Raw accelerometer including gravity** (not "linear acceleration"),
+  ≥ 100 Hz, 200 Hz or more preferred; gyro optional.
+- **A CSV log** `t, ax, ay, az[, gx, gy, gz]` with `t` as Unix time
+  (`time.time()`), logged on the robot computer or one NTP-synced to it.
+  Start it before the session and stop it after; one file for all runs.
+
+```bash
+python scripts/ext_imu.py check ~/imu.csv        # 🔍 rate, span, gravity — before the session
+# ... run the queue (plan with --no-imu: there's no wrist camera to wait for) ...
+python scripts/ext_imu.py attach ~/imu.csv --session ~/tuning/s3   # 🔍
+python scripts/tuning_queue.py summary ~/tuning/s3   # decides on their IMU
+```
+
+`attach` places each run in the log by its start time and refines it by
+cross-correlating the IMU with the flange motion from the encoders (± 2 s);
+it reports a run it can't find (wrong arm, loose mount, clock off). On
+jelly's saved runs, with ZED logs standing in, it matched 40/40 runs
+through ±1.5 s clock errors to within 22 ms and reproduced the ZED's
+metrics within 7%; logs with no motion or of the other arm were refused
+(40/40). The attached IMU then counts as the IMU everywhere (`imu.*`,
+`source: external`, the 5% bar). Its absolute numbers depend on where it
+sits — compare runs with each other, not with `numbers.md`.
+
+**No IMU at all.** Everything still works; only the deciding
 metric changes. `tune.motion` saves the run without an IMU line, and
 `tuning_queue.py summary` decides on `enc.low_mm` instead: the same 1–3 Hz
 sway, measured from the joint encoders (forward kinematics of the wrist
@@ -238,7 +272,8 @@ damped settings traded sway for shake.
    must print a `wrist IMU (…)` line. If it says "camera did not open in
    time": `sudo systemctl restart zed_x_daemon` — a broken camera on a
    robot that has one is fixed, not worked around. No cameras: add
-   `--no-imu` to every `plan`; the summary decides on the encoders.
+   `--no-imu` to every `plan`, and have their own IMU logging (section
+   above) — or the summary decides on the encoders.
 2. Motions: `python scripts/creep_motions.py --all` (creeps for every joint,
    both arms, plus `slow_osc_left.npz`).
 3. Baseline both arms (compare the arms with each other — an asymmetry is a
@@ -301,8 +336,9 @@ winner: it must add no buzz.
 
 `summary` gives per-round means, the change against the baseline, rounds
 won, and a conservative verdict:
-- `decided_on` says which sway decided: `imu.low_mm`, or `enc.low_mm`
-  when the runs have no IMU.
+- `decided_on` says which sway decided: `imu.low_mm` (the wrist camera,
+  or their own attached IMU: `external_imu_runs`), or `enc.low_mm` when the
+  runs have no IMU.
 - `better` — beat the baseline in every round, ≥ 5% IMU sway (≥ 15%
   encoder sway, ≥ 10% ripple), no buzz cost: adopt (encoders only: see the
   section above).

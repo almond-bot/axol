@@ -88,6 +88,16 @@ motion (0.3–8 Hz) to fly with `tune.motion`, then fit with `tune.tf`.
 **`axol motion.build PREFIX`** turns a teleop / gravity-comp recording into
 a reference motion.
 
+**`scripts/ext_imu.py check LOG` / `attach LOG --session DIR | --run ID…`**
+— an IMU the operator mounted on the end-effector (no wrist camera). CSV
+`t, ax, ay, az[, gx, gy, gz]`, Unix time, raw acceleration with gravity
+(m/s² or g, guessed), ≥ 100 Hz. `attach` matches each run (its `t0_wall`,
+then a ± 2 s cross-correlation with the flange's acceleration from the
+encoders; `--search`), scores it like the wrist IMU and saves
+`imu_external.json` beside the run; `tuning_queue.py summary` and
+`score_run` use it as `imu` (`source: external`) when the run has no wrist
+camera IMU. Runs from before `t0_wall` existed are searched ± 10 s.
+
 **`scripts/creep_motions.py --all`** — per-joint creeps, both arms, plus
 `slow_osc_left.npz`, into `~/.almond/motions/`.
 

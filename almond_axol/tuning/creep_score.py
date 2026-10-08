@@ -10,7 +10,9 @@ variants on these numbers, so they are computed in one place:
   ``rip3_p2p_mdeg`` (median 2 s peak-to-peak) / ``vrip3_dps`` (velocity
   ripple), and the same at 6 deg/s. The first 0.6 s of every leg is dropped.
 - ``imu``: the wrist-IMU tool-shake metrics ``tune.motion`` saved, when the
-  wrist camera opened (``low_mm`` is the 1–3 Hz sway an operator feels).
+  wrist camera opened (``low_mm`` is the 1–3 Hz sway an operator feels) —
+  or, without one, those of an IMU the operator mounted on the end-effector
+  and attached to the run (:mod:`.external_imu`); ``source`` says which.
 - ``enc``: the same sway measured from the joint encoders — the wrist
   flange's vertical position by forward kinematics, scored exactly like the
   IMU (``low_mm`` 1–3 Hz, ``high_mm`` 3–15 Hz, median 2 s peak-to-peak). For
@@ -224,6 +226,15 @@ def score_run(run_id: str, runs_dir: Path = TUNING_RUNS_DIR) -> dict[str, Any]:
     if enc:
         out["enc"] = enc
     imu = (metrics.get("imu") or {}).get(side)
+    source = "wrist camera"
+    if not imu:
+        # The operator's own IMU on the end-effector (scripts/ext_imu.py).
+        from .external_imu import load_attached
+
+        ext = load_attached(run_id, runs_dir)
+        if ext and ext.get("side") == side:
+            imu, source = ext["metrics"], "external"
     if imu:
         out["imu"] = {k: round(imu[k], 3) for k in _IMU_KEYS if k in imu}
+        out["imu"]["source"] = source
     return out

@@ -19,6 +19,8 @@ other.
   `high_mm` 0.80–0.93. It reads ~25% under the IMU (it can't see flex past
   the encoders) and tracks the IMU's A/B changes at r ≈ 0.75 (12/12
   directions where the IMU moved > 5%).
+- An operator's own IMU (`scripts/ext_imu.py`) reads differently by where
+  it is mounted (further out = more sway): compare runs with each other.
 - These are with the stock gripper and wrist camera (~0.75 kg on wrist_3).
   Another end-effector changes them; compare such a robot with itself.
 - Camera / IMU floor: ~0.03 mm still camera; `hold` motion 0.09–0.13 mm.

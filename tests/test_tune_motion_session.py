@@ -318,6 +318,19 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(self.trips, [])
         self.assertEqual(_FakeAxol.frozen, 0)
 
+    def test_each_pass_records_its_wall_clock_start(self) -> None:
+        # For matching an IMU logged on the operator's end-effector.
+        from almond_axol.tuning import runs
+
+        with tempfile.TemporaryDirectory() as d:
+            self._run(["--repeat", "2"], Path(d))
+            starts = sorted(
+                runs.load_run(p.name, self.runs_dir)[0]["metrics"]["t0_wall"]
+                for p in self.runs_dir.iterdir()
+            )
+        self.assertEqual(len(starts), 2)
+        self.assertGreater(starts[1] - starts[0], 1.0)
+
     def test_learning_cuts_the_repeatable_error_and_the_correction_replays(
         self,
     ) -> None:

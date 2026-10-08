@@ -2464,6 +2464,10 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
         # The pass on the wrist IMUs' clock: its log origin is the execute()
         # start, so the IMU series shares the run's time axis.
         origin = log_abs[a] - log_t[a]
+        # The wall-clock time of the series' t = 0, so an IMU the operator
+        # logs on their own end-effector can be matched to this pass
+        # (scripts/ext_imu.py).
+        summary["t0_wall"] = time.time() - time.perf_counter() + origin
         imu_metrics, imu_series = imu.run_blocks(
             origin + float(t[0]), origin + float(t[-1]), origin
         )

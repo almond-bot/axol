@@ -20,7 +20,8 @@ The verdict decides on the wrist IMU's 1-3 Hz sway (``imu.low_mm``) when
 the runs have it, otherwise on the same sway measured by the encoders
 (``enc.low_mm``, forward kinematics of the wrist flange) — for robots
 without wrist cameras. ``plan --no-imu`` skips waiting for a camera that
-isn't there.
+isn't there. An IMU the operator mounted on the end-effector counts as the
+IMU once attached (``scripts/ext_imu.py attach LOG --session DIR``).
 
 The first variant is the baseline. A variant may also swap the whole
 calibration file for its runs only (``--variant old@calib=PATH``); the file
@@ -368,7 +369,8 @@ def verdict(
         m = mets.get(metric)
         if not m or "change_vs_baseline_pct" not in m:
             calls[var] = "no data" + (
-                " (no IMU: is the wrist camera up? without one use the default)"
+                " (no IMU: is the wrist camera up, or your own attached with "
+                "scripts/ext_imu.py? without either use the default)"
                 if family == "imu"
                 else ""
             )
@@ -407,11 +409,33 @@ def verdict(
     return calls
 
 
+def merge_external_imu(records: list[dict], runs_dir: Path | None = None) -> int:
+    """Give runs without a wrist-camera IMU the metrics of an IMU the operator
+    mounted on the end-effector (``scripts/ext_imu.py attach``). Returns how
+    many runs got one."""
+    from almond_axol.tuning.external_imu import load_attached
+    from almond_axol.tuning.runs import TUNING_RUNS_DIR
+
+    n = 0
+    for rec in records:
+        for score in rec.get("scores", []):
+            if "imu" in score or not score.get("id"):
+                continue
+            ext = load_attached(score["id"], runs_dir or TUNING_RUNS_DIR)
+            if ext and ext.get("side") == rec["item"].get("arm"):
+                score["imu"] = {**ext["metrics"], "source": "external"}
+                n += 1
+    return n
+
+
 def cmd_summary(args: argparse.Namespace) -> None:
     path = Path(args.session).expanduser() / "results.jsonl"
     records = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+    external = merge_external_imu(records)
     s = summarize(records)
     s["decided_on"] = deciding_metric(s, args.metric)
+    if external:
+        s["external_imu_runs"] = external
     s["verdict"] = verdict(s, args.metric, args.min_gain)
     print(json.dumps(s, indent=1))
 

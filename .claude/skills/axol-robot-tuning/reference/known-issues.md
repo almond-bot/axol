@@ -122,6 +122,13 @@ that has cameras, fix them (below) rather than fall back: the encoder sway
 is the fallback for robots without cameras. A robot without cameras: plan
 with `--no-imu`.
 
+**`ext_imu.py attach`: `the motion isn't in the IMU log`.** The IMU is on
+the other arm (`--side`), loose in its mount, or its clock is more than
+2 s off the robot's (`--search 10`, then fix the sync). `doesn't cover the
+run`: it wasn't logging then, or its timestamps aren't Unix time.
+`gravity must be included`: the logger outputs linear acceleration — log
+the raw accelerometer.
+
 **Fix the wrist cameras:** `sudo systemctl restart zed_x_daemon`, then check
 an IMU opens before a session (a run prints the `wrist IMU (…)` line). Only one
 process can own a ZED camera — teleop or the panel holding it blocks a run.
