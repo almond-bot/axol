@@ -242,7 +242,14 @@ _METRICS = (
     ("rip6_rms_mdeg", "ripple 6°/s mdeg RMS"),
     ("imu.low_mm", "IMU 1-3 Hz sway mm"),
     ("imu.vertical_mm", "IMU vertical mm"),
+    ("imu.high_mm", "IMU 3-15 Hz shake mm"),
+    ("imu.acc_rms", "IMU accel RMS m/s^2"),
 )
+#: A variant that raises either of these by more than this much has bought
+#: its sway with buzz — the trade every stiffer or more damped setting made
+#: on jelly — and is never called ``better``.
+_BUZZ_COST = (("imu.high_mm", "3-15 Hz"), ("imu.acc_rms", "accel"))
+_BUZZ_LIMIT_PCT = 10.0
 
 
 def _get(score: dict, key: str):
@@ -298,37 +305,61 @@ def summarize(records: list[dict]) -> dict:
 
 
 def verdict(
-    summary: dict, metric: str = "rip3_rms_mdeg", min_gain_pct: float = 10.0
+    summary: dict, metric: str = "imu.low_mm", min_gain_pct: float | None = None
 ) -> dict:
-    """A conservative call per variant: ``better`` only when the variant beat
-    the baseline in every round by ``min_gain_pct`` on average and no IMU
-    metric got worse by more than that; ``worse`` symmetrically; else
-    ``inconclusive``."""
+    """A conservative call per variant against the baseline.
+
+    ``better`` only when the variant beat the baseline in **every** round
+    and by ``min_gain_pct`` on average (default 5% for an IMU metric, 10%
+    for joint ripple), the wrist-IMU sway didn't rise, and the buzz cost
+    (3–15 Hz shake, accel) didn't rise by more than 10%. ``trade`` when it
+    won on ``metric`` but paid in buzz. ``worse`` when it lost every round
+    by the margin. Anything else is ``inconclusive``: keep the default.
+
+    The deciding metric is the wrist IMU on ``slow_osc`` (``imu.low_mm``,
+    the 1–3 Hz sway an operator feels): on jelly every per-joint creep
+    ripple win (−30…−57%) turned into at most −7% sway at the tool.
+    """
+    if min_gain_pct is None:
+        min_gain_pct = 5.0 if metric.startswith("imu.") else 10.0
     calls = {}
     for var, entry in summary["variants"].items():
         if var == summary["baseline"]:
             continue
-        m = entry["metrics"].get(metric)
+        mets = entry["metrics"]
+        m = mets.get(metric)
         if not m or "change_vs_baseline_pct" not in m:
-            calls[var] = "no data"
+            calls[var] = "no data" + (
+                " (no IMU: is the wrist camera up?)"
+                if metric.startswith("imu.")
+                else ""
+            )
             continue
         won, total = (int(x) for x in m["rounds_better"].split("/"))
         chg = m["change_vs_baseline_pct"]
-        imu = entry["metrics"].get("imu.low_mm", {}).get("change_vs_baseline_pct")
+        sway = mets.get("imu.low_mm", {}).get("change_vs_baseline_pct")
+        costs = [
+            f"{name} {mets[k]['change_vs_baseline_pct']:+.0f}%"
+            for k, name in _BUZZ_COST
+            if mets.get(k, {}).get("change_vs_baseline_pct", 0.0) > _BUZZ_LIMIT_PCT
+        ]
         if entry["guard_trips"]:
             calls[var] = "rejected: guard trips"
-        elif (
-            chg <= -min_gain_pct
-            and won == total
-            and (imu is None or imu < min_gain_pct)
-        ):
-            calls[var] = f"better ({chg:+.0f}%, {won}/{total} rounds)"
+        elif chg <= -min_gain_pct and won == total:
+            if costs:
+                calls[var] = f"trade ({chg:+.0f}% but {', '.join(costs)}) — don't adopt"
+            elif sway is not None and sway > 0 and metric != "imu.low_mm":
+                calls[var] = (
+                    f"inconclusive ({chg:+.0f}% on {metric}, but IMU sway {sway:+.0f}%)"
+                )
+            else:
+                calls[var] = f"better ({chg:+.0f}%, {won}/{total} rounds)"
         elif chg >= min_gain_pct and won == 0:
             calls[var] = f"worse ({chg:+.0f}%)"
         else:
             calls[var] = f"inconclusive ({chg:+.0f}%, {won}/{total} rounds)"
-        if imu is None:
-            calls[var] += " — no IMU data"
+        if sway is None and not metric.startswith("imu."):
+            calls[var] += " — no IMU data: confirm on slow_osc with the wrist camera"
     return calls
 
 
@@ -336,7 +367,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     path = Path(args.session).expanduser() / "results.jsonl"
     records = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
     s = summarize(records)
-    s["verdict"] = verdict(s, args.metric)
+    s["verdict"] = verdict(s, args.metric, args.min_gain)
     print(json.dumps(s, indent=1))
 
 
@@ -366,7 +397,18 @@ def main() -> None:
     rn.set_defaults(func=cmd_run)
     sm = sub.add_parser("summary", help="per-variant results and a verdict (JSON)")
     sm.add_argument("session")
-    sm.add_argument("--metric", default="rip3_rms_mdeg")
+    sm.add_argument(
+        "--metric",
+        default="imu.low_mm",
+        help="deciding metric (default imu.low_mm, the 1-3 Hz wrist sway on slow_osc; "
+        "rip3_rms_mdeg for creep screening)",
+    )
+    sm.add_argument(
+        "--min-gain",
+        type=float,
+        default=None,
+        help="percent (default 5 IMU / 10 ripple)",
+    )
     sm.set_defaults(func=cmd_summary)
     args = p.parse_args()
     args.func(args)

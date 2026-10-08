@@ -14,9 +14,16 @@ shell on the robot you may run the **read-only** commands yourself (marked
 confirms they are at the e-stop.
 
 Work in the robot's checkout (`~/axol` on Almond's robots) with its venv
-active (`source ~/.venv/bin/activate` or `uv run …`). Reference material:
-`reference/known-issues.md` (symptom → cause → fix, everything learned the
-hard way) and `reference/numbers.md` (what normal looks like).
+(`~/axol/.venv/bin/axol` or `uv run axol` — an older system-wide `axol` may
+lack the flags). Reference material, read as needed:
+
+- `reference/history.md` — **read before proposing any change**: two weeks
+  of tuning, what won, what shipped and why, and what was rejected (with
+  numbers). Most obvious ideas were already tried.
+- `reference/tools.md` — every tuning tool, its flags, what it persists,
+  and which ones to avoid.
+- `reference/known-issues.md` — symptom → cause → fix.
+- `reference/numbers.md` — what normal looks like.
 
 ## Ground rules — never break these
 
@@ -38,7 +45,8 @@ hard way) and `reference/numbers.md` (what normal looks like).
 5. **One change at a time, always A/B.** Slow-motion ripple drifts ±30%
    between sessions and even between back-to-back runs. A change is only
    judged against a baseline interleaved in the same session, ≥ 3 rounds
-   (`scripts/tuning_queue.py`). Never claim "better" from one run.
+   (≥ 4 on `slow_osc`; `scripts/tuning_queue.py`). Never claim "better"
+   from one run.
 6. **Reversible first.** Prefer panel settings (per arm, per joint, undo by
    deleting the key) over editing files. Back up `~/.almond/calibration.json`
    and `settings.json` before anything writes them.
@@ -47,6 +55,10 @@ hard way) and `reference/numbers.md` (what normal looks like).
    only if `rust/` changed.
 8. **Only the tools here.** Don't improvise motor commands or scripts that
    drive the arms.
+9. **Customer hardware:** never repeat a reproduction that risks damage once
+   the person says it's dangerous — record instead (Phase 1), or hand off.
+10. **No live feedback from the camera IMU** and nothing that only works
+    with a camera: the fix must work on robots without one.
 
 ## Phase 0 — Intake (no motion)
 
@@ -140,6 +152,9 @@ Output to expect and how to read it:
   load error. The gravity model plus `Fo` stays within ~0.3 Nm.
 - Stop and investigate on: `! return to rest did not complete`, a joint
   that moves differently from its neighbours, any guard/limit message.
+- The calibration tools have **no tracking guard** and sweep to the joint
+  limits: clear space, e-stop in hand, Ctrl-C **once** (a second one aborts
+  the return home and leaves the arm holding).
 
 Afterwards 🔍 `can_trace.py summary ~/factory.log` should be quiet apart
 from transients. Results are in `~/.almond/calibration.json` (and uploaded
@@ -147,67 +162,89 @@ when `AXOL_SUPABASE_KEY` is set).
 
 ## Phase 3 — Baseline measurements
 
-Creep motions move one joint at 6 and 3 °/s from a fixed pose: the joint's
-own slow-speed ripple, without the rest of the arm moving.
+**The deciding test is `slow_osc` with the wrist IMU** — `low_mm`, the 1–3 Hz
+sway an operator feels, with `high_mm` (3–15 Hz) and accel as the buzz cost.
+Joint-ripple creeps are for screening only: on jelly every per-joint creep win
+(−30…−57%) turned into at most −7% sway at the tool, and stiffer or more
+damped settings traded sway for shake.
+
+1. Make sure the wrist camera works: a `tune.motion` run must print a
+   `wrist IMU (…)` line. If it says "camera did not open in time": `sudo
+   systemctl restart zed_x_daemon`. Without the IMU you can screen, not decide.
+2. Motions: `python scripts/creep_motions.py --all` (creeps for every joint,
+   both arms, plus `slow_osc_left.npz`).
+3. Baseline both arms (compare the arms with each other — an asymmetry is a
+   lead):
 
 ```bash
-python scripts/creep_motions.py --all     # writes ~/.almond/motions/*_creep*.npz
+python scripts/tuning_queue.py plan ~/tuning/base --arm right --motion slow_osc \
+    --rounds 2 --repeat 3 --variant base
 python scripts/tuning_queue.py plan ~/tuning/base --arm left \
-    --motion ~/.almond/motions/s1_creep_left.npz --rounds 2 --variant base
-# … one plan per joint of interest, both arms if comparing arms …
+    --motion ~/.almond/motions/slow_osc_left.npz --rounds 2 --repeat 3 --variant base
 python scripts/tuning_queue.py run ~/tuning/base
-python scripts/tuning_queue.py summary ~/tuning/base     # 🔍
+python scripts/tuning_queue.py summary ~/tuning/base
 ```
 
-The tool-level check is the `slow_osc` reference motion (wrist-IMU sway,
-needs the wrist camera): `--motion slow_osc` (right) or
-`~/.almond/motions/slow_osc_left.npz`. Compare with `reference/numbers.md`,
-and compare the arms with each other.
+Add the creep of the joint the recording pointed at
+(`~/.almond/motions/<s1|s2|s3|el|w1|w2|w3>_creep[_left].npz`). Compare with
+`reference/numbers.md`. A joint whose recording showed `control ringing`:
+`axol tune.pid --l --joint J --mode step --pose-by-hand` finds the pose
+where it rings worst (other joints hold on impedance).
 
 ## Phase 4 — One change, A/B, decide
 
-Try levers in this order, one joint at a time, on the arm with the problem:
+The shipped gains are already the result of the jelly sweep
+(`reference/history.md`). Change something only for a reason this robot
+gives you: a recording that shows ringing on a joint, an arm worse than its
+twin, a different end-effector, or what the person feels.
 
-1. **Stribeck gain** (`stribeck_gain`: 0, 0.4, 0.8) — cancels the low-speed
-   friction excess. Default 0.8 on shoulder_1/shoulder_2/elbow, 0 on
-   shoulder_3 and the wrists. It acts on measured velocity, so it can add
-   sway on some joints. On jelly it cut right shoulder_3 creep ripple ~23%
-   and right wrist_1 ~13%, did nothing on the left arm.
-2. **Shoulder host damper** (`kd_host`, `kd_host_hz`, `kd_host_q`) — for
-   ringing at ~2–3 Hz on shoulder_1/shoulder_2. Defaults: s1 110 at 2.6 Hz
-   (Q 1), s2 70.
-3. **Stiffness** (`kp`) down — s1 450 → 350, s2 500 → 400, elbow 200 → 160 —
-   if a joint still rings. Less stiffness, more sag.
-4. **Re-fit one joint's friction:**
-   `axol tune.friction --l --joint shoulder_3 --profile slow --save`.
+Levers, in the order to try, with what they did on jelly:
 
-A/B with temporary overrides (nothing is written):
+| Lever (`--gain` field) | Use when | Known effect / cost |
+|---|---|---|
+| `stribeck_gain` 0 / 0.4 / 0.8 | slow sticky / ripply motion on a joint | shipped 0.8 on s1/s2/elbow. s3: right −23% ripple and −34% sway, left nothing (open). w1: right −13% ripple only. Above 0.8 or at the old kp 250 it got worse |
+| `kd_host`, `kd_host_hz`, `kd_host_q` (shoulders) | ringing at ~2–3 Hz on s1 / s2 | s1 110 at 2.6 Hz Q 1 shipped; 140 or centring at 2.2 Hz adds 3–15 Hz shake. Never on s3 (pumps the mast mode) |
+| `kp` down (s1 450 → 350, s2 500 → 400, elbow 200 → 160) | a joint still rings, or shudders | trades sway for sag; stiffer than shipped never paid off at the tool |
+| re-fit friction: `axol tune.friction --l --joint J --profile slow --raw-csv F` | one joint's fit looks off, or after a gearbox swap | `--save` writes calibration.json (back it up) |
+| `kd` | only to undo a change | wrist_2 kd 5 buzzed at 110 Hz; kd caps at 5 |
+
+**Don't re-propose** (rejected with numbers in `history.md`): camera-IMU or
+encoder/gyro damping, a disturbance observer, cogging maps, a command notch,
+dither, stiction, higher `fc`, 480 Hz, learned or inverted corrections as a
+fix, friction-law changes, 0xA4 / firmware gains, backlash compensation.
+
+A/B with temporary overrides (nothing is written), deciding on `slow_osc`:
 
 ```bash
-python scripts/tuning_queue.py plan ~/tuning/s3 --arm left \
-  --motion ~/.almond/motions/s3_creep_left.npz --rounds 3 \
+python scripts/tuning_queue.py plan ~/tuning/s3 --arm right --motion slow_osc \
+  --rounds 4 --repeat 3 \
   --variant base \
-  --variant g0.4="--gain left.shoulder_3.stribeck_gain=0.4" \
-  --variant g0.8="--gain left.shoulder_3.stribeck_gain=0.8"
+  --variant g0.4="--gain right.shoulder_3.stribeck_gain=0.4"
 python scripts/tuning_queue.py run ~/tuning/s3
-python scripts/tuning_queue.py summary ~/tuning/s3
+python scripts/tuning_queue.py summary ~/tuning/s3          # decides on imu.low_mm
 ```
 
-`summary` returns per-round means, the change against the baseline, rounds
-won, and a conservative `verdict`. Adopt a change only when it is `better`
-(beats the baseline in every round by ≥ 10% and the wrist-IMU sway doesn't
-rise) — and, if possible, `slow_osc` agrees. `inconclusive` means keep the
-default. `rejected: guard trips` means never adopt it.
+Screen many candidates cheaply on the joint's creep first (`summary
+--metric rip3_rms_mdeg`), then confirm only the survivors on `slow_osc`.
+Also run one fast motion (`shoulder_1_no_load` or `wirst_swing`) with the
+winner: it must add no buzz.
 
-The runner halts on its own (`HALTED` in the session dir says why) on a
-guard trip in a baseline, two trips in a row, an arm left holding, or a
-crash. Read the reason, fix it, delete `HALTED`, run again. `touch
-<session>/STOP` stops it between runs.
+`summary` gives per-round means, the change against the baseline, rounds
+won, and a conservative verdict:
+- `better` — beat the baseline in every round, ≥ 5% sway (≥ 10% on ripple),
+  no buzz cost: adopt.
+- `trade` — less sway but 3–15 Hz / accel up > 10%: don't adopt.
+- `inconclusive` — keep the default. `rejected: guard trips` — never adopt.
 
-**Persisting a winner:** set it in the panel (Settings → Advanced → Axol →
-`left.shoulder_3.stribeck_gain`) — reversible, per arm, and teleop, the SDK
-and every tool pick it up. Then re-record (Phase 1) during normal use to
-confirm the original symptom is gone.
+On the shipped gains a real improvement is only ~5–10%, inside the ±10–15%
+run noise: ≥ 4 interleaved rounds. The runner halts on its own (`HALTED` in
+the session dir says why): a trip on a baseline, two trips in a row, an arm
+left holding, a crash. `touch <session>/STOP` stops it between runs.
+
+**Persisting a winner:** the panel (Settings → Advanced → Axol →
+`left.shoulder_3.stribeck_gain`) — reversible, per arm, picked up by teleop,
+the SDK and every tool. Then record during normal use again (Phase 1) and ask
+the person whether it *feels* better.
 
 ## Phase 5 — Wrap up
 

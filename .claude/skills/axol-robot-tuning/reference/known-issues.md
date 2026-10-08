@@ -38,6 +38,40 @@ A joint's reading is impossible for its zero. Either a glitch read during a
 motor reboot (seen once, right after a violent 0xA4 move), or a lost zero.
 Power-cycle; if it persists, `axol motor.set-zero-pos --guided` (Almond-guided).
 
+**Homing "goes wild", or a shoulder drives itself into its end stop**
+(stall error 0x0002). A motor's firmware planner acceleration was written to
+0 (0/10 dps/s on the X8) — an old tool did this. Only matters on the 0xA4
+loop, which nothing uses by default now. Hand off to Almond: they read the
+motor's stored values and restore stock (5000). Don't run the firmware tools
+yourself (ground rule 1).
+
+**The arm moved by itself right after a CAN reconnect / `can.setup`.**
+The USB CAN hub replays up to 10 stale frames per channel after an interface
+flap, and a MyActuator acts on a 0xA4 frame without being enabled. `can.setup`
+USB-resets the hub now; after any "TX queue stalled", unplug and replug it.
+
+**A run behaves like the previous run's gains.**
+Joints still holding after a cut run keep their old settings. Power-cycle the
+arm after an aborted run.
+
+**`contact: … torque residual N Nm exceeded 8.0`** — `tune.motion`'s contact
+watchdog: something touched the arm or the gravity model is far off. Check
+the space, then the calibration.
+
+**A calibration run hit something / the arm went where it shouldn't.**
+The calibration tools have no tracking guard (only `tune.motion` does). Full
+range passes go to the joint limits (jelly's left shoulder_1 swept −87…177°).
+Clear the space, stay at the e-stop. Ctrl-C **once**: a second Ctrl-C aborts
+the return home and leaves the arm energized and holding.
+
+**Buzz at ~110 Hz on wrist_2:** never raise its kd (5 buzzed; 2.25 ships).
+`kd` is encoded on 0–5; larger values are silently clamped.
+
+**A ~9–13 Hz shudder in the shoulders / mast.** The stand has a mode there.
+shoulder_3's host damper is 0 because damping pumped it; a host-damper Q
+below 1 once excited it on shoulder_1. If a robot shudders with the shipped
+Q 1 damper, A/B `kd_host_q` / `kd_host` on that robot.
+
 **Slow motion feels sticky / ripply on shoulder_3 or the wrists.**
 By design the runtime cancels little low-speed friction there: Stribeck gain
 0 (it added wrist sway when tested in 2026-10), and the Coulomb term is smoothed
@@ -77,6 +111,19 @@ The wrist cameras didn't come up (seen on both after a reboot). Runs still
 score joint ripple, but there is no tool-sway metric — don't decide IMU
 questions without it. Check the camera stack before relying on IMU.
 
+**Fix the wrist cameras:** `sudo systemctl restart zed_x_daemon`, then check
+an IMU opens before a session (a run prints the `wrist IMU (…)` line). Only one
+process can own a ZED camera — teleop or the panel holding it blocks a run.
+
+**Teleop over SSH refuses to start (SCHED_FIFO):** `sudo prlimit --pid $$
+--rtprio=20:20` in that shell first.
+
+**A flag "doesn't exist":** the system-wide `axol` (an older install) runs
+instead of the checkout's. Use `~/axol/.venv/bin/axol` or `uv run axol`.
+`axol serve` / the panel also run the installed version until it's updated.
+
+**`tune.motion` keeps no log:** pipe it: `… 2>&1 | tee ~/run.log`.
+
 **`Automatic CAN discovery failed: … requires root` from `axol serve`.**
 CAN discovery needs root; run via the installed service, or `axol can.setup`.
 
@@ -96,6 +143,13 @@ never run a bare `uv sync` (AGENTS.md has the safe command).
 Creep ripple drifts ±30% between sessions, and a joint can switch between
 a rough and a smooth state from one run to the next (right shoulder_3: ~32 vs
 ~20 mdeg). Only interleaved rounds in one session count; ≥ 3 rounds.
+
+**The scorecard RMS looks huge (1–1.5°).** That is mostly tracking lag
+(55–65 ms), not wobble. Judge wobble on the wrist IMU and on `lagfree`.
+
+**The person says it feels "notchy" but the numbers improved.** Their hand is
+a sensor too: stick-slip they feel is real. Trust a recording plus their
+report together, and ask what exactly they feel and where.
 
 **A video shows "oscillation" but the numbers say quiet / command jitter.**
 Handheld 30 fps video can't resolve a few millimetres, and the arm follows its

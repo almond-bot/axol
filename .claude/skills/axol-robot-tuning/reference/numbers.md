@@ -5,6 +5,24 @@ Measured on Almond's jelly robot with the shipped gains and a fresh
 compare a robot mainly with itself (interleaved) and its two arms with each
 other.
 
+## slow_osc (right arm, wrist IMU) — the acceptance test
+
+| | untuned | shipped |
+|---|---|---|
+| vertical (mm, 2 s p2p, 1–15 Hz) | 4.3–4.5 | ~2.5 (2.2–3.0 day to day) |
+| 1–3 Hz sway `low_mm` | ~4.0 | 1.8–2.1 |
+| 3–15 Hz `high_mm` | — | 1.5–1.7 |
+| accel RMS (m/s²), peak | — | 0.5–0.7, ~5.3 Hz |
+
+- Camera / IMU floor: ~0.03 mm still camera; `hold` motion 0.09–0.13 mm.
+- Noise: ±10–15% run to run, 10–20% across a day. A real change on the
+  shipped gains is ~5–10%: interleave ≥ 4 rounds.
+- Buzz cost: accel up > ~10% or its peak moving to 8–12 Hz = added buzz.
+- Tracking: lag 55–65 ms; `lagfree` RMS s1 0.09–0.16°, s2 ~0.33°, elbow
+  0.28–0.39°; closed-loop modes s1 ~2.4 Hz, elbow ~3.2 Hz, ζ ≈ 0.5–0.6.
+- Fast replays (`wirst_swing`, `shoulder_1_no_load`): 4–15 mm, mostly
+  1–3 Hz — only check that a change adds no buzz there.
+
 ## Creep ripple at 3 °/s (mdeg RMS, `rip3_rms_mdeg`) and wrist-IMU sway
 
 | Joint | right ripple | left ripple | right IMU 1–3 Hz (mm) | left IMU (mm) |

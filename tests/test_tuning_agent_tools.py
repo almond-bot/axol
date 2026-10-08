@@ -253,13 +253,38 @@ class QueueTest(unittest.TestCase):
             ]
         s = tuning_queue.summarize(recs)
         self.assertEqual(s["baseline"], "base")
-        v = tuning_queue.verdict(s)
+        v = tuning_queue.verdict(s, "rip3_rms_mdeg")
         self.assertTrue(v["good"].startswith("better"), v["good"])
         self.assertTrue(v["mixed"].startswith("inconclusive"), v["mixed"])
         self.assertTrue(v["trippy"].startswith("rejected"), v["trippy"])
         self.assertEqual(
             s["variants"]["good"]["metrics"]["rip3_rms_mdeg"]["rounds_better"], "3/3"
         )
+
+    def test_sway_bought_with_buzz_is_a_trade(self) -> None:
+        def rec(var, rnd, low, acc, base=False):
+            score = {"imu": {"low_mm": low, "acc_rms": acc, "high_mm": 1.5}}
+            return {
+                "item": {
+                    "label": f"slow_osc {var} r{rnd}",
+                    "variant": var,
+                    "round": rnd,
+                    "baseline": base,
+                },
+                "trips": [],
+                "scores": [score],
+            }
+
+        recs = []
+        for r in (1, 2, 3, 4):
+            recs += [
+                rec("base", r, 2.0, 0.60, True),
+                rec("stiff", r, 1.8, 0.75),
+                rec("clean", r, 1.85, 0.61),
+            ]
+        v = tuning_queue.verdict(tuning_queue.summarize(recs))  # default: imu.low_mm
+        self.assertTrue(v["stiff"].startswith("trade"), v["stiff"])
+        self.assertTrue(v["clean"].startswith("better"), v["clean"])
 
     def test_halt_rules(self) -> None:
         base = {"label": "b", "baseline": True}
@@ -292,7 +317,12 @@ class SkillDiscoveryTest(unittest.TestCase):
         head = text.split("---")[1]
         self.assertIn("name: axol-robot-tuning", head)
         self.assertIn("description:", head)
-        for ref in ("reference/known-issues.md", "reference/numbers.md"):
+        for ref in (
+            "reference/known-issues.md",
+            "reference/numbers.md",
+            "reference/history.md",
+            "reference/tools.md",
+        ):
             self.assertIn(ref, text)
             self.assertTrue((codex / ref).is_file(), ref)
 
