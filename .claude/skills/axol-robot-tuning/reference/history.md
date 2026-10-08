@@ -1,7 +1,7 @@
 # What was tried, what won, what shipped (jelly, 2026-09-22 → 10-08)
 
-Two weeks of tuning Almond's jelly robot (right arm mostly), plus a customer
-robot. Read this before proposing a change: most obvious ideas were already
+Two weeks of tuning Almond's jelly robot (right arm mostly), plus a robot
+in the field. Read this before proposing a change: most obvious ideas were already
 tried, with numbers. Gains below are the shipped defaults unless marked.
 
 ## The problem and what causes it
@@ -34,7 +34,7 @@ tried, with numbers. Gains below are the shipped defaults unless marked.
      ms); `planner_accel` 0 written by mistake made homing "go wild".
    - Damiao wrists on position-velocity: +14–39% tip shake, a 4 Hz ring.
    - Loop rate 240/400/480 made no measurable difference.
-   - On a customer robot the stock 0xA4 loop later oscillated a shoulder
+   - On another robot the stock 0xA4 loop later oscillated a shoulder
      (see known-issues). Firmware gains are now left stock and 0xA4 is
      opt-in everywhere.
 2. **Friction calibrated in the runtime's own law** (`tune.friction
@@ -133,13 +133,12 @@ shake. Screen on creep; decide on slow_osc with the wrist IMU.
 - Old vs new calibration on creeps: elbow new better (−10%), s3 new worse
   (+28%, fixed by Stribeck), others equal.
 
-## Customer robot (tetra, Oct 6–8)
+## A robot in the field (Oct 6–8)
 
-- Left shoulder_1 oscillated during `tune.factory`: the old tools homed on
+- A left shoulder_1 oscillated during `tune.factory`: the old tools homed on
   0xA4 one joint at a time; reproduced only with the rest of the arm stiff
   on firmware loops (~2 Hz, growing). Fixed by impedance-only calibration.
-- Their hand-tuned gravity (panel link masses/CoMs) is kept with
+- Gravity tuned by hand in the panel settings is kept with
   `tune.factory --keep-gravity`.
-- After that: "right arm good, left still oscillates" in teleop — unresolved;
-  a phone video showed ~1–2 mm at 1–1.5 Hz. Next step was a bus recording
-  (command jitter vs control ringing).
+- Lesson for later reports of "one arm oscillates in teleop": a phone video
+  can't tell input jitter from control ringing — record the bus (Phase 1).

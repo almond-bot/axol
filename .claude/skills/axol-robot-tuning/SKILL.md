@@ -32,7 +32,7 @@ lack the flags). Reference material, read as needed:
    --a4-holders`, a config `wire_mode: "a4"` / `controller: "position"`,
    `scripts/creep_test.py`, `scripts/fw_gains.py`, SDK
    `set_position_velocity`. A MyActuator 0xA4 loop with the rest of the arm
-   held stiff oscillated violently on a customer's left shoulder_1. Never
+   held stiff oscillated violently on a robot's left shoulder_1. Never
    write motor firmware gains.
 2. **The arms have no brakes.** A joint without torque hangs on gearbox
    friction and swings if pushed. Start every tool with both arms hanging

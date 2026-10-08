@@ -23,23 +23,24 @@ from almond_axol.serve.settings import SettingsStore
 from almond_axol.tuning import sweep_safety
 from almond_axol.tuning.friction_model import FrictionFit
 
-# A customer robot's settings.json (version 1): gripperless, hand-tuned link
-# masses and CoMs, plus unrelated knobs (an elbow kp) that are not gravity.
-CUSTOMER_SETTINGS = {
+# A hand-tuned settings.json (version 1): gripperless, link masses and CoMs
+# set in the panel, plus unrelated knobs (an elbow kp) that are not gravity.
+# Illustrative values.
+HAND_TUNED_SETTINGS = {
     "advanced": {
         "axol.experiments.stiction_gain": "0.8",
-        "axol.left.elbow.com": [-0.0256064, 0.04, -0.072044],
-        "axol.left.elbow.kp": "180",
-        "axol.left.shoulder_1.mass": "1.3",
-        "axol.left.shoulder_3.mass": "3.5",
-        "axol.left.wrist_3.com": [-0.0285, 0.01, -0.106],
-        "axol.left.wrist_3.mass": "0.969",
-        "axol.right.elbow.com": [0.0256064, 0.04, -0.072044],
-        "axol.right.elbow.kp": "180",
-        "axol.right.shoulder_1.mass": "1.3",
-        "axol.right.shoulder_3.mass": "3.5",
-        "axol.right.wrist_3.com": [0.0285, 0.01, -0.106],
-        "axol.right.wrist_3.mass": "0.969",
+        "axol.left.elbow.com": [-0.0256064, 0.03, -0.07],
+        "axol.left.elbow.kp": "170",
+        "axol.left.shoulder_1.mass": "1.4",
+        "axol.left.shoulder_3.mass": "3.6",
+        "axol.left.wrist_3.com": [-0.0285, 0.015, -0.11],
+        "axol.left.wrist_3.mass": "0.92",
+        "axol.right.elbow.com": [0.0256064, 0.03, -0.07],
+        "axol.right.elbow.kp": "170",
+        "axol.right.shoulder_1.mass": "1.4",
+        "axol.right.shoulder_3.mass": "3.6",
+        "axol.right.wrist_3.com": [0.0285, 0.015, -0.11],
+        "axol.right.wrist_3.mass": "0.92",
     },
     "cameras": None,
     "values": {"robot.has_gripper": False},
@@ -68,7 +69,7 @@ class KeepGravityTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = Path(tmp.name) / "settings.json"
-        path.write_text(json.dumps(CUSTOMER_SETTINGS))
+        path.write_text(json.dumps(HAND_TUNED_SETTINGS))
         store = SettingsStore(path, strict=True)
         patch = mock.patch("almond_axol.settings.load_store", return_value=store)
         patch.start()
@@ -80,16 +81,16 @@ class KeepGravityTest(unittest.TestCase):
         got = factory.settings_link_overrides(["left", "right"])
         want = {
             "left": {
-                "shoulder_1": {"mass": 1.3},
-                "shoulder_3": {"mass": 3.5},
-                "elbow": {"com": (-0.0256064, 0.04, -0.072044)},
-                "wrist_3": {"mass": 0.969, "com": (-0.0285, 0.01, -0.106)},
+                "shoulder_1": {"mass": 1.4},
+                "shoulder_3": {"mass": 3.6},
+                "elbow": {"com": (-0.0256064, 0.03, -0.07)},
+                "wrist_3": {"mass": 0.92, "com": (-0.0285, 0.015, -0.11)},
             },
             "right": {
-                "shoulder_1": {"mass": 1.3},
-                "shoulder_3": {"mass": 3.5},
-                "elbow": {"com": (0.0256064, 0.04, -0.072044)},
-                "wrist_3": {"mass": 0.969, "com": (0.0285, 0.01, -0.106)},
+                "shoulder_1": {"mass": 1.4},
+                "shoulder_3": {"mass": 3.6},
+                "elbow": {"com": (0.0256064, 0.03, -0.07)},
+                "wrist_3": {"mass": 0.92, "com": (0.0285, 0.015, -0.11)},
             },
         }
         self.assertEqual(set(got), set(want))

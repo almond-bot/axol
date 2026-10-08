@@ -1,14 +1,14 @@
 # Known issues: symptom → cause → fix
 
 Everything here happened on a real robot while tuning (jelly at Almond, and
-a customer's gripperless robot). Check this list before improvising.
+a gripperless robot in the field). Check this list before improvising.
 
 ## Motion and control
 
 **A shoulder swings / oscillates violently during calibration or homing,
 one arm only.**
 Cause: the MyActuator 0xA4 firmware position loop at stock gains, with the
-rest of the arm held stiff on firmware loops. Reproduced on a customer's left
+rest of the arm held stiff on firmware loops. Reproduced on a robot's left
 shoulder_1: the same 0xA4 move with the other joints limp was clean; with them
 held, ~2 Hz growing oscillation. Not the encoder (read clean at ~1.2 kHz over
 the full range). Fix: the calibration tools are impedance-only since commit
@@ -85,7 +85,7 @@ scale); the fit can only move one link's CoM with its mass fixed, and light
 links (elbow / wrist_1, 0.25 kg) can't absorb a distributed load error. The
 model plus `Fo` stays within ~0.3 Nm. Jelly rejected 7 of 14 joints.
 
-**A customer tuned gravity by hand (link `mass` / `com` in the panel).**
+**Gravity was tuned by hand (link `mass` / `com` in the panel).**
 Panel settings override the calibration file. Run `tune.factory
 --keep-gravity`: fits run against their gravity, and only friction, Stribeck and
 `Fo` are saved. Without it, `Fo` would be fitted against a model the robot
