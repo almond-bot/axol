@@ -238,6 +238,10 @@ class SessionTest(unittest.TestCase):
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(cli, "Axol", _FakeAxol))
+            # This machine's panel settings must not leak into the run.
+            stack.enter_context(
+                mock.patch.object(cli, "shared_axol_config", AxolConfig)
+            )
             if imu:
                 stack.enter_context(mock.patch.object(cli, "WristImu", _FakeImu))
             stack.enter_context(

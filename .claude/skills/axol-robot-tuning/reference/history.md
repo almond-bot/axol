@@ -94,6 +94,17 @@ Shipped defaults (both arms):
 tool, and stiffer or more damped settings trade 1–3 Hz sway for 3–15 Hz
 shake. Screen on creep; decide on slow_osc with the wrist IMU.
 
+**Without a camera (Oct 8):** the same sway from the encoders (wrist flange
+by forward kinematics, `enc.low_mm`), re-scored on all 740 saved slow_osc
+runs: per variant it followed the IMU's change at r = 0.75 and in direction
+on 12/12 variants where the IMU moved > 5%. It over-credited dither (−10…−14%
+vs IMU 0…−4%), shoulder_2 alone (−14% vs −2%) and one deployed config
+(−12% vs +1%, with 3–15 Hz +13%). At a 15% bar none of those pass; the
+five that do were all IMU winners (−11…−15%), but the IMU's smaller wins
+(−5…−10%) don't show. So without a camera only big improvements are
+detectable, and an encoder `better` is a candidate, not proof.
+All of this was with the stock gripper and camera on the wrist.
+
 ## Rejected — don't re-propose without new evidence
 
 - **Feedback from the wrist camera IMU** (Python and in the realtime core):

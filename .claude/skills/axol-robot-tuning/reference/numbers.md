@@ -14,6 +14,13 @@ other.
 | 3–15 Hz `high_mm` | — | 1.5–1.7 |
 | accel RMS (m/s²), peak | — | 0.5–0.7, ~5.3 Hz |
 
+- The same runs by the encoders (`enc`, no camera needed): `low_mm`
+  1.35–1.52 shipped, ~1.8 on the Sep 29 – Oct 2 configs, 2.4–3.1 untuned;
+  `high_mm` 0.80–0.93. It reads ~25% under the IMU (it can't see flex past
+  the encoders) and tracks the IMU's A/B changes at r ≈ 0.75 (12/12
+  directions where the IMU moved > 5%).
+- These are with the stock gripper and wrist camera (~0.75 kg on wrist_3).
+  Another end-effector changes them; compare such a robot with itself.
 - Camera / IMU floor: ~0.03 mm still camera; `hold` motion 0.09–0.13 mm.
 - Noise: ±10–15% run to run, 10–20% across a day. A real change on the
   shipped gains is ~5–10%: interleave ≥ 4 rounds.

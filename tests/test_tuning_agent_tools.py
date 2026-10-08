@@ -194,6 +194,32 @@ class ScoreTest(unittest.TestCase):
         self.assertAlmostEqual(s["rip3_rms_mdeg"], 30 / math.sqrt(2), delta=3.0)
         self.assertLess(s["band_mdeg"]["elbow"], 1.0)
 
+    def test_encoder_sway_scores_the_flange_like_the_imu(self) -> None:
+        from almond_axol.tuning.creep_score import flange_heights, flange_sway
+
+        pose = creep_motions.start_pose()
+        t = np.arange(0, 20, 1 / 240)
+        q = np.tile(pose, (len(t), 1))
+        still = flange_sway(t, q, "right")
+        self.assertLess(still["low_mm"], 1e-6)
+        # A 2 Hz wobble on right shoulder_2: 1-3 Hz sway, nothing at 3-15 Hz.
+        amp = math.radians(0.1)
+        wob = q.copy()
+        wob[:, 8] += amp * np.sin(2 * np.pi * 2.0 * t)
+        s = flange_sway(t, wob, "right")
+        z0 = flange_heights(np.array([pose[7:]]), "right")[0]
+        lever = pose[7:].copy()
+        lever[1] += 1e-4
+        dz = abs(flange_heights(np.array([lever]), "right")[0] - z0) / 1e-4
+        self.assertAlmostEqual(
+            s["low_mm"], 1e3 * 2 * amp * dz, delta=0.05 * s["low_mm"]
+        )
+        self.assertLess(s["high_mm"], 0.05 * s["low_mm"])
+        # The left arm's columns don't move the right flange.
+        other = q.copy()
+        other[:, 1] += amp * np.sin(2 * np.pi * 2.0 * t)
+        self.assertLess(flange_sway(t, other, "right")["low_mm"], 1e-6)
+
 
 # ---------------------------------------------------------- the A/B queue
 
@@ -285,6 +311,47 @@ class QueueTest(unittest.TestCase):
         v = tuning_queue.verdict(tuning_queue.summarize(recs))  # default: imu.low_mm
         self.assertTrue(v["stiff"].startswith("trade"), v["stiff"])
         self.assertTrue(v["clean"].startswith("better"), v["clean"])
+
+    def test_without_a_camera_the_encoders_decide_with_a_wider_margin(self) -> None:
+        def rec(var, rnd, low, high=0.9, base=False):
+            score = {"enc": {"low_mm": low, "high_mm": high}}
+            return {
+                "item": {
+                    "label": f"slow_osc {var} r{rnd}",
+                    "variant": var,
+                    "round": rnd,
+                    "baseline": base,
+                },
+                "trips": [],
+                "scores": [score],
+            }
+
+        recs = []
+        for r in (1, 2, 3, 4):
+            recs += [
+                rec("base", r, 1.40, base=True),
+                rec("big", r, 1.15),  # -18%
+                rec("small", r, 1.25),  # -11%: enough for the IMU, not here
+                rec("buzzy", r, 1.10, high=1.05),
+            ]
+        s = tuning_queue.summarize(recs)
+        self.assertEqual(tuning_queue.deciding_metric(s), "enc.low_mm")
+        v = tuning_queue.verdict(s)
+        self.assertTrue(v["big"].startswith("better"), v["big"])
+        self.assertIn("encoders only", v["big"])
+        self.assertTrue(v["small"].startswith("inconclusive"), v["small"])
+        self.assertTrue(v["buzzy"].startswith("trade"), v["buzzy"])
+        # With IMU data in the runs, the IMU decides.
+        recs[0]["scores"][0]["imu"] = {"low_mm": 2.0}
+        self.assertEqual(
+            tuning_queue.deciding_metric(tuning_queue.summarize(recs)), "imu.low_mm"
+        )
+
+    def test_plan_without_cameras(self) -> None:
+        items = tuning_queue.plan_items(
+            "left", "m", [tuning_queue.parse_variant("base")], 1, no_imu=True
+        )
+        self.assertIn("--no-imu", items[0]["args"])
 
     def test_halt_rules(self) -> None:
         base = {"label": "b", "baseline": True}

@@ -126,6 +126,7 @@ def identity() -> dict:
 
 def settings() -> dict:
     from almond_axol.settings import load_store
+    from almond_axol.tuning.wrist_imu import imu_serial
 
     values = load_store().snapshot()["values"]
     axol = {k: v for k, v in values.items() if k.startswith("axol.")}
@@ -136,6 +137,9 @@ def settings() -> dict:
         "axol_overrides": axol,
         "link_mass_com_overrides": settings_link_overrides(["left", "right"]),
         "has_gripper": values.get("robot.has_gripper", values.get("axol.has_gripper")),
+        # A wrist camera assigned per arm: its IMU gives tune.motion the
+        # tool-sway metric; without one the encoders' stands in.
+        "wrist_cameras": {side: imu_serial(side) for side in ("left", "right")},
         "note": "panel settings override the calibration file for every field they set",
     }
 

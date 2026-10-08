@@ -8,7 +8,10 @@ thing to a repeatable teleop session.
 The motion (see ``axol motion.list`` / ``motion.build``) streams to both
 arms at its stored rate with absolute-deadline pacing, exactly like teleop
 drives the robot: impedance gains, gravity/friction/inertia feedforward, and
-host-side damping all come from the same ``AxolConfig`` production uses.
+host-side damping all come from the same ``AxolConfig`` production uses —
+the panel settings over the calibration, as teleop and the SDK load them
+(stiffness, per-joint gains, link mass / CoM for a custom end-effector,
+``has_gripper``). ``--defaults`` runs the bare calibrated defaults instead.
 Override individual gains per run with ``--gain`` and compare runs on the
 identical motion — the deterministic A/B loop that ad-hoc teleop testing
 can't give you.
@@ -70,6 +73,7 @@ from ...robot.config import (
     fast_impedance_joints,
 )
 from ...robot.control import ContactWatchdog
+from ...settings import shared_axol_config
 from ...tuning import save_run, tracking_metrics
 from ...tuning.imu_damping import EncoderTipDamper, GyroFlexDamper, TorqueProbe
 from ...tuning.learning import LEARN_BAND, CommandLearner
@@ -354,6 +358,33 @@ def _apply_gain_overrides(
             setattr(target, fld, value)
 
 
+def _run_config(args: argparse.Namespace) -> AxolConfig:
+    """The config this run starts from, before ``--gain`` overrides.
+
+    What teleop runs: the panel settings over the calibration (a
+    gripperless robot's ``has_gripper``, a custom end-effector's link mass,
+    per-joint gains, stiffness). ``--defaults`` drops the panel settings;
+    ``--stiffness`` / ``--no-gripper`` override them.
+    """
+    if args.stiffness is not None and not 0.0 <= args.stiffness <= 1.0:
+        raise SystemExit("--stiffness must be in [0, 1]")
+    config = AxolConfig() if args.defaults else shared_axol_config()
+    if args.stiffness is not None:
+        config = replace(
+            config, left_stiffness=args.stiffness, right_stiffness=args.stiffness
+        )
+    if args.no_gripper:
+        config = replace(config, has_gripper=False)
+    stiff = {config.left_stiffness, config.right_stiffness}
+    print(
+        "Config: "
+        + ("calibrated defaults (--defaults)" if args.defaults else "panel settings")
+        + f", gripper {'yes' if config.has_gripper else 'no'}"
+        + ("" if stiff == {1.0} else f", stiffness {sorted(stiff, key=str)}")
+    )
+    return config
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register the ``tune.motion`` subcommand."""
     p = subparsers.add_parser(
@@ -380,10 +411,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--stiffness",
         type=float,
-        default=1.0,
+        default=None,
         help="Stiffness-slider position in [0, 1] applied to both arms "
-        "(default: 1.0, the production default — the tuned gains, where "
+        "(default: the panel's, 1.0 unless changed — the tuned gains, where "
         "gain overrides land exactly; lower only adds compliance)",
+    )
+    p.add_argument(
+        "--defaults",
+        action="store_true",
+        help="Run the bare calibrated defaults, ignoring the panel settings "
+        "(per-joint gains, link mass / CoM, stiffness, has_gripper)",
     )
     p.add_argument(
         "--noise",
@@ -835,7 +872,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--no-gripper",
         action="store_true",
         help="Run on the gripperless SKU (the gripper motor is never "
-        "enabled or calibrated)",
+        "enabled or calibrated); the panel's has_gripper already says so "
+        "on a robot set up without grippers",
     )
     p.add_argument(
         "--log-level",
@@ -1675,13 +1713,7 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
             "scored against the clean reference"
         )
 
-    if not 0.0 <= args.stiffness <= 1.0:
-        raise SystemExit("--stiffness must be in [0, 1]")
-    config = AxolConfig(
-        left_stiffness=args.stiffness,
-        right_stiffness=args.stiffness,
-        has_gripper=not args.no_gripper,
-    )
+    config = _run_config(args)
     # The gains before this run's overrides: what a guard trip falls back to.
     base_config = deepcopy(config.resolved())
     _apply_gain_overrides(config, overrides)
@@ -2462,6 +2494,9 @@ async def _run(args: argparse.Namespace) -> list[GuardTrip]:
                     "motion": motion.name,
                     "rate": motion.rate,
                     "stiffness": args.stiffness,
+                    # The panel settings (as teleop runs) or the bare
+                    # calibrated defaults (--defaults).
+                    "config": "defaults" if args.defaults else "panel",
                     "columns": _COLUMNS,
                     # Joints driven on the firmware position loop (--a4) for
                     # this run, so the dashboard can re-arm the same split.

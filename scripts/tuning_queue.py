@@ -16,6 +16,12 @@ halt rules, and summarises it per variant.
     # 3. read the result
     uv run python scripts/tuning_queue.py summary ~/tuning/s3
 
+The verdict decides on the wrist IMU's 1-3 Hz sway (``imu.low_mm``) when
+the runs have it, otherwise on the same sway measured by the encoders
+(``enc.low_mm``, forward kinematics of the wrist flange) — for robots
+without wrist cameras. ``plan --no-imu`` skips waiting for a camera that
+isn't there.
+
 The first variant is the baseline. A variant may also swap the whole
 calibration file for its runs only (``--variant old@calib=PATH``); the file
 in place is restored afterwards.
@@ -65,6 +71,7 @@ def plan_items(
     rounds: int,
     repeat: int = 2,
     prefix: str = "",
+    no_imu: bool = False,
 ) -> list[dict]:
     """Interleave ``rounds`` rounds of every variant (baseline first)."""
     if arm not in ("left", "right"):
@@ -88,6 +95,7 @@ def plan_items(
                 "arm": arm,
                 "args": ["--motion", motion, "--repeat", str(repeat)]
                 + _GUARD
+                + (["--no-imu"] if no_imu else [])
                 + v["args"],
                 "baseline": i == 0,
             }
@@ -107,6 +115,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
         args.rounds,
         args.repeat,
         args.prefix,
+        args.no_imu,
     )
     with (session / "queue.jsonl").open("a") as f:
         f.write("".join(json.dumps(i) + "\n" for i in items))
@@ -244,12 +253,22 @@ _METRICS = (
     ("imu.vertical_mm", "IMU vertical mm"),
     ("imu.high_mm", "IMU 3-15 Hz shake mm"),
     ("imu.acc_rms", "IMU accel RMS m/s^2"),
+    ("enc.low_mm", "encoder 1-3 Hz sway mm"),
+    ("enc.high_mm", "encoder 3-15 Hz shake mm"),
 )
-#: A variant that raises either of these by more than this much has bought
-#: its sway with buzz — the trade every stiffer or more damped setting made
-#: on jelly — and is never called ``better``.
+#: A variant that raises one of these by more than this much has bought its
+#: sway with buzz — the trade every stiffer or more damped setting made on
+#: jelly — and is never called ``better``. The IMU's when the runs have it,
+#: else the encoders' (which track the IMU's 3-15 Hz change at r = 0.8).
 _BUZZ_COST = (("imu.high_mm", "3-15 Hz"), ("imu.acc_rms", "accel"))
+_ENC_BUZZ_COST = (("enc.high_mm", "3-15 Hz (encoders)"),)
 _BUZZ_LIMIT_PCT = 10.0
+#: The smallest average gain called ``better``, per metric family. The
+#: encoders can't see flex past the joints and credited some changes the
+#: IMU didn't (dither, shoulder_2 alone: −14% vs −4…−2%); at 15% none of
+#: jelly's 31 slow_osc variants the IMU didn't confirm would pass.
+_MIN_GAIN_PCT = {"imu": 5.0, "enc": 15.0}
+_MIN_GAIN_RIPPLE_PCT = 10.0
 
 
 def _get(score: dict, key: str):
@@ -304,24 +323,43 @@ def summarize(records: list[dict]) -> dict:
     return out
 
 
+def _has(summary: dict, key: str) -> bool:
+    return any(key in e["metrics"] for e in summary["variants"].values())
+
+
+def deciding_metric(summary: dict, metric: str = "auto") -> str:
+    """``auto``: the wrist IMU's sway when the runs have it, else the
+    encoders' (a robot without wrist cameras)."""
+    if metric != "auto":
+        return metric
+    return "imu.low_mm" if _has(summary, "imu.low_mm") else "enc.low_mm"
+
+
 def verdict(
-    summary: dict, metric: str = "imu.low_mm", min_gain_pct: float | None = None
+    summary: dict, metric: str = "auto", min_gain_pct: float | None = None
 ) -> dict:
     """A conservative call per variant against the baseline.
 
     ``better`` only when the variant beat the baseline in **every** round
-    and by ``min_gain_pct`` on average (default 5% for an IMU metric, 10%
-    for joint ripple), the wrist-IMU sway didn't rise, and the buzz cost
-    (3–15 Hz shake, accel) didn't rise by more than 10%. ``trade`` when it
-    won on ``metric`` but paid in buzz. ``worse`` when it lost every round
+    and by ``min_gain_pct`` on average (default 5% for the IMU, 15% for the
+    encoder sway, 10% for joint ripple), the sway didn't rise, and the buzz
+    cost (3–15 Hz shake, accel) didn't rise by more than 10%. ``trade`` when
+    it won on ``metric`` but paid in buzz. ``worse`` when it lost every round
     by the margin. Anything else is ``inconclusive``: keep the default.
 
-    The deciding metric is the wrist IMU on ``slow_osc`` (``imu.low_mm``,
-    the 1–3 Hz sway an operator feels): on jelly every per-joint creep
-    ripple win (−30…−57%) turned into at most −7% sway at the tool.
+    The deciding metric is the 1–3 Hz sway an operator feels on
+    ``slow_osc``: the wrist IMU's (``imu.low_mm``), or without a wrist
+    camera the encoders' (``enc.low_mm``) — ``auto`` picks. On jelly every
+    per-joint creep ripple win (−30…−57%) turned into at most −7% sway at
+    the tool.
     """
+    metric = deciding_metric(summary, metric)
+    family = metric.split(".", 1)[0]
     if min_gain_pct is None:
-        min_gain_pct = 5.0 if metric.startswith("imu.") else 10.0
+        min_gain_pct = _MIN_GAIN_PCT.get(family, _MIN_GAIN_RIPPLE_PCT)
+    has_imu = _has(summary, "imu.low_mm")
+    sway_key = "imu.low_mm" if has_imu else "enc.low_mm"
+    cost_keys = _BUZZ_COST if has_imu else _ENC_BUZZ_COST
     calls = {}
     for var, entry in summary["variants"].items():
         if var == summary["baseline"]:
@@ -330,17 +368,17 @@ def verdict(
         m = mets.get(metric)
         if not m or "change_vs_baseline_pct" not in m:
             calls[var] = "no data" + (
-                " (no IMU: is the wrist camera up?)"
-                if metric.startswith("imu.")
+                " (no IMU: is the wrist camera up? without one use the default)"
+                if family == "imu"
                 else ""
             )
             continue
         won, total = (int(x) for x in m["rounds_better"].split("/"))
         chg = m["change_vs_baseline_pct"]
-        sway = mets.get("imu.low_mm", {}).get("change_vs_baseline_pct")
+        sway = mets.get(sway_key, {}).get("change_vs_baseline_pct")
         costs = [
             f"{name} {mets[k]['change_vs_baseline_pct']:+.0f}%"
-            for k, name in _BUZZ_COST
+            for k, name in cost_keys
             if mets.get(k, {}).get("change_vs_baseline_pct", 0.0) > _BUZZ_LIMIT_PCT
         ]
         if entry["guard_trips"]:
@@ -348,18 +386,24 @@ def verdict(
         elif chg <= -min_gain_pct and won == total:
             if costs:
                 calls[var] = f"trade ({chg:+.0f}% but {', '.join(costs)}) — don't adopt"
-            elif sway is not None and sway > 0 and metric != "imu.low_mm":
+            elif sway is not None and sway > 0 and metric != sway_key:
                 calls[var] = (
-                    f"inconclusive ({chg:+.0f}% on {metric}, but IMU sway {sway:+.0f}%)"
+                    f"inconclusive ({chg:+.0f}% on {metric}, but "
+                    f"{'IMU' if has_imu else 'encoder'} sway {sway:+.0f}%)"
                 )
             else:
                 calls[var] = f"better ({chg:+.0f}%, {won}/{total} rounds)"
+                if family == "enc":
+                    calls[var] += (
+                        " — encoders only (no wrist IMU): confirm with the "
+                        "person's feel and a bus recording"
+                    )
         elif chg >= min_gain_pct and won == 0:
             calls[var] = f"worse ({chg:+.0f}%)"
         else:
             calls[var] = f"inconclusive ({chg:+.0f}%, {won}/{total} rounds)"
-        if sway is None and not metric.startswith("imu."):
-            calls[var] += " — no IMU data: confirm on slow_osc with the wrist camera"
+        if sway is None and family not in ("imu", "enc"):
+            calls[var] += " — no sway data: confirm on slow_osc"
     return calls
 
 
@@ -367,6 +411,7 @@ def cmd_summary(args: argparse.Namespace) -> None:
     path = Path(args.session).expanduser() / "results.jsonl"
     records = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
     s = summarize(records)
+    s["decided_on"] = deciding_metric(s, args.metric)
     s["verdict"] = verdict(s, args.metric, args.min_gain)
     print(json.dumps(s, indent=1))
 
@@ -391,6 +436,12 @@ def main() -> None:
     pl.add_argument(
         "--prefix", default="", help="label prefix (default: the motion name)"
     )
+    pl.add_argument(
+        "--no-imu",
+        action="store_true",
+        help="no wrist cameras on this robot: don't wait for one (the verdict "
+        "then decides on the encoder sway)",
+    )
     pl.set_defaults(func=cmd_plan)
     rn = sub.add_parser("run", help="run the queue under the halt rules")
     rn.add_argument("session")
@@ -399,15 +450,16 @@ def main() -> None:
     sm.add_argument("session")
     sm.add_argument(
         "--metric",
-        default="imu.low_mm",
-        help="deciding metric (default imu.low_mm, the 1-3 Hz wrist sway on slow_osc; "
+        default="auto",
+        help="deciding metric (default auto: imu.low_mm, the wrist IMU's 1-3 Hz "
+        "sway on slow_osc, or enc.low_mm, the encoders', without a wrist camera; "
         "rip3_rms_mdeg for creep screening)",
     )
     sm.add_argument(
         "--min-gain",
         type=float,
         default=None,
-        help="percent (default 5 IMU / 10 ripple)",
+        help="percent (default 5 IMU / 15 encoder sway / 10 ripple)",
     )
     sm.set_defaults(func=cmd_summary)
     args = p.parse_args()

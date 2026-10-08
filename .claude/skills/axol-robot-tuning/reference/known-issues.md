@@ -1,7 +1,7 @@
 # Known issues: symptom → cause → fix
 
 Everything here happened on a real robot while tuning (jelly at Almond, and
-a gripperless robot in the field). Check this list before improvising.
+robots in the field). Check this list before improvising.
 
 ## Motion and control
 
@@ -56,7 +56,17 @@ arm after an aborted run.
 
 **`contact: … torque residual N Nm exceeded 8.0`** — `tune.motion`'s contact
 watchdog: something touched the arm or the gravity model is far off. Check
-the space, then the calibration.
+the space, then the calibration — and on a robot with its own end-effector,
+the wrist_3 mass (Phase 2 `--mass`).
+
+**`tune.motion` fails bringing up / calibrating a gripper on a gripperless
+robot.** Set the panel's `axol.has_gripper` to false (`tune.motion` follows
+it); on an older checkout pass `--no-gripper`.
+
+**`tune.motion` behaves differently from teleop.** Older checkouts ran the
+bare calibrated defaults and ignored the panel settings (hand-tuned gains,
+link mass, stiffness). Update the checkout; the first output line says
+`Config: panel settings …`.
 
 **A calibration run hit something / the arm went where it shouldn't.**
 The calibration tools have no tracking guard (only `tune.motion` does). Full
@@ -107,9 +117,10 @@ cap_sys_nice,cap_ipc_lock=ep rust/axol-rt/target/release/axol-rt` (or `axol
 rt.install`). `tune.factory` doesn't need it; `tune.motion` and teleop do.
 
 **`wrist IMU: … camera did not open in time — no IMU metrics`.**
-The wrist cameras didn't come up (seen on both after a reboot). Runs still
-score joint ripple, but there is no tool-sway metric — don't decide IMU
-questions without it. Check the camera stack before relying on IMU.
+The wrist cameras didn't come up (seen on both after a reboot). On a robot
+that has cameras, fix them (below) rather than fall back: the encoder sway
+is the fallback for robots without cameras. A robot without cameras: plan
+with `--no-imu`.
 
 **Fix the wrist cameras:** `sudo systemctl restart zed_x_daemon`, then check
 an IMU opens before a session (a run prints the `wrist IMU (…)` line). Only one

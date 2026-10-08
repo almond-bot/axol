@@ -25,6 +25,12 @@ lack the flags). Reference material, read as needed:
 - `reference/known-issues.md` — symptom → cause → fix.
 - `reference/numbers.md` — what normal looks like.
 
+**Not every robot is jelly.** Everything was tuned on a robot with the
+stock gripper and a wrist camera (IMU) on each arm. Some robots have no
+wrist cameras, no gripper, or their own end-effector. Find out in Phase 0
+and read "Robots without cameras or with their own end-effector" below
+before Phase 2.
+
 ## Ground rules — never break these
 
 1. **No firmware position loops.** Never use 0xA4 / position-velocity:
@@ -78,7 +84,10 @@ Ask the person, and write the answers down:
 - **Since when**, and what changed (update, calibration, end-effector,
   a collision, a motor swap).
 - **How it is driven**: VR headset, tracking gloves, SDK script, panel.
-- The end-effector (gripper or not, anything heavier than stock).
+- **What is on each wrist**: the stock gripper, nothing, or their own
+  end-effector — then its mass (weighed, in kg), length past the wrist, and
+  whether it flexes. **Wrist cameras**: yes / no (the report's
+  `settings.wrist_cameras`).
 
 Check the report before anything moves:
 
@@ -91,9 +100,64 @@ Check the report before anything moves:
 | `system.processes_on_the_robot` | `axol serve`, teleop or a tuner running | stop it before any tuning tool (`sudo systemctl stop axol.service`, or stop it in the panel); restart after |
 | `calibration["calibration.json"].matches_this_hub` false | the file belongs to another robot and is ignored | recalibrate (Phase 2) |
 | `settings.link_mass_com_overrides` non-empty | hand-tuned gravity in the panel | always run the factory with `--keep-gravity` |
+| `settings.has_gripper` false, or no gripper on the arm | gripperless robot | panel `axol.has_gripper` must be false (`tune.motion` follows it); see the section below |
+| `settings.wrist_cameras` null on an arm | no wrist IMU there | decide on the encoder sway (section below) |
+| `effective_config.wrist_3.mass` vs the real end-effector | default 0.75 kg is the stock gripper + camera | a different end-effector needs its mass in (Phase 2, `--mass`) |
 | `settings.axol_overrides` | per-joint gains set in the panel | they win over calibration; note them, they may be the cause |
 | `effective_config` | the two arms differ on a joint | asymmetry is a lead |
 | `recent_runs` guard trips | earlier runs aborted | read those runs' labels |
+
+## Robots without cameras or with their own end-effector
+
+**No wrist camera (no IMU).** Everything still works; only the deciding
+metric changes. `tune.motion` saves the run without an IMU line, and
+`tuning_queue.py summary` decides on `enc.low_mm` instead: the same 1–3 Hz
+sway, measured from the joint encoders (forward kinematics of the wrist
+flange, scored like the IMU). On jelly it called the IMU's direction on
+all 12 of 31 past A/B variants where the IMU moved > 5%, but it can't see
+flex past the motor encoders (gearbox, links, the end-effector) and
+sometimes credited a change the IMU didn't, so it needs ≥ 15% in every
+round to say `better`, and says "encoders only" — so only big improvements
+are detectable without a camera; a 5–10% one reads `inconclusive`. Plan with `--no-imu`
+(don't wait for a camera). Treat an encoder-only `better` as a candidate:
+adopt it only with a bus recording in normal use (Phase 1) that is no
+worse, and the person saying it feels better. Prefer the levers already
+proven on jelly; don't explore new ones without an IMU.
+
+**No gripper.** The panel's `axol.has_gripper` must be false; `tune.motion`
+follows it (an older checkout needs `--no-gripper`, or it tries to
+calibrate a gripper that isn't there). The calibration tools never touch
+the gripper. The model's wrist_3 mass (0.75 kg) includes the stock gripper:
+with nothing on the wrist the arm is lighter than the model (next point).
+
+**Own end-effector, or none.** Gravity is the first thing to get right:
+- The factory's gravity fit keeps each link's mass fixed and only moves its
+  CoM (capped at 60 mm), so a different end-effector needs its mass given
+  up front: `axol tune.factory --mass wrist_3=M [--com wrist_3=x,y,z]`
+  (per arm: `left.wrist_3=M`). M is the wrist_3 link plus whatever is bolted
+  to it; weigh the end-effector, and ask Almond for the bare wrist_3 figure
+  rather than guessing. The CoM is in the wrist_3 link frame; a seed that's
+  roughly right (along the tool axis) lets the fit finish it.
+- If they already tuned mass / CoM by hand in the panel, `--keep-gravity`
+  keeps them instead.
+- Signs the mass is wrong: `Fo` beyond ~±1 Nm on the shoulders / elbow,
+  most CoM fits rejected, the arm sagging or drifting when it holds,
+  `contact: … torque residual` trips in `tune.motion`.
+
+Then expect the tuning to differ from jelly's:
+- The shipped gains were tuned with ~0.75 kg at the wrist. A heavier or
+  longer end-effector lowers the arm's modes (more 1–3 Hz sway, wrist and
+  elbow rings); a lighter one raises them. Before any A/B, run `hold` and
+  `wirst_swing` and read each joint's `buzz@Hz`: a new buzz or ring on a
+  wrist is the first thing to fix (wrist `kp` / `kd` down; wrist_2 `kd`
+  never above 2.25).
+- `reference/numbers.md` is jelly with the stock gripper: compare the robot
+  with itself (interleaved) and its two arms with each other, not with
+  those numbers.
+- The motions were recorded with the stock gripper, and the planner that
+  moves the arm to a motion's start and back knows only the stock
+  geometry. With a long end-effector, watch the first run of each motion
+  from the e-stop for clearance to the body, the other arm and the table.
 
 ## Phase 1 — Record the problem (the decisive step)
 
@@ -132,6 +196,7 @@ its hub, a motor/gearbox/end-effector changed, or friction looks wrong.
 axol tune.factory                    # both arms, ~1.5 h
 axol tune.factory --keep-gravity     # if the panel settings hold link mass/CoM
 axol tune.factory --arms left        # one arm (~45 min)
+axol tune.factory --mass wrist_3=M   # own end-effector / none (see above)
 ```
 
 Preconditions: Phase 0 clean, nothing else on the buses, arms hanging at
@@ -163,14 +228,17 @@ when `AXOL_SUPABASE_KEY` is set).
 ## Phase 3 — Baseline measurements
 
 **The deciding test is `slow_osc` with the wrist IMU** — `low_mm`, the 1–3 Hz
-sway an operator feels, with `high_mm` (3–15 Hz) and accel as the buzz cost.
+sway an operator feels, with `high_mm` (3–15 Hz) and accel as the buzz cost
+(no wrist camera: the encoders' `enc.low_mm` / `enc.high_mm`, section above).
 Joint-ripple creeps are for screening only: on jelly every per-joint creep win
 (−30…−57%) turned into at most −7% sway at the tool, and stiffer or more
 damped settings traded sway for shake.
 
-1. Make sure the wrist camera works: a `tune.motion` run must print a
-   `wrist IMU (…)` line. If it says "camera did not open in time": `sudo
-   systemctl restart zed_x_daemon`. Without the IMU you can screen, not decide.
+1. If the robot has wrist cameras, make sure they work: a `tune.motion` run
+   must print a `wrist IMU (…)` line. If it says "camera did not open in
+   time": `sudo systemctl restart zed_x_daemon` — a broken camera on a
+   robot that has one is fixed, not worked around. No cameras: add
+   `--no-imu` to every `plan`; the summary decides on the encoders.
 2. Motions: `python scripts/creep_motions.py --all` (creeps for every joint,
    both arms, plus `slow_osc_left.npz`).
 3. Baseline both arms (compare the arms with each other — an asymmetry is a
@@ -196,7 +264,9 @@ where it rings worst (other joints hold on impedance).
 The shipped gains are already the result of the jelly sweep
 (`reference/history.md`). Change something only for a reason this robot
 gives you: a recording that shows ringing on a joint, an arm worse than its
-twin, a different end-effector, or what the person feels.
+twin, a different end-effector, or what the person feels. `tune.motion`
+runs the panel settings (as teleop does), so a baseline is what the person
+drives; `--defaults` would run the bare calibrated defaults.
 
 Levers, in the order to try, with what they did on jelly:
 
@@ -221,7 +291,7 @@ python scripts/tuning_queue.py plan ~/tuning/s3 --arm right --motion slow_osc \
   --variant base \
   --variant g0.4="--gain right.shoulder_3.stribeck_gain=0.4"
 python scripts/tuning_queue.py run ~/tuning/s3
-python scripts/tuning_queue.py summary ~/tuning/s3          # decides on imu.low_mm
+python scripts/tuning_queue.py summary ~/tuning/s3   # decides on imu.low_mm (enc.low_mm without IMU)
 ```
 
 Screen many candidates cheaply on the joint's creep first (`summary
@@ -231,9 +301,13 @@ winner: it must add no buzz.
 
 `summary` gives per-round means, the change against the baseline, rounds
 won, and a conservative verdict:
-- `better` — beat the baseline in every round, ≥ 5% sway (≥ 10% on ripple),
-  no buzz cost: adopt.
-- `trade` — less sway but 3–15 Hz / accel up > 10%: don't adopt.
+- `decided_on` says which sway decided: `imu.low_mm`, or `enc.low_mm`
+  when the runs have no IMU.
+- `better` — beat the baseline in every round, ≥ 5% IMU sway (≥ 15%
+  encoder sway, ≥ 10% ripple), no buzz cost: adopt (encoders only: see the
+  section above).
+- `trade` — less sway but 3–15 Hz / accel (encoders: 3–15 Hz) up > 10%:
+  don't adopt.
 - `inconclusive` — keep the default. `rejected: guard trips` — never adopt.
 
 On the shipped gains a real improvement is only ~5–10%, inside the ±10–15%

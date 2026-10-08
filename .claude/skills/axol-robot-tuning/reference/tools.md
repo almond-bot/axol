@@ -37,6 +37,12 @@ have **no tracking guard** — stay at the e-stop; Ctrl-C **once**.
 
 **`axol tune.motion --arms left|right --motion NAME|PATH`** — replays a
 reference motion through the production controller and scores it.
+- Runs the panel settings over the calibration, as teleop does (gains,
+  link mass / CoM, stiffness, `has_gripper`); the first line says
+  `Config: panel settings, gripper yes|no`. `--defaults` runs the bare
+  calibrated defaults; `--no-gripper` / `--stiffness` override the panel.
+  (Before this, it ran the bare defaults with a gripper: on an older
+  checkout pass `--no-gripper` on a gripperless robot.)
 - `--repeat N` (a saved run per pass, `[k/N]`), `--label`, `--hold
   SIDE.JOINT[=DEG]` (freeze joints).
 - `--gain [SIDE.]JOINT.FIELD=V` — one run only, nothing persists. Fields:
@@ -53,7 +59,8 @@ reference motion through the production controller and scores it.
   (`~/.almond/recordings/PREFIX_rt.npz`).
 - Prints per joint RMS / lagfree / lag ms / jitter / buzz@Hz (healthy buzz
   ≈ 0.005°) and the wrist IMU line `vertical X mm = 1-3 Hz a + 3-15 Hz b`,
-  accel, peak Hz. Runs go to `~/.almond/diagnostics/tuning/<id>/`.
+  accel, peak Hz (only with a wrist camera; `--no-imu` skips it). Runs go
+  to `~/.almond/diagnostics/tuning/<id>/`.
 - Research flags (don't ship results from them): `--learn N`,
   `--learn-imu`, `--correction RUN`, `--invert`, `--notch`, `--imu-damp*`,
   `--gyro-damp`, `--torque-probe`, `--enc2`, `--fast-impedance`.
@@ -61,9 +68,13 @@ reference motion through the production controller and scores it.
 
 **`scripts/tuning_queue.py plan|run|summary`** — interleaved rounds of
 variants (`--gain` overrides or `NAME@calib=PATH`), halt rules, and a
-verdict. `summary` decides on `imu.low_mm` by default (slow_osc sway) and
+verdict. `summary` decides on the slow_osc sway (`--metric auto`):
+`imu.low_mm` when the runs have the wrist IMU, else `enc.low_mm` — the same
+sway from the encoders (flange forward kinematics), needing ≥ 15%. It
 calls a variant that buys sway with 3–15 Hz shake / accel a `trade`;
-`--metric rip3_rms_mdeg` for creep screening.
+`--metric rip3_rms_mdeg` for creep screening. `plan --no-imu` for a robot
+without wrist cameras. Every saved run is scored by
+`almond_axol/tuning/creep_score.py` (`score_run`: ripple, `imu`, `enc`).
 
 **`axol tune.pid --l|--r --joint J`** — one joint, step or sine, a grid of
 `--kp/--kd` candidates, ranked (overshoot, settling, ring Hz, holder
@@ -91,7 +102,7 @@ stay stock.
 
 | Motion | What | Judge on |
 |---|---|---|
-| `slow_osc` (right; `~/.almond/motions/slow_osc_left.npz` for the left) | 28 s smoothed teleop | wrist IMU `low_mm` (1–3 Hz sway) — **the acceptance test** |
+| `slow_osc` (right; `~/.almond/motions/slow_osc_left.npz` for the left) | 28 s smoothed teleop | wrist IMU `low_mm` (1–3 Hz sway), or `enc.low_mm` without a camera — **the acceptance test** |
 | `*_creep[_left]` (generated) | one joint at 3 and 6°/s | `rip3_rms_mdeg`, screening only |
 | `hold` | 40 s still | noise floor, parked buzz, limit cycles |
 | `shoulder_1_no_load`, `wirst_swing` | fast swings (≤ 173°/s) | no new buzz on fast motion |
