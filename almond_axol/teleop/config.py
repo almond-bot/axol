@@ -115,8 +115,8 @@ class VRTeleopConfig:
             flat outer face of each closed gripper against the box, held by
             friction — and *one* controller moves both arms as a pair:
             either grip engages both arms with that hand as the leader (no
-            both-grips gate; the other grip switches leader), and the
-            leader's trigger drives both grippers. The hand's **position**
+            both-grips gate; the other grip switches leader), while each
+            trigger still drives its own gripper. The hand's **position**
             and its **turn about vertical** are tracked, nothing else: the
             pair stays level with the hands straight out whatever the hand's
             pitch and roll, and turning the hand about the room's up axis

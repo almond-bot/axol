@@ -1172,8 +1172,8 @@ class VRTeleopCore:
         lead over to that hand (the pair stays where it is). Dead-man scheme
         (``config.hold_to_engage``): the pair tracks while any grip is held,
         led by the held hand (a hand-over happens when the leader lets go
-        while the other still holds). Both grippers follow the leader's
-        trigger.
+        while the other still holds). Each gripper follows its own
+        controller's trigger while the pair is engaged, whichever hand leads.
 
         The thumbsticks set the grip width while someone leads and
         drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
@@ -1239,9 +1239,8 @@ class VRTeleopCore:
         self._prev_r_lock = r_lock
 
         if enabled:
-            grip = float(frame.r_grip if leader == "right" else frame.l_grip)
-            self.l_grip = grip
-            self.r_grip = grip
+            self.l_grip = float(frame.l_grip)
+            self.r_grip = float(frame.r_grip)
 
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.

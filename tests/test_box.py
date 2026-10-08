@@ -768,6 +768,41 @@ class SticksDriveJellyTest(unittest.TestCase):
         self.assertFalse(core.pair_owns_sticks)
 
 
+class BoxTriggersTest(unittest.TestCase):
+    """In box mode each trigger drives its own gripper, whichever hand leads."""
+
+    def test_each_trigger_drives_its_own_gripper(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+        def frame(l_lock: bool, r_lock: bool, l_grip: float, r_grip: float):
+            return _stick_frame(
+                l_lock=l_lock, r_lock=r_lock, l_grip=l_grip, r_grip=r_grip
+            )
+
+        core.update_engage(frame(False, False, 1.0, 1.0))
+        core.update_engage(frame(False, True, 1.0, 0.2))
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual((core.l_grip, core.r_grip), (1.0, 0.2))
+
+        core.update_engage(frame(False, False, 0.3, 0.2))
+        self.assertEqual((core.l_grip, core.r_grip), (0.3, 0.2))
+
+        # Hand the lead to the left: the triggers keep their own grippers.
+        core.update_engage(frame(True, False, 0.1, 0.6))
+        self.assertEqual((core.l_grip, core.r_grip), (0.1, 0.6))
+
+        # Freeze: both grippers hold their last command.
+        core.update_engage(frame(False, False, 0.1, 0.6))
+        core.update_engage(frame(True, False, 0.1, 0.6))
+        self.assertFalse(core.teleop_enabled)
+        core.update_engage(frame(False, False, 1.0, 1.0))
+        self.assertEqual((core.l_grip, core.r_grip), (0.1, 0.6))
+
+
 class BoxExitTest(unittest.TestCase):
     """Leaving box mode: going home turns it off, and from the angled grasp
     the pair is levelled first so plain teleop's ramp starts from two
