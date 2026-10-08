@@ -282,5 +282,20 @@ class QueueTest(unittest.TestCase):
         )
 
 
+class SkillDiscoveryTest(unittest.TestCase):
+    def test_claude_and_codex_both_find_the_playbook(self) -> None:
+        root = SCRIPTS.parent
+        claude = root / ".claude/skills/axol-robot-tuning"
+        codex = root / ".agents/skills/axol-robot-tuning"
+        self.assertEqual(codex.resolve(), claude.resolve())
+        text = (codex / "SKILL.md").read_text()
+        head = text.split("---")[1]
+        self.assertIn("name: axol-robot-tuning", head)
+        self.assertIn("description:", head)
+        for ref in ("reference/known-issues.md", "reference/numbers.md"):
+            self.assertIn(ref, text)
+            self.assertTrue((codex / ref).is_file(), ref)
+
+
 if __name__ == "__main__":
     unittest.main()
