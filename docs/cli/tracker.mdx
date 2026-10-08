@@ -153,7 +153,7 @@ Non-invasive dependency, USB, permission, binding, pose-convention, and redacted
 
 ## Transform file
 
-`~/.almond/mantis/tcp_transform.json` holds measured tracker→TCP transforms, keyed per side by the identified device. The built-in factory values for the standard Tracker 3.0 and Ultimate flat-back mounts apply automatically when no conflicting entry exists; a saved entry is a higher-priority override. Quest has no factory value and needs an entry for both sides.
+`~/.almond/mantis/tcp_transform.json` holds measured tracker→TCP transforms, keyed per side by the identified device. The built-in factory values for the standard Tracker 3.0 and Ultimate flat-back mounts apply automatically when no conflicting entry exists; a saved entry is a higher-priority override. Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`) have a factory value too, used only when no Quest entry is saved; other Quest controllers have none and need an entry for both sides.
 
 ```json
 {
