@@ -57,7 +57,8 @@ arm after an aborted run.
 **`contact: … torque residual N Nm exceeded 8.0`** — `tune.motion`'s contact
 watchdog: something touched the arm or the gravity model is far off. Check
 the space, then the calibration — and on a robot with its own end-effector,
-the wrist_3 mass (Phase 2 `--mass`).
+that its gravity comp is loaded (`robot_report.py` → `effective_config`
+wrist_3 `mass` / `com` aren't the stock 0.75 kg defaults).
 
 **`tune.motion` fails bringing up / calibrating a gripper on a gripperless
 robot.** Set the panel's `axol.has_gripper` to false (`tune.motion` follows
@@ -97,7 +98,7 @@ model plus `Fo` stays within ~0.3 Nm. Jelly rejected 7 of 14 joints.
 
 **Gravity was tuned by hand (link `mass` / `com` in the panel).**
 Panel settings override the calibration file. Run `tune.factory
---keep-gravity`: fits run against their gravity, and only friction, Stribeck and
+--keep-gravity` (also when their mass / CoM are in `calibration.json`): fits run against their gravity, and only friction, Stribeck and
 `Fo` are saved. Without it, `Fo` would be fitted against a model the robot
 never runs (their heavier wrist_3 alone shifts proximal gravity ~1 Nm).
 

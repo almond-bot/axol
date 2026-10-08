@@ -105,7 +105,7 @@ Check the report before anything moves:
 | `settings.link_mass_com_overrides` non-empty | hand-tuned gravity in the panel | always run the factory with `--keep-gravity` |
 | `settings.has_gripper` false, or no gripper on the arm | gripperless robot | panel `axol.has_gripper` must be false (`tune.motion` follows it); see the section below |
 | `settings.wrist_cameras` null on an arm | no wrist IMU there | ask them to mount their own IMU (section below); else the encoder sway |
-| `effective_config.wrist_3.mass` vs the real end-effector | default 0.75 kg is the stock gripper + camera | a different end-effector needs its mass in (Phase 2, `--mass`) |
+| `effective_config.wrist_3.mass` / `com` on a robot without the stock gripper | still the default 0.75 kg (stock gripper + camera) | their gravity comp isn't loaded: find out where they set it (section below) |
 | `settings.axol_overrides` | per-joint gains set in the panel | they win over calibration; note them, they may be the cause |
 | `effective_config` | the two arms differ on a joint | asymmetry is a lead |
 | `recent_runs` guard trips | earlier runs aborted | read those runs' labels |
@@ -161,22 +161,29 @@ proven on jelly; don't explore new ones without an IMU.
 **No gripper.** The panel's `axol.has_gripper` must be false; `tune.motion`
 follows it (an older checkout needs `--no-gripper`, or it tries to
 calibrate a gripper that isn't there). The calibration tools never touch
-the gripper. The model's wrist_3 mass (0.75 kg) includes the stock gripper:
-with nothing on the wrist the arm is lighter than the model (next point).
+the gripper. The default wrist_3 mass (0.75 kg) includes the stock gripper,
+so a gripperless robot carries its own gravity comp (next point).
 
-**Own end-effector, or none.** Gravity is the first thing to get right:
-- The factory's gravity fit keeps each link's mass fixed and only moves its
-  CoM (capped at 60 mm), so a different end-effector needs its mass given
-  up front: `axol tune.factory --mass wrist_3=M [--com wrist_3=x,y,z]`
-  (per arm: `left.wrist_3=M`). M is the wrist_3 link plus whatever is bolted
-  to it; weigh the end-effector, and ask Almond for the bare wrist_3 figure
-  rather than guessing. The CoM is in the wrist_3 link frame; a seed that's
-  roughly right (along the tool axis) lets the fit finish it.
-- If they already tuned mass / CoM by hand in the panel, `--keep-gravity`
-  keeps them instead.
-- Signs the mass is wrong: `Fo` beyond ~±1 Nm on the shoulders / elbow,
-  most CoM fits rejected, the arm sagging or drifting when it holds,
-  `contact: … torque residual` trips in `tune.motion`.
+**Own end-effector, or none.** Such a robot already carries its gravity
+comp for that end-effector — link `mass` / `com` (mostly wrist_3) in the
+panel settings (`settings.json`) or in `calibration.json`. Don't
+re-derive it; keep it through calibration:
+- In the panel settings (report: `settings.link_mass_com_overrides`):
+  `axol tune.factory --keep-gravity` — the fits run against their gravity
+  and save no CoM.
+- In `calibration.json` (report: `calibration["calibration.json"]` → a
+  joint's `fields` include `mass` / `com`; `matches_this_hub` must be
+  true, or the file is ignored and replaced): also `--keep-gravity`. The
+  file is updated field by field, so their mass and CoM stay; without the
+  flag the fit would replace their CoM with its own.
+- Neither set, and `effective_config.wrist_3.mass` is the default 0.75 kg?
+  Then the robot runs the stock gripper's gravity. Ask the person where
+  they set theirs (another machine, an SDK script, a file not yet copied
+  over) before calibrating; don't calibrate against the stock model.
+- Signs their gravity is off: `Fo` beyond ~±1 Nm on the shoulders /
+  elbow, the arm sagging or drifting when it holds, `contact: … torque
+  residual` trips in `tune.motion`. Report it; adjusting it is theirs or
+  Almond's call.
 
 Then expect the tuning to differ from jelly's:
 - The shipped gains were tuned with ~0.75 kg at the wrist. A heavier or
@@ -230,7 +237,6 @@ its hub, a motor/gearbox/end-effector changed, or friction looks wrong.
 axol tune.factory                    # both arms, ~1.5 h
 axol tune.factory --keep-gravity     # if the panel settings hold link mass/CoM
 axol tune.factory --arms left        # one arm (~45 min)
-axol tune.factory --mass wrist_3=M   # own end-effector / none (see above)
 ```
 
 Preconditions: Phase 0 clean, nothing else on the buses, arms hanging at
