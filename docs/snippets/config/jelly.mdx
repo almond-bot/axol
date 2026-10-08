@@ -6,10 +6,18 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}channel</F> | `can_alm_axol_b` | CAN interface of the wheel motors. `null` means lift only. |
 | <F>--{prefix}max_speed</F> | `20.0` | Peak wheel speed (rad/s) at full stick. |
 | <F>--{prefix}turn_scale</F> | `1.0` | Rotation speed relative to driving speed, `[0, 1]`. |
-| <F>--{prefix}slew</F> | `0.5` | Acceleration ramp. The default takes 2 s from rest to full speed. |
+| <F>--{prefix}accel</F> | `0.5` | Ramp rate while speeding up (full stick per second). The default takes 2 s from rest to full speed. |
+| <F>--{prefix}decel</F> | `1.0` | Ramp rate while slowing down or stopping. Faster than `accel`, so stops are brisk. |
+| <F>--{prefix}jerk</F> | `2.0` | Rounds the ramp into an S-curve with no jolt at the start or end of a move. `0` gives a plain linear ramp. |
+| <F>--{prefix}wheel_scale</F> | `[1,1,1,1]` | Per-wheel speed multipliers (FL, FR, BL, BR) that correct for wheels of slightly different size, which otherwise make Jelly slide sideways. Measure with [`diag.base-calibrate`](/cli/diag-base-calibrate). |
+| <F>--{prefix}traction</F> | `true` | Ease off acceleration while a wheel has lifted off the floor (read from wheel torque), so a launch or stop doesn't veer. |
+| <F>--{prefix}traction_light</F> | `0.35` | A wheel reading below this fraction of the average wheel torque counts as lifted. |
+| <F>--{prefix}traction_floor</F> | `0.2` | Lowest fraction of `accel` the traction guard eases to. |
+| <F>--{prefix}traction_torque_min</F> | `0.3` | Average wheel torque (Nm) below which the traction guard doesn't judge. |
+| <F>--{prefix}traction_log</F> | `false` | Log the traction guard per move, for tuning. |
 | <F>--{prefix}axis_snap_deg</F> | `15.0` | Stick directions within this many degrees of straight or sideways snap to exact. `0` disables. |
 | <F>--{prefix}deadzone</F> | `0.15` | Thumbstick deadzone, as a fraction of full deflection. |
-| <F>--{prefix}imu</F> | `false` | Use the board IMU to hold a straight heading. |
+| <F>--{prefix}imu</F> | `true` | Use the board IMU to hold a straight heading. Without it the heading drifts a few degrees per move. |
 | <F>--{prefix}yaw_hold_gain</F> | `2.0` | Heading-hold strength. `0` disables. |
 | <F>--{prefix}yaw_hold_max</F> | `0.3` | Maximum heading-hold correction. |
 | <F>--{prefix}yaw_log</F> | `false` | Log heading-hold data at 10 Hz, for diagnosing drift. |

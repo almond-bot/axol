@@ -25,6 +25,7 @@ mod hold;
 mod jelly;
 mod proto;
 mod proxy;
+mod ramp;
 mod safety;
 mod scan;
 mod serve;
