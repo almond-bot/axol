@@ -104,8 +104,8 @@ export function RobotModel({
   const [robot, setRobot] = useState<URDFRobot | null>(null)
   // An ordinary Axol session never publishes urdf_state, so wait for the
   // server to prove this is an overlay-capable Mantis session before fetching
-  // the robot model.
-  const [overlayRequested, setOverlayRequested] = useState(false)
+  // the robot model — the first state also names this Axol version's URDF.
+  const [overlayUrdf, setOverlayUrdf] = useState<string | null>(null)
   const overlayRequestedRef = useRef(false)
   const liveRobotRef = useRef<URDFRobot | null>(null)
   const groupRef = useRef<THREE.Group>(null)
@@ -118,7 +118,8 @@ export function RobotModel({
   const trackingRef = useRef(false)
 
   useEffect(() => {
-    if (!hostname || !overlayRequested) return
+    if (!hostname || !overlayUrdf) return
+    const urdfFile = overlayUrdf
     const origin = axolHttpsOrigin(hostname, VR_WS_PORT)
     let cancelled = false
     let retryTimer: ReturnType<typeof setTimeout> | null = null
@@ -171,11 +172,11 @@ export function RobotModel({
       const loader = new URDFLoader(manager)
       loader.fetchOptions = { signal: activeUrdfRequest.signal }
       loader.parseCollision = false
-      // The longstanding URDF uses package://assembly/meshes/<name>.stl; the
-      // server exposes the whole URDF directory at /urdf.
+      // Every bundled URDF uses package://assembly/meshes/...; the server
+      // exposes the whole URDF directory at /urdf.
       loader.packages = { assembly: `${origin}/urdf` }
       loader.load(
-        `${origin}/urdf/axol.urdf`,
+        `${origin}/urdf/${encodeURIComponent(urdfFile)}`,
         (r) => {
           loaded = r
         },
@@ -203,7 +204,7 @@ export function RobotModel({
         liveRobotRef.current = null
       }
     }
-  }, [hostname, overlayRequested])
+  }, [hostname, overlayUrdf])
 
   useFrame((_, delta) => {
     const group = groupRef.current
@@ -211,7 +212,7 @@ export function RobotModel({
     const state = urdfStateRef.current
     if (state && !overlayRequestedRef.current) {
       overlayRequestedRef.current = true
-      setOverlayRequested(true)
+      setOverlayUrdf(state.urdf)
     }
     if (!robot || !state?.base || !state.viewerWorldAligned) {
       group.visible = false

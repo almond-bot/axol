@@ -1579,7 +1579,9 @@ def run_ik_worker(
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
                 q_target = (
-                    np.asarray(msg[2], dtype=np.float32) if len(msg) == 3 else q_rest
+                    np.asarray(msg[2], dtype=np.float32)
+                    if len(msg) == 3
+                    else q_rest.copy()
                 )
                 if (
                     len(msg) not in (2, 3)
@@ -1591,6 +1593,11 @@ def run_ik_worker(
                     raise ValueError(
                         "reset requires finite current/target joint vectors"
                     )
+                # A reset moves only the arms; whole-body IK's base and lift
+                # stay where they are rather than driving back to where the
+                # session started.
+                n_arm = len(worker.left_indices) + len(worker.right_indices)
+                q_target[n_arm:] = q_current[n_arm:]
                 traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
                 q = traj[-1].copy() if traj else q_target.copy()

@@ -48,6 +48,27 @@ left_arm, right_arm = q[:7], q[7:]  # ARM_JOINTS order, ready for motion_control
 q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 ```
 
+## Robot models
+
+The bundled URDFs live in `almond_axol/kinematics/urdf/`. The Axol-on-Jelly ones are generated from the Onshape export by `scripts/build_jelly_urdfs.py` and share `meshes/jelly/`:
+
+| File | What moves | Used by |
+|---|---|---|
+| `axol.urdf` | the 14 arm joints | classic Axol (fixed mount) |
+| `axol_jelly.urdf` | the 14 arm joints (base and lift frozen, lift fully raised) | Axol on Jelly — picked automatically when Jelly is enabled |
+| `axol_jelly_whole_body.urdf` | arms + `base_x`, `base_y`, `base_yaw`, `lift` | whole-body IK (`kinematics.whole_body`) |
+| `axol_jelly_sim.urdf` | arms, `lift`, gripper fingers, wheels | physics simulators such as Isaac Sim — not used by the stack |
+
+All four share the same arm chain, so forward kinematics and gravity compensation match. Every Jelly model carries camera optical frames — `left_wrist_camera_optical`, `right_wrist_camera_optical`, `head_camera_left_optical`, `head_camera_right_optical` — in the ROS optical convention (+z along the optical axis, +x image right, +y image down).
+
+**Simulation model.** `axol_jelly_sim.urdf` is rooted at the Jelly on the floor (`jelly`) and uses relative mesh paths, so it imports without a ROS package:
+
+- **Joints:** the lift (`lift`, with `lift_2` mimicking it), one joint per gripper (`left_finger_1_joint`, `right_finger_1_joint`, 0 = closed to 0.0588 m open, with the second finger mimicking it), and the four wheels (continuous). Importers that ignore `<mimic>` see the mimicked joints as independent: command them with the same value.
+- **Joint friction and drives:** each arm joint carries `AxolConfig`'s measured friction as `<dynamics friction>` (Coulomb) and `damping` (viscous), per arm. The motors' impedance gains are on the same joint as `<drive stiffness damping>` (`kp` in N·m/rad, `kd` in N·m·s/rad). URDF has no drive-gain element, so this is a custom one that importers ignore: read it and set each joint's position-drive stiffness and damping after import. The controller-only terms `j_eff` and `kd_host` are left out.
+- **Masses:** arm masses and centres of mass are `AxolConfig`'s tuned values. The Jelly, lift, torso, head, wheel and gripper-part masses are estimates, listed in `SIM_MASSES` / `SIM_WRIST_PARTS` in the generator; replace them with measured values.
+- **Wheels:** the x-drive's omni rollers are not modelled, so plain wheels cannot strafe. Drive the base kinematically or with a holonomic controller.
+- **Cameras:** attach Isaac Sim cameras to the `*_optical` links with ROS camera axes. The wrist cameras (ZED X One S fisheye) sit at the projection centre from Stereolabs' camera model, rolled so the gripper is at the bottom of the image as in real frames; render them with the factory fisheye (Kannala-Brandt) calibration, not a pinhole model. The head camera (ZED X Mini Wide) frames are likewise each lens's projection centre from Stereolabs' model, 7.2 mm behind its front cover, 50 mm apart.
+
 ## `KinematicsSolver` interface
 
 | Member | Description |
