@@ -812,11 +812,13 @@ export default function ControlPanel() {
     ? (parseHardwareProfile(settingsSnap?.values[HARDWARE_PROFILE_SETTING]) ?? "axol")
     : localHardwareProfile
 
-  async function selectHardwareProfile(profile: HardwareProfile) {
+  // Resolves false only when the host rejected the save (the optimistic
+  // selection was reverted), so the automatic selection can retry it.
+  async function selectHardwareProfile(profile: HardwareProfile): Promise<boolean> {
     const generation = connectionGenerationRef.current
     setLocalHardwareProfile(profile)
     saveLocalHardwareProfile(profile)
-    if (!hostStoresHardwareProfile || !settingsSnap) return
+    if (!hostStoresHardwareProfile || !settingsSnap) return true
     // Optimistic: the switch, the tiles, and the auto-connect target follow
     // immediately; a failed save restores the stored values.
     const priorValues = settingsSnap.values
@@ -826,17 +828,19 @@ export default function ControlPanel() {
     setHardwareProfileSaving(true)
     try {
       const snap = await saveSettings({ values: { [HARDWARE_PROFILE_SETTING]: profile } })
-      if (generation !== connectionGenerationRef.current) return
+      if (generation !== connectionGenerationRef.current) return true
       setSettingsSnap((prev) => ({
         ...snap,
         schema: prev?.schema ?? snap.schema,
         advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
       }))
       if (snap.cameras) setCameras(snap.cameras)
+      return true
     } catch (e) {
-      if (generation !== connectionGenerationRef.current) return
+      if (generation !== connectionGenerationRef.current) return true
       setSettingsSnap((prev) => (prev ? { ...prev, values: priorValues } : prev))
       toast.error(`Could not save the device selection: ${String(e).replace(/^Error:\s*/, "")}`)
+      return false
     } finally {
       if (generation === connectionGenerationRef.current) setHardwareProfileSaving(false)
     }
@@ -1420,11 +1424,16 @@ export default function ControlPanel() {
   // while the link auto-connects the other one. Once per inventory change
   // (and host), so an operator who deliberately picks the absent device keeps
   // that choice until the attached hardware changes. Waits for the host's
-  // settings so a stored selection isn't judged by this browser's fallback.
+  // settings so a stored selection isn't judged by this browser's fallback,
+  // and for CAN discovery to settle so a hub still being identified isn't
+  // read as absent. A rejected save gets the same bounded retries as
+  // auto-connect before the latch holds.
   const autoSelectedPresenceRef = useRef<string | null>(null)
+  const autoSelectAttemptsRef = useRef(new Map<string, number>())
   useEffect(() => {
     if (conn.state !== "ok" || !canProfiles) return
     if (settingsSnap == null && settingsError == null) return
+    if (canDiscoveryBlocksAutoConnect(canDiscovery)) return
     if (isLive || hardwareProfileSaving) return
     const signature = `${connectionGeneration}:${hardwarePresenceSignature(canProfiles)}`
     if (autoSelectedPresenceRef.current === signature) return
@@ -1435,10 +1444,21 @@ export default function ControlPanel() {
     }
     const timer = window.setTimeout(() => {
       autoSelectedPresenceRef.current = signature
-      void selectHardwareProfile(detected)
+      void selectHardwareProfile(detected).then((saved) => {
+        if (saved) return
+        const attempts = (autoSelectAttemptsRef.current.get(signature) ?? 0) + 1
+        autoSelectAttemptsRef.current.set(signature, attempts)
+        const delay = autoConnectRetryDelay(attempts)
+        if (delay === null) return
+        // The 2 s inventory poll re-runs this effect once the latch clears.
+        window.setTimeout(() => {
+          if (autoSelectedPresenceRef.current === signature) autoSelectedPresenceRef.current = null
+        }, delay)
+      })
     }, 0)
     return () => window.clearTimeout(timer)
   }, [
+    canDiscovery,
     canProfiles,
     conn.state,
     connectionGeneration,
