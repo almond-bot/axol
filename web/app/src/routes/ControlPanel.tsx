@@ -74,7 +74,9 @@ import {
   canDiscoveryBlocksAutoConnect,
   canServerEpoch,
   chooseAutoConnectTarget,
+  chooseDetectedHardwareProfile,
   claimCanInventoryPollResponse,
+  hardwarePresenceSignature,
   issueCanInventoryPoll,
   newCanInventoryPollSequence,
   nextAutoConnectAttempt,
@@ -1411,6 +1413,41 @@ export default function ControlPanel() {
     currentCanServerEpoch,
     resetAutoRobotRetry,
     sessionInventoryReady,
+  ])
+
+  // Follow the hardware when only one of Axol / Mantis is attached: a saved
+  // selection on the absent device would leave its tile marked "selected"
+  // while the link auto-connects the other one. Once per inventory change
+  // (and host), so an operator who deliberately picks the absent device keeps
+  // that choice until the attached hardware changes. Waits for the host's
+  // settings so a stored selection isn't judged by this browser's fallback.
+  const autoSelectedPresenceRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (conn.state !== "ok" || !canProfiles) return
+    if (settingsSnap == null && settingsError == null) return
+    if (isLive || hardwareProfileSaving) return
+    const signature = `${connectionGeneration}:${hardwarePresenceSignature(canProfiles)}`
+    if (autoSelectedPresenceRef.current === signature) return
+    const detected = chooseDetectedHardwareProfile(canProfiles, hardwareProfile)
+    if (detected === null) {
+      autoSelectedPresenceRef.current = signature
+      return
+    }
+    const timer = window.setTimeout(() => {
+      autoSelectedPresenceRef.current = signature
+      void selectHardwareProfile(detected)
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [
+    canProfiles,
+    conn.state,
+    connectionGeneration,
+    hardwareProfile,
+    hardwareProfileSaving,
+    isLive,
+    selectHardwareProfile,
+    settingsError,
+    settingsSnap,
   ])
 
   // While an op is live (including the "stopping" window), poll the server's
