@@ -201,12 +201,19 @@ class StictionConfigTest(unittest.TestCase):
             want = {"shoulder_1": 0.8, "shoulder_2": 0.8, "elbow": 0.8}.get(name, 0.0)
             self.assertEqual(jc.stribeck_gain, want, name)
 
-    def test_calibration_file_can_set_the_fields(self) -> None:
+    def test_a_calibration_entry_never_sets_the_tuning_fields(self) -> None:
+        # Stiction, dither and the wire mode are tuning choices (panel
+        # settings, --gain), never calibration: a document cannot put a joint
+        # on its firmware loop.
         base = ArmConfig().shoulder_1
-        out = _calibrated_joint(base, {"stiction_gain": 0.5, "stiction_err_deg": 0.2})
-        self.assertEqual((out.stiction_gain, out.stiction_err_deg), (0.5, 0.2))
-        untouched = _calibrated_joint(base, {"kp": 200.0})
-        self.assertEqual(untouched.stiction_gain, 0.0)
+        out = _calibrated_joint(
+            base,
+            {"stiction_gain": 0.5, "dither_nm": 0.1, "wire_mode": "a4", "kp": 200.0},
+        )
+        self.assertEqual(
+            (out.stiction_gain, out.dither_nm, out.wire_mode, out.kp),
+            (0.0, 0.0, "mit", 200.0),
+        )
 
     def test_resolved_config_keeps_the_fields(self) -> None:
         cfg = AxolConfig()

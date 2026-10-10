@@ -175,3 +175,78 @@ class SlowFactoryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DegenerateStribeckTest(unittest.TestCase):
+    def test_a_bad_stribeck_fit_saves_the_joint_without_it(self) -> None:
+        import json
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        from almond_axol.cli.tune import factory
+        from almond_axol.robot.calibration import (
+            load_calibration,
+            update_joint_calibration,
+        )
+
+        joint, is_left = Joint.ELBOW, False
+        other, lo_d, hi_d, _ = sweep_safety(joint, is_left)
+
+        async def fake_sweep(motor, kp, kd, speeds, lo, hi, load, jt, left, raw):
+            rows = {k: [] for k in ("speed", "direction", "q", "tau", "group", "load")}
+            for g, v in enumerate(speeds):
+                for d in (1, -1):
+                    for q in np.linspace(lo, hi, 50):
+                        rows["speed"].append(v)
+                        rows["direction"].append("+" if d > 0 else "-")
+                        rows["q"].append(q)
+                        rows["tau"].append(d * 0.5)
+                        rows["group"].append(g)
+                        rows["load"].append(load(q))
+            return rows
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+
+            def save(side, jt, **kw):
+                return update_joint_calibration(side, jt, path=path, **kw)
+
+            jc = AxolConfig().resolved().right.elbow
+            args = argparse.Namespace(profile="slow", raw_dir=None, stribeck_gain=None)
+            out = io.StringIO()
+            with (
+                mock.patch.object(factory, "_identify_slow", fake_sweep),
+                mock.patch.object(factory, "_park_joint", mock.AsyncMock()),
+                mock.patch.object(
+                    factory,
+                    "fit_and_report",
+                    lambda *a, **k: replace(TRUE, vs=float("nan")),
+                ),
+                mock.patch.object(factory, "update_joint_calibration", save),
+                redirect_stdout(out),
+            ):
+                entry = asyncio.run(
+                    factory._calibrate_joint_slow(
+                        {joint: None},
+                        joint,
+                        is_left,
+                        [math.radians(v) for v in (1, 3, 8, 30)],
+                        "hub1",
+                        args,
+                        jc,
+                        jc.kp,
+                        jc.kd,
+                        other,
+                        lo_d,
+                        hi_d,
+                    )
+                )
+            self.assertIn("Not saving Stribeck on elbow", out.getvalue())
+            self.assertNotIn("stribeck_vs", entry)
+            self.assertIn("friction", entry)
+            stored = json.loads(path.read_text())["right"]["elbow"]
+            self.assertIn("friction", stored)
+            self.assertFalse(any(k.startswith("stribeck") for k in stored))
+            got = load_calibration(path, expected_hub_serial="hub1")["right"]["elbow"]
+            self.assertEqual(got["friction"]["fc"], TRUE.fc)

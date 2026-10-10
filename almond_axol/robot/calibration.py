@@ -86,6 +86,20 @@ _STRIBECK_FIELDS = (
     "stribeck_vs",
     "stribeck_pole",
 )
+# Per-joint settings that are tuning choices, not measurements: a
+# calibration file (local or pulled from the cloud) never sets them — the
+# firmware loop gains and wire mode would otherwise let a document put a
+# joint on the motor's own position loop or write its ROM. They are dropped
+# on load with a warning; set them in the panel settings or with --gain.
+_IGNORED_FIELDS = (
+    "firmware",
+    "wire_mode",
+    "stiction_gain",
+    "stiction_load_gain",
+    "stiction_err_deg",
+    "dither_nm",
+    "dither_hz",
+)
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
 # Optional: load-proportional Coulomb friction (``FrictionParams.fl``).
 _FRICTION_OPTIONAL = ("fl",)
@@ -94,6 +108,28 @@ _FRICTION_OPTIONAL = ("fl",)
 # would make a bad calibration mysterious — warn once per process.
 _warned_invalid = False
 _warned_identity: set[tuple[Path, str | None, str]] = set()
+_warned_fields: set[tuple[Path, str, str, str]] = set()
+
+
+def _warn_dropped(path: Path, side: str, joint: str, field: str, why: str) -> None:
+    """Warn once per process about a calibration field that load drops."""
+    key = (path, side, joint, field)
+    if key in _warned_fields:
+        return
+    _warned_fields.add(key)
+    _logger.warning(
+        "Calibration file %s: ignoring %s %s %s (%s).", path, side, joint, field, why
+    )
+
+
+def _invalid_stribeck(stribeck: dict[str, Any]) -> list[str]:
+    """The ``stribeck_*`` entries load would drop: not finite and >= 0."""
+    bad = []
+    for field, value in stribeck.items():
+        v = _coerce_float(value)
+        if v is None or not math.isfinite(v) or v < 0.0:
+            bad.append(f"{field}={value!r}")
+    return bad
 
 
 def _backup_displaced_calibration(path: Path, contents: bytes) -> Path:
@@ -186,9 +222,30 @@ def load_calibration(
                 continue
             clean: dict[str, Any] = {}
             for field in _STRIBECK_FIELDS:
+                if field not in entry:
+                    continue
                 value = _coerce_float(entry.get(field))
                 if value is not None and math.isfinite(value) and value >= 0.0:
                     clean[field] = value
+                else:
+                    _warn_dropped(
+                        path,
+                        side,
+                        str(joint),
+                        field,
+                        f"{entry.get(field)!r} is not a finite number >= 0; "
+                        "the coded default applies",
+                    )
+            for field in _IGNORED_FIELDS:
+                if field in entry:
+                    _warn_dropped(
+                        path,
+                        side,
+                        str(joint),
+                        field,
+                        "a tuning setting, not calibration — set it in the panel "
+                        "settings or with --gain",
+                    )
             for field in _SCALAR_FIELDS:
                 value = _coerce_float(entry.get(field))
                 if value is not None:
@@ -335,6 +392,13 @@ def update_joint_calibration(
         unknown = sorted(set(stribeck) - set(_STRIBECK_FIELDS))
         if unknown:
             raise ValueError(f"unknown stribeck fields: {', '.join(unknown)}")
+        bad = _invalid_stribeck(stribeck)
+        if bad:
+            # load_calibration would drop these, so the saved fit would
+            # silently never apply: refuse instead.
+            raise ValueError(
+                f"stribeck fields must be finite and >= 0: {', '.join(bad)}"
+            )
     if mass is not None and not (math.isfinite(mass) and mass > 0.0):
         raise ValueError(f"mass must be a positive number of kg, got {mass!r}")
 

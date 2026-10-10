@@ -52,12 +52,13 @@ class ConfigTest(unittest.TestCase):
             cfg.left.shoulder_1.firmware, AxolConfig().left.shoulder_1.firmware
         )
 
-    def test_calibration_entry_overlays_firmware_block(self) -> None:
+    def test_a_calibration_entry_never_sets_the_firmware_block(self) -> None:
+        # A calibration document (local or pulled from the cloud) must not
+        # write motor ROM gains: load drops the block, and an entry that
+        # still carries one leaves the config's untouched.
         base = AxolConfig().left.elbow
         out = _calibrated_joint(base, {"firmware": {"position_kp": 0.05}})
-        self.assertEqual(out.firmware.as_dict(), {"position_kp": 0.05})
-        # Untouched entries keep the config's block.
-        self.assertEqual(_calibrated_joint(base, {"kp": 100.0}).firmware, base.firmware)
+        self.assertEqual(out.firmware, base.firmware)
 
     def test_firmware_gains_is_exported_and_replaceable(self) -> None:
         jc = replace(AxolConfig().left.elbow, firmware=FirmwareGains(speed_kp=0.05))

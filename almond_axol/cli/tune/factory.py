@@ -680,15 +680,32 @@ async def _calibrate_joint_slow(
         # Only m·c is identified: pin the mass the CoM was fitted against so
         # the pair stays consistent wherever the document is pulled.
         entry["mass"] = jc.mass
-    update_joint_calibration(
-        side_str,
-        joint.value,
-        friction=entry.get("friction"),
-        stribeck=stribeck,
-        com=tuple(entry["com"]) if "com" in entry else None,
-        mass=entry.get("mass"),
-        hub_serial=hub_serial,
-    )
+    try:
+        update_joint_calibration(
+            side_str,
+            joint.value,
+            friction=entry.get("friction"),
+            stribeck=stribeck,
+            com=tuple(entry["com"]) if "com" in entry else None,
+            mass=entry.get("mass"),
+            hub_serial=hub_serial,
+        )
+    except ValueError as exc:
+        if stribeck is None:
+            raise
+        # A degenerate Stribeck fit must not cost the rest of a 1.5 h run:
+        # save the joint without it (the coded default applies).
+        print(f"  ! Not saving Stribeck on {joint.value}: {exc}")
+        for field in stribeck:
+            entry.pop(field, None)
+        update_joint_calibration(
+            side_str,
+            joint.value,
+            friction=entry.get("friction"),
+            com=tuple(entry["com"]) if "com" in entry else None,
+            mass=entry.get("mass"),
+            hub_serial=hub_serial,
+        )
     return entry
 
 

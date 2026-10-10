@@ -850,12 +850,6 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
             "kd_host",
             "kd_host_hz",
             "kd_host_q",
-            "stiction_gain",
-            "stiction_load_gain",
-            "stiction_err_deg",
-            "dither_nm",
-            "dither_hz",
-            "wire_mode",
             "stribeck_gain",
             "stribeck_dfs",
             "stribeck_load_gain",
@@ -867,9 +861,6 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     friction = entry.get("friction")
     if friction is not None:
         overrides["friction"] = FrictionParams(**friction)
-    firmware = entry.get("firmware")
-    if firmware is not None:
-        overrides["firmware"] = FirmwareGains(**firmware)
     com = entry.get("com")
     if com is not None:
         # Fitted by ``axol tune.gravity --save``; already per-side (measured

@@ -376,6 +376,45 @@ class CalibrationTest(unittest.TestCase):
                     hub_serial="hub1",
                     path=path,
                 )
+            # A value load would drop is refused at save, not stored to be
+            # silently ignored.
+            for bad in (-0.1, float("nan"), float("inf")):
+                with self.assertRaises(ValueError):
+                    update_joint_calibration(
+                        "right",
+                        "shoulder_1",
+                        stribeck={"stribeck_dfs": bad},
+                        hub_serial="hub1",
+                        path=path,
+                    )
+
+    def test_load_warns_about_what_it_drops(self) -> None:
+        from almond_axol.robot import calibration as cal
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "hub_serial": "hub1",
+                        "left": {
+                            "elbow": {
+                                "kp": 200.0,
+                                "stribeck_vs": -1,
+                                "wire_mode": "a4",
+                                "firmware": {"position_kp": 0.05},
+                            }
+                        },
+                    }
+                )
+            )
+            cal._warned_fields.clear()
+            with self.assertLogs(cal._logger, level="WARNING") as logs:
+                got = load_calibration(path, expected_hub_serial="hub1")
+            self.assertEqual(got["left"]["elbow"], {"kp": 200.0})
+            text = "\n".join(logs.output)
+            for field in ("stribeck_vs", "wire_mode", "firmware"):
+                self.assertIn(field, text)
 
     def test_a_retired_cogging_series_is_ignored_and_scrubbed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
