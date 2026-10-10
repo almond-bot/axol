@@ -14,8 +14,9 @@ export interface FieldSuggestion {
  * an input plus a separate picker. Focusing (or typing) opens a styled list
  * of suggestions filtered by the current text; clicking or Enter fills the
  * field, while any free-form text remains valid. Used for dataset repo ids on
- * every operation panel and for the recent hosts in the setup dialog. Extra
- * input attributes (spellCheck, autoCapitalize, …) pass through to the input;
+ * every operation panel and for the recent hosts in the setup dialog and the
+ * VR connect card. Extra input attributes (spellCheck, autoCapitalize, …)
+ * pass through to the input;
  * `className` styles the wrapper so it can size itself inside a flex row.
  */
 export function SuggestInput({

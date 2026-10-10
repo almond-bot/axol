@@ -32,10 +32,11 @@ import { configureTextBuilder } from "troika-three-text"
 import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
 import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
+import { SuggestInput } from "@/components/suggest-input"
 import { authorizeCert } from "@/lib/cert-accept"
+import { VR_HOST_HISTORY_STORAGE, loadHostHistory, recordHost } from "@/lib/host-history"
 import { hostCertAuthorizeVisible, usbCertOrigin } from "@/lib/usb-transport"
 import { cn } from "@/lib/utils"
 
@@ -1251,6 +1252,15 @@ export default function App() {
     autoConnectedRef.current = true
     connect()
   }, [bootParams, hostname, status, connect])
+  // Remember the host once the teleop socket actually opens, so only hosts
+  // that connected show up in the recent-hosts dropdown. The dropdown is only
+  // rendered outside the Open state, so re-reading storage on each status
+  // change is enough to pick up the newly recorded host.
+  useEffect(() => {
+    if (status === AxolConnectionStatus.Open) recordHost(hostname, VR_HOST_HISTORY_STORAGE)
+  }, [status, hostname])
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `status` is the refresh trigger
+  const hostHistory = useMemo(() => loadHostHistory(VR_HOST_HISTORY_STORAGE), [status])
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The tunnel
   // is independent of the WiFi connection, so the socket opens as soon as the
@@ -1368,12 +1378,15 @@ export default function App() {
                 >
                   Axol Host Address
                 </label>
-                <Input
+                <SuggestInput
                   id="vr-host"
-                  type="text"
                   value={hostname}
-                  onChange={(e) => setHostname(e.target.value)}
+                  suggestions={hostHistory.map((h) => ({ value: h }))}
+                  onChange={setHostname}
                   placeholder="axol-host.local"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
                 />
                 <label className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 p-3 text-sm text-white/80">
                   <input
