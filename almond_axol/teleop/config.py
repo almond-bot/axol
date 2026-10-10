@@ -100,8 +100,10 @@ class VRTeleopConfig:
             is — the arm comes to the hand, over ``reengage_ramp_min_s`` or
             longer (paced by ``reengage_ramp_speed``), then tracks 1:1. The
             anchor is dropped by a reset / return-to-rest (the next grip
-            snaps fresh in either mode) and does not apply to box mode,
-            whose engage already blends the pair into the parallel grasp.
+            snaps fresh in either mode). Engages *within* box mode ignore
+            it (they already blend the pair into the parallel grasp), but
+            leaving box mode in ``"ramp"`` blends both arms back out to the
+            mapping from before box mode.
             Toggled live from the headset HUD (``VRFrame.reengage``); this is
             the mode a session starts in.
         reengage_ramp_speed: Linear speed (m/s) that paces the ``"ramp"``
@@ -237,9 +239,22 @@ class VRTeleopConfig:
             swivel is then left alone: rest damping holds it and the
             arm/torso collision model (``KinematicsConfig.self_collision``)
             keeps it off the base — and the sticks' elbow control does
-            nothing. Live-adjustable (control panel).
+            nothing. Set at launch (CLI or control panel); not a live
+            setting.
         box_elbow_speed: Rate (degrees/s) the sticks change
             ``box_elbow_out`` at full forward/back deflection.
+        box_wrist_torque: Cap (Nm) on the impedance spring torque of
+            ``wrist_2`` and ``wrist_3`` on each arm while box mode is on and
+            the arms are not on a return-to-rest (``BOX_WRIST_JOINTS`` in
+            :mod:`almond_axol.teleop.core`, applied through
+            ``set_spring_caps``; plain teleop runs the wrists uncapped). The
+            wrists carry the clamp's moment at the tool, and the small wrist
+            motors overheat pressing with ``kp`` times however far the width
+            is jogged past the box: ``5`` (the default) is ~2.2° of position
+            error at ``kp`` 130, enough authority to hold a clamped box. The
+            squeeze's automatic clamp-force limit is derived from it
+            (``joint_force_limit``: ~39 N a side at 5 Nm). ``0`` disables.
+            Realtime-core hardware only; not a live setting.
         box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
             joints that squeeze the box — ``shoulder_2`` and ``shoulder_3``
             on each arm (see ``BOX_SQUEEZE_JOINTS`` in
@@ -261,8 +276,8 @@ class VRTeleopConfig:
             per side: the cap divided by the shoulder's lever to the
             gripper — ~0.65 m with the arms down, ~0.3 m with the box
             raised — so ``6`` Nm is roughly 9–20 N a side; the arms give
-            way rather than push harder. Gravity feedforward and the other
-            joints' configured caps (the wrists' 5 Nm) are unaffected.
+            way rather than push harder. Gravity feedforward is outside it,
+            and the wrists keep ``box_wrist_torque``.
             ``0`` (the default) disables. Live-adjustable (headset menu /
             control panel); realtime-core hardware only. This is an
             opt-in hard, per-joint backstop, off by default because it
@@ -343,10 +358,10 @@ class VRTeleopConfig:
             lower it to be gentler. Live-adjustable; realtime-core hardware
             only. Whatever it is set to, the clamp is also held under what
             the wrists can press evenly with: ``wrist_2`` carries the moment
-            that keeps the tip on the box and, at its 5 Nm cap, saturates
-            at ~39 N of even clamp, after which squeezing harder only lifts
-            the tip — so the worker stops the clamp at 80% of that (~31 N
-            a side at a box-carrying pose).
+            that keeps the tip on the box and, at ``box_wrist_torque``
+            (5 Nm), saturates at ~39 N of even clamp, after which squeezing
+            harder only lifts the tip — so the worker stops the clamp at
+            80% of that (~31 N a side at a box-carrying pose).
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -535,12 +550,12 @@ class VRTeleopConfig:
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
-    box_lead_hand: str = "right"
+    box_lead_hand: Literal["right", "left"] = "right"
     gripper: Literal["parallel", "parcel"] | None = None
     box_flush_deg: float = 39.0
-    box_grasp: str = "straight"
-    box_face_left: str = "auto"
-    box_face_right: str = "auto"
+    box_grasp: Literal["straight", "flush"] = "straight"
+    box_face_left: Literal["auto", "+x", "-x"] = "auto"
+    box_face_right: Literal["auto", "+x", "-x"] = "auto"
     box_grip_tilt: float = 0.0
     box_width_speed: float = 0.08
     box_width_min: float = 0.02
@@ -549,6 +564,7 @@ class VRTeleopConfig:
     box_elbow_out: float = 30.0
     box_elbow_weight: float = 10.0
     box_elbow_speed: float = 30.0
+    box_wrist_torque: float = 5.0
     box_squeeze_torque: float = 0.0
     box_squeeze_lean: float = 1.0
     box_squeeze_trim: float = 5.0

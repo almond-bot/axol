@@ -57,8 +57,12 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 # while a held box's weight goes to shoulder_1 and the elbow (shoulder_2 sees
 # ≤ 0.12 Nm/N of it). Capping these two bounds the squeeze without starving
 # the joints that lift the box; the elbow, which shares both loads, is left
-# uncapped, and the wrists keep their configured 5 Nm.
+# uncapped.
 BOX_SQUEEZE_JOINTS: tuple[Joint, ...] = (Joint.SHOULDER_2, Joint.SHOULDER_3)
+# Box mode's wrist cap (``VRTeleopConfig.box_wrist_torque``): the small wrist
+# motors carry the clamp's moment at the tool and would otherwise press with
+# kp times however far the width is jogged past the box.
+BOX_WRIST_JOINTS: tuple[Joint, ...] = (Joint.WRIST_2, Joint.WRIST_3)
 
 # ``(left positions, right positions, left kp, right kp)``: each arm's
 # measured joint positions (rad, ``(8,)``, ARM_JOINTS order + gripper) and
@@ -91,6 +95,12 @@ def measured_arms(robot: object) -> MeasuredArms | None:
         out.append(pos)
         kps.append(np.asarray(kp, dtype=np.float64))
     return out[0], out[1], kps[0], kps[1]
+
+
+# Rate of the joint-state push (``{"type": "joints"}``) that drives the
+# headset HUD's box-mode readout (pair status). A ~200 B JSON message;
+# negligible next to the pose stream.
+JOINT_BROADCAST_HZ = 20.0
 
 
 # Thumbstick deflection below which a stick counts as released — the same
@@ -313,6 +323,7 @@ class VRTeleopCore:
         # absolute-mode solve.
         self.last_tcp_change_ts: float | None = None
         self._last_urdf_broadcast = 0.0
+        self._last_joint_broadcast = 0.0
         self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
         self.right_indices: list[int] = []
@@ -796,20 +807,27 @@ class VRTeleopCore:
     def spring_caps(self) -> dict[Joint, float] | None:
         """Per-joint spring-torque caps the arms should run under right now.
 
-        Box mode's squeeze limit: ``config.box_squeeze_torque`` (Nm) on each
-        of :data:`BOX_SQUEEZE_JOINTS`, in force the whole time box mode is
-        on — leading, frozen holding a box, or between engages — except
-        during a return-to-rest (:attr:`is_resetting`), whose joint-space
-        move wants the shoulders' full authority. ``None`` means no caps
-        (plain teleop, box mode with the cap set to 0, a reset). The
+        Box mode's caps: ``config.box_wrist_torque`` (Nm) on each of
+        :data:`BOX_WRIST_JOINTS` and ``config.box_squeeze_torque`` on each of
+        :data:`BOX_SQUEEZE_JOINTS` (either ``0`` = off), in force the whole
+        time box mode is on — leading, frozen holding a box, or between
+        engages — except during a return-to-rest (:attr:`is_resetting`),
+        whose joint-space move wants the joints' full authority. ``None``
+        means no caps (plain teleop, box mode with both caps 0, a reset). The
         adapter applies the result to the robot before each control tick
         (``set_spring_caps``); the caps ride the next command to the
         realtime core. Cheap and pure — safe to call every cycle.
         """
-        cap = float(self.config.box_squeeze_torque)
-        if not self.box_mode or self.is_resetting or not (cap > 0.0):
+        if not self.box_mode or self.is_resetting:
             return None
-        return {joint: cap for joint in BOX_SQUEEZE_JOINTS}
+        caps: dict[Joint, float] = {}
+        wrist = float(self.config.box_wrist_torque)
+        if wrist > 0.0:
+            caps.update({joint: wrist for joint in BOX_WRIST_JOINTS})
+        squeeze = float(self.config.box_squeeze_torque)
+        if squeeze > 0.0:
+            caps.update({joint: squeeze for joint in BOX_SQUEEZE_JOINTS})
+        return caps or None
 
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).
@@ -2029,6 +2047,63 @@ class VRTeleopCore:
             self.last_tcp_change_ts = time.perf_counter()
         # This single reference write is the synchronization point for readers.
         self.last_tcp_snapshot = snapshot
+
+    def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
+        """Push the joint state and pair status to the headset, throttled.
+
+        Throttled to :data:`JOINT_BROADCAST_HZ`; call from the control loop
+        with the 16-DOF command ``out`` (see :meth:`compute_output`). Measured
+        positions are preferred when ``robot`` exposes them (``AxolArm``
+        ``positions``), falling back to the command in sim. Both teleop
+        adapters (``axol teleop`` and collect-data) send it, so the HUD's box
+        readout works in each.
+        """
+        if self._broadcast_json is None:
+            return
+        now = time.perf_counter()
+        if now - self._last_joint_broadcast < 1.0 / JOINT_BROADCAST_HZ:
+            return
+        self._last_joint_broadcast = now
+
+        from ..constants import urdf_arm_joint_names
+
+        left = out[:8]
+        right = out[8:]
+        for side in ("left", "right"):
+            try:
+                meas = getattr(getattr(robot, side, None), "positions", None)
+            except Exception:  # noqa: BLE001 - telemetry must never break the loop
+                meas = None
+            if meas is not None and len(meas) >= 8 and np.all(np.isfinite(meas[:8])):
+                if side == "left":
+                    left = np.asarray(meas)
+                else:
+                    right = np.asarray(meas)
+        q = {
+            name: round(float(v), 4)
+            for name, v in zip(urdf_arm_joint_names(is_left=True), left[:7])
+        }
+        q.update(
+            {
+                name: round(float(v), 4)
+                for name, v in zip(urdf_arm_joint_names(is_left=False), right[:7])
+            }
+        )
+        self._broadcast_json(
+            {
+                "type": "joints",
+                "value": {
+                    "q": q,
+                    "l_grip": round(float(left[7]), 3),
+                    "r_grip": round(float(right[7]), 3),
+                    "engaged": self.teleop_enabled,
+                    # Gripper-pair geometry from the IK worker: the headset
+                    # shows "aligned" when the pair already sits in the
+                    # box-mode grasp, i.e. a good moment to switch modes.
+                    "pair": self.pair_status,
+                },
+            }
+        )
 
     def _maybe_broadcast_urdf_state(self) -> None:
         """Push the URDF overlay state to the headset, throttled to ~60 Hz.

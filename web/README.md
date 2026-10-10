@@ -114,7 +114,7 @@ Each frame sends a JSON message over the WebSocket:
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
-  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 (unused: Jelly and box mode both ignore it)
+  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — box-mode elbows, like the left y (Jelly ignores it)
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
   r_stick_click: boolean  // right thumbstick pressed in — lift up while held (both together: box-mode toggle, sent as a `set` message)
   pose_source_id: string       // stable logical Quest id shared by USB, WebRTC, network, and reconnects

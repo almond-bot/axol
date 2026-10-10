@@ -31,7 +31,7 @@ from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import AxolConfig
 from almond_axol.rt import link as rt_link
 from almond_axol.teleop.config import VRTeleopConfig
-from almond_axol.teleop.core import BOX_SQUEEZE_JOINTS, VRTeleopCore
+from almond_axol.teleop.core import BOX_SQUEEZE_JOINTS, BOX_WRIST_JOINTS, VRTeleopCore
 from almond_axol.teleop.live import LiveSettings
 from almond_axol.teleop.teleop import VRTeleop
 
@@ -40,6 +40,9 @@ def _core(**overrides) -> VRTeleopCore:
     # The per-joint cap is opt-in (off by default, it slows a carry); these
     # tests exercise it, so turn it on unless a test says otherwise.
     overrides.setdefault("box_squeeze_torque", 6.0)
+    # Box mode's wrist cap has its own tests (WristCapTest); leave it out
+    # here so these see the shoulder cap alone.
+    overrides.setdefault("box_wrist_torque", 0.0)
     return VRTeleopCore(
         VRTeleopConfig(**{"gripper": "parcel", **overrides}),
         logging.getLogger("test"),
@@ -79,7 +82,8 @@ class CoreDecisionTest(unittest.TestCase):
             logging.getLogger("test"),
             broadcast_tracking=lambda _enabled: None,
         )
-        self.assertIsNone(core.spring_caps())
+        # Only box mode's default wrist cap remains.
+        self.assertEqual(core.spring_caps(), {Joint.WRIST_2: 5.0, Joint.WRIST_3: 5.0})
 
     def test_zero_disables(self) -> None:
         core = _core(box_mode=True, box_squeeze_torque=0.0)
@@ -100,6 +104,62 @@ class CoreDecisionTest(unittest.TestCase):
         core.set_live("box_mode", False)
         core._apply_live_requests()
         self.assertIsNone(core.spring_caps())
+
+
+class WristCapTest(unittest.TestCase):
+    """Box mode caps the wrists (``box_wrist_torque``); plain teleop doesn't."""
+
+    def _core(self, **overrides) -> VRTeleopCore:
+        return VRTeleopCore(
+            VRTeleopConfig(**{"gripper": "parcel", **overrides}),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+    def test_the_robot_config_leaves_the_wrists_uncapped(self) -> None:
+        cfg = AxolConfig()
+        for side in (cfg.left, cfg.right):
+            for joint in ARM_JOINTS:
+                self.assertEqual(getattr(side, joint.value).torque_limit, float("inf"))
+
+    def test_wrists_capped_only_in_box_mode(self) -> None:
+        self.assertEqual(BOX_WRIST_JOINTS, (Joint.WRIST_2, Joint.WRIST_3))
+        self.assertEqual(VRTeleopConfig().box_wrist_torque, 5.0)
+        core = self._core()
+        self.assertIsNone(core.spring_caps())
+        core.set_live("box_mode", True)
+        core._apply_live_requests()
+        self.assertEqual(core.spring_caps(), {Joint.WRIST_2: 5.0, Joint.WRIST_3: 5.0})
+        core.request_reset()
+        self.assertIsNone(core.spring_caps())
+
+    def test_wrist_and_shoulder_caps_combine(self) -> None:
+        core = self._core(box_mode=True, box_squeeze_torque=6.0)
+        self.assertEqual(
+            core.spring_caps(),
+            {
+                Joint.WRIST_2: 5.0,
+                Joint.WRIST_3: 5.0,
+                Joint.SHOULDER_2: 6.0,
+                Joint.SHOULDER_3: 6.0,
+            },
+        )
+
+    def test_clamp_force_limit_reads_the_box_wrist_cap(self) -> None:
+        # The squeeze lean's automatic clamp limit (joint_force_limit) works
+        # from box mode's effective caps, not the (uncapped) robot config.
+        from almond_axol.teleop.worker import box_joint_caps
+
+        caps = box_joint_caps(AxolConfig(), VRTeleopConfig())
+        for side in ("left", "right"):
+            for i, joint in enumerate(ARM_JOINTS):
+                want = 5.0 if joint in BOX_WRIST_JOINTS else float("inf")
+                self.assertEqual(caps[side][i], want, (side, joint))
+        off = box_joint_caps(AxolConfig(), VRTeleopConfig(box_wrist_torque=0.0))
+        self.assertTrue(np.all(np.isinf(off["left"])))
+
+    def test_zero_disables_the_wrist_cap(self) -> None:
+        self.assertIsNone(self._core(box_mode=True, box_wrist_torque=0.0).spring_caps())
 
 
 class ArmCommandTest(unittest.TestCase):

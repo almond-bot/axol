@@ -1873,6 +1873,15 @@ def _run_session(
                 set_caps(caps)
                 caps_applied = caps
 
+    def _clear_spring_caps() -> None:
+        # Session end: leave no squeeze cap on the robot object (as native
+        # teleop does), whatever state the last tick left.
+        nonlocal caps_applied
+        set_caps = getattr(getattr(robot, "axol", None), "set_spring_caps", None)
+        if set_caps is not None and caps_applied:
+            set_caps(None)
+        caps_applied = None
+
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control
     # thread shows up as gaps >> the 1/teleop_hz period); `slip` is how late the
@@ -3008,6 +3017,7 @@ def _run_session(
                     park.cancel()
         except BaseException:
             _logger.exception("return to rest before disconnect failed")
+        _cleanup("spring caps", _clear_spring_caps)
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its

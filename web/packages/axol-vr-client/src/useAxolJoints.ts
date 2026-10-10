@@ -8,7 +8,7 @@ export type AxolJointSample = AxolJointState & { receivedAt: number }
 /**
  * Mirrors the teleop server's live joint state as a frame-readable ref.
  *
- * The server pushes `{"type":"joints","value":{q, l_grip, r_grip, engaged}}`
+ * The server pushes `{"type":"joints","value":{q, l_grip, r_grip, engaged, pair}}`
  * ~20x/s over the teleop WebSocket (see `AxolJointState`); this hook keeps the
  * newest sample so a per-frame loop (the HUD's box-mode readout) can read it
  * without React re-renders. `null` until the first push on the current

@@ -753,7 +753,7 @@ def joint_force_limit(
     The clamp :func:`squeeze_lean` renders is a force along ``normal``
     through the contacts' centroid; statics puts ``|J^T w|`` of it on each
     joint. A joint with a spring-torque cap (``joint_caps``, Nm, ``inf``
-    for none — the wrists' 5 Nm) can't deliver more than that, and the
+    for none — box mode's 5 Nm on the wrists) can't deliver more than that, and the
     joint that saturates first is the one holding the moment that keeps the
     far contact pressed (``wrist_2``, ~0.13 Nm per N for the parcel
     gripper's facet and tip): past it every extra newton goes where that

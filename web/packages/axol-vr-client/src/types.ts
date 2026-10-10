@@ -65,7 +65,7 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
-  /** Right thumbstick y, [-1, 1], pushed forward = -1 (unused by the server today). */
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode elbows (either stick's y; Jelly ignores it). */
   r_stick_y?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean

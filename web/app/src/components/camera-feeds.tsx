@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, Maximize2, Minimize2, ShieldCheck, VideoOff } from "lucide-react"
 import { useAxolVideo, type CameraStreams } from "@almond/axol-vr-client"
 import { authorizeCert } from "@/lib/cert-accept"
-import { serverHttpBase } from "@/lib/supervisor"
+import { vrHostname } from "@/lib/vr-socket"
 import { Button } from "@/components/ui/button"
 
 /**
@@ -66,19 +66,7 @@ export function CameraFeeds({
   // signature of an unaccepted self-signed cert (or a server still starting).
   const [failedAttempts, setFailedAttempts] = useState(0)
 
-  // Bare hostname of the serve machine: the stored host may carry a scheme
-  // or the control-panel port; same-origin panels have no host at all.
-  const hostname = useMemo(() => {
-    const base = serverHttpBase(host)
-    if (base) {
-      try {
-        return new URL(base).hostname
-      } catch {
-        // fall through to the page's own host
-      }
-    }
-    return window.location.hostname
-  }, [host])
+  const hostname = useMemo(() => vrHostname(host), [host])
   const vrOrigin = `https://${hostname}:${vrPort}`
 
   // Own the WebSocket to the VR server, reconnecting while mounted: the

@@ -336,6 +336,38 @@ def _relative_target_np(
 # ---------------------------------------------------------------------------
 
 
+def box_joint_caps(
+    robot_config: object, config: VRTeleopConfig
+) -> dict[str, np.ndarray]:
+    """Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order, inf = none).
+
+    The configured ``JointConfig.torque_limit`` tightened by box mode's
+    session wrist cap (``config.box_wrist_torque`` on ``BOX_WRIST_JOINTS``,
+    what ``VRTeleopCore.spring_caps`` has the robot apply). The squeeze lean
+    holds the clamp under the force at which these saturate
+    (:func:`joint_force_limit`).
+    """
+    from ..constants import ARM_JOINTS
+    from .core import BOX_WRIST_JOINTS
+
+    wrist_cap = float(getattr(config, "box_wrist_torque", 0.0))
+    out: dict[str, np.ndarray] = {}
+    for side in ("left", "right"):
+        caps = np.array(
+            [
+                getattr(getattr(robot_config, side), j.value).torque_limit
+                for j in ARM_JOINTS
+            ],
+            dtype=np.float64,
+        )
+        if wrist_cap > 0.0:
+            for j in BOX_WRIST_JOINTS:
+                i = ARM_JOINTS.index(j)
+                caps[i] = min(caps[i], wrist_cap)
+        out[side] = caps
+    return out
+
+
 class IKWorker:
     """Self-contained IK controller for the subprocess.
 
@@ -486,73 +518,20 @@ class IKWorker:
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
         self._lean_model = None
-        # Each arm's spring-torque caps (Nm, ARM_JOINTS order; inf for none):
-        # the clamp is held under the force at which they saturate.
+        # Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order;
+        # inf for none): the configured torque_limit, tightened by the
+        # session's box_wrist_torque on the wrists (what the core caps them
+        # at in box mode). The clamp is held under the force at which they
+        # saturate.
         self._joint_caps: dict[str, np.ndarray] | None = None
         try:
-            from ..constants import ARM_JOINTS
             from ..robot.config import AxolConfig
             from ..robot.gravity import GravityCompensator
 
             self._lean_model = GravityCompensator()
-            robot_cfg = AxolConfig()
-            self._joint_caps = {
-                side: np.array(
-                    [
-                        getattr(getattr(robot_cfg, side), j.value).torque_limit
-                        for j in ARM_JOINTS
-                    ],
-                    dtype=np.float64,
-                )
-                for side in ("left", "right")
-            }
+            self._joint_caps = box_joint_caps(AxolConfig(), config)
         except Exception:  # noqa: BLE001 - the lean is optional
             _logger.exception("arm model unavailable; box mode's squeeze lean is off")
-
-        # Absolute (Mantis) mode state: the world-anchored base transform solved
-        # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
-        # raw VR world frame — plus each controller's rigid controller→TCP
-        # offset ``(p_off, R_off)`` expressed in the controller's local frame.
-        # ``_abs_active`` is the whole-session engage toggle (absolute mode
-        # has no per-arm freeze — both grips engage, both release).
-        self._abs_active: bool = False
-        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
-        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        # Tracker→gripper transforms (the rig's factory design constants, or
-        # per-unit file overrides — see almond_axol.mantis.calibration), per
-        # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
-        # When present for a side, engage uses it verbatim instead of
-        # absorbing the mount offset into the engage snapshot.
-        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for side, tf in (
-            ("left", config.tcp_transform_left),
-            ("right", config.tcp_transform_right),
-        ):
-            if tf is not None:
-                self._tcp_transforms[side] = (
-                    np.asarray(tf[:3], dtype=np.float64),
-                    _quat_xyzw_to_matrix(*tf[3:]).astype(np.float64),
-                )
-        # Quaternion sign continuity for the calibrated pose mapping (see
-        # :meth:`_apply_tcp_transform`).
-        self._last_mapped_quat: dict[str, np.ndarray] = {}
-        if self._tcp_transforms and config.absolute_mode:
-            _logger.info(
-                "absolute mode: using calibrated tracker→gripper transforms for %s",
-                sorted(self._tcp_transforms),
-            )
-        # JSON-safe copy of the base transform for the headset (VR world
-        # coords), so the web client can render the URDF at the engage-
-        # calibrated base. ``None`` until the first engage.
-        self.abs_base_msg: dict[str, list[float]] | None = None
-        # Latest absolute-mode TCP target per side, in the robot base frame:
-        # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
-        # tracked ground-truth pose the IK solver chases — Mantis data collection
-        # records it per row so training can use raw TCP trajectories instead
-        # of (or alongside) the IK joint solutions. Holds the last engaged
-        # target while disengaged (mirroring the latched virtual joints);
-        # seeded from rest FK (below) so it is never ``None`` in absolute mode.
-        self.last_tcp_msg: dict[str, list[float]] | None = None
 
         # Pose-stream smoothing (see LagCompensatedLowPass for why this is a
         # linear filter and not OneEuro). Nominal rate is the VR-frame / IK
@@ -1415,7 +1394,8 @@ class IKWorker:
         torque caps set a second, automatic cap (:func:`joint_force_limit`,
         ``_JOINT_CAP_MARGIN`` of it, the lower arm's for both): ``wrist_2``
         holds the moment that keeps the tip pressed and saturates first,
-        at ~39 N of even clamp at its 5 Nm, and squeezing past that only
+        at ~39 N of even clamp at box mode's 5 Nm wrist cap
+        (``box_wrist_torque``), and squeezing past that only
         unloads the tip onto the facet — so the clamp stops there, both
         contacts pressed, however far the width is jogged.
 

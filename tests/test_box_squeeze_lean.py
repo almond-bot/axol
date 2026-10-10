@@ -55,18 +55,20 @@ from almond_axol.teleop.box import (
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore, measured_arms
 from almond_axol.teleop.live import LiveSettings
-from almond_axol.teleop.worker import _JOINT_CAP_MARGIN, _LEAN_TAU_S, IKWorker
+from almond_axol.teleop.worker import (
+    _JOINT_CAP_MARGIN,
+    _LEAN_TAU_S,
+    IKWorker,
+    box_joint_caps,
+)
 
 _CFG = AxolConfig()
 _GC = GravityCompensator(_CFG)
 _KP_L = np.array([float(getattr(_CFG.left, j.value).kp) for j in ARM_JOINTS])
 _KP_R = np.array([float(getattr(_CFG.right, j.value).kp) for j in ARM_JOINTS])
-_CAPS = {
-    side: np.array(
-        [getattr(getattr(_CFG, side), j.value).torque_limit for j in ARM_JOINTS]
-    )
-    for side in ("left", "right")
-}
+# Box mode's effective caps: the robot config (uncapped) tightened by the
+# session wrist cap (box_wrist_torque, 5 Nm on wrist_2 / wrist_3).
+_CAPS = box_joint_caps(_CFG, VRTeleopConfig())
 # Elbow bent, hand ahead of the shoulder at about box height.
 _Q_BOX_L = np.array([0.4, -0.15, 0.1, 1.2, 0.0, 0.3, 0.0])
 _Q_BOX_R = np.array([0.4, 0.15, -0.1, 1.2, 0.0, -0.3, 0.0])

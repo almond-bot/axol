@@ -1075,9 +1075,14 @@ class AxolVRTeleop(Teleoperator):
         """Push an arbitrary JSON message to the headset (fire-and-forget).
 
         Used by the shared core for the URDF overlay state in absolute (Mantis)
-        mode. Safe to call from any thread.
+        mode and the ~20 Hz joint/pair-status push. Skipped with no headset
+        connected. Safe to call from any thread.
         """
-        if self._vr_server is None or self._loop is None:
+        if (
+            self._vr_server is None
+            or self._loop is None
+            or not self._vr_server.connected
+        ):
             return
         try:
             asyncio.run_coroutine_threadsafe(
@@ -1173,6 +1178,8 @@ class AxolVRTeleop(Teleoperator):
             if out is not None:
                 self._q_out = out
             q = self._q_out
+        if out is not None:
+            self._core.maybe_broadcast_joints(out, self.measured_robot)
         # The core's output layout is fixed at (16,): left arm at [0:8], right
         # at [8:16], grips in slots 7/15. On the gripperless SKU the shorter
         # key lists simply skip the grip slots.

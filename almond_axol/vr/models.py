@@ -171,7 +171,8 @@ class VRFrame(BaseModel):
         r_stick_x: Right thumbstick x, [-1, 1], right = +1. Drives Jelly's
             rotation.
         r_stick_y: Right thumbstick y, [-1, 1], pushed forward = -1. Unused
-            by Jelly; in box mode it tilts the fingertips.
+            by Jelly; in box mode, while a grip leads the pair, either
+            stick's forward/back moves the elbows (``box_elbow_out``).
         l_stick_click: Left thumbstick pressed in — lift down while held.
         r_stick_click: Right thumbstick pressed in — lift up while held.
             While a box-mode leader is engaged a single click (and release)

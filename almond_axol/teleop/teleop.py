@@ -41,7 +41,7 @@ import time
 
 import numpy as np
 
-from ..constants import PARK_TIMEOUT_S, urdf_arm_joint_names
+from ..constants import PARK_TIMEOUT_S
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
     HardwareCleanupError,
@@ -71,10 +71,6 @@ _logger = logging.getLogger(__name__)
 # cycle, and releases the GIL, so the VR/IK threads are unaffected. The
 # hybrid measured 79 us mean wakeup error, 8x better than plain asyncio.
 _FINE_SLEEP = 0.0015
-
-# Rate of the joint-state push that drives the headset HUD's box-mode readout
-# (pair status). A ~200 B JSON message; negligible next to the pose stream.
-_JOINT_BROADCAST_HZ = 20.0
 
 # How long teardown waits for the arms to report their positions before it
 # treats the bus as gone and skips the return-to-rest.
@@ -229,9 +225,6 @@ class VRTeleop:
         # from `set` messages off any client, published back as `settings`.
         self._live = LiveSettings(self._core, robot, self._publish_settings)
         self._vr_server.set_on_setting(self._live.apply)
-        # Wall time of the last joint-state push to the headset (HUD pair
-        # status), throttled to _JOINT_BROADCAST_HZ on the control loop.
-        self._last_joint_broadcast: float = 0.0
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -339,64 +332,23 @@ class VRTeleop:
 
         The VR app uses it to allow screen repositioning (trigger grabs) only
         while the robot isn't being controlled. Safe to call from any thread.
+        Goes through :meth:`VRServer.broadcast_tracking`, which also stores the
+        state for headsets that connect later (even with nobody connected now).
         """
-        self._broadcast_json({"type": "tracking", "value": enabled})
+        if self._vr_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_tracking(enabled), self._vr_loop
+            )
+        except RuntimeError:
+            pass  # VR loop already shut down
 
     def _publish_settings(self, snapshot: dict) -> None:
         """Push the live-settings snapshot to every client and store it for
         late joiners (see :class:`LiveSettings`)."""
         self._vr_server.set_announce("settings", snapshot)
         self._broadcast_json({"type": "settings", "value": snapshot})
-
-    def _broadcast_joints(self, out: np.ndarray) -> None:
-        """Push the commanded joint state to the headset for the HUD.
-
-        Throttled to ``_JOINT_BROADCAST_HZ``; ``out`` is the 16-DOF command
-        (see :meth:`VRTeleopCore.compute_output`). Measured positions are
-        preferred when the robot exposes them (hand-guided arms then show
-        where they really are), falling back to the command in sim.
-        """
-        now = time.perf_counter()
-        if now - self._last_joint_broadcast < 1.0 / _JOINT_BROADCAST_HZ:
-            return
-        self._last_joint_broadcast = now
-        left = out[:8]
-        right = out[8:]
-        for side in ("left", "right"):
-            try:
-                meas = getattr(getattr(self._robot, side, None), "positions", None)
-            except Exception:  # noqa: BLE001 - telemetry must never break the loop
-                meas = None
-            if meas is not None and len(meas) >= 8 and np.all(np.isfinite(meas[:8])):
-                if side == "left":
-                    left = np.asarray(meas)
-                else:
-                    right = np.asarray(meas)
-        q = {
-            name: round(float(v), 4)
-            for name, v in zip(urdf_arm_joint_names(is_left=True), left[:7])
-        }
-        q.update(
-            {
-                name: round(float(v), 4)
-                for name, v in zip(urdf_arm_joint_names(is_left=False), right[:7])
-            }
-        )
-        self._broadcast_json(
-            {
-                "type": "joints",
-                "value": {
-                    "q": q,
-                    "l_grip": round(float(left[7]), 3),
-                    "r_grip": round(float(right[7]), 3),
-                    "engaged": self._core.teleop_enabled,
-                    # Gripper-pair geometry from the IK worker: the headset
-                    # shows "aligned" when the pair already sits in the
-                    # box-mode grasp, i.e. a good moment to switch modes.
-                    "pair": self._core.pair_status,
-                },
-            }
-        )
 
     def _broadcast_json(self, payload: dict) -> None:
         """Fire-and-forget a JSON message to every headset. Safe from any thread."""
@@ -1157,7 +1109,7 @@ class VRTeleop:
         out = self._core.compute_output()
         if out is None:
             return None, None
-        self._broadcast_joints(out)
+        self._core.maybe_broadcast_joints(out, self._robot)
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:

@@ -45,6 +45,7 @@ import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
+import { useVrSocket } from "@/lib/vr-socket"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -318,6 +319,9 @@ export function OperationPanel({
   // teleop is grippers-only: no VR server or cameras run, so no feeds; an
   // arms-off (Jelly-only) teleop relays no headset video either.
   const showFeeds = meta.usesHeadset && !isSim && !armsOff && !(mantisMode && meta.id === "teleop")
+  // Live session settings come from the VR server, which every headset run
+  // starts (sim and arms-off included) except grippers-only Mantis teleop.
+  const showSettings = meta.usesHeadset && !(mantisMode && meta.id === "teleop")
   const camCount = recordingCameraCount(cameras, mantisMode)
   const currentTrackerReadinessState =
     trackerReadinessSource === mantisSource ? trackerReadinessState : "loading"
@@ -585,11 +589,12 @@ export function OperationPanel({
                   Mantis teleop is grippers-only (no cameras). Mantis collection
                   still relays its configured wrist-camera feeds even when
                   Lighthouse/Ultimate make the headset unnecessary. */}
-              {live && (meta.episodeControl || showFeeds) && (
+              {live && (meta.episodeControl || showFeeds || showSettings) && (
                 <OperatorDeck
                   label={meta.label}
                   episodeControl={meta.episodeControl}
                   showFeeds={showFeeds}
+                  showSettings={showSettings}
                   policy={policy}
                   onEpisode={onEpisode}
                   host={host}
@@ -789,6 +794,7 @@ function OperatorDeck({
   label,
   episodeControl,
   showFeeds,
+  showSettings,
   policy,
   onEpisode,
   host,
@@ -797,6 +803,7 @@ function OperatorDeck({
   label: string
   episodeControl: boolean
   showFeeds: boolean
+  showSettings: boolean
   policy: PolicyState | null
   onEpisode: (command: string) => void
   host: string
@@ -809,6 +816,8 @@ function OperatorDeck({
   // The open VR-server socket from the camera-feed card, shared with the live
   // session-settings card (null while disconnected).
   const [vrSocket, setVrSocket] = useState<WebSocket | null>(null)
+  // Without the feed card (sim, arms-off) the settings card connects itself.
+  const ownSocket = useVrSocket(host, vrPort, showSettings && !showFeeds)
 
   function toggleFullscreen() {
     const next = !fullscreen
@@ -852,7 +861,7 @@ function OperatorDeck({
           onSocket={setVrSocket}
         />
       )}
-      {showFeeds && !fullscreen && <SessionSettings socket={vrSocket} />}
+      {showSettings && !fullscreen && <SessionSettings socket={showFeeds ? vrSocket : ownSocket} />}
       {hud?.confirm && <ConfirmPopup action={hud.confirm} policy={policy} />}
     </>
   )

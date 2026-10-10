@@ -26,6 +26,7 @@ import {
   type ConfirmAction,
   axolHttpsOrigin,
   formatSettingValue,
+  nextSettingValue,
   useAxolControlChannel,
   useAxolJoints,
   useAxolPoseSocket,
@@ -1067,7 +1068,9 @@ function ToolsRow({
           label={boxLabel}
           active={boxMode}
           accent={!boxMode && aligned ? "#38bdf8" : undefined}
-          onClick={() => onSet("box_mode", !boxMode)}
+          // "toggle" flips server-side, so a stale local copy can't send the
+          // wrong value (same as the both-sticks gesture).
+          onClick={() => onSet("box_mode", "toggle")}
         />
       )}
       {reengage !== null && reengage !== "" && (
@@ -1147,7 +1150,13 @@ function SettingsPanel({
             >
               {def.label}
             </HudText>
-            <SettingsStepper x={0.045} y={y} label="-" onClick={() => onStep(def, -1)} />
+            <SettingsStepper
+              x={0.045}
+              y={y}
+              label="-"
+              disabled={nextSettingValue(def, value, -1) === undefined}
+              onClick={() => onStep(def, -1)}
+            />
             <HudText
               position={[0.095, y, 0]}
               fontSize={0.012}
@@ -1161,7 +1170,13 @@ function SettingsPanel({
             >
               {shown}
             </HudText>
-            <SettingsStepper x={0.145} y={y} label="+" onClick={() => onStep(def, 1)} />
+            <SettingsStepper
+              x={0.145}
+              y={y}
+              label="+"
+              disabled={nextSettingValue(def, value, 1) === undefined}
+              onClick={() => onStep(def, 1)}
+            />
           </group>
         )
       })}
@@ -1173,11 +1188,14 @@ function SettingsStepper({
   x,
   y,
   label,
+  disabled = false,
   onClick,
 }: {
   x: number
   y: number
   label: string
+  // At the end of a number's range: dimmed and inert, like the panel's.
+  disabled?: boolean
   onClick: () => void
 }) {
   const [hovered, setHovered] = useState(false)
@@ -1186,14 +1204,14 @@ function SettingsStepper({
       position={[x, y, 0]}
       fontSize={0.014}
       fontWeight="bold"
-      color={hovered ? "yellow" : "#9ca3af"}
+      color={disabled ? "#4b5563" : hovered ? "yellow" : "#9ca3af"}
       anchorX="center"
       anchorY="top"
       renderOrder={1000}
       material-depthTest={false}
       onPointerOver={() => setHovered(true)}
       onPointerOut={() => setHovered(false)}
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
     >
       {`[${label}]`}
     </HudText>
@@ -1243,12 +1261,17 @@ function HelpPanel({
   mode,
   boxMode,
   boxAvailable,
+  rampAvailable,
+  settingsAvailable,
   poseSourceKind,
 }: {
   onDismiss: () => void
   mode: AxolMode | null
   boxMode: boolean
   boxAvailable: boolean
+  // The tools-row buttons exist only once the server announces its settings.
+  rampAvailable: boolean
+  settingsAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const W = 0.44
@@ -1289,8 +1312,8 @@ function HelpPanel({
               ]
             : [
                 "[Grip]  Engage / Freeze Arm",
-                "[Ramp]  Arm Comes To Hand",
-                "[Settings]  Live Tuning",
+                ...(rampAvailable ? ["[Ramp]  Arm Comes To Hand"] : []),
+                ...(settingsAvailable ? ["[Settings]  Live Tuning"] : []),
               ]),
         ]),
   ].join("\n")
@@ -1378,11 +1401,15 @@ function HelpIcon({
   mode,
   boxMode,
   boxAvailable,
+  rampAvailable,
+  settingsAvailable,
   poseSourceKind,
 }: {
   mode: AxolMode | null
   boxMode: boolean
   boxAvailable: boolean
+  rampAvailable: boolean
+  settingsAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const [open, setOpen] = useState(false)
@@ -1408,6 +1435,8 @@ function HelpIcon({
           mode={mode}
           boxMode={boxMode}
           boxAvailable={boxAvailable}
+          rampAvailable={rampAvailable}
+          settingsAvailable={settingsAvailable}
           poseSourceKind={poseSourceKind}
         />
       )}
@@ -1919,6 +1948,8 @@ export default function App() {
                 mode={vrMode}
                 boxMode={boxMode}
                 boxAvailable={boxAvailable}
+                rampAvailable={!!reengage}
+                settingsAvailable={settings != null}
                 poseSourceKind={poseSourceKind}
               />
               <StateDisplay

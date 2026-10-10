@@ -22,8 +22,9 @@ import { cn } from "@/lib/utils"
  * nothing until the server announces its settings (an older operation has
  * none).
  *
- * `socket` is the open VR-server connection owned by `CameraFeeds` (see its
- * `onSocket`), null while disconnected.
+ * `socket` is the open VR-server connection — the camera-feed card's (see
+ * its `onSocket`), or the panel's own when no feeds are shown (sim,
+ * arms-off; see `useVrSocket`) — null while disconnected.
  */
 export function SessionSettings({ socket }: { socket: WebSocket | null }) {
   // useAxolSettings wants a ref; a fresh object per socket re-runs its
