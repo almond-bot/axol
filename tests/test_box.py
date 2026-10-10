@@ -1,0 +1,1695 @@
+"""Box-mode geometry, stick control (width / tilt) and the live-setting toggle."""
+
+from __future__ import annotations
+
+import logging
+import math
+import time
+import types
+import unittest
+
+import numpy as np
+
+from almond_axol.teleop.box import (
+    PARCEL_FACET_DEG,
+    URDF_TOOL,
+    BoxState,
+    ToolGeometry,
+    approach_axis,
+    box_frame,
+    box_targets,
+    choose_faces,
+    elbow_swivel_hint,
+    ideal_gripper_poses,
+    pair_aligned,
+    parallel_grip_rel,
+    parcel_tool,
+    rodrigues,
+    rotation_angle,
+    side_clamp_rotation,
+    snap_box,
+    swivel_step,
+    tip_inward_sign,
+    toe_out,
+    twist_about,
+)
+from almond_axol.teleop.config import VRTeleopConfig
+from almond_axol.teleop.core import VRTeleopCore
+from almond_axol.teleop.live import LiveSettings
+from almond_axol.teleop.worker import (
+    _BOX_POSE_WEIGHT_SCALE,
+    _ELBOW_HINT_STEP_M,
+    IKWorker,
+    _dominant_axis,
+)
+from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
+
+_UP = np.array((0.0, 0.0, 1.0))
+_FWD = np.array((1.0, 0.0, 0.0))
+_LAT = np.array((0.0, 1.0, 0.0))
+
+# Wedge half-angle of the closed fingers (see the gripper drawing: 68 mm at
+# the heel narrowing to 15.5 mm over 74 mm).
+_WEDGE = math.atan((68.0 - 15.49) / 2.0 / 74.34)
+
+
+def _rot_x(angle: float) -> np.ndarray:
+    return rodrigues(np.array((1.0, 0.0, 0.0)), angle)
+
+
+def _rot_z(angle: float) -> np.ndarray:
+    return rodrigues(_UP, angle)
+
+
+def _face_normal(face: float, wedge: float) -> np.ndarray:
+    """Outward normal (gripper frame) of the flat finger face on the ``face`` side.
+
+    The fingers point along -Z and narrow toward the tip, so the face tilts
+    toward the tip by the wedge half-angle.
+    """
+    return np.array((face * math.cos(wedge), 0.0, -math.sin(wedge)))
+
+
+class SideClampRotationTest(unittest.TestCase):
+    def test_fingers_point_forward_and_a_flat_face_toward_the_box(self) -> None:
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            for face in (1.0, -1.0):
+                with self.subTest(side=side, face=face):
+                    r = side_clamp_rotation(sign, face, 0.0)
+                    # Proper rotation.
+                    np.testing.assert_allclose(r.T @ r, np.eye(3), atol=1e-6)
+                    self.assertAlmostEqual(float(np.linalg.det(r)), 1.0, places=5)
+                    # Fingers along the box +x ...
+                    np.testing.assert_allclose(approach_axis(r), _FWD, atol=1e-6)
+                    # ... and the chosen ±X face toward the centre: the left
+                    # gripper sits at +y, so its face points -y.
+                    palm = r @ np.array((face, 0.0, 0.0))
+                    np.testing.assert_allclose(palm, -sign * _LAT, atol=1e-6)
+
+    def test_grippers_are_parallel_not_facing(self) -> None:
+        left = side_clamp_rotation(1.0, 1.0, 0.0)
+        right = side_clamp_rotation(-1.0, 1.0, 0.0)
+        self.assertGreater(
+            float(np.dot(approach_axis(left), approach_axis(right))), 0.999
+        )
+
+    def test_tilt_turns_fingertips_inward_and_lays_the_wedge_face_flat(self) -> None:
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            for face in (1.0, -1.0):
+                with self.subTest(side=side, face=face):
+                    r = side_clamp_rotation(sign, face, _WEDGE)
+                    app = r @ np.array((0.0, 0.0, -1.0))
+                    # Still level, still mostly forward, tipped toward the centre.
+                    self.assertAlmostEqual(float(app[2]), 0.0, places=6)
+                    self.assertAlmostEqual(float(app[0]), math.cos(_WEDGE), places=6)
+                    self.assertAlmostEqual(
+                        float(app[1]), -sign * math.sin(_WEDGE), places=6
+                    )
+                    # The wedge face turned toward the box is now exactly
+                    # vertical and normal to the box side.
+                    n = r @ _face_normal(face, _WEDGE)
+                    np.testing.assert_allclose(n, -sign * _LAT, atol=1e-6)
+
+
+class ParallelGripRelTest(unittest.TestCase):
+    def test_picks_the_face_needing_the_smaller_turn(self) -> None:
+        rot = np.eye(3, dtype=np.float32)
+        for face in (1.0, -1.0):
+            with self.subTest(face=face):
+                # Start each gripper a little off the +face / -face grasp.
+                start = {
+                    side: _rot_x(0.2) @ side_clamp_rotation(sign, face, 0.0)
+                    for side, sign in (("left", 1.0), ("right", -1.0))
+                }
+                rel = parallel_grip_rel(start, rot, 0.0)
+                for side, sign in (("left", 1.0), ("right", -1.0)):
+                    np.testing.assert_allclose(
+                        rel[side], side_clamp_rotation(sign, face, 0.0), atol=1e-6
+                    )
+                    # Never more than the perturbation away.
+                    self.assertLess(rotation_angle(start[side], rot @ rel[side]), 0.21)
+
+    def test_never_turns_a_wrist_more_than_a_quarter_turn_about_the_fingers(
+        self,
+    ) -> None:
+        # Every roll about the approach axis is within 90° of one of the two
+        # flat faces, so the blend never has to swing through 180°.
+        rot = np.eye(3, dtype=np.float32)
+        for roll in np.linspace(-math.pi, math.pi, 25):
+            start = {
+                side: side_clamp_rotation(sign, 1.0, 0.0)
+                @ rodrigues(np.array((0.0, 0.0, 1.0)), roll)
+                for side, sign in (("left", 1.0), ("right", -1.0))
+            }
+            rel = parallel_grip_rel(start, rot, 0.0)
+            for side in ("left", "right"):
+                self.assertLessEqual(
+                    rotation_angle(start[side], rot @ rel[side]), math.pi / 2 + 1e-6
+                )
+
+    def test_relative_rotations_follow_a_yawed_box(self) -> None:
+        rot = _rot_z(0.7)
+        start = {
+            side: rot @ side_clamp_rotation(sign, -1.0, 0.0)
+            for side, sign in (("left", 1.0), ("right", -1.0))
+        }
+        rel = parallel_grip_rel(start, rot, 0.0)
+        for side in ("left", "right"):
+            self.assertLess(rotation_angle(start[side], rot @ rel[side]), 1e-5)
+
+
+def _pair(width: float, face: float = 1.0, tilt: float = 0.0, yaw: float = 0.0):
+    rot = _rot_z(yaw)
+    center = np.array((0.4, 0.0, 0.3), dtype=np.float32)
+    half = 0.5 * width * rot[:, 1]
+    left = (
+        center + half,
+        (rot @ side_clamp_rotation(1.0, face, tilt)).astype(np.float32),
+    )
+    right = (
+        center - half,
+        (rot @ side_clamp_rotation(-1.0, face, tilt)).astype(np.float32),
+    )
+    return left, right
+
+
+class PairAlignedTest(unittest.TestCase):
+    def test_side_clamping_pair_is_aligned(self) -> None:
+        # Whatever its heading: the box frame yaws with the pair.
+        for face in (1.0, -1.0):
+            for yaw in (0.0, 0.9):
+                left, right = _pair(0.3, face=face, yaw=yaw)
+                self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_facing_pair_is_not_aligned(self) -> None:
+        # The old geometry — approach axes pointing at each other.
+        left_rot = np.stack([_FWD, _UP, _LAT], axis=1).astype(np.float32)
+        right_rot = np.stack([_FWD, -_UP, -_LAT], axis=1).astype(np.float32)
+        left = (np.array((0.4, 0.15, 0.3), np.float32), left_rot)
+        right = (np.array((0.4, -0.15, 0.3), np.float32), right_rot)
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_width_outside_the_range_is_not_aligned(self) -> None:
+        left, right = _pair(0.9)
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_tolerance_bounds_the_deviation(self) -> None:
+        left, right = _pair(0.3)
+        tilted_left = (
+            left[0],
+            (_rot_x(math.radians(20.0)) @ left[1]).astype(np.float32),
+        )
+        self.assertTrue(pair_aligned(tilted_left, right, 0.1, 0.7, 0.0, 25.0))
+        self.assertFalse(pair_aligned(tilted_left, right, 0.1, 0.7, 0.0, 15.0))
+
+    def test_tilt_is_part_of_the_target(self) -> None:
+        left, right = _pair(0.3, tilt=_WEDGE)
+        self.assertTrue(pair_aligned(left, right, 0.1, 0.7, _WEDGE, 5.0))
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 5.0))
+
+
+class SnapBoxTest(unittest.TestCase):
+    def test_snap_keeps_midpoint_and_width_and_lands_on_the_side_clamp(self) -> None:
+        left = (np.array((0.4, 0.2, 0.35), np.float32), _rot_x(0.3).astype(np.float32))
+        right = (
+            np.array((0.4, -0.2, 0.25), np.float32),
+            _rot_z(-0.4).astype(np.float32),
+        )
+        state = snap_box(
+            left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
+        )
+        np.testing.assert_allclose(state.center, (0.4, 0.0, 0.3), atol=1e-6)
+        # The grip width is the lateral separation of the contact faces —
+        # for the URDF gripper, of the mounts — not their 3-D distance: the
+        # frame levels the pair, and the box is as wide as they are apart.
+        self.assertAlmostEqual(state.width, 0.4, places=6)
+        ideal = ideal_gripper_poses(
+            state.center, state.rot, state.width, state.grip_rel()
+        )
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = ideal[side]
+            np.testing.assert_allclose(approach_axis(rot), _FWD, atol=1e-6)
+            # The flat face toward the centre is one of the two ±X sides.
+            palm_x = rot @ np.array((1.0, 0.0, 0.0))
+            self.assertAlmostEqual(abs(float(palm_x[1])), 1.0, places=6)
+            self.assertAlmostEqual(float(pos[1]), sign * state.width / 2, places=6)
+            self.assertAlmostEqual(float(pos[2]), 0.3, places=6)
+
+    def test_align_blend_starts_where_the_grippers_were(self) -> None:
+        left = (np.array((0.4, 0.2, 0.35), np.float32), _rot_x(0.3).astype(np.float32))
+        right = (
+            np.array((0.4, -0.2, 0.25), np.float32),
+            _rot_z(-0.4).astype(np.float32),
+        )
+        state = snap_box(
+            left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
+        )
+        at_start = box_targets(state, state.center, state.rot, now=0.0)
+        np.testing.assert_allclose(at_start["left"][0], left[0], atol=1e-6)
+        np.testing.assert_allclose(at_start["left"][1], left[1], atol=1e-6)
+        np.testing.assert_allclose(at_start["right"][0], right[0], atol=1e-6)
+        at_end = box_targets(state, state.center, state.rot, now=2.0)
+        ideal = ideal_gripper_poses(
+            state.center, state.rot, state.width, state.grip_rel()
+        )
+        np.testing.assert_allclose(at_end["left"][1], ideal["left"][1], atol=1e-6)
+        self.assertTrue(state.aligned)
+
+    def test_box_frame_is_level_with_lateral_from_right_to_left(self) -> None:
+        # One gripper ahead of and above the other: the frame is level (z up)
+        # and headed along the horizontal right-to-left direction.
+        center, rot, width = box_frame(
+            np.array((0.5, 0.2, 0.4)), np.array((0.3, -0.2, 0.2))
+        )
+        np.testing.assert_allclose(center, (0.4, 0.0, 0.3), atol=1e-6)
+        np.testing.assert_allclose(rot[:, 2], _UP, atol=1e-6)
+        np.testing.assert_allclose(
+            rot[:, 1], np.array((0.2, 0.4, 0.0)) / math.hypot(0.2, 0.4), atol=1e-6
+        )
+        self.assertAlmostEqual(width, math.sqrt(0.04 + 0.16 + 0.04), places=6)
+
+    def test_snap_keeps_the_pairs_heading(self) -> None:
+        # A pair frozen at a 40° heading and led again must not swing back
+        # square: the snap frame is the pair's own heading, level.
+        left, right = _pair(0.3, yaw=0.7)
+        state = snap_box(
+            left, right, now=0.0, align_duration=1.0, width_min=0.1, width_max=0.7
+        )
+        np.testing.assert_allclose(state.rot, _rot_z(0.7), atol=1e-6)
+        ideal = ideal_gripper_poses(
+            state.center, state.rot, state.width, state.grip_rel()
+        )
+        for side in ("left", "right"):
+            np.testing.assert_allclose(
+                ideal[side][0], (left if side == "left" else right)[0], atol=1e-6
+            )
+            np.testing.assert_allclose(
+                ideal[side][1], (left if side == "left" else right)[1], atol=1e-6
+            )
+
+    def test_twist_about_extracts_the_yaw_of_a_tilted_hand(self) -> None:
+        # Pure yaw comes back exactly, however the hand is otherwise held
+        # (a turn about the room's up is a turn about the room's up whatever
+        # the hand's pitch at the time), and a pure roll or pitch has none.
+        for yaw in (0.0, 0.4, -1.2, 2.5):
+            self.assertAlmostEqual(twist_about(_rot_z(yaw), _UP), yaw, places=6)
+            for tilt in (_rot_x(0.6), rodrigues(_LAT, -0.8)):
+                self.assertAlmostEqual(
+                    twist_about(_rot_z(yaw) @ tilt, _UP), yaw, places=6
+                )
+        self.assertAlmostEqual(twist_about(_rot_x(0.8), _UP), 0.0, places=6)
+        self.assertAlmostEqual(twist_about(rodrigues(_LAT, 0.8), _UP), 0.0, places=6)
+        # Roll and pitch together do couple a little into the twist (the
+        # swing-twist split is not an Euler yaw), but only a little.
+        self.assertLess(abs(twist_about(_rot_x(0.6) @ rodrigues(_LAT, -0.3), _UP)), 0.1)
+
+
+def _parcel_pair(width: float, tool: ToolGeometry, face: float, tilt: float = 0.0):
+    """Ideal parcel-gripper pair for a square box frame at ``_pair``'s centre."""
+    rot = np.eye(3, dtype=np.float32)
+    center = np.array((0.4, 0.0, 0.3), dtype=np.float32)
+    rel = {
+        side: side_clamp_rotation(sign, face, tilt + tool.flush_tilt)
+        for side, sign in (("left", 1.0), ("right", -1.0))
+    }
+    feet = {side: tool.foot(face) for side in ("left", "right")}
+    return ideal_gripper_poses(center, rot, width, rel, feet)
+
+
+class ParcelToolTest(unittest.TestCase):
+    """The parcel gripper's contact geometry: the blade folded flat at its
+    stop, its face what box mode places ``width`` apart, and the angled
+    grasp a turn of each gripper inward about that face."""
+
+    def test_the_angled_yaw_is_the_setting(self) -> None:
+        self.assertAlmostEqual(math.degrees(parcel_tool(39.0).flush_tilt), 39.0)
+        self.assertAlmostEqual(math.degrees(parcel_tool(30.0).flush_tilt), 30.0)
+        self.assertEqual(URDF_TOOL.flush_tilt, 0.0)
+        np.testing.assert_array_equal(URDF_TOOL.foot(1.0), np.zeros(3))
+
+    def test_the_foot_is_the_plate_edge_in_both_grasps(self) -> None:
+        # The folded plate's face is 41.5 mm toward the box; its front edge,
+        # where the chamfer facet starts, 54 mm ahead of the mount.
+        for flush_deg in (0.0, 39.0):
+            for grasp in ("straight", "flush"):
+                tool = parcel_tool(flush_deg, grasp)
+                self.assertAlmostEqual(tool.foot_fwd, 0.0542, places=9)
+                self.assertAlmostEqual(tool.foot_in, 0.0415, places=9)
+
+    def test_the_facet_and_tip_lie_on_the_box_side_at_the_chamfer_angle(self) -> None:
+        # Turned by the chamfer's angle about the edge, the facet's and the
+        # tip's contacts are all on the plane the plate's face was on.
+        tool = parcel_tool(PARCEL_FACET_DEG)
+        ideal = _parcel_pair(0.30, tool, 1.0)
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = ideal[side]
+            for c in tool.contacts(1.0):
+                lateral = float((pos + rot @ c)[1])
+                self.assertAlmostEqual(lateral, sign * 0.15, delta=0.0005)
+
+    def test_min_width_keeps_the_bodies_apart(self) -> None:
+        # The parcel gripper's contact faces are proud of its body in both
+        # grasps: only the clearance is left.
+        for grasp in ("straight", "flush"):
+            tool = parcel_tool(39.0, grasp)
+            self.assertAlmostEqual(tool.min_width(0.01), 0.01, places=9)
+        # The stock gripper's face is on the mount axis and the 67 mm wrists
+        # close with the width — a centimetre apart at 77 mm.
+        self.assertAlmostEqual(URDF_TOOL.min_width(0.01), 0.077, places=9)
+        self.assertAlmostEqual(URDF_TOOL.min_width(0.0), 0.067, places=9)
+        self.assertEqual(ToolGeometry(body_in=0.0).min_width(0.01), 0.01)
+
+    def test_a_grasp_switch_rolls_about_the_edge(self) -> None:
+        # Holding a box in the straight grasp, then snapping to the angled
+        # one: the width is unchanged, the edge stays where it is through
+        # the blend, and the facet and tip end on the box side.
+        straight, flush = parcel_tool(39.0, "straight"), parcel_tool(39.0)
+        held = _parcel_pair(0.30, straight, 1.0)
+        faces = {"left": 1.0, "right": 1.0}
+        state = snap_box(
+            held["left"],
+            held["right"],
+            now=0.0,
+            align_duration=1.0,
+            width_min=0.02,
+            width_max=0.7,
+            tool=flush,
+            faces=faces,
+        )
+        self.assertAlmostEqual(state.width, 0.30, places=6)
+        for t in np.linspace(0.0, 1.0, 11):
+            targets = box_targets(state, state.center, state.rot, now=float(t))
+            for side in ("left", "right"):
+                p0, r0 = held[side]
+                p1, r1 = targets[side]
+                np.testing.assert_allclose(
+                    p0 + r0 @ flush.foot(1.0), p1 + r1 @ flush.foot(1.0), atol=1e-6
+                )
+        done = box_targets(state, state.center, state.rot, now=1.0)
+        for side, sign in (("left", 1.0), ("right", -1.0)):
+            pos, rot = done[side]
+            self.assertAlmostEqual(
+                math.degrees(rotation_angle(held[side][1], rot)), 39.0, places=4
+            )
+            for c in flush.contacts(1.0):
+                self.assertAlmostEqual(
+                    float((pos + rot @ c)[1]), sign * 0.15, delta=0.001
+                )
+
+    def test_the_angled_grasp_turns_the_grippers_in_about_the_face(self) -> None:
+        tool = parcel_tool(39.0)
+        for face in (1.0, -1.0):
+            ideal = _parcel_pair(0.30, tool, face)
+            for side, sign in (("left", 1.0), ("right", -1.0)):
+                pos, rot = ideal[side]
+                foot = pos + rot @ tool.foot(face)
+                # The foot is at ±width/2, level with the box centre, on
+                # the box side of the mount.
+                self.assertAlmostEqual(float(foot[1]), sign * 0.15, places=6)
+                self.assertAlmostEqual(float(foot[0]), 0.4, places=6)
+                self.assertGreater(abs(float(pos[1])), 0.15)
+                # Blades vertical, fingers 39° inward of straight ahead.
+                fwd = approach_axis(rot)
+                self.assertAlmostEqual(float(fwd[2]), 0.0, places=6)
+                self.assertAlmostEqual(
+                    math.degrees(math.atan2(-sign * fwd[1], fwd[0])), 39.0, places=4
+                )
+
+    def test_the_turn_keeps_the_face_where_the_parallel_grasp_has_it(self) -> None:
+        tool = parcel_tool(39.0)
+        parallel = _parcel_pair(0.30, parcel_tool(0.0), 1.0)
+        angled = _parcel_pair(0.30, tool, 1.0)
+        for side in ("left", "right"):
+            p0, r0 = parallel[side]
+            p1, r1 = angled[side]
+            np.testing.assert_allclose(
+                p0 + r0 @ tool.foot(1.0), p1 + r1 @ tool.foot(1.0), atol=1e-6
+            )
+            self.assertAlmostEqual(math.degrees(rotation_angle(r0, r1)), 39.0, places=4)
+
+    def test_tilt_trim_pivots_about_the_foot(self) -> None:
+        tool = parcel_tool(39.0)
+        flat = _parcel_pair(0.30, tool, 1.0)
+        trimmed = _parcel_pair(0.30, tool, 1.0, tilt=0.2)
+        for side in ("left", "right"):
+            p0, r0 = flat[side]
+            p1, r1 = trimmed[side]
+            np.testing.assert_allclose(
+                p0 + r0 @ tool.foot(1.0), p1 + r1 @ tool.foot(1.0), atol=1e-6
+            )
+            self.assertGreater(float(np.linalg.norm(p1 - p0)), 0.005)
+            self.assertAlmostEqual(rotation_angle(r0, r1), 0.2, places=6)
+
+    def test_snap_reads_the_width_off_the_faces_not_the_mounts(self) -> None:
+        tool = parcel_tool(39.0)
+        left, right = (_parcel_pair(0.30, tool, 1.0)[s] for s in ("left", "right"))
+        mount_sep = float(np.linalg.norm(left[0] - right[0]))
+        self.assertGreater(mount_sep, 0.33)
+        state = snap_box(
+            left,
+            right,
+            now=0.0,
+            align_duration=0.0,
+            width_min=0.1,
+            width_max=0.7,
+            tool=tool,
+            faces={"left": 1.0, "right": 1.0},
+        )
+        self.assertAlmostEqual(state.width, 0.30, places=6)
+        # Already in the grasp: the targets are exactly the current poses.
+        targets = box_targets(state, state.center, state.rot, now=0.0)
+        for side, pose in (("left", left), ("right", right)):
+            np.testing.assert_allclose(targets[side][0], pose[0], atol=1e-6)
+            np.testing.assert_allclose(targets[side][1], pose[1], atol=1e-6)
+        self.assertTrue(pair_aligned(left, right, 0.1, 0.7, 0.0, 1.0, tool=tool))
+        # The stock geometry would call this pair 39° off and 0.4 m wide.
+        self.assertFalse(pair_aligned(left, right, 0.1, 0.7, 0.0, 25.0))
+
+    def test_pinned_faces_override_the_nearest(self) -> None:
+        rot = np.eye(3, dtype=np.float32)
+        current = {
+            side: side_clamp_rotation(sign, 1.0, 0.0)
+            for side, sign in (("left", 1.0), ("right", -1.0))
+        }
+        self.assertEqual(choose_faces(current, rot, 0.0), {"left": 1.0, "right": 1.0})
+        self.assertEqual(
+            choose_faces(current, rot, 0.0, {"left": -1.0, "right": 0.0}),
+            {"left": -1.0, "right": 1.0},
+        )
+
+    def test_worker_builds_the_tool_and_faces_from_the_config(self) -> None:
+        worker = object.__new__(IKWorker)
+        worker._config = types.SimpleNamespace(
+            box_grasp="flush",
+            gripper="parcel",
+            box_flush_deg=30.0,
+            box_face_left="-x",
+            box_face_right="auto",
+        )
+        self.assertAlmostEqual(math.degrees(worker._box_tool().flush_tilt), 30.0)
+        self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 0.0})
+        worker._config.gripper = "parallel"
+        worker._config.box_face_right = "+x"
+        self.assertIs(worker._box_tool(), URDF_TOOL)
+        self.assertEqual(worker._box_faces(), {"left": -1.0, "right": 1.0})
+
+
+class DominantAxisTest(unittest.TestCase):
+    def test_off_axis_leak_is_dropped(self) -> None:
+        self.assertEqual(_dominant_axis(-0.95, 0.35), (-0.95, 0.0))
+        self.assertEqual(_dominant_axis(0.2, -0.9), (0.0, -0.9))
+
+    def test_deadzone_still_applies(self) -> None:
+        self.assertEqual(_dominant_axis(0.1, 0.05), (0.0, 0.0))
+        self.assertEqual(_dominant_axis(0.1, 0.5), (0.0, 0.5))
+
+
+def _stick_worker(leader: str = "left") -> IKWorker:
+    worker = object.__new__(IKWorker)
+    worker._config = types.SimpleNamespace(
+        box_width_speed=0.1,
+        box_width_min=0.1,
+        box_width_max=0.7,
+        box_grip_tilt=0.0,
+        box_elbow_out=40.0,
+        box_elbow_weight=10.0,
+        box_elbow_speed=30.0,
+    )
+    worker._box_leader = leader
+    return worker
+
+
+_SHOULDER_L = np.array((0.0, 0.2, 0.5), np.float32)
+_SHOULDER_R = np.array((0.0, -0.2, 0.5), np.float32)
+
+
+class ElbowSwivelHintTest(unittest.TestCase):
+    """Box mode's synthetic 'elbows out' hint: same radius, same elbow angle,
+    only the swing about the shoulder-wrist line changes."""
+
+    # Left arm reaching straight forward at shoulder height, elbow currently
+    # folded *inward* (toward -y, the torso side) and a little below the axis.
+    wrist = np.array((0.5, 0.2, 0.5), np.float32)
+    elbow_in = np.array((0.25, 0.05, 0.42), np.float32)
+
+    def _decompose(self, p: np.ndarray, shoulder: np.ndarray, wrist: np.ndarray):
+        a = (wrist - shoulder) / np.linalg.norm(wrist - shoulder)
+        e = p - shoulder
+        along = float(e @ a)
+        radial = e - along * a
+        return along, radial
+
+    def test_moves_elbow_outboard_keeping_geometry(self) -> None:
+        hint = elbow_swivel_hint(
+            _SHOULDER_L, self.elbow_in, self.wrist, 1.0, math.radians(40.0)
+        )
+        along0, rad0 = self._decompose(self.elbow_in, _SHOULDER_L, self.wrist)
+        along1, rad1 = self._decompose(hint, _SHOULDER_L, self.wrist)
+        # Reachable: same distance along the axis and the same swing radius.
+        self.assertAlmostEqual(along0, along1, places=5)
+        self.assertAlmostEqual(np.linalg.norm(rad0), np.linalg.norm(rad1), places=5)
+        # Outboard (+y for the left arm) and below the axis, 40° from down.
+        self.assertGreater(hint[1], _SHOULDER_L[1])
+        self.assertLess(hint[2], _SHOULDER_L[2])
+        angle = math.degrees(math.atan2(rad1[1], -rad1[2]))
+        self.assertAlmostEqual(angle, 40.0, places=3)
+
+    def test_zero_hangs_elbow_straight_down(self) -> None:
+        hint = elbow_swivel_hint(_SHOULDER_L, self.elbow_in, self.wrist, 1.0, 0.0)
+        _, rad = self._decompose(hint, _SHOULDER_L, self.wrist)
+        self.assertAlmostEqual(float(rad[1]), 0.0, places=6)
+        self.assertLess(float(rad[2]), 0.0)
+
+    def test_right_arm_mirrors(self) -> None:
+        wrist = self.wrist * np.array((1, -1, 1), np.float32)
+        elbow = self.elbow_in * np.array((1, -1, 1), np.float32)
+        hint_l = elbow_swivel_hint(
+            _SHOULDER_L, self.elbow_in, self.wrist, 1.0, math.radians(40.0)
+        )
+        hint_r = elbow_swivel_hint(_SHOULDER_R, elbow, wrist, -1.0, math.radians(40.0))
+        np.testing.assert_allclose(hint_r, hint_l * np.array((1, -1, 1)), atol=1e-6)
+        self.assertLess(hint_r[1], _SHOULDER_R[1])  # outboard = -y on the right
+
+    def test_degenerate_inputs_return_current_elbow(self) -> None:
+        # Wrist on the shoulder: no axis.
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, self.elbow_in, _SHOULDER_L, 1.0, 0.5),
+            self.elbow_in,
+        )
+        # Straight arm: elbow on the axis, no swing to steer.
+        on_axis = _SHOULDER_L + 0.5 * (self.wrist - _SHOULDER_L)
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, on_axis, self.wrist, 1.0, 0.5), on_axis
+        )
+        # Wanted direction parallel to the axis: nothing to project.
+        wrist_down = _SHOULDER_L + np.array((0.0, 0.0, -0.5), np.float32)
+        elbow = _SHOULDER_L + np.array((0.1, 0.0, -0.25), np.float32)
+        np.testing.assert_allclose(
+            elbow_swivel_hint(_SHOULDER_L, elbow, wrist_down, 1.0, 0.0), elbow
+        )
+
+
+class SwivelStepTest(unittest.TestCase):
+    """The hint keeps only the reachable part of the goal: along the swivel."""
+
+    elbow = np.array((0.25, 0.05, 0.42))
+
+    def test_keeps_the_part_along_the_swivel(self) -> None:
+        goal = self.elbow + np.array((0.004, 0.01, -0.02))
+        hint = swivel_step(self.elbow, goal, np.array((0.0, 0.0, -1.0)), 0.03)
+        np.testing.assert_allclose(hint, self.elbow + (0.0, 0.0, -0.02), atol=1e-6)
+
+    def test_either_sense_of_the_direction(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.0, -0.02))
+        np.testing.assert_allclose(
+            swivel_step(self.elbow, goal, np.array((0.0, 0.0, 1.0)), 0.03),
+            swivel_step(self.elbow, goal, np.array((0.0, 0.0, -1.0)), 0.03),
+            atol=1e-6,
+        )
+
+    def test_capped(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.2, 0.0))
+        hint = swivel_step(self.elbow, goal, np.array((0.0, 1.0, 0.0)), 0.03)
+        np.testing.assert_allclose(hint, self.elbow + (0.0, 0.03, 0.0), atol=1e-6)
+
+    def test_no_swivel_holds_the_elbow(self) -> None:
+        goal = self.elbow + np.array((0.0, 0.2, 0.0))
+        np.testing.assert_allclose(
+            swivel_step(self.elbow, goal, np.zeros(3), 0.03), self.elbow, atol=1e-6
+        )
+
+
+class BoxElbowHintsTest(unittest.TestCase):
+    def _worker(self, weight: float = 10.0) -> IKWorker:
+        worker = _stick_worker()
+        worker._config.box_elbow_weight = weight
+        wrist = np.array((0.0, 0.0, 0.03), np.float64)
+        # Swivel directions of either sense: the hint picks the one toward its goal.
+        worker._solver = types.SimpleNamespace(
+            elbow_swivel=lambda q: {
+                "left": types.SimpleNamespace(
+                    shoulder=_SHOULDER_L,
+                    elbow=np.array((0.25, 0.05, 0.42)),
+                    wrist_in_mount=wrist,
+                    direction=np.array((0.0, -1.0, 0.0)),
+                ),
+                "right": types.SimpleNamespace(
+                    shoulder=_SHOULDER_R,
+                    elbow=np.array((0.25, -0.05, 0.42)),
+                    wrist_in_mount=wrist,
+                    direction=np.array((0.0, -1.0, 0.0)),
+                ),
+            },
+        )
+        return worker
+
+    def _targets(self):
+        eye = np.eye(3, dtype=np.float32)
+        return {
+            "left": (np.array((0.5, 0.15, 0.5), np.float32), eye),
+            "right": (np.array((0.5, -0.15, 0.5), np.float32), eye),
+        }
+
+    def test_hints_step_both_elbows_outboard_along_their_swivel(self) -> None:
+        hints = self._worker()._box_elbow_hints(
+            np.zeros(14, np.float32), self._targets()
+        )
+        self.assertIsNotNone(hints)
+        np.testing.assert_allclose(
+            hints["left"], (0.25, 0.05 + _ELBOW_HINT_STEP_M, 0.42), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            hints["right"], (0.25, -0.05 - _ELBOW_HINT_STEP_M, 0.42), atol=1e-6
+        )
+
+    def test_zero_weight_disables(self) -> None:
+        self.assertIsNone(
+            self._worker(0.0)._box_elbow_hints(
+                np.zeros(14, np.float32), self._targets()
+            )
+        )
+
+
+def _box_state(width: float = 0.3, tilt: float = 0.0) -> BoxState:
+    return BoxState(
+        center=np.array((0.4, 0.0, 0.3), np.float32),
+        rot=np.eye(3, dtype=np.float32),
+        width=width,
+        face={"left": 1.0, "right": 1.0},
+        tilt=tilt,
+        align_start={},
+        align_t0=0.0,
+        align_duration=0.0,
+    )
+
+
+def _stick_frame(
+    l_lock: bool = True, r_lock: bool = True, **sticks: float | bool
+) -> VRFrame:
+    identity = VRQuaternion(x=0.0, y=0.0, z=0.0, w=1.0)
+    zero = VRPosition(x=0.0, y=0.0, z=0.0)
+    return VRFrame(
+        l_ee=VRPose(position=zero, quaternion=identity),
+        r_ee=VRPose(position=zero, quaternion=identity),
+        l_elbow=zero,
+        r_elbow=zero,
+        l_lock=l_lock,
+        r_lock=r_lock,
+        **sticks,
+    )
+
+
+class SticksDriveJellyTest(unittest.TestCase):
+    """Box mode hands the thumbsticks to Jelly while nobody leads the pair."""
+
+    def _core(self) -> VRTeleopCore:
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+        return core
+
+    def _lead(self, core: VRTeleopCore) -> None:
+        # Right grip rising edge: the right hand leads the pair.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+
+    def test_off_box_mode_sticks_are_jellys(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _e: None,
+        )
+        self.assertFalse(core.pair_owns_sticks)
+
+    def test_unled_pair_drives_led_pair_owns_sticks(self) -> None:
+        core = self._core()
+        self.assertFalse(core.pair_owns_sticks)  # box mode, nobody leading yet
+        self._lead(core)
+        self.assertTrue(core.pair_owns_sticks)
+
+    def test_freeze_with_sticks_released_hands_over_at_once(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(
+            _stick_frame(l_lock=False, r_lock=True)
+        )  # leader again: freeze
+        self.assertFalse(core.teleop_enabled)
+        self.assertFalse(core.pair_owns_sticks)
+
+    def test_freeze_with_a_stick_held_waits_for_neutral_sticks(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False, r_stick_y=-0.8))
+        # Freeze while a stick is still pushed: Jelly must not inherit it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.8))
+        self.assertFalse(core.teleop_enabled)
+        self.assertTrue(core.pair_owns_sticks)
+        # Still deflected (or clicked): still held back.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, r_stick_y=-0.5))
+        self.assertTrue(core.pair_owns_sticks)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_click=True))
+        self.assertTrue(core.pair_owns_sticks)
+        # Released: the sticks are Jelly's from here on.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.pair_owns_sticks)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True, l_stick_y=-1.0))
+        self.assertFalse(core.pair_owns_sticks)
+
+    def test_forced_disengage_waits_for_neutral_sticks(self) -> None:
+        core = self._core()
+        self._lead(core)
+        core._disengage_all("stale")
+        self.assertTrue(core.pair_owns_sticks)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.pair_owns_sticks)
+
+
+class BoxTriggersTest(unittest.TestCase):
+    """In box mode each trigger drives its own gripper, whichever hand leads."""
+
+    def test_each_trigger_drives_its_own_gripper(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+        def frame(l_lock: bool, r_lock: bool, l_grip: float, r_grip: float):
+            return _stick_frame(
+                l_lock=l_lock, r_lock=r_lock, l_grip=l_grip, r_grip=r_grip
+            )
+
+        core.update_engage(frame(False, False, 1.0, 1.0))
+        core.update_engage(frame(False, True, 1.0, 0.2))
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual((core.l_grip, core.r_grip), (1.0, 0.2))
+
+        core.update_engage(frame(False, False, 0.3, 0.2))
+        self.assertEqual((core.l_grip, core.r_grip), (0.3, 0.2))
+
+        # Hand the lead to the left: the triggers keep their own grippers.
+        core.update_engage(frame(True, False, 0.1, 0.6))
+        self.assertEqual((core.l_grip, core.r_grip), (0.1, 0.6))
+
+        # Freeze: both grippers hold their last command.
+        core.update_engage(frame(False, False, 0.1, 0.6))
+        core.update_engage(frame(True, False, 0.1, 0.6))
+        self.assertFalse(core.teleop_enabled)
+        core.update_engage(frame(False, False, 1.0, 1.0))
+        self.assertEqual((core.l_grip, core.r_grip), (0.1, 0.6))
+
+
+class BoxExitTest(unittest.TestCase):
+    """Leaving box mode: going home turns it off, and from the angled grasp
+    the pair is levelled first so plain teleop's ramp starts from two
+    straight wrists."""
+
+    def _core(self, **cfg) -> tuple[VRTeleopCore, list[tuple[str, object]]]:
+        modes: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel", **cfg),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: modes.append((key, value)),
+        )
+        return core, modes
+
+    def _lead(self, core: VRTeleopCore) -> None:
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+
+    def test_going_home_turns_box_mode_off(self) -> None:
+        # Drive the IK loop's reset branch (the X button's latch) through a
+        # fake worker connection that answers the plan with no trajectory.
+        import threading
+
+        core, modes = self._core(box_grasp="flush")
+        self._lead(core)
+        core.q = np.zeros(14, dtype=np.float32)
+        core.request_reset()
+
+        class _Conn:
+            sent: tuple = ()
+
+            def send(self, msg):
+                self.sent = msg
+
+            def recv(self):
+                return ("reset_traj", np.zeros(14), [])
+
+        stop = threading.Event()
+        conn = _Conn()
+        # One loop pass: the reset latch dispatches, then stop.
+        core._pace = lambda _t0, _interval: stop.set()
+        core.run_ik_loop(conn, lambda: None, stop, lambda: True, lambda _t: None)
+        self.assertEqual(conn.sent[0], "reset")
+        self.assertFalse(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        self.assertIn(("box_mode", False), modes)
+        # Straight to home: no angled-grasp undo is started for a reset.
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertEqual(core.config.box_grasp, "flush")
+
+    def test_straight_grasp_exits_at_once(self) -> None:
+        core, modes = self._core(box_grasp="straight")
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertIn(("box_mode", False), modes)
+
+    def test_angled_grasp_is_undone_before_the_exit(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=0.05)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        # Still in box mode, still led; the grasp went straight to the worker.
+        self.assertTrue(core.box_mode)
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual(core.config.box_grasp, "straight")
+        self.assertIn(("box_grasp", "straight"), core._worker_updates)
+        self.assertEqual(core._worker_pending.get("box_grasp"), "straight")
+        self.assertIn(("box_grasp", "straight"), modes)
+        self.assertNotIn(("box_mode", False), modes)
+        # Once the blend has had its time, the mode switch lands — and the
+        # next frame engages both arms in plain teleop straight away.
+        core._box_exit_deadline = 0.0
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertIn(("box_mode", False), modes)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.left_enabled and core.right_enabled)
+
+    def test_letting_go_finishes_the_exit_early(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        # Leader clicks again: the pair freezes; nothing more can level it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertIn(("box_mode", False), modes)
+
+    def test_asking_again_exits_now(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+
+    def test_switching_back_on_cancels_the_exit(self) -> None:
+        core, modes = self._core(box_grasp="flush", box_align_duration=10.0)
+        self._lead(core)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.box_mode)
+        self.assertIsNone(core._box_exit_deadline)
+        self.assertNotIn(("box_mode", False), modes)
+
+    def test_unled_pair_exits_at_once(self) -> None:
+        # Nobody leading: the pair can't move, so there is nothing to wait for.
+        core, modes = self._core(box_grasp="flush")
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.box_mode)
+        self.assertEqual(core.config.box_grasp, "flush")
+
+
+class ModeSwitchEngagesTest(unittest.TestCase):
+    """A box-mode switch engages the arms at once: into box mode led by
+    ``box_lead_hand``, out of it with both arms — no grip needed."""
+
+    def _core(self, **cfg) -> VRTeleopCore:
+        return VRTeleopCore(
+            VRTeleopConfig(**{"gripper": "parcel", **cfg}),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+    def test_switching_on_leads_with_the_right_hand(self) -> None:
+        core = self._core()
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.teleop_enabled)
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual(core._box_leader, "right")
+        self.assertTrue(core.pair_owns_sticks)
+
+    def test_the_lead_hand_is_a_setting(self) -> None:
+        core = self._core(box_lead_hand="left")
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertEqual(core._box_leader, "left")
+        # Live too.
+        core.set_live("box_lead_hand", "right")
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertEqual(core._box_leader, "right")
+
+    def test_a_grip_held_at_the_switch_is_not_an_edge(self) -> None:
+        core = self._core()
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.set_box_mode(True)
+        # Still holding the right grip through the switch: the pair is led
+        # by the right hand and the held grip doesn't freeze it.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertEqual(core._box_leader, "right")
+        # Releasing and clicking again does freeze it, as usual.
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertIsNone(core._box_leader)
+
+    def test_switching_off_engages_both_arms(self) -> None:
+        core = self._core(box_mode=True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertTrue(core.teleop_enabled)
+        core.set_box_mode(False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertFalse(core.box_mode)
+        self.assertTrue(core.left_enabled)
+        self.assertTrue(core.right_enabled)
+        self.assertFalse(core.pair_owns_sticks)
+
+    def test_a_late_first_frame_does_not_engage(self) -> None:
+        # Switched from the panel with nobody in the headset: the first
+        # frame, long after, engages nothing — the grips do, as usual.
+        core = self._core()
+        core.set_box_mode(True)
+        core._apply_live_requests()
+        core._auto_engage_until = time.perf_counter() - 1.0
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        self.assertIsNone(core._auto_engage_until)
+
+    def test_a_reset_that_leaves_box_mode_does_not_engage(self) -> None:
+        core = self._core(box_mode=True)
+        core._set_box_mode(False, engage=False)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertFalse(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+
+    def test_dead_man_sessions_keep_the_grip_rule(self) -> None:
+        core = self._core(hold_to_engage=True)
+        core.set_box_mode(True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        self.assertTrue(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+
+
+class StickControlTest(unittest.TestCase):
+    """Box mode's sticks set the grip width (left/right) and how far out the
+    elbows are held (forward/back), on either stick; the grasp sets the yaw."""
+
+    def _sticks(
+        self, worker: IKWorker, box: BoxState, frame: VRFrame, dt: float = 0.05
+    ) -> None:
+        worker._integrate_sticks(frame, box, now=10.0)
+        worker._integrate_sticks(frame, box, now=10.0 + dt)
+
+    def test_right_widens_left_narrows(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(r_stick_x=1.0))
+        # 0.1 m/s for 50 ms.
+        self.assertAlmostEqual(box.width, 0.305, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_x=-1.0))
+        self.assertAlmostEqual(box.width, 0.3, places=6)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_forward_brings_the_elbows_out_back_tucks_them_in(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        # The raw axis reads negative pushed forward (WebXR): 30°/s for 50 ms.
+        self._sticks(worker, box, _stick_frame(r_stick_y=-1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 41.5, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_y=1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 40.0, places=6)
+        # Neither touches the width or the yaw trim.
+        self.assertEqual(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+        self.assertEqual(worker._config.box_grip_tilt, 0.0)
+        # Both sticks add, capped at full deflection, and the angle is
+        # clamped to 0..90° from straight down.
+        self._sticks(worker, box, _stick_frame(l_stick_y=-1.0, r_stick_y=-1.0))
+        self.assertAlmostEqual(worker._config.box_elbow_out, 41.5, places=6)
+        for _ in range(40):  # 4 s at the 0.1 s dt cap: 120° asked, 90° given
+            self._sticks(worker, box, _stick_frame(l_stick_y=-1.0), dt=0.1)
+        self.assertEqual(worker._config.box_elbow_out, 90.0)
+        for _ in range(40):
+            self._sticks(worker, box, _stick_frame(l_stick_y=1.0), dt=0.1)
+        self.assertEqual(worker._config.box_elbow_out, 0.0)
+
+    def test_config_tilt_trim_yaws_the_fingertips(self) -> None:
+        # The trim is a fixed calibration: positive turns the left gripper's
+        # fingers toward the centre (-y), the right's toward +y.
+        box = _box_state(tilt=math.radians(1.5))
+        rel = box.grip_rel()
+        self.assertLess(float(approach_axis(rel["left"])[1]), 0.0)
+        self.assertGreater(float(approach_axis(rel["right"])[1]), 0.0)
+
+    def test_width_stick_with_a_forward_leak_only_changes_width(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        # Hard right with a 35 % forward component.
+        self._sticks(worker, box, _stick_frame(r_stick_x=0.95, r_stick_y=-0.35))
+        self.assertGreater(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_forward_stick_with_a_side_leak_does_not_creep_the_width(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.3, l_stick_y=0.9))
+        self.assertEqual(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_both_sticks_add_but_never_exceed_full_deflection(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=1.0, r_stick_x=1.0))
+        self.assertAlmostEqual(box.width, 0.305, places=6)
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.5, r_stick_x=0.5))
+        self.assertAlmostEqual(box.width, 0.310, places=6)
+
+    def test_clicks_are_not_modifiers(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        for click in ("l_stick_click", "r_stick_click"):
+            self._sticks(worker, box, _stick_frame(**{click: True}))
+            self.assertEqual(box.width, 0.3)
+            self.assertEqual(box.tilt, 0.0)
+        # A clicked stick still does its ordinary job.
+        self._sticks(worker, box, _stick_frame(r_stick_x=1.0, r_stick_click=True))
+        self.assertGreater(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_same_mapping_whichever_hand_leads(self) -> None:
+        for leader in ("left", "right"):
+            with self.subTest(leader=leader):
+                worker = _stick_worker(leader)
+                box = _box_state()
+                self._sticks(worker, box, _stick_frame(l_stick_x=-1.0))
+                self.assertLess(box.width, 0.3)
+                self._sticks(worker, box, _stick_frame(r_stick_x=1.0))
+                self.assertAlmostEqual(box.width, 0.3, places=6)
+
+    def test_resting_sticks_change_nothing(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(l_stick_x=0.1, r_stick_y=-0.1))
+        self.assertEqual(box.width, 0.3)
+        self.assertEqual(box.tilt, 0.0)
+
+    def test_width_is_clamped(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        frame = _stick_frame(r_stick_x=-1.0)
+        worker._integrate_sticks(frame, box, now=0.0)
+        for i in range(1, 100):  # 10 s at 0.1 m/s = 1 m requested
+            worker._integrate_sticks(frame, box, now=0.1 * i)
+        self.assertAlmostEqual(box.width, 0.1, places=6)
+
+    def test_width_floor_follows_the_grasp(self) -> None:
+        # The operator's floor is 2 cm. The parcel gripper's contact faces
+        # are proud of its body in both grasps, so they close to the floor;
+        # the stock gripper stops where its wrists would meet.
+        worker = _stick_worker()
+        worker._config.box_width_min = 0.02
+        worker._config.box_flush_deg = 39.0
+        frame = _stick_frame(r_stick_x=-1.0)
+        for tool, grasp, floor in (
+            ("parcel", "straight", 0.02),
+            ("parcel", "flush", 0.02),
+            ("parallel", "straight", 0.077),
+            ("parallel", "flush", 0.077),
+        ):
+            worker._config.gripper = tool
+            worker._config.box_grasp = grasp
+            box = _box_state()
+            worker._integrate_sticks(frame, box, now=0.0)
+            for i in range(1, 100):
+                worker._integrate_sticks(frame, box, now=0.1 * i)
+            self.assertAlmostEqual(box.width, floor, places=6, msg=(tool, grasp))
+        self.assertEqual(VRTeleopConfig().box_width_min, 0.02)
+
+    def test_tilt_seeds_the_next_engage(self) -> None:
+        left, right = _pair(0.3)
+        state = snap_box(
+            left,
+            right,
+            now=0.0,
+            align_duration=0.0,
+            width_min=0.1,
+            width_max=0.7,
+            tilt=0.3,
+        )
+        self.assertEqual(state.tilt, 0.3)
+        ideal = ideal_gripper_poses(
+            state.center, state.rot, state.width, state.grip_rel()
+        )
+        self.assertAlmostEqual(
+            float(approach_axis(ideal["left"][1])[1]), -math.sin(0.3), places=5
+        )
+
+
+class _FakeCore:
+    box_available = True
+
+    def __init__(self) -> None:
+        self.values = {
+            "box_mode": True,
+            "box_lead_hand": "right",
+            "box_grasp": "flush",
+            "box_flush_deg": 39.0,
+            "box_face_left": "auto",
+            "box_face_right": "auto",
+            "box_elbow_out": 30.0,
+            "reengage": "clutch",
+            "hold_to_engage": False,
+            "position_multiplier": 1.0,
+            "teleop_max_vel": 6.283185307179586,
+        }
+        self.set_calls: list[tuple[str, object]] = []
+
+    def live_value(self, key: str) -> object:
+        return self.values[key]
+
+    def set_live(self, key: str, value: object) -> None:
+        self.set_calls.append((key, value))
+        self.values[key] = value
+
+
+class _RecordingSolver:
+    """Solver stub for ``_step_box``: fixed FK, ``ik`` records its targets."""
+
+    def __init__(self) -> None:
+        self.left_pose = (
+            np.array((0.40, 0.20, 0.30), np.float32),
+            _rot_z(0.5).astype(np.float32),
+        )
+        self.right_pose = (
+            np.array((0.40, -0.20, 0.30), np.float32),
+            _rot_x(-0.3).astype(np.float32),
+        )
+        self.calls: list[dict[str, object]] = []
+
+    def set_posture_pose(self, q: np.ndarray) -> None:
+        del q
+
+    def fk(self, q: np.ndarray):
+        del q
+        return self.left_pose, self.right_pose
+
+    def ik(self, q: np.ndarray, **kwargs: object) -> np.ndarray:
+        self.calls.append(kwargs)
+        return np.asarray(q, dtype=np.float32).copy()
+
+
+def _box_worker(leader: str = "left") -> IKWorker:
+    worker = object.__new__(IKWorker)
+    worker._config = types.SimpleNamespace(
+        ik_frequency=120.0,
+        position_multiplier=1.0,
+        rotation_multiplier=1.0,
+        box_align_duration=0.0,
+        box_width_min=0.1,
+        box_width_max=0.7,
+        gripper="parallel",
+        box_face_left="auto",
+        box_face_right="auto",
+        box_grip_tilt=0.0,
+        box_width_speed=0.1,
+        box_elbow_out=30.0,
+        box_elbow_weight=0.0,
+    )
+    worker._solver = _RecordingSolver()
+    worker._rec = None
+    worker._active = {"left": True, "right": True}
+    worker._hold_fk = {}
+    worker._hold_elbow_fk = {}
+    worker._ramp = {}
+    worker._box = None
+    worker._box_leader = None
+    worker._box_snap = None
+    worker._freeze_since = {}
+    worker._freeze_targets = {}
+    worker._snap_ctrl = {}
+    worker._snap_fk = {}
+    worker._last_solve_t = None
+    # No measured arms (the sim): the squeeze lean stays out of the way.
+    worker._measured, worker._measured_t = None, 0.0
+    worker._lean_model = None
+    worker._lean_depth, worker._lean_t, worker._lean_force = 0.0, None, 0.0
+    # Engage snap with the leader controller at the origin, unrotated.
+    frame = _stick_frame()
+    frame.box_leader = leader
+    q = np.zeros(14, np.float32)
+    ctrl = {
+        "left": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+    }
+    worker._step_box(frame, q, ctrl, ctrl["left"][0], ctrl["right"][0])
+    return worker
+
+
+def _ctrl_turn(yaw: float) -> np.ndarray:
+    """A controller rotation of ``yaw`` about the room's up.
+
+    Controller rotations reach ``_step_box`` in the frame ``_vr_to_flu_np``
+    produces, where the VR world's up (+y) is the *second* axis — not FLU.
+    """
+    return rodrigues(np.array((0.0, 1.0, 0.0)), yaw)
+
+
+class HandTrackingTest(unittest.TestCase):
+    """Box mode follows the leader hand's position and its turn about
+    vertical, and ignores its pitch and roll: the pair stays level with the
+    fingers straight out whatever else the controller does."""
+
+    def _targets(self, worker: IKWorker, ctrl_pos, ctrl_rot):
+        frame = _stick_frame()
+        frame.box_leader = "left"
+        ctrl = {
+            "left": (
+                np.asarray(ctrl_pos, np.float32),
+                np.asarray(ctrl_rot, np.float32),
+            ),
+            "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        }
+        worker._step_box(
+            frame, np.zeros(14, np.float32), ctrl, ctrl["left"][0], ctrl["right"][0]
+        )
+        call = worker._solver.calls[-1]
+        return call["left_pose"], call["right_pose"]
+
+    def _assert_straight_out(self, left, right, center) -> None:
+        for (pos, rot), sign in ((left, 1.0), (right, -1.0)):
+            np.testing.assert_allclose(approach_axis(rot), _FWD, atol=1e-6)
+            # Level: the flat clamping face (gripper X) is horizontal.
+            np.testing.assert_allclose(rot[:, 0] @ _UP, 0.0, atol=1e-6)
+            np.testing.assert_allclose(pos, center + sign * 0.2 * _LAT, atol=1e-6)
+
+    def test_snap_squares_the_grippers_up_from_an_arbitrary_pose(self) -> None:
+        worker = _box_worker()
+        left, right = self._targets(worker, np.zeros(3), np.eye(3))
+        self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)))
+
+    def test_the_box_solve_holds_the_pose_harder(self) -> None:
+        worker = _box_worker()
+        self._targets(worker, np.zeros(3), np.eye(3))
+        scale = worker._solver.calls[-1]["pose_weight_scale"]
+        self.assertEqual(scale, _BOX_POSE_WEIGHT_SCALE)
+        self.assertGreater(scale[1], 1.0)
+
+    def test_pitching_or_rolling_the_controller_changes_nothing(self) -> None:
+        worker = _box_worker()
+        base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
+        # In the controller frame the two horizontal axes are its first and
+        # third: a rotation about either is a pitch or a roll of the hand.
+        # (The third is the one a rotation about FLU's up would be — a
+        # regression check: pitching the hand up and down used to turn the
+        # pair.)
+        for rot in (_rot_x(0.8), _rot_z(0.8), rodrigues((0.0, 0.0, 1.0), -0.7)):
+            left, right = self._targets(worker, np.zeros(3), rot)
+            np.testing.assert_allclose(left[0], base_left[0], atol=1e-6)
+            np.testing.assert_allclose(left[1], base_left[1], atol=1e-6)
+            np.testing.assert_allclose(right[0], base_right[0], atol=1e-6)
+            np.testing.assert_allclose(right[1], base_right[1], atol=1e-6)
+
+    def test_turning_the_controller_turns_the_pair_about_its_centre(self) -> None:
+        worker = _box_worker()
+        center = np.array((0.4, 0.0, 0.3))
+        for yaw in (0.5, -1.0):
+            with self.subTest(yaw=yaw):
+                # Turned about the room's up, and tilted as well: only the
+                # turn counts, and a left turn of the hand is a left turn of
+                # the pair (FLU +z, counter-clockwise from above).
+                left, right = self._targets(
+                    worker, np.zeros(3), _ctrl_turn(yaw) @ _rot_x(0.3)
+                )
+                r = _rot_z(yaw)
+                for (pos, rot), sign in ((left, 1.0), (right, -1.0)):
+                    np.testing.assert_allclose(approach_axis(rot), r @ _FWD, atol=1e-6)
+                    np.testing.assert_allclose(rot[:, 0] @ _UP, 0.0, atol=1e-6)  # level
+                    np.testing.assert_allclose(
+                        pos, center + sign * 0.2 * (r @ _LAT), atol=1e-6
+                    )
+
+    def test_moving_the_controller_translates_the_level_pair(self) -> None:
+        worker = _box_worker()
+        base_left, base_right = self._targets(worker, np.zeros(3), np.eye(3))
+        # Any translation, with the hand twisted while it moves.
+        left, right = self._targets(worker, np.array((0.05, 0.10, -0.15)), _rot_x(0.9))
+        shift = left[0] - base_left[0]
+        self.assertGreater(float(np.linalg.norm(shift)), 0.1)
+        np.testing.assert_allclose(right[0] - base_right[0], shift, atol=1e-6)
+        self._assert_straight_out(left, right, np.array((0.4, 0.0, 0.3)) + shift)
+
+
+class GraspToggleTest(unittest.TestCase):
+    """A single stick click (and release) while leading flips box mode's grasp
+    between flush and straight, and the pair re-snaps into it; the both-sticks
+    (leave box mode) gesture never does."""
+
+    def _step(self, worker: IKWorker, **clicks: bool) -> None:
+        frame = _stick_frame(**clicks)
+        frame.box_leader = "left"
+        ctrl = {
+            "left": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+            "right": (np.zeros(3, np.float32), np.eye(3, dtype=np.float32)),
+        }
+        worker._step_box(
+            frame, np.zeros(14, np.float32), ctrl, ctrl["left"][0], ctrl["right"][0]
+        )
+
+    def _worker(self) -> IKWorker:
+        worker = _box_worker()
+        worker._config.gripper = "parcel"
+        worker._config.box_flush_deg = 39.0
+        worker._config.box_grasp = "flush"
+        return worker
+
+    def test_a_session_starts_straight_and_a_click_goes_flush(self) -> None:
+        self.assertEqual(VRTeleopConfig().box_grasp, "straight")
+        worker = _box_worker()
+        worker._config.gripper = "parcel"
+        worker._config.box_flush_deg = 39.0
+        self.assertFalse(hasattr(worker._config, "box_grasp"))  # the fallback
+        self.assertEqual(worker._box_grasp(), "straight")
+        worker._config.box_grasp = "nonsense"
+        self.assertEqual(worker._box_grasp(), "straight")
+        worker._config.box_grasp = VRTeleopConfig().box_grasp
+        worker._box = None
+        self._step(worker)  # snap: fingers straight out, 0°
+        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # release: to flush (39°) ...
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self._step(worker)
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 39.0, places=6
+        )
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # ... and back
+        self.assertEqual(worker._config.box_grasp, "straight")
+
+    def test_click_and_release_toggles_and_resnaps(self) -> None:
+        worker = self._worker()
+        # _box_worker snapped with the "urdf" straight geometry; the parcel
+        # config above is read at the *next* snap, so force one first.
+        worker._box = None
+        self._step(worker)  # snap (flush)
+        self._step(worker)
+        self.assertAlmostEqual(
+            math.degrees(worker._box.tool.flush_tilt), 39.0, places=6
+        )
+        n_solves = len(worker._solver.calls)
+        self._step(worker, l_stick_click=True)  # press: armed, no toggle yet
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+        self._step(worker)  # release: toggle, pair state dropped
+        self.assertEqual(worker._config.box_grasp, "straight")
+        self.assertIsNone(worker._box)
+        self._step(worker)  # re-snap in the straight grasp
+        self.assertIsNotNone(worker._box)
+        self.assertEqual(worker._box.tool.flush_tilt, 0.0)
+        status = worker.pair_status(np.zeros(14))
+        self.assertEqual(status["grasp"], "straight")
+        self.assertEqual(status["elbow"], worker._config.box_elbow_out)
+        # Solves happened before and after; the toggle and snap frames hold.
+        self._step(worker)
+        self.assertGreater(len(worker._solver.calls), n_solves)
+        # And the other stick toggles back.
+        self._step(worker, r_stick_click=True)
+        self._step(worker)
+        self.assertEqual(worker._config.box_grasp, "flush")
+
+    def test_both_sticks_do_not_toggle(self) -> None:
+        worker = self._worker()
+        self._step(worker)
+        self._step(worker, l_stick_click=True)  # first of the pair
+        self._step(worker, l_stick_click=True, r_stick_click=True)  # gesture
+        self._step(worker, r_stick_click=True)  # left released first
+        self._step(worker)  # right released
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+
+    def test_click_held_through_the_snap_does_not_toggle(self) -> None:
+        worker = self._worker()
+        worker._box = None
+        self._step(worker, l_stick_click=True)  # snap with the stick down
+        self._step(worker, l_stick_click=True)
+        self._step(worker)  # release
+        self.assertEqual(worker._config.box_grasp, "flush")
+        self.assertIsNotNone(worker._box)
+
+    def test_live_setting_change_resnaps_too(self) -> None:
+        worker = self._worker()
+        self._step(worker)
+        worker.set_config("box_grasp", "straight")
+        self.assertIsNone(worker._box)
+        worker.set_config("box_grasp", "straight")  # no-op: nothing to drop
+        self._step(worker)
+        self.assertIsNotNone(worker._box)
+        worker.set_config("box_flush_deg", 35.0)  # calibration: next engage
+        self.assertIsNotNone(worker._box)
+
+    def test_core_mirrors_the_workers_grasp(self) -> None:
+        notified: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: notified.append((key, value)),
+        )
+        q = np.zeros(14, np.float32)
+        self.assertEqual(core.config.box_grasp, "straight")  # the default
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
+        self.assertEqual(core.config.box_grasp, "flush")
+        self.assertEqual(notified[-1], ("box_grasp", "flush"))
+        # A request on its way to the worker is not undone by a stale report.
+        core.set_live("box_grasp", "straight")
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
+        self.assertEqual(core.config.box_grasp, "straight")
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_grasp, "straight")
+        # ...and once it has landed, the worker's word is final again.
+        core._unpack_solution((q, {"aligned": False, "width": 0.3, "grasp": "flush"}))
+        self.assertEqual(core.config.box_grasp, "flush")
+
+    def test_core_mirrors_the_workers_elbow_angle(self) -> None:
+        notified: list[tuple[str, object]] = []
+        core = VRTeleopCore(
+            VRTeleopConfig(box_mode=True, gripper="parcel"),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            broadcast_mode=lambda key, value: notified.append((key, value)),
+        )
+        q = np.zeros(14, np.float32)
+        self.assertEqual(core.config.box_elbow_out, 30.0)  # the default
+        self.assertEqual(core.config.box_elbow_weight, 10.0)  # hint on by default
+        status = {"aligned": False, "width": 0.3, "grasp": "straight", "elbow": 42.5}
+        core._unpack_solution((q, status))
+        self.assertEqual(core.config.box_elbow_out, 42.5)
+        self.assertEqual(notified[-1], ("box_elbow_out", 42.5))
+        # A panel/HUD change on its way to the worker survives stale reports.
+        core.set_live("box_elbow_out", 10)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_elbow_out, 10.0)
+        core._unpack_solution((q, dict(status, elbow=42.5)))
+        self.assertEqual(core.config.box_elbow_out, 10.0)
+        core._unpack_solution((q, dict(status, elbow=10.0)))
+        core._unpack_solution((q, dict(status, elbow=15.0)))
+        self.assertEqual(core.config.box_elbow_out, 15.0)
+        # An old worker without the field changes nothing.
+        core._unpack_solution(
+            (q, {"aligned": False, "width": 0.3, "grasp": "straight"})
+        )
+        self.assertEqual(core.config.box_elbow_out, 15.0)
+
+
+class LiveToggleTest(unittest.TestCase):
+    def test_toggle_flips_the_server_side_value(self) -> None:
+        core = _FakeCore()
+        live = LiveSettings(core, robot=object(), publish=lambda snapshot: None)
+        live.apply("box_mode", "toggle")
+        self.assertEqual(core.set_calls, [("box_mode", False)])
+        live.apply("box_mode", "toggle")
+        self.assertEqual(core.set_calls[-1], ("box_mode", True))
+
+    def test_plain_booleans_still_coerce(self) -> None:
+        core = _FakeCore()
+        live = LiveSettings(core, robot=object(), publish=lambda snapshot: None)
+        live.apply("box_mode", "false")
+        self.assertEqual(core.set_calls, [("box_mode", False)])
+        live.apply("hold_to_engage", True)
+        self.assertEqual(core.set_calls[-1], ("hold_to_engage", True))
+
+    def test_toggle_is_boolean_only(self) -> None:
+        core = _FakeCore()
+        live = LiveSettings(core, robot=object(), publish=lambda snapshot: None)
+        with self.assertRaises(ValueError):
+            live.apply("reengage", "toggle")
+        with self.assertRaises(ValueError):
+            live.apply("position_multiplier", "toggle")
+
+
+class BoxExitRampTest(unittest.TestCase):
+    """Box mode keeps its leader anchor apart from the per-arm session snaps,
+    so leaving it in "ramp" re-engage blends *both* arms back out to the
+    controller↔arm mapping the operator had before the box."""
+
+    def _worker(self) -> IKWorker:
+        from tests.test_ik_freeze_clutch import _step_worker
+
+        worker = _step_worker()
+        cfg = worker._config
+        cfg.reengage = "ramp"
+        cfg.reengage_ramp_speed = 0.15
+        cfg.reengage_ramp_min_s = 0.75
+        cfg.box_align_duration = 0.0
+        cfg.box_width_min = 0.02
+        cfg.box_width_max = 0.7
+        cfg.gripper = "parallel"
+        cfg.box_face_left = "auto"
+        cfg.box_face_right = "auto"
+        cfg.box_grip_tilt = 0.0
+        cfg.box_width_speed = 0.1
+        cfg.box_elbow_out = 30.0
+        cfg.box_elbow_weight = 0.0
+        cfg.box_elbow_speed = 30.0
+        cfg.box_squeeze_lean = 0.0
+        cfg.box_squeeze_trim = 0.0
+        cfg.box_squeeze_force = 0.0
+        worker._measured, worker._measured_t = None, 0.0
+        worker._lean_model = None
+        worker._lean_depth, worker._lean_t, worker._lean_force = 0.0, None, 0.0
+        worker._lean_trim = 0.0
+        return worker
+
+    def test_leaving_box_mode_ramps_both_arms_to_the_session_mapping(self) -> None:
+        from tests.test_ik_freeze_clutch import _frame
+
+        worker = self._worker()
+        session = {
+            side: tuple(v.copy() for v in worker._snap_ctrl[side])
+            for side in ("left", "right")
+        }
+        q = np.zeros(14, np.float32)
+        # Plain teleop, both arms engaged on the session snaps.
+        worker.step(_frame(left_forward=0.0, t_ms=0.0), q)
+        # Into box mode, right hand leading: the pair snaps its own anchor.
+        boxed = _frame(left_forward=0.0, t_ms=10.0)
+        boxed.box_leader = "right"
+        worker.step(boxed, q)
+        self.assertIsNotNone(worker._box_snap)
+        self.assertEqual(set(worker._snap_ctrl), {"left", "right"})
+        boxed = _frame(left_forward=0.0, t_ms=20.0)
+        boxed.box_leader = "right"
+        worker.step(boxed, q)
+        # Out again with both grips engaged (the core engages both arms on
+        # the switch): each arm ramps against its *session* snap.
+        worker.step(_frame(left_forward=0.05, t_ms=30.0), q)
+        self.assertIsNone(worker._box)
+        self.assertIsNone(worker._box_snap)
+        self.assertEqual(set(worker._ramp), {"left", "right"})
+        for side in ("left", "right"):
+            np.testing.assert_array_equal(worker._snap_ctrl[side][0], session[side][0])
+            np.testing.assert_array_equal(worker._snap_ctrl[side][1], session[side][1])
+
+
+class ToeOutTest(unittest.TestCase):
+    """The squeeze trim's error: how far the tips have swung off the box."""
+
+    def _pair(self):
+        rot = np.eye(3, dtype=np.float32)
+        ideal = ideal_gripper_poses(
+            np.array((0.4, 0.0, 0.3), np.float32),
+            rot,
+            0.3,
+            BoxState(
+                center=np.zeros(3, np.float32),
+                rot=rot,
+                width=0.3,
+                face={"left": 1.0, "right": 1.0},
+                tilt=0.0,
+                align_start={},
+                align_t0=0.0,
+                align_duration=0.0,
+                tool=URDF_TOOL,
+            ).grip_rel(),
+        )
+        normals = {"left": -rot[:, 1], "right": rot[:, 1]}
+        return ideal, normals, rot[:, 2]
+
+    def _yawed(self, ideal, yaw: dict[str, float]):
+        return {
+            side: (pos, (rodrigues(_UP, yaw[side]) @ rot).astype(np.float32))
+            for side, (pos, rot) in ideal.items()
+        }
+
+    def test_parallel_is_zero(self) -> None:
+        ideal, normals, up = self._pair()
+        self.assertAlmostEqual(toe_out(ideal, ideal, normals, up), 0.0, places=9)
+
+    def test_tips_off_the_box_is_positive_on_both_sides(self) -> None:
+        ideal, normals, up = self._pair()
+        # Fingers forward (+x); the left gripper sits at +y and its box is
+        # at -y. Its tip swings *away* (to +y) with a positive yaw about
+        # up; the right gripper's with a negative one.
+        left_out = self._yawed(ideal, {"left": math.radians(2.0), "right": 0.0})
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, left_out, normals, up)), 1.0, places=6
+        )
+        both_out = self._yawed(
+            ideal, {"left": math.radians(2.0), "right": -math.radians(2.0)}
+        )
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, both_out, normals, up)), 2.0, places=6
+        )
+        tips_in = self._yawed(
+            ideal, {"left": -math.radians(2.0), "right": math.radians(2.0)}
+        )
+        self.assertAlmostEqual(
+            math.degrees(toe_out(ideal, tips_in, normals, up)), -2.0, places=6
+        )
+
+    def test_a_turn_of_the_pair_cancels(self) -> None:
+        ideal, normals, up = self._pair()
+        lag = self._yawed(
+            ideal, {"left": math.radians(3.0), "right": math.radians(3.0)}
+        )
+        self.assertAlmostEqual(toe_out(ideal, lag, normals, up), 0.0, places=9)
+
+    def test_tip_inward_sign_matches_the_side(self) -> None:
+        ideal, normals, up = self._pair()
+        self.assertEqual(tip_inward_sign(ideal["left"][1], normals["left"], up), -1.0)
+        self.assertEqual(tip_inward_sign(ideal["right"][1], normals["right"], up), 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

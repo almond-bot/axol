@@ -20,6 +20,14 @@ def _frame(left: bool, right: bool, release_id: int | None = None) -> SimpleName
     )
 
 
+def _box_frame(left: bool, right: bool) -> SimpleNamespace:
+    """A frame with centred sticks, as box mode's engage reads them."""
+    frame = _frame(left, right)
+    frame.l_stick_x = frame.l_stick_y = frame.r_stick_x = frame.r_stick_y = 0.0
+    frame.l_stick_click = frame.r_stick_click = False
+    return frame
+
+
 SQUEEZE = _frame(True, True)
 RELEASE = _frame(False, False)
 
@@ -28,7 +36,7 @@ class EngageBlockTest(unittest.TestCase):
     def _core(self, **config: object) -> tuple[VRTeleopCore, list[dict]]:
         sent: list[dict] = []
         core = VRTeleopCore(
-            VRTeleopConfig(**config),
+            VRTeleopConfig(**{"gripper": "parcel", **config}),
             logging.getLogger(__name__),
             lambda _enabled: None,
             broadcast_json=sent.append,
@@ -74,6 +82,34 @@ class EngageBlockTest(unittest.TestCase):
         core.block_engage()
         core.update_engage(RELEASE)
         self.assertFalse(core.teleop_enabled)
+
+    def test_box_mode_is_blocked_too(self) -> None:
+        # Neither a box-mode switch's auto-engage nor a box-mode grip gets
+        # past the block.
+        core, _ = self._core()
+        core.block_engage()
+        core.set_box_mode(True)
+        core.update_engage(_box_frame(False, False))
+        self.assertTrue(core.box_mode)
+        self.assertFalse(core.teleop_enabled)
+        core.update_engage(_box_frame(False, True))
+        self.assertFalse(core.teleop_enabled)
+        # Unblocked: the right grip leads the pair again after a release.
+        core.unblock_engage()
+        core.update_engage(_box_frame(False, False))
+        core.update_engage(_box_frame(False, True))
+        self.assertTrue(core.teleop_enabled)
+        self.assertEqual(core._box_leader, "right")
+
+    def test_block_freezes_a_leading_pair(self) -> None:
+        core, _ = self._core()
+        core.set_box_mode(True)
+        core.update_engage(_box_frame(False, False))
+        self.assertTrue(core.teleop_enabled)
+        core.block_engage()
+        core.update_engage(_box_frame(False, False))
+        self.assertFalse(core.teleop_enabled)
+        self.assertIsNone(core._box_leader)
 
     def test_lock_release_still_acknowledged_while_blocked(self) -> None:
         core, sent = self._core()

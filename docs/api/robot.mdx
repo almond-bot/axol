@@ -85,7 +85,7 @@ asyncio.run(main())
 
 If a controlling process dies (or disconnects) while the robot is torqued on, the motors keep holding their last commanded pose. Startup code does not need to know whether that happened: `enable()` queries each motor and converges —
 
-- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its open-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that forces the jaws open;
+- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its end-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that closes and then opens the jaws;
 - **cold** joints get the classic full bring-up;
 - a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
 - with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
@@ -118,7 +118,7 @@ Notes:
 - `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting. A process that must never actuate can `connect()`, check `get_holding()`, and only proceed when every joint is already holding.
 - Custom control modes: pass `enable(hold=False)` to leave freshly brought-up joints enabled but limp, then pick your mode with `set_control_mode()` (position/velocity/force) and drive with `set_positions_velocity()` / `set_velocity()`. The bus stays in Python and no core is started, so `motion_control()` is unavailable until a later `enable()`. The reconnect machinery targets the impedance workflow — a session that died in another control mode is asked to `disable()` and re-enable rather than being reattached.
 - To force a fresh bring-up of a live robot (re-run gripper calibration, reset motors), call `disable()` first, then `enable()`.
-- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
+- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws closed and open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
 - `enable()` also refuses (raising `MotorError`) if any arm joint's encoder reading is implausible for a zero at its calibration end stop — the zero was never set, or is stale, and bringing the robot up on garbage joint-frame values is unsafe. The gate runs **before anything is actuated** (`connect()` and the read APIs still work, for inspecting such a robot); run `axol motor.set-zero-pos --guided` to (re)zero. See [`motor.set-zero-pos`](/cli/motor-set-zero-pos).
 - `disconnect()` closes the buses without touching torque, so the robot keeps holding and a later process can reconnect. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
 
@@ -137,7 +137,7 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 
 | Method | Units |
 |---|---|
-| `get_positions()` | rad (gripper: `[0, 1]`) |
+| `get_positions()` | rad (gripper: `[0, 1]` over the calibrated stroke, `1.0` = at the open stop) |
 | `get_velocities()` | rad/s |
 | `get_torques()` | Nm (Damiao) / A (MyActuator) |
 | `get_temperatures()` | °C |
@@ -150,7 +150,7 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 
 | Method | Description |
 |---|---|
-| `motion_control(left, right)` | Impedance (arm) + position-force (gripper); primary control method. Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
+| `motion_control(left, right)` | Impedance (arm) + position-force (gripper: `[0, 1]` over the calibrated stroke, so `1` is always the open stop the enable-time sweep found); primary control method. Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
 | `gravity_compensate(kd, free_joints, gripper_targets)` | One gravity-comp cycle — the arms go limp and hand-guidable, held up by feedforward |
 | `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
 | `set_velocity(left, right)` | Motor built-in speed controller |
@@ -299,16 +299,22 @@ left = replace(
 | `kd_host` | `float` (default `0.0`) | Host-side velocity damping (Nm·s/rad): `τ = kd_host · (v_des − v_meas)` added to `t_ff`, with `v_meas` differentiated from measured positions at the command rate. Needed on the high-inertia shoulders, where the motor firmware's velocity estimate is too filtered to damp the ~2 Hz closed-loop resonance (firmware `kd` delivers ~10× less damping than nominal there); the elbow uses a small dose for the same reason. Zero for the wrists and `shoulder_3`, whose firmware `kd` works. Never raise it past the highest value verified stable on hardware — the shipped shoulder 45s are that ceiling; host damping runs on a one-cycle-stale velocity and destabilizes joints that ring above ~10 Hz. A `kd` beyond the firmware's 0–5 range is clamped by the command encoding (with a warning at arm construction), never converted into host damping. |
 | `kd_host_hz` | `float \| None` (default `None`) | Centre frequency (Hz) of the band-pass that confines `kd_host` to the joint's resonance band — a damper centred on the wrong mode arrives rolled-off and out of phase. `None` makes the centre track the pose (the shoulders' impedance mode `√(kp/J(q))` moves ~2.2 → 5.4 Hz between rest and raised-to-the-side); set an explicit value for structural modes that √(kp/J) can't predict (the elbow rings at 6.7–12.5 Hz under load, so it pins 9.5 Hz). The control internals convert to rad/s once at arm construction. |
 | `kd_host_q` | `float \| None` (default `None`) | Quality factor of that band-pass (bandwidth = centre/q). `None` uses the shared 0.8, about an octave wide either side — right for a pose-tracked centre that only estimates the mode, but wide enough to reach into the sub-1.5 Hz intentional-motion band when the centre sits low, where the damping drags the joint's final approach (measured on shoulder_1 as a step that never enters its settle band — a sub-Hz wander, not a ring). When `kd_host_hz` is pinned on a *measured* ring frequency, q ≈ 2–3 confines the damping to the ring and releases the approach. |
+| `torque_limit` | `float` (default `inf`) | Cap (Nm) on the impedance *spring* torque a joint may develop against whatever blocks it. The realtime core enforces it every tick by never sending a position more than `torque_limit / kp` from the last measured one, so `kp · error` is bounded however far the operator's target runs ahead of a blocked joint (at the wrists' `kp=130`, 5 Nm is a ~2.2° window). Gravity feedforward is outside the cap — holding the arm's own weight is not pressing — and the friction / inertia / host-damping feedforwards are derived from the capped command, so they fall to zero while the joint is held. `inf` (the default on every joint) leaves a joint uncapped; box mode caps the wrists for its session instead (`VRTeleopConfig.box_wrist_torque`, 5 Nm). Override per joint: `--axol.left.wrist_2.torque_limit 2.0`. |
 
 Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
 
 `ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+
+Which gripper is fitted is `AxolConfig.gripper` (below): `"parallel"`, the stock two-finger gripper, or `"parcel"`, the hinged-plate parcel gripper. It sets the sign of the motor rotation that closes each jaw (`gripper_close_direction(gripper, is_left)`): both parallel jaws close toward positive motor angles, while the parcel gripper's right motor is mounted the other way round and closes toward negative ones.
+
+The gripper's stroke is not hardcoded. On every cold `enable()` it is calibrated against its own hardware: the jaw is swept closed (in its close direction) until it stalls on the closed stop, then swept back until it stalls on the open stop, so it finishes **open**. The two measured stops define the `[0 = closed, 1 = open]` normalisation for that session and are persisted for reconnects. The measured stroke is then checked against the configured type — about 290° for the parallel gripper, 185° for the parcel gripper — and a stroke nearer the other type's fails the bring-up with a `MotorError` naming the right setting (a wrong type would leave the parcel gripper's right jaw closed after calibration).
 
 `AxolConfig` also exposes top-level parameters:
 
 | Field | Default | Description |
 |---|---|---|
 | `has_gripper` | `True` | Whether this robot is the gripper-equipped SKU. Set `False` for the gripperless SKU: the gripper motors are never constructed, enabled, or calibrated; the gripper element of every `(8,)` joint array is ignored on write and reported as `0.0` on read (array shapes are unchanged). LeRobot datasets recorded on a gripperless robot carry 7 channels per arm instead of 8. |
+| `gripper` | `"parallel"` | Which gripper is fitted to both arms: `"parallel"` (the stock two-finger gripper) or `"parcel"` (the hinged-plate parcel gripper). Sets each jaw's close direction for the end-stop calibration, which refuses a measured stroke that belongs to the other type. Teleop's box mode exists only with `"parcel"`. CLI `--axol.gripper parcel`; control panel **Robot → Gripper**. |
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
 | `left_stiffness` | `1.0` | Compliance blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `1.0` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=350`) — the stiffest the hardware was measured to support, so lower values only *add compliance*, down to the hand-guidable `_SOFT_GAINS` at `0` (`shoulder_1` `kp=40`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness), with a damping-ratio-consistent soft endpoint so every slider position stays as well damped as the tuned gains; `j_eff` is unchanged by the blend; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
 | `right_stiffness` | `1.0` | Same, for the **right** arm. |
@@ -342,6 +348,8 @@ async with Axol(config=config) as axol: ...
 
 See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.
 
+The same model also serves the arm's kinematics on the control side: `GravityCompensator.mount_jacobian(arm_q, is_left=...)` returns the gripper mount's pose (the URDF gripper link — the frame the IK solver targets) and its `(6, 7)` geometric Jacobian at any joint configuration, from `mj_kinematics` alone.
+
 ### Payloads
 
 The link masses above describe the robot itself. Whatever a gripper picks up is added at runtime with `set_payload`, so the arm carrying it holds its commanded pose instead of sagging by `unmodelled torque / kp`, gravity-comp hand-guiding stays weightless, and `torque_residuals()` does not read the load as a contact:
@@ -365,3 +373,7 @@ asyncio.run(main())
 ```
 
 The payload is a point mass rigidly attached to the gripper: `com` is in metres in the gripper link frame — the end-effector frame forward kinematics reports — and `GRIPPER_TIP_OFFSET` is where the fingers close. Use `"both"` for one object carried between the two grippers, giving each arm its share of the mass. The feedforward changes on the next control cycle, so call it when the grasp actually closes and clear it when it opens: a payload the gripper is not yet carrying lifts the arm slightly until it is. Masses above 5 kg (and CoMs more than 0.5 m from the gripper) are refused as unit slips. A payload is not persisted; a permanently heavier end-effector belongs in the calibration instead ([`tune.factory --mass wrist_3=<kg>`](/cli/tune-factory)). `Sim.set_payload` validates the same arguments and changes nothing, so a script runs identically in sim.
+
+## Squeeze lean (box mode)
+
+The force side of [box mode](/guides/vr-interface#box-mode) lives in the IK worker, not the robot (`almond_axol.teleop.box.squeeze_lean`; see [`box_squeeze_lean`](/api/teleop#vrteleopconfig)). What the robot contributes is the model: `GravityCompensator.mount_jacobian` above, and `AxolArm.kp` — each arm's impedance stiffness per joint (Nm/rad, after the stiffness blend), which with the Jacobian gives the arm's Cartesian compliance at the mount, `J diag(1/kp) J^T`. The teleop core reads both arms' cached measured positions and `kp` before every box-mode frame (`almond_axol.teleop.core.measured_arms`) and forwards them to the worker, which offsets the gripper *targets* so the run-ahead the operator jogs becomes a pure force through the tool's contact points. Nothing on the robot's command path is touched: the arms are position controlled as ever, and the realtime core sees ordinary targets. (An earlier version reshaped every command on the robot from its measured pose; it worked on the bench and cost the pair its alignment on the robot, and is gone.)

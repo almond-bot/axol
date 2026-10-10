@@ -68,7 +68,7 @@ joint_line = (
     b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02"
     b" 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20\n"
     b"joint 0 can_alm_axol_l elbow 4 130 5.0 9.4 33.0 0.6 250 0.15 0.02"
-    b" 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+    b" 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20 0 0 0 0 5\n"  # ... tau_cap 5 Nm
     b"joint 0 can_alm_axol_l wrist_2 6 130 3.5 9.4 33.0 0 0 0 0"
     b" 0 0 0 0 60 pv 0 0.3 0.1 0.1 0 20\n"
 )
@@ -96,8 +96,8 @@ async def stale_client(send, recv, w):
 async def skewed(send, recv, w):
     send(cfg)
     await recv()
-    # A previous-generation 8-field target against the 9-field core.
-    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<8d", *([0.0] * 8)) * 8)
+    # A previous-generation 9-field target against the 10-field core.
+    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<9d", *([0.0] * 9)) * 8)
     await asyncio.sleep(0.5)
     return "sent skewed target"
 

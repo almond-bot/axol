@@ -112,6 +112,7 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..teleop.config import adopt_robot_gripper
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
 from ..utils.logquiet import quiet_noisy_loggers
@@ -517,6 +518,34 @@ class _LocalPolicy:
 # ----------------------------------------------------------------------
 
 
+class _SpringCaps:
+    """Box mode's spring-torque caps on the arms while the operator drives.
+
+    The teleop core says which joints to cap (``teleop.spring_caps()``: box
+    mode on, not resetting); the robot is told on change only, as in
+    collect-data. Caps apply only to the operator's teleop commands: the
+    policy, the frozen hold and a return to rest run uncapped, so each of
+    those paths calls :meth:`clear` first. No-op on a robot without the
+    setter (classic CAN path).
+    """
+
+    def __init__(self, robot: "AxolRobot", teleop: "DaggerVRTeleop") -> None:
+        self._set = getattr(getattr(robot, "axol", None), "set_spring_caps", None)
+        self._teleop = teleop
+        self._applied: dict | None = None
+
+    def sync(self, teleop_driving: bool = True) -> None:
+        if self._set is None:
+            return
+        caps = self._teleop.spring_caps() if teleop_driving else None
+        if caps != self._applied:
+            self._set(caps)
+            self._applied = caps
+
+    def clear(self) -> None:
+        self.sync(teleop_driving=False)
+
+
 class _DaggerControlLoop(threading.Thread):
     """Drive the robot from the policy or the operator, at a per-state rate.
 
@@ -567,9 +596,11 @@ class _DaggerControlLoop(threading.Thread):
         fps: int,
         teleop_hz: int,
         limiter: "PolicyActionLimiter | None" = None,
+        spring_caps: _SpringCaps | None = None,
     ) -> None:
         super().__init__(name="axol-dagger-control", daemon=True)
         self.robot = robot
+        self.spring_caps = spring_caps or _SpringCaps(robot, teleop)
         self.policy = policy
         self.teleop = teleop
         self.recorder = recorder
@@ -749,6 +780,7 @@ class _DaggerControlLoop(threading.Thread):
                 if self.shutdown_event.is_set():
                     return
                 if self.state == _STATE_POLICY:
+                    self.spring_caps.clear()
                     sent = self._policy_tick(t0)
                     if sent is None:
                         time.sleep(period)
@@ -760,6 +792,7 @@ class _DaggerControlLoop(threading.Thread):
                     action = self.teleop.get_action()
                     if self.shutdown_event.is_set():
                         return
+                    self.spring_caps.sync()
                     performed = self.robot.send_action(action)
                     if self.shutdown_event.is_set():
                         return
@@ -790,6 +823,7 @@ class _DaggerControlLoop(threading.Thread):
                     if last_action is not None and last_dataset_action is not None:
                         if self.shutdown_event.is_set():
                             return
+                        self.spring_caps.clear()
                         self.robot.send_action(last_action)
                         if self.shutdown_event.is_set():
                             return
@@ -829,6 +863,11 @@ class _DaggerControlLoop(threading.Thread):
             )
             self.fatal_error = exc
             self.shutdown_event.set()
+        finally:
+            try:
+                self.spring_caps.clear()
+            except Exception:  # noqa: BLE001 - teardown clears again
+                _logger.exception("could not clear spring caps")
 
 
 # ----------------------------------------------------------------------
@@ -876,6 +915,7 @@ def _idle_teleop_until_record(
     teleop_hz: int,
     control: "_StdinPolicyControl | _QueuePolicyControl",
     stop_event: threading.Event,
+    spring_caps: _SpringCaps | None = None,
 ) -> tuple[bool, bool]:
     """Drive between-episode teleop until the operator starts the next episode.
 
@@ -897,8 +937,29 @@ def _idle_teleop_until_record(
     (the policy expects to start from the rest pose). ``started`` is False when
     the operator quit instead: the panel's Stop or a quit at the gate. A
     KeyboardInterrupt propagates to the supervisor's handler (quit).
-    """
 
+    ``spring_caps`` carries box mode's spring caps onto the operator's teleop
+    commands; they are lifted for the reset move and on return.
+    """
+    caps = spring_caps or _SpringCaps(robot, teleop)
+    try:
+        return _idle_teleop_loop(
+            teleop, robot, return_to_rest, teleop_hz, control, stop_event, caps
+        )
+    finally:
+        caps.clear()
+
+
+def _idle_teleop_loop(
+    teleop: "DaggerVRTeleop",
+    robot: "AxolRobot",
+    return_to_rest: Callable[[], bool],
+    teleop_hz: int,
+    control: "_StdinPolicyControl | _QueuePolicyControl",
+    stop_event: threading.Event,
+    caps: _SpringCaps,
+) -> tuple[bool, bool]:
+    """The body of :func:`_idle_teleop_until_record`."""
     period = 1.0 / float(teleop_hz)
     teleop_used = False
     while not stop_event.is_set():
@@ -929,6 +990,7 @@ def _idle_teleop_until_record(
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
             _logger.info("Returning to rest pose.")
+            caps.clear()
             returned_to_rest = return_to_rest()
             if returned_to_rest:
                 teleop_used = False  # the arms are at rest again
@@ -943,6 +1005,7 @@ def _idle_teleop_until_record(
         if teleop.teleop_engaged:
             teleop_used = True
             action = teleop.get_action()
+            caps.sync()
             robot.send_action(action)
         elapsed = time.perf_counter() - t0
         if elapsed < period:
@@ -1311,6 +1374,9 @@ def _run(
         cfg.teleop_config, AxolVRTeleopConfig
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+        adopt_robot_gripper(
+            cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
+        )
 
     robot = AxolRobot(cfg.robot_config)
     teleop = DaggerVRTeleop(cfg.teleop_config)
@@ -1644,6 +1710,12 @@ def _run(
         pos_l, pos_r = robot.positions
         _logger.info("Connecting VR teleop (IK worker JIT may take ~20s)...")
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        # As in collect-data: the headset's live settings act on the hardware
+        # (grip force, box mode's squeeze caps) and box mode's squeeze lean
+        # reads the measured arms.
+        teleop.live_settings.set_robot(robot.axol)
+        teleop.measured_robot = robot.axol
+        spring_caps = _SpringCaps(robot, teleop)
 
         # Stream the cameras to the headset via the relay's out-of-process
         # WebRTC manager.
@@ -1726,6 +1798,7 @@ def _run(
                 teleop_hz,
                 control,
                 stop_event,
+                spring_caps,
             )
             # An idle VR-reset home sets ``arms_at_rest`` itself on the way.
             arms_at_rest = not idle_teleop_used and (was_at_rest or arms_at_rest)
@@ -1848,6 +1921,7 @@ def _run(
                     recorder=recorder,
                     fps=fps,
                     teleop_hz=teleop_hz,
+                    spring_caps=spring_caps,
                     limiter=(
                         PolicyActionLimiter(
                             cfg.policy_max_vel, cfg.policy_max_accel, fps

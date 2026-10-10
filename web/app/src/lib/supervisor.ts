@@ -16,6 +16,8 @@ export interface SchemaField {
   help?: string | null
   /** Widget hint for a per-run field (CommandSpec.fieldUi), e.g. a slider. */
   ui?: SettingsFieldUI
+  /** Advanced-tree fields shown only while another setting holds a value. */
+  showWhen?: ShowWhen
 }
 
 /** A nested config section (a dataclass / dict in the config tree). */
@@ -1346,6 +1348,16 @@ export interface SettingsFieldUI {
   step?: number
   /** toggle-number: value filled in when the switch turns on. */
   onValue?: number
+  /** Shown only while another setting holds a value. */
+  showWhen?: ShowWhen
+}
+
+/** Show a setting only while the setting `key` (its staged value, else its
+ * default) equals `equals` — box mode's settings only with the parcel
+ * gripper, say. */
+export interface ShowWhen {
+  key: string
+  equals: SettingValue
 }
 
 export interface SettingsField {
@@ -1524,6 +1536,42 @@ export function filterSchema(nodes: SchemaNode[], exclude: Set<string>): SchemaN
     }
   }
   return out
+}
+
+/** Whether a setting gated by `showWhen` is visible: the controlling
+ * setting's staged value (else its schema default) equals the wanted one. */
+export function settingShown(
+  showWhen: ShowWhen | undefined,
+  values: Record<string, SettingValue>,
+  schema: SettingsCategory[]
+): boolean {
+  if (!showWhen) return true
+  // A staged null is a reset to default, the same as nothing staged.
+  const staged = values[showWhen.key] as SettingValue | null | undefined
+  const value =
+    staged != null
+      ? staged
+      : schema.flatMap((c) => c.settings).find((s) => s.key === showWhen.key)?.default
+  return value === showWhen.equals
+}
+
+/** Drop the Advanced-tree fields whose `showWhen` doesn't hold (and any
+ * groups left empty). */
+export function visibleAdvancedSections(
+  sections: AdvancedSection[],
+  values: Record<string, SettingValue>,
+  schema: SettingsCategory[]
+): AdvancedSection[] {
+  const hidden = new Set(
+    sections
+      .flatMap((s) => flattenFields(s.nodes))
+      .filter((f) => !settingShown(f.showWhen, values, schema))
+      .map((f) => f.key)
+  )
+  if (hidden.size === 0) return sections
+  return sections
+    .map((s) => ({ ...s, nodes: filterSchema(s.nodes, hidden) }))
+    .filter((s) => s.nodes.length > 0)
 }
 
 export function defaultString(field: SchemaField): string {

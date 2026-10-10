@@ -5,9 +5,13 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
 
+# Re-engage behaviour of a grip (see ``VRTeleopConfig.reengage``). Registered
+# as a draccus choice in ``almond_axol.cli.config``.
+ReengageMode = Literal["clutch", "ramp"]
 _logger = logging.getLogger(__name__)
 
 
@@ -84,6 +88,280 @@ class VRTeleopConfig:
             stays held — release a grip and that arm freezes where it is,
             hold on and it keeps going; re-engaging from a full release
             requires holding both again.
+        reengage: What happens to an arm's controller↔arm mapping when its
+            grip re-engages (after a freeze, a disengage, or a pause in which
+            the operator walked away or the arm was moved by hand).
+            ``"clutch"`` (default) re-snaps: the arm stays where it is and
+            the controller's *current* pose becomes the new origin — the
+            operator brings the controller to (roughly) match the arm before
+            gripping, and nothing moves at the grip. ``"ramp"`` keeps
+            the mapping from the arm's previous engage as a session anchor and
+            eases the arm out to where that mapping says the controller now
+            is — the arm comes to the hand, over ``reengage_ramp_min_s`` or
+            longer (paced by ``reengage_ramp_speed``), then tracks 1:1. The
+            anchor is dropped by a reset / return-to-rest (the next grip
+            snaps fresh in either mode). Engages *within* box mode ignore
+            it (they already blend the pair into the parallel grasp), but
+            leaving box mode in ``"ramp"`` blends both arms back out to the
+            mapping from before box mode.
+            Toggled live from the headset HUD (``VRFrame.reengage``); this is
+            the mode a session starts in.
+        reengage_ramp_speed: Linear speed (m/s) that paces the ``"ramp"``
+            re-engage blend: an arm 30 cm from its target takes at least
+            ``0.30 / reengage_ramp_speed`` seconds to get there.
+        reengage_ramp_min_s: Floor (s) on the ``"ramp"`` blend duration so a
+            small correction is still eased rather than stepped.
+        box_mode: Start the session in **box mode** (bimanual carry). The two
+            grippers are held as a parallel pair clamping the box between
+            their sides — fingers pointing forward like two flat hands, the
+            flat outer face of each closed gripper against the box, held by
+            friction — and *one* controller moves both arms as a pair:
+            either grip engages both arms with that hand as the leader (no
+            both-grips gate; the other grip switches leader), while each
+            trigger still drives its own gripper. The hand's **position**
+            and its **turn about vertical** are tracked, nothing else: the
+            pair stays level with the hands straight out whatever the hand's
+            pitch and roll, and turning the hand about the room's up axis
+            turns the pair about its centre to line it up with a box on the
+            table. On engage the grippers first blend into that
+            configuration over ``box_align_duration`` (from wherever they
+            were, e.g. after someone hand-guided the arms), then follow the
+            leader controller.
+            While a grip is leading, the thumbsticks stop driving Jelly and
+            set the grasp instead (freeze the pair — click the leader's grip
+            again — and they drive Jelly as usual, so the box can be carried
+            across the room). Either stick does the same thing: left/right
+            changes the gripper separation (right = wider), forward/back how
+            far out the elbows are held (``box_elbow_out``; forward =
+            further apart), and a single stick click toggles the grasp
+            (``box_grasp``: flush face or fingers straight). The mode is a live setting
+            (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
+            both thumbstick clicks together, the control panel); this is the
+            default it starts in. Switching engages at once, no grip
+            needed: into box mode the pair is led by ``box_lead_hand``
+            straight away (the grippers blend into the pair first, as on
+            any box engage), and out of it both arms engage together, so
+            in ``"ramp"`` re-engage they blend back out to the controllers.
+            A return-to-rest that leaves box mode does not engage.
+        box_lead_hand: Which controller leads the pair when box mode is
+            switched on, ``"right"`` (the default) or ``"left"``. The lead
+            can still be handed over with the other grip, and a session
+            that engages from a frozen pair is led by the grip that does.
+            Live-adjustable.
+        gripper: Which gripper is fitted. ``None`` (the default) follows
+            the robot's
+            :attr:`AxolConfig.gripper <almond_axol.robot.config.AxolConfig>`
+            (``--axol.gripper``), which the CLIs and :class:`VRTeleop` adopt
+            through :func:`adopt_robot_gripper`, so set it there; a value
+            here that disagrees with the robot's is overridden with a
+            warning. Box mode exists only with ``"parcel"``, the parcel
+            gripper: with ``"parallel"`` (the stock two-finger gripper, and
+            what ``None`` means with no robot to follow) every
+            box-mode setting is hidden from the headset and the control
+            panel, ``box_mode`` is forced off and :meth:`VRTeleopCore.set_box_mode`
+            refuses to switch it on. The parcel gripper has a fixed blade
+            across the mount axis from the box and a hinged plate that folds
+            back along the wrist on the box side at its open stop; box mode
+            places its contact geometry
+            (:class:`~almond_axol.teleop.box.ToolGeometry`): the straight
+            grasp presses the plate's face flat on the box, the angled grasp
+            rolls each gripper ``box_flush_deg`` inward about the plate's
+            front edge onto its chamfer facet, which then touches together
+            with the fixed blade's tip. The width is measured between the
+            contact faces in both.
+        box_flush_deg: Parcel gripper only: how far (degrees) box mode's
+            angled (``"flush"``) grasp turns each gripper inward from the
+            parallel grasp, about the folded plate's front edge. The
+            plate's chamfer is 39.2°, so 39° lays the facet and the fixed
+            blade's tip on the box together. The plate stays at its open
+            stop in this grasp as everywhere else. Live-adjustable.
+        box_grasp: Which of box mode's two grasps a session starts in.
+            ``"straight"`` (the default): fingers straight forward (yaw 0),
+            the tool's flat face on the box — the parcel gripper's folded
+            plate, the stock gripper's closed fingers (width between the
+            mounts). ``"flush"``: for the parcel gripper, each gripper
+            turned ``box_flush_deg`` (39°) inward about the plate's front
+            edge, the plate still at its stop and the width still measured
+            between the contact faces. Toggled live while a grip is leading by clicking (and
+            releasing) either thumbstick — a click that turns into the
+            both-sticks box-mode gesture doesn't count — or from the
+            settings; the pair blends into the new grasp over
+            ``box_align_duration``, each gripper turning about that edge so
+            a box already held stays held. The tilt trim applies on top of
+            either.
+        box_face_left / box_face_right: Which flat side of each gripper
+            (the mount's ``"+x"`` or ``"-x"``) is turned toward the box.
+            ``"auto"`` picks whichever needs the smaller wrist turn at the
+            engage — a coin toss for the parcel gripper, whose hinged blade
+            is on one particular side. If a gripper engages with its fixed
+            blade toward the box (the blade folds away from it) or its
+            motor cap downward, pin that arm to the other side.
+            Live-adjustable.
+        box_grip_tilt: Fixed inward yaw trim (degrees) of each gripper in
+            box mode, on top of the grasp's yaw (``straight`` 0°, ``flush``
+            the tool's flush tilt). ``0`` holds the tool's contact face
+            parallel to the box side. Positive turns the fingertips
+            toward the box centre, negative splays them outward; the gripper
+            pivots about its contact face, so the trim doesn't move the
+            point of contact. A calibration constant, not a live control —
+            the sticks no longer change it.
+        box_width_speed: Rate (m/s) the grip width changes at full stick
+            deflection in box mode.
+        box_width_min: Smallest grip width (m, between the two grippers'
+            contact faces) the box-mode sticks allow. A floor for thin
+            parcels: the fitted tool raises it, per grasp, to where the two
+            grippers' bodies would meet (``ToolGeometry.min_width``).
+            Clamping a box means
+            jogging the width *past* its size, so this sits well under the
+            thinnest parcel.
+        box_width_max: Largest grip width (m) the box-mode sticks allow.
+        box_align_duration: Seconds over which a box-mode engage blends the
+            grippers from their current poses into the parallel
+            configuration before the leader controller takes over 1:1.
+        box_elbow_out: How far out the elbows are held in box mode, in
+            degrees from straight down toward each arm's outboard side
+            (``0`` hangs the elbows under the shoulder-wrist line, ``90``
+            holds them out level). The parallel, fingers-forward gripper
+            poses of box mode leave each arm's elbow swivel free; an IK
+            elbow hint steers it to this angle (at ``box_elbow_weight``).
+            The operator sets it live from either thumbstick — forward
+            brings the elbows further apart, back tucks them in, at
+            ``box_elbow_speed`` — and the value the sticks leave it at is
+            mirrored back here, so it outlasts the pair and shows in the
+            settings panel (also adjustable there, and from the headset
+            menu as **Elbows out**).
+        box_elbow_weight: IK weight on that elbow hint (compare the
+            grippers' pose weights, which box mode raises to twice
+            ``KinematicsConfig.pos_weight`` and four times ``ori_weight``).
+            The hint only steps each elbow along the arm's own swivel, so
+            it doesn't pull a gripper off its target. ``10`` (the default)
+            follows the angle. ``0`` disables the hint — the
+            swivel is then left alone: rest damping holds it and the
+            arm/torso collision model (``KinematicsConfig.self_collision``)
+            keeps it off the base — and the sticks' elbow control does
+            nothing. Set at launch (CLI or control panel); not a live
+            setting.
+        box_elbow_speed: Rate (degrees/s) the sticks change
+            ``box_elbow_out`` at full forward/back deflection.
+        box_wrist_torque: Cap (Nm) on the impedance spring torque of
+            ``wrist_2`` and ``wrist_3`` on each arm while box mode is on and
+            the arms are not on a return-to-rest (``BOX_WRIST_JOINTS`` in
+            :mod:`almond_axol.teleop.core`, applied through
+            ``set_spring_caps``; plain teleop runs the wrists uncapped). The
+            wrists carry the clamp's moment at the tool, and the small wrist
+            motors overheat pressing with ``kp`` times however far the width
+            is jogged past the box: ``5`` (the default) is ~2.2° of position
+            error at ``kp`` 130, enough authority to hold a clamped box. The
+            squeeze's automatic clamp-force limit is derived from it
+            (``joint_force_limit``: ~39 N a side at 5 Nm). ``0`` disables.
+            Realtime-core hardware only; not a live setting.
+        box_squeeze_torque: Cap (Nm) on the impedance spring torque of the
+            joints that squeeze the box — ``shoulder_2`` and ``shoulder_3``
+            on each arm (see ``BOX_SQUEEZE_JOINTS`` in
+            :mod:`almond_axol.teleop.core`), which carry almost all of a
+            lateral force at the gripper and almost none of a held box's
+            weight — whenever box mode is on and the arms are not on a
+            return-to-rest. Closing the grip width onto a box drives the IK
+            targets *into* it; without a cap the arms then press with
+            ``kp`` times the run-ahead (~6 N per centimetre of width past
+            contact, and rising). With it, each command is first backed off
+            toward the measured pose — the whole arm by one factor, so it
+            keeps its shape and the contact face its orientation
+            (``AxolArm._back_off_to_spring_caps``) — until the capped
+            joints' spring is within the cap, and the realtime core then
+            also keeps each capped joint's commanded position within
+            ``cap / kp`` of its measured one, so the pair leans on the box
+            with a bounded squeeze however far the width is jogged in and
+            the face stays flat on it. Rough clamp force
+            per side: the cap divided by the shoulder's lever to the
+            gripper — ~0.65 m with the arms down, ~0.3 m with the box
+            raised — so ``6`` Nm is roughly 9–20 N a side; the arms give
+            way rather than push harder. Gravity feedforward is outside it,
+            and the wrists keep ``box_wrist_torque``.
+            ``0`` (the default) disables. Live-adjustable (headset menu /
+            control panel); realtime-core hardware only. This is an
+            opt-in hard, per-joint backstop, off by default because it
+            cannot tell a squeeze from a move: the shoulders' spring
+            torque during an ordinary carry — servo lag under motion, a
+            few degrees at ``kp`` 250 — exceeds any cap tight enough to
+            matter, so with it on the arm moving toward the other trails
+            the move and the pair skews. The squeeze *force* the operator
+            feels is bounded by ``box_squeeze_force`` below instead, which
+            caps the clamp consistently across poses (the shoulder's lever
+            to the gripper halves as the box is raised, so a fixed torque
+            alone would let the force double) by holding the targets'
+            depth, not by rewriting commands.
+        box_squeeze_lean: Scale on box mode's **squeeze lean** (``1`` = the
+            arm model's value, ``0`` = off). Jogging the width in past the
+            box runs the IK targets ahead of where the box holds the
+            grippers, and the arms' impedance springs turn that run-ahead
+            into the clamp — ``kp`` times it, ~6 N per centimetre. A plain
+            lateral run-ahead, though, is a force at the gripper *mount*
+            plus the moment it takes to hold the mount's orientation fixed
+            against the arm's stiffness coupling (~1.5 Nm per centimetre at
+            a box-carrying pose). The tool doesn't touch the box at the
+            mount: in the angled grasp the parcel gripper presses with its
+            plate's chamfer facet and the fixed blade's tip 7 cm further
+            along the box side, and that moment can only be carried by those
+            contacts loading unevenly — the facet digs in as the tip lifts, the pinch
+            the operator sees. The lean turns the run-ahead into a pure
+            force through the contacts' centroid, which they then share
+            evenly: from each arm's Jacobian at the commanded pose and its
+            joint stiffness (:func:`almond_axol.teleop.box.squeeze_lean`),
+            the gripper target is yawed inward about 1.3° per centimetre of
+            clamp depth, rolled a fraction so the tall face stays flat, and
+            shifted a millimetre to match, all in proportion to the depth —
+            how far the targets sit past the measured mounts along the
+            pair's inward normals, averaged over both arms so a carry's
+            servo lag adds nothing, low-passed 0.2 s. It is an offset to
+            the *target*: the arms stay position controlled, the command
+            path is untouched, and neither arm is held back from a move
+            (the measured-pose command shaping this replaces did exactly
+            that and cost the pair its alignment). Tune by eye: raise it if
+            the tip still lifts as you squeeze, lower it if the face by the
+            wrist lifts instead. Live-adjustable; realtime-core hardware
+            only (the sim has no compliance and reports no measurement).
+        box_squeeze_trim: Bound (degrees) on box mode's **squeeze trim**;
+            ``0`` turns it off. The lean above is open loop, and the arm is
+            not quite its model: gear backlash, the wrist's own give and
+            the gripper flexing under load all let the tip swing off the
+            box further than the joint springs say, so a heavy box — more
+            depth, for the friction to carry it — still shows the pinch.
+            The trim closes that gap from what the encoders do see: the
+            yaw between each gripper's measured mount rotation and its
+            parallel slot, signed tip-out — per arm, since the two give
+            differently (the grippers are identical parts, not mirrored,
+            so a clamp loads their hinges opposite ways). While the
+            grippers press, each arm's toe-out is integrated — 1° adds
+            1°/s — into an extra inward yaw of its own target, never more
+            than this many degrees, and it bleeds away (1 s) once they
+            don't. A turn of the pair lags both arms the same way about up
+            (toe-out on one side, toe-in on the other), so the trims only
+            integrate once the pair's commanded motion has been still for
+            0.3 s. They settle where each measured face is parallel to the
+            box, tip and root both on it, whatever the unmodelled give
+            was, about a second after the clamp. Shown as ``trim`` (mean)
+            and ``trims`` (``[left, right]``) in the pair status, and
+            logged once a second while pressing with each arm's depth,
+            force and toe-out. Live-adjustable; realtime-core hardware only.
+        box_squeeze_force: Clamp force cap (N) per arm in box mode; ``0``
+            (the default) for none. The squeeze lean above knows the clamp
+            force the depth produces (the arm model's stiffness along the
+            lean, ~6 N per centimetre); past the cap the targets are pulled
+            back out along the pair's inward normals to the cap's depth, by
+            the same amount on both arms, so the pair presses with the cap
+            however far the width is jogged in — at any pose, unlike a
+            joint torque cap. It follows the measured width, low-passed,
+            and only ever moves the two targets toward each other's
+            gripper by equal amounts, so the pair stays a pair. ``8`` N a
+            side holds a light parcel with margin; raise it if boxes slip,
+            lower it to be gentler. Live-adjustable; realtime-core hardware
+            only. Whatever it is set to, the clamp is also held under what
+            the wrists can press evenly with: ``wrist_2`` carries the moment
+            that keeps the tip on the box and, at ``box_wrist_torque``
+            (5 Nm), saturates at ~39 N of even clamp, after which squeezing
+            harder only lifts the tip — so the worker stops the clamp at
+            80% of that (~31 N a side at a box-carrying pose).
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -275,6 +553,29 @@ class VRTeleopConfig:
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
+    reengage: ReengageMode = "clutch"
+    reengage_ramp_speed: float = 0.15
+    reengage_ramp_min_s: float = 0.75
+    box_mode: bool = False
+    box_lead_hand: Literal["right", "left"] = "right"
+    gripper: Literal["parallel", "parcel"] | None = None
+    box_flush_deg: float = 39.0
+    box_grasp: Literal["straight", "flush"] = "straight"
+    box_face_left: Literal["auto", "+x", "-x"] = "auto"
+    box_face_right: Literal["auto", "+x", "-x"] = "auto"
+    box_grip_tilt: float = 0.0
+    box_width_speed: float = 0.08
+    box_width_min: float = 0.02
+    box_width_max: float = 0.70
+    box_align_duration: float = 1.5
+    box_elbow_out: float = 30.0
+    box_elbow_weight: float = 10.0
+    box_elbow_speed: float = 30.0
+    box_wrist_torque: float = 5.0
+    box_squeeze_torque: float = 0.0
+    box_squeeze_lean: float = 1.0
+    box_squeeze_trim: float = 5.0
+    box_squeeze_force: float = 0.0
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
@@ -295,6 +596,23 @@ class VRTeleopConfig:
     quest_controller_profile: str | None = None
     quest_pose_space: str | None = None
     urdf_viewer_world_aligned: bool | None = None
+
+
+def adopt_robot_gripper(config: VRTeleopConfig, gripper: str) -> None:
+    """Set ``config.gripper`` to the robot's fitted gripper.
+
+    The robot's ``AxolConfig.gripper`` is the one source of truth (it also
+    sets the jaws' close direction and the calibration's stroke check); a
+    teleop value that disagrees with it is replaced, with a warning.
+    """
+    if config.gripper is not None and config.gripper != gripper:
+        _logger.warning(
+            "teleop gripper=%r ignored: the robot is configured for the %s "
+            "gripper (set axol.gripper to change it)",
+            config.gripper,
+            gripper,
+        )
+    config.gripper = gripper
 
 
 def apply_mantis_teleop_profile(

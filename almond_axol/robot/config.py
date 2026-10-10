@@ -30,7 +30,7 @@ import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
-from typing import Any
+from typing import Any, Literal, get_args
 
 from ..constants import ARM_JOINTS, Joint
 from ..motor.motor import _JOINT_CONFIG
@@ -332,6 +332,26 @@ class JointConfig:
                   q=3 on both arms even with its pose-tracked centre: hardware
                   traces found a separate 12.5-13.6 Hz mast/forearm mode that
                   the old wide band could feed.
+        torque_limit: Cap (Nm) on the impedance *spring* torque the joint may
+                  develop against whatever blocks it. Enforced in the
+                  realtime core each tick by clamping the position error the
+                  wire carries: the commanded position is never sent more
+                  than ``torque_limit / kp`` from the measured position, so
+                  ``kp · error`` is bounded at ``torque_limit`` however far
+                  the operator's target runs ahead of a blocked joint. Gravity
+                  feedforward is on top of the cap (holding the arm's own
+                  weight is not "pressing"); friction/inertia feedforwards
+                  fall to zero on their own once the sent command stops
+                  moving. ``inf`` (the default, on every joint) disables
+                  it. A flow can tighten any joint's cap for a while on top
+                  of this (``AxolArm.set_spring_caps``, carried per
+                  command): box mode caps the wrists at
+                  ``VRTeleopConfig.box_wrist_torque`` and, optionally, the
+                  squeeze-carrying shoulders at
+                  ``VRTeleopConfig.box_squeeze_torque``. The tighter of the
+                  two applies. Impedance (``wire_mode`` ``"mit"``) joints
+                  only: a firmware-loop joint (``"a4"`` / ``"pv"``) has no
+                  spring to cap.
         stiction_gain: Error-sign Coulomb compensation, as a fraction of
                   ``friction.fc`` (see
                   :func:`almond_axol.robot.control.stiction_compensation`).
@@ -437,6 +457,7 @@ class JointConfig:
     kd_host: float = 0.0
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
+    torque_limit: float = math.inf
     stiction_gain: float = 0.0
     stiction_load_gain: float = 0.0
     stiction_err_deg: float = 0.1
@@ -472,6 +493,29 @@ class PositionForceConfig:
 
     torque_limit: float
     max_speed: float
+
+
+GripperType = Literal["parallel", "parcel"]
+GRIPPER_TYPES: tuple[str, ...] = get_args(GripperType)
+
+
+def gripper_close_direction(gripper: str, is_left: bool) -> int:
+    """Sign of the motor rotation that closes one arm's jaw.
+
+    ``+1`` closes toward positive motor angles, ``-1`` toward negative. Both
+    jaws of the stock parallel gripper close toward positive angles; on the
+    parcel gripper the right motor is mounted the other way round, so its
+    jaw closes toward negative ones. The end-stop calibration at enable time
+    sweeps in this direction first to find the closed stop, then back to the
+    open stop — so a wrong sign swaps open/closed and leaves the jaw closed
+    after bring-up (and the measured stroke then gives the wrong
+    ``AxolConfig.gripper`` away).
+    """
+    if gripper not in GRIPPER_TYPES:
+        raise ValueError(
+            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
+        )
+    return -1 if gripper == "parcel" and not is_left else 1
 
 
 # Placeholder used in :class:`ArmConfig` defaults. Real per-arm friction
@@ -1266,6 +1310,17 @@ class AxolConfig:
                          (the last element of every ``(8,)`` joint array) are
                          ignored, and gripper reads report ``0.0``. The array
                          shapes of the public API are unchanged.
+        gripper:         Which gripper is fitted to both arms: ``"parallel"``
+                         (the default — the stock two-finger gripper, ~290°
+                         of motor stroke, both jaws closing toward positive
+                         motor angles) or ``"parcel"`` (the hinged-plate
+                         parcel gripper, ~185° of stroke, the right jaw
+                         closing toward negative angles — see
+                         :func:`gripper_close_direction`). The enable-time
+                         end-stop calibration checks the stroke it measures
+                         against this and refuses to bring up a gripper
+                         that looks like the other type. Teleop's box mode
+                         is only available with ``"parcel"``.
         max_step_rad:    Maximum allowed change in any arm joint (rad)
                          between consecutive ``motion_control`` calls.
                          Commands that exceed this are dropped and a warning
@@ -1319,6 +1374,7 @@ class AxolConfig:
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
     has_gripper: bool = True
+    gripper: GripperType = "parallel"
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
@@ -1344,6 +1400,12 @@ class AxolConfig:
         if len(mit) < 2 * len(ARM_JOINTS):
             return MIXED_LOOP_HZ
         return CONTROLLER_LOOP_HZ["impedance"]
+
+    def __post_init__(self) -> None:
+        if self.gripper not in GRIPPER_TYPES:
+            raise ValueError(
+                f"gripper must be one of {list(GRIPPER_TYPES)}, got {self.gripper!r}"
+            )
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.

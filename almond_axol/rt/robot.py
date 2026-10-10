@@ -70,7 +70,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Self
 
 import numpy as np
@@ -393,6 +393,8 @@ class Axol(RobotBase):
                 gains = getattr(arm._arm_config, j.value)
                 f = gains.friction
                 motor_id = _JOINT_CONFIG[j].motor_id
+                # torque_limit formats as "inf" when unset; Rust's f64 parser
+                # reads that as +infinity, i.e. no cap.
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} "
                     f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
@@ -410,7 +412,9 @@ class Axol(RobotBase):
                     f"{gains.firmware.planner_lead_ms or 0.0} "
                     f"{tf_nm_per_pct(j, gains)} "
                     # This joint's impedance rate (0 = the config-wide one).
-                    f"{gains.impedance_hz or 0.0}"
+                    f"{gains.impedance_hz or 0.0} "
+                    # Spring-torque cap (Nm; "inf" = none).
+                    f"{gains.torque_limit}"
                 )
             if arm._has_gripper:
                 lines.append(
@@ -1092,6 +1096,16 @@ class Axol(RobotBase):
         """Clear command history on both arms (pure Python state)."""
         self._robot.reset_command_state()
 
+    def set_spring_caps(self, caps: Mapping[Joint, float] | None) -> None:
+        """Live per-joint spring-torque caps on both arms (see ``AxolArm.set_spring_caps``).
+
+        Each tracked command carries its cap to the core, which clamps the
+        wire position to within ``cap / kp`` of measured for that joint —
+        the tighter of this and the configured ``torque_limit``. Applies
+        from the next :meth:`motion_control`.
+        """
+        self._robot.set_spring_caps(caps)
+
     def reset_gravity_hold(self) -> None:
         """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""
         self._robot.reset_gravity_hold()
@@ -1384,12 +1398,24 @@ class Axol(RobotBase):
             await self.disconnect()
             return
         if not self._core_started:
-            if all(bus.never_opened for bus in self._buses()):
+            buses = self._buses()
+            if all(bus.never_opened for bus in buses):
                 _logger.info(
                     "rt: disable() before any CAN bus was opened — no motor "
                     "traffic was sent, nothing to torque off"
                 )
                 return
+            if not all(bus.is_open for bus in buses):
+                # A rolled-back enable() closes the buses it used, leaving
+                # the joints it found holding still holding: the torque-off
+                # needs them reopened, but never under a live core.
+                core_process = self._link._proc
+                if core_process is not None and core_process.poll() is None:
+                    raise HardwareCleanupError(
+                        "rt: core process is still running; refusing to reopen "
+                        "maintenance proxies for the torque-off"
+                    )
+                await self._robot.connect(purge_stale=False)
             await self._robot.disable()
             return
         if self._rec is not None:

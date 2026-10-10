@@ -276,7 +276,12 @@ const HOLDOVER_MAX: f64 = 0.080;
 /// - 16: an optional per-joint `impedance_hz` after `tf_nm_per_pct` (240 |
 ///   480 | 0 = the config's): single impedance joints at 480 Hz, the rest on
 ///   the 240 Hz lane. A proto-15 core would run them all at one rate.
-const CONFIG_PROTO: u32 = 16;
+/// - 17: an optional per-joint spring-torque cap `tau_cap` (Nm, `inf` =
+///   none) after `impedance_hz`, and `T` slots are `TARGET_FIELDS` (10)
+///   floats — the 10th a per-command cap that tightens it (box mode's
+///   wrist and squeeze caps; 0 = the config cap alone). A proto-16 core
+///   would reject every target on its length.
+const CONFIG_PROTO: u32 = 17;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -1065,6 +1070,23 @@ pub struct JointCmd {
     /// Pose-scaled inertia feedforward gain (Nm·s²/rad), applied to the
     /// low-pass acceleration derivative of tracker position in tracked mode.
     pub j_eff: f64,
+    /// Per-command spring-torque cap (Nm), combined with the joint's config
+    /// cap by `min` (see `effective_tau_cap`). ≤ 0 or non-finite means no
+    /// per-command cap — so the all-zero default and idle slots are inert.
+    pub tau_cap: f64,
+}
+
+/// Number of f64 fields per target slot on the wire (`T` packets).
+pub const TARGET_FIELDS: usize = 10;
+
+/// The spring-torque cap in force for one command: the joint's config cap
+/// tightened by the command's own cap when that is a positive finite number.
+pub fn effective_tau_cap(config_cap: f64, cmd_cap: f64) -> f64 {
+    if cmd_cap.is_finite() && cmd_cap > 0.0 {
+        config_cap.min(cmd_cap)
+    } else {
+        config_cap
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1409,7 +1431,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 //       <dither_nm> <dither_hz> <wire mit|a4|pv>
                 //       <stribeck_gain> <stribeck_dfs> <stribeck_load_gain> <stribeck_vs>
                 //       <fl> <stribeck_pole> [<cap_track> [<lead_ms>
-                //       [<tf_nm_per_pct> [<impedance_hz>]]]]
+                //       [<tf_nm_per_pct> [<impedance_hz> [<tau_cap>]]]]]
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f
@@ -1462,6 +1484,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         lead_s: 0.0,
                         tf_nm_per_pct: 0.0,
                         mit_hz: 0.0,
+                        tau_cap: f64::INFINITY,
                     }
                 } else {
                     let motor_id: u8 = f
@@ -1524,6 +1547,17 @@ fn parse_config(text: &str) -> io::Result<Config> {
                             Some(_) => num(28)?,
                             None => 0.0,
                         },
+                        // Optional: the spring-torque cap (Nm; "inf" =
+                        // uncapped, the default). A NaN or non-positive cap
+                        // would clamp every command onto the measured
+                        // position — a joint that cannot move — so refuse it.
+                        tau_cap: match f.get(29) {
+                            Some(_) => match num(29)? {
+                                cap if cap > 0.0 => cap,
+                                _ => return Err(bad(line)),
+                            },
+                            None => f64::INFINITY,
+                        },
                     }
                 };
                 if spec.slot >= N_SLOTS || bus.2.iter().any(|s| s.slot == spec.slot) {
@@ -1566,8 +1600,8 @@ fn parse_config(text: &str) -> io::Result<Config> {
 }
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
-    // side u8, seq u32, 8 slots x 9 f64
-    let expected = 1 + 4 + N_SLOTS * 9 * 8;
+    // side u8, seq u32, 8 slots x TARGET_FIELDS f64
+    let expected = 1 + 4 + N_SLOTS * TARGET_FIELDS * 8;
     if payload.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1579,7 +1613,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     let mut cmds = [JointCmd::default(); N_SLOTS];
     let mut off = 5;
     for cmd in &mut cmds {
-        let mut vals = [0.0f64; 9];
+        let mut vals = [0.0f64; TARGET_FIELDS];
         for v in &mut vals {
             *v = f64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
             off += 8;
@@ -1594,6 +1628,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
             damp_w0: vals[6],
             damp_q: vals[7],
             j_eff: vals[8],
+            tau_cap: vals[9],
         };
     }
     Ok((
@@ -1633,13 +1668,14 @@ mod tests {
     use super::*;
 
     /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
-    /// 8 slots x 9 f64 LE.
+    /// 8 slots x TARGET_FIELDS f64 LE.
     #[test]
     fn parse_target_roundtrip() {
+        assert_eq!(TARGET_FIELDS, 10);
         let mut payload = vec![1u8];
         payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         for slot in 0..N_SLOTS {
-            for field in 0..9 {
+            for field in 0..TARGET_FIELDS {
                 let v = slot as f64 * 10.0 + field as f64;
                 payload.extend_from_slice(&v.to_le_bytes());
             }
@@ -1652,9 +1688,55 @@ mod tests {
             (c.p_des, c.mode, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q, c.j_eff),
             (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0)
         );
-        // Wrong size (the previous 8-field layout) must be rejected, not
+        assert_eq!(c.tau_cap, 29.0);
+        // Wrong size (the previous 9-field layout) must be rejected, not
         // misparsed — a version-skewed client fails loudly.
-        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
+        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 9 * 8]).is_err());
+    }
+
+    /// The per-command cap only ever tightens the config cap; zero (idle
+    /// slots, the all-zero default) and non-finite values leave it alone.
+    #[test]
+    fn per_command_cap_tightens_only() {
+        assert_eq!(effective_tau_cap(f64::INFINITY, 4.0), 4.0);
+        assert_eq!(effective_tau_cap(5.0, 4.0), 4.0);
+        assert_eq!(effective_tau_cap(3.0, 4.0), 3.0);
+        assert_eq!(effective_tau_cap(5.0, 0.0), 5.0);
+        assert_eq!(effective_tau_cap(5.0, -1.0), 5.0);
+        assert_eq!(effective_tau_cap(5.0, f64::INFINITY), 5.0);
+        assert_eq!(effective_tau_cap(5.0, f64::NAN), 5.0);
+        assert_eq!(effective_tau_cap(f64::INFINITY, 0.0), f64::INFINITY);
+        // ... and through cap_spring: a 4 Nm command cap on an uncapped
+        // kp=250 joint clamps the wire position to 16 mrad of measured.
+        let p = filter::cap_spring(1.0, Some(0.0), 250.0, effective_tau_cap(f64::INFINITY, 4.0));
+        assert!((p - 0.016).abs() < 1e-12, "{p}");
+        let p = filter::cap_spring(1.0, Some(0.0), 250.0, effective_tau_cap(f64::INFINITY, 0.0));
+        assert_eq!(p, 1.0);
+    }
+
+    /// `tau_cap` is an optional trailing field after `impedance_hz`: absent
+    /// = uncapped, `inf` = uncapped, a positive number = that cap, and a
+    /// cap that would pin the joint (0, negative, NaN) is a bad line.
+    #[test]
+    fn parse_config_tau_cap() {
+        let base =
+            "joint 0 canL wrist_2 6 130 3.5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20";
+        let cap_of = |tail: &str| {
+            parse_config(&format!(
+                "proto {CONFIG_PROTO}\nloop_hz 240\n{base}{tail}\n"
+            ))
+            .map(|cfg| cfg.buses[0].2[0].tau_cap)
+        };
+        assert_eq!(cap_of("").unwrap(), f64::INFINITY);
+        assert_eq!(cap_of(" 0 0 0 0").unwrap(), f64::INFINITY);
+        assert_eq!(cap_of(" 0 0 0 0 inf").unwrap(), f64::INFINITY);
+        assert_eq!(cap_of(" 0 0 0 0 5").unwrap(), 5.0);
+        assert!(cap_of(" 0 0 0 0 0").is_err());
+        assert!(cap_of(" 0 0 0 0 -1").is_err());
+        assert!(cap_of(" 0 0 0 0 nan").is_err());
+        // The gripper is never capped.
+        let cfg = parse_config(&format!("proto {CONFIG_PROTO}\ngripper 0 canL 8\n")).unwrap();
+        assert_eq!(cfg.buses[0].2[0].tau_cap, f64::INFINITY);
     }
 
     #[test]
@@ -1895,6 +1977,7 @@ mod tests {
             fw_version: None,
             tf_nm_per_pct: 0.0,
             mit_hz: 0.0,
+            tau_cap: f64::INFINITY,
         }
     }
 
@@ -2116,10 +2199,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 16\ngripper 0 canL 8\n".to_string()
+                "proto 17\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2356,7 +2439,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 16\n\
+            "proto 17\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2408,39 +2491,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 16\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 17\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2451,7 +2534,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 16\n\
+            "proto 17\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2465,15 +2548,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 16\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 17\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 17\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 16\n\
+            "proto 17\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2499,12 +2582,12 @@ mod tests {
         // A future client generation this core does not understand.
         let err = error_of(&format!("proto 99\n{joint}"));
         assert!(err.contains("proto 99"), "{err}");
-        assert!(err.contains("proto 16"), "{err}");
+        assert!(err.contains(&format!("proto {CONFIG_PROTO}")), "{err}");
         // Malformed declarations are bad lines, not silently accepted.
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 16\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 17\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2513,7 +2596,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
-            "proto 16\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 17\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
@@ -2528,27 +2611,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 16\n{mit}"))
+            parse_config(&format!("proto 17\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 16\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 17\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 16\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 16\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 17\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2564,7 +2647,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 16\nloop_hz 480\n{}{}{}{}",
+            "proto 17\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -3104,6 +3187,7 @@ fn bus_loop(
             damp_w0: 20.0,
             damp_q: 0.8,
             j_eff: 0.0,
+            tau_cap: f64::INFINITY,
         };
     }
     // The in-core target tracker, per slot: chases the latest streamed
@@ -3744,12 +3828,35 @@ fn bus_loop(
                     };
                     // The tracker's own velocity: the rate of the trajectory
                     // actually sent, for the 0xA4 cap below (0 on a hold).
-                    let (p_cmd, v_trk) = if tracked {
+                    let (p_track, v_trk) = if tracked {
                         let (p, v, _) = trk[m.slot].update(p_tgt, cmd_dt);
                         (p, v)
                     } else {
                         trk[m.slot].seed(c.p_des);
                         (c.p_des, 0.0)
+                    };
+                    // Spring-torque cap (MIT joints the config or the
+                    // command caps — box mode's wrist and squeeze limits):
+                    // keep the wire position within tau_cap / kp of the last
+                    // measured position, so a joint blocked by an object
+                    // leans on it with at most tau_cap instead of kp times
+                    // the operator's run-ahead. The tracker keeps rendering
+                    // the real trajectory underneath (no re-seed: a
+                    // transient clip during a fast move must not zero its
+                    // velocity), and everything downstream — the derivative
+                    // chain feeding friction / inertia / host damping, the
+                    // trace — sees the clamped command. Firmware-loop joints
+                    // (a4 / pv) have no spring to cap. The measured position
+                    // is the previous tick's reply.
+                    let p_cmd = if m.wire == WireMode::Mit {
+                        filter::cap_spring(
+                            p_track,
+                            latest[m.slot].map(|(pos, _, _, _)| pos),
+                            c.kp,
+                            effective_tau_cap(m.tau_cap, c.tau_cap),
+                        )
+                    } else {
+                        p_track
                     };
                     let d = &mut damp[m.slot];
                     let (

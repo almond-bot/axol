@@ -41,6 +41,7 @@ from typing import Any
 
 import numpy as np
 
+from ..constants import ARM_JOINTS, Joint
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import (
@@ -52,6 +53,84 @@ from .filter import (
 from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
+
+# The arm joints box mode's squeeze cap (``VRTeleopConfig.box_squeeze_torque``)
+# applies to. In the side-clamp poses — arms hanging or reaching forward,
+# grippers parallel — a lateral force at the gripper is carried almost
+# entirely by shoulder_2 (the abduction axis: ~0.45-0.68 Nm per N over the
+# working range) with shoulder_3 (upper-arm twist) next (~0.1-0.3 Nm/N),
+# while a held box's weight goes to shoulder_1 and the elbow (shoulder_2 sees
+# ≤ 0.12 Nm/N of it). Capping these two bounds the squeeze without starving
+# the joints that lift the box; the elbow, which shares both loads, is left
+# uncapped.
+BOX_SQUEEZE_JOINTS: tuple[Joint, ...] = (Joint.SHOULDER_2, Joint.SHOULDER_3)
+# Box mode's wrist cap (``VRTeleopConfig.box_wrist_torque``): the small wrist
+# motors carry the clamp's moment at the tool and would otherwise press with
+# kp times however far the width is jogged past the box.
+BOX_WRIST_JOINTS: tuple[Joint, ...] = (Joint.WRIST_2, Joint.WRIST_3)
+
+# ``(left positions, right positions, left kp, right kp)``: each arm's
+# measured joint positions (rad, ``(8,)``, ARM_JOINTS order + gripper) and
+# impedance stiffness per arm joint (Nm/rad, ``(7,)``). See measured_arms.
+MeasuredArms = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+
+
+def measured_arms(robot: object) -> MeasuredArms | None:
+    """The arms' measured joint positions and stiffness, for the squeeze lean.
+
+    Reads ``robot.left`` / ``robot.right`` (``AxolArm``: cached feedback
+    ``positions`` — no bus traffic — and ``kp``). ``None`` when the robot
+    has no such arms (the sim), either is absent (a bench arm), or a
+    reading isn't available yet; the worker then adds no lean. Pass as
+    ``get_measured`` to :meth:`VRTeleopCore.run_ik_loop`.
+    """
+    out: list[np.ndarray] = []
+    kps: list[np.ndarray] = []
+    for side in ("left", "right"):
+        arm = getattr(robot, side, None)
+        kp = getattr(arm, "kp", None)
+        if arm is None or kp is None:
+            return None
+        try:
+            pos = np.asarray(arm.positions, dtype=np.float32)
+        except Exception:  # noqa: BLE001 - MotorError etc: no reading yet
+            return None
+        if pos.shape[0] < len(ARM_JOINTS) or not np.all(np.isfinite(pos)):
+            return None
+        out.append(pos)
+        kps.append(np.asarray(kp, dtype=np.float64))
+    return out[0], out[1], kps[0], kps[1]
+
+
+# Rate of the joint-state push (``{"type": "joints"}``) that drives the
+# headset HUD's box-mode readout (pair status). A ~200 B JSON message;
+# negligible next to the pose stream.
+JOINT_BROADCAST_HZ = 20.0
+
+
+# Thumbstick deflection below which a stick counts as released — the same
+# deadzone box mode and Jelly apply, so "neutral" here means neither would act.
+_STICK_NEUTRAL = 0.15
+# Grace after ``box_align_duration`` for a deferred box-mode exit: the
+# worker's re-blend to the straight grasp starts a frame after the request.
+_BOX_EXIT_MARGIN_S = 0.25
+# How long after a box-mode switch the next VR frame may arrive and still
+# engage the arms at once (see VRTeleopCore._maybe_auto_engage). Longer than
+# a frame gap under load; far shorter than the walk from the panel to the
+# headset.
+_AUTO_ENGAGE_WINDOW_S = 1.0
+
+
+def _sticks_neutral(frame: object) -> bool:
+    """True when both thumbsticks are centred and neither is clicked."""
+    return (
+        abs(float(frame.l_stick_x)) < _STICK_NEUTRAL
+        and abs(float(frame.l_stick_y)) < _STICK_NEUTRAL
+        and abs(float(frame.r_stick_x)) < _STICK_NEUTRAL
+        and abs(float(frame.r_stick_y)) < _STICK_NEUTRAL
+        and not frame.l_stick_click
+        and not frame.r_stick_click
+    )
 
 
 @dataclass(frozen=True)
@@ -75,6 +154,22 @@ class TCPPoseSnapshot:
             right=tuple(tcp["right"]),
             out_of_reach=tuple(tcp.get("out_of_reach") or ()),
         )
+
+
+def _is_absolute_reply(result: object) -> bool:
+    """Whether an IK-worker reply is the absolute (Mantis) mode tuple.
+
+    Absolute mode answers ``("q", q, base_msg, tcp_msg)``; relative mode
+    answers ``(q, status)`` (see :meth:`VRTeleopCore._unpack_solution`), whose
+    first element is an array — so the tag must be type-checked before it is
+    compared, or numpy would turn the comparison into an elementwise one.
+    """
+    return (
+        isinstance(result, tuple)
+        and len(result) == 4
+        and isinstance(result[0], str)
+        and result[0] == "q"
+    )
 
 
 def recv_with_timeout(
@@ -150,6 +245,14 @@ class VRTeleopCore:
         broadcast_tracking: Callback ``(enabled: bool) -> None`` that pushes the
             engage state to the headset. Safe to call before the VR server
             exists (the adapter's implementation guards that).
+        broadcast_mode: Optional callback ``(key: str, value) -> None`` fired
+            on the IK thread whenever a live setting changes (see
+            :meth:`set_live`), so the adapter can push the new state to the
+            headset / control panel (:class:`~almond_axol.teleop.live.LiveSettings`).
+        broadcast_json: Optional callback ``(payload: dict) -> None`` for a
+            generic fire-and-forget server→headset JSON push; absolute
+            (Mantis) mode streams the calibrated base + joint solution for
+            the headset's URDF overlay through it.
     """
 
     def __init__(
@@ -157,11 +260,13 @@ class VRTeleopCore:
         config: VRTeleopConfig,
         logger: logging.Logger,
         broadcast_tracking: Callable[[bool], None],
+        broadcast_mode: Callable[[str, object], None] | None = None,
         broadcast_json: Callable[[dict], None] | None = None,
     ) -> None:
         self.config = config
         self._logger = logger
         self._broadcast = broadcast_tracking
+        self._broadcast_mode = broadcast_mode
         # Optional generic server→headset JSON push (fire-and-forget), used in
         # absolute (Mantis) mode to stream the calibrated base + joint solution
         # for the headset's URDF overlay.
@@ -230,6 +335,7 @@ class VRTeleopCore:
         # absolute-mode solve.
         self.last_tcp_change_ts: float | None = None
         self._last_urdf_broadcast = 0.0
+        self._last_joint_broadcast = 0.0
         self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
         self.right_indices: list[int] = []
@@ -286,6 +392,66 @@ class VRTeleopCore:
         self._tracking_release_seen: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
+
+        # Box mode (bimanual carry, see :mod:`.box`): one controller leads
+        # both arms. ``box_mode`` is the live mode (seeded from the config,
+        # switched by :meth:`set_box_mode`); ``_box_leader`` is the leading
+        # side while engaged in that mode. Mutated on the IK thread like the
+        # engage state. Only the parcel gripper has box mode
+        # (:attr:`box_available`).
+        if config.box_mode and not self.box_available:
+            logger.warning(
+                "Box mode needs the parcel gripper (gripper=%r); starting with it off",
+                config.gripper,
+            )
+        self.box_mode: bool = bool(config.box_mode) and self.box_available
+        self._box_leader: str | None = None
+        # Box mode hands the thumbsticks back to Jelly while nobody leads
+        # (the pair is frozen holding the box) — but not until the operator
+        # has let the sticks go after the freeze, so a width change
+        # in progress when the leader's grip was clicked can't turn into a
+        # base command. Set when the lead drops, cleared by the first neutral
+        # frame; see :attr:`pair_owns_sticks`.
+        self._box_sticks_held: bool = False
+
+        # Re-engage behaviour ("clutch": the controller matches the arm,
+        # "ramp": the arm ramps out to the controller — see
+        # ``VRTeleopConfig.reengage``). The effective value is forwarded to
+        # the IK worker on every frame, which is where it takes effect.
+        self.reengage: str = str(config.reengage)
+
+        # Live-setting requests (:meth:`set_box_mode`, :meth:`set_reengage`,
+        # :meth:`set_live`), queued from any thread and applied on the IK
+        # thread at the next frame (see :meth:`_apply_live_requests`) so the
+        # engage state and the worker's config never change mid-step. Worker
+        # fields are forwarded as ``("set", key, value)`` before the frame.
+        self._live_requests: dict[str, object] = {}
+        self._live_lock = threading.Lock()
+        self._worker_updates: list[tuple[str, object]] = []
+
+        # Latest gripper-pair geometry from the worker (see
+        # ``IKWorker.pair_status``): ``{"aligned": bool, "width": m,
+        # "grasp": str, "elbow": deg, "squeeze": N}``, or None before the
+        # first report.
+        # Read by the adapter for the headset; ``grasp`` and ``elbow`` are
+        # mirrored into the config (see ``_mirror_worker_field``).
+        self.pair_status: dict | None = None
+        # Config fields the worker owns while a pair is live (a stick click
+        # toggles the grasp, the sticks jog the elbows): a change sent *to*
+        # the worker is pending until it reports the value back, see
+        # _mirror_worker_field.
+        self._worker_pending: dict[str, object] = {}
+        # A box-mode-off request taken while the led pair held the angled
+        # grasp: the grasp is switched back to straight first and the exit
+        # waits (until this deadline, or the grip lets go) for the pair to
+        # blend the yaw back out, see ``_begin_box_exit``.
+        self._box_exit_deadline: float | None = None
+        # A mode switch engages at once (into box mode led by
+        # ``config.box_lead_hand``, out of it with both arms): the deadline
+        # by which the next frame must arrive for that to happen, else the
+        # switch was made with nobody in the headset and the usual grip
+        # engage applies. See ``_maybe_auto_engage``.
+        self._auto_engage_until: float | None = None
 
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
@@ -428,6 +594,95 @@ class VRTeleopCore:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
         self._reset_latched = True
 
+    @property
+    def box_available(self) -> bool:
+        """Whether this session has box mode: only with the parcel gripper
+        (``VRTeleopConfig.gripper``)."""
+        return self.config.gripper == "parcel"
+
+    def set_box_mode(self, enabled: bool) -> None:
+        """Switch box mode on/off (headset HUD / control panel / SDK). Safe
+        from any thread.
+
+        Takes effect on the IK thread at the next frame: switching while
+        engaged disengages first, so the new mode's engage rule applies from
+        a deliberate engage. Switching off while a led pair holds the angled
+        grasp levels it first (``_begin_box_exit``); a return-to-rest
+        (:meth:`request_reset`, the headset's X) switches box mode off itself.
+
+        Raises:
+            ValueError: Switching it on without the parcel gripper
+                (:attr:`box_available`).
+        """
+        self.set_live("box_mode", bool(enabled))
+
+    def set_reengage(self, mode: str) -> None:
+        """Select the re-engage behaviour, ``"clutch"`` or ``"ramp"`` (see
+        ``VRTeleopConfig.reengage``). Safe from any thread; applies to the
+        next grip edge.
+        """
+        if mode not in ("clutch", "ramp"):
+            raise ValueError(f"reengage mode must be 'clutch' or 'ramp', not {mode!r}")
+        self.set_live("reengage", mode)
+
+    # Config fields that may change while a session runs. ``core`` fields are
+    # read live by this class; ``worker`` fields are also forwarded to the IK
+    # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
+    _LIVE_CORE_FIELDS = frozenset(
+        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_lead_hand"}
+    )
+    _LIVE_WORKER_FIELDS = frozenset(
+        {
+            "position_multiplier",
+            "rotation_multiplier",
+            "reengage_ramp_speed",
+            "reengage_ramp_min_s",
+            "box_width_speed",
+            "box_align_duration",
+            "box_flush_deg",
+            "box_grasp",
+            "box_face_left",
+            "box_face_right",
+            "box_grip_tilt",
+            "box_elbow_out",
+            "box_elbow_weight",
+            "box_elbow_speed",
+            "box_squeeze_lean",
+            "box_squeeze_trim",
+            "box_squeeze_force",
+        }
+    )
+
+    def set_live(self, key: str, value: object) -> None:
+        """Queue a live change to a session mode or config field.
+
+        ``key`` is ``"box_mode"``, ``"reengage"``, or one of the
+        :class:`VRTeleopConfig` fields in ``_LIVE_CORE_FIELDS`` /
+        ``_LIVE_WORKER_FIELDS``. Safe from any thread; applied on the IK
+        thread before the next frame (see :meth:`_apply_live_requests`).
+        Unknown keys raise ``KeyError`` so callers can't silently misspell a
+        field; switching box mode on without the parcel gripper raises
+        ``ValueError``.
+        """
+        if key not in ("box_mode", "reengage") and not (
+            key in self._LIVE_CORE_FIELDS or key in self._LIVE_WORKER_FIELDS
+        ):
+            raise KeyError(f"{key!r} is not a live-adjustable teleop setting")
+        if key == "box_mode" and value and not self.box_available:
+            raise ValueError(
+                f"box mode needs the parcel gripper (gripper={self.config.gripper!r})"
+            )
+        with self._live_lock:
+            self._live_requests[key] = value
+
+    def live_value(self, key: str) -> object:
+        """Current value of a live setting (see :meth:`set_live`)."""
+        if key == "box_mode":
+            return self.box_mode
+        if key == "reengage":
+            return self.reengage
+        return getattr(self.config, key)
+
     def clear_reset_request(self) -> None:
         """Consume a pending reset latch without acting on it.
 
@@ -547,6 +802,47 @@ class VRTeleopCore:
         """True while at least one arm is engaged (tracking)."""
         return self.left_enabled or self.right_enabled
 
+    @property
+    def pair_owns_sticks(self) -> bool:
+        """True while the thumbsticks belong to the arm pair, not to Jelly.
+
+        In :attr:`box_mode` the sticks set the pair's width whenever a
+        grip is leading it. Once the leader freezes the pair (nobody leads), they go
+        back to driving the base with the ordinary mapping — so the operator
+        grabs the box, freezes, drives across the room, and leads again to
+        adjust — after one frame with every stick released (see
+        ``_box_sticks_held``). Outside box mode the sticks are always
+        Jelly's. Read by the frame handler (VR thread) to gate
+        ``Jelly.apply_vr_frame``; a frame of lag against the IK thread that
+        writes the state is harmless.
+        """
+        return self.box_mode and (self._box_leader is not None or self._box_sticks_held)
+
+    def spring_caps(self) -> dict[Joint, float] | None:
+        """Per-joint spring-torque caps the arms should run under right now.
+
+        Box mode's caps: ``config.box_wrist_torque`` (Nm) on each of
+        :data:`BOX_WRIST_JOINTS` and ``config.box_squeeze_torque`` on each of
+        :data:`BOX_SQUEEZE_JOINTS` (either ``0`` = off), in force the whole
+        time box mode is on — leading, frozen holding a box, or between
+        engages — except during a return-to-rest (:attr:`is_resetting`),
+        whose joint-space move wants the joints' full authority. ``None``
+        means no caps (plain teleop, box mode with both caps 0, a reset). The
+        adapter applies the result to the robot before each control tick
+        (``set_spring_caps``); the caps ride the next command to the
+        realtime core. Cheap and pure — safe to call every cycle.
+        """
+        if not self.box_mode or self.is_resetting:
+            return None
+        caps: dict[Joint, float] = {}
+        wrist = float(self.config.box_wrist_torque)
+        if wrist > 0.0:
+            caps.update({joint: wrist for joint in BOX_WRIST_JOINTS})
+        squeeze = float(self.config.box_squeeze_torque)
+        if squeeze > 0.0:
+            caps.update({joint: squeeze for joint in BOX_SQUEEZE_JOINTS})
+        return caps or None
+
     def _disengage_all(self, log_message: str | None = None) -> None:
         """Disengage both arms and clear the edge/ramp state (IK thread).
 
@@ -562,6 +858,9 @@ class VRTeleopCore:
         self._prev_r_lock = False
         self._require_both_engage = True
         self._engage_time = None
+        if self._box_leader is not None:
+            self._box_sticks_held = True
+        self._box_leader = None
         if self.config.absolute_mode:
             # A forced stop invalidates the absolute world→base anchor. This
             # covers explicit bad-tracking frames as well as a total WebXR
@@ -572,6 +871,195 @@ class VRTeleopCore:
         if log_message is not None and was_enabled:
             self._logger.info(log_message)
         self._broadcast(False)
+
+    def _apply_live_requests(self) -> None:
+        """Apply queued :meth:`set_live` requests (IK thread, before a frame).
+
+        Mode switches log and notify ``broadcast_mode``; config fields are
+        written to :attr:`config` (and queued for the worker when it owns a
+        copy — flushed by ``run_ik_loop`` right before the next dispatch).
+        """
+        with self._live_lock:
+            requests = self._live_requests
+            self._live_requests = {}
+        if self._box_exit_deadline is not None and "box_mode" not in requests:
+            self._finish_box_exit()
+        # A no-op request (value already current) still notifies, so every
+        # ``set`` a client sends is answered with the server's state.
+        for key, value in requests.items():
+            if key == "box_mode":
+                want = bool(value)
+                if want:
+                    # Switching (back) on cancels a deferred exit.
+                    self._box_exit_deadline = None
+                if want != self.box_mode:
+                    if not want and self._begin_box_exit():
+                        # Answered (with the mode actually applied) once
+                        # the pair has left the angled grasp.
+                        continue
+                    self._set_box_mode(want)
+                self._notify_mode("box_mode", want)
+            elif key == "reengage":
+                mode = str(value)
+                if mode != self.reengage:
+                    self.reengage = mode
+                    self._logger.info(
+                        "Re-engage: %s",
+                        "ramp (the arm comes to the controller)"
+                        if mode == "ramp"
+                        else "clutch (the controller matches the arm)",
+                    )
+                self._notify_mode("reengage", mode)
+            else:
+                field_type = type(getattr(self.config, key))
+                coerced = (
+                    field_type(value) if field_type in (bool, int, float) else value
+                )
+                if coerced != getattr(self.config, key):
+                    setattr(self.config, key, coerced)
+                    if key == "teleop_max_vel" and self._engage_time is None:
+                        # Not inside the post-engage ramp (which writes the
+                        # cap itself every tick from the config): apply now.
+                        self.smooth_left.max_vel = float(coerced)
+                        self.smooth_right.max_vel = float(coerced)
+                    if key in self._LIVE_WORKER_FIELDS:
+                        self._worker_updates.append((key, coerced))
+                        if key in self._WORKER_OWNED:
+                            self._worker_pending[key] = coerced
+                    self._logger.info("Live setting %s = %s", key, coerced)
+                self._notify_mode(key, coerced)
+
+    def _set_box_mode(self, want: bool, engage: bool = True) -> None:
+        """Apply a box-mode switch now (IK thread): disengage, flip, log.
+
+        With ``engage`` (the default for an operator's switch; a
+        return-to-rest passes ``False``) the next frame engages the new
+        mode's arms at once, see :meth:`_maybe_auto_engage`.
+        """
+        self._box_exit_deadline = None
+        self._auto_engage_until = None
+        if want == self.box_mode:
+            return
+        if self.teleop_enabled:
+            self._disengage_all("Teleop disabled (mode switch)")
+        self.box_mode = want
+        self._logger.info(
+            "Box mode %s", "on: one grip engages both arms" if want else "off"
+        )
+        if engage:
+            self._auto_engage_until = time.perf_counter() + _AUTO_ENGAGE_WINDOW_S
+
+    def _lead_hand(self) -> str:
+        """``config.box_lead_hand`` normalised to ``"left"`` / ``"right"``."""
+        hand = str(getattr(self.config, "box_lead_hand", "right")).strip().lower()
+        return "left" if hand == "left" else "right"
+
+    def _maybe_auto_engage(self, frame: object) -> None:
+        """Engage the arms on the first frame after a mode switch (IK thread).
+
+        Into box mode the pair engages led by ``config.box_lead_hand`` —
+        the grippers blend into the pair from where they are first, as on
+        any box engage — and out of it both arms engage together, so with
+        ``"ramp"`` re-engage they blend back out to where the controllers
+        are. No grip needed either way. Skipped if the frame comes later
+        than :data:`_AUTO_ENGAGE_WINDOW_S` after the switch (nobody in the
+        headset: the usual grip engage applies), while a return-to-rest is
+        under way, in dead-man (``hold_to_engage``) sessions, or if the
+        arms are somehow engaged already.
+        """
+        until = self._auto_engage_until
+        if until is None:
+            return
+        self._auto_engage_until = None
+        if (
+            time.perf_counter() > until
+            or self.teleop_enabled
+            or self.is_resetting
+            or self.config.hold_to_engage
+        ):
+            return
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        if self.box_mode:
+            leader = self._lead_hand()
+            self._box_leader = leader
+            self._box_sticks_held = False
+            self._logger.info(
+                "Teleop enabled (box mode, %s hand leads — switched on)", leader
+            )
+        else:
+            self._logger.info("Teleop enabled (both arms — box mode switched off)")
+        self.left_enabled = True
+        self.right_enabled = True
+        self._require_both_engage = False
+        self._broadcast(True)
+        self._start_engage_ramp()
+        # A grip already held at the switch is not an edge on this frame.
+        self._prev_both = l_lock and r_lock
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+
+    def _start_engage_ramp(self) -> None:
+        """Begin the out-of-rest velocity ramp (``engage_max_vel`` →
+        ``teleop_max_vel`` over ``engage_duration``) if the arms were at rest."""
+        if self._at_rest:
+            self.smooth_left.max_vel = self.config.engage_max_vel
+            self.smooth_right.max_vel = self.config.engage_max_vel
+            self._engage_time = time.perf_counter()
+            self._at_rest = False
+
+    def _begin_box_exit(self) -> bool:
+        """Start leaving box mode from the angled grasp; ``True`` if deferred.
+
+        Leaving box mode while the led pair holds the angled (``"flush"``)
+        grasp would hand plain teleop two wrists yawed into the box, and the
+        re-engage ramp then blends each arm out from there. So the grasp is
+        switched back to ``"straight"`` first — the worker re-blends the pair
+        level over ``box_align_duration`` while the grip keeps leading — and
+        the mode switch itself waits for that (:meth:`_finish_box_exit`).
+        Nothing to undo (straight grasp, or no grip leading so the pair
+        can't move anyway): returns ``False`` and the caller exits at once.
+        """
+        if self._box_exit_deadline is not None:
+            # Asked again while waiting: exit now.
+            return False
+        cfg = self.config
+        grasp = str(getattr(cfg, "box_grasp", "straight")).strip().lower()
+        if grasp != "flush" or not self.teleop_enabled:
+            return False
+        self._box_exit_deadline = (
+            time.perf_counter()
+            + float(getattr(cfg, "box_align_duration", 0.0))
+            + _BOX_EXIT_MARGIN_S
+        )
+        self._set_worker_field("box_grasp", "straight")
+        self._logger.info("Box mode off: leaving the angled grasp first")
+        return True
+
+    def _finish_box_exit(self) -> None:
+        """Complete a deferred box-mode exit once the pair is level (or let go)."""
+        deadline = self._box_exit_deadline
+        if deadline is None:
+            return
+        if time.perf_counter() < deadline and self.teleop_enabled:
+            return
+        self._set_box_mode(False)
+        self._notify_mode("box_mode", False)
+
+    def _set_worker_field(self, key: str, value: object) -> None:
+        """Change a worker-mirrored config field from the core (IK thread)."""
+        if value == getattr(self.config, key):
+            return
+        setattr(self.config, key, value)
+        if key in self._LIVE_WORKER_FIELDS:
+            self._worker_updates.append((key, value))
+            if key in self._WORKER_OWNED:
+                self._worker_pending[key] = value
+        self._notify_mode(key, value)
+
+    def _notify_mode(self, key: str, value: object) -> None:
+        if self._broadcast_mode is not None:
+            self._broadcast_mode(key, value)
 
     def update_engage(self, frame: object) -> None:
         """Advance the per-arm engage state and grip tracking for one VR frame.
@@ -588,6 +1076,9 @@ class VRTeleopCore:
             releasing both disengages the session (both grips must be held
             again to resume).
 
+        In **box mode** (:attr:`box_mode`) the arms only ever move as a pair
+        and a single grip drives them — see :meth:`_update_engage_box`.
+
         On the first engage out of rest, the velocity cap starts at
         ``engage_max_vel`` and smoothsteps up to ``teleop_max_vel`` across
         ``engage_duration`` (advanced in :meth:`compute_output`).
@@ -596,12 +1087,18 @@ class VRTeleopCore:
         still-engaged session is disengaged); afterwards a fully released
         frame must arrive before the both-grips engage is accepted again.
         """
+        self._apply_live_requests()
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
         both = l_lock and r_lock
         if self._engage_blocked or self._engage_release_required:
             if self.teleop_enabled:
                 self._disengage_all("Teleop disabled (engage blocked)")
+            # No mode-switch engage either; a deferred box exit completes
+            # now that the pair is let go.
+            self._auto_engage_until = None
+            self._finish_box_exit()
+            self._auto_engage_until = None
             if not self._engage_blocked and not l_lock and not r_lock:
                 self._engage_release_required = False
             # Track the raw edges so the toggle scheme sees no rising edge
@@ -611,6 +1108,14 @@ class VRTeleopCore:
             self._prev_r_lock = r_lock
             self._ack_lock_release(frame, l_lock, r_lock)
             return
+
+        self._maybe_auto_engage(frame)
+        if self.box_mode:
+            self._update_engage_box(frame)
+            # A grip that just froze the pair ends a deferred exit now.
+            self._finish_box_exit()
+            return
+
         was_left = self.left_enabled
         was_right = self.right_enabled
         was_enabled = was_left or was_right
@@ -645,11 +1150,7 @@ class VRTeleopCore:
         if now_enabled and not was_enabled:
             self._logger.info("Teleop enabled")
             self._broadcast(True)
-            if self._at_rest:
-                self.smooth_left.max_vel = self.config.engage_max_vel
-                self.smooth_right.max_vel = self.config.engage_max_vel
-                self._engage_time = time.perf_counter()
-                self._at_rest = False
+            self._start_engage_ramp()
         elif was_enabled and not now_enabled:
             self._logger.info("Teleop disabled")
             self._broadcast(False)
@@ -693,6 +1194,133 @@ class VRTeleopCore:
             self._broadcast_json(
                 {"type": "lock_release", "value": int(lock_release_id)}
             )
+
+    def _update_engage_box(self, frame: object) -> None:
+        """Box-mode engage: one grip drives both arms as a level pair.
+
+        Toggle scheme (default): a rising edge on *either* grip engages both
+        arms with that hand as the leader; while engaged, a rising edge on
+        the leader's grip disengages, and one on the other grip hands the
+        lead over to that hand (the pair stays where it is). Dead-man scheme
+        (``config.hold_to_engage``): the pair tracks while any grip is held,
+        led by the held hand (a hand-over happens when the leader lets go
+        while the other still holds). Each gripper follows its own
+        controller's trigger while the pair is engaged, whichever hand leads.
+
+        The thumbsticks set the grip width while someone leads and
+        drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
+        to Jelly waits for a frame with the sticks released so a stick held
+        for the grasp can't carry over into base motion.
+        """
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        was_enabled = self.teleop_enabled
+        leader = self._box_leader
+        if leader is None and self._box_sticks_held and _sticks_neutral(frame):
+            self._box_sticks_held = False
+
+        if self.config.hold_to_engage:
+            if l_lock or r_lock:
+                if leader == "left" and not l_lock:
+                    leader = "right"
+                elif leader == "right" and not r_lock:
+                    leader = "left"
+                elif leader is None:
+                    leader = "right" if r_lock else "left"
+            else:
+                leader = None
+        else:
+            l_edge = l_lock and not self._prev_l_lock
+            r_edge = r_lock and not self._prev_r_lock
+            if leader is None:
+                if r_edge:
+                    leader = "right"
+                elif l_edge:
+                    leader = "left"
+            elif leader == "left":
+                if l_edge:
+                    leader = None
+                elif r_edge:
+                    leader = "right"
+            else:
+                if r_edge:
+                    leader = None
+                elif l_edge:
+                    leader = "left"
+
+        if leader != self._box_leader and leader is not None and self._box_leader:
+            self._logger.info("Box lead handed to the %s hand", leader)
+        self._box_leader = leader
+        enabled = leader is not None
+        self.left_enabled = enabled
+        self.right_enabled = enabled
+        self._require_both_engage = False
+
+        if enabled and not was_enabled:
+            self._logger.info("Teleop enabled (box mode, %s hand leads)", leader)
+            self._broadcast(True)
+            self._start_engage_ramp()
+        elif was_enabled and not enabled:
+            self._logger.info("Teleop disabled (box pair frozen)")
+            self._broadcast(False)
+            # Hand the sticks to Jelly only once they've been released.
+            self._box_sticks_held = not _sticks_neutral(frame)
+
+        self._prev_both = l_lock and r_lock
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+
+        if enabled:
+            self.l_grip = float(frame.l_grip)
+            self.r_grip = float(frame.r_grip)
+
+    def _unpack_solution(self, result: object) -> object:
+        """Split a worker frame response into the joint vector and side data.
+
+        The worker answers a frame with ``(q, status)`` where ``status`` is
+        ``None`` or a small dict it refreshes a few times a second (see
+        :meth:`IKWorker.pair_status`); a bare array is accepted too. The
+        status is published on :attr:`pair_status` for the adapter's
+        headset feedback (the "arms aligned" cue). The worker owns the
+        box-mode grasp (a stick click toggles it) and the elbows-out angle
+        (the sticks jog it) while a pair is live, so the ``grasp`` and
+        ``elbow`` it reports are mirrored into :attr:`config` (and announced
+        as live setting changes) when they differ — the settings panel then
+        shows what the arms are doing, and the values survive the next
+        engage.
+        """
+        if isinstance(result, tuple):
+            q, status = result
+            if status is not None:
+                self.pair_status = status
+                if isinstance(status, dict):
+                    grasp = status.get("grasp")
+                    if isinstance(grasp, str):
+                        self._mirror_worker_field("box_grasp", grasp)
+                    elbow = status.get("elbow")
+                    if isinstance(elbow, (int, float)):
+                        self._mirror_worker_field("box_elbow_out", float(elbow))
+            return q
+        return result
+
+    # Config fields the worker changes on its own from stick input and
+    # reports back through pair_status (see _unpack_solution).
+    _WORKER_OWNED = frozenset({"box_grasp", "box_elbow_out"})
+
+    def _mirror_worker_field(self, key: str, value: object) -> None:
+        # A change sent *to* the worker is in flight until the worker
+        # reports it back; statuses from before it landed still carry the old
+        # value and must not undo the request.
+        pending = self._worker_pending.get(key)
+        if pending is not None:
+            if value != pending:
+                return
+            del self._worker_pending[key]
+        if value != getattr(self.config, key):
+            setattr(self.config, key, value)
+            if key == "box_grasp":
+                self._logger.info("Box grasp: %s (stick click)", value)
+            self._notify_mode(key, value)
 
     def _accept_tracking_frame(self, frame: object) -> bool:
         """Gate absolute-mode frames across an optical tracking dropout.
@@ -1154,6 +1782,7 @@ class VRTeleopCore:
         stop_event: threading.Event,
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
+        get_measured: Callable[[], MeasuredArms | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1170,6 +1799,12 @@ class VRTeleopCore:
             process_alive: Returns ``False`` if the IK subprocess has died.
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
+            get_measured: Optional; returns the arms' measured joint
+                positions and joint stiffness (see :func:`measured_arms`),
+                or ``None``. Read before every frame while box mode is
+                engaged and forwarded to the worker as ``("meas", left,
+                right, kp_left, kp_right)`` for the squeeze lean
+                (``IKWorker.note_measured``). Hardware flows only.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
@@ -1195,6 +1830,11 @@ class VRTeleopCore:
             ):
                 self._reset_latched = False
                 self._reset_cancel = False
+                if self.box_mode:
+                    # Going home leaves box mode: the arms come back as two
+                    # arms, and the next engage is a deliberate one.
+                    self._set_box_mode(False, engage=False)
+                    self._notify_mode("box_mode", False)
                 # Keep is_resetting true across the (possibly seconds-long)
                 # planning round trip so callers waiting on it don't observe a
                 # false gap between the latch and the trajectory playback.
@@ -1255,22 +1895,25 @@ class VRTeleopCore:
                 self._logger.exception("VR frame sampling failed; keeping last target")
                 self._pace(t0, ik_interval)
                 continue
-            if frame is None:
-                self._maybe_disengage_stale(conn, last_frame, process_alive)
-                time.sleep(0.001)
-                continue
-            if frame is last_frame:
-                # PoseInterpolator deliberately preserves object identity when
-                # the rendered pose is numerically unchanged, but advances
-                # t_host as equal-valued raw samples arrive. The action is
-                # still current without another IK solve, so carry that live
-                # capture heartbeat into Mantis dataset timestamps/QA.
-                pose_ts = getattr(frame, "t_host", None)
-                if pose_ts is not None:
-                    self.last_pose_host_ts = pose_ts
-                    snapshot = self.last_tcp_snapshot
-                    if snapshot is not None:
-                        self.last_tcp_snapshot = replace(snapshot, pose_host_ts=pose_ts)
+            if frame is None or frame is last_frame:
+                # No new frame (idle headset, or none connected): live
+                # settings still apply — the panel may be changing them.
+                self._apply_live_requests()
+                if frame is not None:
+                    # PoseInterpolator deliberately preserves object identity
+                    # when the rendered pose is numerically unchanged, but
+                    # advances t_host as equal-valued raw samples arrive. The
+                    # action is still current without another IK solve, so
+                    # carry that live capture heartbeat into Mantis dataset
+                    # timestamps/QA.
+                    pose_ts = getattr(frame, "t_host", None)
+                    if pose_ts is not None:
+                        self.last_pose_host_ts = pose_ts
+                        snapshot = self.last_tcp_snapshot
+                        if snapshot is not None:
+                            self.last_tcp_snapshot = replace(
+                                snapshot, pose_host_ts=pose_ts
+                            )
                 self._maybe_disengage_stale(conn, last_frame, process_alive)
                 time.sleep(0.001)
                 continue
@@ -1317,19 +1960,42 @@ class VRTeleopCore:
 
             try:
                 # Synthesize lock state so the IK worker tracks our per-arm
-                # engage state rather than the raw button state.
+                # engage state rather than the raw button state; in box mode
+                # also tell it which hand leads the pair.
                 frame_to_send = frame.model_copy(
                     update={
                         "l_lock": self.left_enabled,
                         "r_lock": self.right_enabled,
+                        "box_leader": (
+                            self._box_leader
+                            if self.box_mode and self.teleop_enabled
+                            else None
+                        ),
+                        # The worker only ever sees the *effective* mode.
+                        "reengage": self.reengage,
                     }
                 )
+                # Live config changes the worker's pickled config must
+                # mirror (fire-and-forget; see run_ik_worker).
+                if self._worker_updates:
+                    for key, value in self._worker_updates:
+                        conn.send(("set", key, value))
+                    self._worker_updates = []
+                if get_measured is not None and self.box_mode and self.teleop_enabled:
+                    try:
+                        measured = get_measured()
+                    except Exception:  # noqa: BLE001 - never stall the solve
+                        self._logger.exception("measured-arm readout failed")
+                        measured = None
+                    if measured is not None:
+                        conn.send(("meas", *measured))
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:
                     # Absolute (Mantis) mode replies are ("q", q, base_msg,
-                    # tcp_msg); relative mode replies are the bare joint array.
-                    if isinstance(result, tuple) and result[0] == "q":
+                    # tcp_msg); relative mode replies are (q, status) — see
+                    # _unpack_solution.
+                    if _is_absolute_reply(result):
                         _, q_arr, base_msg, tcp_msg = result
                         self.set_target(q_arr)
                         if self._handle_engage_rejection(base_msg):
@@ -1341,7 +2007,7 @@ class VRTeleopCore:
                         self._publish_tcp_pose(tcp_msg, pose_host_ts)
                         self._maybe_broadcast_urdf_state()
                     else:
-                        self.set_target(result)
+                        self.set_target(self._unpack_solution(result))
                     self.last_pose_host_ts = getattr(frame, "t_host", None)
                     recv_timeout_count = 0
                     on_ik_sample(time.perf_counter())
@@ -1397,6 +2063,63 @@ class VRTeleopCore:
             self.last_tcp_change_ts = time.perf_counter()
         # This single reference write is the synchronization point for readers.
         self.last_tcp_snapshot = snapshot
+
+    def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
+        """Push the joint state and pair status to the headset, throttled.
+
+        Throttled to :data:`JOINT_BROADCAST_HZ`; call from the control loop
+        with the 16-DOF command ``out`` (see :meth:`compute_output`). Measured
+        positions are preferred when ``robot`` exposes them (``AxolArm``
+        ``positions``), falling back to the command in sim. Both teleop
+        adapters (``axol teleop`` and collect-data) send it, so the HUD's box
+        readout works in each.
+        """
+        if self._broadcast_json is None:
+            return
+        now = time.perf_counter()
+        if now - self._last_joint_broadcast < 1.0 / JOINT_BROADCAST_HZ:
+            return
+        self._last_joint_broadcast = now
+
+        from ..constants import urdf_arm_joint_names
+
+        left = out[:8]
+        right = out[8:]
+        for side in ("left", "right"):
+            try:
+                meas = getattr(getattr(robot, side, None), "positions", None)
+            except Exception:  # noqa: BLE001 - telemetry must never break the loop
+                meas = None
+            if meas is not None and len(meas) >= 8 and np.all(np.isfinite(meas[:8])):
+                if side == "left":
+                    left = np.asarray(meas)
+                else:
+                    right = np.asarray(meas)
+        q = {
+            name: round(float(v), 4)
+            for name, v in zip(urdf_arm_joint_names(is_left=True), left[:7])
+        }
+        q.update(
+            {
+                name: round(float(v), 4)
+                for name, v in zip(urdf_arm_joint_names(is_left=False), right[:7])
+            }
+        )
+        self._broadcast_json(
+            {
+                "type": "joints",
+                "value": {
+                    "q": q,
+                    "l_grip": round(float(left[7]), 3),
+                    "r_grip": round(float(right[7]), 3),
+                    "engaged": self.teleop_enabled,
+                    # Gripper-pair geometry from the IK worker: the headset
+                    # shows "aligned" when the pair already sits in the
+                    # box-mode grasp, i.e. a good moment to switch modes.
+                    "pair": self.pair_status,
+                },
+            }
+        )
 
     def _maybe_broadcast_urdf_state(self) -> None:
         """Push the URDF overlay state to the headset, throttled to ~60 Hz.
@@ -1501,10 +2224,10 @@ class VRTeleopCore:
                     result = recv_with_timeout(conn, _IK_RECV_TIMEOUT)
                     if result is not None:
                         # Absolute (Mantis) mode replies are ("q", q, base, tcp).
-                        if isinstance(result, tuple) and result[0] == "q":
+                        if _is_absolute_reply(result):
                             self.set_target(result[1])
                         else:
-                            self.set_target(result)
+                            self.set_target(self._unpack_solution(result))
                     else:
                         self._logger.warning(
                             "IK recv timeout during stale-stream disengage"

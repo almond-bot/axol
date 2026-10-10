@@ -15,6 +15,7 @@ every public boundary and callers never see it.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 import math
@@ -27,9 +28,11 @@ import numpy as np
 import pyroki as pk
 
 from ..constants import (
+    ARM_JOINTS,
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
+    urdf_joint_name,
 )
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
@@ -37,6 +40,7 @@ from .model import (
     collision_cost_params,
     shared_robot,
     shared_robot_collision,
+    shared_urdf,
 )
 
 _logger = logging.getLogger(__name__)
@@ -49,6 +53,30 @@ Pose = tuple[np.ndarray, np.ndarray]
 The format :meth:`KinematicsSolver.fk` returns and :meth:`KinematicsSolver.ik`
 takes, so a pose can be read, edited, and solved for without conversion.
 """
+
+
+@dataclasses.dataclass(frozen=True)
+class ElbowSwivel:
+    """One arm's elbow swivel (:meth:`KinematicsSolver.elbow_swivel`).
+
+    Attributes:
+        shoulder: Shoulder centre, world frame — where the three shoulder
+            axes meet; fixed.
+        elbow: Elbow position, world frame (as
+            :meth:`KinematicsSolver.elbow_positions`).
+        wrist_in_mount: Wrist centre — where the forearm roll meets
+            ``wrist_2`` — in the gripper *mount* frame at these joints, to
+            place it on a target pose.
+        direction: Unit world-frame direction the elbow moves in as the arm
+            swings with its gripper mount held (either sense; zeros at a
+            singular pose).
+    """
+
+    shoulder: np.ndarray
+    elbow: np.ndarray
+    wrist_in_mount: np.ndarray
+    direction: np.ndarray
+
 
 # Convenience aliases for URDF link / joint names. The single source of
 # truth for these strings lives in :mod:`almond_axol.constants`; the helpers
@@ -110,6 +138,53 @@ def _bounded_manipulability_residual(
 
 
 _bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residual)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ArmSwivel:
+    """One arm's fixed geometry for :meth:`KinematicsSolver.elbow_swivel`."""
+
+    axes: tuple[tuple[int, np.ndarray], ...]  # (child link, local axis) per joint
+    shoulder: np.ndarray  # shoulder centre, world
+    wrist_link: int
+    wrist_local: np.ndarray  # wrist centre in wrist_link's frame
+    elbow_joints: int  # joints upstream of the elbow link
+
+
+def _pose_np(wxyz_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(rotation (3, 3), position (3,))`` of a jaxlie ``wxyz_xyz`` link pose."""
+    w, x, y, z = wxyz_xyz[:4]
+    rot = np.array(
+        (
+            (1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)),
+            (2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)),
+            (2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)),
+        )
+    )
+    return rot, np.asarray(wxyz_xyz[4:7], np.float64)
+
+
+def _axis_line(
+    poses: np.ndarray, link: int, axis: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """World ``(point, direction)`` of a joint axis given its child link's pose."""
+    rot, pos = _pose_np(poses[link])
+    return pos, rot @ axis
+
+
+def _axes_meet(
+    p1: np.ndarray, d1: np.ndarray, p2: np.ndarray, d2: np.ndarray
+) -> np.ndarray:
+    """Midpoint of the closest approach of two lines (point, direction)."""
+    w = p1 - p2
+    a, b, c = d1 @ d1, d1 @ d2, d2 @ d2
+    d, e = d1 @ w, d2 @ w
+    den = a * c - b * b
+    if abs(den) < 1e-12:
+        return p1.copy()
+    s = (b * e - c * d) / den
+    t = (a * e - b * d) / den
+    return 0.5 * ((p1 + s * d1) + (p2 + t * d2))
 
 
 # ---------------------------------------------------------------------------
@@ -326,11 +401,13 @@ def _project_elbow(
 
     The operator's elbow (different arm proportions, position-multiplier
     scaling) generally lies off the sphere the robot's elbow actually lives on
-    (|shoulder->elbow| at the current configuration — the radius varies a few
-    cm with shoulder pose, so it is measured from FK rather than fixed). The
+    (|shoulder->elbow| at the current configuration, measured from FK). The
     radial component of the raw target is unreachable by construction and
     would inject a permanent residual that fights the EE cost through the
-    shared shoulder joints; only the swivel direction is kept.
+    shared shoulder joints; only the swivel direction is kept. ``shoulder``
+    is the shoulder's centre, where its three axes meet: the radius is fixed
+    about it, and box mode's swivel hints (already on the sphere) pass
+    through unchanged.
     """
     r = jnp.linalg.norm(current_elbow_pos - shoulder)
     d = elbow.translation() - shoulder
@@ -339,10 +416,34 @@ def _project_elbow(
     return jaxlie.SE3.from_rotation_and_translation(elbow.rotation(), proj)
 
 
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
+def _clamp_to_limits_np(
+    robot: pk.Robot, q_from: np.ndarray, q_to: np.ndarray
+) -> np.ndarray:
+    """Clip the step ``q_from -> q_to`` so every joint stays inside its limits.
+
+    Enforces the solver's otherwise-soft joint limits on the collision-free
+    path (with the collision guard on, ``bound_step`` inside
+    :func:`_base_collision_safe_step` does this). Joints are clipped
+    *individually*: a joint that has reached its limit parks there while the
+    others keep moving. Scaling the whole vector instead — as ``bound_step``
+    must, to keep its clearance projection tangent — would freeze the entire
+    arm the moment one joint touches a limit, since the soft limit cost keeps
+    nudging that joint outward by a hair on every solve.
+    """
+    lower = np.asarray(robot.joints.lower_limits, dtype=np.float32)
+    upper = np.asarray(robot.joints.upper_limits, dtype=np.float32)
+    # A joint that starts outside its interval (hand-moved, measured offset)
+    # isn't yanked back in one step: clip to the interval widened to include
+    # q_from, so it can only move back toward its range, never further out.
+    lo = np.minimum(lower, q_from)
+    hi = np.maximum(upper, q_from)
+    return np.clip(q_to, lo, hi).astype(np.float32)
+
+
+@functools.partial(jax.jit, static_argnames=("max_iterations", "use_self_collision"))
 def _solve_ik(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: pk.collision.RobotCollision | None,
     target_L: jaxlie.SE3 | None,
     target_R: jaxlie.SE3 | None,
     L_ee_idx: jax.Array,
@@ -376,6 +477,7 @@ def _solve_ik(
     cost_tolerance: float,
     lambda_initial: float,
     lambda_factor: float,
+    use_self_collision: bool,
 ) -> tuple[jax.Array, jax.Array]:
     JointVar = robot.joint_var_cls
 
@@ -488,16 +590,18 @@ def _solve_ik(
         )
 
     costs.append(pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight))
-    costs.append(
-        _self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            activation_start=self_collision_start,
-            ramp_width=self_collision_ramp,
-            weight=self_collision_weight,
+    if use_self_collision:
+        assert robot_coll is not None
+        costs.append(
+            _self_collision_cost(
+                robot,
+                robot_coll,
+                JointVar(0),
+                activation_start=self_collision_start,
+                ramp_width=self_collision_ramp,
+                weight=self_collision_weight,
+            )
         )
-    )
 
     var_joints = JointVar(jnp.array([0]))
     initial_vals = jaxls.VarValues.make(
@@ -709,10 +813,21 @@ class KinematicsSolver:
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
         self.robot = shared_robot()
-        self.robot_coll = shared_robot_collision()
-        starts, widths = collision_cost_params(
-            self.robot, self.robot_coll, config.self_collision_margin
+        # Base collision detection is opt-in (config.self_collision): when
+        # off, no collision model is built at all — the soft cost is left out
+        # of the solve graph and the hard base guard below is skipped, so the
+        # only geometric constraint on the arms is their joint limits.
+        self.robot_coll: pk.collision.RobotCollision | None = (
+            shared_robot_collision() if config.self_collision else None
         )
+        if self.robot_coll is not None:
+            starts, widths = collision_cost_params(
+                self.robot, self.robot_coll, config.self_collision_margin
+            )
+        else:
+            _logger.info("Self-collision (arm/base) detection is off.")
+            starts = np.zeros(0, dtype=np.float32)
+            widths = np.zeros(0, dtype=np.float32)
         self._collision_starts = jnp.asarray(starts)
         self._collision_ramps = jnp.asarray(widths)
         # A soft cost normally turns every arm/base pair away. Independently
@@ -721,22 +836,25 @@ class KinematicsSolver:
         # overlaps at the safe straight-down pose, so the threshold is relative
         # to that reference: at most 20 mm closer. The observed contact was
         # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
-        q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
-        home_distances = np.asarray(
-            self.robot_coll.compute_self_collision_distance(self.robot, q_home)
-        )
         clearance_floor = np.full_like(starts, -np.inf)
-        for k, (i, j) in enumerate(
-            zip(
-                np.asarray(self.robot_coll.active_idx_i),
-                np.asarray(self.robot_coll.active_idx_j),
+        if self.robot_coll is not None:
+            q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
+            home_distances = np.asarray(
+                self.robot_coll.compute_self_collision_distance(self.robot, q_home)
             )
-        ):
-            a = self.robot_coll.link_names[int(i)]
-            b = self.robot_coll.link_names[int(j)]
-            arm_link = b if a in ("base", "s1") else a if b in ("base", "s1") else ""
-            if arm_link.endswith("_e1"):
-                clearance_floor[k] = home_distances[k] - 0.020
+            for k, (i, j) in enumerate(
+                zip(
+                    np.asarray(self.robot_coll.active_idx_i),
+                    np.asarray(self.robot_coll.active_idx_j),
+                )
+            ):
+                a = self.robot_coll.link_names[int(i)]
+                b = self.robot_coll.link_names[int(j)]
+                arm_link = (
+                    b if a in ("base", "s1") else a if b in ("base", "s1") else ""
+                )
+                if arm_link.endswith("_e1"):
+                    clearance_floor[k] = home_distances[k] - 0.020
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
 
@@ -765,6 +883,36 @@ class KinematicsSolver:
         )
         self._left_shoulder_jax = jnp.asarray(self._left_shoulder_pos)
         self._right_shoulder_jax = jnp.asarray(self._right_shoulder_pos)
+
+        # The elbow's swivel (see elbow_swivel): each arm's joint axes (the
+        # child link and the axis in it, ARM_JOINTS order), its shoulder
+        # centre — the three shoulder axes meet at one point, fixed in the
+        # world — and its wrist centre, where the forearm roll (wrist_1)
+        # meets wrist_2, fixed in wrist_2's link.
+        urdf = shared_urdf()
+        fk0_np = np.asarray(fk0, np.float64)
+        self._swivel: dict[str, _ArmSwivel] = {}
+        for side, is_left in (("left", True), ("right", False)):
+            axes = []
+            for joint in ARM_JOINTS:
+                j = urdf.joint_map[urdf_joint_name(joint, is_left=is_left)]
+                axes.append((names.index(j.child), np.asarray(j.axis, np.float64)))
+            lines = [_axis_line(fk0_np, link, axis) for link, axis in axes]
+            shoulder = _axes_meet(*lines[0], *lines[1])
+            wrist = _axes_meet(*lines[4], *lines[5])
+            w2_link = axes[5][0]
+            rot, pos = _pose_np(fk0_np[w2_link])
+            self._swivel[side] = _ArmSwivel(
+                axes=tuple(axes),
+                shoulder=shoulder,
+                wrist_link=w2_link,
+                wrist_local=rot.T @ (wrist - pos),
+                elbow_joints=ARM_JOINTS.index(Joint.ELBOW) + 1,
+            )
+        self._left_swivel_jax = jnp.asarray(self._swivel["left"].shoulder, jnp.float32)
+        self._right_swivel_jax = jnp.asarray(
+            self._swivel["right"].shoulder, jnp.float32
+        )
 
         # Public joint vectors are left-then-right in ARM_JOINTS order (the
         # robot's own ordering); pyroki reorders the actuated joints
@@ -937,6 +1085,58 @@ class KinematicsSolver:
             np.asarray(jaxlie.SE3(fk[self.r_elbow_idx]).translation(), np.float32),
         )
 
+    def elbow_swivel(self, q: np.ndarray) -> dict[str, ElbowSwivel]:
+        """Each arm's elbow swivel at joint positions ``q``.
+
+        With its gripper mount held, a 7-joint arm still has one free
+        motion: the elbow swinging round. Each arm's shoulder axes meet at
+        one point and its forearm roll meets ``wrist_2`` at another, and
+        the swing is roughly a circle about the line between the two — but
+        only roughly, since ``wrist_3`` is offset from that wrist centre
+        and has to turn with it, so the exact motion is
+        :attr:`ElbowSwivel.direction`, from the arm's Jacobian. A wrist
+        turned far from straight (box mode's angled grasp) bends the motion
+        well off the circle.
+
+        Args:
+            q: Full ``(N,)`` joint array in radians.
+
+        Returns:
+            Per side (``"left"``, ``"right"``), an :class:`ElbowSwivel`.
+        """
+        poses = np.asarray(
+            self.robot.forward_kinematics(jnp.asarray(self.to_pyroki_order(q))),
+            np.float64,
+        )
+        out: dict[str, ElbowSwivel] = {}
+        for side, ee, elbow_idx in (
+            ("left", self.l_ee_idx, self.l_elbow_idx),
+            ("right", self.r_ee_idx, self.r_elbow_idx),
+        ):
+            geo = self._swivel[side]
+            ee_rot, ee_pos = _pose_np(poses[ee])
+            elbow = _pose_np(poses[elbow_idx])[1]
+            w_rot, w_pos = _pose_np(poses[geo.wrist_link])
+            wrist = w_pos + w_rot @ geo.wrist_local
+            jac = np.zeros((6, len(geo.axes)))
+            elbow_jac = np.zeros((3, len(geo.axes)))
+            for i, (link, axis) in enumerate(geo.axes):
+                origin, a = _axis_line(poses, link, axis)
+                jac[:3, i] = np.cross(a, ee_pos - origin)
+                jac[3:, i] = a
+                if i < geo.elbow_joints:
+                    elbow_jac[:, i] = np.cross(a, elbow - origin)
+            null = np.linalg.svd(jac)[2][-1]
+            direction = elbow_jac @ null
+            norm = float(np.linalg.norm(direction))
+            out[side] = ElbowSwivel(
+                shoulder=geo.shoulder.copy(),
+                elbow=elbow,
+                wrist_in_mount=ee_rot.T @ (wrist - ee_pos),
+                direction=direction / norm if norm > 1e-9 else np.zeros(3),
+            )
+        return out
+
     def ik(
         self,
         q_current: np.ndarray,
@@ -945,6 +1145,8 @@ class KinematicsSolver:
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
         delta_scale: float = 1.0,
+        elbow_weight: float | None = None,
+        pose_weight_scale: tuple[float, float] = (1.0, 1.0),
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -972,6 +1174,18 @@ class KinematicsSolver:
                 the effective joint speed silently collapses (a 30 ms solve
                 under the default clamp allows only ~1.1 rad/s instead of
                 4 rad/s) and the accumulated error releases as a lurch.
+            elbow_weight: Per-call weight on the elbow hints, replacing
+                ``config.elbow_weight`` for this solve and applied *without*
+                the overhead fade — for hints the caller synthesises (box
+                mode's outward elbow bias, see
+                :func:`almond_axol.teleop.box.elbow_swivel_hint`) rather than
+                the headset's inferred elbow the fade exists for. ``None``
+                keeps the configured behaviour.
+            pose_weight_scale: ``(position, orientation)`` multipliers on
+                ``config.pos_weight`` / ``config.ori_weight`` for this solve.
+                The other costs (manipulability, an elbow hint) settle where
+                they balance a small pose error; a caller that needs the
+                pose held to a fraction of a degree raises these.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -1024,8 +1238,13 @@ class KinematicsSolver:
         # elbow is inferred rather than tracked and degrades sharply once the
         # hand rises to shoulder height, exactly where the shoulder nears its
         # joint limits and bad swivel targets do the most damage.
-        elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
-        elbow_w_r = cfg.elbow_weight * self._elbow_fade(rp, self._right_shoulder_pos)
+        if elbow_weight is not None:
+            elbow_w_l = elbow_w_r = float(elbow_weight)
+        else:
+            elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
+            elbow_w_r = cfg.elbow_weight * self._elbow_fade(
+                rp, self._right_shoulder_pos
+            )
 
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
@@ -1046,10 +1265,10 @@ class KinematicsSolver:
             self._posture_pose,
             self._left_idx_jax,
             self._right_idx_jax,
-            self._left_shoulder_jax,
-            self._right_shoulder_jax,
-            cfg.pos_weight,
-            cfg.ori_weight,
+            self._left_swivel_jax,
+            self._right_swivel_jax,
+            cfg.pos_weight * float(pose_weight_scale[0]),
+            cfg.ori_weight * float(pose_weight_scale[1]),
             cfg.rest_weight,
             cfg.posture_weight,
             cfg.manipulability_weight,
@@ -1066,6 +1285,7 @@ class KinematicsSolver:
             cfg.cost_tolerance,
             cfg.lambda_initial,
             cfg.lambda_factor,
+            self.robot_coll is not None,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
 
@@ -1099,6 +1319,11 @@ class KinematicsSolver:
         if max_abs > delta_budget:
             delta = delta * (delta_budget / max_abs)
         q_out = (q_current + delta).astype(np.float32)
+        if self.robot_coll is None:
+            # Collision detection off: the guard's projection is skipped, but
+            # the joint-limit clamp it also provided still applies.
+            q_out = _clamp_to_limits_np(self.robot, q_current, q_out)
+            return self.from_pyroki_order(q_out)
         q_out, guard_active_jax = _base_collision_safe_step(
             self.robot,
             self.robot_coll,
@@ -1134,21 +1359,33 @@ class KinematicsSolver:
     # -- Internal ------------------------------------------------------------
 
     def _warmup(self) -> None:
-        """Trigger JIT compilation with a dummy solve."""
+        """Trigger JIT compilation with dummy solves.
+
+        Both graph shapes are compiled — with and without elbow hints — so
+        neither the plain teleop solve nor box mode's first frame (which adds
+        synthetic elbow hints, see ``ik(elbow_weight=...)``) stalls on a
+        compile mid-session. The persistent compilation cache
+        (:mod:`almond_axol.kinematics.jax_cache`) makes the second one a
+        disk load on every run but the first.
+        """
         _logger.info("Warming up IK solver (JIT compile)...")
         dummy_q = np.zeros(self.num_joints, dtype=np.float32)
         dummy_pos = np.array([0.0, 0.0, 0.3], dtype=np.float32)
         dummy_rot = np.eye(3, dtype=np.float32)
         dummy_pose = (dummy_pos, dummy_rot)
-        kwargs: dict = dict(
-            q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
-        )
-        if self.config.elbow_weight > 0:
-            dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
-            kwargs["left_elbow_pos"] = dummy_elbow
-            kwargs["right_elbow_pos"] = dummy_elbow
-        # Compilation/runtime failures here mean the worker cannot safely
-        # serve the first real pose. Propagate them instead of announcing a
-        # false-ready solver and leaving teleop frozen on its seed pose.
-        self.ik(**kwargs)
+        dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
+        # Box mode passes explicit elbow hints (and an ``elbow_weight``
+        # override) regardless of the configured weight, so compile both the
+        # with- and without-elbow variants up front.
+        for with_elbows in (False, True):
+            kwargs: dict = dict(
+                q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
+            )
+            if with_elbows:
+                kwargs["left_elbow_pos"] = dummy_elbow
+                kwargs["right_elbow_pos"] = dummy_elbow
+            # Compilation/runtime failures here mean the worker cannot safely
+            # serve the first real pose. Propagate them instead of announcing a
+            # false-ready solver and leaving teleop frozen on its seed pose.
+            self.ik(**kwargs)
         _logger.info("IK solver ready.")

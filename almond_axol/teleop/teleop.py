@@ -55,8 +55,9 @@ from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from .config import VRTeleopConfig
-from .core import VRTeleopCore, wait_for_ik_ready
+from .config import VRTeleopConfig, adopt_robot_gripper
+from .core import VRTeleopCore, measured_arms, wait_for_ik_ready
+from .live import LiveSettings
 from .recorder import make as _recorder_make
 from .worker import run_ik_worker
 
@@ -191,6 +192,12 @@ class VRTeleop:
                 vr_server_config = shared_config(
                     VRServerConfig, "teleop", "vr_server", store=store
                 )
+        # The robot's fitted gripper (AxolConfig.gripper) decides box mode;
+        # a robot without one (Sim) leaves the config's value.
+        arm = getattr(robot, "left", None) or getattr(robot, "right", None)
+        robot_gripper = getattr(arm, "gripper_type", None)
+        if isinstance(robot_gripper, str):
+            adopt_robot_gripper(config, robot_gripper)
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -208,8 +215,16 @@ class VRTeleop:
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config, _logger, self._broadcast_tracking, self._broadcast_json
+            config,
+            _logger,
+            self._broadcast_tracking,
+            broadcast_mode=lambda key, value: self._live.on_changed(key, value),
+            broadcast_json=self._broadcast_json,
         )
+        # Live session settings (box mode, re-engage, grip force, …): applied
+        # from `set` messages off any client, published back as `settings`.
+        self._live = LiveSettings(self._core, robot, self._publish_settings)
+        self._vr_server.set_on_setting(self._live.apply)
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -317,6 +332,8 @@ class VRTeleop:
 
         The VR app uses it to allow screen repositioning (trigger grabs) only
         while the robot isn't being controlled. Safe to call from any thread.
+        Goes through :meth:`VRServer.broadcast_tracking`, which also stores the
+        state for headsets that connect later (even with nobody connected now).
         """
         if self._vr_loop is None:
             return
@@ -327,17 +344,20 @@ class VRTeleop:
         except RuntimeError:
             pass  # VR loop already shut down
 
-    def _broadcast_json(self, obj: dict) -> None:
-        """Push an arbitrary JSON message to the headset (fire-and-forget).
+    def _publish_settings(self, snapshot: dict) -> None:
+        """Push the live-settings snapshot to every client and store it for
+        late joiners (see :class:`LiveSettings`)."""
+        self._vr_server.set_announce("settings", snapshot)
+        self._broadcast_json({"type": "settings", "value": snapshot})
 
-        Used by the shared core for the URDF overlay state in absolute (Mantis)
-        mode. Safe to call from any thread.
-        """
-        if self._vr_loop is None:
+    def _broadcast_json(self, payload: dict) -> None:
+        """Fire-and-forget a JSON message to every headset. Safe from any thread."""
+        if self._vr_loop is None or not self._vr_server.connected:
             return
+        text = json.dumps(payload)
         try:
             asyncio.run_coroutine_threadsafe(
-                self._vr_server.broadcast_text(json.dumps(obj)), self._vr_loop
+                self._vr_server.broadcast_text(text), self._vr_loop
             )
         except RuntimeError:
             pass  # VR loop already shut down
@@ -369,6 +389,9 @@ class VRTeleop:
         await loop.run_in_executor(None, self._vr_ready.wait)
         if self._vr_start_error is not None:
             raise self._vr_start_error
+        # Seed the connect-time announce so a headset / panel adopts the live
+        # session settings (their controls mirror the server; see set_announce).
+        self._live.announce()
 
         await self._robot.enable()
         if self._jelly is not None:
@@ -858,6 +881,23 @@ class VRTeleop:
 
         guard = self._guard_supported()
 
+        # Box mode's squeeze torque cap (VRTeleopConfig.box_squeeze_torque):
+        # the core says which joints to cap and by how much for the current
+        # state (box mode on, not resetting); the robot carries the caps to
+        # the realtime core on every command. Written only on change, and
+        # cleared when the loop ends so a robot object outliving this
+        # session is not left capped. Sim / classic targets have no caps.
+        set_caps = getattr(self._robot, "set_spring_caps", None)
+        caps_applied: dict | None = None
+
+        def _sync_squeeze() -> None:
+            nonlocal caps_applied
+            if set_caps is not None:
+                want = self._core.spring_caps()
+                if want != caps_applied:
+                    set_caps(want)
+                    caps_applied = want
+
         # Tracking-phase contact watchdog (hardware only, opt-in — the
         # threshold defaults to 0 = off): the same sustained-torque trip the
         # guarded return uses, but active while the operator drives (or
@@ -902,6 +942,9 @@ class VRTeleop:
                         self._robot_recorder(False)
                     if self._rec is not None:
                         self._rec.set_engaged(False)
+                    # A return wants the shoulders' full authority (the core
+                    # reports no caps while resetting).
+                    _sync_squeeze()
                     await self._core.guarded_return(
                         send_step=self._guard_send_step,
                         gravity_step=self._guard_gravity_step,
@@ -922,6 +965,7 @@ class VRTeleop:
                 t_step = time.perf_counter()
                 if self._robot_recorder is not None:
                     self._robot_recorder(self._core.teleop_enabled)
+                _sync_squeeze()
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
@@ -1039,6 +1083,8 @@ class VRTeleop:
         finally:
             if self._robot_recorder is not None:
                 self._robot_recorder(False)
+            if set_caps is not None and caps_applied:
+                set_caps(None)
             activity.stop()
             diag.stop()
             tegra.stop()
@@ -1063,6 +1109,7 @@ class VRTeleop:
         out = self._core.compute_output()
         if out is None:
             return None, None
+        self._core.maybe_broadcast_joints(out, self._robot)
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:
@@ -1109,8 +1156,12 @@ class VRTeleop:
         if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
-            # creep while the arms replay their return-to-rest trajectory.
-            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            # creep while the arms replay their return-to-rest trajectory;
+            # while a box-mode leader owns the sticks (grip width / tilt)
+            # Jelly is held stopped the same way (frozen pair: sticks drive).
+            self._jelly.apply_vr_frame(
+                frame, resetting=self._core.is_resetting or self._core.pair_owns_sticks
+            )
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)
@@ -1140,4 +1191,5 @@ class VRTeleop:
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            get_measured=lambda: measured_arms(self._robot),
         )

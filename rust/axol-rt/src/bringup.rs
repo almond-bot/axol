@@ -84,6 +84,10 @@ pub struct MotorSpec {
     /// command it every tick of a 480 Hz loop, 240 for the half-rate lane, 0
     /// to follow the config-wide `impedance_hz`. Only meaningful on MIT.
     pub mit_hz: f64,
+    /// Spring-torque cap (Nm): the wire position is kept within
+    /// `tau_cap / kp` of the measured one (`filter::cap_spring`). `inf` =
+    /// uncapped. MIT joints only.
+    pub tau_cap: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -182,6 +186,8 @@ pub struct ReadyMotor {
     pub fw_version: Option<u32>,
     /// See `MotorSpec::mit_hz`.
     pub mit_hz: f64,
+    /// See `MotorSpec::tau_cap`.
+    pub tau_cap: f64,
     /// `MotorSpec::tf_nm_per_pct` where the firmware takes 0x73, else 0 —
     /// the bus loop sends 0x73 exactly when this is positive.
     pub tf_nm_per_pct: f64,
@@ -350,6 +356,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fw_version: version,
             tf_nm_per_pct: tf_scale(spec.tf_nm_per_pct, version),
             mit_hz: spec.mit_hz,
+            tau_cap: spec.tau_cap,
         });
     }
 
@@ -444,6 +451,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             fw_version: None,
             tf_nm_per_pct: 0.0,
             mit_hz: spec.mit_hz,
+            tau_cap: spec.tau_cap,
         });
     }
     Ok(motors)
