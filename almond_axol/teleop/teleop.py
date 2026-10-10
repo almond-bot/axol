@@ -55,7 +55,7 @@ from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from .config import VRTeleopConfig
+from .config import VRTeleopConfig, adopt_robot_gripper
 from .core import VRTeleopCore, measured_arms, wait_for_ik_ready
 from .live import LiveSettings
 from .recorder import make as _recorder_make
@@ -197,6 +197,12 @@ class VRTeleop:
                 vr_server_config = shared_config(
                     VRServerConfig, "teleop", "vr_server", store=store
                 )
+        # The robot's fitted gripper (AxolConfig.gripper) decides box mode;
+        # a robot without one (Sim) leaves the config's value.
+        arm = getattr(robot, "left", None) or getattr(robot, "right", None)
+        robot_gripper = getattr(arm, "gripper_type", None)
+        if isinstance(robot_gripper, str):
+            adopt_robot_gripper(config, robot_gripper)
         self._robot = robot
         self._jelly = jelly
         self._config = config

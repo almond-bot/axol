@@ -104,7 +104,7 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | `position_multiplier` | number, × | hand-motion scale (forwarded to the IK worker) |
 | `teleop_max_vel` | number, rev/s | joint velocity cap while tracking |
 
-The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`, mirrored from `AxolConfig.gripper`): with the parallel gripper they are left out of both `schema` and `values` and a `set` of one is rejected, so clients show box mode only when `box_mode` is in `values`.
+The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`, adopted from `AxolConfig.gripper`): with the parallel gripper they are left out of both `schema` and `values` and a `set` of one is rejected, so clients show box mode only when `box_mode` is in `values`.
 
 Core-side settings are queued (`VRTeleopCore.set_live()`) and applied on the IK thread before the next frame — or while idle, so the panel can change them with no headset connected; IK-worker fields are mirrored to the worker subprocess as `("set", key, value)` messages.
 

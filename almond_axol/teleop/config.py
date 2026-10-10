@@ -146,11 +146,15 @@ class VRTeleopConfig:
             can still be handed over with the other grip, and a session
             that engages from a frozen pair is led by the grip that does.
             Live-adjustable.
-        gripper: Which gripper is fitted — a mirror of
-            :attr:`AxolConfig.gripper <almond_axol.robot.config.AxolConfig>`,
-            which the CLIs copy in (``--axol.gripper``), so set it there.
-            Box mode exists only with ``"parcel"``, the parcel gripper: with
-            ``"parallel"`` (the default, the stock two-finger gripper) every
+        gripper: Which gripper is fitted. ``None`` (the default) follows
+            the robot's
+            :attr:`AxolConfig.gripper <almond_axol.robot.config.AxolConfig>`
+            (``--axol.gripper``), which the CLIs and :class:`VRTeleop` adopt
+            through :func:`adopt_robot_gripper`, so set it there; a value
+            here that disagrees with the robot's is overridden with a
+            warning. Box mode exists only with ``"parcel"``, the parcel
+            gripper: with ``"parallel"`` (the stock two-finger gripper, and
+            what ``None`` means with no robot to follow) every
             box-mode setting is hidden from the headset and the control
             panel, ``box_mode`` is forced off and :meth:`VRTeleopCore.set_box_mode`
             refuses to switch it on. The parcel gripper has a fixed blade
@@ -532,7 +536,7 @@ class VRTeleopConfig:
     reengage_ramp_min_s: float = 0.75
     box_mode: bool = False
     box_lead_hand: str = "right"
-    gripper: Literal["parallel", "parcel"] = "parallel"
+    gripper: Literal["parallel", "parcel"] | None = None
     box_flush_deg: float = 39.0
     box_grasp: str = "straight"
     box_face_left: str = "auto"
@@ -567,6 +571,23 @@ class VRTeleopConfig:
     quest_controller_profile: str | None = None
     quest_pose_space: str | None = None
     urdf_viewer_world_aligned: bool | None = None
+
+
+def adopt_robot_gripper(config: VRTeleopConfig, gripper: str) -> None:
+    """Set ``config.gripper`` to the robot's fitted gripper.
+
+    The robot's ``AxolConfig.gripper`` is the one source of truth (it also
+    sets the jaws' close direction and the calibration's stroke check); a
+    teleop value that disagrees with it is replaced, with a warning.
+    """
+    if config.gripper is not None and config.gripper != gripper:
+        _logger.warning(
+            "teleop gripper=%r ignored: the robot is configured for the %s "
+            "gripper (set axol.gripper to change it)",
+            config.gripper,
+            gripper,
+        )
+    config.gripper = gripper
 
 
 def apply_mantis_teleop_profile(

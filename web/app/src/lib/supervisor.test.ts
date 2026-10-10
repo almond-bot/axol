@@ -332,6 +332,18 @@ describe("showWhen gates", () => {
     expect(settingShown(parcelOnly, { "axol.gripper": "parcel" }, schema)).toBe(true)
   })
 
+  it("reads a reset (null) value as the default", () => {
+    const parcelDefault: SettingsCategory[] = [
+      {
+        ...schema[0],
+        settings: [{ ...schema[0].settings[0], default: "parcel" }],
+      },
+    ]
+    const reset = { "axol.gripper": null } as unknown as Record<string, string>
+    expect(settingShown(parcelOnly, reset, parcelDefault)).toBe(true)
+    expect(settingShown(parcelOnly, reset, schema)).toBe(false)
+  })
+
   it("prunes gated Advanced fields", () => {
     const keys = (sections: AdvancedSection[]) =>
       sections.flatMap((s) => flattenFields(s.nodes)).map((f) => f.key)

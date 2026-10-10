@@ -112,6 +112,7 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..teleop.config import adopt_robot_gripper
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
 from ..utils.logquiet import quiet_noisy_loggers
@@ -1311,8 +1312,8 @@ def _run(
         cfg.teleop_config, AxolVRTeleopConfig
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
-        cfg.teleop_config.vr_teleop_config.gripper = (
-            cfg.robot_config.axol_config.gripper
+        adopt_robot_gripper(
+            cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
         )
 
     robot = AxolRobot(cfg.robot_config)

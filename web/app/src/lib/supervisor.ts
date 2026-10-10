@@ -1525,9 +1525,10 @@ export function settingShown(
   schema: SettingsCategory[]
 ): boolean {
   if (!showWhen) return true
-  const staged = values[showWhen.key]
+  // A staged null is a reset to default, the same as nothing staged.
+  const staged = values[showWhen.key] as SettingValue | null | undefined
   const value =
-    staged !== undefined
+    staged != null
       ? staged
       : schema.flatMap((c) => c.settings).find((s) => s.key === showWhen.key)?.default
   return value === showWhen.equals

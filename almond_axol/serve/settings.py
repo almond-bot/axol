@@ -133,7 +133,7 @@ SECTIONS: tuple[Section, ...] = (
         targets={"teleop": "teleop", "collect-data": _VRT},
         ref_op="teleop",
         ref_prefix="teleop",
-        # A mirror of axol.gripper, copied in by the CLIs.
+        # Follows axol.gripper (adopt_robot_gripper); not a setting of its own.
         drop_children=("gripper",),
     ),
     Section(

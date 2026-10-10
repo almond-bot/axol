@@ -93,6 +93,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
 from ..teleop_activity import TeleopActivityMarker
@@ -1385,8 +1386,8 @@ def _run_session(
         and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
-        cfg.teleop_config.vr_teleop_config.gripper = (
-            cfg.robot_config.axol_config.gripper
+        adopt_robot_gripper(
+            cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
         )
 
         # Keep the optional teleop flight recorder coherent across Python and

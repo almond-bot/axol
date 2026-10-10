@@ -1,8 +1,8 @@
 """Box mode exists only with the parcel gripper.
 
-``AxolConfig.gripper`` (mirrored into ``VRTeleopConfig.gripper`` by the CLIs)
-selects the fitted gripper. With the stock parallel gripper the whole of box
-mode is absent: the core refuses it, the live settings drop every ``box_*``
+``AxolConfig.gripper`` (adopted into ``VRTeleopConfig.gripper`` by the CLIs
+and ``VRTeleop``) selects the fitted gripper. With the stock parallel gripper
+the whole of box mode is absent: the core refuses it, the live settings drop every ``box_*``
 key, and the control panel hides its box settings.
 """
 
@@ -12,9 +12,11 @@ import logging
 import unittest
 
 from almond_axol.serve import settings as serve_settings
-from almond_axol.teleop.config import VRTeleopConfig
+from almond_axol.robot.config import GRIPPER_TYPES
+from almond_axol.teleop.config import VRTeleopConfig, adopt_robot_gripper
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.teleop.live import LIVE_SETTINGS, LiveSettings
+from almond_axol.vr.config import VRServerConfig
 
 _BOX_KEYS = {d.key for d in LIVE_SETTINGS if d.key.startswith("box_")}
 
@@ -29,8 +31,10 @@ def _core(**overrides) -> VRTeleopCore:
 
 class CoreGateTest(unittest.TestCase):
     def test_parallel_is_the_default_and_has_no_box_mode(self) -> None:
-        self.assertEqual(VRTeleopConfig().gripper, "parallel")
+        # None follows the robot; with no robot to follow it is parallel.
+        self.assertIsNone(VRTeleopConfig().gripper)
         self.assertFalse(_core().box_available)
+        self.assertFalse(_core(gripper="parallel").box_available)
         self.assertTrue(_core(gripper="parcel").box_available)
 
     def test_box_mode_at_startup_is_forced_off(self) -> None:
@@ -46,6 +50,39 @@ class CoreGateTest(unittest.TestCase):
             core.set_box_mode(True)
         core.set_box_mode(False)
         _core(gripper="parcel").set_box_mode(True)
+
+
+class AdoptRobotGripperTest(unittest.TestCase):
+    def test_follows_the_robot(self) -> None:
+        config = VRTeleopConfig()
+        adopt_robot_gripper(config, "parcel")
+        self.assertEqual(config.gripper, "parcel")
+
+    def test_a_disagreeing_teleop_value_is_overridden_with_a_warning(self) -> None:
+        config = VRTeleopConfig(gripper="parcel")
+        with self.assertLogs("almond_axol.teleop.config", "WARNING") as logs:
+            adopt_robot_gripper(config, "parallel")
+        self.assertEqual(config.gripper, "parallel")
+        self.assertIn("ignored", logs.output[0])
+
+    def test_vrteleop_adopts_an_axol_robots_gripper(self) -> None:
+        from almond_axol.teleop.teleop import VRTeleop
+
+        class _Arm:
+            gripper_type = "parcel"
+
+        class _Robot:
+            left = _Arm()
+            right = None
+
+        config = VRTeleopConfig()
+        teleop = VRTeleop(
+            _Robot(),
+            config=config,
+            kinematics_config=object(),
+            vr_server_config=VRServerConfig(),
+        )
+        self.assertTrue(teleop._core.box_available)
 
 
 class LiveGateTest(unittest.TestCase):
@@ -74,7 +111,7 @@ class PanelGateTest(unittest.TestCase):
     def test_gripper_select_on_the_robot_tab(self) -> None:
         robot = next(c for c in serve_settings.SETTINGS if c.key == "robot")
         gripper = next(s for s in robot.settings if s.key == "axol.gripper")
-        self.assertEqual(gripper.options, ("parallel", "parcel"))
+        self.assertEqual(gripper.options, GRIPPER_TYPES)
 
     def test_every_box_setting_needs_the_parcel_gripper(self) -> None:
         box = [

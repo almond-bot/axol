@@ -74,26 +74,28 @@ LIMITS: dict[Joint, tuple[float, float]] = {
 # (:mod:`almond_axol.robot.mantis`) has no closed stop to sweep to and uses it
 # as the stroke from its calibrated open stop.
 GRIPPER_TRAVEL = math.radians(290)
-_GRIPPER_NOMINAL_TRAVEL = GRIPPER_TRAVEL
 # Nominal stroke of each ``AxolConfig.gripper`` type (rad). The two are far
 # enough apart that a measured stroke tells them apart: calibration refuses a
-# stroke nearer the other type's, which is what a wrong setting measures (on
-# the right arm it would also have swapped open and closed).
+# stroke that matches the other type's, which is what a wrong setting
+# measures (on the right arm it would also have swapped open and closed).
 _GRIPPER_NOMINAL_STROKE = {
     "parallel": GRIPPER_TRAVEL,
     "parcel": math.radians(185),
 }
+# How close (rad) a measured stroke must be to a type's nominal one to count
+# as that type's. Units vary by a few degrees; a stroke matching neither type
+# (a sweep cut short by an object in the jaws or a sticky stop) is accepted
+# with a warning rather than taken as the other gripper.
+_GRIPPER_STROKE_TOLERANCE = math.radians(25)
 
 # Gripper end-stop calibration parameters.
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — pushing this hard into a stop ends a sweep
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
-# Two-stop sweep (AxolArm._sweep_to_stop): longest sweep tolerated before
-# concluding there is no stop in that direction.
-_GRIPPER_CALIB_MAX_SWEEP = 2.5 * _GRIPPER_NOMINAL_TRAVEL
-_GRIPPER_CALIB_MAX_SWEEP_STEPS = math.ceil(
-    _GRIPPER_CALIB_MAX_SWEEP / _GRIPPER_CALIB_STEP
-)
+# Two-stop sweep (AxolArm._seek_gripper_stop): longest sweep tolerated before
+# concluding there is no stop in that direction, as a multiple of the
+# configured gripper type's nominal stroke.
+_GRIPPER_CALIB_MAX_SWEEP_STROKES = 2.5
 # A stop is only recognised from torque pushing *along* the sweep. Torque
 # this far against the sweep with the shaft lagging the target by at least
 # half what it takes to make it at the calibration stiffness (abort / kp),
@@ -848,6 +850,11 @@ class AxolArm:
         return self._kp_vector.copy()
 
     @property
+    def gripper_type(self) -> str:
+        """The fitted gripper type (``AxolConfig.gripper``)."""
+        return self._config.gripper
+
+    @property
     def present_joints(self) -> frozenset[Joint]:
         """The joints with a motor on this arm's bus (see ``joints`` in ``__init__``)."""
         return frozenset(self.motors)
@@ -1170,7 +1177,8 @@ class AxolArm:
             MotorError: If torque builds up *against* the sweep while the
                 shaft lags the target (the motor reports pushing opposite to
                 its commanded motion — an inverted torque sign), or no stop
-                is met within ``_GRIPPER_CALIB_MAX_SWEEP``.
+                is met within ``_GRIPPER_CALIB_MAX_SWEEP_STROKES`` times the
+                configured type's nominal stroke.
         """
         motor = self.motors[Joint.GRIPPER]
         side = "left" if self._is_left else "right"
@@ -1178,8 +1186,12 @@ class AxolArm:
         pressed_at: float | None = None
         stalled = 0
         against = 0
+        max_sweep = (
+            _GRIPPER_CALIB_MAX_SWEEP_STROKES
+            * _GRIPPER_NOMINAL_STROKE[self._config.gripper]
+        )
 
-        for _ in range(_GRIPPER_CALIB_MAX_SWEEP_STEPS):
+        for _ in range(math.ceil(max_sweep / _GRIPPER_CALIB_STEP)):
             target += direction * _GRIPPER_CALIB_STEP
             await motor.set_impedance(
                 target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
@@ -1224,7 +1236,7 @@ class AxolArm:
         await self._unload_gripper_target()
         raise MotorError(
             f"{side} gripper calibration: no hard stop met within "
-            f"{math.degrees(_GRIPPER_CALIB_MAX_SWEEP):.0f}° sweeping in direction "
+            f"{math.degrees(max_sweep):.0f}° sweeping in direction "
             f"{direction:+d} — is the gripper attached and the jaw free to move?"
         )
 
@@ -1301,27 +1313,52 @@ class AxolArm:
     def _check_gripper_stroke(self, travel: float) -> None:
         """Refuse a measured stroke that belongs to the other gripper type.
 
+        Only a stroke within ``_GRIPPER_STROKE_TOLERANCE`` of another type's
+        nominal stroke (``_GRIPPER_NOMINAL_STROKE``) and not of the
+        configured ``AxolConfig.gripper``'s is refused; one that matches
+        neither is logged and accepted.
+
         Raises:
-            MotorError: If ``travel`` (rad) is nearer another type's nominal
-                stroke (``_GRIPPER_NOMINAL_STROKE``) than the configured
-                ``AxolConfig.gripper``'s.
+            MotorError: If ``travel`` (rad) matches another type's stroke.
         """
         configured = self._config.gripper
-        nearest = min(
-            _GRIPPER_NOMINAL_STROKE,
-            key=lambda kind: abs(_GRIPPER_NOMINAL_STROKE[kind] - travel),
-        )
-        if nearest == configured:
-            return
         side = "left" if self._is_left else "right"
+
+        def matches(kind: str) -> bool:
+            return (
+                abs(_GRIPPER_NOMINAL_STROKE[kind] - travel) <= _GRIPPER_STROKE_TOLERANCE
+            )
+
+        if matches(configured):
+            return
+        other = next(
+            (
+                kind
+                for kind in _GRIPPER_NOMINAL_STROKE
+                if kind != configured and matches(kind)
+            ),
+            None,
+        )
+        if other is None:
+            _logger.warning(
+                "%s gripper measured a %.0f° stroke, off the %s gripper's "
+                "~%.0f° — an object in the jaws or a sticky stop? Empty the "
+                "gripper and enable again to recalibrate if it misbehaves",
+                side,
+                math.degrees(travel),
+                configured,
+                math.degrees(_GRIPPER_NOMINAL_STROKE[configured]),
+            )
+            return
         raise MotorError(
             f"{side} gripper measured a {math.degrees(travel):.0f}° stroke, which "
-            f"is the {nearest} gripper's "
-            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[nearest]):.0f}°), but the "
+            f"matches the {other} gripper "
+            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[other]):.0f}°), but the "
             f"robot is configured for the {configured} gripper "
-            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[configured]):.0f}°) — set "
-            f"the gripper type to {nearest} (--axol.gripper {nearest}, control "
-            f"panel Robot → Gripper) and enable again"
+            f"(~{math.degrees(_GRIPPER_NOMINAL_STROKE[configured]):.0f}°). Empty "
+            f"the gripper and enable again; if the {other} gripper really is "
+            f"fitted, set the gripper type to {other} (--axol.gripper {other}, "
+            f"control panel Robot → Gripper)"
         )
 
     async def enable(self, hold: bool = True) -> None:

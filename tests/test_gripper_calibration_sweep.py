@@ -186,7 +186,8 @@ class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
         arm = AxolHardware(AxolConfig(gripper="parallel")).right
         arm.motors[Joint.GRIPPER] = jaw
         with self.assertRaisesRegex(
-            MotorError, "parcel gripper's.*--axol.gripper parcel"
+            MotorError,
+            "matches the parcel gripper.*Empty the gripper.*--axol.gripper parcel",
         ):
             await arm._calibrate_gripper()
         self.assertEqual(jaw.target, jaw.position)
@@ -196,8 +197,26 @@ class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
         jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(290), start=-4.0)
         arm = AxolHardware(AxolConfig(gripper="parcel")).left
         arm.motors[Joint.GRIPPER] = jaw
-        with self.assertRaisesRegex(MotorError, "parallel gripper's"):
+        with self.assertRaisesRegex(MotorError, "matches the parallel gripper"):
             await arm._calibrate_gripper()
+
+    async def test_short_stroke_matching_neither_type_is_accepted(self) -> None:
+        # A parallel jaw stopped short by an object (240°, or 120°) matches
+        # neither type: it calibrates, with a warning, rather than being
+        # taken for the parcel gripper.
+        for stroke_deg in (240, 120):
+            with self.subTest(stroke_deg=stroke_deg):
+                jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(stroke_deg), start=-5.0)
+                arm = AxolHardware(AxolConfig(gripper="parallel")).right
+                arm.motors[Joint.GRIPPER] = jaw
+                with self.assertLogs(axol_module._logger, "WARNING") as logs:
+                    await arm._calibrate_gripper()
+                self.assertIn("off the parallel gripper's", "\n".join(logs.output))
+                self.assertAlmostEqual(
+                    abs(arm._gripper_close - arm._gripper_open),
+                    math.radians(stroke_deg),
+                    delta=0.02,
+                )
 
     async def test_restore_rejects_the_other_types_calibration(self) -> None:
         arm = AxolHardware(AxolConfig(gripper="parcel")).left
@@ -207,7 +226,7 @@ class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
             "_load_gripper_calibration",
             return_value=(-6.0, -6.0 + math.radians(290)),
         ):
-            with self.assertRaisesRegex(MotorError, "parallel gripper's"):
+            with self.assertRaisesRegex(MotorError, "matches the parallel gripper"):
                 await arm._restore_gripper_calibration()
 
     def test_unknown_type_is_rejected(self) -> None:

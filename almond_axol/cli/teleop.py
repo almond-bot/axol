@@ -86,12 +86,14 @@ def main(argv: list[str]) -> None:
             settings_op="teleop",
             settings_args={"mantis": True},
         )
-    # The fitted gripper is a robot setting; teleop mirrors it (box mode).
-    cfg.teleop.gripper = cfg.axol.gripper
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    # The fitted gripper is a robot setting; teleop follows it (box mode).
+    from ..teleop.config import adopt_robot_gripper
+
+    adopt_robot_gripper(cfg.teleop, cfg.axol.gripper)
     quiet_noisy_loggers()
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled

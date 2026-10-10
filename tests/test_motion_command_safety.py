@@ -572,6 +572,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         # The two-stop calibration sweeps in the configured close direction.
         arm._is_left = True
         arm._close_direction = -1
+        arm._config = SimpleNamespace(gripper="parcel")
 
         with (
             patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
