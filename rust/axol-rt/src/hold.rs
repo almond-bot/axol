@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor};
+use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor, WireMode};
 use crate::can::CanSock;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
@@ -66,13 +66,29 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     kd: fields.get(4)?.parse().ok()?,
                     gripper: false, // hold never touches the gripper
                     slot: 0,        // unused: hold has no target stream
-                    // Tracker/friction params and the torque cap are serve-only.
+                    // Tracker/friction params are serve-only.
                     max_vel: 0.0,
                     max_accel: 0.0,
                     fc: 0.0,
                     k: 0.0,
                     fv: 0.0,
                     fo: 0.0,
+                    stiction_gain: 0.0,
+                    stiction_err: 0.0,
+                    stiction_load_gain: 0.0,
+                    dither_nm: 0.0,
+                    dither_hz: 0.0,
+                    wire: WireMode::Mit,
+                    stribeck_gain: 0.0,
+                    stribeck_dfs: 0.0,
+                    stribeck_load_gain: 0.0,
+                    stribeck_vs: 0.0,
+                    fl: 0.0,
+                    stribeck_pole: 0.0,
+                    cap_track: 0.0,
+                    lead_s: 0.0,
+                    tf_nm_per_pct: 0.0,
+                    mit_hz: 0.0,
                     tau_cap: f64::INFINITY,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,

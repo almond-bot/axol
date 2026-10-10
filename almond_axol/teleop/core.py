@@ -44,7 +44,12 @@ import numpy as np
 from ..constants import ARM_JOINTS, Joint
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
-from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
+from .filter import (
+    AlphaSmoothFilter,
+    NotchFilter,
+    ResetInterpolator,
+    TrapezoidalFilter,
+)
 from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
@@ -279,6 +284,13 @@ class VRTeleopCore:
         )
         self.smooth_right = TrapezoidalFilter(
             config.teleop_max_vel, config.teleop_max_accel, dt
+        )
+        # Structural-mode notches on the arm command (off unless configured).
+        self.notch_left = NotchFilter(
+            config.command_notch_hz, config.command_notch_q, config.frequency
+        )
+        self.notch_right = NotchFilter(
+            config.command_notch_hz, config.command_notch_q, config.frequency
         )
         self.reset_interp = ResetInterpolator()
 
@@ -515,10 +527,12 @@ class VRTeleopCore:
         if cur_left is not None:
             seed_l = np.append(cur_left[:7], self.l_grip)
             self.ema_left.reset(seed=seed_l)
+            self.notch_left.reset(seed_l[:7])
             self.smooth_left.reset(seed=seed_l[:7])
         if cur_right is not None:
             seed_r = np.append(cur_right[:7], self.r_grip)
             self.ema_right.reset(seed=seed_r)
+            self.notch_right.reset(seed_r[:7])
             self.smooth_right.reset(seed=seed_r[:7])
         # The command is being re-adopted to the measured arm: the output
         # guard must not rate-limit across the adoption (the arm is already
@@ -1500,6 +1514,8 @@ class VRTeleopCore:
                 self.ema_right.reset(seed=seed_r)
                 self.smooth_left.reset(seed=q[self.left_indices])
                 self.smooth_right.reset(seed=q[self.right_indices])
+                self.notch_left.reset(q[self.left_indices])
+                self.notch_right.reset(q[self.right_indices])
             out = np.empty(16, dtype=np.float32)
             out[:7] = q[self.left_indices]
             out[7] = l_grip
@@ -1515,8 +1531,8 @@ class VRTeleopCore:
         # Arm joints go through the trapezoidal filter; the gripper bypasses it
         # so it responds immediately (limited only by the EMA) rather than being
         # throttled by the rad/s velocity limit designed for arm joints.
-        smoothed_l_arm = self.smooth_left.update(ema_l[:7])
-        smoothed_r_arm = self.smooth_right.update(ema_r[:7])
+        smoothed_l_arm = self.smooth_left.update(self.notch_left.update(ema_l[:7]))
+        smoothed_r_arm = self.smooth_right.update(self.notch_right.update(ema_r[:7]))
 
         out = np.empty(16, dtype=np.float32)
         out[:7] = smoothed_l_arm

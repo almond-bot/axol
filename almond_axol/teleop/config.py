@@ -392,6 +392,13 @@ class VRTeleopConfig:
             high-frequency jitter at the cost of a small fixed lag
             (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
             at 120 Hz), favouring smoothness over minimum latency.
+        command_notch_hz: Notch centres (Hz) on the joint command, between
+            the IK EMA and the trapezoidal tracker (see
+            :class:`~almond_axol.teleop.filter.NotchFilter`) — for the arm's
+            structural modes the joint loops cannot see or damp. Empty (the
+            default) = off. Candidates on the jelly robot: 5.5 (the wrist
+            IMU's 3-15 Hz peak) and ~2.1.
+        command_notch_q: Quality factor of those notches (bandwidth f0/Q).
         pose_cutoff: Pole frequency (Hz) of the lag-compensated low-pass
             applied to raw VR controller positions, quaternions, and elbow
             positions **before** they enter the IK solver (see
@@ -575,6 +582,8 @@ class VRTeleopConfig:
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
     pose_cutoff: float = 2.5
+    command_notch_hz: list[float] = field(default_factory=list)
+    command_notch_q: float = 2.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5

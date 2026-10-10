@@ -113,7 +113,18 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
 
     def test_config_header_declares_the_protocol(self) -> None:
         self.assertEqual(link.config_header(), [f"proto {link.CONFIG_PROTO}"])
-        self.assertEqual(link.CONFIG_PROTO, 3)
+        # 2: slot-by-motor-id; 3/4: stiction fields; 5: dither fields; 6: wire
+        # mode token; 7: Stribeck fields; 8: load-proportional friction fl;
+        # 9: the Stribeck velocity pole on every joint line; 10: the pv wire
+        # token; 11: impedance joints at 240 Hz only (480 = alternate ticks);
+        # 12: the optional trailing 0xA4 cap_track field on joint lines;
+        # 13: cap_track > 0 (the planner) puts a joint on the half-rate lane;
+        # 14: the optional trailing 0xA4 target lead (ms); 15: impedance_hz
+        # and the optional 0x73 feedforward scale; 16: the optional per-joint
+        # impedance_hz; 17: the optional trailing spring-torque cap and the
+        # 10-field target slot (per-command cap).
+        # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
+        self.assertEqual(link.CONFIG_PROTO, 17)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())

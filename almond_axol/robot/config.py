@@ -29,10 +29,11 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal, get_args
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, Joint
+from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
     CALIBRATION_PATH,
     FACTORY_CALIBRATION_PATH,
@@ -49,22 +50,188 @@ _warned_calibration_identity = False
 class FrictionParams:
     """tanh-Coulomb + viscous friction model.
 
-    ``τ_friction = fc · tanh(k · v) + fv · v + fo``
+    ``τ_friction = (fc + fl · |τ_gravity|) · tanh(k · v) + fv · v + fo``
 
-    where ``v`` is the joint velocity (rad/s).
+    where ``v`` is the joint velocity (rad/s) and ``τ_gravity`` the gravity
+    feedforward the joint is carrying.
 
     Attributes:
-        fc: Coulomb friction magnitude (Nm).
+        fc: Coulomb friction magnitude (Nm) at zero gravity load.
         k:  Tanh sharpness factor — larger is closer to a sign() function.
         fv: Viscous friction coefficient (Nm·s/rad).
         fo: Constant friction offset (Nm). Captures direction-independent
             biases such as imperfect gravity compensation or motor cogging.
+        fl: Load-proportional Coulomb friction, Nm per Nm of gravity
+            feedforward. Planetary gear friction grows with the torque the
+            meshes carry: right shoulder_1's sliding friction measured
+            ~0.6 Nm at rest and ~1.5 Nm under 12 Nm of load (slope ≈ 0.08),
+            and its breakaway 0.66 Nm at rest against 2.4–3.3 Nm loaded. A
+            constant ``fc`` fitted at moderate load therefore over-compensates
+            at rest (kicking the joint at every reversal) and under-compensates
+            at reach. ``0`` (default) keeps the constant model; ``tune.friction``
+            fits it when its sweep spans enough load.
     """
 
     fc: float
     k: float
     fv: float
     fo: float
+    fl: float = 0.0
+
+
+@dataclass
+class FirmwareGains:
+    """MyActuator firmware loop gains, written to the motor's ROM at enable.
+
+    These are the gains of the motor's own cascaded controller — position
+    PI → speed PI → current PI — which is the loop a joint runs on when its
+    ``wire_mode`` is ``a4``. Under the MIT impedance frame (``wire_mode``
+    ``mit``, the production law) the firmware ignores them; ``kp`` / ``kd``
+    on :class:`JointConfig` are the impedance gains and travel with every
+    command. Each field is ``None`` by default, meaning "leave whatever the
+    motor holds". A set value is compared against the motor's stored gain
+    while the joint is still disabled at enable (the only state a MyActuator
+    accepts a ROM write in) and written only if it differs, so the flash is
+    touched once per change, not once per bring-up. Identified with
+    ``axol tune.a4``; protocol V4.2+ firmware only.
+
+    Attributes:
+        position_kp: Position loop proportional gain: position error →
+                  speed setpoint. Sets the loop bandwidth. Stock 0.008 on the
+                  X8-P20 shoulders (~0.3 Hz), which stick-slips at creep
+                  speed; 0.2 removes the stairs and 0.3 is the knee before
+                  the loop's ~5 Hz mode and a speed-loop buzz appear.
+        position_ki: Position loop integral gain. Leave at the stock 0: on
+                  top of the speed integrator it hunts around the target.
+        position_kd: Position loop derivative gain (protocol V4.2+ index
+                  0x09). Stored and read back by the firmware but measured
+                  inert in the 0xA4 loop on the X8-P20 — 0.1, 0.3 and 0.6
+                  produced identical traces — so it is carried for
+                  completeness, not as a damping knob.
+        speed_kp: Speed loop proportional gain: velocity error → current.
+                  The only damping term the 0xA4 loop has; also the buzz
+                  knob (0.15 doubled the >20 Hz current on shoulder_1).
+        speed_ki: Speed loop integral gain. Lower is smoother on a geared
+                  joint: the integrator winds up while the joint is stuck and
+                  dumps it at release, so the stock 1e-4 feeds the surge
+                  (2e-4 limit-cycled at 5 Hz); 1e-5 halves the mode's current.
+        profile_acc: **Damiao only.** The position-velocity mode's profiler
+                  ramp, rad/s² — written to both ACC and (negated) DEC. Every
+                  streamed target is reached along a trapezoid under this
+                  acceleration, so it caps how fast the wrist can follow: the
+                  wrists ship at 2 rad/s² (115 deg/s²), which cannot keep up
+                  with a 200 Hz stream — the loop hunts at ~5 Hz, 3x the
+                  impedance frame's 3-15 Hz error — and would take half a
+                  second to reach teleop speed. 50 is above the core
+                  tracker's 33 rad/s² limit (the profile never binds) while
+                  still rounding each 5 ms step; 50 and 200 scored alike in
+                  ``tune.a4``. A MyActuator joint uses ``planner_accel``.
+        planner_accel: **MyActuator only.** The 0xA4 position planner's stored
+                  acceleration and deceleration, dps/s (0x43), written at
+                  enable like the gains. Only two values follow a stream:
+                  ``0`` is direct PI tracking of each target, ``60000`` (the
+                  protocol maximum) makes the planner finish each step within
+                  the tick — anything between re-plans every target and the
+                  joint barely moves. On the X6-P20 elbow ``tune.a4`` tracked a
+                  3 deg/s triangle to 0.02° RMS with 4 ms lag at 60000 against
+                  0.23° / 74 ms direct. 60000 wants ``cap_track`` too.
+        cap_track: **Host side, 0xA4 joints with the planner on.** Each tick's
+                  0xA4 speed cap as this multiple of the commanded speed
+                  (floor 1 dps) instead of the fixed tracker limit: at a fixed
+                  cap the planner bursts through each step and idles the rest
+                  of the tick (4x the current spread on the elbow); 1.1-1.2
+                  moved it continuously. Leave unset under direct tracking —
+                  there the cap is a hard limit on the PI output and a tight
+                  one never lets the loop catch up. Not a motor parameter:
+                  carried to the realtime core, never written to the motor.
+        planner_lead_ms: **Host side, 0xA4 joints on the planner.** Each
+                  tick's 0xA4 target is sent this far ahead along the core
+                  tracker's velocity. The planner reaches a target that is
+                  exactly on the trajectory before its step ends and stops for
+                  the rest of it — a speed ripple at the step rate (half the
+                  right elbow's speed error at 60-120 Hz on the 240 Hz lane);
+                  a few ms ahead keeps it cruising. 0-50; not written to the
+                  motor.
+        tf_rated_current_a: **Host side, MyActuator 0xA4 joints.** The motor's
+                  rated current (A, from its datasheet, or estimated with
+                  ``tune.a4 --tf-probe``). Set, the realtime core sends the
+                  joint's position command as **0x73** (protocol V4.4:
+                  position control with torque feedforward) carrying the host
+                  feedforward — gravity and inertia — in the int8 1%-of-rated-current unit the firmware takes,
+                  scaled with the joint's torque constant; faded in over a
+                  second so the speed integrator can hand the load over. Only
+                  on firmware that implements 0x73 (VersionDate 2026042402 or
+                  later: the X8-P20 shoulders, not the X6-P20 elbow's
+                  2025070202) — elsewhere the joint stays on plain 0xA4 and
+                  the core logs why. Unset (default): plain 0xA4. Direct
+                  tracking only (``planner_accel`` 0): with the planner on the
+                  firmware ignores the feedforward. Not written to the motor.
+    """
+
+    position_kp: float | None = None
+    position_ki: float | None = None
+    position_kd: float | None = None
+    speed_kp: float | None = None
+    speed_ki: float | None = None
+    profile_acc: float | None = None
+    planner_accel: float | None = None
+    cap_track: float | None = None
+    planner_lead_ms: float | None = None
+    tf_rated_current_a: float | None = None
+
+    def __post_init__(self) -> None:
+        check_firmware_extras(self.planner_accel, self.cap_track, self.planner_lead_ms)
+        if self.tf_rated_current_a is not None and not (
+            math.isfinite(self.tf_rated_current_a) and self.tf_rated_current_a > 0.0
+        ):
+            raise ValueError(
+                f"tf_rated_current_a {self.tf_rated_current_a:g}: the motor's rated "
+                "current in amps (> 0), or unset for plain 0xA4"
+            )
+
+    def as_dict(self) -> dict[str, float]:
+        """The set motor parameters, keyed by name (``cap_track``,
+        ``planner_lead_ms`` and ``tf_rated_current_a`` excluded: they are the
+        realtime core's, not the motor's)."""
+        return {
+            f.name: float(v)
+            for f in fields(self)
+            if f.name not in _HOST_FIRMWARE_FIELDS
+            and (v := getattr(self, f.name)) is not None
+        }
+
+
+#: ``FirmwareGains`` fields the realtime core uses; never written to a motor.
+_HOST_FIRMWARE_FIELDS = frozenset(
+    {"cap_track", "planner_lead_ms", "tf_rated_current_a"}
+)
+
+
+def check_firmware_extras(
+    planner_accel: float | None,
+    cap_track: float | None,
+    planner_lead_ms: float | None = None,
+) -> None:
+    """Refuse a planner acceleration or cap tracking that cannot follow a stream.
+
+    Raises:
+        ValueError: ``planner_accel`` not 0 / 60000, ``cap_track`` below 1
+            (a cap under the commanded speed can never keep up), or
+            ``planner_lead_ms`` outside 0..50.
+    """
+    if planner_accel is not None and float(planner_accel) not in (0.0, 60000.0):
+        raise ValueError(
+            f"planner_accel {planner_accel:g}: only 0 (direct tracking) or 60000 "
+            "(the planner finishing each step within the tick) follow a stream — "
+            "values in between re-plan every target and the joint barely moves"
+        )
+    if cap_track is not None and not (cap_track == 0.0 or cap_track >= 1.0):
+        raise ValueError(
+            f"cap_track {cap_track:g}: a cap under the commanded speed never keeps "
+            "up — use >= 1 (1.1-1.2 tested), or 0 / unset for the fixed cap"
+        )
+    if planner_lead_ms is not None and not 0.0 <= planner_lead_ms <= 50.0:
+        raise ValueError(f"planner_lead_ms {planner_lead_ms:g}: must be within 0..50")
 
 
 @dataclass
@@ -182,7 +349,103 @@ class JointConfig:
                   ``VRTeleopConfig.box_wrist_torque`` and, optionally, the
                   squeeze-carrying shoulders at
                   ``VRTeleopConfig.box_squeeze_torque``. The tighter of the
-                  two applies.
+                  two applies. Impedance (``wire_mode`` ``"mit"``) joints
+                  only: a firmware-loop joint (``"a4"`` / ``"pv"``) has no
+                  spring to cap.
+        stiction_gain: Error-sign Coulomb compensation, as a fraction of
+                  ``friction.fc`` (see
+                  :func:`almond_axol.robot.control.stiction_compensation`).
+                  ``0`` (default) is the production law. Pushes up to
+                  ``gain·fc`` toward the target while the joint is stuck and
+                  the velocity feedforward has switched itself off, fading
+                  out as that feedforward saturates — the lever for the
+                  slow-motion stick-slip stairs of the high-ratio X8-P20
+                  shoulders (0.3-0.6° at 2 Hz on right shoulder_1, where
+                  breakaway is ~2.3× the fitted sliding ``fc``). Keep it
+                  below the breakaway/``fc`` ratio ``axol tune.breakaway``
+                  measures, or the term hunts around the target at rest.
+        stiction_load_gain: Load-proportional part of that push, in Nm per
+                  Nm of the joint's gravity feedforward: the peak push is
+                  ``stiction_gain·fc + stiction_load_gain·|gravity|``.
+                  Gear friction follows the transmitted torque — right
+                  shoulder_1 broke away at 0.66 Nm at rest but at 2-3.3 Nm
+                  under 10-15 Nm of gravity load — so a constant push
+                  either hunts at rest or does nothing extended. Size it
+                  from ``tune.breakaway --poses`` at loaded poses, or from
+                  the excess torque at release in a slow replay trace.
+        stiction_err_deg: Position error (degrees) at which that term
+                  saturates. Smaller is a stiffer push-off; 0.1° is a few
+                  encoder LSBs above the feedback noise floor.
+        dither_nm: Peak amplitude (Nm) of a sinusoidal torque dither on the
+                  feedforward (see :func:`almond_axol.robot.control.dither_step`);
+                  ``0`` (default) off. Keeps a geared joint's meshes sliding
+                  so its velocity-weakening friction cannot re-stick between
+                  cycles — the lever for the X8-P20 shoulders' 2 Hz
+                  stick-slip once feedforward and stiction compensation
+                  have shrunk the stairs as far as they can. Start at 1-2 Nm
+                  on a shoulder; it is audible.
+        dither_hz: Dither frequency; above the arm's structural modes
+                  (~35 Hz), below the core's 120 Hz Nyquist.
+        wire_mode: Which frame the realtime core commands this joint with
+                  (the gripper, gravity comp and the limp fallback always
+                  use MIT). ``"mit"`` (default) is the impedance frame and
+                  the production law. ``"a4"`` hands a **MyActuator** joint
+                  to the firmware's own position loop (0xA4 absolute
+                  position closed-loop, speed-capped at the tracker's
+                  velocity limit) from its first frame, holds included —
+                  the X6-P20's 2025070202 firmware ignores 0xA4 after an
+                  MIT frame until the motor is reset, so an a4 joint
+                  hand-guided in gravity comp needs a re-enable before it
+                  tracks again. Its position/speed PI on the motor-side
+                  encoder is the candidate for creeping through the
+                  X8-P20's stick-slip; its gains are the ``firmware`` block
+                  below and its stored planner acceleration must be 0 or
+                  60000 (see ``tune.a4``). ``"pv"`` is the same thing for a
+                  **Damiao** wrist: its position-velocity mode (0x100+ID,
+                  control-mode register 2, which the core sets at bring-up
+                  and toggles back to MIT for limp / gravity comp), gains
+                  ``firmware.position_kp`` etc. in the KP_APR/KP_ASR
+                  registers. Costs of either: no compliance (the joint
+                  holds position with integral action and pushes back up to
+                  motor torque), no host feedforward (gravity, friction,
+                  stiction, dither and damping are all inert), and on a4 no
+                  torque telemetry — the reply carries q-axis current, so
+                  measured torque reads NaN and the contact watchdog is
+                  blind on that joint (a pv wrist keeps its torque channel).
+                  Position stays 0.01° on a4 via a paired 0x92 read.
+                  ``AxolConfig.controller`` ``"position"`` sets every
+                  joint's position wire mode at once (and runs the core at
+                  400 Hz); this field is the per-joint override.
+        stribeck_gain: Friction cancellation on *measured* velocity (see
+                  :func:`almond_axol.robot.control.stribeck_excess`), as a
+                  fraction of the measured static-minus-sliding excess.
+                  ``0`` (default) off. The one feedforward that acts on the
+                  velocity-weakening slope behind the X8-P20 shoulders'
+                  2 Hz stick-slip; sweep 0.5 → 0.7 → 0.9 and stop when the
+                  arm's 3 Hz mode starts to grow (over-cancellation).
+        stribeck_dfs: Static-minus-sliding friction excess (Nm) at zero
+                  gravity load; right shoulder_1 measured ~0.3.
+        stribeck_load_gain: Its growth per Nm of gravity feedforward
+                  (~0.1 on right shoulder_1: excess ≈ 1.5 Nm under 12 Nm).
+        stribeck_vs: Speed (rad/s) at which the excess has fallen to 1/e
+                  (~0.1 on the X8 shoulders).
+        stribeck_pole: Low-pass pole (rad/s) of the measured-velocity
+                  estimate the term follows. 20 rad/s (3.2 Hz) is smooth at
+                  0.05 rad/s but ~40° behind the 2.6 Hz ring, which halved
+                  the cancellation in the first A/B; 40-80 rad/s follows the
+                  surge more closely at the cost of encoder-step noise in
+                  the torque (a 16-bit count at 240 Hz is 0.09 rad/s).
+        firmware: :class:`FirmwareGains` written to the motor's ROM at
+                  enable — the position/speed loop gains behind
+                  ``wire_mode`` ``a4``. All ``None`` (the default) leaves the
+                  motor's stored gains alone; MyActuator joints only.
+        impedance_hz: This joint's impedance command rate: ``480.0`` commands
+                  it every tick of a 480 Hz core loop (its host feedforward,
+                  damping and tracker stepped at 480), ``240.0`` keeps it on
+                  the verified 240 Hz lane, ``None`` (default) follows
+                  ``AxolConfig.impedance_hz`` (which at 480 covers the
+                  MyActuator joints only). Any joint at 480 runs the core
+                  at 480 Hz. ``tune.motion --fast-impedance right.shoulder_1``.
     """
 
     kp: float
@@ -195,6 +458,28 @@ class JointConfig:
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
     torque_limit: float = math.inf
+    stiction_gain: float = 0.0
+    stiction_load_gain: float = 0.0
+    stiction_err_deg: float = 0.1
+    dither_nm: float = 0.0
+    dither_hz: float = 60.0
+    wire_mode: str = "mit"
+    stribeck_gain: float = 0.0
+    stribeck_dfs: float = 0.3
+    stribeck_load_gain: float = 0.1
+    stribeck_vs: float = 0.1
+    stribeck_pole: float = 20.0
+    firmware: FirmwareGains = field(default_factory=FirmwareGains)
+    impedance_hz: float | None = None
+
+    def __post_init__(self) -> None:
+        # The per-type defaults (_X8_FIRMWARE_GAINS, _ZERO_FRICTION, ...) are
+        # module-level instances every matching joint is built from; each
+        # joint keeps its own copy so setting a field on one joint — a
+        # tune.motion override, a calibration overlay, a test — can never
+        # reach another joint or the next config built.
+        self.friction = replace(self.friction)
+        self.firmware = replace(self.firmware)
 
 
 @dataclass
@@ -239,6 +524,75 @@ def gripper_close_direction(gripper: str, is_left: bool) -> int:
 _ZERO_FRICTION = FrictionParams(fc=0.0, k=1.0, fv=0.0, fo=0.0)
 
 
+# Firmware loop gains for the X8-P20 shoulders (shoulder_1 / shoulder_2),
+# from the 2026-09-21 ``tune.a4`` sweeps on right shoulder_1 — the 400 Hz
+# stream the realtime core is moving to, 12 deg/s triangle and 40 deg/s
+# sine at -45°, checked at -10° and -70°. Stiffness: the stick-slip stairs
+# are gone by position_kp 0.2 and tracking keeps improving (0.44° / 36 ms
+# at 0.3 → 0.17° / 12 ms at 1.0 → 0.13° / 9 ms at 1.4); at 400 Hz the
+# >10 Hz position buzz no longer moves with it. Damping: speed_kp is the
+# speed loop's own ~100 Hz resonance knob, not a damper — it did nothing
+# for the 5 Hz reversal mode (2.2 A at 0.13 and 0.16 alike) while the
+# 100 Hz current tone went 0.07 → 0.30 → 0.41 → 1.0 A (unstable, 32 A
+# abort) at 0.1 / 0.13 / 0.16 / 0.2. Lowering it to 0.07 puts the tone at
+# the stock floor (0.04 A) with the tracking intact; 1.4 / 0.07 was also
+# clean, so 1.0 / 0.07 carries margin. speed_ki 1e-5: 1e-6 was identical.
+_X8_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=1.0,
+    position_kd=0.1,
+    speed_kp=0.07,
+    speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
+)
+
+# The X6-P20 elbow's set (stock position_kp 0.15, speed_kp 0.01 on firmware
+# 2025070202), from the same 2026-09-21 400 Hz sweeps on right elbow (12 deg/s
+# triangle and 40 deg/s sine at -75°, checked at -30° and -120°). Same law
+# as the shoulders with the speed loop's resonance at ~135 Hz: at speed_kp
+# 0.1 it grew 0.04 → 0.21 A from position_kp 0.5 → 1.0 and went unstable at
+# 1.5 (34 A abort); at 0.05 it stays at 0.05-0.08 A through 1.4 and even
+# 1.8. 1.4 / 0.05: 0.098° RMS, 8 ms lag, velocity ripple 0.13, current
+# spread 0.41 A — 1.8 was still clean, so this carries margin.
+_X6_ELBOW_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=1.4,
+    position_kd=0.1,
+    speed_kp=0.05,
+    speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
+)
+
+# shoulder_3 and wrist_1 (both RMD-X6-P20 on the same firmware, identical
+# stock gains: position_kp 0.06, speed_kp 0.01, position_kd 0.5). At stock
+# they are near-limp under a4: shoulder_3 held at rest during a shoulder_2
+# sweep with the arm extended wobbled 1° peak-to-peak at ~3 Hz whenever the
+# arm moved, and wrist_1 tracked a 12 deg/s triangle 124 ms late (2026-09-22).
+# 1.0 / 0.05 — the elbow's speed gain, one stiffness step below the elbow —
+# is the knee on both at the 400 Hz stream: shoulder_3 0.04° RMS / 9 ms at
+# 3 deg/s with the tone at 0.06 A (1.4 doubled it); wrist_1 0.12° / 10 ms at
+# 12 deg/s, tone 0.04 A (0.025 → 0.071 A from 0.7 → 1.4), sine ripple 0.05.
+# The Damiao DM-J4310 wrists (wrist_2 / wrist_3): their position-velocity
+# loop's KP_APR. Stock 54 trails a 12 deg/s stream by 150 ms (2.0° RMS);
+# 400 gives 0.35° / 26 ms on both, 800 buzzes wrist_2 (0.12° >10 Hz, guard
+# abort). The velocity-loop gains (KP_ASR 0.0037, KI_ASR 0.002) and the
+# profiler ramps changed nothing at 12 deg/s and stay stock; there is no kd.
+# Registers take effect on write and are stored — no reset (2026-09-22).
+_DM_WRIST_FIRMWARE_GAINS = FirmwareGains(position_kp=400.0, profile_acc=50.0)
+
+_X6_ROLL_FIRMWARE_GAINS = FirmwareGains(
+    position_kp=1.0,
+    position_kd=0.5,
+    speed_kp=0.05,
+    speed_ki=1e-5,
+    # Direct tracking, pinned: a planner left at 60000 by a test run must
+    # not carry into the next session (see FirmwareGains.planner_accel).
+    planner_accel=0.0,
+)
+
+
 @dataclass
 class ArmConfig:
     """Per-joint configuration for a single arm.
@@ -275,26 +629,62 @@ class ArmConfig:
     # tune.friction --save`` store per-robot values that override these.
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
+            # 09-28, s1_creep and slow_osc through the realtime core at 240 Hz):
+            # the notchy slow motion was a ~2 Hz spring-mass ringing on
+            # velocity-weakening friction. Stiffer (kp 450, from 250), the
+            # firmware kd at its maximum, the host damper pinned on the
+            # measured 3.2 Hz loop mode with a wider band, and the Stribeck
+            # cancellation on — with the slow_osc wrist shake down 44% and
+            # shoulder_1's ripple down 66% from the untuned 250/3.5/40 set.
+            # 480 Hz on the joint made no difference once friction was
+            # calibrated (same-session A/B, 2026-09-29). The host damper then
+            # moved to 2.6 Hz at 110 (from 3.2 Hz at 70) after the overnight
+            # per-joint sweep (2026-10-06): s1_creep ripple -29% at 3°/s and
+            # -17% at 6°/s over interleaved repeats, and slow_osc's 1-3 Hz
+            # wrist sway -15% on its own (the joint's creep error peaks at
+            # 1.2-1.6 Hz, below the old centre; 2.2 Hz and 140 were no better).
+            kp=450.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
-            # mode is the impedance mode, moving with reflected inertia.
-            kd_host=40.0,
+            kd_host=110.0,
+            kd_host_hz=2.6,
+            # Q 1.0 (the band ±1.3 Hz around 2.6): the old pose-tracked Q=3
+            # was confined to keep the damper off a ~13 Hz mast/forearm mode
+            # the wide Q=0.8 band once fed on the reference robot (0.551 Nm /
+            # +0.0255 W, a whole-arm shudder). At Q 1.0 the band is down to
+            # 0.26 there (Q=3: 0.09); the jelly robot ran it with no buzz on
+            # either joint — re-check on a robot that shudders.
+            kd_host_q=1.0,
+            stribeck_gain=0.8,
+            stribeck_pole=40.0,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Overnight per-joint sweep on the jelly robot's right arm
+            # (2026-10-06, s2_creep, interleaved repeats): shoulder_2 carries
+            # the arm's largest friction (2.1-2.6 Nm at creep speeds) and was
+            # the roughest joint (190 mdeg p2p at 3°/s) and the second source
+            # of the tool's 1-3 Hz sway in slow_osc. Stiffest kp (the
+            # encoding's 500), firmware kd at its maximum, more host damping
+            # on the pose-tracked band and the Stribeck cancellation: creep
+            # ripple -57% at 3°/s and -28% at 6°/s. At the tool it is small
+            # (slow_osc's 1-3 Hz wrist sway -4%, acceleration -5%, alone);
+            # with shoulder_1's damper change the sway is about -10% over
+            # three interleaved slow_osc rounds.
+            kp=500.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=35.0,
+            kd_host=70.0,
+            stribeck_gain=0.8,
+            stribeck_pole=40.0,
         )
     )
     shoulder_3: JointConfig = field(
@@ -321,7 +711,12 @@ class ArmConfig:
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=130.0,
+            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
+            # 09-28, el_creep and slow_osc): stiffer (kp 200, from 130), the
+            # Stribeck cancellation on, and a gentle host damper on the
+            # elbow's own ~1.3-1.6 Hz slow-motion mode — the elbow's slow_osc
+            # ripple down 48% and its 3°/s creep ripple down 56%.
+            kp=200.0,
             # The motor-side maximum is the phase-safe lever for the loaded
             # 6.7-12.5 Hz transmission mode.
             kd=5.0,
@@ -329,11 +724,15 @@ class ArmConfig:
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # No host damping. The far-forward rust_damping event sits at
-            # 8.7-11.3 Hz while this joint's old host band was nearly fully
-            # active at 9.55 Hz. Hardware step/replay A/Bs found that term
-            # increased overshoot without removing a ring; firmware kd=5
-            # settled the joint without the host-loop phase risk.
+            # Host damping only low and narrow: the far-forward rust_damping
+            # event sits at 8.7-11.3 Hz, and the joint's old host band, active
+            # at 9.55 Hz, increased overshoot without removing a ring. At
+            # 1.6 Hz / Q 1.5 the band is down to ~0.15 at 9.5 Hz.
+            kd_host=10.0,
+            kd_host_hz=1.6,
+            kd_host_q=1.5,
+            stribeck_gain=0.8,
+            stribeck_pole=40.0,
         )
     )
     wrist_1: JointConfig = field(
@@ -425,46 +824,82 @@ class _ArmFriction:
     wrist_3: FrictionParams
 
 
-# Per-joint friction values measured with ``axol tune.friction`` on the
-# reference robot. The two arms share gains, masses, and (after mirroring)
-# CoMs, but motor-by-motor friction differs enough to be worth identifying
-# per side — and per robot: these are only the *fallback* for machines that
-# have not been calibrated. Run ``axol tune.friction --save`` on each new
-# Axol to write its own values to ``~/.almond/calibration.json``, which
-# overrides these defaults (see :mod:`almond_axol.robot.calibration`).
+# Per-joint friction fallbacks for machines without their own calibration —
+# measured on the jelly robot with ``axol tune.friction --profile slow``
+# (2026-09-28/29: 1-30 deg/s sweeps, the slow speeds at the joint's least-
+# and most-loaded angles, fitted with the realtime core's own law). They
+# replace the reference robot's 7-72 deg/s Coulomb fits, which had no load
+# dependence and whose k (742-927) the core caps at 100 anyway. Friction is
+# per motor — left and right differ (the left elbow 0.04 + 0.086|g| Nm, the
+# right 0.27 + 0.045|g|) — so run ``axol tune.friction --profile slow --save``
+# on each Axol to write its own values to ``~/.almond/calibration.json``,
+# which overrides these (see :mod:`almond_axol.robot.calibration`).
 #
-# Shoulders were swept at 0.13–0.38 rad/s only: above ~0.5 rad/s the
-# MyActuator torque telemetry on the heavy joints degrades (apparent
-# friction *decreases* with speed, scatter grows to ±10 Nm), which is what
-# produced the large phantom viscous terms in earlier fits — every joint is
-# in fact Coulomb-dominated (fv ≈ 0) except a small real viscous drag on
-# wrist_1 and right shoulder_3.
+# The ``fo`` offsets are the sweeps' mean gravity-model residuals; the large
+# shoulder_2 ones (+1.04 right, -0.61 left) made no difference to slow_osc
+# either way (same-session A/B).
 _LEFT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=0.9091, k=799.59, fv=0.0, fo=0.37),
-    shoulder_2=FrictionParams(fc=1.1378, k=756.76, fv=0.0, fo=-0.3969),
-    shoulder_3=FrictionParams(fc=0.3599, k=835.51, fv=0.0, fo=-0.0133),
-    elbow=FrictionParams(fc=0.6023, k=855.95, fv=0.0, fo=-0.072),
-    wrist_1=FrictionParams(fc=0.3765, k=88.91, fv=0.0298, fo=-0.0115),
-    wrist_2=FrictionParams(fc=0.1521, k=780.31, fv=0.0, fo=-0.0152),
-    wrist_3=FrictionParams(fc=0.0714, k=927.26, fv=0.0, fo=0.0042),
+    shoulder_1=FrictionParams(fc=0.5903, k=100.0, fv=0.0, fo=0.0733, fl=0.0491),
+    shoulder_2=FrictionParams(fc=0.4702, k=100.0, fv=0.0, fo=-0.6108, fl=0.0401),
+    shoulder_3=FrictionParams(fc=0.3664, k=100.0, fv=0.0, fo=-0.0018, fl=0.0786),
+    elbow=FrictionParams(fc=0.0382, k=100.0, fv=0.0, fo=-0.0113, fl=0.0858),
+    wrist_1=FrictionParams(fc=0.4791, k=100.0, fv=0.0, fo=0.0686),
+    wrist_2=FrictionParams(fc=0.1228, k=100.0, fv=0.0, fo=-0.0286),
+    wrist_3=FrictionParams(fc=0.2765, k=100.0, fv=0.0, fo=0.0267),
 )
 
 _RIGHT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=1.2972, k=742.11, fv=0.0, fo=-0.1557),
-    shoulder_2=FrictionParams(fc=1.3950, k=768.06, fv=0.0, fo=0.2082),
-    shoulder_3=FrictionParams(fc=0.4377, k=107.94, fv=0.0853, fo=-0.0147),
-    elbow=FrictionParams(fc=0.6066, k=784.78, fv=0.0, fo=0.049),
-    wrist_1=FrictionParams(fc=0.5245, k=98.58, fv=0.3062, fo=-0.0097),
-    wrist_2=FrictionParams(fc=0.1092, k=899.67, fv=0.0, fo=0.0021),
-    wrist_3=FrictionParams(fc=0.1172, k=204.46, fv=0.0, fo=0.0042),
+    shoulder_1=FrictionParams(fc=0.4022, k=100.0, fv=0.0, fo=-0.3074, fl=0.0544),
+    shoulder_2=FrictionParams(fc=1.3210, k=100.0, fv=0.0, fo=1.0389, fl=0.0768),
+    shoulder_3=FrictionParams(fc=0.3674, k=100.0, fv=0.0, fo=0.1217, fl=0.0550),
+    elbow=FrictionParams(fc=0.2704, k=100.0, fv=0.0, fo=0.0197, fl=0.0448),
+    wrist_1=FrictionParams(fc=0.4998, k=100.0, fv=0.0, fo=0.1562),
+    wrist_2=FrictionParams(fc=0.1923, k=100.0, fv=0.0, fo=-0.0657),
+    wrist_3=FrictionParams(fc=0.2790, k=100.0, fv=0.0, fo=-0.0392),
 )
+
+# The same sweeps' low-speed (Stribeck) excess, per side: ``(stribeck_dfs,
+# stribeck_load_gain, stribeck_vs)``. shoulder_1, shoulder_2 and the elbow
+# cancel it (``stribeck_gain`` on their JointConfig; shoulder_2 only since
+# its stiffer, more damped 2026-10-06 gains); on shoulder_3 cancelling it
+# made slow motion rougher, and on the wrists it is untested in slow_osc.
+_LEFT_STRIBECK: dict[str, tuple[float, float, float]] = {
+    "shoulder_1": (0.9814, 0.0485, 0.1),
+    "shoulder_2": (0.6142, 0.0389, 0.0989),
+    "shoulder_3": (0.2214, 0.1685, 0.1),
+    "elbow": (0.2347, 0.1301, 0.1),
+    "wrist_1": (0.5188, 0.0, 0.1),
+    "wrist_2": (0.0828, 0.0, 0.1),
+    "wrist_3": (0.2378, 0.0, 0.1),
+}
+_RIGHT_STRIBECK: dict[str, tuple[float, float, float]] = {
+    "shoulder_1": (0.7326, 0.0335, 0.1),
+    "shoulder_2": (1.1065, 0.066, 0.0937),
+    "shoulder_3": (0.4078, 0.1479, 0.1),
+    "elbow": (0.1558, 0.1405, 0.0754),
+    "wrist_1": (0.3968, 0.0, 0.0852),
+    "wrist_2": (0.1498, 0.0, 0.1),
+    "wrist_3": (0.2439, 0.0, 0.0916),
+}
 
 
 def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
         f: entry[f]
-        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+        for f in (
+            "kp",
+            "kd",
+            "j_eff",
+            "kd_host",
+            "kd_host_hz",
+            "kd_host_q",
+            "stribeck_gain",
+            "stribeck_dfs",
+            "stribeck_load_gain",
+            "stribeck_vs",
+            "stribeck_pole",
+        )
         if f in entry
     }
     friction = entry.get("friction")
@@ -502,22 +937,9 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
-    # Both sides couple shoulder-1 into a ~13 Hz mast/forearm structural
-    # mode. With the old wide Q=0.8 shoulder damper, its high-side leakage
-    # became phase-positive at that mode: an RT control-term trace measured
-    # 0.551 Nm / +0.0255 W and a whole-arm right-side shudder (47/87/99 mdeg
-    # RMS at shoulder-1 / elbow / wrist-3); repeated left-side traces expose
-    # the same 12.5-12.9 Hz mode. Q=3 keeps unity gain at the intended,
-    # pose-tracked ~3.2 Hz shoulder mode while confining it enough to cut the
-    # right-side figures to 6/10/9 mdeg in an otherwise-identical hardware
-    # A/B. Apply it symmetrically: the structure and control law are shared,
-    # and leaving one side at Q=0.8 merely moves the excitation risk there.
-    # This shared config feeds every production control path; factory and
-    # local calibration entries can still override it.
-    arm = replace(
-        arm,
-        shoulder_1=replace(arm.shoulder_1, kd_host_q=3.0),
-    )
+    # shoulder_1's host-damper Q lives on its JointConfig (1.0, see there);
+    # it used to be forced to 3.0 here, symmetrically, against the ~13 Hz
+    # mast/forearm mode. Factory and local calibration entries override it.
     arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),
@@ -527,6 +949,19 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         wrist_1=replace(arm.wrist_1, friction=replace(friction.wrist_1)),
         wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
         wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
+    )
+    stribeck = _LEFT_STRIBECK if is_left else _RIGHT_STRIBECK
+    arm = replace(
+        arm,
+        **{
+            name: replace(
+                getattr(arm, name),
+                stribeck_dfs=dfs,
+                stribeck_load_gain=ls,
+                stribeck_vs=vs,
+            )
+            for name, (dfs, ls, vs) in stribeck.items()
+        },
     )
     # Override order: coded defaults ← this robot's factory calibration
     # (fetched from the cloud by ``axol calibration.pull``) ← the local
@@ -712,6 +1147,149 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
     )
 
 
+#: The two control laws the realtime core can run the arms on
+#: (:attr:`AxolConfig.controller`).
+#:
+#: ``"impedance"`` is the production MIT frame: host gravity / friction /
+#: inertia feedforward and host damping around the firmware PD, compliant,
+#: at 240 Hz. ``"position"`` hands every joint to its motor's own position
+#: loop — 0xA4 on the MyActuator joints, position-velocity on the Damiao
+#: wrists, gains from each joint's ``firmware`` block — streamed at 400 Hz,
+#: where the loop's target staircase (audible at 200 Hz) is gone. It is
+#: stiff: no compliance, no host feedforward, the contact watchdog blind on
+#: the MyActuator joints. The bus cannot carry every motor every tick at
+#: 400 Hz, so the core thins its schedule (wrists commanded on alternate
+#: ticks, one a4 fine-position read per tick round-robin, gripper in that
+#: rotation); the MyActuator commands themselves go out every tick.
+CONTROLLERS: tuple[str, ...] = ("impedance", "position")
+
+#: Realtime-core tick rate under each controller (see :data:`CONTROLLERS`).
+CONTROLLER_LOOP_HZ: dict[str, float] = {"impedance": 240.0, "position": 400.0}
+
+#: The only rate the impedance (MIT) frame is commanded at. Its gains, host
+#: feedforward and damping filters were tuned and verified at 240 Hz; at
+#: 400 Hz with the firmware-loop joints beside it, right shoulder_3 / wrist_1
+#: on impedance shook the arm hard enough to stop the run (2026-09-22).
+IMPEDANCE_LOOP_HZ: float = CONTROLLER_LOOP_HZ["impedance"]
+
+#: The core loop of an arm that mixes impedance joints with firmware-loop
+#: ones (``wire_mode`` ``a4`` / ``pv`` on some joints only): twice
+#: :data:`IMPEDANCE_LOOP_HZ`. The core commands each impedance joint on
+#: alternate ticks — exactly 240 Hz, its whole host pipeline stepped at that
+#: rate — and the firmware-loop joints every tick, above the position
+#: controller's 400 Hz (see ``Thinning`` in ``rust/axol-rt/src/serve.rs``).
+MIXED_LOOP_HZ: float = 2.0 * IMPEDANCE_LOOP_HZ
+
+#: ``AxolConfig.impedance_hz`` values: the verified 240 Hz, or 480 Hz on the
+#: MyActuator impedance joints — commanded every tick of a 480 Hz loop, their
+#: host pipeline stepped at 480, while the Damiao wrists stay at 240 Hz on
+#: alternate ticks. 480 is an experiment (the gains were tuned at 240) and is
+#: never the default.
+IMPEDANCE_RATES: tuple[float, ...] = (IMPEDANCE_LOOP_HZ, 2.0 * IMPEDANCE_LOOP_HZ)
+
+#: The fast impedance rate (see :data:`IMPEDANCE_RATES`).
+FAST_IMPEDANCE_HZ: float = IMPEDANCE_RATES[1]
+
+
+def position_wire_mode(joint: Joint) -> str:
+    """The firmware-position-loop wire token for an arm joint's vendor.
+
+    ``"a4"`` for the MyActuator joints (ids 1-5), ``"pv"`` for the Damiao
+    wrists.
+    """
+    return "pv" if _JOINT_CONFIG[joint].motor_id >= 6 else "a4"
+
+
+def impedance_joints(config: "AxolConfig") -> list[str]:
+    """``side.joint`` for every arm joint the config runs on the MIT frame.
+
+    Resolved first, so ``controller`` ``"position"`` counts as it runs. The
+    gripper is not an arm joint: it is always MIT and is not what the rate
+    rule protects.
+    """
+    resolved = config.resolved()
+    return [
+        f"{side}.{j.value}"
+        for side in ("left", "right")
+        for j in ARM_JOINTS
+        if str(getattr(getattr(resolved, side), j.value).wire_mode).lower() == "mit"
+    ]
+
+
+def fast_impedance_joints(config: "AxolConfig") -> list[str]:
+    """``side.joint`` of every impedance joint that runs at
+    :data:`FAST_IMPEDANCE_HZ`: its own ``impedance_hz`` 480, or (none of its
+    own) the config-wide 480 on a MyActuator joint — the rule
+    ``fast_mit`` in ``rust/axol-rt/src/serve.rs`` applies."""
+    resolved = config.resolved()
+    out = []
+    for side in ("left", "right"):
+        for j in ARM_JOINTS:
+            jc = getattr(getattr(resolved, side), j.value)
+            if str(jc.wire_mode).lower() != "mit":
+                continue
+            own = jc.impedance_hz
+            if own is not None and abs(own - FAST_IMPEDANCE_HZ) < 1e-6:
+                out.append(f"{side}.{j.value}")
+            elif (
+                own is None
+                and _JOINT_CONFIG[j].motor_id <= 5
+                and abs(config.impedance_hz - FAST_IMPEDANCE_HZ) < 1e-6
+            ):
+                out.append(f"{side}.{j.value}")
+    return out
+
+
+def check_loop_hz(config: "AxolConfig", loop_hz: float) -> None:
+    """Refuse a core rate that would command an MIT joint off its rate.
+
+    With any arm joint on the impedance frame the core runs at
+    :data:`IMPEDANCE_LOOP_HZ`, or at :data:`MIXED_LOOP_HZ` with the impedance
+    joints on alternate ticks — or, at ``impedance_hz``
+    :data:`FAST_IMPEDANCE_HZ`, at exactly that rate (MyActuator impedance
+    joints every tick, wrists on alternate ticks). Without an impedance
+    joint, any rate goes.
+
+    Raises:
+        ValueError: If ``loop_hz`` is not one of those while an arm joint is
+            on the impedance frame — e.g. ``tune.motion --loop-hz 400`` with
+            ``--a4`` putting only some joints on their firmware loops.
+    """
+    fast = fast_impedance_joints(config)
+    allowed = (FAST_IMPEDANCE_HZ,) if fast else (IMPEDANCE_LOOP_HZ, MIXED_LOOP_HZ)
+    if any(abs(loop_hz - hz) < 1e-6 for hz in allowed):
+        return
+    mit = impedance_joints(config)
+    if mit:
+        shown = ", ".join(mit[:4]) + (
+            f" and {len(mit) - 4} more" if len(mit) > 4 else ""
+        )
+        if fast:
+            raise ValueError(
+                f"a {loop_hz:g} Hz core loop with {fast[0]} running impedance at "
+                f"{FAST_IMPEDANCE_HZ:g} Hz: the loop is {FAST_IMPEDANCE_HZ:g} Hz only "
+                "then. Drop the loop-rate override."
+            )
+        raise ValueError(
+            f"a {loop_hz:g} Hz core loop with {shown} on the impedance frame: "
+            f"impedance runs at {IMPEDANCE_LOOP_HZ:g} Hz only — a "
+            f"{IMPEDANCE_LOOP_HZ:g} Hz loop, or {MIXED_LOOP_HZ:g} Hz with it on "
+            "alternate ticks (the default when some joints are on their "
+            "firmware loops). Drop the loop-rate override."
+        )
+
+
+def _on_position_loops(arm: ArmConfig) -> ArmConfig:
+    """Every arm joint on its vendor's firmware position loop."""
+    return replace(
+        arm,
+        **{
+            j.value: replace(getattr(arm, j.value), wire_mode=position_wire_mode(j))
+            for j in ARM_JOINTS
+        },
+    )
+
+
 @dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
@@ -768,6 +1346,25 @@ class AxolConfig:
                          round-trips cleanly (loading a dumped config and
                          resolving it again is idempotent).
         right_stiffness: Same, for the **right** arm.
+        controller:      Which control law the realtime core runs the arms
+                         on — see :data:`CONTROLLERS`. ``"impedance"``
+                         (default) is the production MIT frame at 240 Hz.
+                         ``"position"`` puts every joint on its firmware
+                         position loop (``wire_mode`` ``a4`` / ``pv``, the
+                         ``firmware`` gains) at 400 Hz. Like stiffness it is
+                         baked into the per-joint ``wire_mode`` fields by
+                         :meth:`resolved`; a per-joint ``wire_mode`` set
+                         explicitly under ``"impedance"`` is kept, so one
+                         joint can still be tried on its firmware loop
+                         inside the impedance controller (``tune.motion
+                         --a4``).
+        impedance_hz:    Command rate of the MyActuator impedance joints —
+                         see :data:`IMPEDANCE_RATES`. ``240.0`` (default) is
+                         the verified rate. ``480.0`` runs them every tick of
+                         a 480 Hz core loop with the Damiao wrists at 240 Hz
+                         on alternate ticks (``tune.motion --impedance-hz
+                         480``) — an experiment: their gains, host damping
+                         and feedforward were tuned at 240.
     """
 
     left: ArmConfig = field(
@@ -781,6 +1378,28 @@ class AxolConfig:
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 1.0
     right_stiffness: float | list[float] = 1.0
+    controller: str = "impedance"
+    impedance_hz: float = IMPEDANCE_LOOP_HZ
+
+    @property
+    def loop_hz(self) -> float:
+        """The realtime-core tick rate this config runs at.
+
+        :data:`CONTROLLER_LOOP_HZ` for a uniform arm — 240 Hz all on
+        impedance, 400 Hz all on firmware loops (``controller``
+        ``"position"``) — and :data:`MIXED_LOOP_HZ` when some arm joints are
+        on their firmware loops and some on impedance, so the impedance ones
+        keep exactly 240 Hz on alternate ticks. At ``impedance_hz``
+        :data:`FAST_IMPEDANCE_HZ` any impedance joint makes it that rate.
+        """
+        mit = impedance_joints(self)
+        if not mit:
+            return CONTROLLER_LOOP_HZ["position"]
+        if fast_impedance_joints(self):
+            return FAST_IMPEDANCE_HZ
+        if len(mit) < 2 * len(ARM_JOINTS):
+            return MIXED_LOOP_HZ
+        return CONTROLLER_LOOP_HZ["impedance"]
 
     def __post_init__(self) -> None:
         if self.gripper not in GRIPPER_TYPES:
@@ -799,11 +1418,66 @@ class AxolConfig:
         applied once at the single robot-construction boundary
         (``Axol.__init__``) so every consumer sees consistent gains while
         the unresolved config stays safe to serialize and reload.
+
+        The ``controller`` is baked in the same way: ``"position"`` sets
+        every joint's ``wire_mode`` to its vendor's firmware position loop
+        (:func:`position_wire_mode`); ``"impedance"`` leaves the per-joint
+        fields as configured. The field itself is kept (the core reads its
+        loop rate from it).
         """
+        if self.controller not in CONTROLLERS:
+            raise ValueError(
+                f"controller {self.controller!r} is not one of {list(CONTROLLERS)}"
+            )
+        if not any(abs(self.impedance_hz - hz) < 1e-6 for hz in IMPEDANCE_RATES):
+            raise ValueError(
+                f"impedance_hz {self.impedance_hz:g} is not one of "
+                f"{[f'{hz:g}' for hz in IMPEDANCE_RATES]}"
+            )
+        for side in ("left", "right"):
+            for j in ARM_JOINTS:
+                own = getattr(getattr(self, side), j.value).impedance_hz
+                if own is not None and not any(
+                    abs(own - hz) < 1e-6 for hz in IMPEDANCE_RATES
+                ):
+                    raise ValueError(
+                        f"{side}.{j.value}.impedance_hz {own:g} is not one of "
+                        f"{[f'{hz:g}' for hz in IMPEDANCE_RATES]}"
+                    )
+        left = _apply_stiffness(self.left, self.left_stiffness)
+        right = _apply_stiffness(self.right, self.right_stiffness)
+        if self.controller == "position":
+            left = _on_position_loops(left)
+            right = _on_position_loops(right)
         return replace(
             self,
-            left=_apply_stiffness(self.left, self.left_stiffness),
-            right=_apply_stiffness(self.right, self.right_stiffness),
+            left=left,
+            right=right,
             left_stiffness=1.0,
             right_stiffness=1.0,
         )
+
+
+#: What a gripperless robot still on the stock gripper's gravity is told.
+STOCK_GRAVITY_WARNING = (
+    "{sides}: no gripper, but wrist_3 still has the stock gripper's mass "
+    "({mass:g} kg) — this robot's own gravity comp (link mass / CoM for its "
+    "end-effector) isn't in the panel settings or calibration.json, so gravity "
+    "compensation, calibration fits and the contact watchdog use the wrong load."
+)
+
+
+def stock_gravity_sides(config: AxolConfig) -> list[str]:
+    """The arms of a gripperless robot (``has_gripper`` false) whose wrist_3
+    still has the coded default mass — the stock gripper's, lumped into the
+    link. Such a robot's gravity comp for its own end-effector (or none)
+    belongs in the panel settings or ``calibration.json``; the gravity fits
+    never change a mass, so a default one means nobody set it."""
+    if config.has_gripper:
+        return []
+    stock = ArmConfig().wrist_3.mass
+    return [
+        side
+        for side in ("left", "right")
+        if math.isclose(getattr(config, side).wrist_3.mass, stock, abs_tol=1e-9)
+    ]

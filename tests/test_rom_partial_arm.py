@@ -402,8 +402,42 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         rt = _wrap_rt(axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
-                # ... followed by the joint's spring-torque cap (proto 3).
                 self.assertEqual(line.split()[9:13], ["0.0", "0.0", "0.0", "0.0"], line)
+                # Stiction and dither terms stay off on the bench too, and
+                # every joint is on the MIT frame.
+                fields = line.split()[13:]
+                # The Stribeck *shape* (dfs, load gain, vs) is per-joint
+                # calibration data; on the bench its gain (before it) is 0.
+                self.assertEqual(fields[6], "0.0", line)
+                fields[7:10] = ["0.3", "0.1", "0.1"]
+                self.assertEqual(
+                    fields,
+                    [
+                        "0.0",
+                        "0.0017453292519943296",
+                        "0.0",
+                        "0.0",
+                        "60.0",
+                        "mit",
+                        "0.0",
+                        "0.3",
+                        "0.1",
+                        "0.1",
+                        "0.0",
+                        "20.0",
+                        # 0xA4 cap tracking off (fixed cap), no target lead,
+                        # no 0x73 feedforward (plain 0xA4), the config-wide
+                        # impedance rate.
+                        "0.0",
+                        "0.0",
+                        "0.0",
+                        "0.0",
+                        # ... and the joint's spring-torque cap (proto 17):
+                        # uncapped by config, box mode caps per command.
+                        "inf",
+                    ],
+                    line,
+                )
 
     def test_only_a_partial_arm_is_a_bench_run(self) -> None:
         """A full arm on the bus — even with a joint subset selected — is the

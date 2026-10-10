@@ -79,9 +79,24 @@ class LiftStatusTest(unittest.TestCase):
         self.assertFalse(status.flash_interlock)
         self.assertTrue(status.save_pending)
 
+    def test_decodes_v09_firmware_and_homing_mode_bits(self) -> None:
+        status = _decode_status(struct.pack("<HhBbBB", 0xFFFF, 0, 0x40, 0, 0, 0x73))
+
+        self.assertTrue(status.homing)
+        self.assertTrue(status.fw_trial)
+        self.assertTrue(status.fw_updating)
+        self.assertTrue(status.independent_homing)
+
+        idle = _decode_status(struct.pack("<HhBbBB", 500, 0, 0x01, 0, 0, 0x03))
+        self.assertFalse(idle.fw_trial)
+        self.assertFalse(idle.fw_updating)
+        self.assertFalse(idle.independent_homing)
+
     def test_legacy_status_keeps_driver_health_unknown(self) -> None:
         status = _decode_status(struct.pack("<HhBb", 0xFFFF, 0, 0, 0))
 
+        self.assertIsNone(status.fw_trial)
+        self.assertIsNone(status.independent_homing)
         self.assertIsNone(status.position_permille)
         self.assertIsNone(status.driver_fault_mask)
         self.assertIsNone(status.drivers_enabled)
@@ -619,6 +634,19 @@ class LiftStatusModeTest(unittest.IsolatedAsyncioTestCase):
             self._motion_frames(lift._send),
             [call(lift_module._OP_JOG, struct.pack("<h", lift_module.JOG_SPEED))],
         )
+
+    async def test_home_sends_mode_byte(self) -> None:
+        for kwargs, mode in (({}, 0), ({"independent": True}, 1)):
+            with self.subTest(mode=mode):
+                lift = Lift()
+                lift._bus = SimpleNamespace()
+                lift._send = AsyncMock()  # type: ignore[method-assign]
+                await lift.home(**kwargs)
+
+                self.assertEqual(
+                    lift._send.await_args_list[-1],
+                    call(lift_module._OP_HOME, bytes([mode])),
+                )
 
     async def test_suspend_aborts_an_active_one_shot(self) -> None:
         lift = Lift()

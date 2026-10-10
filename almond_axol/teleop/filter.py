@@ -164,6 +164,73 @@ class TrapezoidalFilter:
             self._vel = None
 
 
+class NotchFilter:
+    """Cascade of causal biquad notches, per joint, on a command stream.
+
+    For the arm's structural modes — motion the joint encoders cannot see
+    (on the jelly robot the wrist camera's IMU shows them near 2.1 Hz and
+    5.4-6.6 Hz) — which feedback cannot remove once excited, so the command
+    should not carry energy there: hand tremor and the arm's own accelerations
+    are what excite them. Each notch is the standard RBJ biquad
+    (``H(s) = (s² + ω0²) / (s² + ω0/Q·s + ω0²)``, bilinear): zero gain at its
+    centre, unity away from it, bandwidth ``f0/Q``. A slow command passes
+    with little phase: a 5.4 Hz, Q 2 notch shifts 0.3 Hz by ~1°.
+
+    Args:
+        freqs_hz: Notch centres (Hz); empty = pass-through.
+        q: Quality factor, one for all (or one per notch).
+        rate_hz: The stream's update rate.
+    """
+
+    def __init__(
+        self,
+        freqs_hz: list[float] | tuple[float, ...],
+        q: float | list[float],
+        rate_hz: float,
+    ) -> None:
+        qs = list(q) if isinstance(q, (list, tuple)) else [float(q)] * len(freqs_hz)
+        self._coef = []
+        for f0, qi in zip(freqs_hz, qs):
+            if not 0.0 < f0 < 0.45 * rate_hz or qi <= 0:
+                raise ValueError(
+                    f"notch {f0} Hz / Q {qi} is not below Nyquist or Q ≤ 0"
+                )
+            w0 = 2 * math.pi * f0 / rate_hz
+            alpha = math.sin(w0) / (2 * qi)
+            a0 = 1 + alpha
+            b = np.array([1.0, -2 * math.cos(w0), 1.0]) / a0
+            a = np.array([1.0, -2 * math.cos(w0) / a0, (1 - alpha) / a0])
+            self._coef.append((b, a))
+        self._state: list[np.ndarray] | None = None
+
+    @property
+    def active(self) -> bool:
+        return bool(self._coef)
+
+    def update(self, x: np.ndarray | None) -> np.ndarray | None:
+        if x is None or not self._coef:
+            return x
+        x = np.asarray(x, dtype=np.float64)
+        if self._state is None or self._state[0].shape[1] != len(x):
+            self.reset(x)
+        y = x
+        for n, (b, a) in enumerate(self._coef):
+            st = self._state[n]  # rows: x[n-1], x[n-2], y[n-1], y[n-2]
+            out = b[0] * y + b[1] * st[0] + b[2] * st[1] - a[1] * st[2] - a[2] * st[3]
+            st[1], st[0] = st[0].copy(), y
+            st[3], st[2] = st[2].copy(), out
+            y = out
+        return y.astype(np.float32)
+
+    def reset(self, seed: np.ndarray | None = None) -> None:
+        """Settle every stage at ``seed`` (a held value passes unchanged)."""
+        if seed is None:
+            self._state = None
+            return
+        seed = np.asarray(seed, dtype=np.float64)
+        self._state = [np.tile(seed, (4, 1)) for _ in self._coef]
+
+
 class AlphaSmoothFilter:
     """Exponential smoothing filter for joint angle arrays (radians).
 

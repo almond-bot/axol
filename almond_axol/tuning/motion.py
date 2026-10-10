@@ -1,9 +1,16 @@
-"""Reference motions: committed joint trajectories, identical on every robot.
+"""Reference motions: joint trajectories replayed by ``axol tune.motion``.
 
 A reference motion is a uniform-rate, both-arm joint trajectory stored as a
-small ``.npz`` in :data:`MOTIONS_DIR` (inside the package, committed to git),
-so the exact same motion can be replayed on any robot, today or years from
-now, and the tracking metrics compared 1:1.
+small ``.npz`` in :data:`MOTIONS_DIR` (``~/.almond/motions``, on the robot),
+so the same motion can be replayed on that robot again and again and the
+tracking metrics compared 1:1. Record one, or generate one (``axol
+motion.chirp``, ``scripts/creep_motions.py``).
+
+A few motions are built in (:data:`BUILTIN_MOTIONS`): generated in code, the
+same on every robot, and always available by name without a file —
+``slow_osc`` (the slow-motion acceptance test), ``fast_swing`` (large fast
+swings, to check a change adds no buzz), each with a ``_left`` mirror, and
+``hold``. A file of the same name in :data:`MOTIONS_DIR` takes precedence.
 
 Motions are *built* from recorded sessions (``axol motion.build PREFIX
 --name N`` postprocesses the flight-recorder capture), from either source:
@@ -41,7 +48,22 @@ from pathlib import Path
 
 import numpy as np
 
-MOTIONS_DIR = Path(__file__).parent / "motions"
+MOTIONS_DIR = Path.home() / ".almond" / "motions"
+
+#: The start pose the generated motions (chirps, creeps) hold every other
+#: joint at, in degrees, ARM_JOINTS order, 7 left then 7 right: shoulder_1
+#: and the elbow raised and wrist_3 turned, the arms mirrored. It is the
+#: first sample of the jelly robot's old ``slow_osc`` recording.
+START_POSE_DEG = (
+    *(-12.709, 0.0, 0.0, 25.943, 0.0, 0.0, -13.113),  # left
+    *(12.709, 0.0, 0.0, -25.943, 0.0, 0.0, 13.113),  # right
+)
+
+
+def start_pose() -> np.ndarray:
+    """:data:`START_POSE_DEG` in radians, shape ``(14,)``."""
+    return np.radians(np.asarray(START_POSE_DEG, dtype=float))
+
 
 # Width of a motion row: 7 left + 7 right arm joints (ARM_JOINTS order).
 MOTION_WIDTH = 14
@@ -49,7 +71,7 @@ MOTION_WIDTH = 14
 
 @dataclass
 class ReferenceMotion:
-    """One committed reference motion (see module docstring for the format)."""
+    """One reference motion (see module docstring for the format)."""
 
     name: str
     rate: float
@@ -71,7 +93,7 @@ class ReferenceMotion:
 
 
 def save_motion(motion: ReferenceMotion, path: Path | None = None) -> Path:
-    """Write a motion to ``path`` (default: the committed motions directory)."""
+    """Write a motion to ``path`` (default: :data:`MOTIONS_DIR`)."""
     if path is None:
         path = MOTIONS_DIR / f"{motion.name}.npz"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,12 +107,14 @@ def save_motion(motion: ReferenceMotion, path: Path | None = None) -> Path:
 
 
 def load_motion(name_or_path: str) -> ReferenceMotion:
-    """Load a motion by committed name (``list_motions()``) or filesystem path."""
+    """Load a motion by path, by name in :data:`MOTIONS_DIR`, or a built-in."""
     path = Path(name_or_path)
     if not path.is_file():
         path = MOTIONS_DIR / f"{name_or_path}.npz"
+    if not path.is_file() and name_or_path in BUILTIN_MOTIONS:
+        return BUILTIN_MOTIONS[name_or_path]()
     if not path.is_file():
-        known = ", ".join(m.name for m in list_motions()) or "(none committed)"
+        known = ", ".join(m.name for m in list_motions()) or f"(none in {MOTIONS_DIR})"
         raise FileNotFoundError(
             f"No reference motion {name_or_path!r}. Known motions: {known}"
         )
@@ -105,13 +129,168 @@ def load_motion(name_or_path: str) -> ReferenceMotion:
 
 
 def list_motions() -> list[ReferenceMotion]:
-    """All committed reference motions, alphabetically, without their arrays.
+    """Every motion in :data:`MOTIONS_DIR` and the built-ins, alphabetically.
 
     ``q`` is loaded too (files are small); use this for listings and pickers.
     """
-    if not MOTIONS_DIR.is_dir():
-        return []
-    return [load_motion(str(p)) for p in sorted(MOTIONS_DIR.glob("*.npz"))]
+    files = sorted(MOTIONS_DIR.glob("*.npz")) if MOTIONS_DIR.is_dir() else []
+    motions = {p.stem: load_motion(str(p)) for p in files}
+    for name, make in BUILTIN_MOTIONS.items():
+        motions.setdefault(name, make())
+    return [motions[n] for n in sorted(motions)]
+
+
+# --------------------------------------------------------------------- #
+# Built-in motions: generated, identical on every robot                  #
+# --------------------------------------------------------------------- #
+
+_BUILTIN_RATE = 240.0
+#: Peak speed of the largest joint move between two ``fast_swing`` poses.
+_FAST_PEAK_DPS = 140.0
+#: Right-arm poses ``fast_swing`` moves through (deg, ARM_JOINTS order),
+#: taken from poses the old teleop recordings (``wirst_swing``,
+#: ``shoulder_1_no_load``) passed through: the arm raised out to the side,
+#: folded across the front, the forearm rolled both ways, and shoulder_1
+#: swung far back. The inward folds stop at shoulder_3 +40° (the recordings
+#: reached +76°, which brings the forearm and wrist ~25 mm closer to the base
+#: than at rest in the collision model); the whole motion stays outside the
+#: collision solver's activation shell, as ``tests/test_builtin_motions.py``
+#: checks.
+_FAST_SWING_POSES_DEG = (
+    (-20.0, 78.0, -21.0, -15.0, -5.0, 6.0, 13.0),
+    (-35.0, 77.0, -49.0, -72.0, -5.0, 6.0, 13.0),
+    (-5.0, 22.0, -7.0, -117.0, 0.0, 7.0, 13.0),
+    (-25.0, 8.0, 40.0, -108.0, 0.0, 26.0, 13.0),
+    (-15.0, 29.0, 7.0, -132.0, 0.0, 16.0, 13.0),
+    (-14.0, 69.0, -88.0, -55.0, 10.0, 15.0, 13.0),
+    (11.0, 54.0, -101.0, -39.0, 17.0, 7.0, 13.0),
+    (3.5, 14.0, -15.0, -110.0, 3.5, 22.0, 12.0),
+    (-17.0, 2.0, 40.0, -95.0, 12.0, 16.0, 12.0),
+    (0.0, 31.0, -13.0, -65.0, 4.0, -1.0, 10.0),
+    (-28.0, 76.0, -35.0, -11.0, -7.0, 2.0, 13.0),
+    (-61.0, 84.0, -46.0, -14.0, -14.0, 1.0, 13.0),
+    (-93.0, 87.0, -63.0, -31.0, -31.0, 4.0, 13.0),
+    (-80.0, 81.0, 9.0, -11.0, 10.0, 4.0, 13.0),
+    (-63.0, 70.0, 2.0, -5.0, -5.0, 4.0, 13.0),
+)
+
+
+def _min_jerk(a: np.ndarray, b: np.ndarray, seconds: float) -> np.ndarray:
+    """Rows from ``a`` to ``b`` (excluding ``b``), at rest at both ends."""
+    s = np.arange(max(1, round(seconds * _BUILTIN_RATE))) / (seconds * _BUILTIN_RATE)
+    s = 10 * s**3 - 15 * s**4 + 6 * s**5
+    return a + (b - a) * s[:, None]
+
+
+def _still(pose: np.ndarray, seconds: float) -> np.ndarray:
+    return np.tile(pose, (round(seconds * _BUILTIN_RATE), 1))
+
+
+def _right_arm(rows: np.ndarray) -> np.ndarray:
+    """Right-arm rows (N, 7) with the left arm still at the start pose."""
+    q = np.tile(start_pose(), (len(rows), 1))
+    q[:, 7:] = rows
+    return q
+
+
+def _mirror(motion: ReferenceMotion) -> ReferenceMotion:
+    """The motion onto the other arm: the arms swapped, every joint negated."""
+    q = -np.concatenate([motion.q[:, 7:], motion.q[:, :7]], axis=1)
+    meta = dict(
+        motion.meta, source=motion.meta["source"] + ", mirrored to the left arm"
+    )
+    return ReferenceMotion(
+        f"{motion.name}_left", motion.rate, q.astype(np.float32), meta
+    )
+
+
+def _builtin(name: str, q: np.ndarray, source: str) -> ReferenceMotion:
+    meta = {"source": f"built-in: {source}", "builtin": True}
+    return ReferenceMotion(name, _BUILTIN_RATE, q.astype(np.float32), meta)
+
+
+def slow_osc_motion() -> ReferenceMotion:
+    """``slow_osc``: the right arm's slow-motion acceptance test.
+
+    Modelled on the jelly robot's recorded slow teleop sweep: from the start
+    pose the arm bends up in front over 7 s (elbow ~-112°, wrist_3 rolled),
+    then sweeps shoulder_1 slowly back and forth between +2° and -38° — two
+    14 s periods, shoulder_1 at most ~9°/s — with the elbow opening 1.2° per
+    degree as the arm swings out (~11°/s) and shoulder_3 / wrist_1 / wrist_2
+    following a little: the slow motion an operator feels the 1-3 Hz sway
+    in. Then it returns to the start pose over 7 s.
+    """
+    period, amp, centre = 14.0, 20.0, -18.0
+    t = np.arange(round(2 * period * _BUILTIN_RATE)) / _BUILTIN_RATE
+    s1 = centre + amp * np.cos(2 * np.pi * t / period)
+    right = np.stack(
+        [
+            s1,
+            np.full_like(s1, 20.0),
+            -13.0 - 0.25 * s1,
+            -110.0 - 1.2 * s1,
+            -12.5 - 0.27 * s1,
+            1.0 - 0.2 * s1,
+            np.full_like(s1, 31.0),
+        ],
+        axis=1,
+    )
+    sweep = np.radians(right)
+    rest = start_pose()[7:]
+    rows = np.concatenate(
+        [
+            _still(rest, 1.0),
+            _min_jerk(rest, sweep[0], 7.0),
+            sweep,
+            _min_jerk(sweep[0], rest, 7.0),
+            _still(rest, 1.0),
+        ]
+    )
+    return _builtin(
+        "slow_osc",
+        _right_arm(rows),
+        "right shoulder_1 swept slowly between +2 and -38 deg (14 s period) "
+        "with the elbow coupled, the arm bent up in front",
+    )
+
+
+def fast_swing_motion() -> ReferenceMotion:
+    """``fast_swing``: large fast right-arm swings, for checking that a change
+    adds no buzz on fast motion.
+
+    Minimum-jerk moves through :data:`_FAST_SWING_POSES_DEG`, each timed so
+    its largest joint move peaks at :data:`_FAST_PEAK_DPS`, stopping at every
+    pose, from and back to the start pose.
+    """
+    rest = start_pose()[7:]
+    poses = [rest, *np.radians(_FAST_SWING_POSES_DEG), rest]
+    rows = [_still(rest, 1.0)]
+    for a, b in zip(poses, poses[1:]):
+        span = math.degrees(float(np.max(np.abs(b - a))))
+        rows.append(_min_jerk(a, b, max(0.6, 1.875 * span / _FAST_PEAK_DPS)))
+    rows.append(_still(rest, 1.0))
+    return _builtin(
+        "fast_swing",
+        _right_arm(np.concatenate(rows)),
+        f"right arm swung through {len(_FAST_SWING_POSES_DEG)} poses, "
+        f"peaks near {_FAST_PEAK_DPS:.0f} deg/s",
+    )
+
+
+def hold_motion() -> ReferenceMotion:
+    """``hold``: both arms still at the start pose for 40 s — the noise
+    floor under the running controller (parked buzz, limit cycles)."""
+    return _builtin("hold", _still(start_pose(), 40.0), "40 s hold at the start pose")
+
+
+#: Built-in motions by name: generated on demand, no file needed.
+BUILTIN_MOTIONS = {
+    "slow_osc": slow_osc_motion,
+    "slow_osc_left": lambda: _mirror(slow_osc_motion()),
+    "fast_swing": fast_swing_motion,
+    "fast_swing_left": lambda: _mirror(fast_swing_motion()),
+    "hold": hold_motion,
+}
 
 
 # --------------------------------------------------------------------- #

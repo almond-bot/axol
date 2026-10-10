@@ -5,8 +5,16 @@ Full-robot factory calibration: friction and gravity for all 14 joints (both
 arms x 7) in one command, saved to this machine's calibration file and
 uploaded to the cloud keyed by the Axol hub adapter's serial.
 
-One bidirectional multi-velocity sweep per joint yields both fits (the same
-sweep ``tune.friction`` and ``tune.gravity`` run individually):
+One bidirectional multi-velocity sweep per joint yields both fits. The default
+``--profile slow`` is ``tune.friction --profile slow``'s sweep — 1, 2, 3, 5,
+8, 15, 30 deg/s, the speeds under 8 deg/s in a low- and a high-load window —
+fitted with the realtime core's own friction law (sliding ``fc + fl·|g|``,
+viscous, and the low-speed Stribeck excess ``dfs + ls·|g|`` over ``vs``),
+with the full-range passes' averaged torques feeding the gravity fit; the
+Stribeck share cancelled is saved per joint (0.8 on shoulder_1,
+shoulder_2 and the elbow, 0 elsewhere). ``--profile standard`` is the old 7-72 deg/s sweep with
+a Coulomb + viscous fit (the same sweep ``tune.friction`` and
+``tune.gravity`` run individually):
 
   - half(t_fwd - t_bwd) at matched positions -> Fc / k / Fv (friction)
   - avg(t_fwd, t_bwd) at matched positions   -> gravity(q), fit to the
@@ -36,10 +44,12 @@ hub adapter serial — any later machine fetches it keylessly with ``axol
 calibration.pull`` (or automatically during ``axol can.setup``). Without
 the key the upload is skipped and the local calibration still happens.
 
+About 1.5 h for both arms on the slow profile (~6 min per joint).
+
 Examples:
-    axol tune.factory                       # both arms, default velocities
+    axol tune.factory                       # both arms, slow profile
     axol tune.factory --arms left           # one arm only
-    axol tune.factory --velocities 18 36    # quicker sweep (fewer velocities)
+    axol tune.factory --profile standard --velocities 18 36   # the old, quick sweep
     axol tune.factory --mass wrist_3=1.1    # custom gripper on both arms
     axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14
 """
@@ -47,12 +57,13 @@ Examples:
 import argparse
 import asyncio
 import math
+from pathlib import Path
 from typing import Any, TypedDict
 
 import numpy as np
 
 from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, Joint, Motor
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.calibration_cloud import (
     fetch_calibration,
@@ -69,12 +80,21 @@ from ...tuning import (
 from ..can.setup import hub_serial
 from .friction import (
     DEFAULT_VELOCITIES_DEG,
+    SLOW_VELOCITIES_DEG,
+    _SWEEP_MARGIN,
+    _identify_slow,
+    _stribeck_gain,
+    fit_and_report,
+    slow_profile_seconds,
+    sweep_load,
     _compare_to_gravity_model,
     _fit_friction_halfdiff,
+    CAL_GAINS,
+    _enter_impedance_hold,
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
+    _safe_torque_off,
 )
 from .gravity import fit_com
 
@@ -89,8 +109,6 @@ _CAL_ORDER: tuple[Joint, ...] = (
     Joint.SHOULDER_2,
     Joint.SHOULDER_1,
 )
-# MyActuator mode switches are a ~2 s reset that silently drops commands.
-_MODE_SWITCH_SETTLE_S = 2.5
 _SIDES = ("left", "right")
 
 
@@ -196,6 +214,79 @@ def merge_cloud_document(
     return merged
 
 
+def _keep_gravity(args: argparse.Namespace | None) -> bool:
+    return bool(getattr(args, "keep_gravity", False))
+
+
+def _warn_stock_gravity(
+    sides: list[str], overrides: dict[str, dict[str, LinkOverride]]
+) -> list[str]:
+    """Tell the operator when a gripperless robot still runs the stock
+    gripper's wrist_3 mass (and no ``--mass`` gives one): its own gravity
+    comp isn't set, and every fit would run against the wrong load."""
+    from ...robot.config import STOCK_GRAVITY_WARNING, stock_gravity_sides
+    from ...settings import shared_axol_config
+
+    try:
+        cfg = shared_axol_config()
+    except Exception:  # noqa: BLE001 - unreadable settings: nothing to judge
+        return []
+    stock = [
+        side
+        for side in stock_gravity_sides(cfg)
+        if side in sides
+        and "mass" not in overrides.get(side, {}).get(Joint.WRIST_3.value, {})
+    ]
+    if stock:
+        mass = getattr(cfg, stock[0]).wrist_3.mass
+        print("\n" + "!" * 72)
+        print(
+            "  ! " + STOCK_GRAVITY_WARNING.format(sides=" and ".join(stock), mass=mass)
+        )
+        print(
+            "  ! Set it first (panel Advanced → Axol, or calibration.json), or pass "
+            "--mass wrist_3=KG; Ctrl-C now to stop."
+        )
+        print("!" * 72 + "\n")
+    return stock
+
+
+def settings_link_overrides(sides: list[str]) -> dict[str, dict[str, LinkOverride]]:
+    """The link masses / CoMs this robot's shared settings set (the panel's
+    Advanced → Axol, ``~/.almond/settings.json``), per side and joint.
+
+    Teleop and the SDK run the gravity model with these on top of the
+    calibration file, but ``tune.factory`` builds its model from the file
+    alone — so a hand-tuned gravity comp has to be handed to the fits, or
+    ``fo`` and the load terms would be fitted against a model the robot
+    never runs. Only the links the settings actually change are returned.
+    """
+    from ...settings import shared_axol_config
+
+    shared = shared_axol_config()
+    bare = AxolConfig()
+    out: dict[str, dict[str, LinkOverride]] = {}
+    for side in sides:
+        for j in ARM_JOINTS:
+            mine = getattr(getattr(shared, side), j.value)
+            base = getattr(getattr(bare, side), j.value)
+            link: LinkOverride = {}
+            if not math.isclose(float(mine.mass), float(base.mass), abs_tol=1e-9):
+                link["mass"] = float(mine.mass)
+            if any(
+                not math.isclose(float(a), float(b), abs_tol=1e-9)
+                for a, b in zip(mine.com, base.com)
+            ):
+                link["com"] = (
+                    float(mine.com[0]),
+                    float(mine.com[1]),
+                    float(mine.com[2]),
+                )
+            if link:
+                out.setdefault(side, {})[j.value] = link
+    return out
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register the ``tune.factory`` subcommand."""
     p = subparsers.add_parser(
@@ -224,13 +315,39 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help=f"Right arm CAN interface (default: {CAN_RIGHT})",
     )
     p.add_argument(
+        "--profile",
+        choices=("slow", "standard"),
+        default="slow",
+        help="slow (default): the slow-motion friction calibration of "
+        "tune.friction --profile slow — the realtime core's friction law with "
+        "load dependence and the Stribeck excess — plus gravity from its "
+        "full-range passes (~6 min/joint). standard: the old 7-72 deg/s "
+        "Coulomb + viscous sweep (quicker, no load or low-speed terms)",
+    )
+    p.add_argument(
         "--velocities",
         type=float,
         nargs="+",
-        default=DEFAULT_VELOCITIES_DEG,
+        default=None,
         metavar="DEG_S",
-        help="Friction velocity sweep in deg/s (default: 7.2 18 36 54 72). "
-        "The gravity fit uses the same sweeps' averaged torques.",
+        help="Sweep speeds in deg/s (default: slow 1 2 3 5 8 15 30; standard "
+        "7.2 18 36 54 72). The gravity fit uses the full-range passes' "
+        "averaged torques.",
+    )
+    p.add_argument(
+        "--stribeck-gain",
+        type=float,
+        default=None,
+        help="Stribeck share saved for every joint (slow profile; default 0.8 "
+        "on shoulder_1, shoulder_2 and the elbow, 0 elsewhere)",
+    )
+    p.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Write each joint's raw sweep samples to DIR/<side>-<joint>.csv "
+        "(tune.friction --fit-csv re-fits them without moving anything)",
     )
     p.add_argument(
         "--hub-serial",
@@ -238,6 +355,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="SERIAL",
         help="Robot identity for the cloud upload (default: the attached "
         "Axol hub adapter's USB serial)",
+    )
+    p.add_argument(
+        "--keep-gravity",
+        action="store_true",
+        help="Keep this robot's gravity model: every fit runs against the link "
+        "masses / CoMs set in the panel's settings (Advanced → Axol) on top of "
+        "the calibration file, and no CoM or mass is fitted or saved — friction, "
+        "Stribeck and Fo only. For robots whose gravity comp was tuned by hand.",
     )
     p.add_argument(
         "--mass",
@@ -271,6 +396,7 @@ async def _calibrate_joint(
     is_left: bool,
     velocities_rad: list[float],
     hub_serial: str,
+    args: argparse.Namespace | None = None,
     override: LinkOverride | None = None,
 ) -> dict[str, Any] | None:
     """Sweep one joint, fit friction + CoM, save both, return the entry.
@@ -284,7 +410,8 @@ async def _calibrate_joint(
     side_str = "left" if is_left else "right"
     resolved = AxolConfig().resolved()
     jc = getattr(resolved.left if is_left else resolved.right, joint.value)
-    kp, kd = jc.kp, jc.kd
+    # Fixed calibration gains, not the production config's (see CAL_GAINS).
+    kp, kd = CAL_GAINS[joint]
     print(f"\n{'=' * 60}")
     print(f"  {side_str} {joint.value}  (Kp={kp:g}  Kd={kd:g})")
     print(f"{'=' * 60}")
@@ -300,8 +427,22 @@ async def _calibrate_joint(
     for stage in ramp_stages(other_targets):
         await _ramp_verified(motors, stage)
 
-    await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-    await asyncio.sleep(1.0)
+    if args is not None and args.profile == "slow":
+        return await _calibrate_joint_slow(
+            motors,
+            joint,
+            is_left,
+            velocities_rad,
+            hub_serial,
+            args,
+            jc,
+            kp,
+            kd,
+            other_targets,
+            lo_default,
+            hi_default,
+            override,
+        )
     try:
         avg_samples, halfdiff_samples = await _identify_joint(
             motors[joint],
@@ -314,15 +455,8 @@ async def _calibrate_joint(
             hi_override=hi_default,
         )
     finally:
-        # Park and hand the joint back to POSITION_VELOCITY so the next
-        # joint's homing/clearance ramps can drive it.
-        try:
-            await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-        except Exception:
-            pass
-        await motors[joint].set_control_mode(ControlMode.POSITION_VELOCITY)
-        await asyncio.sleep(_MODE_SWITCH_SETTLE_S)
-        # Re-verify the whole arm at rest (returns the clearance joints too).
+        # Park the joint and re-verify the whole arm at rest (returns the
+        # clearance joints too) — all on impedance, every joint held.
         await _home_all(motors)
 
     # What the operator set must reach the cloud even if the fits fail.
@@ -342,13 +476,14 @@ async def _calibrate_joint(
     tau_meas = np.array([s[1] for s in avg_samples])
     order = np.argsort(q_bins)
     q_bins, tau_meas = q_bins[order], tau_meas[order]
-    try:
-        gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
-    except RuntimeError as exc:
-        # An implausible fit means bad sweep data — keep the CAD CoM but
-        # don't lose the friction fit over it.
-        print(f"  ! Gravity fit rejected: {exc}")
-        gravity_fit = None
+    gravity_fit = None
+    if not _keep_gravity(args):
+        try:
+            gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+        except RuntimeError as exc:
+            # An implausible fit means bad sweep data — keep the CAD CoM but
+            # don't lose the friction fit over it.
+            print(f"  ! Gravity fit rejected: {exc}")
 
     com_fit = None
     if gravity_fit is not None:
@@ -405,13 +540,183 @@ async def _calibrate_joint(
     return entry
 
 
+async def _park_joint(
+    motors: dict[Joint, JointFrameMotor], joint: Joint, kp: float, kd: float
+) -> None:
+    """Park the swept joint and home the arm, every joint held on impedance.
+
+    ``_home_all`` alone: a smooth ramp at ``_RAMP_SPEED`` with gravity fed
+    forward, distal to proximal, so the swept joint parks before the
+    clearance joints proximal to it. A fixed 4 s linear ramp to 0 used to
+    run first — up to ~44 deg/s from a standing start with no velocity
+    feedforward, which lurched the shoulders back from the far end of their
+    sweeps (2026-10-07), and drove the elbow at its 0 hard stop.
+    """
+    await _home_all(motors)
+
+
+async def _calibrate_joint_slow(
+    motors: dict[Joint, JointFrameMotor],
+    joint: Joint,
+    is_left: bool,
+    velocities_rad: list[float],
+    hub_serial: str,
+    args: argparse.Namespace,
+    jc: Any,
+    kp: float,
+    kd: float,
+    other_targets: dict[Joint, float],
+    lo_default: float | None,
+    hi_default: float | None,
+    override: LinkOverride | None = None,
+) -> dict[str, Any] | None:
+    """The slow-profile sweep of one joint: runtime-law friction + Stribeck
+    from every pass, gravity (CoM) from the full-range passes' averages.
+
+    ``override`` is the operator's custom-link numbers, carried into the
+    returned entry as in :func:`_calibrate_joint`."""
+    from dataclasses import replace
+
+    from ...robot.axol import arm_limits
+    from ...tuning.friction_model import matched_samples
+
+    side_str = "left" if is_left else "right"
+    lo, hi = arm_limits(joint, is_left)
+    lo = lo_default if lo_default is not None else lo
+    hi = hi_default if hi_default is not None else hi
+    lo, hi = lo + _SWEEP_MARGIN, hi - _SWEEP_MARGIN
+    load_fn = sweep_load(joint, is_left, other_targets)
+    print(
+        f"  Slow profile: {len(velocities_rad)} speeds, about "
+        f"{slow_profile_seconds(lo, hi, velocities_rad, load_fn) / 60:.0f} min"
+    )
+    raw_csv = None
+    if args.raw_dir is not None:
+        args.raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_csv = args.raw_dir / f"{side_str}-{joint.value}.csv"
+    try:
+        rows = await _identify_slow(
+            motors[joint],
+            kp,
+            kd,
+            velocities_rad,
+            lo,
+            hi,
+            load_fn,
+            joint,
+            is_left,
+            raw_csv,
+        )
+    finally:
+        await _park_joint(motors, joint, kp, kd)
+
+    # What the operator set must reach the cloud even if the fits fail.
+    base: dict[str, Any] = {}
+    if override:
+        base["mass"] = jc.mass
+        if "com" in override:
+            base["com"] = list(override["com"])
+
+    if len(rows["q"]) < 50:
+        print(f"  ! Too few samples on {joint.value} — skipping its fits.")
+        return base or None
+
+    # Gravity: the averaged fwd/bwd torque of the passes that swept the whole
+    # range (the windowed slow passes cover only part of it), pooled per bin.
+    speeds = np.asarray(rows["speed"])
+    groups = np.asarray(rows["group"])
+    qs = np.asarray(rows["q"])
+    full = np.zeros(len(qs), dtype=bool)
+    for g in set(groups.tolist()):
+        sel = groups == g
+        if float(np.ptp(qs[sel])) > 0.8 * (hi - lo):
+            full |= sel
+    avg = matched_samples(
+        speeds[full],
+        np.asarray(rows["direction"])[full],
+        qs[full],
+        np.asarray(rows["tau"])[full],
+        load_fn,
+        groups[full],
+    )
+    com_fit = None
+    fo = None
+    if len(avg) >= 8 and not _keep_gravity(args):
+        by_bin: dict[float, list[float]] = {}
+        for smp in avg:
+            by_bin.setdefault(round(smp.q, 6), []).append(smp.average)
+        q_bins = np.array(sorted(by_bin))
+        tau_meas = np.array([float(np.mean(by_bin[q])) for q in q_bins])
+        try:
+            gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+        except RuntimeError as exc:
+            print(f"  ! Gravity fit rejected: {exc}")
+            gravity_fit = None
+        if gravity_fit is not None:
+            com_fit, fo, tau_before, tau_after = gravity_fit
+            delta_mm = [(f - c) * 1000 for f, c in zip(com_fit, jc.com)]
+            print(
+                f"  CoM shift ({delta_mm[0]:+.1f}, {delta_mm[1]:+.1f}, "
+                f"{delta_mm[2]:+.1f}) mm"
+            )
+
+    fit = fit_and_report(rows, joint, is_left, other_targets)
+    if fit is None:
+        print(f"  ! Friction fit failed on {joint.value} — not saving friction.")
+        if com_fit is None:
+            return base or None
+    elif fo is not None:
+        # fo against the corrected CoM, not the CAD one.
+        fit = replace(fit, fo=float(fo))
+
+    entry: dict[str, Any] = dict(base)
+    stribeck = None
+    if fit is not None:
+        entry["friction"] = fit.friction_params()
+        stribeck = fit.stribeck_params(_stribeck_gain(args, joint))
+        entry.update(stribeck)
+    if com_fit is not None:
+        entry["com"] = [round(v, 5) for v in com_fit]
+        # Only m·c is identified: pin the mass the CoM was fitted against so
+        # the pair stays consistent wherever the document is pulled.
+        entry["mass"] = jc.mass
+    try:
+        update_joint_calibration(
+            side_str,
+            joint.value,
+            friction=entry.get("friction"),
+            stribeck=stribeck,
+            com=tuple(entry["com"]) if "com" in entry else None,
+            mass=entry.get("mass"),
+            hub_serial=hub_serial,
+        )
+    except ValueError as exc:
+        if stribeck is None:
+            raise
+        # A degenerate Stribeck fit must not cost the rest of a 1.5 h run:
+        # save the joint without it (the coded default applies).
+        print(f"  ! Not saving Stribeck on {joint.value}: {exc}")
+        for field in stribeck:
+            entry.pop(field, None)
+        update_joint_calibration(
+            side_str,
+            joint.value,
+            friction=entry.get("friction"),
+            com=tuple(entry["com"]) if "com" in entry else None,
+            mass=entry.get("mass"),
+            hub_serial=hub_serial,
+        )
+    return entry
+
+
 async def _calibrate_arm(
     channel: str,
     is_left: bool,
     velocities_rad: list[float],
     results: dict[str, dict[str, Any]],
     hub_serial: str,
-    overrides: dict[str, LinkOverride],
+    args: argparse.Namespace | None = None,
+    overrides: dict[str, LinkOverride] | None = None,
 ) -> None:
     """Home the arm, calibrate all 7 joints distal->proximal, park, disable.
 
@@ -425,12 +730,8 @@ async def _calibrate_arm(
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Every joint on impedance and held where it is before anything moves.
+        await _enter_impedance_hold(motors)
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
@@ -441,7 +742,8 @@ async def _calibrate_arm(
                     is_left,
                     velocities_rad,
                     hub_serial,
-                    overrides.get(joint.value),
+                    args,
+                    (overrides or {}).get(joint.value),
                 )
                 if entry:
                     results[joint.value] = entry
@@ -449,12 +751,10 @@ async def _calibrate_arm(
             print("  Returning to rest and disabling ...")
             try:
                 await _home_all(motors)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            # Disables only at rest: a joint off rest would fall.
+            await _safe_torque_off(motors)
 
 
 async def _run(args: argparse.Namespace) -> None:
@@ -465,6 +765,10 @@ async def _run(args: argparse.Namespace) -> None:
             "--hub-serial before starting factory calibration."
         )
 
+    if args.velocities is None:
+        args.velocities = (
+            SLOW_VELOCITIES_DEG if args.profile == "slow" else DEFAULT_VELOCITIES_DEG
+        )
     velocities_rad = [math.radians(v) for v in args.velocities]
     sides = {
         "both": [("left", args.left_channel), ("right", args.right_channel)],
@@ -477,12 +781,44 @@ async def _run(args: argparse.Namespace) -> None:
         )
     except ValueError as exc:
         raise SystemExit(f"ERROR: {exc}")
+    side_names = [side for side, _ in sides]
+    try:
+        from_settings = settings_link_overrides(side_names)
+    except Exception as exc:  # noqa: BLE001 - an unreadable settings file
+        if args.keep_gravity:
+            raise SystemExit(
+                f"ERROR: --keep-gravity could not read the shared settings: {exc}"
+            )
+        from_settings = {}
+    if args.keep_gravity:
+        for side_str, joints in from_settings.items():
+            for joint_name, link in joints.items():
+                given = overrides.get(side_str, {}).get(joint_name, {})
+                overrides.setdefault(side_str, {})[joint_name] = {**link, **given}
 
     creds = supabase_credentials()
     print("\nAxol factory calibration — friction + gravity, all joints")
     print(f"  Arms: {', '.join(s for s, _ in sides)}")
-    print(f"  Velocities: {[round(v, 1) for v in args.velocities]} deg/s")
+    print(
+        f"  Profile: {args.profile} — velocities "
+        f"{[round(v, 1) for v in args.velocities]} deg/s"
+    )
     print(f"  Robot id (hub serial): {serial or 'not detected'}")
+    _warn_stock_gravity(side_names, overrides)
+    if args.keep_gravity:
+        print(
+            "  Gravity: kept — fits run against this robot's model "
+            "(calibration + panel settings); no CoM or mass is fitted or saved."
+        )
+    elif from_settings:
+        links = ", ".join(
+            f"{s} {j}" for s, joints in from_settings.items() for j in joints
+        )
+        print(
+            f"  ! The panel settings override link mass/CoM ({links}): teleop runs "
+            "those, so fitted CoMs there are shadowed and Fo is fitted against a "
+            "different model. Pass --keep-gravity to keep the hand-tuned gravity."
+        )
     if creds is None:
         print(
             "  Supabase: no write key (AXOL_SUPABASE_KEY, plus "
@@ -519,6 +855,7 @@ async def _run(args: argparse.Namespace) -> None:
                 velocities_rad,
                 side_results,
                 serial,
+                args,
                 overrides.get(side_str, {}),
             )
     except KeyboardInterrupt:

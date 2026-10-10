@@ -39,6 +39,7 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
+from ..robot import lift_firmware
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -2061,6 +2062,46 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Delete the whole run history (the dashboard's Clear button)."""
         return {"removed": await asyncio.to_thread(runs.clear)}
 
+    # -- lift firmware upload ------------------------------------------------
+    #
+    # The dashboard's "Update lift firmware" dialog uploads the raw
+    # firmware.bin here first; the validated image is stored on the host and
+    # its path filled into the lift.update run's --firmware argument.
+
+    @app.post("/api/lift/firmware", response_model=None)
+    async def upload_lift_firmware(request: Request) -> JSONResponse:
+        data = bytearray()
+        async for part in request.stream():
+            data += part
+            if len(data) > lift_firmware.MAX_IMAGE_BYTES:
+                return JSONResponse(
+                    {
+                        "error": "the file is larger than a lift firmware "
+                        f"partition ({lift_firmware.MAX_IMAGE_BYTES} bytes)"
+                    },
+                    status_code=413,
+                )
+        try:
+            image = lift_firmware.FirmwareImage.parse(bytes(data))
+        except lift_firmware.FirmwareUpdateError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            path = await asyncio.to_thread(lift_firmware.store_upload, image)
+        except OSError as exc:
+            return JSONResponse(
+                {"error": f"could not store the firmware on the host: {exc}"},
+                status_code=500,
+            )
+        return JSONResponse(
+            {
+                "path": str(path),
+                "version": image.version,
+                "built": image.built,
+                "buildId": f"0x{image.build_id:08x}",
+                "size": len(image.data),
+            }
+        )
+
     @app.get("/api/diagnostics/runs/{run_id}")
     async def diagnostics_run_data(run_id: str) -> JSONResponse:
         data = await asyncio.to_thread(runs.load, run_id)
@@ -2083,7 +2124,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         file overlaid — exactly what a tuning run uses when a gain field is
         left empty. The workbench shows these as the slider baselines.
         ``kd_host_hz`` is resolved to the shared default where a joint
-        doesn't set its own band centre.
+        doesn't set its own band centre. ``wire_modes`` carries each joint's
+        configured controller (``mit`` impedance or ``a4`` firmware position
+        loop): the Recorded-motion tab's per-joint controller picker seeds
+        from it, since a run adds ``--a4`` joints on top of the config.
         """
         import math
 
@@ -2094,11 +2138,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         def _load() -> dict[str, Any]:
             cfg = AxolConfig()
             out: dict[str, Any] = {}
+            wire: dict[str, Any] = {}
             for side in ("left", "right"):
                 arm_cfg = getattr(cfg, side)
                 joints: dict[str, Any] = {}
+                modes: dict[str, str] = {}
                 for j in ARM_JOINTS:
                     jc = getattr(arm_cfg, j.value)
+                    modes[j.value] = str(jc.wire_mode).lower()
                     joints[j.value] = {
                         "kp": jc.kp,
                         "kd": jc.kd,
@@ -2112,11 +2159,30 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                             jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
                         ),
                         "j_eff": jc.j_eff,
+                        "stiction_gain": jc.stiction_gain,
+                        "stiction_load_gain": jc.stiction_load_gain,
+                        "dither_nm": jc.dither_nm,
+                        "stribeck_gain": jc.stribeck_gain,
+                        # Firmware position-loop set (tune.motion's
+                        # ``firmware.*`` overrides): the grid's baselines.
+                        **{
+                            f"firmware.{name}": getattr(jc.firmware, name)
+                            for name in (
+                                "position_kp",
+                                "speed_kp",
+                                "speed_ki",
+                                "planner_accel",
+                                "cap_track",
+                                "planner_lead_ms",
+                                "tf_rated_current_a",
+                            )
+                        },
                     }
                 out[side] = joints
-            return out
+                wire[side] = modes
+            return {"gains": out, "wire_modes": wire}
 
-        return {"gains": await asyncio.to_thread(_load)}
+        return await asyncio.to_thread(_load)
 
     @app.get("/api/tuning/runs")
     async def tuning_runs() -> dict[str, Any]:
@@ -2180,7 +2246,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/tuning/motions")
     async def tuning_motions() -> dict[str, Any]:
-        """The committed reference motions available for tune.motion replays."""
+        """The reference motions in ~/.almond/motions for tune.motion replays."""
         from ..tuning.motion import list_motions
 
         def _list() -> list[dict[str, Any]]:

@@ -595,6 +595,28 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
+        section="tuning",
+    ),
+    "tune.a4": CommandDef(
+        "tune.a4",
+        "tune.a4",
+        "Firmware position loop (0xA4)",
+        "Tune a MyActuator joint's own position/speed loop — the controller "
+        "behind wire_mode a4 — with a sine or constant-speed triangle: set "
+        "firmware gains (RAM unless persisted), the speed cap and the "
+        "planner acceleration, score tracking and creep smoothness, and "
+        "save the run. A buzz guard restores the previous gains on any "
+        "high-frequency motion.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.a4"),
+        requires_hardware=True,
+        drives_motors=True,
+        hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
         section="tuning",
     ),
     "tune.friction": CommandDef(
@@ -632,10 +654,12 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.factory",
         "tune.factory",
         "Factory calibration (all joints)",
-        "Friction + gravity identification for all 14 joints (both arms, "
-        "distal→proximal) in one run — saved to this robot's calibration "
-        "and uploaded to the cloud keyed by the hub adapter serial when "
-        "Supabase credentials are configured.",
+        "Friction (the slow-motion profile: load-dependent sliding friction "
+        "and the Stribeck excess, in the realtime core's own law) + gravity "
+        "identification for all 14 joints (both arms, distal→proximal) in "
+        "one run, ~1.5 h — saved to this robot's calibration and uploaded to "
+        "the cloud keyed by the hub adapter serial when Supabase credentials "
+        "are configured.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.factory"),
@@ -651,6 +675,21 @@ COMMANDS: dict[str, CommandDef] = {
         "Download this robot's factory calibration (friction + gravity, by "
         "hub adapter serial) from the cloud into the local cache; every "
         "config then overlays it under the local calibration file.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.calibration"),
+        requires_hardware=False,
+        uses_can_bus=False,
+        drives_motors=False,
+    ),
+    "calibration.push": CommandDef(
+        "calibration.push",
+        "calibration.push",
+        "Upload local calibration",
+        "Upload this robot's local calibration file (friction, Stribeck, "
+        "gravity, gains — everything saved here) to the cloud by hub adapter "
+        "serial, merged per joint over what is stored; needs the Supabase "
+        "write key.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.calibration"),
@@ -674,6 +713,8 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
         hardware_profiles=("axol",),
+        # Records the wrist cameras' IMUs (almond_axol.tuning.wrist_imu).
+        uses_cameras=True,
         section="tuning",
     ),
     "tune.filter": CommandDef(
@@ -730,8 +771,10 @@ COMMANDS: dict[str, CommandDef] = {
         "Home the lift",
         "Calibrate the telescoping lift: drive both legs to their end stops "
         "and save the height scale to the lift board's flash (~1-2 min). "
-        "One-time — the calibration persists across power cycles. Stop "
-        "aborts safely (rolls back).",
+        "One-time — the calibration persists across power cycles. Legs home "
+        "together by default (safe on the robot); turn on Independent only "
+        "for loose legs off the robot, to level them. Stop aborts safely "
+        "(rolls back).",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.home"),
@@ -748,6 +791,22 @@ COMMANDS: dict[str, CommandDef] = {
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.goto"),
+        requires_hardware=True,
+        hardware_profiles=("axol",),
+        section="helper",
+    ),
+    "lift.update": CommandDef(
+        "lift.update",
+        "lift.update",
+        "Update lift firmware",
+        "Upload a jelly_legs firmware.bin and install it on the lift board "
+        "over CAN (~1 min). The new firmware boots on trial and reverts on "
+        "its own unless it comes up healthy; the lift's homing is kept. "
+        "Without a file it reports the running firmware. Needs lift firmware "
+        "0.9+ (installed once over USB).",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.lift.update"),
         requires_hardware=True,
         hardware_profiles=("axol",),
         section="helper",
