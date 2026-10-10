@@ -73,6 +73,7 @@ _STATUS_NAMES = (
 )
 _STATUS_OK = 0
 _STATUS_BUSY = 1
+_STATUS_FLASH = 6
 
 IDENT_MAGIC = b"jelly_legs-fwid\0"
 _IDENT_SIZE = 40  # fw_ident_t in firmware.c
@@ -285,7 +286,11 @@ class LiftFirmwareUpdater:
         """End an update session; True when the board acknowledged it."""
         return await self._request(_OP_ABORT) is not None
 
-    async def confirm(self, expected_build: int | None = None) -> None:
+    async def confirm(
+        self,
+        expected_build: int | None = None,
+        log: Callable[[str], None] = print,
+    ) -> None:
         """Confirm the image on trial so it stays installed."""
         r = await self._request(_OP_CONFIRM, timeout=2.0, retries=1)
         if r is None:
@@ -300,6 +305,14 @@ class LiftFirmwareUpdater:
             raise FirmwareUpdateError(
                 "no reply to UPDATE_CONFIRM, and the board is not confirmed"
             )
+        if r[1] == _STATUS_FLASH:
+            # Confirmed, but the old image is still in flash. The new one stays
+            # installed: if the old image ever boots first it hands over.
+            log(
+                "warning: confirmed, but the previous firmware image could not "
+                "be erased (flash problem?); the board retries on every boot"
+            )
+            return
         if r[1] != _STATUS_OK:
             raise FirmwareUpdateError(f"confirm failed: {status_name(r[1])}")
 
@@ -442,7 +455,7 @@ class LiftFirmwareUpdater:
                 "within 15 s of booting"
             )
             return info
-        await self.confirm(image.build_id)
+        await self.confirm(image.build_id, log)
         final = await self.info()
         log(f"confirmed: {final.describe() if final else 'no FW_INFO reply'}")
         return final

@@ -47,6 +47,7 @@ class FakeBoard:
         self.sent_ops: list[int] = []
         self.drop_acks = 0  # lose this many chunk acks (forces re-sends)
         self.busy_replies = 0
+        self.confirm_status = 0
 
     def _add_listener(self, listener) -> None:  # noqa: ANN001
         self.listeners.append(listener)
@@ -96,7 +97,7 @@ class FakeBoard:
         elif op == 0x0D:
             ok = self.state & 0x01
             self.state &= ~0x01
-            self._reply(bytes([0x0D, 0 if ok else 9]))
+            self._reply(bytes([0x0D, self.confirm_status if ok else 9]))
 
     def _data(self, d: bytes) -> None:
         if d[0] == 0xFF:
@@ -173,6 +174,17 @@ class LiftFirmwareUpdaterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bytes(board.image), image.data)
         self.assertEqual(progress[-1], len(image.data))
         self.assertIn(0x0D, board.sent_ops)
+
+    async def test_confirm_with_old_image_left_is_a_warning(self) -> None:
+        board = FakeBoard()
+        board.confirm_status = 6  # bought, previous image not erased
+        image = FirmwareImage.parse(_image())
+        log: list[str] = []
+        with patch.object(lift_firmware.asyncio, "sleep", _no_sleep):
+            info = await LiftFirmwareUpdater(board).flash(image, log=log.append)  # type: ignore[arg-type]
+        assert info is not None
+        self.assertEqual(info.build_id, image.build_id)
+        self.assertTrue(any("could not be erased" in line for line in log))
 
     async def test_resends_a_chunk_whose_ack_was_lost(self) -> None:
         board = FakeBoard()
