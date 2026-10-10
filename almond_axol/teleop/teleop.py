@@ -72,9 +72,8 @@ _logger = logging.getLogger(__name__)
 # hybrid measured 79 us mean wakeup error, 8x better than plain asyncio.
 _FINE_SLEEP = 0.0015
 
-# Rate of the joint-state push that drives the headset's ghost robot overlay.
-# A ~200 B JSON message; 20 Hz is smooth enough for a re-alignment aid and
-# negligible next to the pose stream.
+# Rate of the joint-state push that drives the headset HUD's box-mode readout
+# (pair status). A ~200 B JSON message; negligible next to the pose stream.
 _JOINT_BROADCAST_HZ = 20.0
 
 # How long teardown waits for the arms to report their positions before it
@@ -230,8 +229,8 @@ class VRTeleop:
         # from `set` messages off any client, published back as `settings`.
         self._live = LiveSettings(self._core, robot, self._publish_settings)
         self._vr_server.set_on_setting(self._live.apply)
-        # Wall time of the last joint-state push to the headset (ghost robot
-        # overlay), throttled to _JOINT_BROADCAST_HZ on the control loop.
+        # Wall time of the last joint-state push to the headset (HUD pair
+        # status), throttled to _JOINT_BROADCAST_HZ on the control loop.
         self._last_joint_broadcast: float = 0.0
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
@@ -350,7 +349,7 @@ class VRTeleop:
         self._broadcast_json({"type": "settings", "value": snapshot})
 
     def _broadcast_joints(self, out: np.ndarray) -> None:
-        """Push the commanded joint state to the headset for the ghost overlay.
+        """Push the commanded joint state to the headset for the HUD.
 
         Throttled to ``_JOINT_BROADCAST_HZ``; ``out`` is the 16-DOF command
         (see :meth:`VRTeleopCore.compute_output`). Measured positions are

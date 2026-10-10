@@ -42,7 +42,6 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
-import { GhostRobot } from "@/components/vr/ghost-robot"
 import { authorizeCert } from "@/lib/cert-accept"
 import { hostCertAuthorizeVisible, usbCertOrigin } from "@/lib/usb-transport"
 import { cn } from "@/lib/utils"
@@ -1021,8 +1020,8 @@ function usePairStatus(jointsRef: RefObject<AxolJointSample | null>): {
 }
 
 // Tools row (second HUD line, under Exit / ? / status): the two most-used
-// live settings (box mode, re-engage ramp) as one-click toggles, the local
-// ghost overlay toggle, and the entry to the full settings panel.
+// live settings (box mode, re-engage ramp) as one-click toggles and the
+// entry to the full settings panel.
 // Server-mirrored settings are hidden until the server announces them (an
 // older server has no live settings).
 function ToolsRow({
@@ -1032,8 +1031,6 @@ function ToolsRow({
   grasp,
   squeeze,
   trim,
-  ghost,
-  onToggleGhost,
   onOpenSettings,
 }: {
   settings: AxolSettings | null
@@ -1048,8 +1045,6 @@ function ToolsRow({
   // Extra inward yaw (whole degrees) the squeeze trim has added so the blade
   // tips press as hard as the roots; shown with the force while nonzero.
   trim: number
-  ghost: boolean
-  onToggleGhost: () => void
   onOpenSettings: () => void
 }) {
   // The server only offers box mode with the parcel gripper.
@@ -1083,13 +1078,7 @@ function ToolsRow({
           onClick={() => onSet("reengage", reengage === "ramp" ? "clutch" : "ramp")}
         />
       )}
-      <HudButton
-        x={0.1}
-        label={ghost ? "Ghost: ON" : "Ghost: OFF"}
-        active={ghost}
-        onClick={onToggleGhost}
-      />
-      {settings !== null && <HudButton x={0.19} label="Settings" onClick={onOpenSettings} />}
+      {settings !== null && <HudButton x={0.1} label="Settings" onClick={onOpenSettings} />}
     </>
   )
 }
@@ -1217,8 +1206,6 @@ function HudTools({
   settings,
   onSet,
   jointsRef,
-  ghost,
-  onToggleGhost,
   settingsOpen,
   onOpenSettings,
   onCloseSettings,
@@ -1227,8 +1214,6 @@ function HudTools({
   settings: AxolSettings | null
   onSet: (key: string, value: boolean | number | string) => void
   jointsRef: RefObject<AxolJointSample | null>
-  ghost: boolean
-  onToggleGhost: () => void
   settingsOpen: boolean
   onOpenSettings: () => void
   onCloseSettings: () => void
@@ -1244,8 +1229,6 @@ function HudTools({
         grasp={grasp}
         squeeze={squeeze}
         trim={trim}
-        ghost={ghost}
-        onToggleGhost={onToggleGhost}
         onOpenSettings={onOpenSettings}
       />
       {settingsOpen && settings && (
@@ -1605,8 +1588,6 @@ export default function App() {
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
-  // Ghost robot overlay (live joint state), remembered across sessions.
-  const [ghost, setGhost] = useState(() => localStorage.getItem("ghostRobot") === "1")
   // In-headset live-settings panel.
   const [settingsOpen, setSettingsOpen] = useState(false)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
@@ -1697,13 +1678,6 @@ export default function App() {
   const handleUsbToggle = (next: boolean) => {
     setUsbPoses(next)
     localStorage.setItem("usbPoses", next ? "1" : "0")
-  }
-
-  const handleGhostToggle = () => {
-    setGhost((v) => {
-      localStorage.setItem("ghostRobot", v ? "0" : "1")
-      return !v
-    })
   }
 
   // Controller shortcut (both thumbsticks clicked): toggle box mode. The flip
@@ -1959,19 +1933,12 @@ export default function App() {
                 settings={settings}
                 onSet={setSetting}
                 jointsRef={jointsRef}
-                ghost={ghost}
-                onToggleGhost={handleGhostToggle}
                 settingsOpen={settingsOpen}
                 onOpenSettings={() => setSettingsOpen(true)}
                 onCloseSettings={() => setSettingsOpen(false)}
                 onStep={stepSetting}
               />
             </XRHud>
-            <GhostRobot
-              enabled={ghost}
-              urdfBase={hostname.trim() ? `${axolHttpsOrigin(hostname, VR_WS_PORT)}/urdf` : ""}
-              jointsRef={jointsRef}
-            />
             <PoseVisualizer poseMode={poseMode} />
             {/* Remount on host changes so any in-flight URDF/STL requests and
                 cached overlay resources are cancelled and disposed. */}

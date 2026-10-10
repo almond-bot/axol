@@ -10,8 +10,8 @@ export type AxolJointSample = AxolJointState & { receivedAt: number }
  *
  * The server pushes `{"type":"joints","value":{q, l_grip, r_grip, engaged}}`
  * ~20x/s over the teleop WebSocket (see `AxolJointState`); this hook keeps the
- * newest sample so a per-frame loop (the ghost robot overlay) can pose a
- * model without React re-renders. `null` until the first push on the current
+ * newest sample so a per-frame loop (the HUD's box-mode readout) can read it
+ * without React re-renders. `null` until the first push on the current
  * connection — an older server that never pushes joints simply leaves it null.
  *
  * A `message` *listener* is added (not `ws.onmessage`) so this coexists with

@@ -119,8 +119,8 @@ export type AxolSettings = {
 
 /**
  * Live joint state the teleop server pushes ~20x/s as
- * `{"type":"joints","value":AxolJointState}` — drives the in-headset ghost
- * robot. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
+ * `{"type":"joints","value":AxolJointState}` — drives the HUD's box-mode
+ * readout. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
  * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap

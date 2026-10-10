@@ -118,12 +118,10 @@ Every time a grip re-engages an arm — you froze it, walked away from the robot
 
 | Ramp | Who moves | When to use it |
 |---|---|---|
-| **OFF** — *clutch* (default) | **You match the arm.** The arm stays exactly where it is; your controller's current pose becomes its new origin and only motion from then on counts. | You want the arm to stay put — it's holding something, or you just want to resume from where it is. To keep the same reach and comfort you had before the pause, bring your hand to roughly the arm's pose first: the **Ghost** overlay (below) or the passthrough view of the real arm shows you where that is. |
+| **OFF** — *clutch* (default) | **You match the arm.** The arm stays exactly where it is; your controller's current pose becomes its new origin and only motion from then on counts. | You want the arm to stay put — it's holding something, or you just want to resume from where it is. To keep the same reach and comfort you had before the pause, bring your hand to roughly the arm's pose first: the passthrough view of the real arm shows you where that is. |
 | **ON** — *ramp* | **The arm matches you.** The mapping from the arm's previous engage is kept as a session anchor, and on the grip the arm eases out to where that mapping says your controller is now, then tracks 1:1. | After a hand-off or hand-guiding: hold your hands where you want the arms and grip — they come to you. The move is paced by `--teleop.reengage_ramp_speed` (0.15 m/s) with a `--teleop.reengage_ramp_min_s` (0.75 s) floor, and the target is live, so you can keep moving while the arm catches up. |
 
 In either mode the engage-edge frame itself never moves the arm. The ramp anchor is dropped by a reset / return to rest (the first grip afterwards snaps fresh, so the arms never jump out of rest), and box mode ignores the toggle — its engage already blends the pair into the parallel grasp.
-
-**Ghost overlay.** The **Ghost** HUD button overlays a translucent copy of the robot — the real URDF, posed from the joint state the server streams at 20 Hz (green while engaged, grey otherwise) — anchored to the floor in front of you at the robot's shoulder height. Use it to see the arms' true pose through the passthrough while lining up a clutch re-engage; the URDF and meshes are fetched from the VR server itself, so it works wherever the pose link does.
 
 <a id="box-mode"></a>
 
