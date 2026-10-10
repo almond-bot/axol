@@ -39,6 +39,7 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
+from ..robot import lift_firmware
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -2060,6 +2061,46 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def diagnostics_runs_clear() -> dict[str, Any]:
         """Delete the whole run history (the dashboard's Clear button)."""
         return {"removed": await asyncio.to_thread(runs.clear)}
+
+    # -- lift firmware upload ------------------------------------------------
+    #
+    # The dashboard's "Update lift firmware" dialog uploads the raw
+    # firmware.bin here first; the validated image is stored on the host and
+    # its path filled into the lift.update run's --firmware argument.
+
+    @app.post("/api/lift/firmware", response_model=None)
+    async def upload_lift_firmware(request: Request) -> JSONResponse:
+        data = bytearray()
+        async for part in request.stream():
+            data += part
+            if len(data) > lift_firmware.MAX_IMAGE_BYTES:
+                return JSONResponse(
+                    {
+                        "error": "the file is larger than a lift firmware "
+                        f"partition ({lift_firmware.MAX_IMAGE_BYTES} bytes)"
+                    },
+                    status_code=413,
+                )
+        try:
+            image = lift_firmware.FirmwareImage.parse(bytes(data))
+        except lift_firmware.FirmwareUpdateError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            path = await asyncio.to_thread(lift_firmware.store_upload, image)
+        except OSError as exc:
+            return JSONResponse(
+                {"error": f"could not store the firmware on the host: {exc}"},
+                status_code=500,
+            )
+        return JSONResponse(
+            {
+                "path": str(path),
+                "version": image.version,
+                "built": image.built,
+                "buildId": f"0x{image.build_id:08x}",
+                "size": len(image.data),
+            }
+        )
 
     @app.get("/api/diagnostics/runs/{run_id}")
     async def diagnostics_run_data(run_id: str) -> JSONResponse:

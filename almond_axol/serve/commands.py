@@ -730,8 +730,10 @@ COMMANDS: dict[str, CommandDef] = {
         "Home the lift",
         "Calibrate the telescoping lift: drive both legs to their end stops "
         "and save the height scale to the lift board's flash (~1-2 min). "
-        "One-time — the calibration persists across power cycles. Stop "
-        "aborts safely (rolls back).",
+        "One-time — the calibration persists across power cycles. Legs home "
+        "together by default (safe on the robot); turn on Independent only "
+        "for loose legs off the robot, to level them. Stop aborts safely "
+        "(rolls back).",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.home"),
@@ -748,6 +750,22 @@ COMMANDS: dict[str, CommandDef] = {
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.goto"),
+        requires_hardware=True,
+        hardware_profiles=("axol",),
+        section="helper",
+    ),
+    "lift.update": CommandDef(
+        "lift.update",
+        "lift.update",
+        "Update lift firmware",
+        "Upload a jelly_legs firmware.bin and install it on the lift board "
+        "over CAN (~1 min). The new firmware boots on trial and reverts on "
+        "its own unless it comes up healthy; the lift's homing is kept. "
+        "Without a file it reports the running firmware. Needs lift firmware "
+        "0.9+ (installed once over USB).",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.lift.update"),
         requires_hardware=True,
         hardware_profiles=("axol",),
         section="helper",
