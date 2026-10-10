@@ -754,6 +754,22 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="helper",
     ),
+    "lift.update": CommandDef(
+        "lift.update",
+        "lift.update",
+        "Update lift firmware",
+        "Upload a jelly_legs firmware.bin and install it on the lift board "
+        "over CAN (~1 min). The new firmware boots on trial and reverts on "
+        "its own unless it comes up healthy; the lift's homing is kept. "
+        "Without a file it reports the running firmware. Needs lift firmware "
+        "0.9+ (installed once over USB).",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.lift.update"),
+        requires_hardware=True,
+        hardware_profiles=("axol",),
+        section="helper",
+    ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",

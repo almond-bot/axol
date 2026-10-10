@@ -582,6 +582,27 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
+/** A lift firmware image the serve host validated and stored for `lift.update`. */
+export interface LiftFirmwareUpload {
+  /** Host-side path, passed as the run's `--firmware` argument. */
+  path: string
+  version: string
+  built: string
+  buildId: string
+  size: number
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+  return json(
+    await fetch(apiUrl("/api/lift/firmware"), {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    })
+  )
+}
+
 /** Healthy = reachable on CAN and reporting no error status. */
 export function wheelMotorHealthy(m: WheelMotorHealth): boolean {
   return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)

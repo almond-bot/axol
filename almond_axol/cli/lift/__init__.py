@@ -1,6 +1,6 @@
 """Shared plumbing for the ``axol lift.*`` commands.
 
-Both commands (``lift.home``, ``lift.goto``) talk to the jelly_legs lift
+The motion commands (``lift.home``, ``lift.goto``) talk to the jelly_legs lift
 controller — on its chest CAN bus or the wheel bus it shares with the
 motors, whichever ``axol can.setup`` pinned — through the
 :class:`~almond_axol.robot.lift.Lift` driver, watch its status to
