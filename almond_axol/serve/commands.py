@@ -730,8 +730,10 @@ COMMANDS: dict[str, CommandDef] = {
         "Home the lift",
         "Calibrate the telescoping lift: drive both legs to their end stops "
         "and save the height scale to the lift board's flash (~1-2 min). "
-        "One-time — the calibration persists across power cycles. Stop "
-        "aborts safely (rolls back).",
+        "One-time — the calibration persists across power cycles. Legs home "
+        "together by default (safe on the robot); turn on Independent only "
+        "for loose legs off the robot, to level them. Stop aborts safely "
+        "(rolls back).",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.home"),
