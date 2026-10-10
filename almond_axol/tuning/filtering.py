@@ -54,7 +54,12 @@ import numpy as np
 
 from ..constants import ARM_JOINTS
 from ..teleop.config import VRTeleopConfig
-from ..teleop.filter import AlphaSmoothFilter, LagCompensatedLowPass, TrapezoidalFilter
+from ..teleop.filter import (
+    AlphaSmoothFilter,
+    LagCompensatedLowPass,
+    NotchFilter,
+    TrapezoidalFilter,
+)
 from .metrics import band_rms, tracking_lag_ms
 from .motion import load_motion
 
@@ -211,6 +216,7 @@ def replay_filter_stack(
     # exactly like TeleopCore so the EMA time constant matches production.
     alpha = 1.0 - (1.0 - cfg.ik_alpha) ** (120.0 * dt)
     ema = AlphaSmoothFilter(alpha)
+    notch = NotchFilter(cfg.command_notch_hz, cfg.command_notch_q, cfg.frequency)
     trap = TrapezoidalFilter(cfg.teleop_max_vel, cfg.teleop_max_accel, dt)
 
     n_out = int((t_in[-1] - t_in[0]) / dt) + 1
@@ -219,7 +225,7 @@ def replay_filter_stack(
     filtered = np.empty((n_out, x_in.shape[1]), dtype=float)
     for k, i in enumerate(hold_index):
         y = ema.update(pose[i])
-        filtered[k] = trap.update(y)
+        filtered[k] = trap.update(notch.update(y))
     return t_out, filtered, hold_index
 
 

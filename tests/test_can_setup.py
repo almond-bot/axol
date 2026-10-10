@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -405,12 +406,16 @@ class CanSetupAssignmentTest(unittest.TestCase):
         )
 
     def test_axol_rx_retry_does_not_reset_wheel_and_lift_buses_again(self) -> None:
+        # A host without the reset script: the retry is the plain pair cycle.
+        no_reset = Mock()
+        no_reset.exists.return_value = False
         with (
             patch.object(
                 setup, "_global_setup_lock", return_value=contextlib.nullcontext()
             ),
             patch.object(setup._LOCK_LOCAL, "depth", 1, create=True),
             patch.object(setup.Path, "exists", return_value=True),
+            patch.object(setup, "CAN_RESET_SCRIPT", no_reset),
             patch.object(setup, "run_root") as run_root,
             patch.object(
                 setup,
@@ -434,6 +439,80 @@ class CanSetupAssignmentTest(unittest.TestCase):
         recover_pair.assert_called_once_with(
             [setup.CAN_LEFT, setup.CAN_RIGHT], force_cycle=True
         )
+
+    def test_axol_rx_retry_usb_resets_the_hub_once_installed(self) -> None:
+        # The hub firmware can release frames it held from a stalled session
+        # on any pair cycle; the retry resets the device instead.
+        with (
+            patch.object(
+                setup, "_global_setup_lock", return_value=contextlib.nullcontext()
+            ),
+            patch.object(setup._LOCK_LOCAL, "depth", 1, create=True),
+            patch.object(setup.Path, "exists", return_value=True),
+            patch.object(setup, "run_root") as run_root,
+            patch.object(
+                setup,
+                "rx_alive_per_arm",
+                side_effect=[(False, False), (True, True)],
+            ),
+            patch.object(setup, "bring_up_interfaces", side_effect=AssertionError),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup.bring_up_can(setup._AXOL_PROFILE)
+
+        flagged = ["env", f"{setup._GLOBAL_LOCK_ENV}=1", "bash"]
+        self.assertEqual(
+            run_root.call_args_list,
+            [
+                call([*flagged, str(setup._AXOL_PROFILE.cron_script)], check=True),
+                call([*flagged, str(setup.CAN_RESET_SCRIPT)], check=True),
+            ],
+        )
+
+    def test_only_the_arm_hub_pair_is_usb_reset(self) -> None:
+        with (
+            patch.object(setup.Path, "exists", return_value=True),
+            patch.object(setup, "run_root", side_effect=AssertionError),
+            patch.object(setup, "bring_up_interfaces") as bring_up,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            setup._recover_hub_pair([setup.CAN_MANTIS_LEFT, setup.CAN_MANTIS_RIGHT])
+        bring_up.assert_called_once_with(
+            [setup.CAN_MANTIS_LEFT, setup.CAN_MANTIS_RIGHT], force_cycle=True
+        )
+
+    def test_reset_script_resets_the_hub_then_runs_the_bring_up(self) -> None:
+        text = setup._reset_script_text()
+        self.assertTrue(text.startswith("#!/bin/bash\n"))
+        self.assertIn("set -euo pipefail", text)
+        # The hub behind the arm channels, found through sysfs, reset once.
+        self.assertIn("/sys/class/net/${IFACE}/device/..", text)
+        self.assertIn(f"for IFACE in {setup.CAN_LEFT} {setup.CAN_RIGHT}; do", text)
+        self.assertIn('usbreset "$(printf "%03d/%03d"', text)
+        # The sysfs fallback where usbreset is missing or fails.
+        self.assertIn('echo 0 > "${HUB}/authorized"', text)
+        self.assertIn('echo 1 > "${HUB}/authorized"', text)
+        # Lock handling matches the bring-up script, which it hands over to
+        # with the global lock still held.
+        self.assertIn(f'exec 8<"{setup._GLOBAL_LOCK_FILE}"', text)
+        self.assertTrue(
+            text.rstrip().endswith(
+                f"exec env {setup._GLOBAL_LOCK_ENV}=1 bash "
+                f'"{setup._AXOL_PROFILE.cron_script}"'
+            )
+        )
+        # The single-channel wheel/chest adapters are never reset.
+        self.assertNotIn(setup.CAN_BASE, text)
+        self.assertNotIn(setup.CAN_CHEST, text)
+
+    def test_reset_script_passes_bash_syntax_check(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".sh") as script:
+            script.write(setup._reset_script_text())
+            script.flush()
+            checked = subprocess.run(
+                ["bash", "-n", script.name], capture_output=True, text=True
+            )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
 
     def test_root_executed_scripts_install_root_owned_outside_operator_state(
         self,
@@ -612,6 +691,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
         with (
             patch.object(setup, "_write_udev_rules"),
             patch.object(setup, "_write_cron_script"),
+            patch.object(setup, "_write_reset_script"),
             patch.object(setup, "_write_hotplug_unit"),
             patch.object(setup, "_reload_udev"),
             patch.object(setup, "_rename_interfaces"),

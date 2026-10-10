@@ -19,7 +19,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from almond_axol.cli.can import setup as can_setup
-from almond_axol.constants import CAN_BRINGUP_SCRIPT, CAN_LEFT, CAN_RIGHT
+from almond_axol.constants import (
+    CAN_BASE,
+    CAN_BRINGUP_SCRIPT,
+    CAN_LEFT,
+    CAN_RESET_SCRIPT,
+    CAN_RIGHT,
+)
 from almond_axol.utils import can_purge
 
 
@@ -50,6 +56,15 @@ class PurgeGrantTest(unittest.TestCase):
                 )
         for command in commands:
             self.assertTrue(command.startswith("/"), command)
+
+    def test_grants_the_arm_hub_usb_reset(self) -> None:
+        # safety.rs prefers the reset script on the arm channels: the hub
+        # firmware keeps frames a flap cannot reach.
+        commands = can_purge.purge_commands()
+        self.assertTrue(
+            any(command.endswith(f"bash {CAN_RESET_SCRIPT}") for command in commands),
+            commands,
+        )
 
     def test_grants_every_form_the_fallback_flap_issues(self) -> None:
         # bring_up_interfaces configures between the down and the up. A grant
@@ -175,6 +190,16 @@ class BacklogDetectionTest(unittest.TestCase):
 
 class PurgeStaleTxTest(unittest.TestCase):
     """What a bring-up does about frames the last session left queued."""
+
+    def setUp(self) -> None:
+        # Neither generated script is installed, whatever this host (a robot
+        # included) has in /etc: the flap goes through bring_up_interfaces.
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        for name in ("CAN_BRINGUP_SCRIPT", "CAN_RESET_SCRIPT"):
+            patcher = patch.object(can_setup, name, Path(scratch.name) / name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_clean_queues_flap_nothing(self) -> None:
         with (
@@ -311,10 +336,45 @@ class FlapChoiceTest(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.script = Path(scratch.name) / "startup.sh"
+        self.reset = Path(scratch.name) / "reset_adapter.sh"
+        # Absent unless a test installs it, whatever this host has in /etc.
+        patcher = patch.object(can_setup, "CAN_RESET_SCRIPT", self.reset)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _installed(self) -> Path:
         self.script.write_text("#!/bin/bash\n")
         return self.script
+
+    def test_arm_channels_prefer_the_usb_reset_once_installed(self) -> None:
+        self.reset.write_text("#!/bin/bash\n")
+        runs: list[list[str]] = []
+        with (
+            patch.object(can_setup, "CAN_BRINGUP_SCRIPT", self._installed()),
+            patch.object(
+                can_setup,
+                "run_root",
+                lambda argv, **_kw: runs.append(argv) or _completed(0),
+            ),
+            patch.object(can_setup, "bring_up_interfaces", side_effect=AssertionError),
+        ):
+            can_setup._flap_for_purge([CAN_LEFT, CAN_RIGHT])
+        self.assertEqual(runs, [["bash", str(self.reset)]])
+
+    def test_a_single_bus_keeps_the_bring_up_flap(self) -> None:
+        # The reset covers only the arm hub; the wheel bus is its own adapter.
+        self.reset.write_text("#!/bin/bash\n")
+        runs: list[list[str]] = []
+        with (
+            patch.object(can_setup, "CAN_BRINGUP_SCRIPT", self._installed()),
+            patch.object(
+                can_setup,
+                "run_root",
+                lambda argv, **_kw: runs.append(argv) or _completed(0),
+            ),
+        ):
+            can_setup._flap_for_purge([CAN_BASE])
+        self.assertEqual(runs, [["bash", str(self.script)]])
 
     def test_prefers_the_bring_up_script_for_managed_channels(self) -> None:
         # One granted command, and the only ordering that takes the dual

@@ -20,7 +20,7 @@ import time
 import numpy as np
 
 from ..constants import ARM_JOINTS
-from ..motor import Joint, MotorError
+from ..motor import ControlMode, Joint, MotorError
 from ..robot.axol import arm_limits
 from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
 from .feedforward import FeedForward
@@ -114,7 +114,11 @@ def probe_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, flo
 # Three joints hang axis-vertical and need other joints posed to tilt them.
 # Clearances below were verified against the torso collision model; signal
 # figures are the CAD gravity model's torque variation over the sweep.
-SHOULDER_1_LOAD = math.radians(90.0)  # humerus horizontal for shoulder_3
+# Humerus horizontal for shoulder_3 — a *left-arm* joint-frame value. The
+# shoulder_1 frame is mirrored across arms (left −90..+180, right −180..+90),
+# so the right arm's copy of this pose is −90°: +90° there is the hard stop,
+# and an unmirrored raise drove right shoulder_1 into it (2026-09-22).
+SHOULDER_1_LOAD = math.radians(90.0)
 WRIST_2_LOAD = math.radians(85.0)  # hand off wrist_1's axis (85°: limit is 90)
 WRIST_1_LOAD = math.radians(90.0)  # hand off wrist_2's axis
 # shoulder_3 / wrist_1 sweep cap at their loaded poses: ±90° keeps the bent
@@ -185,13 +189,15 @@ def sweep_safety(
             "the base is inboard."
         )
     elif joint == Joint.SHOULDER_3:
-        clearance[Joint.SHOULDER_1] = SHOULDER_1_LOAD
+        s1_load = SHOULDER_1_LOAD if is_left else -SHOULDER_1_LOAD
+        clearance[Joint.SHOULDER_1] = s1_load
         clearance[Joint.ELBOW] = elbow_mid
         lo_cap, hi_cap = -LOADED_SWEEP_CAP, LOADED_SWEEP_CAP
         notes.append(
-            "Raising shoulder_1 to 90° and bending the elbow so gravity "
-            "loads shoulder_3 (its axis is vertical at rest — zero gravity "
-            "moment there); sweep capped at ±90° to stay clear of the torso."
+            f"Raising shoulder_1 to {math.degrees(s1_load):+.0f}° and bending the "
+            "elbow so gravity loads shoulder_3 (its axis is vertical at rest — "
+            "zero gravity moment there); sweep capped at ±90° to stay clear of "
+            "the torso."
         )
     elif joint == Joint.WRIST_1:
         clearance[Joint.ELBOW] = elbow_mid
@@ -357,9 +363,31 @@ async def ramp_joints_to(
     motors: dict[Joint, JointFrameMotor],
     targets: dict[Joint, float],
 ) -> None:
-    """Ramp POSITION_VELOCITY-mode joints to joint-frame targets, poll until arrival."""
+    """Ramp joints to joint-frame targets and wait for arrival.
+
+    Joints on impedance (the default) take a host-side ramp with every other
+    joint held (``tune.friction``'s ``_ramp_verified``). Only joints a tool
+    explicitly put on the firmware position loop (``tune.pid --a4-holders``)
+    get one 0xA4 / position-velocity target and a poll — that loop, with the
+    rest of the arm stiff on its own firmware loops, set left shoulder_1
+    oscillating (2026-10-07).
+    """
     joints = list(targets)
     if not joints:
+        return
+    if any(
+        getattr(motors[j].motor, "mode", None) != ControlMode.POSITION_VELOCITY
+        for j in joints
+    ):
+        from ..cli.tune.friction import _ramp_verified
+
+        # Hold every other joint where it is now: a probe since the last
+        # ramp moved the test joint off any earlier hold.
+        others = [j for j in motors if j not in targets]
+        now = await asyncio.gather(*[motors[j].get_position() for j in others])
+        for j, pos in zip(others, now):
+            motors[j].hold = pos
+        await _ramp_verified(motors, targets)
         return
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max((abs(p - targets[j]) for j, p in zip(joints, pos_vals)), default=0.0)
@@ -416,8 +444,8 @@ def cached_meas(motor: JointFrameMotor) -> tuple[float, float] | None:
 class HolderMonitor:
     """Round-robin wobble sampler for the non-test joints during a probe.
 
-    The holders sit in firmware POSITION_VELOCITY holds — the stiffest mode
-    the motors offer — but stiff is not *proven quiet*: a holder wobbling at
+    The holders sit in impedance holds (or, with ``tune.pid --a4-holders``,
+    firmware position-loop holds) — and held is not *proven quiet*: a holder wobbling at
     its own resonance feeds structure motion straight back into the test
     joint's ring, and the test joint's encoder alone can never show that.
     One extra position read per command cycle, rotating through the holders

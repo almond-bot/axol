@@ -7,7 +7,7 @@ Identifies the four friction-model parameters for one joint via a bidirectional 
 
 **Friction model:** `τ = Fc·tanh(0.1·k·v) + Fv·v + Fo`
 
-Sweep safety is built in: shoulder_2 sweeps only its outboard side, capped at 0 (starting at rest is fine — travel past it swings into the base); wrist_2 gets the elbow raised to midpoint, which clears the gripper from the base through its **full** range; and shoulder_3 / wrist_1 sweeps hold shoulder_2 10° outboard so the arm swings clear of the chest cameras. The sweep poses are shared with [`tune.gravity`](/cli/tune-gravity), which additionally needs the test joint gravity-*loaded* — so shoulder_3 sweeps with shoulder_1 raised 90° and the elbow bent (capped ±90°), wrist_1 with the elbow bent and wrist_2 at 85° (capped ±90°), and wrist_2 adds wrist_1 at 90° to the elbow raise. The friction fit is pose-independent (the fwd/bwd half-difference cancels gravity), so sharing the loaded poses costs it nothing.
+Sweep safety is built in: shoulder_2 sweeps only its outboard side, capped at 0 (starting at rest is fine — travel past it swings into the base); wrist_2 gets the elbow raised to midpoint, which clears the gripper from the base through its **full** range; and shoulder_3 / wrist_1 sweeps hold shoulder_2 10° outboard so the arm swings clear of the chest cameras. The sweep poses are shared with [`tune.gravity`](/cli/tune-gravity), which additionally needs the test joint gravity-*loaded* — so shoulder_3 sweeps with shoulder_1 raised to humerus-horizontal (+90° on the left arm, −90° on the right — the shoulder_1 frame is mirrored, and +90° is the right arm's hard stop) and the elbow bent (capped ±90°), wrist_1 with the elbow bent and wrist_2 at 85° (capped ±90°), and wrist_2 adds wrist_1 at 90° to the elbow raise. The friction fit is pose-independent (the fwd/bwd half-difference cancels gravity), so sharing the loaded poses costs it nothing.
 
 Friction is motor-specific — the shared defaults in `config.py` were measured on one reference robot. Run this per joint, per arm, on every robot you build, and pass `--save` to persist the fit to that machine's calibration file (`~/.almond/calibration.json`). `AxolConfig` loads the file on construction, so saved values apply to every operation on the robot without a code change; explicit config overrides still win over them.
 
@@ -16,17 +16,28 @@ Friction is motor-specific — the shared defaults in `config.py` were measured 
 | `--l` / `--r` | Arm side (required) |
 | `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
-| `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
-| `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
-| `--velocities V [V ...]` | Velocity setpoints in deg/s (default: 7.2, 18, 36, 54, 72) |
+| `--kp FLOAT` | Proportional gain (default: the calibration gains, below) |
+| `--kd FLOAT` | Derivative gain (default: the calibration gains) |
+| `--velocities V [V ...]` | Velocity setpoints in deg/s (default: 7.2, 18, 36, 54, 72; `--profile slow`: 1, 2, 3, 5, 8, 15, 30) |
+| `--profile {standard,slow}` | `slow` is the calibration for slow, smooth motion: 1–30°/s, the speeds under 8°/s swept in two windows (the joint's least- and most-loaded angles, ~15 s of travel each way), fitted with the realtime core's own friction law — sliding `fc + fl·\|g\|` (with the runtime's k cap), viscous `fv`, and the low-speed Stribeck excess `dfs + ls·\|g\|` over `vs`. `--save` stores the friction fit **and** the `stribeck_*` fields. About 5–8 min per joint |
+| `--stribeck-gain G` | Share of the fitted low-speed excess the runtime cancels, saved with `--profile slow` (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere — on the jelly robot's shoulder_2 / shoulder_3 it made slow_osc 30% / 18% rougher than the same friction fit without it) |
+| `--fit-csv PATH [PATH ...]` | Fit the slow-profile model to saved `--raw-csv` files (or `scripts/runs_to_friction_csv.py` output from creep runs) without moving anything; `--save` still applies |
 | `--lo DEG` | Override lower joint limit for the sweep (degrees) |
 | `--hi DEG` | Override upper joint limit for the sweep (degrees) |
 | `--save` | Save the fitted parameters to `~/.almond/calibration.json` |
 | `--dump-csv [PATH]` | Write per-bin `(v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff)` rows to a CSV for offline plotting / arm-vs-arm comparison. Pass without a value to auto-name as `logs/friction_<side>_<joint>_<timestamp>.csv` |
+
+<Note>
+  Every calibration tool (`tune.factory`, `tune.friction`, `tune.gravity`, `tune.breakaway`) holds and moves the arm on impedance only, at fixed calibration gains (kp/kd 250/3.5 on the shoulders, 180/5 shoulder_3, 130/5 elbow, 180/1.7 wrist_1, 130/2.25 and 130/2 the Damiao wrists) with gravity fed forward — never the motors' own position loops (0xA4), and never the production gains, which rely on the realtime core's host damping. Every joint is held before anything moves.
+</Note>
 
 ```bash
 axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
 axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
 axol tune.friction --l --joint wrist_1 --velocities 12 35 60
 axol tune.friction --l --joint shoulder_2 --dump-csv
+axol tune.friction --r --joint shoulder_1 --profile slow --raw-csv s1-slow.csv --save
+axol tune.friction --r --joint shoulder_1 --fit-csv s1-slow.csv creep-s1.csv
 ```
+
+**Why the slow profile.** The core's Coulomb term is capped at k = 100, so it applies only 17% of `fc` at 1°/s and 48% at 3°/s; whatever friction the joint really has at those speeds must come from the Stribeck term, whose `tanh(v/0.02)` is sharp. The slow profile measures exactly those speeds and fits both terms together, so the runtime cancels the friction the joint has where slow motion runs. On the jelly robot's right shoulder_1 the hand-tuned setting applied ~1.10 Nm at 3°/s under 5 Nm of load against 0.93 Nm measured; the fit applies 0.93.

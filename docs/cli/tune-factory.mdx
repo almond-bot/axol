@@ -5,7 +5,7 @@ description: "Factory calibration: friction + gravity for all 14 joints in one r
 
 Full-robot factory calibration: identifies friction ([`tune.friction`](/cli/tune-friction)) and gravity CoM ([`tune.gravity`](/cli/tune-gravity)) for **all 14 joints** (both arms × 7) in one command. Also available from the diagnostics dashboard's Tuning workbench (`axol serve`).
 
-One bidirectional multi-velocity sweep per joint yields both fits — the half-difference of forward/backward torque gives the friction model (`Fc`, `k`, `Fv`), the average gives the gravity curve the CoM is fit to, with the friction offset `Fo` refit against the corrected model. Each arm runs **distal → proximal** (`wrist_3` → … → `shoulder_1`) and every joint's fit is saved before the next joint sweeps, so proximal sweeps see already-corrected distal links — the ordering `tune.gravity` asks the operator to keep by hand happens automatically here. Sweep safety and the gravity-load poses (base-collision caps, elbow raised for `wrist_2`, camera clearance, and axis-vertical joints posed so gravity actually loads them — see [`tune.gravity`](/cli/tune-gravity)) match the individual tools.
+One bidirectional multi-velocity sweep per joint yields both fits — the half-difference of forward/backward torque gives the friction model, the average gives the gravity curve the CoM is fit to, with the friction offset `Fo` refit against the corrected model. The default **slow profile** is [`tune.friction --profile slow`](/cli/tune-friction)'s sweep (1, 2, 3, 5, 8, 15, 30°/s, the speeds under 8°/s in a low- and a high-load window) fitted with the realtime core's own friction law — sliding `fc + fl·|g|`, viscous `fv`, and the low-speed Stribeck excess `dfs + ls·|g|` over `vs` — with the full-range passes feeding the gravity fit; the Stribeck share cancelled is saved per joint (`0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere). About 6 min per joint, ~1.5 h for both arms. `--profile standard` is the old, quicker 7–72°/s Coulomb + viscous sweep. Each arm runs **distal → proximal** (`wrist_3` → … → `shoulder_1`) and every joint's fit is saved before the next joint sweeps, so proximal sweeps see already-corrected distal links — the ordering `tune.gravity` asks the operator to keep by hand happens automatically here. Sweep safety and the gravity-load poses (base-collision caps, elbow raised for `wrist_2`, camera clearance, and axis-vertical joints posed so gravity actually loads them — see [`tune.gravity`](/cli/tune-gravity)) match the individual tools.
 
 Results are saved to `~/.almond/calibration.json` (this machine uses them immediately) **and** uploaded to Supabase Storage keyed by the robot's identity — the Axol hub adapter's USB serial, which travels with the arms across compute-host swaps. The documents live in a **public** bucket (`axol-calibrations/<hub_serial>.json`), so fetching them needs no credentials at all — only uploading does.
 
@@ -34,6 +34,14 @@ axol tune.factory --mass wrist_3=1.1                                          # 
 axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14    # one arm, seeded CoM
 ```
 
+### Keeping a hand-tuned gravity model
+
+If the robot's gravity comp was tuned by hand in the panel (Settings → Advanced → Axol: per-link `mass` / `com`), run with `--keep-gravity`. Teleop and the SDK run those settings on top of the calibration file, but the factory otherwise models gravity from the file alone — so the fitted `Fo` and load terms would be against a model the robot never runs, and fitted CoMs on links the settings don't touch would mix in. With `--keep-gravity` the settings' link masses and CoMs are handed to every fit (written to the calibration file first, like `--mass` / `--com`, which still win over them), and no CoM or mass is fitted or saved: the run saves friction, Stribeck and `Fo` only. Without the flag, a robot whose settings override link mass or CoM gets a warning at start.
+
+```bash
+axol tune.factory --keep-gravity
+```
+
 The resulting document (local file and cloud copy) carries `mass` (kg) next to `friction` and `com` for each joint:
 
 ```json
@@ -54,15 +62,33 @@ The resulting document (local file and cloud copy) carries `mass` (kg) next to `
 |---|---|
 | `--arms {both,left,right}` | Which arm(s) to calibrate (default: both) |
 | `--left-channel IFACE` / `--right-channel IFACE` | CAN interface overrides (default: the Axol hub's persistent names) |
-| `--velocities DEG_S …` | Friction velocity sweep in deg/s (default: `7.2 18 36 54 72`). Fewer velocities = quicker run, coarser friction fit |
+| `--profile {slow,standard}` | `slow` (default): the slow-motion friction calibration above. `standard`: the old 7–72°/s Coulomb + viscous fit (no load or low-speed terms) |
+| `--velocities DEG_S …` | Sweep speeds in deg/s (default: slow `1 2 3 5 8 15 30`; standard `7.2 18 36 54 72`) |
+| `--stribeck-gain G` | Stribeck share saved for every joint (default `0.8` on `shoulder_1`, `shoulder_2` and `elbow`, `0` elsewhere) |
+| `--raw-dir DIR` | Write each joint's raw sweep samples to `DIR/<side>-<joint>.csv` — re-fit them any time with `tune.friction --fit-csv` |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
+| `--keep-gravity` | Keep the [hand-tuned gravity model](#keeping-a-hand-tuned-gravity-model) from the panel settings: fit against it, save friction, Stribeck and `Fo` only |
 | `--mass [SIDE.]JOINT=KG` | Link mass for a [custom end-effector](#custom-end-effectors), repeatable (e.g. `wrist_3=1.1` for both arms, `left.wrist_3=1.1`). Saved and uploaded with the calibration |
 | `--com SIDE.JOINT=X,Y,Z` | Starting link CoM in metres (that arm's URDF link frame), repeatable. The gravity fit refines it; uploaded as-is if the fit is rejected |
+
+<Note>
+  Every calibration tool (`tune.factory`, `tune.friction`, `tune.gravity`, `tune.breakaway`) holds and moves the arm on impedance only, at fixed calibration gains (kp/kd 250/3.5 on the shoulders, 180/5 shoulder_3, 130/5 elbow, 180/1.7 wrist_1, 130/2.25 and 130/2 the Damiao wrists) with gravity fed forward — never the motors' own position loops (0xA4), and never the production gains, which rely on the realtime core's host damping. Every joint is held before anything moves.
+</Note>
 
 ```bash
 axol tune.factory                     # both arms, upload if credentials exist
 axol tune.factory --arms left
-axol tune.factory --velocities 18 36  # quicker sweep
+axol tune.factory --raw-dir ~/factory-raw   # keep the raw sweeps too
+axol tune.factory --profile standard  # the old, quick sweep
+```
+
+## calibration.push
+
+Uploads this robot's **local** calibration file (`~/.almond/calibration.json` — whatever `tune.friction`, `tune.gravity`, `tune.pid`, … saved here, sanitized the way every config load reads it) to the cloud under the hub serial, merged per joint over what is already stored. For a robot calibrated joint by joint, it shares the values without re-running `tune.factory`. Needs the same write key; `--dry-run` shows what would be uploaded without it.
+
+```bash
+axol calibration.push --dry-run
+axol calibration.push
 ```
 
 ## calibration.pull

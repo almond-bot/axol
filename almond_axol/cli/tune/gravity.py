@@ -56,7 +56,7 @@ from dataclasses import replace
 import numpy as np
 
 from ...constants import ARM_JOINTS
-from ...motor import CanBus, ControlMode, Joint, Motor
+from ...motor import CanBus, Joint, Motor
 from ...robot.calibration import (
     CALIBRATION_PATH,
     load_calibration,
@@ -68,10 +68,12 @@ from ...robot.identity import hub_serial
 from ...tuning import joint_frame_motors, ramp_stages, save_run, sweep_safety
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
+    CAL_GAINS,
+    _enter_impedance_hold,
     _home_all,
     _identify_joint,
-    _ramp_to,
     _ramp_verified,
+    _safe_torque_off,
 )
 
 # Central-difference step for the CoM sensitivity columns (metres). Gravity
@@ -271,13 +273,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--kp",
         type=float,
         default=None,
-        help="Sweep-hold proportional gain (default: from config)",
+        help="Sweep-hold proportional gain (default: the calibration gains, "
+        "friction.CAL_GAINS)",
     )
     p.add_argument(
         "--kd",
         type=float,
         default=None,
-        help="Sweep-hold derivative gain (default: from config)",
+        help="Sweep-hold derivative gain (default: the calibration gains)",
     )
     p.add_argument(
         "--save",
@@ -313,8 +316,9 @@ async def _run(args: argparse.Namespace) -> None:
     serial = hub_serial()
     resolved = AxolConfig().resolved()
     jc = getattr(resolved.left if is_left else resolved.right, joint.value)
-    kp = args.kp if args.kp is not None else jc.kp
-    kd = args.kd if args.kd is not None else jc.kd
+    # Fixed calibration gains unless overridden (see friction.CAL_GAINS).
+    kp = args.kp if args.kp is not None else CAL_GAINS[joint][0]
+    kd = args.kd if args.kd is not None else CAL_GAINS[joint][1]
 
     print(f"\nAxol gravity identification — {side_str} {joint.value}")
     print(f"  Sweep velocity: {args.velocity:g} deg/s   Kp={kp}  Kd={kd}")
@@ -346,12 +350,8 @@ async def _run(args: argparse.Namespace) -> None:
         raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in raw_motors.values()])
         motors = await joint_frame_motors(raw_motors, is_left)
-        await asyncio.gather(
-            *[
-                m.set_control_mode(ControlMode.POSITION_VELOCITY)
-                for m in motors.values()
-            ]
-        )
+        # Every joint on impedance and held where it is before anything moves.
+        await _enter_impedance_hold(motors)
         try:
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
@@ -368,9 +368,6 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"  {note}")
             for stage in ramp_stages(other_targets):
                 await _ramp_verified(motors, stage)
-
-            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
-            await asyncio.sleep(1.0)
 
             avg_samples, _halfdiff = await _identify_joint(
                 motors[joint],
@@ -417,20 +414,12 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
-            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
-            if in_impedance:
-                try:
-                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-                except Exception:
-                    pass
             try:
-                await _home_all(motors, exclude=joint if in_impedance else None)
-            except Exception:
-                pass
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
-            )
-            await asyncio.gather(*[m.disable() for m in motors.values()])
+                await _home_all(motors)
+            except Exception as exc:  # noqa: BLE001 - reported, arm keeps holding
+                print(f"  ! return to rest did not complete: {exc}")
+            # Disables only at rest: a joint off rest would fall.
+            await _safe_torque_off(motors)
 
 
 def _report_and_save(

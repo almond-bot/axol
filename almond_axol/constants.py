@@ -46,6 +46,13 @@ CAN_CHEST = "can_alm_axol_c"
 # cron/systemd, so it must live outside the operator-writable state tree.
 CAN_BRINGUP_SCRIPT: Path = Path("/etc/almond-axol/can/startup.sh")
 
+# USB-resets the arm hub, then runs CAN_BRINGUP_SCRIPT. The hub's firmware
+# keeps up to 10 frames per channel through the driver's link-down reset and
+# transmits them on the next open (kernel: "Unexpected unused echo id"), so a
+# flap cannot purge frames queued behind a stalled bus; this is what the
+# purge runs instead. Written by `axol can.setup`, root-owned like the above.
+CAN_RESET_SCRIPT: Path = Path("/etc/almond-axol/can/reset_adapter.sh")
+
 # Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
 CAN_MANTIS_LEFT = "can_mantis_l"
