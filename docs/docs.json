@@ -170,7 +170,8 @@
                 "group": "Lift",
                 "pages": [
                   "cli/lift-home",
-                  "cli/lift-goto"
+                  "cli/lift-goto",
+                  "cli/lift-update"
                 ]
               },
               {

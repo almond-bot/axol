@@ -19,7 +19,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 
 import can
 import numpy as np
@@ -54,7 +54,7 @@ from .control import (
     stribeck_amplitude,
     stribeck_excess,
 )
-from .gravity import GravityCompensator
+from .gravity import GravityCompensator, PayloadSide, payload_sides
 
 _logger = logging.getLogger(__name__)
 
@@ -2950,6 +2950,28 @@ class AxolHardware(RobotBase):
             self.left.reset_gravity_hold()
         if self.right is not None:
             self.right.reset_gravity_hold()
+
+    def set_payload(
+        self,
+        side: PayloadSide,
+        mass: float,
+        com: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Tell the gravity model what the gripper is holding.
+
+        See :meth:`almond_axol.robot.Axol.set_payload` for the full contract.
+        Pure model state — no CAN traffic — so it is safe at any time,
+        enabled or not; it takes effect on the next control cycle.
+        """
+        for is_left in payload_sides(side):
+            self._gravity_comp.set_payload(mass, com, is_left=is_left)
+
+    def payload(self, side: PayloadSide) -> tuple[float, np.ndarray]:
+        """The payload set on one arm: ``(mass_kg, com_m)`` in the gripper frame."""
+        if side == "both":
+            raise ValueError("payload() reads one arm: pass 'left' or 'right'")
+        (is_left,) = payload_sides(side)
+        return self._gravity_comp.payload(is_left=is_left)
 
     def reset_command_state(self) -> None:
         """Clear cached command history on both arms after an out-of-band move.

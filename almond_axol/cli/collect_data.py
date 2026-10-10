@@ -261,11 +261,13 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
 
     def quest_error() -> ValueError:
         return ValueError(
-            "Mantis Quest production collection requires measured left and "
-            "right transforms under one profile-scoped "
+            "Mantis Quest production collection requires factory or measured "
+            "left and right transforms under one profile-scoped "
             "`quest:<WebXR-profile>:grip` key. Bare `quest`, target-ray, "
             "missing, or conflicting datum metadata is unsafe because the "
-            "controller-local frame differs. Add the constants to "
+            "controller-local frame differs. Quest 3 Touch Plus controllers "
+            "(`quest:meta-quest-touch-plus:grip`) ship a factory transform; "
+            "for other controllers add the constants to "
             f"{MANTIS_TCP_TRANSFORM_FILE}; the live WebXR profile is "
             "reported by the updated Quest client. Use "
             "--mantis_allow_uncalibrated true only for a bring-up capture "
@@ -399,11 +401,12 @@ def _require_mantis_resume_transform(
     row-level data carries nothing that could tell them apart afterwards.
     Datasets predating the ``mantis_tcp_transform`` marker field were recorded
     with the Rx(+90°) Vive rotation; ``axol migrate-dataset
-    --mantis-tcp-rotation`` repairs them (and stamps the field), after which
-    they can be resumed.
+    --mantis-tcp-rotation`` repairs the rotation (and stamps the field).
+    Factory Vive datasets from axol 0.2.5–0.2.16 carry the retired
+    92 mm-forward translation and stay refused under the current constants.
     """
     from ..mantis.calibration import (
-        DESIGN_TCP_TRANSFORM_ID,
+        LEGACY_DESIGN_TCP_TRANSFORM_ID,
         MEASURED_TCP_TRANSFORM_ID,
         UNCALIBRATED_TCP_TRANSFORM_ID,
         same_tcp_transform,
@@ -420,8 +423,8 @@ def _require_mantis_resume_transform(
     recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
     current = _mantis_tcp_transform_provenance(cfg)
     if recorded is None and cfg.mantis_source == "quest":
-        # Quest never had a factory constant, so the old rows used a per-unit
-        # measurement this run cannot check against.
+        # Quest had no factory constant before the marker existed, so the old
+        # rows used a per-unit measurement this run cannot check against.
         _logger.warning(
             "Resuming a Mantis Quest dataset (%s) recorded before axol stamped "
             "its tracker→gripper transforms into meta/axol.json; make sure the "
@@ -449,7 +452,8 @@ def _require_mantis_resume_transform(
     if UNCALIBRATED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Bring-up captures are explicitly not training data; nothing to protect.
         return
-    if recorded_id == current_id == DESIGN_TCP_TRANSFORM_ID:
+    if recorded_id == current_id != MEASURED_TCP_TRANSFORM_ID:
+        # Factory ids are versioned per constant: equal ids, equal transforms.
         return
     if MEASURED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Compare as rigid transforms (q and -q are the same rotation), the
@@ -460,6 +464,15 @@ def _require_mantis_resume_transform(
             for side in ("left", "right")
         ):
             return
+    if recorded_id == LEGACY_DESIGN_TCP_TRANSFORM_ID:
+        raise ValueError(
+            f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
+            "with the axol 0.2.5–0.2.16 factory Vive tracker→gripper transform, "
+            "whose translation put the tracker 92 mm in front of the gripper "
+            "instead of 47 mm behind it. This run resolved "
+            f"{current['id']!r}, and appending would mix two pose conventions "
+            "in one dataset. Record to a new repo_id."
+        )
     raise ValueError(
         f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
         f"with tracker→gripper transforms {recorded_id!r} but this run resolved "

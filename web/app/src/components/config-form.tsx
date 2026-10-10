@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { SuggestInput, type FieldSuggestion } from "@/components/suggest-input"
 import { Label } from "@/components/ui/label"
+import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { cn, sentenceCase } from "@/lib/utils"
 
@@ -434,6 +435,27 @@ export function FieldRow({
           {labelNode}
           <Switch checked={checked} disabled={disabled} onChange={(v) => onChange(field.key, v)} />
         </div>
+      </div>
+    )
+  }
+
+  if (field.ui?.widget === "slider" && field.type === "number") {
+    const min = field.ui.min ?? 0
+    const max = field.ui.max ?? 1
+    const current = Number(has ? value : (field.default ?? min))
+    return (
+      <div className="flex flex-col gap-1.5">
+        {labelNode}
+        <Slider
+          value={Number.isFinite(current) ? current : min}
+          min={min}
+          max={max}
+          step={field.ui.step ?? 0.05}
+          disabled={disabled}
+          onChange={(v) => onChange(field.key, v)}
+          format={(v) => v.toFixed(2)}
+          aria-label={sentenceCase(field.label)}
+        />
       </div>
     )
   }
