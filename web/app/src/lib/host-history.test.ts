@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest"
 
-import { HOST_HISTORY_STORAGE, loadHostHistory, recordHost } from "./host-history"
+import {
+  HOST_HISTORY_STORAGE,
+  VR_HOST_HISTORY_STORAGE,
+  loadHostHistory,
+  recordHost,
+} from "./host-history"
 
 describe("host history", () => {
   beforeEach(() => localStorage.clear())
@@ -30,5 +35,12 @@ describe("host history", () => {
     expect(loadHostHistory()).toEqual([])
     localStorage.setItem(HOST_HISTORY_STORAGE, JSON.stringify(["ok", 3, ""]))
     expect(loadHostHistory()).toEqual(["ok"])
+  })
+
+  it("keeps separate lists per storage key", () => {
+    recordHost("panel.local")
+    recordHost("teleop.local", VR_HOST_HISTORY_STORAGE)
+    expect(loadHostHistory()).toEqual(["panel.local"])
+    expect(loadHostHistory(VR_HOST_HISTORY_STORAGE)).toEqual(["teleop.local"])
   })
 })
