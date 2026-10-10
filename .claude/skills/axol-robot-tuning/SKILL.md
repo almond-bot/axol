@@ -199,7 +199,7 @@ Then expect the tuning to differ from jelly's:
 - The shipped gains were tuned with ~0.75 kg at the wrist. A heavier or
   longer end-effector lowers the arm's modes (more 1–3 Hz sway, wrist and
   elbow rings); a lighter one raises them. Before any A/B, run `hold` and
-  `wirst_swing` and read each joint's `buzz@Hz`: a new buzz or ring on a
+  `fast_swing` and read each joint's `buzz@Hz`: a new buzz or ring on a
   wrist is the first thing to fix (wrist `kp` / `kd` down; wrist_2 `kd`
   never above 2.25).
 - `reference/numbers.md` is jelly with the stock gripper: compare the robot
@@ -290,8 +290,10 @@ damped settings traded sway for shake.
    robot that has one is fixed, not worked around. No cameras: add
    `--no-imu` to every `plan`, and have their own IMU logging (section
    above) — or the summary decides on the encoders.
-2. Motions: `python scripts/creep_motions.py --all` (creeps for every joint,
-   both arms, plus `slow_osc_left.npz`).
+2. Motions: `slow_osc`, `fast_swing` (each with a `_left` mirror) and
+   `hold` are built in — generated in code, the same on every robot, no
+   recording needed. For the per-joint creeps run
+   `python scripts/creep_motions.py --all` (every joint, both arms).
 3. Baseline both arms (compare the arms with each other — an asymmetry is a
    lead):
 
@@ -299,7 +301,7 @@ damped settings traded sway for shake.
 python scripts/tuning_queue.py plan ~/tuning/base --arm right --motion slow_osc \
     --rounds 2 --repeat 3 --variant base
 python scripts/tuning_queue.py plan ~/tuning/base --arm left \
-    --motion ~/.almond/motions/slow_osc_left.npz --rounds 2 --repeat 3 --variant base
+    --motion slow_osc_left --rounds 2 --repeat 3 --variant base
 python scripts/tuning_queue.py run ~/tuning/base
 python scripts/tuning_queue.py summary ~/tuning/base
 ```
@@ -347,8 +349,7 @@ python scripts/tuning_queue.py summary ~/tuning/s3   # decides on imu.low_mm (en
 
 Screen many candidates cheaply on the joint's creep first (`summary
 --metric rip3_rms_mdeg`), then confirm only the survivors on `slow_osc`.
-Also run one fast motion (`shoulder_1_no_load` or `wirst_swing`) with the
-winner: it must add no buzz.
+Also run the fast motion (`fast_swing`) with the winner: it must add no buzz.
 
 `summary` gives per-round means, the change against the baseline, rounds
 won, and a conservative verdict:

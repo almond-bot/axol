@@ -1,14 +1,13 @@
 """Write the per-joint creep motions the slow-motion tuning is judged on.
 
 A creep moves one joint at constant 6 and 3 deg/s between two angles, every
-other joint held at ``slow_osc``'s start pose — so the joint's own slow-speed
-ripple (friction, Stribeck, cogging) shows without the rest of the arm
-moving. The angles are the ones run on the jelly robot (right arm; the left
+other joint held at the built-in start pose (``tuning.motion.START_POSE_DEG``)
+— so the joint's own slow-speed ripple (friction, Stribeck, cogging) shows
+without the rest of the arm moving. The angles are the ones run on the jelly robot (right arm; the left
 arm is the mirror, every joint negated). ``wrist_2`` stays in its outboard
 half: with the elbow this straight, the inboard half meets the base.
 
     uv run python scripts/creep_motions.py --all            # every joint, both arms
-                                                            # (+ slow_osc_left.npz)
     uv run python scripts/creep_motions.py --joint shoulder_3 --arm left
     uv run python scripts/creep_motions.py --list
 
@@ -55,10 +54,10 @@ _MARGIN_DEG = 3.0
 
 
 def start_pose() -> np.ndarray:
-    """``slow_osc``'s first sample: both arms, 14 joints (rad)."""
-    from almond_axol.tuning.motion import MOTIONS_DIR
+    """The built-in start pose: both arms, 14 joints (rad)."""
+    from almond_axol.tuning.motion import start_pose as pose
 
-    return np.load(MOTIONS_DIR / "slow_osc.npz")["q"][0].astype(float)
+    return pose()
 
 
 def leg(q0: float, q1: float, v_dps: float, ta: float = 0.3) -> np.ndarray:
@@ -132,7 +131,7 @@ def build(
     q[:, col] = x
     meta = {
         "source": f"synthetic: {arm} {joint} creep at 3 and 6 deg/s, every other "
-        "joint at slow_osc's start pose (scripts/creep_motions.py)",
+        "joint at the built-in start pose (scripts/creep_motions.py)",
         "legs_deg_dps": legs,
     }
     return q, meta
@@ -152,23 +151,6 @@ def write(joint: str, arm: str, out_dir: Path = OUT_DIR) -> Path:
     return path
 
 
-def write_slow_osc_left(out_dir: Path = OUT_DIR) -> Path:
-    """``slow_osc`` mirrored onto the left arm (every joint negated, the arms
-    swapped) — the packaged one drives the right arm."""
-    from almond_axol.tuning.motion import MOTIONS_DIR
-
-    z = np.load(MOTIONS_DIR / "slow_osc.npz")
-    q = z["q"].astype(float)
-    ql = -np.concatenate([q[:, 7:], q[:, :7]], axis=1)
-    meta = {"source": "slow_osc mirrored to the left arm (scripts/creep_motions.py)"}
-    out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / "slow_osc_left.npz"
-    np.savez(
-        path, q=ql.astype(np.float32), rate=z["rate"], meta=np.array(json.dumps(meta))
-    )
-    return path
-
-
 def main() -> None:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -184,8 +166,6 @@ def main() -> None:
         p.error("give --joint or --all")
     arms = ("right", "left") if args.arm == "both" else (args.arm,)
     pose = start_pose()
-    if args.all and not args.list and "left" in arms:
-        print(write_slow_osc_left(args.out))
     for j in joints:
         for a in arms:
             if args.list:

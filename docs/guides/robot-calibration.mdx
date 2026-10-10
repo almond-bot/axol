@@ -41,13 +41,13 @@ A machine picks up its robot's calibration automatically at the end of [`can.set
 
 ## Check the result
 
-Replay the slow-motion reference and read the wrist IMU's shake score:
+Replay the built-in slow-motion reference (`slow_osc`: the arm bent up in front while shoulder_1 sweeps slowly back and forth, generated in code and the same on every robot) and read the wrist IMU's shake score:
 
 ```bash
 axol tune.motion --motion slow_osc --arms right --repeat 2
 ```
 
-Each pass prints a `wrist IMU (right): … vertical X mm = 1-3 Hz … + 3-15 Hz …` line. Compare against the same command before calibrating, in the same session (the score drifts 10–20% across a day). The wrist camera only *measures* here; nothing feeds back from it.
+Each pass prints a `wrist IMU (right): … vertical X mm = 1-3 Hz … + 3-15 Hz …` line. Compare against the same command before calibrating, in the same session (the score drifts 10–20% across a day). Jelly's numbers above were measured on an earlier recorded version of `slow_osc`, so treat them as an order of magnitude, not a target. The wrist camera only *measures* here; nothing feeds back from it.
 
 <Note>
   One joint at a time: [`tune.friction --profile slow`](/cli/tune-friction) calibrates a single joint's friction (and `--fit-csv` re-fits a saved sweep), [`tune.gravity`](/cli/tune-gravity) its gravity. Push the result with `calibration.push`.

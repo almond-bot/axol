@@ -3,7 +3,10 @@
 Measured on Almond's jelly robot with the shipped gains and a fresh
 `tune.factory` calibration. Use them as orders of magnitude, not targets —
 compare a robot mainly with itself (interleaved) and its two arms with each
-other.
+other. These were measured on jelly's old *recorded* `slow_osc` (and
+`wirst_swing` / `shoulder_1_no_load`); the built-in `slow_osc` and
+`fast_swing` that replaced them are generated approximations, so expect the
+same order of magnitude, not the same numbers.
 
 ## slow_osc (right arm, wrist IMU) — the acceptance test
 
@@ -29,7 +32,7 @@ other.
 - Buzz cost: accel up > ~10% or its peak moving to 8–12 Hz = added buzz.
 - Tracking: lag 55–65 ms; `lagfree` RMS s1 0.09–0.16°, s2 ~0.33°, elbow
   0.28–0.39°; closed-loop modes s1 ~2.4 Hz, elbow ~3.2 Hz, ζ ≈ 0.5–0.6.
-- Fast replays (`wirst_swing`, `shoulder_1_no_load`): 4–15 mm, mostly
+- Fast replays (jelly's old `wirst_swing`, `shoulder_1_no_load`): 4–15 mm, mostly
   1–3 Hz — only check that a change adds no buzz there.
 
 ## Creep ripple at 3 °/s (mdeg RMS, `rip3_rms_mdeg`) and wrist-IMU sway

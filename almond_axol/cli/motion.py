@@ -1,8 +1,8 @@
 """
 axol motion.build / motion.list
 
-Build and inspect the committed reference motions used by ``axol
-tune.motion``.
+Build and inspect the reference motions used by ``axol tune.motion``
+(besides the built-in ``slow_osc``, ``fast_swing`` and ``hold``).
 
 ``motion.build`` postprocesses a flight-recorder capture into a reference
 motion. The capture comes from either recorder: a teleoperated session
@@ -13,9 +13,8 @@ its still lead-in/lead-out). Either way the stream is resampled onto a
 uniform grid, zero-phase smoothed (keeping the operator's intent, dropping
 tremor and network jitter), and projected waypoint-by-waypoint through the
 collision-aware solver so the stored motion is joint-limit- and
-self-collision-safe by construction. The result lands in the package's
-``almond_axol/tuning/motions/`` directory — commit it so every robot can
-replay the identical motion.
+self-collision-safe by construction. The result lands in
+``~/.almond/motions/`` on the robot, where ``tune.motion`` finds it by name.
 
 Examples:
     axol teleop --teleop.record rec1        # record via teleop, or ...
@@ -35,7 +34,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     """Register the ``motion.build`` and ``motion.list`` subcommands."""
     b = subparsers.add_parser(
         "motion.build",
-        help="Build a committed reference motion from a recorded session "
+        help="Build a reference motion from a recorded session "
         "(teleop or gravity-comp).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
@@ -53,16 +52,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     b.add_argument(
         "--name",
         default=None,
-        help="Motion name; the file is written to the package's committed "
-        "motions directory as <name>.npz (use --out for another location). "
+        help="Motion name; the file is written to ~/.almond/motions/ as "
+        "<name>.npz (use --out for another location). "
         "Defaults to the recording's name.",
     )
     b.add_argument(
         "--out",
         default=None,
         metavar="PATH",
-        help="Write the motion to an explicit path instead of the committed "
-        "motions directory",
+        help="Write the motion to an explicit path instead of ~/.almond/motions/",
     )
     b.add_argument(
         "--rate",
@@ -107,8 +105,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     c.add_argument("joint", metavar="SIDE.JOINT", help="e.g. right.shoulder_1")
     c.add_argument(
         "--base",
-        default="slow_osc",
-        help="Motion whose first pose the sweep is centred on (default slow_osc)",
+        default=None,
+        help="Motion whose first pose the sweep is centred on (default: the "
+        "built-in start pose, shoulder_1 and the elbow raised)",
     )
     c.add_argument(
         "--f0", type=float, default=0.3, help="Start frequency, Hz (default 0.3)"
@@ -152,7 +151,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
     ls = subparsers.add_parser(
         "motion.list",
-        help="List the committed reference motions.",
+        help="List the reference motions: the built-ins and ~/.almond/motions/.",
     )
     ls.set_defaults(func=run_list)
 
@@ -164,7 +163,7 @@ def run_chirp(args: argparse.Namespace) -> None:
 
     from ..constants import ARM_JOINTS, Joint
     from ..robot.axol import arm_limits
-    from ..tuning.motion import load_motion, save_motion
+    from ..tuning.motion import MOTIONS_DIR, load_motion, save_motion, start_pose
     from ..tuning.tracking_model import chirp_motion
 
     side, _, joint = args.joint.partition(".")
@@ -172,7 +171,7 @@ def run_chirp(args: argparse.Namespace) -> None:
     if side not in ("left", "right") or joint not in names:
         raise SystemExit(f"motion.chirp wants SIDE.JOINT, got {args.joint!r}")
     col = (0 if side == "left" else 7) + names.index(joint)
-    base = load_motion(args.base).q[0].astype(float)
+    base = load_motion(args.base).q[0].astype(float) if args.base else start_pose()
     motion = chirp_motion(
         base,
         col,
@@ -192,11 +191,7 @@ def run_chirp(args: argparse.Namespace) -> None:
             f"{math.degrees(x.max()):.1f}°, outside {joint}'s "
             f"{math.degrees(lo):.0f}..{math.degrees(hi):.0f}° — pick another --base"
         )
-    out = (
-        Path(args.out)
-        if args.out
-        else Path.home() / ".almond" / "motions" / f"{motion.name}.npz"
-    )
+    out = Path(args.out) if args.out else MOTIONS_DIR / f"{motion.name}.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
     save_motion(motion, out)
     print(
@@ -324,12 +319,12 @@ def _save_build_run(args: argparse.Namespace, prefix: str, motion, raw) -> None:
 
 
 def run_list(args: argparse.Namespace) -> None:
-    """List the committed reference motions."""
-    from ..tuning.motion import list_motions
+    """List the reference motions: the built-ins and ``~/.almond/motions/``."""
+    from ..tuning.motion import MOTIONS_DIR, list_motions
 
     motions = list_motions()
     if not motions:
-        print("No committed reference motions (see axol motion.build --help).")
+        print(f"No reference motions in {MOTIONS_DIR} (see axol motion.build --help).")
         return
     print(f"{'name':<24} {'dur':>6}  {'rate':>5}  {'peak vel':>8}  source")
     for m in motions:

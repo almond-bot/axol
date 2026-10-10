@@ -98,8 +98,8 @@ encoders; `--search`), scores it like the wrist IMU and saves
 `score_run` use it as `imu` (`source: external`) when the run has no wrist
 camera IMU. Runs from before `t0_wall` existed are searched ± 10 s.
 
-**`scripts/creep_motions.py --all`** — per-joint creeps, both arms, plus
-`slow_osc_left.npz`, into `~/.almond/motions/`.
+**`scripts/creep_motions.py --all`** — per-joint creeps, both arms, into
+`~/.almond/motions/`.
 
 ## Avoid (A4) unless Almond asks
 
@@ -110,12 +110,18 @@ stay stock.
 
 ## Reference motions
 
-| Motion | What | Judge on |
-|---|---|---|
-| `slow_osc` (right; `~/.almond/motions/slow_osc_left.npz` for the left) | 28 s smoothed teleop | wrist IMU `low_mm` (1–3 Hz sway), or `enc.low_mm` without a camera — **the acceptance test** |
-| `*_creep[_left]` (generated) | one joint at 3 and 6°/s | `rip3_rms_mdeg`, screening only |
-| `hold` | 40 s still | noise floor, parked buzz, limit cycles |
-| `shoulder_1_no_load`, `wirst_swing` | fast swings (≤ 173°/s) | no new buzz on fast motion |
+The built-ins are generated in code (`almond_axol/tuning/motion.py`), the
+same on every robot and always available by name; a file of the same name in
+`~/.almond/motions/` overrides one. Other motions live in
+`~/.almond/motions/` (`motion.build` from a recording, `creep_motions.py`,
+`motion.chirp`).
+
+| Motion | Where from | What | Judge on |
+|---|---|---|---|
+| `slow_osc` (right; `slow_osc_left` for the left) | built in | 44 s: the arm bends up in front, then shoulder_1 sweeps +2…−38° twice (≤ 9°/s) with the elbow coupled | wrist IMU `low_mm` (1–3 Hz sway), or `enc.low_mm` without a camera — **the acceptance test** |
+| `fast_swing` (right; `fast_swing_left`) | built in | 15 s: 15 large poses, moves peaking at 140°/s | no new buzz on fast motion |
+| `hold` | built in | 40 s still | noise floor, parked buzz, limit cycles |
+| `*_creep[_left]` | `creep_motions.py` | one joint at 3 and 6°/s | `rip3_rms_mdeg`, screening only |
 
 ## Where values live (later wins)
 

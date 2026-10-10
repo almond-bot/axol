@@ -2205,7 +2205,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/tuning/motions")
     async def tuning_motions() -> dict[str, Any]:
-        """The committed reference motions available for tune.motion replays."""
+        """The reference motions in ~/.almond/motions for tune.motion replays."""
         from ..tuning.motion import list_motions
 
         def _list() -> list[dict[str, Any]]:

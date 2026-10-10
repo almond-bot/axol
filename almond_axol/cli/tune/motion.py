@@ -1,7 +1,7 @@
 """
 axol tune.motion
 
-Replay a committed reference motion through the production ``motion_control``
+Replay a reference motion through the production ``motion_control``
 path and score tracking accuracy and smoothness per joint — the closest
 thing to a repeatable teleop session.
 
@@ -39,8 +39,8 @@ Examples:
     axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
     axol tune.motion --motion reach-and-place --stiffness 0.8
     axol tune.motion --motion reach-and-place --ik   # drive through the IK solver
-    axol tune.motion --motion slow_osc --arms right  # one arm only
-    axol tune.motion --motion slow_osc --controller position  # firmware loops, 400 Hz
+    axol tune.motion --motion reach-and-place --arms right  # one arm only
+    axol tune.motion --motion reach-and-place --controller position  # firmware loops, 400 Hz
 """
 
 from __future__ import annotations
@@ -2630,5 +2630,5 @@ def _load_motion_or_exit(name: str) -> ReferenceMotion:
     try:
         return load_motion(name)
     except FileNotFoundError as exc:
-        known = ", ".join(m.name for m in list_motions()) or "(none committed)"
+        known = ", ".join(m.name for m in list_motions()) or "(none recorded)"
         raise SystemExit(f"{exc}\nKnown motions: {known}")
