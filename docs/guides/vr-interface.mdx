@@ -16,6 +16,8 @@ The app's source lives in this repository under `web/` (it was previously the se
 
 Either way, the headset connects to the **VR WebSocket server on port 8000** that [`axol teleop`](/cli/teleop) (and the control panel's teleop/collect operations) runs on the host.
 
+On the connect card, tap the **Axol Host Address** field for a dropdown of the last five hosts the app connected to successfully, newest first — pick one or keep typing. A host is remembered only once its teleop socket actually opens (including `?host=…&autoconnect=1` links), and the list is the VR app's own, kept in the headset browser separately from the [control panel's](/guides/control-panel#axol-host) recent hosts.
+
 <Note>
   On networks where Wi-Fi adds latency, tick **Quest over USB** on the connect screen to stream controller poses over a USB cable instead — the camera feeds keep using the LAN. See [Quest over USB](/guides/quest-over-usb).
 </Note>

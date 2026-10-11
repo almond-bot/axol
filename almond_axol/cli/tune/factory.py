@@ -79,22 +79,22 @@ from ...tuning import (
 )
 from ..can.setup import hub_serial
 from .friction import (
+    _SWEEP_MARGIN,
+    CAL_GAINS,
     DEFAULT_VELOCITIES_DEG,
     SLOW_VELOCITIES_DEG,
-    _SWEEP_MARGIN,
+    _compare_to_gravity_model,
+    _enter_impedance_hold,
+    _fit_friction_halfdiff,
+    _home_all,
+    _identify_joint,
     _identify_slow,
+    _ramp_verified,
+    _safe_torque_off,
     _stribeck_gain,
     fit_and_report,
     slow_profile_seconds,
     sweep_load,
-    _compare_to_gravity_model,
-    _fit_friction_halfdiff,
-    CAL_GAINS,
-    _enter_impedance_hold,
-    _home_all,
-    _identify_joint,
-    _ramp_verified,
-    _safe_torque_off,
 )
 from .gravity import fit_com
 

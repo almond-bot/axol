@@ -11,8 +11,8 @@ from __future__ import annotations
 import logging
 import unittest
 
-from almond_axol.serve import settings as serve_settings
 from almond_axol.robot.config import GRIPPER_TYPES
+from almond_axol.serve import settings as serve_settings
 from almond_axol.teleop.config import VRTeleopConfig, adopt_robot_gripper
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.teleop.live import LIVE_SETTINGS, LiveSettings

@@ -10,8 +10,8 @@ import numpy as np
 from scipy.signal import butter, sosfilt
 
 from almond_axol.tuning.imu_damping import (
-    G,
     EncoderVelocity,
+    G,
     TipDamper,
     VerticalVelocity,
 )

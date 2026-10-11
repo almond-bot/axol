@@ -985,9 +985,9 @@ def fit_and_report(
     per-speed scorecard. ``fo`` comes from the averages against the URDF
     gravity model at the sweep pose; rows carrying their own load (runs
     whose other joints were elsewhere) contribute to the friction fit only."""
-    from ...tuning.friction_model import fit_friction, matched_samples, speed_table
-
     from dataclasses import replace
+
+    from ...tuning.friction_model import fit_friction, matched_samples, speed_table
 
     load_fn = sweep_load(joint, is_left, other_targets)
     loads = np.asarray(rows["load"], dtype=float)

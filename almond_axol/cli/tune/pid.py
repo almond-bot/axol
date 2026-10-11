@@ -76,8 +76,8 @@ from ...tuning import (
     step_metrics,
 )
 from ...tuning.wrist_imu import WristImu, format_imu
-from .friction import _enter_impedance_hold
 from ..motor import add_side_and_channel_arguments, resolve_channel
+from .friction import _enter_impedance_hold
 
 
 def _print_chatter(m: dict) -> None:

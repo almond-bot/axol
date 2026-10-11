@@ -48,9 +48,8 @@ class StockGravityTest(unittest.TestCase):
         self.assertEqual(self._factory(_cfg(has_gripper=True), ["left"]), ([], ""))
 
     def test_tune_motion_says_it_too(self) -> None:
-        from tests.test_tune_motion_config import _args
-
         from almond_axol.cli.tune import motion
+        from tests.test_tune_motion_config import _args
 
         out = io.StringIO()
         with (

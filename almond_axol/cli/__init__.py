@@ -37,10 +37,10 @@ from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
-from .tune import factory as tune_factory
-from .tune import filter as tune_filter
 from .tune import a4 as tune_a4
 from .tune import breakaway, friction, pid, repeatability
+from .tune import factory as tune_factory
+from .tune import filter as tune_filter
 from .tune import gravity as tune_gravity
 from .tune import motion as tune_motion
 from .tune import tf as tune_tf

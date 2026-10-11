@@ -5,17 +5,17 @@ from __future__ import annotations
 
 import csv
 import io
-from contextlib import redirect_stdout
 import json
 import math
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 import numpy as np
 
 from almond_axol.robot.calibration import load_calibration, update_joint_calibration
-from almond_axol.robot.config import JointConfig, FrictionParams, _calibrated_joint
+from almond_axol.robot.config import FrictionParams, JointConfig, _calibrated_joint
 from almond_axol.tuning.friction_model import (
     K_MAX,
     STRIBECK_V0,
