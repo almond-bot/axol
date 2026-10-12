@@ -41,3 +41,5 @@ axol tune.friction --r --joint shoulder_1 --fit-csv s1-slow.csv creep-s1.csv
 ```
 
 **Why the slow profile.** The core's Coulomb term is capped at k = 100, so it applies only 17% of `fc` at 1°/s and 48% at 3°/s; whatever friction the joint really has at those speeds must come from the Stribeck term, whose `tanh(v/0.02)` is sharp. The slow profile measures exactly those speeds and fits both terms together, so the runtime cancels the friction the joint has where slow motion runs. On the jelly robot's right shoulder_1 the hand-tuned setting applied ~1.10 Nm at 3°/s under 5 Nm of load against 0.93 Nm measured; the fit applies 0.93.
+
+A saved slow-profile fit also switches that joint onto the stiffer [slow-motion gains](/operations/teleop-config) (`shoulder_1`, `shoulder_2` and `elbow`; see the per-joint defaults). A joint without one keeps the long-standing gains, because the slow-motion set oscillates on uncalibrated friction. `--profile standard` does not switch them on.
