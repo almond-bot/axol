@@ -195,11 +195,9 @@ class StictionConfigTest(unittest.TestCase):
             self.assertEqual(jc.stiction_err_deg, 0.1, name)
             self.assertEqual(jc.dither_nm, 0.0, name)
             self.assertEqual(jc.wire_mode, "mit", name)
-            # Stribeck cancellation is on where slow-motion tuning found it
-            # smoothed the joint (config.py, 2026-09-29 and 10-06), off
-            # elsewhere.
-            want = {"shoulder_1": 0.8, "shoulder_2": 0.8, "elbow": 0.8}.get(name, 0.0)
-            self.assertEqual(jc.stribeck_gain, want, name)
+            # Stribeck cancellation comes with the slow-motion gains, only on
+            # a joint whose friction is calibrated (test_slow_friction_gains).
+            self.assertEqual(jc.stribeck_gain, 0.0, name)
 
     def test_a_calibration_entry_never_sets_the_tuning_fields(self) -> None:
         # Stiction, dither and the wire mode are tuning choices (panel

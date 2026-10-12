@@ -109,6 +109,7 @@ Check the report before anything moves:
 | `effective_config.wrist_3.mass` / `com` on a robot without the stock gripper | still the default 0.75 kg (stock gripper + camera) | their gravity comp isn't loaded: find out where they set it (section below) |
 | `settings.axol_overrides` | per-joint gains set in the panel | they win over calibration; note them, they may be the cause |
 | `effective_config` | the two arms differ on a joint | asymmetry is a lead |
+| `effective_config.shoulder_1.kp` 250 (or s2 250, elbow 130) | that joint has no slow-profile friction fit, so it runs the uncalibrated gains (`reference/numbers.md`) | expected before `tune.factory`; the slow-motion gains switch on per joint once it has run |
 | `recent_runs` guard trips | earlier runs aborted | read those runs' labels |
 
 ## Robots without cameras or with their own end-effector
@@ -325,9 +326,9 @@ Levers, in the order to try, with what they did on jelly:
 
 | Lever (`--gain` field) | Use when | Known effect / cost |
 |---|---|---|
-| `stribeck_gain` 0 / 0.4 / 0.8 | slow sticky / ripply motion on a joint | shipped 0.8 on s1/s2/elbow. s3: right −23% ripple and −34% sway, left nothing (open). w1: right −13% ripple only. Above 0.8 or at the old kp 250 it got worse |
-| `kd_host`, `kd_host_hz`, `kd_host_q` (shoulders) | ringing at ~2–3 Hz on s1 / s2 | s1 110 at 2.6 Hz Q 1 shipped; 140 or centring at 2.2 Hz adds 3–15 Hz shake. Never on s3 (pumps the mast mode) |
-| `kp` down (s1 450 → 350, s2 500 → 400, elbow 200 → 160) | a joint still rings, or shudders | trades sway for sag; stiffer than shipped never paid off at the tool |
+| `stribeck_gain` 0 / 0.4 / 0.8 | slow sticky / ripply motion on a joint | shipped 0.8 on s1/s2/elbow once their slow-profile friction is calibrated (0 before). s3: right −23% ripple and −34% sway, left nothing (open). w1: right −13% ripple only. Above 0.8 or at the old kp 250 it got worse |
+| `kd_host`, `kd_host_hz`, `kd_host_q` (shoulders) | ringing at ~2–3 Hz on s1 / s2 | s1 110 at 2.6 Hz Q 1 shipped on a calibrated joint (40 pose-tracked Q 3 before); 140 or centring at 2.2 Hz adds 3–15 Hz shake. Never on s3 (pumps the mast mode) |
+| `kp` down (calibrated: s1 450 → 350, s2 500 → 400, elbow 200 → 160) | a joint still rings, or shudders | trades sway for sag; stiffer than shipped never paid off at the tool |
 | re-fit friction: `axol tune.friction --l --joint J --profile slow --raw-csv F` | one joint's fit looks off, or after a gearbox swap | `--save` writes calibration.json (back it up) |
 | `kd` | only to undo a change | wrist_2 kd 5 buzzed at 110 Hz; kd caps at 5 |
 

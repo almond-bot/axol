@@ -114,9 +114,10 @@ DEFAULT_STRIBECK_GAIN = {
 
 #: Fixed impedance gains the calibration tools hold, move and sweep every
 #: joint with — the long-standing set the factory swept with before the
-#: slow-motion tuning, never the production config. Production shoulder
-#: gains (kp 450-500) are tuned to run with the realtime core's host damping
-#: and feedforward, which the calibration path does not have.
+#: slow-motion tuning, never the production config. The slow-motion shoulder
+#: gains (kp 450-500, on a joint calibrated with this tool's slow profile) are
+#: tuned to run with the realtime core's host damping and feedforward, which
+#: the calibration path does not have.
 CAL_GAINS: dict[Joint, tuple[float, float]] = {
     Joint.SHOULDER_1: (250.0, 3.5),
     Joint.SHOULDER_2: (250.0, 3.5),

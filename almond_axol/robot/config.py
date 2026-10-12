@@ -629,62 +629,43 @@ class ArmConfig:
     # tune.friction --save`` store per-robot values that override these.
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
-            # 09-28, s1_creep and slow_osc through the realtime core at 240 Hz):
-            # the notchy slow motion was a ~2 Hz spring-mass ringing on
-            # velocity-weakening friction. Stiffer (kp 450, from 250), the
-            # firmware kd at its maximum, the host damper pinned on the
-            # measured 3.2 Hz loop mode with a wider band, and the Stribeck
-            # cancellation on — with the slow_osc wrist shake down 44% and
-            # shoulder_1's ripple down 66% from the untuned 250/3.5/40 set.
-            # 480 Hz on the joint made no difference once friction was
-            # calibrated (same-session A/B, 2026-09-29). The host damper then
-            # moved to 2.6 Hz at 110 (from 3.2 Hz at 70) after the overnight
-            # per-joint sweep (2026-10-06): s1_creep ripple -29% at 3°/s and
-            # -17% at 6°/s over interleaved repeats, and slow_osc's 1-3 Hz
-            # wrist sway -15% on its own (the joint's creep error peaks at
-            # 1.2-1.6 Hz, below the old centre; 2.2 Hz and 140 were no better).
-            kp=450.0,
-            kd=5.0,
+            # The long-standing set. The stiffer slow-motion set (kp 450,
+            # see _SLOW_FRICTION_GAINS) is only safe on a joint whose own
+            # friction has been calibrated: it is applied in _build_arm.
+            kp=250.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_host=110.0,
-            kd_host_hz=2.6,
-            # Q 1.0 (the band ±1.3 Hz around 2.6): the old pose-tracked Q=3
-            # was confined to keep the damper off a ~13 Hz mast/forearm mode
-            # the wide Q=0.8 band once fed on the reference robot (0.551 Nm /
-            # +0.0255 W, a whole-arm shudder). At Q 1.0 the band is down to
-            # 0.26 there (Q=3: 0.09); the jelly robot ran it with no buzz on
-            # either joint — re-check on a robot that shudders.
-            kd_host_q=1.0,
-            stribeck_gain=0.8,
-            stribeck_pole=40.0,
+            # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
+            # mode is the impedance mode, moving with reflected inertia.
+            kd_host=40.0,
+            # Both sides couple shoulder-1 into a ~13 Hz mast/forearm
+            # structural mode. With the old wide Q=0.8 shoulder damper, its
+            # high-side leakage became phase-positive at that mode: an RT
+            # control-term trace measured 0.551 Nm / +0.0255 W and a
+            # whole-arm right-side shudder (47/87/99 mdeg RMS at shoulder-1 /
+            # elbow / wrist-3); repeated left-side traces expose the same
+            # 12.5-12.9 Hz mode. Q=3 keeps unity gain at the intended,
+            # pose-tracked ~3.2 Hz shoulder mode while confining it enough to
+            # cut the right-side figures to 6/10/9 mdeg in an
+            # otherwise-identical hardware A/B.
+            kd_host_q=3.0,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Overnight per-joint sweep on the jelly robot's right arm
-            # (2026-10-06, s2_creep, interleaved repeats): shoulder_2 carries
-            # the arm's largest friction (2.1-2.6 Nm at creep speeds) and was
-            # the roughest joint (190 mdeg p2p at 3°/s) and the second source
-            # of the tool's 1-3 Hz sway in slow_osc. Stiffest kp (the
-            # encoding's 500), firmware kd at its maximum, more host damping
-            # on the pose-tracked band and the Stribeck cancellation: creep
-            # ripple -57% at 3°/s and -28% at 6°/s. At the tool it is small
-            # (slow_osc's 1-3 Hz wrist sway -4%, acceleration -5%, alone);
-            # with shoulder_1's damper change the sway is about -10% over
-            # three interleaved slow_osc rounds.
-            kp=500.0,
-            kd=5.0,
+            # The long-standing set; kp 500 with its host damper and the
+            # Stribeck cancellation needs this joint's friction calibrated
+            # (see _SLOW_FRICTION_GAINS).
+            kp=250.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=70.0,
-            stribeck_gain=0.8,
-            stribeck_pole=40.0,
+            kd_host=35.0,
         )
     )
     shoulder_3: JointConfig = field(
@@ -711,12 +692,10 @@ class ArmConfig:
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to
-            # 09-28, el_creep and slow_osc): stiffer (kp 200, from 130), the
-            # Stribeck cancellation on, and a gentle host damper on the
-            # elbow's own ~1.3-1.6 Hz slow-motion mode — the elbow's slow_osc
-            # ripple down 48% and its 3°/s creep ripple down 56%.
-            kp=200.0,
+            # The long-standing set; the slow-motion kp 200 / host damper /
+            # Stribeck set needs this joint's friction calibrated (see
+            # _SLOW_FRICTION_GAINS).
+            kp=130.0,
             # The motor-side maximum is the phase-safe lever for the loaded
             # 6.7-12.5 Hz transmission mode.
             kd=5.0,
@@ -724,15 +703,11 @@ class ArmConfig:
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # Host damping only low and narrow: the far-forward rust_damping
-            # event sits at 8.7-11.3 Hz, and the joint's old host band, active
-            # at 9.55 Hz, increased overshoot without removing a ring. At
-            # 1.6 Hz / Q 1.5 the band is down to ~0.15 at 9.5 Hz.
-            kd_host=10.0,
-            kd_host_hz=1.6,
-            kd_host_q=1.5,
-            stribeck_gain=0.8,
-            stribeck_pole=40.0,
+            # No host damping. The far-forward rust_damping event sits at
+            # 8.7-11.3 Hz while this joint's old host band was nearly fully
+            # active at 9.55 Hz. Hardware step/replay A/Bs found that term
+            # increased overshoot without removing a ring; firmware kd=5
+            # settled the joint without the host-loop phase risk.
         )
     )
     wrist_1: JointConfig = field(
@@ -824,63 +799,123 @@ class _ArmFriction:
     wrist_3: FrictionParams
 
 
-# Per-joint friction fallbacks for machines without their own calibration —
-# measured on the jelly robot with ``axol tune.friction --profile slow``
-# (2026-09-28/29: 1-30 deg/s sweeps, the slow speeds at the joint's least-
-# and most-loaded angles, fitted with the realtime core's own law). They
-# replace the reference robot's 7-72 deg/s Coulomb fits, which had no load
-# dependence and whose k (742-927) the core caps at 100 anyway. Friction is
-# per motor — left and right differ (the left elbow 0.04 + 0.086|g| Nm, the
-# right 0.27 + 0.045|g|) — so run ``axol tune.friction --profile slow --save``
-# on each Axol to write its own values to ``~/.almond/calibration.json``,
-# which overrides these (see :mod:`almond_axol.robot.calibration`).
+# Per-joint friction values measured with ``axol tune.friction`` on the
+# reference robot. The two arms share gains, masses, and (after mirroring)
+# CoMs, but motor-by-motor friction differs enough to be worth identifying
+# per side — and per robot: these are only the *fallback* for machines that
+# have not been calibrated. Run ``axol tune.friction --save`` on each new
+# Axol to write its own values to ``~/.almond/calibration.json``, which
+# overrides these defaults (see :mod:`almond_axol.robot.calibration`).
 #
-# The ``fo`` offsets are the sweeps' mean gravity-model residuals; the large
-# shoulder_2 ones (+1.04 right, -0.61 left) made no difference to slow_osc
-# either way (same-session A/B).
+# Shoulders were swept at 0.13–0.38 rad/s only: above ~0.5 rad/s the
+# MyActuator torque telemetry on the heavy joints degrades (apparent
+# friction *decreases* with speed, scatter grows to ±10 Nm), which is what
+# produced the large phantom viscous terms in earlier fits — every joint is
+# in fact Coulomb-dominated (fv ≈ 0) except a small real viscous drag on
+# wrist_1 and right shoulder_3.
+#
+# The jelly robot's slow-profile fits (load-dependent ``fl`` and the Stribeck
+# excess, #317) briefly replaced these and are deliberately *not* fallbacks:
+# with the slow-motion gains they made uncalibrated robots oscillate. A
+# robot's slow-profile values come only from its own calibration.
 _LEFT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=0.5903, k=100.0, fv=0.0, fo=0.0733, fl=0.0491),
-    shoulder_2=FrictionParams(fc=0.4702, k=100.0, fv=0.0, fo=-0.6108, fl=0.0401),
-    shoulder_3=FrictionParams(fc=0.3664, k=100.0, fv=0.0, fo=-0.0018, fl=0.0786),
-    elbow=FrictionParams(fc=0.0382, k=100.0, fv=0.0, fo=-0.0113, fl=0.0858),
-    wrist_1=FrictionParams(fc=0.4791, k=100.0, fv=0.0, fo=0.0686),
-    wrist_2=FrictionParams(fc=0.1228, k=100.0, fv=0.0, fo=-0.0286),
-    wrist_3=FrictionParams(fc=0.2765, k=100.0, fv=0.0, fo=0.0267),
+    shoulder_1=FrictionParams(fc=0.9091, k=799.59, fv=0.0, fo=0.37),
+    shoulder_2=FrictionParams(fc=1.1378, k=756.76, fv=0.0, fo=-0.3969),
+    shoulder_3=FrictionParams(fc=0.3599, k=835.51, fv=0.0, fo=-0.0133),
+    elbow=FrictionParams(fc=0.6023, k=855.95, fv=0.0, fo=-0.072),
+    wrist_1=FrictionParams(fc=0.3765, k=88.91, fv=0.0298, fo=-0.0115),
+    wrist_2=FrictionParams(fc=0.1521, k=780.31, fv=0.0, fo=-0.0152),
+    wrist_3=FrictionParams(fc=0.0714, k=927.26, fv=0.0, fo=0.0042),
 )
 
 _RIGHT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=0.4022, k=100.0, fv=0.0, fo=-0.3074, fl=0.0544),
-    shoulder_2=FrictionParams(fc=1.3210, k=100.0, fv=0.0, fo=1.0389, fl=0.0768),
-    shoulder_3=FrictionParams(fc=0.3674, k=100.0, fv=0.0, fo=0.1217, fl=0.0550),
-    elbow=FrictionParams(fc=0.2704, k=100.0, fv=0.0, fo=0.0197, fl=0.0448),
-    wrist_1=FrictionParams(fc=0.4998, k=100.0, fv=0.0, fo=0.1562),
-    wrist_2=FrictionParams(fc=0.1923, k=100.0, fv=0.0, fo=-0.0657),
-    wrist_3=FrictionParams(fc=0.2790, k=100.0, fv=0.0, fo=-0.0392),
+    shoulder_1=FrictionParams(fc=1.2972, k=742.11, fv=0.0, fo=-0.1557),
+    shoulder_2=FrictionParams(fc=1.3950, k=768.06, fv=0.0, fo=0.2082),
+    shoulder_3=FrictionParams(fc=0.4377, k=107.94, fv=0.0853, fo=-0.0147),
+    elbow=FrictionParams(fc=0.6066, k=784.78, fv=0.0, fo=0.049),
+    wrist_1=FrictionParams(fc=0.5245, k=98.58, fv=0.3062, fo=-0.0097),
+    wrist_2=FrictionParams(fc=0.1092, k=899.67, fv=0.0, fo=0.0021),
+    wrist_3=FrictionParams(fc=0.1172, k=204.46, fv=0.0, fo=0.0042),
 )
 
-# The same sweeps' low-speed (Stribeck) excess, per side: ``(stribeck_dfs,
-# stribeck_load_gain, stribeck_vs)``. shoulder_1, shoulder_2 and the elbow
-# cancel it (``stribeck_gain`` on their JointConfig; shoulder_2 only since
-# its stiffer, more damped 2026-10-06 gains); on shoulder_3 cancelling it
-# made slow motion rougher, and on the wrists it is untested in slow_osc.
-_LEFT_STRIBECK: dict[str, tuple[float, float, float]] = {
-    "shoulder_1": (0.9814, 0.0485, 0.1),
-    "shoulder_2": (0.6142, 0.0389, 0.0989),
-    "shoulder_3": (0.2214, 0.1685, 0.1),
-    "elbow": (0.2347, 0.1301, 0.1),
-    "wrist_1": (0.5188, 0.0, 0.1),
-    "wrist_2": (0.0828, 0.0, 0.1),
-    "wrist_3": (0.2378, 0.0, 0.1),
+# The slow-motion gains (#317), applied per joint over the ArmConfig defaults
+# only where that joint carries its own slow-profile friction calibration
+# (``tune.factory`` or ``tune.friction --profile slow --save``; see
+# :func:`slow_friction_calibrated`). Stiffer springs, wider host dampers and
+# the Stribeck cancellation were tuned against the jelly robot's measured
+# friction; on a robot still running the coded fallback friction they
+# oscillate, so an uncalibrated joint keeps the long-standing set.
+_SLOW_FRICTION_GAINS: dict[str, dict[str, float]] = {
+    # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to 09-28,
+    # s1_creep and slow_osc through the realtime core at 240 Hz): the notchy
+    # slow motion was a ~2 Hz spring-mass ringing on velocity-weakening
+    # friction. Stiffer (kp 450, from 250), the firmware kd at its maximum,
+    # the host damper pinned on the measured loop mode with a wider band, and
+    # the Stribeck cancellation on — with the slow_osc wrist shake down 44%
+    # and shoulder_1's ripple down 66% from the untuned 250/3.5/40 set. 480 Hz
+    # on the joint made no difference once friction was calibrated
+    # (same-session A/B, 2026-09-29). The host damper then moved to 2.6 Hz at
+    # 110 (from 3.2 Hz at 70) after the overnight per-joint sweep
+    # (2026-10-06): s1_creep ripple -29% at 3°/s and -17% at 6°/s over
+    # interleaved repeats, and slow_osc's 1-3 Hz wrist sway -15% on its own
+    # (the joint's creep error peaks at 1.2-1.6 Hz, below the old centre;
+    # 2.2 Hz and 140 were no better). Q 1.0 (the band ±1.3 Hz around 2.6):
+    # at Q 1.0 the band is down to 0.26 at the ~13 Hz mast/forearm mode
+    # (Q=3: 0.09); the jelly robot ran it with no buzz on either joint —
+    # re-check on a robot that shudders.
+    "shoulder_1": {
+        "kp": 450.0,
+        "kd": 5.0,
+        "kd_host": 110.0,
+        "kd_host_hz": 2.6,
+        "kd_host_q": 1.0,
+        "stribeck_gain": 0.8,
+        "stribeck_pole": 40.0,
+    },
+    # Overnight per-joint sweep on the jelly robot's right arm (2026-10-06,
+    # s2_creep, interleaved repeats): shoulder_2 carries the arm's largest
+    # friction (2.1-2.6 Nm at creep speeds) and was the roughest joint
+    # (190 mdeg p2p at 3°/s) and the second source of the tool's 1-3 Hz sway
+    # in slow_osc. Stiffest kp (the encoding's 500), firmware kd at its
+    # maximum, more host damping on the pose-tracked band and the Stribeck
+    # cancellation: creep ripple -57% at 3°/s and -28% at 6°/s. At the tool
+    # it is small (slow_osc's 1-3 Hz wrist sway -4%, acceleration -5%,
+    # alone); with shoulder_1's damper change the sway is about -10% over
+    # three interleaved slow_osc rounds.
+    "shoulder_2": {
+        "kp": 500.0,
+        "kd": 5.0,
+        "kd_host": 70.0,
+        "stribeck_gain": 0.8,
+        "stribeck_pole": 40.0,
+    },
+    # Slow-motion tuning on the jelly robot's right arm (2026-09-24 to 09-28,
+    # el_creep and slow_osc): stiffer (kp 200, from 130), the Stribeck
+    # cancellation on, and a gentle host damper on the elbow's own
+    # ~1.3-1.6 Hz slow-motion mode — the elbow's slow_osc ripple down 48% and
+    # its 3°/s creep ripple down 56%. Host damping only low and narrow: at
+    # 1.6 Hz / Q 1.5 the band is down to ~0.15 at the 9.5 Hz rust_damping
+    # event.
+    "elbow": {
+        "kp": 200.0,
+        "kd_host": 10.0,
+        "kd_host_hz": 1.6,
+        "kd_host_q": 1.5,
+        "stribeck_gain": 0.8,
+        "stribeck_pole": 40.0,
+    },
 }
-_RIGHT_STRIBECK: dict[str, tuple[float, float, float]] = {
-    "shoulder_1": (0.7326, 0.0335, 0.1),
-    "shoulder_2": (1.1065, 0.066, 0.0937),
-    "shoulder_3": (0.4078, 0.1479, 0.1),
-    "elbow": (0.1558, 0.1405, 0.0754),
-    "wrist_1": (0.3968, 0.0, 0.0852),
-    "wrist_2": (0.1498, 0.0, 0.1),
-    "wrist_3": (0.2439, 0.0, 0.0916),
-}
+
+
+def slow_friction_calibrated(entry: dict[str, Any]) -> bool:
+    """Whether a joint's calibration entry holds a slow-profile friction fit.
+
+    ``tune.factory`` (slow profile, the default) and ``tune.friction
+    --profile slow --save`` write the fitted Stribeck curve next to the
+    friction; the standard-profile sweep and pre-#317 factory runs do not.
+    A joint with it runs :data:`_SLOW_FRICTION_GAINS`.
+    """
+    return "stribeck_dfs" in entry
 
 
 def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
@@ -926,7 +961,9 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     to this machine's calibration file (see
     :mod:`almond_axol.robot.calibration`) are then overlaid per joint, so a
     calibrated robot uses its own measured friction and gains as the
-    defaults. Explicit overrides at construction (draccus dotted flags, the
+    defaults. A joint whose entry holds a slow-profile friction fit also
+    takes :data:`_SLOW_FRICTION_GAINS` (under the entry's own values); every
+    other joint keeps the :class:`ArmConfig` gains. Explicit overrides at construction (draccus dotted flags, the
     panel's Advanced settings) apply on top of the built defaults and
     therefore still win.
 
@@ -937,9 +974,6 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
-    # shoulder_1's host-damper Q lives on its JointConfig (1.0, see there);
-    # it used to be forced to 3.0 here, symmetrically, against the ~13 Hz
-    # mast/forearm mode. Factory and local calibration entries override it.
     arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),
@@ -949,19 +983,6 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         wrist_1=replace(arm.wrist_1, friction=replace(friction.wrist_1)),
         wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
         wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
-    )
-    stribeck = _LEFT_STRIBECK if is_left else _RIGHT_STRIBECK
-    arm = replace(
-        arm,
-        **{
-            name: replace(
-                getattr(arm, name),
-                stribeck_dfs=dfs,
-                stribeck_load_gain=ls,
-                stribeck_vs=vs,
-            )
-            for name, (dfs, ls, vs) in stribeck.items()
-        },
     )
     # Override order: coded defaults ← this robot's factory calibration
     # (fetched from the cloud by ``axol calibration.pull``) ← the local
@@ -989,17 +1010,18 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     local = load_calibration(expected_hub_serial=current_hub_serial)[side]
     if not factory and not local:
         return arm
-    return replace(
-        arm,
-        **{
-            joint.value: _calibrated_joint(
-                getattr(arm, joint.value),
-                {**factory.get(joint.value, {}), **local.get(joint.value, {})},
-            )
-            for joint in ARM_JOINTS
-            if joint.value in factory or joint.value in local
-        },
-    )
+    overrides: dict[str, JointConfig] = {}
+    for joint in ARM_JOINTS:
+        if joint.value not in factory and joint.value not in local:
+            continue
+        entry = {**factory.get(joint.value, {}), **local.get(joint.value, {})}
+        jc = getattr(arm, joint.value)
+        # The slow-motion gains go under the entry, so gains the entry
+        # itself carries (tune.pid --save, its stribeck_gain) still win.
+        if slow_friction_calibrated(entry) and joint.value in _SLOW_FRICTION_GAINS:
+            jc = replace(jc, **_SLOW_FRICTION_GAINS[joint.value])
+        overrides[joint.value] = _calibrated_joint(jc, entry)
+    return replace(arm, **overrides)
 
 
 @dataclass(frozen=True)

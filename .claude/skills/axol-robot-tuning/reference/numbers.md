@@ -68,14 +68,23 @@ a look. Shoulder ripple swings run to run (see known-issues).
 
 ## Shipped gains (impedance, 240 Hz)
 
-| Joint | kp | kd | host damper | Stribeck gain |
-|---|---|---|---|---|
-| shoulder_1 | 450 | 5 | 110 at 2.6 Hz, Q 1 | 0.8 |
-| shoulder_2 | 500 | 5 | 70 (pose-tracked) | 0.8 |
-| shoulder_3 | 180 | 5 | — | 0 |
-| elbow | 200 | 5 | 10 at 1.6 Hz, Q 1.5 | 0.8 |
-| wrist_1 | 180 | 1.7 | — | 0 |
-| wrist_2 / wrist_3 | 130 | 2.25 / 2.0 | — | 0 |
+Two sets. A joint with its own slow-profile friction fit in the calibration
+(`stribeck_dfs` in its entry — `tune.factory`'s default profile, or
+`tune.friction --profile slow --save`) runs the **calibrated** column; any
+other joint runs the **uncalibrated** one. The calibrated set oscillates on
+the coded fallback friction, which is why it is gated.
+
+| Joint | uncalibrated kp / kd / host damper | calibrated kp / kd / host damper | Stribeck gain (calibrated) |
+|---|---|---|---|
+| shoulder_1 | 250 / 3.5 / 40 pose-tracked, Q 3 | 450 / 5 / 110 at 2.6 Hz, Q 1 | 0.8 |
+| shoulder_2 | 250 / 3.5 / 35 pose-tracked | 500 / 5 / 70 pose-tracked | 0.8 |
+| shoulder_3 | 180 / 5 / — | same | 0 |
+| elbow | 130 / 5 / — | 200 / 5 / 10 at 1.6 Hz, Q 1.5 | 0.8 |
+| wrist_1 | 180 / 1.7 / — | same | 0 |
+| wrist_2 / wrist_3 | 130 / 2.25 / 2.0 / — | same | 0 |
+
+An arm that oscillates on the uncalibrated set's joints at kp 450–500 means
+the robot is not factory-calibrated: run `tune.factory` before tuning.
 
 Calibration tools hold and sweep at fixed calibration gains instead
 (s1/s2 250/3.5, s3 180/5, elbow 130/5, wrists as above). `robot_report.py`

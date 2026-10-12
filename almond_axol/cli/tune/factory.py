@@ -12,7 +12,10 @@ fitted with the realtime core's own friction law (sliding ``fc + fl·|g|``,
 viscous, and the low-speed Stribeck excess ``dfs + ls·|g|`` over ``vs``),
 with the full-range passes' averaged torques feeding the gravity fit; the
 Stribeck share cancelled is saved per joint (0.8 on shoulder_1,
-shoulder_2 and the elbow, 0 elsewhere). ``--profile standard`` is the old 7-72 deg/s sweep with
+shoulder_2 and the elbow, 0 elsewhere). That fit is also what switches a
+joint from the long-standing gains to the stiffer slow-motion set (see
+``_SLOW_FRICTION_GAINS`` in :mod:`almond_axol.robot.config`), which
+oscillates on uncalibrated friction. ``--profile standard`` is the old 7-72 deg/s sweep with
 a Coulomb + viscous fit (the same sweep ``tune.friction`` and
 ``tune.gravity`` run individually):
 
