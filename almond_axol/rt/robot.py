@@ -519,14 +519,14 @@ class Axol(RobotBase):
         if any(bus.is_open for bus in self._buses()):
             await self._robot.disconnect()
         # Nothing owns the interfaces at this instant, which is the only
-        # point in a bring-up where they can be flapped: drop anything a
-        # dead bus left queued (an e-stop's in-flight position commands,
-        # which the kernel holds on the interface and replays the moment the
-        # motors answer again) before the core takes them. Doing it here
-        # rather than in the `connect()` below is the whole point — by then
-        # the core has started, prepped, and already flushed the queue into
-        # the motors.
-        await self._robot._purge_stale_can_queues()
+        # point in a bring-up where they can be flapped: update the arm hub's
+        # firmware if it is outdated, and drop anything a dead bus left queued
+        # (an e-stop's in-flight position commands, which the kernel holds on
+        # the interface and replays the moment the motors answer again)
+        # before the core takes them. Doing it here rather than in the
+        # `connect()` below is the whole point — by then the core has
+        # started, prepped, and already flushed the queue into the motors.
+        await self._robot._prepare_can_interfaces()
         await self._link.start()
         self._core_started = True
         await self._link.configure(self._config_text())

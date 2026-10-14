@@ -7,6 +7,7 @@ import sys
 from ..rt import install as rt_install
 from ..utils.dotenv import load_local_env
 from . import calibration as calibration_cmd
+from . import hub as hub_cmd
 from . import (
     mantis_latency,
     mantis_session,
@@ -145,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     can_setup.add_parser(subparsers)
     can_enable.add_parser(subparsers)
     can_driver.add_parser(subparsers)
+    hub_cmd.add_parser(subparsers)
     mantis_session.add_parser(subparsers)
     mantis_latency.add_parser(subparsers)
     tracker_bridge.add_parser(subparsers)
