@@ -550,12 +550,13 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         from ..settings import resolve_robot_model
 
         cfg.kinematics.robot_model = resolve_robot_model(
-            jelly_enabled=jelly_cfg is not None
+            jelly_enabled=jelly_cfg is not None, mount=cfg.kinematics.mount
         ).value
     if cfg.sim:
         robot = Sim(
             robot_model=cfg.kinematics.robot_model,
             whole_body=cfg.kinematics.whole_body,
+            mount=cfg.kinematics.mount,
             gripper=cfg.axol.gripper,
         )
     else:

@@ -65,6 +65,7 @@ class Sim(RobotBase):
         port: int = 8002,
         robot_model: AxolModel | str | None = None,
         whole_body: bool = False,
+        mount: AxolModel | str | None = None,
         gripper: str | None = None,
     ) -> None:
         """Construct the simulation.
@@ -78,6 +79,9 @@ class Sim(RobotBase):
             port:        Port for the viser web server.
             robot_model: Axol version to render; inferred when ``None``.
             whole_body:  Render the whole-body IK model (base and lift move).
+            mount:       What Axol is mounted on without Jelly
+                         (``KinematicsConfig.mount``); read from the shared
+                         settings when ``None``.
             gripper:     Fitted gripper (``AxolConfig.gripper``), which picks
                          the mobile Axol's URDF; read from the shared
                          settings when ``None``.
@@ -87,6 +91,7 @@ class Sim(RobotBase):
         self._port = port
         self._robot_model = robot_model
         self._whole_body = whole_body
+        self._mount = mount
         self._gripper = gripper
         # Whole-body: base_x, base_y, base_yaw, lift (see BODY_JOINTS).
         self._body = np.zeros(len(BODY_JOINTS) if whole_body else 0, dtype=float)
@@ -232,7 +237,9 @@ class Sim(RobotBase):
             from ..settings import resolve_gripper, resolve_robot_model
 
             model = resolve_robot_model(
-                self._robot_model, jelly_enabled=True if self._whole_body else None
+                self._robot_model,
+                jelly_enabled=True if self._whole_body else None,
+                mount=self._mount,
             )
             path = urdf_path(
                 model,

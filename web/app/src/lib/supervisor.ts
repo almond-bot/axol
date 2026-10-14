@@ -1342,7 +1342,7 @@ export type SettingValue = string | number | boolean | (number | string)[]
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose" | "toggle-number"
+  widget?: "slider" | "pose" | "toggle-number" | "mount"
   min?: number
   max?: number
   step?: number
@@ -1428,18 +1428,32 @@ export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapsh
 
 /**
  * Which Axol hardware version the host runs: mobile whenever Jelly is enabled
- * (attached and not switched off in the Robot tab), classic otherwise. The
+ * (attached and not switched off in the Robot tab), otherwise the mount picked
+ * in the Robot tab (`kinematics.mount`, legacy `classic` until one is). The
  * host derives it and reports it with the settings as `robotModel`.
  */
-export type AxolModel = "classic" | "mobile"
+export type AxolModel = "classic" | "standalone" | "ox_cart" | "owl" | "mobile"
+
+/** The versions to pick from without Jelly (the `kinematics.mount` options). */
+export type AxolMount = Exclude<AxolModel, "mobile">
+
+export const AXOL_MOUNTS: readonly AxolMount[] = ["classic", "standalone", "ox_cart", "owl"]
 
 const URDF_FILES: Record<AxolModel, string> = {
   classic: "axol.urdf",
+  standalone: "axol_standalone.urdf",
+  ox_cart: "axol_ox_cart.urdf",
+  owl: "axol_owl.urdf",
   mobile: "axol_jelly.urdf",
 }
 
 export function parseAxolModel(value: unknown): AxolModel | null {
-  return value === "classic" || value === "mobile" ? value : null
+  return typeof value === "string" && value in URDF_FILES ? (value as AxolModel) : null
+}
+
+/** A saved `kinematics.mount`, legacy (`classic`) when unset or unknown. */
+export function parseAxolMount(value: unknown): AxolMount {
+  return AXOL_MOUNTS.find((m) => m === value) ?? "classic"
 }
 
 /** The gripper fitted to both arms (the `axol.gripper` setting). */

@@ -15,9 +15,11 @@ import {
   flattenFields,
   setQuestProximityDisabled,
   settingShown,
+  parseAxolMount,
   parseGripper,
   visibleAdvancedSections,
   type AdvancedSection,
+  type AxolModel,
   type CameraDevice,
   type CameraSlot,
   type CameraSpec,
@@ -55,6 +57,7 @@ import {
 } from "@/lib/settings-scope"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
+import { MountPicker } from "./mount-picker"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
@@ -559,6 +562,7 @@ export function SettingsSection({
                 schema={schema}
                 values={draft.values}
                 onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
                 excludeKeys={
                   activeCategory.key === "teleop"
                     ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS]
@@ -802,6 +806,7 @@ function CategoryPanel({
   values,
   onChange,
   excludeKeys = [],
+  robotModel = "classic",
 }: {
   category: SettingsCategory
   /** Every category, to resolve the defaults `showWhen` gates read. */
@@ -809,16 +814,29 @@ function CategoryPanel({
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
   excludeKeys?: string[]
+  /** What the host runs now, for the robot-model picker. */
+  robotModel?: AxolModel
 }) {
-  const fields = category.settings.filter(
+  const shown = category.settings.filter(
     (s) =>
       s.ui.widget !== "pose" &&
       !excludeKeys.includes(s.key) &&
       settingShown(s.ui.showWhen, values, schema)
   )
+  // The robot-model picker gets the full width, above the other controls.
+  const mountFields = shown.filter((s) => s.ui.widget === "mount")
+  const fields = shown.filter((s) => s.ui.widget !== "mount")
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>
+      {mountFields.map((f) => (
+        <MountPicker
+          key={f.key}
+          mount={parseAxolMount(values[f.key] ?? f.default)}
+          robotModel={robotModel}
+          onSelect={(mount) => onChange(f.key, mount)}
+        />
+      ))}
       <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
         {fields.map((f) => (
           <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />

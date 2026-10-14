@@ -10,9 +10,11 @@ from unittest.mock import patch
 import numpy as np
 
 from almond_axol.constants import (
+    MOUNTS,
     URDF_PATH,
     AxolModel,
     torso_links,
+    upper_arm_guard_links,
     urdf_path,
 )
 from almond_axol.serve.commands import build_argv
@@ -48,6 +50,30 @@ class JellyInfersRobotModelTest(unittest.TestCase):
     def test_a_session_decision_skips_detection(self) -> None:
         self.assertIs(self._resolve(False, jelly_enabled=True), AxolModel.MOBILE)
         self.assertIs(self._resolve(True, jelly_enabled=False), AxolModel.CLASSIC)
+
+    def test_without_jelly_the_saved_mount_decides(self) -> None:
+        # Legacy until a mount is picked; then that mount, unless Jelly is on.
+        self.assertIs(self._resolve(False), AxolModel.CLASSIC)
+        self.store.update(values={"kinematics.mount": "owl"})
+        self.assertIs(self._resolve(False), AxolModel.OWL)
+        self.assertIs(self._resolve(True), AxolModel.MOBILE)
+        self.assertIs(self._resolve(False, jelly_enabled=False), AxolModel.OWL)
+        # A session's own mount wins over the saved one.
+        self.assertIs(
+            self._resolve(False, jelly_enabled=False, mount="ox_cart"),
+            AxolModel.OX_CART,
+        )
+
+    def test_mount_is_validated(self) -> None:
+        from almond_axol.settings import resolve_mount
+
+        for mount in MOUNTS:
+            self.assertIs(resolve_mount(mount.value), mount)
+        self.assertIs(resolve_mount(None), AxolModel.CLASSIC)
+        # Jelly is detected, never picked.
+        for bad in ("mobile", "hover"):
+            with self.assertRaises(ValueError):
+                resolve_mount(bad)
 
     def test_explicit_model_wins_and_is_validated(self) -> None:
         self.assertIs(self._resolve(True, model="classic"), AxolModel.CLASSIC)
@@ -94,8 +120,7 @@ class GripperResolutionTest(unittest.TestCase):
 
 # Every bundled IK model: (version, gripper).
 _MODELS = (
-    (AxolModel.CLASSIC, "parallel"),
-    (AxolModel.MOBILE, "parallel"),
+    *((model, "parallel") for model in AxolModel),
     (AxolModel.MOBILE, "parcel"),
 )
 
@@ -105,7 +130,14 @@ class UrdfSelectionTest(unittest.TestCase):
         self.assertEqual(urdf_path(), URDF_PATH)
         self.assertEqual(urdf_path("classic"), URDF_PATH)
         self.assertEqual(urdf_path(AxolModel.MOBILE).name, "axol_jelly.urdf")
-        self.assertTrue(urdf_path(AxolModel.MOBILE).is_file())
+        self.assertEqual(urdf_path("owl").name, "axol_owl.urdf")
+        paths = {urdf_path(model) for model in AxolModel}
+        self.assertEqual(len(paths), len(AxolModel))
+        self.assertTrue(all(p.is_file() for p in paths))
+        # Whole-body IK is Jelly's alone.
+        for model in MOUNTS:
+            with self.assertRaises(ValueError):
+                urdf_path(model, whole_body=True)
 
     def test_the_mobile_axol_has_a_urdf_per_gripper(self) -> None:
         for whole_body, name in (
@@ -236,9 +268,10 @@ class CapsuleDistanceTest(unittest.TestCase):
                 home = _pair_distances(model, [0.0] * 7, [0.0] * 7)
                 rest = _pair_distances(model, cfg.rest_pose_left, cfg.rest_pose_right)
                 torso = torso_links(model)
+                guarded = upper_arm_guard_links(model)
                 for (a, b), value in rest.items():
                     arm = b if a in torso else a
-                    if arm.endswith("_e1"):
+                    if arm.endswith("_e1") and {a, b} & set(guarded):
                         floor = upper_arm_guard_floor(home[(a, b)])
                         self.assertGreaterEqual(value, floor, (a, b))
                         if model is AxolModel.CLASSIC:

@@ -36,6 +36,8 @@ export default function PoseViewer({
   onLoaded,
   robotModel = "classic",
   gripper = "parallel",
+  autoRotate = false,
+  distance = 1,
 }: {
   /** URDF joint name -> angle (rad). */
   jointValues: Record<string, number>
@@ -45,6 +47,10 @@ export default function PoseViewer({
   robotModel?: AxolModel
   /** The fitted gripper (the mobile Axol has a URDF per gripper). Fixed per mount too. */
   gripper?: GripperType
+  /** Slowly turn the model (a showcase turntable); dragging still orbits. */
+  autoRotate?: boolean
+  /** Camera distance, as a multiple of the default framing. */
+  distance?: number
 }) {
   const [model, setModel] = useState<LoadedModel | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -118,9 +124,9 @@ export default function PoseViewer({
 
   const { center, size } = model
   const camPos: [number, number, number] = [
-    center.x + size * 0.9,
-    center.y + size * 0.45,
-    center.z + size * 0.9,
+    center.x + size * 0.9 * distance,
+    center.y + size * 0.45 * distance,
+    center.z + size * 0.9 * distance,
   ]
   return (
     <Canvas camera={{ position: camPos, fov: 40, near: size / 100, far: size * 20 }}>
@@ -129,7 +135,13 @@ export default function PoseViewer({
       <directionalLight position={[-3, 2, -2]} intensity={0.5} />
       <primitive object={model.scene} />
       <gridHelper args={[size * 2, 20, "#3a3a3a", "#242424"]} position={model.floor.toArray()} />
-      <OrbitControls target={center.toArray()} enableDamping makeDefault />
+      <OrbitControls
+        target={center.toArray()}
+        enableDamping
+        makeDefault
+        autoRotate={autoRotate}
+        autoRotateSpeed={1.2}
+      />
     </Canvas>
   )
 }

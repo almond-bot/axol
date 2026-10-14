@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from xml.etree import ElementTree
 
@@ -131,15 +132,16 @@ class MobileUrdfContractTest(unittest.TestCase):
     differs where it should: the elbow limits, the meshes, and the body.
     """
 
-    # The fitted gripper (the mobile Axol has a URDF per gripper), its sim
-    # model and the mesh directory only its models use.
+    # The version, its fitted gripper (the mobile Axol has a URDF per
+    # gripper) and its whole-body and sim models, if it has them.
+    model = AxolModel.MOBILE
     gripper = "parallel"
-    sim_path = JELLY_SIM_URDF
-    mesh_dir = "meshes/jelly"
+    sim_path: Path | None = JELLY_SIM_URDF
+    whole_body = True
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.path = urdf_path(AxolModel.MOBILE, gripper=cls.gripper)
+        cls.path = urdf_path(cls.model, gripper=cls.gripper)
         cls.root = ElementTree.parse(cls.path).getroot()
         cls.classic = ElementTree.parse(URDF_PATH).getroot()
         cls.urdf = yourdfpy.URDF.load(str(cls.path), mesh_dir=str(cls.path.parent))
@@ -213,44 +215,32 @@ class MobileUrdfContractTest(unittest.TestCase):
 
     def test_body_links_carry_collision_geometry(self) -> None:
         links = {ln.attrib["name"]: ln for ln in self.root.findall("link")}
-        for link in torso_links(AxolModel.MOBILE) + tuple(_arm_bodies()):
+        for link in torso_links(self.model) + tuple(_arm_bodies()):
             with self.subTest(link=link):
                 self.assertIsNotNone(links[link].find("collision"))
-        # The deck is out of reach with the lift raised: visual only, and it
-        # must not be a collision body (pyroki would fit it a point capsule).
-        self.assertIsNone(links["jelly"].find("collision"))
-        self.assertNotIn("jelly", torso_links(AxolModel.MOBILE))
+        # Every other link is visual or a frame only: a torso link without
+        # geometry would get a point capsule from pyroki. (The Jelly deck and
+        # the Ox cart's caster frame are out of reach with the lift raised.)
+        torso = set(torso_links(self.model))
+        for name, link in links.items():
+            if not name.startswith(("left_", "right_")) and name not in torso:
+                with self.subTest(link=name):
+                    self.assertIsNone(link.find("collision"))
 
-    def test_mesh_set_is_complete(self) -> None:
+    def test_meshes_exist(self) -> None:
         prefix = "package://assembly/"
-        references = {
-            mesh.attrib["filename"].removeprefix(prefix)
-            for mesh in self.root.iter("mesh")
-        }
-        # The arm, whole-body and sim models share their directory: together
-        # they use every mesh packaged in it (the sim model's paths are
-        # relative). Another gripper's models also reuse the parallel
-        # gripper's body and arm meshes.
-        for other in (
-            urdf_path(AxolModel.MOBILE, whole_body=True, gripper=self.gripper),
-            self.sim_path,
-        ):
-            references |= {
-                mesh.attrib["filename"].removeprefix(prefix)
-                for mesh in ElementTree.parse(other).getroot().iter("mesh")
-            }
-        self.assertTrue(
-            all(
-                r.startswith(("meshes/jelly/", f"{self.mesh_dir}/")) for r in references
-            )
-        )
-        self.assertTrue(all((self.path.parent / r).is_file() for r in references))
-        packaged = {
-            p.relative_to(self.path.parent).as_posix()
-            for p in (self.path.parent / self.mesh_dir).glob("*.stl")
-        }
-        own = {r for r in references if r.startswith(f"{self.mesh_dir}/")}
-        self.assertEqual(own, packaged)
+        paths = [self.path]
+        if self.whole_body:
+            paths.append(urdf_path(self.model, whole_body=True, gripper=self.gripper))
+        if self.sim_path is not None:
+            paths.append(self.sim_path)
+        for path in paths:
+            for mesh in ElementTree.parse(path).getroot().iter("mesh"):
+                ref = mesh.attrib["filename"].removeprefix(prefix)
+                # IK models resolve meshes via the package, the sim model
+                # relative to itself; both land in the generated directories.
+                self.assertTrue(ref.startswith(_GENERATED_DIRS), ref)
+                self.assertTrue((path.parent / ref).is_file(), ref)
 
 
 class ParcelUrdfContractTest(MobileUrdfContractTest):
@@ -258,7 +248,6 @@ class ParcelUrdfContractTest(MobileUrdfContractTest):
 
     gripper = "parcel"
     sim_path = JELLY_PARCEL_SIM_URDF
-    mesh_dir = "meshes/jelly_parcel"
 
     def test_gripper_is_the_parcel_gripper(self) -> None:
         links = {ln.attrib["name"] for ln in self.root.findall("link")}
@@ -282,6 +271,52 @@ class ParcelUrdfContractTest(MobileUrdfContractTest):
                 if j.find("child").attrib["link"] == f"{side}_fingers"
             )
             self.assertEqual(joint.find("parent").attrib["link"], f"{side}_gripper")
+
+
+class StandaloneUrdfContractTest(MobileUrdfContractTest):
+    """Axol standalone: the same arms under nothing but the shoulder bar."""
+
+    model = AxolModel.STANDALONE
+    sim_path = None
+    whole_body = False
+
+
+class OxCartUrdfContractTest(StandaloneUrdfContractTest):
+    """Axol on the Ox cart: the same arms on its lift column."""
+
+    model = AxolModel.OX_CART
+
+
+class OwlUrdfContractTest(StandaloneUrdfContractTest):
+    """Axol on the Owl mount: the same arms on its column and foot."""
+
+    model = AxolModel.OWL
+
+
+# Where scripts/build_jelly_urdfs.py writes meshes.
+_GENERATED_DIRS = tuple(
+    f"meshes/{d}/" for d in ("jelly", "jelly_parcel", "standalone", "owl", "ox_cart")
+)
+
+
+class GeneratedMeshesTest(unittest.TestCase):
+    def test_every_generated_mesh_is_used(self) -> None:
+        # Exports share meshes across directories (the body and arms are the
+        # same in every export): together the generated URDFs use every mesh
+        # the generator packaged, and nothing else.
+        prefix = "package://assembly/"
+        urdfs = [p for p in URDF_PATH.parent.glob("axol_*.urdf")]
+        references = {
+            mesh.attrib["filename"].removeprefix(prefix)
+            for path in urdfs
+            for mesh in ElementTree.parse(path).getroot().iter("mesh")
+        }
+        packaged = {
+            p.relative_to(URDF_PATH.parent).as_posix()
+            for d in _GENERATED_DIRS
+            for p in (URDF_PATH.parent / d).glob("*.stl")
+        }
+        self.assertEqual(references, packaged)
 
 
 if __name__ == "__main__":

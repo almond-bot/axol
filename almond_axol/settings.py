@@ -205,13 +205,17 @@ def resolve_robot_model(
     model: AxolModel | str | None = None,
     *,
     jelly_enabled: bool | None = None,
+    mount: AxolModel | str | None = None,
     store: SettingsStore | None = None,
 ) -> AxolModel:
     """Which Axol version's URDF to use: ``model`` if given, else inferred.
 
     An explicit value (``KinematicsConfig.robot_model``) wins and is
     validated. Otherwise the robot is the mobile Axol exactly when Jelly is
-    enabled — attached and not switched off. A session that has already
+    enabled — attached and not switched off — and else the version it is
+    mounted as (``mount``, ``KinematicsConfig.mount``: one of
+    :data:`~almond_axol.constants.MOUNTS`; ``None`` reads the saved
+    ``kinematics.mount``, legacy if unset). A session that has already
     decided whether it drives Jelly passes ``jelly_enabled``; everything else
     (the sim, run policy, the tuning tools, the control panel's viewer) takes
     a ``kinematics.robot_model`` saved in the shared settings if there is
@@ -224,20 +228,43 @@ def resolve_robot_model(
         return model
     if model is not None:
         return AxolModel(str(model).strip().lower())
-    if jelly_enabled is None:
+    saved = None
+    if jelly_enabled is None or (not jelly_enabled and mount is None):
         from .kinematics.config import KinematicsConfig
-        from .robot.jelly import JellyConfig, detect_jelly
 
         if store is None:
             store = load_store()
+        saved = shared_config(KinematicsConfig, "teleop", "kinematics", store=store)
+    if jelly_enabled is None:
+        from .robot.jelly import JellyConfig, detect_jelly
+
         # A kinematics.robot_model saved in the settings overrides the
         # inference for callers that built a default config.
-        saved = shared_config(KinematicsConfig, "teleop", "kinematics", store=store)
         if saved.robot_model is not None:
             return AxolModel(str(saved.robot_model).strip().lower())
         jelly = shared_config(JellyConfig, "teleop", "jelly", store=store)
         jelly_enabled = detect_jelly(jelly) is not None
-    return AxolModel.MOBILE if jelly_enabled else AxolModel.CLASSIC
+    if jelly_enabled:
+        return AxolModel.MOBILE
+    return resolve_mount(mount if mount is not None else saved.mount)
+
+
+def resolve_mount(mount: AxolModel | str | None) -> AxolModel:
+    """``mount`` (``kinematics.mount``) as a version, validated: one of
+    :data:`~almond_axol.constants.MOUNTS`, legacy (``classic``) when unset."""
+    from .constants import MOUNTS, AxolModel
+
+    if mount is None:
+        return AxolModel.CLASSIC
+    try:
+        model = AxolModel(str(mount).strip().lower())
+    except ValueError:
+        model = None
+    if model not in MOUNTS:
+        raise ValueError(
+            f"mount must be one of {[m.value for m in MOUNTS]}, got {mount!r}"
+        )
+    return model
 
 
 def resolve_gripper(

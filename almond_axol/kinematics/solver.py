@@ -32,7 +32,7 @@ from ..constants import (
     AxolModel,
     BODY_JOINTS,
     Joint,
-    torso_links,
+    upper_arm_guard_links,
     urdf_arm_joint_names,
     urdf_body_name,
     urdf_joint_name,
@@ -842,6 +842,7 @@ class KinematicsSolver:
         self.robot_model = resolve_robot_model(
             config.robot_model,
             jelly_enabled=True if self.whole_body else None,
+            mount=config.mount,
         )
         # The fitted gripper (the mobile Axol has a URDF per gripper).
         self.gripper = (
@@ -890,7 +891,7 @@ class KinematicsSolver:
             home_distances = np.asarray(
                 self.robot_coll.compute_self_collision_distance(self.robot, q_home)
             )
-            torso = torso_links(self.robot_model, whole_body=self.whole_body)
+            torso = upper_arm_guard_links(self.robot_model, whole_body=self.whole_body)
             for k, (i, j) in enumerate(
                 zip(
                     np.asarray(self.robot_coll.active_idx_i),

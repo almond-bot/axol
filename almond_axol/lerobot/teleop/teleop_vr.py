@@ -146,6 +146,7 @@ class AxolVRTeleop(Teleoperator):
             robot_model=resolve_robot_model(
                 config.kinematics_config.robot_model,
                 jelly_enabled=jelly_cfg is not None,
+                mount=config.kinematics_config.mount,
             ).value,
         )
         # The mobile Axol has a URDF per gripper: solve with the fitted one.

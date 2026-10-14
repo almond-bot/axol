@@ -50,19 +50,24 @@ q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 
 ## Robot models
 
-The bundled URDFs live in `almond_axol/kinematics/urdf/`. The Axol-on-Jelly ones are generated from the Onshape exports (one per gripper) by `scripts/build_jelly_urdfs.py` and share `meshes/jelly/`:
+The bundled URDFs live in `almond_axol/kinematics/urdf/`. All but `axol.urdf` are generated from the Onshape exports (one per mount and gripper) by `scripts/build_jelly_urdfs.py`. They share the body and arm meshes in `meshes/jelly/`, and keep only their own parts in `meshes/<mount>/`:
 
 | File | What moves | Used by |
 |---|---|---|
-| `axol.urdf` | the 14 arm joints | classic Axol (fixed mount) |
+| `axol.urdf` | the 14 arm joints | Axol Legacy, the original model (the default) |
+| `axol_standalone.urdf` | the 14 arm joints | Axol standalone: the shoulder bar and head camera, nothing below |
+| `axol_ox_cart.urdf` | the 14 arm joints (lift frozen, fully raised) | Axol on the Ox cart's lift column |
+| `axol_owl.urdf` | the 14 arm joints | Axol on the Owl mount: a column on a foot plate |
 | `axol_jelly.urdf` | the 14 arm joints (base and lift frozen, lift fully raised) | Axol on Jelly — picked automatically when Jelly is enabled |
 | `axol_jelly_whole_body.urdf` | arms + `base_x`, `base_y`, `base_yaw`, `lift` | whole-body IK (`kinematics.whole_body`) |
 | `axol_jelly_sim.urdf` | arms, `lift`, gripper fingers, wheels | physics simulators such as Isaac Sim — not used by the stack |
 | `axol_jelly_parcel.urdf`, `axol_jelly_parcel_whole_body.urdf`, `axol_jelly_parcel_sim.urdf` | as above | the same three with the parcel gripper — picked instead when `axol.gripper` is `parcel` |
 
-**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses the parcel models everywhere the URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`, a revolute `*_plate_joint` over a half turn in the sim model, 0 = alongside the jaw). The IK models cannot see the plate's angle, so its collision body is one cylinder over its whole sweep (`*_fingers`). The parcel gripper has no wrist cameras, so its models carry only the head camera frames, and its own meshes (gripper, wrist link) are in `meshes/jelly_parcel/`. The classic Axol has one URDF, `axol.urdf`, whichever gripper is fitted.
+**Picking the version.** With Jelly enabled the robot is Axol on Jelly. Otherwise it is the mount picked in the control panel's Robot tab (**Choose your Axol**), saved as `kinematics.mount`: `classic` (legacy, the default), `standalone`, `ox_cart` or `owl`. Each picks the body IK keeps the arms clear of: the Ox cart's lift column, and the Owl mount's column and its foot plate (six thin strips, kept off the hard upper-arm guard since they sit under the arms' path). The Ox cart model has the lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and this model does not see it. `kinematics.robot_model` still forces a version outright.
 
-All of them share the same arm chain, so forward kinematics and gravity compensation match. Every Jelly model carries camera optical frames — `left_wrist_camera_optical`, `right_wrist_camera_optical` (parallel gripper only), `head_camera_left_optical`, `head_camera_right_optical` — in the ROS optical convention (+z along the optical axis, +x image right, +y image down).
+**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses the parcel models everywhere the URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`, a revolute `*_plate_joint` over a half turn in the sim model, 0 = alongside the jaw). The IK models cannot see the plate's angle, so its collision body is one cylinder over its whole sweep (`*_fingers`). The parcel gripper has no wrist cameras, so its models carry only the head camera frames, and its own meshes (gripper, wrist link) are in `meshes/jelly_parcel/`. The parcel gripper is on Jelly only: the other versions have one URDF each, with the parallel gripper, whichever gripper is fitted.
+
+All of them share the same arm chain, so forward kinematics and gravity compensation match. Every generated model carries camera optical frames — `left_wrist_camera_optical`, `right_wrist_camera_optical` (parallel gripper only), `head_camera_left_optical`, `head_camera_right_optical` — in the ROS optical convention (+z along the optical axis, +x image right, +y image down).
 
 **Simulation model.** `axol_jelly_sim.urdf` is rooted at the Jelly on the floor (`jelly`) and uses relative mesh paths, so it imports without a ROS package:
 

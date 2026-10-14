@@ -210,6 +210,7 @@ class VRTeleop:
             jelly_enabled=(
                 True if jelly is not None or kinematics_config.whole_body else None
             ),
+            mount=kinematics_config.mount,
         )
         kinematics_config = replace(kinematics_config, robot_model=robot_model.value)
         # The mobile Axol has a URDF per gripper: solve with the fitted one.
