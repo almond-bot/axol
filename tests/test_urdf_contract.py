@@ -9,6 +9,7 @@ import yourdfpy
 
 from almond_axol.constants import (
     ARM_JOINTS,
+    JELLY_PARCEL_SIM_URDF,
     JELLY_SIM_URDF,
     URDF_PATH,
     AxolModel,
@@ -130,9 +131,15 @@ class MobileUrdfContractTest(unittest.TestCase):
     differs where it should: the elbow limits, the meshes, and the body.
     """
 
+    # The fitted gripper (the mobile Axol has a URDF per gripper), its sim
+    # model and the mesh directory only its models use.
+    gripper = "parallel"
+    sim_path = JELLY_SIM_URDF
+    mesh_dir = "meshes/jelly"
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.path = urdf_path(AxolModel.MOBILE)
+        cls.path = urdf_path(AxolModel.MOBILE, gripper=cls.gripper)
         cls.root = ElementTree.parse(cls.path).getroot()
         cls.classic = ElementTree.parse(URDF_PATH).getroot()
         cls.urdf = yourdfpy.URDF.load(str(cls.path), mesh_dir=str(cls.path.parent))
@@ -220,19 +227,61 @@ class MobileUrdfContractTest(unittest.TestCase):
             mesh.attrib["filename"].removeprefix(prefix)
             for mesh in self.root.iter("mesh")
         }
-        self.assertTrue(all(r.startswith("meshes/jelly/") for r in references))
-        # The arm, whole-body and sim models share the directory: together
-        # they use every packaged mesh (the sim model's paths are relative).
-        for other in (urdf_path(AxolModel.MOBILE, whole_body=True), JELLY_SIM_URDF):
+        # The arm, whole-body and sim models share their directory: together
+        # they use every mesh packaged in it (the sim model's paths are
+        # relative). Another gripper's models also reuse the parallel
+        # gripper's body and arm meshes.
+        for other in (
+            urdf_path(AxolModel.MOBILE, whole_body=True, gripper=self.gripper),
+            self.sim_path,
+        ):
             references |= {
                 mesh.attrib["filename"].removeprefix(prefix)
                 for mesh in ElementTree.parse(other).getroot().iter("mesh")
             }
+        self.assertTrue(
+            all(
+                r.startswith(("meshes/jelly/", f"{self.mesh_dir}/")) for r in references
+            )
+        )
+        self.assertTrue(all((self.path.parent / r).is_file() for r in references))
         packaged = {
             p.relative_to(self.path.parent).as_posix()
-            for p in (self.path.parent / "meshes" / "jelly").glob("*.stl")
+            for p in (self.path.parent / self.mesh_dir).glob("*.stl")
         }
-        self.assertEqual(references, packaged)
+        own = {r for r in references if r.startswith(f"{self.mesh_dir}/")}
+        self.assertEqual(own, packaged)
+
+
+class ParcelUrdfContractTest(MobileUrdfContractTest):
+    """The mobile Axol with the parcel gripper: the same arms on the same body."""
+
+    gripper = "parcel"
+    sim_path = JELLY_PARCEL_SIM_URDF
+    mesh_dir = "meshes/jelly_parcel"
+
+    def test_gripper_is_the_parcel_gripper(self) -> None:
+        links = {ln.attrib["name"] for ln in self.root.findall("link")}
+        for side in ("left", "right"):
+            self.assertIn(f"{side}_plate", links)
+            self.assertNotIn(f"{side}_finger_1", links)
+            # No wrist camera on the parcel gripper.
+            self.assertNotIn(f"{side}_wrist_camera", links)
+            self.assertNotIn(f"{side}_wrist_camera_optical", links)
+
+    def test_plate_sweep_is_one_capsule(self) -> None:
+        # The IK model cannot see the plate's angle: its collision body
+        # covers the whole sweep, fixed to the gripper.
+        links = {ln.attrib["name"]: ln for ln in self.root.findall("link")}
+        for side in ("left", "right"):
+            (col,) = links[f"{side}_fingers"].findall("collision")
+            self.assertIsNotNone(col.find("geometry/cylinder"))
+            joint = next(
+                j
+                for j in self.root.findall("joint")
+                if j.find("child").attrib["link"] == f"{side}_fingers"
+            )
+            self.assertEqual(joint.find("parent").attrib["link"], f"{side}_gripper")
 
 
 if __name__ == "__main__":

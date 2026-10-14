@@ -17,7 +17,7 @@ from almond_axol.constants import (
 )
 from almond_axol.serve.commands import build_argv
 from almond_axol.serve.settings import SettingsStore
-from almond_axol.settings import resolve_robot_model
+from almond_axol.settings import resolve_gripper, resolve_robot_model
 
 
 class JellyInfersRobotModelTest(unittest.TestCase):
@@ -70,6 +70,36 @@ class JellyInfersRobotModelTest(unittest.TestCase):
         self.assertIs(self._resolve(True), AxolModel.CLASSIC)
 
 
+class GripperResolutionTest(unittest.TestCase):
+    """The fitted gripper picks the mobile Axol's URDF: explicit, else saved."""
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.store = SettingsStore(Path(self._dir.name) / "settings.json", strict=True)
+
+    def tearDown(self) -> None:
+        self._dir.cleanup()
+
+    def test_saved_gripper_is_used(self) -> None:
+        self.assertEqual(resolve_gripper(store=self.store), "parallel")
+        self.store.update(values={"axol.gripper": "parcel"})
+        self.assertEqual(resolve_gripper(store=self.store), "parcel")
+
+    def test_explicit_gripper_wins_and_is_validated(self) -> None:
+        self.store.update(values={"axol.gripper": "parcel"})
+        self.assertEqual(resolve_gripper("Parallel", store=self.store), "parallel")
+        with self.assertRaises(ValueError):
+            resolve_gripper("claw", store=self.store)
+
+
+# Every bundled IK model: (version, gripper).
+_MODELS = (
+    (AxolModel.CLASSIC, "parallel"),
+    (AxolModel.MOBILE, "parallel"),
+    (AxolModel.MOBILE, "parcel"),
+)
+
+
 class UrdfSelectionTest(unittest.TestCase):
     def test_each_version_has_its_own_urdf(self) -> None:
         self.assertEqual(urdf_path(), URDF_PATH)
@@ -77,12 +107,23 @@ class UrdfSelectionTest(unittest.TestCase):
         self.assertEqual(urdf_path(AxolModel.MOBILE).name, "axol_jelly.urdf")
         self.assertTrue(urdf_path(AxolModel.MOBILE).is_file())
 
+    def test_the_mobile_axol_has_a_urdf_per_gripper(self) -> None:
+        for whole_body, name in (
+            (False, "axol_jelly_parcel.urdf"),
+            (True, "axol_jelly_parcel_whole_body.urdf"),
+        ):
+            path = urdf_path(AxolModel.MOBILE, whole_body=whole_body, gripper="parcel")
+            self.assertEqual(path.name, name)
+            self.assertTrue(path.is_file())
+        # The classic Axol has one URDF, whatever its gripper.
+        self.assertEqual(urdf_path(AxolModel.CLASSIC, gripper="parcel"), URDF_PATH)
+
     def test_collision_is_arm_against_body_on_both_versions(self) -> None:
         from almond_axol.kinematics.model import shared_robot_collision
 
-        for model in AxolModel:
-            with self.subTest(model=model.value):
-                rc = shared_robot_collision(model)
+        for model, gripper in _MODELS:
+            with self.subTest(model=model.value, gripper=gripper):
+                rc = shared_robot_collision(model, gripper=gripper)
                 torso = set(torso_links(model))
                 self.assertTrue(torso <= set(rc.link_names))
                 pairs = {
@@ -104,6 +145,29 @@ class UrdfSelectionTest(unittest.TestCase):
                 }
                 expected = {frozenset((t, a)) for t in torso for a in arms}
                 self.assertEqual(pairs, expected)
+
+
+class OverlayUrdfTest(unittest.TestCase):
+    """The headset overlay loads the URDF the IK solver runs."""
+
+    def _file(self, robot_model: str, gripper: str) -> str:
+        import logging
+
+        from almond_axol.teleop.config import VRTeleopConfig
+        from almond_axol.teleop.core import VRTeleopCore
+
+        core = VRTeleopCore(
+            VRTeleopConfig(gripper=gripper),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+            robot_model=robot_model,
+        )
+        return core._urdf_file
+
+    def test_follows_the_version_and_gripper(self) -> None:
+        self.assertEqual(self._file("mobile", "parcel"), "axol_jelly_parcel.urdf")
+        self.assertEqual(self._file("mobile", "parallel"), "axol_jelly.urdf")
+        self.assertEqual(self._file("classic", "parcel"), "axol.urdf")
 
 
 def _pair_distances(model: AxolModel, q_left, q_right) -> dict[tuple[str, str], float]:

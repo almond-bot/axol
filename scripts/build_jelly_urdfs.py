@@ -48,10 +48,21 @@ stage (``base``, ``lift_stage``, ``jelly``) plus deck strips in the
 whole-body model. Their fingers collide as one cylinder spanning the full
 stroke.
 
-Run (``fast-simplification`` is only needed here, not at runtime)::
+Each gripper (``AxolConfig.gripper``) has its own export and its own three
+URDFs (a :class:`Variant`): the parallel gripper's above, and the parcel
+gripper's ``axol_jelly_parcel{,_whole_body,_sim}.urdf`` — a fixed jaw and a
+plate hinged on it (a revolute joint in the sim model, its whole sweep one
+collision cylinder in the IK models), and no wrist cameras. The body and
+arms are the same in every export, so the parcel gripper's URDFs reuse the
+parallel gripper's meshes wherever the source parts match and keep only
+their own (gripper, wrist link) under ``meshes/jelly_parcel/``. The script
+tells the exports apart by their links.
+
+Run (``fast-simplification`` is only needed here, not at runtime), the
+parallel gripper's export first::
 
     uv run --with fast-simplification python scripts/build_jelly_urdfs.py \\
-        path/to/almond_urdf
+        path/to/almond_urdf path/to/parcel/almond_urdf
 """
 
 from __future__ import annotations
@@ -61,6 +72,7 @@ import itertools
 import re
 import textwrap
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -86,8 +98,9 @@ CLASSIC_JOINTS = ("s1_0", "s2_0", "s3_0", "e1_0", "e2_0", "w1_0", "w2_0")
 EXPORT_JOINTS = ("s1", "s2", "s3", "e1", "w1", "w2", "w3")
 
 # Export link -> bundled link. Every other export link joins the group of its
-# nearest listed ancestor.
-ANCHORS: dict[str, str] = {
+# nearest listed ancestor. The body and arms, common to every export; each
+# gripper's own links are in its Variant.
+BODY_ANCHORS: dict[str, str] = {
     "jelly_base": "jelly",
     "jelly_stage_2_1": "lift_stage",
     "jelly_stage_3": "base",
@@ -100,10 +113,6 @@ ANCHORS: dict[str, str] = {
     "w0_left": "left_w0",
     "w1_left": "left_w1",
     "w2_1": "left_w2",
-    "gripper_base": "left_gripper",
-    "gripper_tip_1": "left_finger_1",
-    "gripper_tip": "left_finger_2",
-    "wrist_mount": "left_wrist_camera",
     "s2_right": "right_s2",
     "s3_right": "right_s3",
     "e1_right": "right_e1",
@@ -111,10 +120,6 @@ ANCHORS: dict[str, str] = {
     "w0_right": "right_w0",
     "w1_right": "right_w1",
     "w2": "right_w2",
-    "gripper_base_1": "right_gripper",
-    "gripper_tip_3": "right_finger_1",
-    "gripper_tip_2": "right_finger_2",
-    "wrist_mount_1": "right_wrist_camera",
     "wheel": "wheel_1_link",
     "wheel_2": "wheel_2_link",
     "wheel_3": "wheel_3_link",
@@ -123,14 +128,14 @@ ANCHORS: dict[str, str] = {
 
 # Bundled links that exist only in the Jelly models, and the classic link each
 # is rigidly attached to with an identity origin (their meshes are placed in
-# the parent's frame).
-EXTRA_LINKS: dict[str, str] = {
+# the parent's frame). Each Variant adds its gripper's.
+BODY_EXTRA_LINKS: dict[str, str] = {
     "head": "s1",
     "lift_plate": "base",
-    # Split off the gripper so each part gets its own (much tighter) capsule.
-    "left_wrist_camera": "left_gripper",
-    "right_wrist_camera": "right_gripper",
-    # IK models only: collision-only link holding the finger cylinder.
+}
+# IK models only: collision-only link per gripper holding its jaws' swept
+# volume (see Collision.finger_cylinder / plate_sweep).
+FINGER_LINKS: dict[str, str] = {
     "left_fingers": "left_gripper",
     "right_fingers": "right_gripper",
 }
@@ -151,16 +156,9 @@ class Moving:
 
 
 # Fingers and wheels keep the export's link frames (their joint frames), so
-# the sim model can move them along the export's own axes.
-MOVING: dict[str, Moving] = {
-    "left_finger_1": Moving("gripper_tip_1", "gripper_tip_1", "left_gripper"),
-    "left_finger_2": Moving(
-        "gripper_tip", "gripper_tip_2", "left_gripper", "left_finger_1"
-    ),
-    "right_finger_1": Moving("gripper_tip_3", "gripper_tip_1_1", "right_gripper"),
-    "right_finger_2": Moving(
-        "gripper_tip_2", "gripper_tip_2_1", "right_gripper", "right_finger_1"
-    ),
+# the sim model can move them along the export's own axes. Each Variant adds
+# its gripper's moving parts.
+BODY_MOVING: dict[str, Moving] = {
     "wheel_1_link": Moving("wheel", "wheel_1", "jelly"),
     "wheel_2_link": Moving("wheel_2", "wheel_2", "jelly"),
     "wheel_3_link": Moving("wheel_3", "wheel_3", "jelly"),
@@ -196,21 +194,13 @@ PIECE_SPLITS: dict[str, tuple[tuple[float, ...], tuple[float, ...], str, str]] =
 
 # Collision body specs: a hull over pieces, a cylinder along a link axis over
 # pieces (``stroke``: include the fingers fully open), or deck strips.
-_ARM_PARTS = ("s2", "s3", "e1", "e2", "w0", "w1", "w2", "gripper", "wrist_camera")
-COMMON_HULLS = (
-    *(f"{side}_{part}" for side in ("left", "right") for part in _ARM_PARTS),
-    "s1",
-    "head",
-    "lift_plate",
-)
+_ARM_PARTS = ("s2", "s3", "e1", "e2", "w0", "w1", "w2", "gripper")
+BODY_HULLS = ("s1", "head", "lift_plate")
 # The deck (0.6 x 0.6 m, ~0.24 m tall) as strips across the robot for capsule
 # collision: one capsule over the whole deck would swallow the arms; three
 # along y stay within a few cm of it.
 DECK_STRIPS = 3
 
-# Visual meshes the wrist cameras see up close (5-10 cm): simplified to the
-# tight tolerance so renders from the wrist match real images.
-CAMERA_VIEWED = ("_gripper", "_finger_1", "_finger_2")
 
 # ZED X One S fisheye: where the camera's rays converge, along its optical
 # axis from the camera's CAD origin (m). From Stereolabs' model
@@ -249,8 +239,7 @@ WHOLE_BODY_NOTE = (
 SIM_NOTE = (
     "Simulation model: rooted at the Jelly on the floor (link jelly, at the "
     "Jelly centre). Moving: the 14 arm joints, the lift (lift, lift_2 "
-    "mimics), each gripper's fingers (left_finger_1 / right_finger_1, the "
-    "second finger mimics; 0 = closed, 0.0588 m = open) and the four wheels "
+    "mimics), {gripper_joints} and the four wheels "
     "(continuous). Arm joints carry AxolConfig's measured friction as "
     "<dynamics friction> (Coulomb, N·m) and damping (viscous, N·m·s/rad), "
     "per arm, and the motors' impedance gains as <drive stiffness> (kp, "
@@ -260,8 +249,8 @@ SIM_NOTE = (
     "omni rollers are not modelled: plain wheels "
     "cannot strafe, so drive the base kinematically or with a holonomic "
     "controller. Arm masses and CoMs are AxolConfig's tuned gravity-comp "
-    "values (the wrist-3 body is split so the gripper, fingers and wrist "
-    "camera carry their share while the assembly's total mass and CoM stay "
+    "values (the wrist-3 body is split so {wrist_parts} carry their share "
+    "while the assembly's total mass and CoM stay "
     "as tuned); every other mass is an ESTIMATE (SIM_MASSES in the "
     "generator) - replace with measured values. Inertia tensors assume "
     "uniform density over each part's convex hull. Effort/velocity: arm "
@@ -271,15 +260,17 @@ SIM_NOTE = (
     "rotation. Mesh paths are relative to this file."
 )
 
+HEAD_CAMERA_NOTE = (
+    "Head camera frames (head_camera_*_optical, ZED X Mini Wide): each lens's "
+    "projection centre from Stereolabs' model, 7.2 mm behind its front cover."
+)
 WRIST_CAMERA_NOTE = (
     "Wrist camera frames (*_wrist_camera_optical, ZED X One S fisheye): the "
     "origin is the projection centre from Stereolabs' model of the camera "
     "(its FOV solid's rays meet on the lens axis 2.2 mm behind the front "
     "glass); fitting real wrist images through each camera's factory "
     "calibration agrees within the fit's ~3 mm resolution. Roll puts the "
-    "gripper at the bottom of the image, as in real frames. Head camera "
-    "frames (head_camera_*_optical, ZED X Mini Wide): each lens's projection "
-    "centre from Stereolabs' model, 7.2 mm behind its front cover."
+    "gripper at the bottom of the image, as in real frames. " + HEAD_CAMERA_NOTE
 )
 
 # Masses (kg) of the non-arm links in the sim model: ESTIMATES, not measured.
@@ -297,19 +288,139 @@ SIM_MASSES: dict[str, float] = {
     "wheel_3_link": 1.0,
     "wheel_4_link": 1.0,
 }
-SIM_WRIST_PARTS: dict[str, float] = {
-    "gripper": 0.25,
-    "finger_1": 0.04,
-    "finger_2": 0.04,
-    "wrist_camera": 0.08,
-}
 # Joint effort (N·m or N) / velocity (rad/s or m/s) in the sim model for the
 # joints axol.urdf does not define: ESTIMATES.
 SIM_LIMITS: dict[str, tuple[float, float]] = {
     "lift": (1000.0, 0.03),
     "finger": (50.0, 0.1),
+    "plate": (5.0, 3.0),
     "wheel": (20.0, 30.0),
 }
+
+
+@dataclass(frozen=True)
+class Variant:
+    """One gripper's export: the links it adds to the body and arms, and the
+    URDFs and meshes made from it."""
+
+    gripper: str  # AxolConfig.gripper
+    marker: str  # an export link only this gripper's export has
+    anchors: dict[str, str]  # its export links -> bundled links
+    extra_links: dict[str, str]  # its fixed extra links (see BODY_EXTRA_LINKS)
+    moving: dict[str, Moving]  # its moving parts (sim joints)
+    hulls: tuple[str, ...]  # its per-side collision hulls besides _ARM_PARTS
+    # Visual meshes simplified to the tight tolerance (link-name suffixes).
+    tight: tuple[str, ...]
+    # Masses (kg, ESTIMATES) carved out of AxolConfig's wrist_3 mass, which
+    # lumps the whole gripper assembly, so they redistribute rather than add.
+    wrist_parts: dict[str, float]
+    outputs: tuple[Path, Path, Path]  # arm, whole-body, sim
+    mesh_subdir: str
+    # A mesh subdirectory whose byte-identical files are referenced instead
+    # of written again (the body and arms are the same in every export).
+    share_subdir: str | None
+    wrist_cameras: bool
+    gripper_joints: str  # SIM_NOTE's description of the gripper joints
+    wrist_parts_note: str  # ... and of wrist_parts
+
+    @property
+    def all_anchors(self) -> dict[str, str]:
+        return {**BODY_ANCHORS, **self.anchors}
+
+    @property
+    def all_extra_links(self) -> dict[str, str]:
+        return {**BODY_EXTRA_LINKS, **self.extra_links, **FINGER_LINKS}
+
+    @property
+    def all_moving(self) -> dict[str, Moving]:
+        return {**self.moving, **BODY_MOVING}
+
+
+PARALLEL = Variant(
+    gripper="parallel",
+    marker="gripper_base",
+    anchors={
+        "gripper_base": "left_gripper",
+        "gripper_tip_1": "left_finger_1",
+        "gripper_tip": "left_finger_2",
+        "wrist_mount": "left_wrist_camera",
+        "gripper_base_1": "right_gripper",
+        "gripper_tip_3": "right_finger_1",
+        "gripper_tip_2": "right_finger_2",
+        "wrist_mount_1": "right_wrist_camera",
+    },
+    # Split off the gripper so each part gets its own (much tighter) capsule.
+    extra_links={
+        "left_wrist_camera": "left_gripper",
+        "right_wrist_camera": "right_gripper",
+    },
+    moving={
+        "left_finger_1": Moving("gripper_tip_1", "gripper_tip_1", "left_gripper"),
+        "left_finger_2": Moving(
+            "gripper_tip", "gripper_tip_2", "left_gripper", "left_finger_1"
+        ),
+        "right_finger_1": Moving("gripper_tip_3", "gripper_tip_1_1", "right_gripper"),
+        "right_finger_2": Moving(
+            "gripper_tip_2", "gripper_tip_2_1", "right_gripper", "right_finger_1"
+        ),
+    },
+    hulls=("wrist_camera",),
+    # What the wrist cameras see up close (5-10 cm): renders from the wrist
+    # should match real images.
+    tight=("_gripper", "_finger_1", "_finger_2"),
+    wrist_parts={
+        "gripper": 0.25,
+        "finger_1": 0.04,
+        "finger_2": 0.04,
+        "wrist_camera": 0.08,
+    },
+    outputs=(OUT_ARM, OUT_WHOLE_BODY, OUT_SIM),
+    mesh_subdir=MESH_SUBDIR,
+    share_subdir=None,
+    wrist_cameras=True,
+    gripper_joints=(
+        "each gripper's fingers (left_finger_1 / right_finger_1, the second "
+        "finger mimics; 0 = closed, 0.0588 m = open)"
+    ),
+    wrist_parts_note="the gripper, fingers and wrist camera",
+)
+
+# The parcel gripper (AxolConfig.gripper = "parcel"): a fixed jaw and a plate
+# hinged on it, no wrist camera. Its export's body and arms are the parallel
+# export's, so its URDFs reuse those meshes.
+PARCEL = Variant(
+    gripper="parcel",
+    marker="thumb_l",
+    anchors={
+        "finger_l": "left_gripper",
+        "thumb_l": "left_plate",
+        "finger_r": "right_gripper",
+        "thumb_r": "right_plate",
+    },
+    extra_links={},
+    moving={
+        "left_plate": Moving("thumb_l", "g_l", "left_gripper"),
+        "right_plate": Moving("thumb_r", "g_r", "right_gripper"),
+    },
+    hulls=(),
+    tight=("_gripper", "_plate"),
+    wrist_parts={"gripper": 0.30, "plate": 0.08},
+    outputs=(
+        URDF_DIR / "axol_jelly_parcel.urdf",
+        URDF_DIR / "axol_jelly_parcel_whole_body.urdf",
+        URDF_DIR / "axol_jelly_parcel_sim.urdf",
+    ),
+    mesh_subdir="meshes/jelly_parcel",
+    share_subdir=MESH_SUBDIR,
+    wrist_cameras=False,
+    gripper_joints=(
+        "each gripper's hinged plate (left_plate_joint / right_plate_joint, "
+        "revolute over the export's half turn: left [-pi, 0], right [0, pi], "
+        "0 = folded flat along the jaw)"
+    ),
+    wrist_parts_note="the jaw and plate",
+)
+VARIANTS = (PARALLEL, PARCEL)
 
 
 def _load(path: Path) -> yourdfpy.URDF:
@@ -403,7 +514,11 @@ def align(
 
 
 def check_equivalent(
-    classic: yourdfpy.URDF, export: yourdfpy.URDF, tf: np.ndarray, sg: np.ndarray
+    classic: yourdfpy.URDF,
+    export: yourdfpy.URDF,
+    tf: np.ndarray,
+    sg: np.ndarray,
+    variant: Variant,
 ) -> None:
     """Every arm link must move identically in both models (within CAD slop)."""
     rng = np.random.default_rng(0)
@@ -412,10 +527,10 @@ def check_equivalent(
         prefix = "left_" if side == "l" else "right_"
         pairs = [
             (bundled, exported)
-            for exported, bundled in ANCHORS.items()
+            for exported, bundled in variant.all_anchors.items()
             if bundled.startswith(prefix)
-            and bundled not in EXTRA_LINKS
-            and bundled not in MOVING
+            and bundled not in variant.all_extra_links
+            and bundled not in variant.all_moving
             and not bundled.endswith("_gripper")
         ]
         ref = None
@@ -476,16 +591,16 @@ def export_limits(
     return out
 
 
-def groups(export: yourdfpy.URDF) -> dict[str, str]:
+def groups(export: yourdfpy.URDF, anchors: dict[str, str]) -> dict[str, str]:
     """Export link -> bundled link (nearest anchored ancestor)."""
     parent = {j.child: j.parent for j in export.robot.joints}
     out = {}
     for link in export.link_map:
         cur = link
-        while cur not in ANCHORS and cur in parent:
+        while cur not in anchors and cur in parent:
             cur = parent[cur]
-        if cur in ANCHORS:
-            out[link] = ANCHORS[cur]
+        if cur in anchors:
+            out[link] = anchors[cur]
     return out
 
 
@@ -562,11 +677,16 @@ class Frames:
     """Bundled link frames in the classic root frame, every joint at zero."""
 
     def __init__(
-        self, classic: yourdfpy.URDF, export: yourdfpy.URDF, tf: np.ndarray
+        self,
+        classic: yourdfpy.URDF,
+        export: yourdfpy.URDF,
+        tf: np.ndarray,
+        variant: Variant,
     ) -> None:
         _zero(classic)
         _zero(export)
         self.classic, self.export, self.tf = classic, export, tf
+        self.variant = variant
         self.jelly_center = tf[:3, 3].copy()
 
     def __call__(self, link: str) -> np.ndarray:
@@ -574,16 +694,56 @@ class Frames:
             frame = np.eye(4)
             frame[:3, 3] = self.jelly_center
             return frame
-        if link in MOVING:
+        moving = self.variant.all_moving
+        if link in moving:
             return self.tf @ self.export.get_transform(
-                MOVING[link].export_link, self.export.base_link
+                moving[link].export_link, self.export.base_link
             )
         return self.classic.get_transform(
-            EXTRA_LINKS.get(link, link), self.classic.base_link
+            self.variant.all_extra_links.get(link, link), self.classic.base_link
         )
 
     def relative(self, parent: str, child: str) -> np.ndarray:
         return np.linalg.inv(self(parent)) @ self(child)
+
+
+# Every mesh written this run: file name -> [(source geometry, path)], so an
+# export whose part matches one already written references it rather than
+# writing a copy.
+_WRITTEN: dict[str, list[tuple[tuple[np.ndarray, ...], str]]] = defaultdict(list)
+# Sources closer than this are the same part: two exports of one assembly
+# place it a few µm apart (their CAD poses are rounded differently).
+SAME_SOURCE = 1e-4
+
+
+def _same(a: tuple[np.ndarray, ...], b: tuple[np.ndarray, ...]) -> bool:
+    return all(
+        x.shape == y.shape and np.allclose(x, y, rtol=0.0, atol=SAME_SOURCE)
+        for x, y in zip(a, b, strict=True)
+    )
+
+
+def _write_mesh(
+    name: str,
+    source: tuple[np.ndarray, ...],
+    variant: Variant,
+    make: Callable[[], trimesh.Trimesh],
+) -> str:
+    """Write ``make()`` as ``variant``'s ``name``; returns its URDF-relative path.
+
+    ``source`` is the geometry it is made from. When an earlier export in
+    this run (``variant.share_subdir``) wrote the same file from the same
+    source — the body and arms are the same in every export — that file is
+    referenced instead (simplification and hulls are not bit-reproducible,
+    so the outputs themselves cannot be compared).
+    """
+    for other, path in _WRITTEN[name]:
+        if path.startswith(f"{variant.share_subdir}/") and _same(source, other):
+            return path
+    path = f"{variant.mesh_subdir}/{name}"
+    make().export(URDF_DIR / path)
+    _WRITTEN[name].append((source, path))
+    return path
 
 
 def build_meshes(
@@ -605,7 +765,8 @@ def build_meshes(
     link's frame])}``), and every export link's vertices in the classic root
     frame (for the camera frames).
     """
-    owner = groups(export)
+    variant = frames.variant
+    owner = groups(export, variant.all_anchors)
     by_color: dict[tuple[str, tuple[float, ...]], list[trimesh.Trimesh]] = defaultdict(
         list
     )
@@ -644,8 +805,8 @@ def build_meshes(
                 rgba = tuple(round(float(c), 4) for c in vis.material.color.rgba)
             by_color[(target, rgba)].append(placed)
 
-    (URDF_DIR / MESH_SUBDIR).mkdir(parents=True, exist_ok=True)
-    for old in (URDF_DIR / MESH_SUBDIR).glob("*.stl"):
+    (URDF_DIR / variant.mesh_subdir).mkdir(parents=True, exist_ok=True)
+    for old in (URDF_DIR / variant.mesh_subdir).glob("*.stl"):
         old.unlink()
     visuals: dict[str, list[tuple[str, tuple[float, ...]]]] = defaultdict(list)
     counters: dict[str, int] = defaultdict(int)
@@ -653,18 +814,24 @@ def build_meshes(
     for (target, rgba), meshes in sorted(by_color.items()):
         merged = trimesh.util.concatenate(meshes)
         merged.merge_vertices()
-        tol = tolerance if target.endswith(CAMERA_VIEWED) else loose_tolerance
-        merged, error = _decimate(merged, visual_faces, tol)
-        worst = max(worst, (error, target))
-        if target.endswith(CAMERA_VIEWED):
-            tight = max(tight, (error, target))
+        is_tight = target.endswith(variant.tight)
+        tol = tolerance if is_tight else loose_tolerance
         name = f"{target}_{counters[target]}.stl"
         counters[target] += 1
-        merged.export(URDF_DIR / MESH_SUBDIR / name)
-        visuals[target].append((f"{MESH_SUBDIR}/{name}", rgba))
+
+        def make(merged=merged, target=target, is_tight=is_tight, tol=tol):
+            nonlocal worst, tight
+            out, error = _decimate(merged, visual_faces, tol)
+            worst = max(worst, (error, target))
+            if is_tight:
+                tight = max(tight, (error, target))
+            return out
+
+        source = (merged.vertices, merged.faces, np.asarray(rgba))
+        visuals[target].append((_write_mesh(name, source, variant, make), rgba))
     print(
         f"visual meshes: worst deviation {worst[0] * 1e3:.2f} mm ({worst[1]}); "
-        f"camera-viewed {tight[0] * 1e3:.2f} mm ({tight[1]})"
+        f"gripper {tight[0] * 1e3:.2f} mm ({tight[1]})"
     )
     return visuals, pieces, {k: np.vstack(v) for k, v in in_root.items()}
 
@@ -722,9 +889,11 @@ def camera_frames(
       camera, +x from the left lens to the right one (the ZED convention:
       the right camera sits at +x of the left). The two covers are checked
       to be the 50 mm baseline apart.
+
+    The wrist frames only for a gripper with wrist cameras.
     """
     out: dict[str, tuple[str, np.ndarray]] = {}
-    for seal, lens, rear, fingers, camera_frame in (
+    wrists = (
         (
             "camera_component___seal___zed_x_one",
             "fisheye_lens",
@@ -739,6 +908,9 @@ def camera_frames(
             ("gripper_tip_2", "gripper_tip_3"),
             "zed_x_one_gs_compact__1__1",
         ),
+    )
+    for seal, lens, rear, fingers, camera_frame in (
+        wrists if frames.variant.wrist_cameras else ()
     ):
         ring = in_root[seal]
         centre = (ring.min(axis=0) + ring.max(axis=0)) / 2
@@ -855,13 +1027,15 @@ class Collision:
             snapped = np.unique(
                 np.round(self.points(link, names) / 2e-3) * 2e-3, axis=0
             )
-            hull = trimesh.PointCloud(snapped).convex_hull
             stem = link if names == (link,) else "_".join(names)
             if stem != link:
                 stem = f"{link}__{stem}"
-            path = f"{MESH_SUBDIR}/{stem}_collision.stl"
-            hull.export(URDF_DIR / path)
-            self.written[key] = path
+            self.written[key] = _write_mesh(
+                f"{stem}_collision.stl",
+                (self.points(link, names),),
+                self.frames.variant,
+                lambda: trimesh.PointCloud(snapped).convex_hull,
+            )
         return ("mesh", self.written[key])
 
     def finger_cylinder(self, link: str, fingers: tuple[str, ...]) -> Spec:
@@ -870,12 +1044,32 @@ class Collision:
         pts = []
         for finger in fingers:
             closed = np.vstack(self.pieces[finger][1])
-            joint = self.export.joint_map[MOVING[finger].export_joint]
+            joint = self.export.joint_map[
+                self.frames.variant.moving[finger].export_joint
+            ]
             opened = closed + np.asarray(joint.axis) * float(joint.limit.upper)
             rel = self.frames.relative(link, finger)
             pts += [trimesh.transform_points(p, rel) for p in (closed, opened)]
         radius, length, centre = _fit_cylinder(np.vstack(pts), 0)
         return ("cylinder", radius, length, centre, _CYLINDER_RPY[0])
+
+    def plate_sweep(self, link: str, plate: str, steps: int = 37) -> Spec:
+        """One cylinder over a hinged plate's whole sweep (it turns about its
+        joint axis through its frame's origin), along the link axis that
+        gives the smallest capsule."""
+        rest = np.vstack(self.pieces[plate][1])
+        joint = self.export.joint_map[self.frames.variant.moving[plate].export_joint]
+        rel = self.frames.relative(link, plate)
+        pts = []
+        for angle in np.linspace(joint.limit.lower, joint.limit.upper, steps):
+            turn = trimesh.transformations.rotation_matrix(angle, joint.axis)
+            pts.append(trimesh.transform_points(rest, rel @ turn))
+        pts = np.vstack(pts)
+        fits = [(_fit_cylinder(pts, axis), axis) for axis in range(3)]
+        (radius, length, centre), axis = min(
+            fits, key=lambda f: f[0][0] ** 2 * (f[0][1] + 4 / 3 * f[0][0])
+        )
+        return ("cylinder", radius, length, centre, _CYLINDER_RPY[axis])
 
     def deck_strips(self) -> dict[str, list[Spec]]:
         # The deck mesh is a box with vertices only at its edges, so strip
@@ -899,11 +1093,20 @@ class Collision:
 
 def collision_plan(model: str, col: Collision) -> dict[str, list[Spec]]:
     """Each model's collision bodies (link -> specs)."""
-    plan: dict[str, list[Spec]] = {
-        link: [col.hull(link, (link,))] for link in COMMON_HULLS
-    }
-    fingers = {
-        side: (f"{side}_finger_1", f"{side}_finger_2") for side in ("left", "right")
+    variant = col.frames.variant
+    hulls = (
+        *(
+            f"{side}_{part}"
+            for side in ("left", "right")
+            for part in (*_ARM_PARTS, *variant.hulls)
+        ),
+        *BODY_HULLS,
+    )
+    plan: dict[str, list[Spec]] = {link: [col.hull(link, (link,))] for link in hulls}
+    # Each gripper's moving parts (fingers or plate).
+    jaws = {
+        side: tuple(n for n in variant.moving if n.startswith(f"{side}_"))
+        for side in ("left", "right")
     }
     if model == "arm":
         plan["base"] = [col.hull("base", ("column_top", "column_mid", "column_stub"))]
@@ -912,16 +1115,20 @@ def collision_plan(model: str, col: Collision) -> dict[str, list[Spec]]:
         plan["lift_stage"] = [col.hull("lift_stage", ("column_mid",))]
         plan["jelly"] = [col.hull("jelly", ("column_stub",))]
     if model in ("arm", "whole_body"):
-        for side, pair in fingers.items():
-            plan[f"{side}_fingers"] = [col.finger_cylinder(f"{side}_gripper", pair)]
+        for side, parts in jaws.items():
+            plan[f"{side}_fingers"] = [
+                col.plate_sweep(f"{side}_gripper", *parts)
+                if variant.gripper == "parcel"
+                else col.finger_cylinder(f"{side}_gripper", parts)
+            ]
     if model == "whole_body":
         plan.update(col.deck_strips())
     if model == "sim":
         plan["jelly"].append(col.hull("jelly", ("deck",)))
-        for pair in fingers.values():
-            for finger in pair:
-                plan[finger] = [col.hull(finger, (finger,))]
-        for wheel in (n for n in MOVING if n.startswith("wheel_")):
+        for parts in jaws.values():
+            for part in parts:
+                plan[part] = [col.hull(part, (part,))]
+        for wheel in BODY_MOVING:
             plan[wheel] = [col.hull(wheel, (wheel,))]
     return plan
 
@@ -979,7 +1186,7 @@ def sim_inertials(
         w2 = f"{side}_w2"
         total, com_total, _ = out[w2]
         carved_mass, carved_moment = 0.0, np.zeros(3)
-        for part, mass in SIM_WRIST_PARTS.items():
+        for part, mass in col.frames.variant.wrist_parts.items():
             link = f"{side}_{part}"
             com_link = hull_of(link).center_mass
             com_w2 = trimesh.transform_points(
@@ -1106,12 +1313,13 @@ def write_urdf(
     def link(name: str) -> None:
         links[name] = ET.SubElement(robot, "link", name=name)
 
-    for name, parent in EXTRA_LINKS.items():
-        if model == "sim" and name.endswith("_fingers"):
+    variant = frames.variant
+    for name, parent in variant.all_extra_links.items():
+        if model == "sim" and name in FINGER_LINKS:
             continue
         link(name)
         _joint(robot, f"{name}_0", "fixed", parent, name)
-    for name in (*BODY_FRAME_LINKS, *MOVING, *cameras):
+    for name in (*BODY_FRAME_LINKS, *variant.all_moving, *cameras):
         link(name)
     for name, (parent, pose) in cameras.items():
         _joint(robot, f"{name}_0", "fixed", parent, name, pose)
@@ -1192,7 +1400,7 @@ def write_urdf(
             effort_velocity=lift_limits,
         )
 
-    for name, moving in MOVING.items():
+    for name, moving in variant.all_moving.items():
         joint = export.joint_map[moving.export_joint]
         pose = frames.relative(moving.parent, name)
         if model != "sim":
@@ -1208,6 +1416,19 @@ def write_urdf(
                 pose,
                 joint.axis,
                 effort_velocity=SIM_LIMITS["wheel"],
+            )
+        elif joint.type == "revolute":
+            # The parcel gripper's hinged plate: the export's range as is.
+            _joint(
+                robot,
+                f"{name}_joint",
+                "revolute",
+                moving.parent,
+                name,
+                pose,
+                joint.axis,
+                (float(joint.limit.lower), float(joint.limit.upper)),
+                effort_velocity=SIM_LIMITS["plate"],
             )
         else:
             _joint(
@@ -1291,49 +1512,46 @@ def write_urdf(
             )
     ET.indent(tree, space="    ")
     body = ET.tostring(robot, encoding="unicode")
+    sim_note = SIM_NOTE.format(
+        gripper_joints=variant.gripper_joints, wrist_parts=variant.wrist_parts_note
+    )
+    gripper = (
+        "With the parcel gripper (AxolConfig.gripper = parcel): a fixed jaw "
+        "and a plate hinged on it, no wrist cameras. "
+        if variant.gripper == "parcel"
+        else ""
+    )
     note = (
         "Axol on the Jelly mobile base. GENERATED by scripts/build_jelly_urdfs.py "
-        "from the Onshape export; do not edit by hand. Arm links, joints and "
+        "from the Onshape export; do not edit by hand. "
+        + gripper
+        + "Arm links, joints and "
         "joint frames are the classic axol.urdf's, so FK and gravity "
         "compensation match it exactly; joint limits and meshes are the "
         "export's. "
-        + {"arm": ARM_NOTE, "whole_body": WHOLE_BODY_NOTE, "sim": SIM_NOTE}[model]
+        + {"arm": ARM_NOTE, "whole_body": WHOLE_BODY_NOTE, "sim": sim_note}[model]
         + " "
-        + WRIST_CAMERA_NOTE
+        + (WRIST_CAMERA_NOTE if variant.wrist_cameras else HEAD_CAMERA_NOTE)
     )
     header = "<!-- " + textwrap.fill(note, 76, subsequent_indent="     ") + "\n-->\n"
     out_path.write_text(header + body + "\n")
     print(f"wrote {out_path.relative_to(REPO)}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument(
-        "export_dir", type=Path, help="Onshape export (contains urdf/ and meshes/)"
-    )
-    ap.add_argument("--min-part-mm", type=float, default=15.0)
-    ap.add_argument("--visual-faces", type=int, default=2000)
-    ap.add_argument(
-        "--visual-tolerance-mm",
-        type=float,
-        default=0.3,
-        help="largest deviation from the CAD of what the wrist cameras see "
-        "(grippers and fingers)",
-    )
-    ap.add_argument(
-        "--loose-tolerance-mm",
-        type=float,
-        default=1.0,
-        help="largest deviation from the CAD of every other visual mesh",
-    )
-    args = ap.parse_args()
-    urdfs = sorted((args.export_dir / "urdf").glob("*.urdf"))
+def build(args: argparse.Namespace, export_dir: Path) -> None:
+    """Every URDF of one export (its gripper's Variant)."""
+    urdfs = sorted((export_dir / "urdf").glob("*.urdf"))
     if len(urdfs) != 1:
-        raise SystemExit(f"expected one URDF under {args.export_dir / 'urdf'}")
+        raise SystemExit(f"expected one URDF under {export_dir / 'urdf'}")
     classic = _load(CLASSIC_URDF)
     export = _load(urdfs[0])
+    found = [v for v in VARIANTS if v.marker in export.link_map]
+    if len(found) != 1:
+        raise SystemExit(f"{export_dir}: not a known gripper's export")
+    variant = found[0]
+    print(f"== {export_dir} ({variant.gripper} gripper)")
     tf, sg = align(classic, export)
-    check_equivalent(classic, export, tf, sg)
+    check_equivalent(classic, export, tf, sg, variant)
     lift_travel = check_lift(export)
     limits = export_limits(export, sg)
     for name, (lo, hi) in limits.items():
@@ -1344,10 +1562,10 @@ def main() -> None:
             else "  <- changed"
         )
         print(f"  {name:12s} [{lo:+.4f}, {hi:+.4f}]{mark}")
-    frames = Frames(classic, export, tf)
+    frames = Frames(classic, export, tf, variant)
     visuals, pieces, in_root = build_meshes(
         export,
-        args.export_dir,
+        export_dir,
         frames,
         args.min_part_mm,
         args.visual_faces,
@@ -1356,11 +1574,7 @@ def main() -> None:
     )
     cameras = camera_frames(in_root, frames)
     col = Collision(frames, pieces, export)
-    for model, out_path in (
-        ("arm", OUT_ARM),
-        ("whole_body", OUT_WHOLE_BODY),
-        ("sim", OUT_SIM),
-    ):
+    for model, out_path in zip(("arm", "whole_body", "sim"), variant.outputs):
         plan = collision_plan(model, col)
         report(model, plan)
         write_urdf(
@@ -1376,6 +1590,36 @@ def main() -> None:
             sim_inertials(col, plan) if model == "sim" else None,
             sim_dynamics() if model == "sim" else None,
         )
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument(
+        "export_dirs",
+        type=Path,
+        nargs="+",
+        help="Onshape exports (each contains urdf/ and meshes/), one per "
+        "gripper; the parallel gripper's first, since the others reuse its "
+        "body meshes",
+    )
+    ap.add_argument("--min-part-mm", type=float, default=15.0)
+    ap.add_argument("--visual-faces", type=int, default=2000)
+    ap.add_argument(
+        "--visual-tolerance-mm",
+        type=float,
+        default=0.3,
+        help="largest deviation from the CAD of the grippers' visual meshes "
+        "(what the wrist cameras see)",
+    )
+    ap.add_argument(
+        "--loose-tolerance-mm",
+        type=float,
+        default=1.0,
+        help="largest deviation from the CAD of every other visual mesh",
+    )
+    args = ap.parse_args()
+    for export_dir in args.export_dirs:
+        build(args, export_dir)
 
 
 if __name__ == "__main__":

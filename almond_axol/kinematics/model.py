@@ -20,8 +20,10 @@ users (observation recording) never pay for capsule fitting.
 
 Each :class:`~almond_axol.constants.AxolModel` (hardware version) has its own
 URDF and therefore its own robot and collision model; both are cached per
-version. A ``model`` of ``None`` is inferred — mobile when Jelly is enabled — by
-:func:`almond_axol.settings.resolve_robot_model`.
+version (and, on the mobile Axol, per gripper). A ``model`` of ``None`` is
+inferred — mobile when Jelly is enabled — by
+:func:`almond_axol.settings.resolve_robot_model`, and a ``gripper`` of
+``None`` by :func:`almond_axol.settings.resolve_gripper`.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ import pyroki as pk
 import yourdfpy
 
 from ..constants import AxolModel, torso_links, urdf_path
-from ..settings import resolve_robot_model
+from ..settings import resolve_gripper, resolve_robot_model
 
 _logger = logging.getLogger(__name__)
 
@@ -75,42 +77,75 @@ _RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
-# Keyed by (version, whole_body): whole-body IK has its own URDF.
-_Key = tuple[AxolModel, bool]
+# Keyed by (version, whole_body, gripper): whole-body IK and the parcel
+# gripper have their own URDFs.
+_Key = tuple[AxolModel, bool, str]
 _urdf: dict[_Key, yourdfpy.URDF] = {}
 _robot: dict[_Key, pk.Robot] = {}
 _robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
 
 
+def _key(model: AxolModel | str | None, whole_body: bool, gripper: str | None) -> _Key:
+    resolved = resolve_robot_model(
+        model, jelly_enabled=True if whole_body and model is None else None
+    )
+    # Only the mobile Axol has a URDF per gripper: skip the settings lookup
+    # for the classic one.
+    if resolved is AxolModel.MOBILE:
+        gripper = resolve_gripper(gripper)
+    else:
+        gripper = "parallel"
+    return resolved, whole_body, gripper
+
+
 def _load_urdf(key: _Key) -> yourdfpy.URDF:
     if key not in _urdf:
-        path = urdf_path(key[0], whole_body=key[1])
+        path = urdf_path(key[0], whole_body=key[1], gripper=key[2])
         _logger.info("Loading Axol URDF (%s)...", path.name)
         _urdf[key] = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
     return _urdf[key]
 
 
+def shared_urdf(
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
+) -> yourdfpy.URDF:
+    """The parsed bundled URDF for ``model``, loaded once per process."""
+    with _lock:
+        return _load_urdf(_key(model, whole_body, gripper))
+
+
 def shared_robot(
-    model: AxolModel | str | None = None, *, whole_body: bool = False
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
 ) -> pk.Robot:
     """The pyroki robot for ``model``'s bundled URDF, built once per process.
 
     ``whole_body`` selects the mobile model whose Jelly base and lift are
-    joints too (:data:`~almond_axol.constants.BODY_JOINTS`).
+    joints too (:data:`~almond_axol.constants.BODY_JOINTS`). ``gripper`` is
+    the fitted gripper (``AxolConfig.gripper``; ``None`` reads it from the
+    shared settings): the mobile Axol has a URDF per gripper.
     """
-    key = (resolve_robot_model(model), whole_body)
     with _lock:
+        key = _key(model, whole_body, gripper)
         if key not in _robot:
             _robot[key] = pk.Robot.from_urdf(_load_urdf(key))
         return _robot[key]
 
 
 def shared_robot_collision(
-    model: AxolModel | str | None = None, *, whole_body: bool = False
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
 ) -> pk.collision.RobotCollision:
     """``model``'s torso<->arm collision model, built once per process."""
-    key = (resolve_robot_model(model), whole_body)
     with _lock:
+        key = _key(model, whole_body, gripper)
         if key not in _robot_coll:
             _robot_coll[key] = _build_robot_collision(
                 _load_urdf(key), torso_links(key[0], whole_body=whole_body)

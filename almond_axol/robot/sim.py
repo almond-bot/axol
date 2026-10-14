@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -64,6 +65,7 @@ class Sim(RobotBase):
         port: int = 8002,
         robot_model: AxolModel | str | None = None,
         whole_body: bool = False,
+        gripper: str | None = None,
     ) -> None:
         """Construct the simulation.
 
@@ -76,12 +78,16 @@ class Sim(RobotBase):
             port:        Port for the viser web server.
             robot_model: Axol version to render; inferred when ``None``.
             whole_body:  Render the whole-body IK model (base and lift move).
+            gripper:     Fitted gripper (``AxolConfig.gripper``), which picks
+                         the mobile Axol's URDF; read from the shared
+                         settings when ``None``.
         """
         self._joint_names = joint_names
         self._default_q = default_q
         self._port = port
         self._robot_model = robot_model
         self._whole_body = whole_body
+        self._gripper = gripper
         # Whole-body: base_x, base_y, base_yaw, lift (see BODY_JOINTS).
         self._body = np.zeros(len(BODY_JOINTS) if whole_body else 0, dtype=float)
         self._latest_q: np.ndarray | None = None
@@ -185,6 +191,23 @@ class Sim(RobotBase):
             self._latest_q = q
             self._condition.notify()
 
+    def set_payload(
+        self,
+        side: str,
+        mass: float,
+        com: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        """Accept a payload like :meth:`Axol.set_payload` does; nothing to model.
+
+        The viewer is kinematic, so a payload changes nothing here — but it is
+        validated the same way, so a script written against the robot runs
+        (and fails) identically in sim.
+        """
+        from .gravity import payload_sides, validate_payload
+
+        payload_sides(side)
+        validate_payload(mass, com)
+
     def _build_q(self) -> np.ndarray:
         """Arm joint angles (radians), left then right, no gripper; then the
         body joints when rendering the whole-body model."""
@@ -206,12 +229,20 @@ class Sim(RobotBase):
         # Stopping here guarantees the in-process port is freed whenever the
         # loop exits, which is what makes the in-process restart reliable.
         try:
-            from ..settings import resolve_robot_model
+            from ..settings import resolve_gripper, resolve_robot_model
 
             model = resolve_robot_model(
                 self._robot_model, jelly_enabled=True if self._whole_body else None
             )
-            path = urdf_path(model, whole_body=self._whole_body)
+            path = urdf_path(
+                model,
+                whole_body=self._whole_body,
+                gripper=(
+                    resolve_gripper(self._gripper)
+                    if model is AxolModel.MOBILE
+                    else "parallel"
+                ),
+            )
             urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
             viser_urdf = ViserUrdf(
                 server,

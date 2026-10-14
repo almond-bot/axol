@@ -324,6 +324,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             )
         )
         control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
         control_loop.recorder = SimpleNamespace(publish=mock.Mock())
         control_loop.robot.get_observation_with_capture_timestamp = mock.Mock(
             return_value=({"joint": 0.0}, 1.0)
@@ -356,6 +357,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             act=mock.Mock(return_value={"left.pos": 1.0})
         )
         control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
         control_loop.recorder = SimpleNamespace(publish=mock.Mock())
 
         result = control_loop._policy_tick(42.0)  # noqa: SLF001
@@ -394,6 +396,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         )
         control_loop.recorder = recorder
         control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
         control_loop.fps = 60
         control_loop.teleop_hz = 120
         control_loop.vr_choice = None
@@ -455,6 +458,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.teleop = teleop
         control_loop.recorder = recorder
         control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
         control_loop.fps = 60
         control_loop.teleop_hz = 120
         control_loop.vr_choice = None

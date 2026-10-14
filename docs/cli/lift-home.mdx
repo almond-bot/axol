@@ -3,11 +3,23 @@ title: "lift.home"
 description: "One-time calibration (homing) of the telescoping lift."
 ---
 
-Calibrates the telescoping lift by running the lift controller's two-ended homing sequence: both legs drive down until they reach the bottom stop, then up to the top stop. On success the controller rebases its position counters (bottom = 0), sets soft limits a margin inside the hard stops, and saves everything to its flash — establishing the height scale that [`lift.goto`](/cli/lift-goto) and the teleop height display use.
+Calibrates the telescoping lift by running the lift controller's two-ended homing sequence: the legs drive up until they reach the top stop, then down to the bottom stop. On success the controller rebases its position counters (bottom = 0), sets soft limits a margin inside the hard stops, and saves everything to its flash — establishing the height scale that [`lift.goto`](/cli/lift-goto) and the teleop height display use.
 
 ```bash
-axol lift.home
+axol lift.home                  # legs together (default, legs on the robot)
+axol lift.home --independent    # each leg to its own stops (loose legs only)
 ```
+
+There are two modes:
+
+- **Together** (default) — for legs bolted to the robot, with or without the robot on top. The legs move as one, and the first leg to reach a stop stops both, so the frame is never racked. Whatever height offset the legs start with is kept.
+- **Independent** (`--independent`, or the **Independent** toggle in the dashboard dialog) — for loose legs off the robot, e.g. before mounting or after swapping a leg. Each leg runs to its own top and bottom stops and is zeroed at its own bottom, so legs that start at different heights end up level.
+
+<Warning>
+  Never home independently with the legs mounted: after the first leg reaches its stop, the other keeps pushing alone against the frame until its own stall cut fires.
+</Warning>
+
+Lift firmware before v0.9 ignores the mode and always homes each leg independently.
 
 The sequence takes **1–2 minutes** and intentionally touches both end stops. Progress streams as status lines; Ctrl-C (or **Stop** in the control panel) aborts safely — an interrupted homing rolls back to the previous calibration, so the lift is never left half-homed.
 

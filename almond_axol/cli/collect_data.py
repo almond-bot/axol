@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..constants import PARK_TIMEOUT_S
+from ..constants import PARK_TIMEOUT_S, Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
@@ -93,6 +93,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
 from ..teleop_activity import TeleopActivityMarker
@@ -261,11 +262,13 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
 
     def quest_error() -> ValueError:
         return ValueError(
-            "Mantis Quest production collection requires measured left and "
-            "right transforms under one profile-scoped "
+            "Mantis Quest production collection requires factory or measured "
+            "left and right transforms under one profile-scoped "
             "`quest:<WebXR-profile>:grip` key. Bare `quest`, target-ray, "
             "missing, or conflicting datum metadata is unsafe because the "
-            "controller-local frame differs. Add the constants to "
+            "controller-local frame differs. Quest 3 Touch Plus controllers "
+            "(`quest:meta-quest-touch-plus:grip`) ship a factory transform; "
+            "for other controllers add the constants to "
             f"{MANTIS_TCP_TRANSFORM_FILE}; the live WebXR profile is "
             "reported by the updated Quest client. Use "
             "--mantis_allow_uncalibrated true only for a bring-up capture "
@@ -399,11 +402,12 @@ def _require_mantis_resume_transform(
     row-level data carries nothing that could tell them apart afterwards.
     Datasets predating the ``mantis_tcp_transform`` marker field were recorded
     with the Rx(+90°) Vive rotation; ``axol migrate-dataset
-    --mantis-tcp-rotation`` repairs them (and stamps the field), after which
-    they can be resumed.
+    --mantis-tcp-rotation`` repairs the rotation (and stamps the field).
+    Factory Vive datasets from axol 0.2.5–0.2.16 carry the retired
+    92 mm-forward translation and stay refused under the current constants.
     """
     from ..mantis.calibration import (
-        DESIGN_TCP_TRANSFORM_ID,
+        LEGACY_DESIGN_TCP_TRANSFORM_ID,
         MEASURED_TCP_TRANSFORM_ID,
         UNCALIBRATED_TCP_TRANSFORM_ID,
         same_tcp_transform,
@@ -420,8 +424,8 @@ def _require_mantis_resume_transform(
     recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
     current = _mantis_tcp_transform_provenance(cfg)
     if recorded is None and cfg.mantis_source == "quest":
-        # Quest never had a factory constant, so the old rows used a per-unit
-        # measurement this run cannot check against.
+        # Quest had no factory constant before the marker existed, so the old
+        # rows used a per-unit measurement this run cannot check against.
         _logger.warning(
             "Resuming a Mantis Quest dataset (%s) recorded before axol stamped "
             "its tracker→gripper transforms into meta/axol.json; make sure the "
@@ -449,7 +453,8 @@ def _require_mantis_resume_transform(
     if UNCALIBRATED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Bring-up captures are explicitly not training data; nothing to protect.
         return
-    if recorded_id == current_id == DESIGN_TCP_TRANSFORM_ID:
+    if recorded_id == current_id != MEASURED_TCP_TRANSFORM_ID:
+        # Factory ids are versioned per constant: equal ids, equal transforms.
         return
     if MEASURED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Compare as rigid transforms (q and -q are the same rotation), the
@@ -460,6 +465,15 @@ def _require_mantis_resume_transform(
             for side in ("left", "right")
         ):
             return
+    if recorded_id == LEGACY_DESIGN_TCP_TRANSFORM_ID:
+        raise ValueError(
+            f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
+            "with the axol 0.2.5–0.2.16 factory Vive tracker→gripper transform, "
+            "whose translation put the tracker 92 mm in front of the gripper "
+            "instead of 47 mm behind it. This run resolved "
+            f"{current['id']!r}, and appending would mix two pose conventions "
+            "in one dataset. Record to a new repo_id."
+        )
     raise ValueError(
         f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
         f"with tracker→gripper transforms {recorded_id!r} but this run resolved "
@@ -1372,6 +1386,9 @@ def _run_session(
         and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+        adopt_robot_gripper(
+            cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
+        )
 
         # Keep the optional teleop flight recorder coherent across Python and
         # Rust. An explicit name enables every stage; the documented ``None``
@@ -1641,6 +1658,10 @@ def _run_session(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        # The headset's live settings act on the hardware too (grip force):
+        # hand the teleoperator the arms now that the robot is up.
+        teleop.live_settings.set_robot(robot.axol)
+        teleop.measured_robot = robot.axol
         try:
             activity.start()
         except OSError as exc:
@@ -1835,6 +1856,32 @@ def _run_session(
     def _stopped() -> bool:
         return (stop_event is not None and stop_event.is_set()) or loop_stop.is_set()
 
+    # Box mode's squeeze torque cap (VRTeleopConfig.box_squeeze_torque): the
+    # teleop core says which joints run under a per-command spring-torque
+    # cap right now, and the robot is told on change only — same as native
+    # teleop. The Mantis rig has no arms and no setter, so this is a no-op
+    # there.
+    caps_applied: dict[Joint, float] | None = None
+
+    def _sync_spring_caps() -> None:
+        nonlocal caps_applied
+        axol = getattr(robot, "axol", None)
+        set_caps = getattr(axol, "set_spring_caps", None)
+        if set_caps is not None:
+            caps = teleop.spring_caps()
+            if caps != caps_applied:
+                set_caps(caps)
+                caps_applied = caps
+
+    def _clear_spring_caps() -> None:
+        # Session end: leave no squeeze cap on the robot object (as native
+        # teleop does), whatever state the last tick left.
+        nonlocal caps_applied
+        set_caps = getattr(getattr(robot, "axol", None), "set_spring_caps", None)
+        if set_caps is not None and caps_applied:
+            set_caps(None)
+        caps_applied = None
+
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control
     # thread shows up as gaps >> the 1/teleop_hz period); `slip` is how late the
@@ -2002,6 +2049,7 @@ def _run_session(
             robot_act = robot_action_proc((act_processed, joint_obs))
             dataset_act = robot.action_to_dataset(act_processed)
             t_proc = time.perf_counter()
+            _sync_spring_caps()
             await robot.send_action_async(robot_act)
             t_send = time.perf_counter()
             sect["obs"] += t_obs - t0
@@ -2120,6 +2168,7 @@ def _run_session(
             robot.set_control_trace_active(True)
             joint_obs = robot.get_joint_observation()
             teleop.send_feedback(joint_obs)
+            _sync_spring_caps()
             await robot.send_action_async(last_robot_act)
             # Capture is already being stopped on the worker thread. Publishing
             # keeps the nearest-state history fresh for any final in-flight AU.
@@ -2470,6 +2519,7 @@ def _run_session(
     async def _guard_send_step() -> None:
         joint_obs = robot.get_joint_observation()
         act = teleop.get_action()
+        _sync_spring_caps()  # lifts the squeeze cap: the core caps nothing mid-reset
         await robot.send_action_async(robot_action_proc((act, joint_obs)))
 
     async def _guard_gravity_step() -> None:
@@ -2967,6 +3017,7 @@ def _run_session(
                     park.cancel()
         except BaseException:
             _logger.exception("return to rest before disconnect failed")
+        _cleanup("spring caps", _clear_spring_caps)
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its

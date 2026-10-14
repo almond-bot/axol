@@ -74,14 +74,62 @@ CALIBRATION_PATH = Path.home() / ".almond" / "calibration.json"
 FACTORY_CALIBRATION_PATH = Path.home() / ".almond" / "factory_calibration.json"
 
 _SIDES = ("left", "right")
-# ``kd_soft`` entries written by older versions are silently dropped on load.
+# ``kd_soft`` and ``cogging`` entries written by older versions are silently
+# dropped on load.
 _SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+# The low-speed friction curve ``tune.friction --profile slow`` fits (see
+# :mod:`almond_axol.tuning.friction_model`) and the share of it cancelled.
+_STRIBECK_FIELDS = (
+    "stribeck_gain",
+    "stribeck_dfs",
+    "stribeck_load_gain",
+    "stribeck_vs",
+    "stribeck_pole",
+)
+# Per-joint settings that are tuning choices, not measurements: a
+# calibration file (local or pulled from the cloud) never sets them — the
+# firmware loop gains and wire mode would otherwise let a document put a
+# joint on the motor's own position loop or write its ROM. They are dropped
+# on load with a warning; set them in the panel settings or with --gain.
+_IGNORED_FIELDS = (
+    "firmware",
+    "wire_mode",
+    "stiction_gain",
+    "stiction_load_gain",
+    "stiction_err_deg",
+    "dither_nm",
+    "dither_hz",
+)
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
+# Optional: load-proportional Coulomb friction (``FrictionParams.fl``).
+_FRICTION_OPTIONAL = ("fl",)
 
 # A corrupt file must never take the robot down, but silently ignoring it
 # would make a bad calibration mysterious — warn once per process.
 _warned_invalid = False
 _warned_identity: set[tuple[Path, str | None, str]] = set()
+_warned_fields: set[tuple[Path, str, str, str]] = set()
+
+
+def _warn_dropped(path: Path, side: str, joint: str, field: str, why: str) -> None:
+    """Warn once per process about a calibration field that load drops."""
+    key = (path, side, joint, field)
+    if key in _warned_fields:
+        return
+    _warned_fields.add(key)
+    _logger.warning(
+        "Calibration file %s: ignoring %s %s %s (%s).", path, side, joint, field, why
+    )
+
+
+def _invalid_stribeck(stribeck: dict[str, Any]) -> list[str]:
+    """The ``stribeck_*`` entries load would drop: not finite and >= 0."""
+    bad = []
+    for field, value in stribeck.items():
+        v = _coerce_float(value)
+        if v is None or not math.isfinite(v) or v < 0.0:
+            bad.append(f"{field}={value!r}")
+    return bad
 
 
 def _backup_displaced_calibration(path: Path, contents: bytes) -> Path:
@@ -173,6 +221,31 @@ def load_calibration(
             if not isinstance(entry, dict):
                 continue
             clean: dict[str, Any] = {}
+            for field in _STRIBECK_FIELDS:
+                if field not in entry:
+                    continue
+                value = _coerce_float(entry.get(field))
+                if value is not None and math.isfinite(value) and value >= 0.0:
+                    clean[field] = value
+                else:
+                    _warn_dropped(
+                        path,
+                        side,
+                        str(joint),
+                        field,
+                        f"{entry.get(field)!r} is not a finite number >= 0; "
+                        "the coded default applies",
+                    )
+            for field in _IGNORED_FIELDS:
+                if field in entry:
+                    _warn_dropped(
+                        path,
+                        side,
+                        str(joint),
+                        field,
+                        "a tuning setting, not calibration — set it in the panel "
+                        "settings or with --gain",
+                    )
             for field in _SCALAR_FIELDS:
                 value = _coerce_float(entry.get(field))
                 if value is not None:
@@ -221,6 +294,10 @@ def load_calibration(
             if isinstance(friction, dict):
                 fclean = {f: _coerce_float(friction.get(f)) for f in _FRICTION_FIELDS}
                 if all(v is not None for v in fclean.values()):
+                    for f in _FRICTION_OPTIONAL:
+                        extra = _coerce_float(friction.get(f))
+                        if extra is not None:
+                            fclean[f] = extra
                     clean["friction"] = fclean
                 elif any(v is not None for v in fclean.values()):
                     _logger.warning(
@@ -285,6 +362,7 @@ def update_joint_calibration(
     kd_host_q: float | None = None,
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
+    stribeck: dict[str, float] | None = None,
     mass: float | None = None,
     hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
@@ -295,7 +373,9 @@ def update_joint_calibration(
     damping band does not clobber a previously saved friction fit, and vice
     versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
     ``com`` is the link's fitted centre of mass (metres, URDF link frame)
-    and ``mass`` its mass (kg, must be positive).
+    and ``mass`` its mass (kg, must be positive); ``friction`` may add
+    ``fl``; ``stribeck`` carries any of the ``stribeck_*`` fields (the
+    low-speed friction curve and its gain).
     The document is scoped to ``hub_serial`` (auto-detected when omitted) and
     stale data for another robot is never merged into it. If an existing file
     is unscoped or belongs to another robot, it is preserved in a numbered
@@ -308,6 +388,17 @@ def update_joint_calibration(
         missing = [f for f in _FRICTION_FIELDS if f not in friction]
         if missing:
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
+    if stribeck is not None:
+        unknown = sorted(set(stribeck) - set(_STRIBECK_FIELDS))
+        if unknown:
+            raise ValueError(f"unknown stribeck fields: {', '.join(unknown)}")
+        bad = _invalid_stribeck(stribeck)
+        if bad:
+            # load_calibration would drop these, so the saved fit would
+            # silently never apply: refuse instead.
+            raise ValueError(
+                f"stribeck fields must be finite and >= 0: {', '.join(bad)}"
+            )
     if mass is not None and not (math.isfinite(mass) and mass > 0.0):
         raise ValueError(f"mass must be a positive number of kg, got {mass!r}")
 
@@ -366,8 +457,10 @@ def update_joint_calibration(
     if not isinstance(entry, dict):
         entry = {}
         side_map[joint] = entry
-    # Scrub the retired software-damping field left behind by older versions.
+    # Scrub retired fields left behind by older versions: the software
+    # damping gain and the cogging cancellation series.
     entry.pop("kd_soft", None)
+    entry.pop("cogging", None)
 
     for field, value in (
         ("kp", kp),
@@ -380,7 +473,14 @@ def update_joint_calibration(
         if value is not None:
             entry[field] = float(value)
     if friction is not None:
-        entry["friction"] = {f: float(friction[f]) for f in _FRICTION_FIELDS}
+        entry["friction"] = {
+            f: float(friction[f])
+            for f in _FRICTION_FIELDS + _FRICTION_OPTIONAL
+            if f in friction
+        }
+    if stribeck is not None:
+        for field, value in stribeck.items():
+            entry[field] = float(value)
     if com is not None:
         if len(com) != 3:
             raise ValueError(f"com must have 3 components, got {len(com)}")

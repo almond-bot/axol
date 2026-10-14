@@ -90,6 +90,10 @@ def main(argv: list[str]) -> None:
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop the INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+    # The fitted gripper is a robot setting; teleop follows it (box mode).
+    from ..teleop.config import adopt_robot_gripper
+
+    adopt_robot_gripper(cfg.teleop, cfg.axol.gripper)
     quiet_noisy_loggers()
 
     # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
@@ -552,6 +556,7 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         robot = Sim(
             robot_model=cfg.kinematics.robot_model,
             whole_body=cfg.kinematics.whole_body,
+            gripper=cfg.axol.gripper,
         )
     else:
         # The Rust realtime core is the sole hardware control backend. Python

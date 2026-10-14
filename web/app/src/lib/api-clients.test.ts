@@ -144,6 +144,8 @@ describe("supervisor API client", () => {
     expect(api.wsBaseUrl()).toBe("wss://robot.local:8001")
     expect(api.urdfUrl().endsWith("/api/urdf/axol.urdf")).toBe(true)
     expect(api.urdfUrl("mobile").endsWith("/api/urdf/axol_jelly.urdf")).toBe(true)
+    expect(api.urdfUrl("mobile", "parcel").endsWith("/api/urdf/axol_jelly_parcel.urdf")).toBe(true)
+    expect(api.urdfUrl("classic", "parcel").endsWith("/api/urdf/axol.urdf")).toBe(true)
     expect(
       api.motorFaultLabel({
         arm: "left",

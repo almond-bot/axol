@@ -113,21 +113,34 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
 
     def test_config_header_declares_the_protocol(self) -> None:
         self.assertEqual(link.config_header(), [f"proto {link.CONFIG_PROTO}"])
-        self.assertEqual(link.CONFIG_PROTO, 2)
+        # 2: slot-by-motor-id; 3/4: stiction fields; 5: dither fields; 6: wire
+        # mode token; 7: Stribeck fields; 8: load-proportional friction fl;
+        # 9: the Stribeck velocity pole on every joint line; 10: the pv wire
+        # token; 11: impedance joints at 240 Hz only (480 = alternate ticks);
+        # 12: the optional trailing 0xA4 cap_track field on joint lines;
+        # 13: cap_track > 0 (the planner) puts a joint on the half-rate lane;
+        # 14: the optional trailing 0xA4 target lead (ms); 15: impedance_hz
+        # and the optional 0x73 feedforward scale; 16: the optional per-joint
+        # impedance_hz; 17: the optional trailing spring-torque cap and the
+        # 10-field target slot (per-command cap).
+        # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
+        self.assertEqual(link.CONFIG_PROTO, 17)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())
         started = asyncio.get_running_loop().time()
         with self.assertRaises(link.RtLinkError) as ctx:
-            await rt.configure("proto 2\nloop_hz 240\n")
+            await rt.configure(f"proto {link.CONFIG_PROTO}\nloop_hz 240\n")
         message = str(ctx.exception)
         self.assertIn("/opt/axol-rt", message)
-        self.assertIn("proto 2", message)
+        self.assertIn(f"proto {link.CONFIG_PROTO}", message)
         self.assertIn("axol rt.install", message)
         # The exit is noticed in well under the 5 s ack timeout.
         self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
         sent = rt._writer.write.call_args.args[0]
-        self.assertTrue(sent.endswith(b"Cproto 2\nloop_hz 240\n"))
+        self.assertTrue(
+            sent.endswith(f"Cproto {link.CONFIG_PROTO}\nloop_hz 240\n".encode())
+        )
 
     async def test_configure_keeps_a_generic_error_while_the_core_runs(self) -> None:
         # A core that is alive but silent is a different failure (not skew):
@@ -137,7 +150,7 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
             rt, "_await_state", side_effect=link.RtLinkError("timed out")
         ):
             with self.assertRaises(link.RtLinkError) as ctx:
-                await rt.configure("proto 2\n")
+                await rt.configure(f"proto {link.CONFIG_PROTO}\n")
         self.assertEqual(str(ctx.exception), "timed out")
 
     async def test_await_state_still_takes_an_ack_sent_just_before_exit(self) -> None:

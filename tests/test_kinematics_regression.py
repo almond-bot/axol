@@ -112,5 +112,61 @@ class KinematicsBoundaryRegressionTest(unittest.TestCase):
         )
 
 
+class ElbowSwivelTest(unittest.TestCase):
+    """The elbow's free motion with the gripper mount held."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.solver = KinematicsSolver()
+        q = np.zeros(cls.solver.num_joints, dtype=np.float32)
+        # Box mode's angled grasp, wrist_2 turned well off straight.
+        q[:7] = np.radians((32.8, -12.1, -25.8, 31.4, 7.4, -30.8, 34.5))
+        cls.q = q
+
+    def test_the_shoulder_and_wrist_centres_are_fixed_on_the_arm(self) -> None:
+        solver = self.solver
+        rng = np.random.default_rng(0)
+        reach, forearm = [], []
+        for _ in range(4):
+            q = rng.uniform(-0.6, 0.6, solver.num_joints).astype(np.float32)
+            arm = solver.elbow_swivel(q)["left"]
+            pos, rot = solver.fk(q)[0]
+            wrist = pos + rot @ arm.wrist_in_mount
+            reach.append(np.linalg.norm(arm.elbow - arm.shoulder))
+            forearm.append(np.linalg.norm(wrist - arm.elbow))
+            np.testing.assert_allclose(
+                arm.shoulder, solver.elbow_swivel(self.q)["left"].shoulder
+            )
+        self.assertLess(np.ptp(reach), 1e-5)
+        self.assertLess(np.ptp(forearm), 1e-5)
+
+    def test_the_direction_swings_the_elbow_with_the_mount_held(self) -> None:
+        solver = self.solver
+        q = self.q
+        arm = solver.elbow_swivel(q)["left"]
+        self.assertAlmostEqual(float(np.linalg.norm(arm.direction)), 1.0, places=6)
+        pose = solver.fk(q)[0]
+        elbow = np.asarray(solver.elbow_positions(q)[0], np.float64)
+        hint = (elbow + 0.01 * arm.direction).astype(np.float32)
+        q_out = q.copy()
+        for _ in range(30):
+            solver.set_posture_pose(q_out)
+            q_out = solver.ik(
+                q_out,
+                left_pose=pose,
+                left_elbow_pos=hint,
+                elbow_weight=10.0,
+                pose_weight_scale=(2.0, 4.0),
+            )
+        pos, rot = solver.fk(q_out)[0]
+        moved = solver.elbow_positions(q_out)[0] - elbow
+        # Each solve is damped toward its seed, so the swing is slow; the
+        # mount must not move with it.
+        self.assertGreater(float(moved @ arm.direction), 3e-4)
+        self.assertLess(float(np.linalg.norm(pos - pose[0])), 1e-3)
+        cos = np.clip((np.trace(rot.T @ pose[1]) - 1.0) / 2.0, -1.0, 1.0)
+        self.assertLess(float(np.degrees(np.arccos(cos))), 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()

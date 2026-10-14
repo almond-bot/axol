@@ -46,12 +46,29 @@ CAN_CHEST = "can_alm_axol_c"
 # cron/systemd, so it must live outside the operator-writable state tree.
 CAN_BRINGUP_SCRIPT: Path = Path("/etc/almond-axol/can/startup.sh")
 
+# USB-resets the arm hub, then runs CAN_BRINGUP_SCRIPT. The hub's firmware
+# keeps up to 10 frames per channel through the driver's link-down reset and
+# transmits them on the next open (kernel: "Unexpected unused echo id"), so a
+# flap cannot purge frames queued behind a stalled bus; this is what the
+# purge runs instead. Written by `axol can.setup`, root-owned like the above.
+CAN_RESET_SCRIPT: Path = Path("/etc/almond-axol/can/reset_adapter.sh")
+
 # Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
 CAN_MANTIS_LEFT = "can_mantis_l"
 CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
+
+# Fields per joint slot in a realtime-core command tuple — what an
+# ``AxolArm`` command sink hands to ``almond_axol.rt`` and what one ``T``
+# target slot carries on the wire: ``(p_des, mode, kp, kd, t_ff, kd_host,
+# damp_w0, damp_q, j_eff, tau_cap)``. The gripper slot repurposes the first
+# three (target, max_speed, max_torque) and zero-pads the rest. Must match
+# ``TARGET_FIELDS`` in ``rust/axol-rt/src/serve.rs``; the core's config
+# handshake (``proto``, ``almond_axol.rt.link.CONFIG_PROTO``) rejects a
+# mismatch, so bump that together with any change here.
+RT_TARGET_FIELDS = 10
 
 # Cap on the return-to-rest a flow plays while shutting down, before it torques
 # the arms off. It has to cover the IK plan plus a full return from a raised
@@ -99,6 +116,11 @@ _URDF_FILES: dict[AxolModel, str] = {
 # Whole-body IK model (mobile only): the same torso and arms on the Jelly's
 # planar base and lift — see BODY_JOINTS.
 _WHOLE_BODY_URDF = "axol_jelly_whole_body.urdf"
+# The mobile Axol with the parcel gripper (AxolConfig.gripper = "parcel"):
+# the same body and arms, the parcel gripper's jaw and hinged plate in place
+# of the parallel gripper and its wrist camera.
+_PARCEL_URDF = "axol_jelly_parcel.urdf"
+_PARCEL_WHOLE_BODY_URDF = "axol_jelly_parcel_whole_body.urdf"
 
 JELLY_SIM_URDF: Path = URDF_DIR / "axol_jelly_sim.urdf"
 """Axol on Jelly for physics simulators (e.g. Isaac Sim), not used by the stack.
@@ -108,6 +130,10 @@ wheels as joints, AxolConfig's arm masses, per-part contact hulls, camera
 optical frames (``*_optical``, ROS convention) and relative mesh paths. See
 the header of the file for what is estimated.
 """
+
+JELLY_PARCEL_SIM_URDF: Path = URDF_DIR / "axol_jelly_parcel_sim.urdf"
+""":data:`JELLY_SIM_URDF` with the parcel gripper: each hinged plate is a
+revolute joint (``left_plate_joint`` / ``right_plate_joint``)."""
 
 BODY_JOINTS: tuple[str, ...] = ("base_x", "base_y", "base_yaw", "lift")
 """The Jelly joints whole-body IK solves for, after the 14 arm joints.
@@ -149,15 +175,23 @@ def _check_whole_body(model: AxolModel | str) -> None:
 
 
 def urdf_path(
-    model: AxolModel | str = AxolModel.CLASSIC, *, whole_body: bool = False
+    model: AxolModel | str = AxolModel.CLASSIC,
+    *,
+    whole_body: bool = False,
+    gripper: str = "parallel",
 ) -> Path:
     """The bundled URDF for ``model`` (meshes resolve relative to :data:`URDF_DIR`).
 
     ``whole_body`` selects the mobile model with the Jelly joints
-    (:data:`BODY_JOINTS`) instead of the arms-only one.
+    (:data:`BODY_JOINTS`) instead of the arms-only one. ``gripper``
+    (``AxolConfig.gripper``) selects the mobile Axol's parcel-gripper model;
+    the classic Axol has one URDF, with the parallel gripper, for either.
     """
     if whole_body:
         _check_whole_body(model)
+    if gripper == "parcel" and AxolModel(model) is AxolModel.MOBILE:
+        return URDF_DIR / (_PARCEL_WHOLE_BODY_URDF if whole_body else _PARCEL_URDF)
+    if whole_body:
         return URDF_DIR / _WHOLE_BODY_URDF
     return URDF_DIR / _URDF_FILES[AxolModel(model)]
 

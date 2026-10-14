@@ -22,6 +22,7 @@ from almond_axol.diagnostics.rom import enable as rom
 from almond_axol.motor import ControlMode, MotorError
 from almond_axol.robot.axol import AxolHardware
 from almond_axol.rt import Axol
+from almond_axol.rt.link import CONFIG_PROTO
 from almond_axol.serve.robot_link import scoped_motor_faults
 
 WRIST_KIT = {Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}
@@ -301,7 +302,7 @@ class PartialAxolTest(unittest.IsolatedAsyncioTestCase):
         # Slot-by-motor-id is protocol generation 2; a core that predates it
         # would slot these wrists at 0 and 1 and then reject every target,
         # so the config declares the generation and such a core refuses it.
-        self.assertEqual(lines[0], "proto 2")
+        self.assertEqual(lines[0], f"proto {CONFIG_PROTO}")
         joint_lines = [line for line in lines if line.startswith("joint ")]
         self.assertEqual(
             [line.split()[3:5] for line in joint_lines],
@@ -387,13 +388,13 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         q[7] = 1.0
         await arm.motion_control(q)
         (cmds,) = shipped
-        p_des, mode, kp, kd, t_ff, kd_host, _w0, _q, j_eff = cmds[5]
+        p_des, mode, kp, kd, t_ff, kd_host, _w0, _q, j_eff, _cap = cmds[5]
         self.assertAlmostEqual(p_des, 1.2, places=5)
         self.assertEqual(mode, 1.0)
         self.assertAlmostEqual(kp, 25.0)
         self.assertAlmostEqual(kd, 1.5)
         self.assertEqual((t_ff, kd_host, j_eff), (0.0, 0.0, 0.0))
-        _p, _m, kp3, kd3, t_ff3, kd_host3, _w03, _q3, j_eff3 = cmds[6]
+        _p, _m, kp3, kd3, t_ff3, kd_host3, _w03, _q3, j_eff3, _cap3 = cmds[6]
         self.assertAlmostEqual(kp3, 25.0)
         self.assertAlmostEqual(kd3, 0.9)
         self.assertEqual((t_ff3, kd_host3, j_eff3), (0.0, 0.0, 0.0))
@@ -401,7 +402,42 @@ class BenchConfigTest(unittest.IsolatedAsyncioTestCase):
         rt = _wrap_rt(axol)
         for line in rt._config_text().splitlines():
             if line.startswith("joint "):
-                self.assertEqual(line.split()[9:], ["0.0", "0.0", "0.0", "0.0"], line)
+                self.assertEqual(line.split()[9:13], ["0.0", "0.0", "0.0", "0.0"], line)
+                # Stiction and dither terms stay off on the bench too, and
+                # every joint is on the MIT frame.
+                fields = line.split()[13:]
+                # The Stribeck *shape* (dfs, load gain, vs) is per-joint
+                # calibration data; on the bench its gain (before it) is 0.
+                self.assertEqual(fields[6], "0.0", line)
+                fields[7:10] = ["0.3", "0.1", "0.1"]
+                self.assertEqual(
+                    fields,
+                    [
+                        "0.0",
+                        "0.0017453292519943296",
+                        "0.0",
+                        "0.0",
+                        "60.0",
+                        "mit",
+                        "0.0",
+                        "0.3",
+                        "0.1",
+                        "0.1",
+                        "0.0",
+                        "20.0",
+                        # 0xA4 cap tracking off (fixed cap), no target lead,
+                        # no 0x73 feedforward (plain 0xA4), the config-wide
+                        # impedance rate.
+                        "0.0",
+                        "0.0",
+                        "0.0",
+                        "0.0",
+                        # ... and the joint's spring-torque cap (proto 17):
+                        # uncapped by config, box mode caps per command.
+                        "inf",
+                    ],
+                    line,
+                )
 
     def test_only_a_partial_arm_is_a_bench_run(self) -> None:
         """A full arm on the bus — even with a joint subset selected — is the

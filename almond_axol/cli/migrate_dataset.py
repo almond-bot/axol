@@ -526,7 +526,10 @@ def migrate_mantis_tcp_rotation(
     run it on those). ``rest_midpoint`` overrides the FK-derived pivot for
     ``swap_sides`` (tests).
     """
-    from ..mantis.calibration import DESIGN_TCP_TRANSFORM_ID
+    from ..mantis.calibration import (
+        DESIGN_TCP_TRANSFORM_IDS,
+        LEGACY_DESIGN_TCP_TRANSFORM_ID,
+    )
     from ..recording.cartesian_frame import (
         CARTESIAN_FRAME_ID,
         MANTIS_TCP_TRANSFORM_KEY,
@@ -554,7 +557,12 @@ def migrate_mantis_tcp_rotation(
         recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
         if recorded is not None:
             recorded_id = recorded.get("id") if isinstance(recorded, dict) else None
-            if recorded_id == DESIGN_TCP_TRANSFORM_ID:
+            vive_ids = {
+                LEGACY_DESIGN_TCP_TRANSFORM_ID,
+                DESIGN_TCP_TRANSFORM_IDS["survive"],
+                DESIGN_TCP_TRANSFORM_IDS["ultimate"],
+            }
+            if recorded_id in vive_ids:
                 raise ValueError(
                     "Dataset was recorded (or already migrated) with the corrected "
                     "Ry(180°) Vive tracker→gripper rotation; nothing to fix."
@@ -575,9 +583,9 @@ def migrate_mantis_tcp_rotation(
         )
 
     def write_marker(root: Path) -> None:
-        # The dataset now matches what a current session would have recorded
-        # with the factory constants — stamp that provenance so collect-data
-        # can append to it and this migration refuses to run twice. The
+        # The dataset now matches what an axol 0.2.5–0.2.16 session recorded
+        # with that era's factory constants (Ry(180°), retired translation) —
+        # stamp that provenance so this migration refuses to run twice. The
         # tracker family (and so the exact translation) is not recorded by
         # old datasets, hence no per-side values.
         update_cartesian_frame_marker(
@@ -586,10 +594,10 @@ def migrate_mantis_tcp_rotation(
                 "id": _MANTIS_TCP_MIGRATION_ID,
                 "swap_sides": swap_sides,
                 "from": "vive Rx(+90°) tracker→gripper rotation (axol <= 0.2.4)",
-                "to": DESIGN_TCP_TRANSFORM_ID,
+                "to": LEGACY_DESIGN_TCP_TRANSFORM_ID,
             },
             mantis_tcp_transform={
-                "id": DESIGN_TCP_TRANSFORM_ID,
+                "id": LEGACY_DESIGN_TCP_TRANSFORM_ID,
                 "source": None,
                 "left": None,
                 "right": None,

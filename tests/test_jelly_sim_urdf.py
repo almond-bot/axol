@@ -1,4 +1,5 @@
-"""The Axol-on-Jelly simulation URDF (``axol_jelly_sim.urdf``).
+"""The Axol-on-Jelly simulation URDFs (``axol_jelly_sim.urdf`` and, with the
+parcel gripper, ``axol_jelly_parcel_sim.urdf``).
 
 Not loaded by the control stack; this pins what makes it usable in a physics
 simulator (Isaac Sim, MuJoCo): the right joints move, the arm chain is the
@@ -18,6 +19,7 @@ import yourdfpy
 
 from almond_axol.constants import (
     ARM_JOINTS,
+    JELLY_PARCEL_SIM_URDF,
     JELLY_SIM_URDF,
     AxolModel,
     urdf_arm_joint_names,
@@ -44,37 +46,36 @@ def _load(path) -> yourdfpy.URDF:
 
 
 class JellySimUrdfTest(unittest.TestCase):
+    # Per gripper: the sim model, its gripper joints (and their mimics), the
+    # links wrist_3's tuned mass is split across, and MuJoCo's dof count.
+    gripper = "parallel"
+    path = JELLY_SIM_URDF
+    gripper_joints = {"left_finger_1_joint", "right_finger_1_joint"}
+    gripper_mimics = {
+        "left_finger_2_joint": "left_finger_1_joint",
+        "right_finger_2_joint": "right_finger_1_joint",
+    }
+    wrist_parts = ("w2", "gripper", "finger_1", "finger_2", "wrist_camera")
+    # 21 driven joints + the three mimics (MuJoCo imports them as joints).
+    dofs = 24
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.sim = _load(JELLY_SIM_URDF)
-        cls.arm = _load(urdf_path(AxolModel.MOBILE))
-        cls.root = ElementTree.parse(JELLY_SIM_URDF).getroot()
+        cls.sim = _load(cls.path)
+        cls.arm = _load(urdf_path(AxolModel.MOBILE, gripper=cls.gripper))
+        cls.root = ElementTree.parse(cls.path).getroot()
         cls.zero = {n: 0.0 for n in cls.sim.actuated_joint_names}
 
     def test_moving_joints(self) -> None:
-        extra = {
-            "lift",
-            "left_finger_1_joint",
-            "right_finger_1_joint",
-            "wheel_1",
-            "wheel_2",
-            "wheel_3",
-            "wheel_4",
-        }
+        extra = {"lift", "wheel_1", "wheel_2", "wheel_3", "wheel_4"}
         self.assertEqual(
-            set(self.sim.actuated_joint_names), set(ARM_JOINT_NAMES) | extra
+            set(self.sim.actuated_joint_names),
+            set(ARM_JOINT_NAMES) | extra | self.gripper_joints,
         )
         mimics = {
             j.name: j.mimic.joint for j in self.sim.robot.joints if j.mimic is not None
         }
-        self.assertEqual(
-            mimics,
-            {
-                "lift_2": "lift",
-                "left_finger_2_joint": "left_finger_1_joint",
-                "right_finger_2_joint": "right_finger_1_joint",
-            },
-        )
+        self.assertEqual(mimics, {"lift_2": "lift", **self.gripper_mimics})
         self.assertEqual(self.sim.base_link, "jelly")
 
     def test_arm_chain_is_the_ik_models(self) -> None:
@@ -121,13 +122,7 @@ class JellySimUrdfTest(unittest.TestCase):
             # wrist_3's tuned mass/CoM lumps the gripper assembly; the sim
             # model splits it across links but keeps the total.
             w3 = getattr(arm, ARM_JOINTS[-1].value)
-            parts = [
-                f"{prefix}_w2",
-                f"{prefix}_gripper",
-                f"{prefix}_finger_1",
-                f"{prefix}_finger_2",
-                f"{prefix}_wrist_camera",
-            ]
+            parts = [f"{prefix}_{part}" for part in self.wrist_parts]
             self.sim.update_cfg(self.zero)
             to_w2 = np.linalg.inv(self.sim.get_transform(f"{prefix}_w2"))
             total, moment = 0.0, np.zeros(3)
@@ -158,7 +153,7 @@ class JellySimUrdfTest(unittest.TestCase):
         self.assertTrue(refs)
         for ref in refs:
             self.assertNotIn("://", ref)
-            self.assertTrue((JELLY_SIM_URDF.parent / ref).is_file(), ref)
+            self.assertTrue((self.path.parent / ref).is_file(), ref)
 
     def test_joint_friction_and_drive_gains_are_axol_configs(self) -> None:
         from almond_axol.constants import urdf_joint_name
@@ -184,19 +179,49 @@ class JellySimUrdfTest(unittest.TestCase):
                     self.assertAlmostEqual(float(drive["damping"]), jc.kd, places=5)
 
     def test_a_physics_engine_loads_it(self) -> None:
-        xml = JELLY_SIM_URDF.read_text().replace(
+        xml = self.path.read_text().replace(
             '<robot name="assembly">',
             '<robot name="assembly"><mujoco><compiler meshdir="%s" '
-            'balanceinertia="false" discardvisual="true"/></mujoco>'
-            % JELLY_SIM_URDF.parent,
+            'balanceinertia="false" discardvisual="true"/></mujoco>' % self.path.parent,
             1,
         )
         model = mujoco.MjModel.from_xml_string(xml)
-        # 21 driven joints + the three mimics (MuJoCo imports them as joints).
-        self.assertEqual(model.nv, 24)
+        self.assertEqual(model.nv, self.dofs)
         # ...and reads the joints' measured friction.
         jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "left_s1_0")
         self.assertGreater(model.dof_frictionloss[model.jnt_dofadr[jid]], 0.5)
+
+
+class ParcelSimUrdfTest(JellySimUrdfTest):
+    """The sim model with the parcel gripper: a hinged plate per gripper."""
+
+    gripper = "parcel"
+    path = JELLY_PARCEL_SIM_URDF
+    gripper_joints = {"left_plate_joint", "right_plate_joint"}
+    gripper_mimics: dict[str, str] = {}
+    wrist_parts = ("w2", "gripper", "plate")
+    # 21 driven joints + the lift's mimic.
+    dofs = 22
+
+    def test_fingers_open_together(self) -> None:
+        self.skipTest("the parcel gripper has a plate, not fingers")
+
+    def test_plate_swings_half_a_turn_about_its_hinge(self) -> None:
+        for side, (lo, hi) in (("left", (-np.pi, 0.0)), ("right", (0.0, np.pi))):
+            joint = self.sim.joint_map[f"{side}_plate_joint"]
+            self.assertEqual(joint.type, "revolute")
+            self.assertAlmostEqual(float(joint.limit.lower), lo, places=4)
+            self.assertAlmostEqual(float(joint.limit.upper), hi, places=4)
+            # The plate turns about its own origin, on the gripper.
+            self.sim.update_cfg(self.zero)
+            rest = self.sim.get_transform(f"{side}_plate", f"{side}_gripper")
+            self.sim.update_cfg({**self.zero, joint.name: (lo + hi) / 2})
+            turned = self.sim.get_transform(f"{side}_plate", f"{side}_gripper")
+            np.testing.assert_allclose(turned[:3, 3], rest[:3, 3], atol=1e-9)
+            angle = np.arccos(
+                np.clip((np.trace(rest[:3, :3].T @ turned[:3, :3]) - 1) / 2, -1, 1)
+            )
+            self.assertAlmostEqual(float(angle), np.pi / 2, places=6)
 
 
 class CameraFramesTest(unittest.TestCase):
@@ -207,8 +232,29 @@ class CameraFramesTest(unittest.TestCase):
             "whole_body": _load(urdf_path(AxolModel.MOBILE, whole_body=True)),
             "sim": _load(JELLY_SIM_URDF),
         }
-        for urdf in cls.models.values():
+        # The parcel gripper's models: the same head, no wrist cameras.
+        cls.parcel = {
+            "arm": _load(urdf_path(AxolModel.MOBILE, gripper="parcel")),
+            "whole_body": _load(
+                urdf_path(AxolModel.MOBILE, whole_body=True, gripper="parcel")
+            ),
+            "sim": _load(JELLY_PARCEL_SIM_URDF),
+        }
+        for urdf in (*cls.models.values(), *cls.parcel.values()):
             urdf.update_cfg({n: 0.0 for n in urdf.actuated_joint_names})
+
+    def test_parcel_models_have_the_head_cameras_only(self) -> None:
+        arm = self.models["arm"]
+        for name, urdf in self.parcel.items():
+            with self.subTest(model=name):
+                frames = {ln for ln in urdf.link_map if ln.endswith("_optical")}
+                self.assertEqual(frames, set(CAMERAS[2:]))
+                for cam in CAMERAS[2:]:
+                    joint = next(j for j in urdf.robot.joints if j.child == cam)
+                    ref = next(j for j in arm.robot.joints if j.child == cam)
+                    self.assertEqual(joint.parent, ref.parent)
+                    # The two exports' CAD poses differ by ~5 µrad of rounding.
+                    np.testing.assert_allclose(joint.origin, ref.origin, atol=1e-5)
 
     def test_every_model_has_the_same_camera_frames(self) -> None:
         arm = self.models["arm"]

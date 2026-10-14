@@ -238,3 +238,26 @@ def resolve_robot_model(
         jelly = shared_config(JellyConfig, "teleop", "jelly", store=store)
         jelly_enabled = detect_jelly(jelly) is not None
     return AxolModel.MOBILE if jelly_enabled else AxolModel.CLASSIC
+
+
+def resolve_gripper(
+    gripper: str | None = None, *, store: SettingsStore | None = None
+) -> str:
+    """Which gripper the arms carry: ``gripper`` if given, else the saved one.
+
+    An explicit value (``KinematicsConfig.gripper``, set by teleop from
+    ``AxolConfig.gripper``) wins and is validated; otherwise it is the
+    ``axol.gripper`` saved in the shared settings (``"parallel"`` unless the
+    control panel or ``--axol.gripper`` changed it). It selects the mobile
+    Axol's URDF (:func:`almond_axol.constants.urdf_path`).
+    """
+    from .robot.config import GRIPPER_TYPES
+
+    if gripper is None:
+        gripper = shared_axol_config(store).gripper
+    gripper = str(gripper).strip().lower()
+    if gripper not in GRIPPER_TYPES:
+        raise ValueError(
+            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
+        )
+    return gripper
