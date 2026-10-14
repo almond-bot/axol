@@ -378,14 +378,17 @@ class VRTeleopConfig:
             any single joint can move toward a new IK target.  Defaults to
             1.0 rev/s (~360 °/s).
         teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
-            trapezoidal filter.  Defaults to 3.5 rev/s² (~1260 °/s²).  Since
-            the filter became a critically damped linear tracker, smoothness
-            comes from the tracker itself, not this clamp: replaying recorded
-            teleop showed resonance-band excitation identical at 2.0 and
-            3.5 rev/s², while the lower cap saturated ~4% of moving time —
+            trapezoidal filter.  Defaults to 3π rad/s² (1.5 rev/s²,
+            540 °/s²), lowered from 3.5 rev/s² so the catch-up after a
+            controller re-acquires optical tracking (the held pose jumps to
+            the real one) eases in instead of snapping.  Since the filter
+            became a critically damped linear tracker, smoothness of ordinary
+            motion comes from the tracker itself, not this clamp: replaying
+            recorded teleop showed resonance-band excitation identical at 2.0
+            and 3.5 rev/s², while the lower cap saturated ~4% of moving time —
             felt as lag-then-surge "jumpiness" on fast moves (vibration
-            windows correlated 5.5× with saturation). Keep it high enough
-            that genuine motion never saturates; it is a safety ceiling.
+            windows correlated 5.5× with saturation). Raise it if fast hand
+            motion starts to lag and surge.
         ik_alpha: Blend factor for the exponential moving average applied to
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
@@ -579,7 +582,7 @@ class VRTeleopConfig:
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
-    teleop_max_accel: float = 3.5 * 2 * math.pi
+    teleop_max_accel: float = 3.0 * math.pi
     ik_alpha: float = 0.3
     pose_cutoff: float = 2.5
     command_notch_hz: list[float] = field(default_factory=list)

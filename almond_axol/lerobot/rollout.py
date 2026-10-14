@@ -808,7 +808,7 @@ class PolicyActionLimiter:
     policy's *arm* joints (the grippers snap by design and pass through
     untouched).
 
-    With the default limits at the teleop envelope (~1 rev/s, ~3.5 rev/s²)
+    With the default limits at the teleop envelope (~1 rev/s, 1.5 rev/s²)
     the filter is transparent for normal trained motion and only engages on
     discontinuities, turning a jump into a bounded, acceleration-limited
     move. It is a smoothness guarantee, not a safety stop: a policy heading

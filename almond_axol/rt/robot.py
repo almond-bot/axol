@@ -166,7 +166,7 @@ class Axol(RobotBase):
         loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
-        max_accel: float = 7.0 * math.pi,
+        max_accel: float = 3.0 * math.pi,
         record: str | None = None,
     ) -> None:
         """Construct the dual-arm interface.
@@ -205,7 +205,7 @@ class Axol(RobotBase):
                 without a fresh one before treating the host as gone.
             max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
                 runs at ``_TRACKER_HEADROOM`` times this. Defaults match
-                ``VRTeleopConfig.teleop_max_vel``.
+                ``VRTeleopConfig.teleop_max_vel`` / ``teleop_max_accel``.
             max_accel: Teleop joint-acceleration cap (rad/s²), same
                 treatment.
             record: Teleop flight-recorder prefix. When set, measured
@@ -235,7 +235,7 @@ class Axol(RobotBase):
         loop_hz: float | None = None,
         watchdog_ms: float = 150.0,
         max_vel: float = 2.0 * math.pi,
-        max_accel: float = 7.0 * math.pi,
+        max_accel: float = 3.0 * math.pi,
         record: str | None = None,
     ) -> Self:
         """Build the robot around an already-constructed low-level object.
