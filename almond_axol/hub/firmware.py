@@ -1,6 +1,6 @@
 """Keep the Axol arm hub on the firmware this package ships.
 
-The hub (``firmware/axol_hub`` in the repository) is an RP2350 that bridges
+The hub is an RP2350 that bridges
 the two arm CAN buses to USB as a gs_usb device. Its firmware decides what
 happens to motor commands when the bus dies — whether a setpoint parked behind
 an e-stop can still reach the motors when they are powered back on — so a
@@ -40,12 +40,15 @@ from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
-#: BCD firmware version of the bundled image (0x0200 = 2.00). Must match
-#: ``AXOL_HUB_FW_VERSION`` in ``firmware/axol_hub/CMakeLists.txt``; the test
-#: suite checks both that and the version baked into the image itself.
+#: BCD firmware version of the bundled image (0x0200 = 2.00): the
+#: ``AXOL_HUB_FW_VERSION`` it was built with. The test suite checks the image
+#: itself reports it.
 FIRMWARE_VERSION = 0x0200
 
-#: The bundled image, built from ``firmware/axol_hub`` (see its README).
+#: The bundled image. The source lives in the circuits-py repository
+#: (``designs/axol_hub/firmware``); this is its built ``firmware.uf2``, copied
+#: here when the firmware changes, together with a :data:`FIRMWARE_VERSION`
+#: bump to the new ``AXOL_HUB_FW_VERSION``.
 FIRMWARE_PATH = Path(__file__).resolve().parent / "axol_hub.uf2"
 
 HUB_VID, HUB_PID = 0x1D50, 0x606F  # gs_usb IDs the hub enumerates with

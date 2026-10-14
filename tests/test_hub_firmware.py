@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import errno
 import os
-import re
 import struct
 import tempfile
 import unittest
@@ -23,8 +22,6 @@ from unittest.mock import patch
 from almond_axol.cli.can import setup as can_setup
 from almond_axol.constants import CAN_LEFT, CAN_RIGHT
 from almond_axol.hub import firmware as hub_fw
-
-_REPO = Path(__file__).resolve().parents[1]
 
 _UF2_MAGIC = (0x0A324655, 0x9E5D5157)
 _UF2_MAGIC_END = 0x0AB16F30
@@ -51,15 +48,9 @@ def _uf2_payload(path: Path) -> bytes:
 
 
 class BundledImageTest(unittest.TestCase):
-    def test_version_matches_the_firmware_build(self) -> None:
-        cmake = (_REPO / "firmware" / "axol_hub" / "CMakeLists.txt").read_text()
-        match = re.search(r"set\(AXOL_HUB_FW_VERSION\s+(0x[0-9a-fA-F]+)\)", cmake)
-        self.assertIsNotNone(match)
-        self.assertEqual(int(match.group(1), 16), hub_fw.FIRMWARE_VERSION)
-
     def test_image_reports_the_bundled_version(self) -> None:
-        # The device descriptor baked into the image: an image rebuilt without
-        # bumping the version (or not rebuilt after a bump) would make every
+        # The device descriptor baked into the image: an image copied in
+        # without updating FIRMWARE_VERSION (or the reverse) would make every
         # bring-up reflash forever, or never.
         payload = _uf2_payload(hub_fw.FIRMWARE_PATH)
         descriptor = struct.pack(
