@@ -34,7 +34,7 @@ The kit includes the mount for the pose source you purchased: Quest, Lighthouse 
 
 | Pose source | Mount | Tracker → gripper transform |
 |---|---|---|
-| **Meta Quest** controllers | The controller is rigidly mounted to the rig. | No factory constant; measured per controller generation (see [Mantis Tracking](/mantis/tracking#transforms)). |
+| **Meta Quest** controllers | The controller is rigidly mounted to the rig. | Built-in factory transform for Quest 3 (Touch Plus) controllers; other controller generations are measured (see [Mantis Tracking](/mantis/tracking#transforms)). |
 | **VIVE Tracker 3.0** (Lighthouse) | Flat-back mount in the controller's place. | Built-in factory transform; nothing to measure for the standard mount. |
 | **VIVE Ultimate Tracker** | Same flat-back mount and orientation as Tracker 3.0. | Built-in factory transform (includes the 11 mm origin difference from Tracker 3.0). |
 
@@ -88,7 +88,7 @@ Mantis episodes are standard LeRobot datasets with the same schema a robot-colle
     Plug the USB cable from the Mantis Hub into the ZED Box (this is how the host communicates with the grippers) and power both rigs. The host discovers the hub alongside the Axol Hub: it works out which side is which rig, assigns the persistent left/right interface names, and installs a udev rule and hotplug unit so a replug brings the interfaces back up on its own.
   </Step>
   <Step title="Let the control panel identify it">
-    Open the [control panel](/guides/control-panel#connections) and connect the **Axol Host**. When the panel comes online it inventories the host's CAN interfaces; a new hub that still shows as anonymous `can0` / `can1` is identified automatically as long as the rigs are powered. If the probe cannot prove the role (unpowered rig, ambiguous hub), power the hardware and press **Retry CAN identification**, or run [`axol can.setup`](/cli/can-setup) in a terminal as the interactive fallback.
+    Open the [control panel](/guides/control-panel#connections) and connect the **Axol Host**. When the panel comes online it inventories the host's CAN interfaces; a new hub that still shows as anonymous `can0` / `can1` is identified automatically as long as the rigs are powered. If the probe cannot prove the role (unpowered rig, ambiguous hub), power the hardware and press **Connect** or **Retry CAN identification**, or run [`axol can.setup`](/cli/can-setup) in a terminal as the interactive fallback.
   </Step>
 </Steps>
 

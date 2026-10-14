@@ -51,7 +51,7 @@ def run_session(
         return True
 
     reset.park.side_effect = park
-    client = mock.Mock(fatal_error=fault, contact_tripped=None)
+    client = mock.Mock(fatal_error=fault, contact_tripped=None, start_rejected=None)
     client.start.return_value = True
     if soft_park:
         client.stop.side_effect = lambda: events.append("client stopped")

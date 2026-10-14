@@ -24,6 +24,15 @@ const BRINGUP_SCRIPT: &str = "/etc/almond-axol/can/startup.sh";
 /// `/etc`. Still honoured so a purge works on a robot that has not been
 /// re-provisioned yet; `axol provision` deletes the root references to it.
 const LEGACY_BRINGUP_SCRIPT: &str = ".almond/can/startup.sh";
+/// The arm hub's USB reset — `almond_axol.constants.CAN_RESET_SCRIPT`. The
+/// hub firmware keeps the frames it already accepted (up to the driver's 10
+/// in flight per channel) through a link down/up and transmits them on the
+/// next open, so on the arm buses a flap only defers the replay; this script
+/// resets the device, then runs the bring-up script. Same grant as above.
+const RESET_SCRIPT: &str = "/etc/almond-axol/can/reset_adapter.sh";
+/// The two channels of the arm hub (`CAN_LEFT` / `CAN_RIGHT` in
+/// `almond_axol.constants`), the only interfaces the reset script covers.
+const ARM_HUB_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
 
 fn is_tx_full(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EAGAIN))
@@ -99,10 +108,14 @@ fn bringup_script() -> Option<PathBuf> {
     bringup_script_in(Path::new(BRINGUP_SCRIPT), home.as_deref())
 }
 
-/// Drop frames queued behind a dead bus by flapping the CAN interface.
+/// Drop frames queued behind a dead bus.
 ///
-/// Prefer the installed bring-up script because the dual-channel adapter is
-/// most reliable when both channels are flapped together. A purge performed
+/// On an arm-hub channel, USB-reset the hub first (`RESET_SCRIPT`): a flap
+/// clears the kernel's queue but not the frames the hub firmware already
+/// holds, which it transmits on the next open. Otherwise, or when the reset
+/// cannot run, flap the interface — preferring the installed bring-up script
+/// because the dual-channel adapter is most reliable when both channels are
+/// flapped together. A purge performed
 /// for the other arm within the last three seconds counts for this arm too.
 ///
 /// Returns false when the flap could not be run at all — most often because
@@ -113,9 +126,18 @@ fn bringup_script() -> Option<PathBuf> {
 /// (`almond_axol.cli.can.setup.purge_stale_tx`).
 pub fn purge_tx_queue(iface: &str) -> bool {
     let mut last = LAST_PURGE.lock().unwrap();
+    let reset = reset_script_for(iface, Path::new(RESET_SCRIPT));
     let script = bringup_script();
-    if script.is_some() && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE) {
+    if (reset.is_some() || script.is_some()) && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE) {
         return true;
+    }
+    if let Some(path) = &reset {
+        // Falls through to the flap when the reset cannot run — most often a
+        // robot whose sudo grant predates the script (`axol provision`).
+        if run_root(&["bash", &path.to_string_lossy()]).is_ok_and(|st| st.success()) {
+            *last = Some(Instant::now());
+            return true;
+        }
     }
     let result = match &script {
         Some(path) => run_root(&["bash", &path.to_string_lossy()]),
@@ -134,6 +156,12 @@ pub fn purge_tx_queue(iface: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The reset script to purge `iface` with: only for an arm-hub channel, and
+/// only once `axol can.setup` has installed it. Split out for the tests.
+fn reset_script_for(iface: &str, provisioned: &Path) -> Option<PathBuf> {
+    (ARM_HUB_IFACES.contains(&iface) && provisioned.is_file()).then(|| provisioned.to_path_buf())
 }
 
 #[cfg(test)]
@@ -184,5 +212,30 @@ mod tests {
         let dir = scratch("none");
         assert_eq!(bringup_script_in(&dir.join("absent.sh"), Some(&dir)), None);
         assert_eq!(bringup_script_in(&dir.join("absent.sh"), None), None);
+    }
+
+    #[test]
+    fn arm_hub_channels_purge_with_the_usb_reset() {
+        let dir = scratch("reset");
+        let reset = dir.join("reset_adapter.sh");
+        std::fs::write(&reset, "#!/bin/bash\n").unwrap();
+        for iface in ARM_HUB_IFACES {
+            assert_eq!(reset_script_for(iface, &reset), Some(reset.clone()));
+        }
+    }
+
+    #[test]
+    fn other_buses_and_unset_up_hosts_keep_the_flap() {
+        // The wheel/chest adapters are single-channel and not the hub; a
+        // reset of the hub for their stall would drop a healthy arm session.
+        let dir = scratch("noreset");
+        let reset = dir.join("reset_adapter.sh");
+        std::fs::write(&reset, "#!/bin/bash\n").unwrap();
+        assert_eq!(reset_script_for("can_alm_axol_b", &reset), None);
+        assert_eq!(reset_script_for("can0", &reset), None);
+        assert_eq!(
+            reset_script_for("can_alm_axol_l", &dir.join("absent.sh")),
+            None
+        );
     }
 }

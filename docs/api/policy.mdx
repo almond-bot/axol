@@ -86,10 +86,42 @@ What `infer` receives: one observation per request, captured with the same expos
 | `joints` | `state` as a `{name: value}` dict, e.g. `obs.joints["left_gripper.pos"]`. |
 | `images` | Camera name → `(height, width, 3)` uint8 **RGB** frame. |
 | `plan` | The rows of the robot's current plan that haven't executed yet, aligned with your reply: `plan[k]` is what the robot would command at the tick your row `k` targets. `None` when nothing is executing (episode start, after a reset). Read-only. |
+| `continuation` | Raw `Continuation(prediction_id, from_row)` identifying the accepted plan and its first remaining row. Use it to index richer model-specific prediction state. `None` when no plan is accepted. |
+| `last_dispatched` | Independent `LastDispatched(prediction_id, row)` for the most recent completed local dispatch, when `PolicySpec.dispatch_feedback` is enabled. It can name a different prediction from `continuation`. |
+| `last_dispatched_action` | Read-only copy of the exact published action row named by `last_dispatched`, including server ensembling, before downstream robot filtering. `None` when no dispatch reference is present. |
 | `delay_steps` | The robot's estimate of how many of your rows will already have passed when your reply arrives. `None` unless the robot runs with `--plan_config.advertise_delay true`. |
 | `state_time_ns` | Robot-monotonic time the state was sampled. |
 | `image_time_ns` | Robot-monotonic capture time per camera. |
+| `state_sample_time_ns`, `image_capture_time_ns` | Aliases of `state_time_ns` and `image_time_ns`, matching the names on `PlanObservation`. |
 | `request_id` | This request's id, which is also the id of the plan you publish. |
+
+`last_dispatched` means the local dispatch call returned successfully. It is not
+a motor acknowledgement, measured pose, or proof that the target was reached.
+It remains independent of accepted-plan continuation, including when
+`continuation` is absent. Sensor timestamps stay in the robot's monotonic clock;
+do not compare them directly with the desktop's clock.
+
+### Keeping model-specific prediction state
+
+Some policies retain information beyond the float32 wire targets, such as
+rotation matrices, unclipped gripper openings, or latent model state. Cache that
+information under `obs.request_id`. On the next request,
+`obs.continuation.prediction_id` and `from_row` identify the exact cached suffix
+to condition on. Use `obs.plan` when the published action rows alone are enough.
+
+Retain each prediction named by `continuation` or `last_dispatched`, plus your
+newest candidate. A published candidate may never be adopted; repeated rejected
+candidates must not evict the accepted or dispatched prediction. Clear your
+private cache in `Policy.reset()`, and initialize it in `setup()` for each new
+connection. The server independently retains both referenced published plans,
+rejects unknown/out-of-range references and duplicate request IDs, and clears
+its own history on reset. Request IDs may be reused after reset.
+
+When exact private-state prefixes matter, keep server ensembling disabled:
+ensembling changes published targets after your model constructs its cache.
+Otherwise, `obs.plan` and `obs.last_dispatched_action` always resolve the
+server's published rows. Modifying policy-owned output buffers or copies of
+these observation arrays cannot change published history.
 
 ## `PolicySpec`
 
@@ -105,6 +137,7 @@ The robot's session contract, passed to `Policy.setup` (an alias of `PlanSpec`).
 | `actions_per_chunk` | The most rows the robot uses from one chunk. Extra rows are dropped. |
 | `request_interval` | How many rows the robot executes between requests. |
 | `max_adoption_offset_steps` | The latest row a reply may start executing at. A slower reply triggers recovery. |
+| `dispatch_feedback` | Whether observations include the independent last-dispatched reference and its resolved action. |
 
 ### State and action names
 
@@ -134,6 +167,31 @@ The robot executes your chunks **as published**, without blending them. Two ways
 - **Let the server ensemble.** Pass `ensemble=` to `serve()` for chunked policies trained with ACT-style temporal ensembling (below).
 
 Replies must arrive within `max_adoption_offset_steps` rows (default 6, i.e. 200 ms at 30 Hz) and within 10 s overall. The robot then recovers: by default it holds, calls `reset`, and requests a fresh plan. `setup` has up to 5 minutes. Check an endpoint with [`check_policy`](#check_policy) before running it on the robot.
+
+### `Prediction`
+
+Return `Prediction` when a particular reply needs a tighter adoption deadline:
+
+```python
+from almond_axol.policy import Policy, Prediction
+
+class DeadlinePolicy(Policy):
+    def __init__(self, model):
+        self.model = model
+
+    def infer(self, obs):
+        actions = self.model(obs.state, obs.images)
+        return Prediction(actions, max_adoption_offset_steps=2)
+```
+
+`actions` accepts all the ordinary chunk formats above. The deadline is the
+largest allowed adoption offset in control ticks from this request's origin;
+it is not a minimum wait or a desktop-clock timestamp. It must be a nonnegative
+integer smaller than the returned horizon after truncation and no larger than
+the negotiated session bound. `None` keeps the session bound. The server adds
+the correct request ID, validates the response before caching it, and preserves
+the deadline on the wire. Existing policies and plain functions returning only
+action arrays keep their behavior.
 
 ## `serve`
 

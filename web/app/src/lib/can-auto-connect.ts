@@ -85,6 +85,32 @@ export function chooseUnambiguousAutoConnectProfile(
 }
 
 /**
+ * The device selection to switch to because the host's inventory shows only
+ * the other device. With exactly one of Axol / Mantis present, a selection on
+ * the absent one is stale (auto-connect already falls back to the present
+ * device), so the panel follows the hardware instead of showing a device that
+ * isn't there. Suppressed automatic connects still count as present: the
+ * selection describes what is attached, not whether it may auto-connect.
+ * Returns null when the selection already matches or the inventory is
+ * ambiguous (both or neither present).
+ */
+export function chooseDetectedHardwareProfile(
+  profiles: CanProfileInventory,
+  selected: HardwareProfile
+): HardwareProfile | null {
+  const axol = profiles.axol.present
+  const mantis = profiles.mantis.present
+  if (axol === mantis) return null
+  const detected: HardwareProfile = axol ? "axol" : "mantis"
+  return detected === selected ? null : detected
+}
+
+/** Presence key for latching one auto-selection per inventory change. */
+export function hardwarePresenceSignature(profiles: CanProfileInventory): string {
+  return `${profiles.axol.present ? "axol" : "-"}:${profiles.mantis.present ? "mantis" : "-"}`
+}
+
+/**
  * Resolve Diagnostics' deliberately narrower startup policy. New hosts must
  * prove that exactly one configured profile is present. A legacy host cannot
  * provide that inventory, so retain its historical server-reported profile;

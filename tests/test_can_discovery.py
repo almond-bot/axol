@@ -1424,7 +1424,9 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.disconnects, 1)
         discover.assert_called_once_with()
 
-    async def test_managed_connect_waits_for_root_validation(self) -> None:
+    async def test_manual_managed_connect_runs_root_validation_first(self) -> None:
+        # After a serve restart (an update, a reinstall) a root serve must
+        # revalidate the saved hub; the operator's Connect runs that pass.
         attached = _state(
             profiles={"axol"},
             validation=(("usb", "usb-1", "SERIAL"),),
@@ -1449,17 +1451,181 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
                 async with httpx.AsyncClient(
                     transport=transport, base_url="http://test"
                 ) as client:
-                    blocked = await client.post("/api/robot/connect")
-                    validation = await client.post("/api/can/discover")
                     connected = await client.post("/api/robot/connect")
+                    again = await client.post("/api/robot/connect")
 
-        self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(validation.json()["discovery"]["status"], "ready")
         self.assertEqual(connected.status_code, 200)
         self.assertTrue(connected.json()["connected"])
+        self.assertEqual(again.status_code, 200)
+        # Validated once per epoch: the second Connect does not re-probe.
         self.assertEqual(discover.call_count, 1)
         self.assertEqual(robot.disconnects, 1)
+
+    async def test_manual_connect_retries_unidentified_discovery(self) -> None:
+        # Discovery ran while the motors were unpowered. Powering them changes
+        # nothing USB-visible, so Connect itself must re-run the pass.
+        attached = _state(
+            profiles={"axol"},
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        results = iter(
+            [
+                setup.HeadlessHubSetupResult(
+                    "unidentified",
+                    0,
+                    "Power its Axol motors and retry identification",
+                    validation_identity=attached.validation_identity,
+                ),
+                setup.HeadlessHubSetupResult(
+                    "ready", 0, validation_identity=attached.validation_identity
+                ),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(channels=settings.can_channels(), profile="axol")
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            discover = Mock(side_effect=lambda: next(results))
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+                patch.object(setup, "setup_detected_hubs", discover),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    silent = await client.post("/api/can/discover")
+                    connected = await client.post(
+                        "/api/robot/connect", json={"profile": "axol"}
+                    )
+
+        self.assertEqual(silent.json()["discovery"]["status"], "unidentified")
+        self.assertEqual(connected.status_code, 200)
+        self.assertTrue(connected.json()["connected"])
+        self.assertEqual(discover.call_count, 2)
         self.assertEqual(robot.connects, 1)
+
+    async def test_manual_connect_explains_a_discovery_that_still_fails(
+        self,
+    ) -> None:
+        attached = _state(
+            profiles={"axol"},
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        result = setup.HeadlessHubSetupResult(
+            "unidentified",
+            0,
+            "Power its Axol motors and retry identification",
+            validation_identity=attached.validation_identity,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(channels=settings.can_channels(), profile="axol")
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            discover = Mock(return_value=result)
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+                patch.object(setup, "setup_detected_hubs", discover),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    blocked = await client.post("/api/robot/connect")
+
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(
+            blocked.json()["error"], "Power its Axol motors and retry identification"
+        )
+        self.assertEqual(discover.call_count, 1)
+        self.assertEqual(robot.connects, 0)
+
+    async def test_manual_custom_channel_connect_never_starts_discovery(
+        self,
+    ) -> None:
+        # Discovery may rename raw interfaces; a Connect on hand-picked
+        # channels must not rename them out from under itself.
+        attached = _state(
+            candidates=(("usb-1", "SERIAL"),),
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        discover = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            settings = SettingsStore(Path(directory) / "settings.json")
+            robot = _Robot(state="disconnected")
+            _app, _robot, _runner, _manager, transport = self._transport(
+                robot=robot, settings=settings
+            )
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(app_module, "_list_can_interfaces", return_value=[]),
+                patch.object(app_module, "_attached_hub_state", return_value=attached),
+                patch.object(setup, "setup_detected_hubs", discover),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    connected = await client.post(
+                        "/api/robot/connect",
+                        json={
+                            "profile": "axol",
+                            "channelsSet": True,
+                            "leftChannel": "can0",
+                            "rightChannel": "can1",
+                        },
+                    )
+
+        self.assertEqual(connected.status_code, 200)
+        discover.assert_not_called()
+
+    async def test_manual_jelly_connect_runs_pending_discovery_first(self) -> None:
+        initial = _state(
+            candidates=(("usb-3", "BASE"),),
+            validation=(("usb", "usb-3", "BASE"),),
+        )
+        final = _state(validation=(("claim", "wheels", "BASE"),))
+        current = {"state": initial}
+        events: list[str] = []
+        _app, _robot, _runner, _manager, transport = self._transport()
+
+        def discover_hubs() -> setup.HeadlessHubSetupResult:
+            events.append("discover")
+            current["state"] = final
+            return setup.HeadlessHubSetupResult(
+                "configured", 1, validation_identity=final.validation_identity
+            )
+
+        with (
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(
+                app_module,
+                "_attached_hub_state",
+                side_effect=lambda: current["state"],
+            ),
+            patch.object(setup, "setup_detected_hubs", side_effect=discover_hubs),
+            patch.object(
+                app_module,
+                "device_presence",
+                side_effect=lambda device: (
+                    events.append(f"connect:{device}")
+                    or {"channel": "can_alm_axol_b", "present": True, "up": True}
+                ),
+            ),
+        ):
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                connected = await client.post("/api/jelly/wheels/connect")
+
+        self.assertEqual(connected.status_code, 200)
+        self.assertEqual(events[:2], ["discover", "connect:wheels"])
 
     async def test_automatic_managed_connect_rejects_unidentified_epoch(self) -> None:
         attached = _state(

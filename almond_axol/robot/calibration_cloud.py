@@ -29,7 +29,8 @@ One-time Supabase setup: create a Storage bucket named
 needed — write access comes from the service key).
 
 The document has the same shape as ``~/.almond/calibration.json`` (see
-:mod:`.calibration`): per-side, per-joint ``friction`` / ``com`` entries.
+:mod:`.calibration`): per-side, per-joint ``friction`` / ``mass`` / ``com``
+entries — ``mass`` is how a custom gripper's weight follows the robot.
 
 Uses only stdlib HTTP so the SDK gains no new dependency.
 """

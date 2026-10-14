@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,12 +23,28 @@ class _Dist:
 
 
 class _AsyncProc:
-    def __init__(self, output: bytes = b"", returncode: int = 0) -> None:
+    """A finished subprocess; update steps get its output in their log file."""
+
+    pid = 4242
+
+    def __init__(self, output: bytes = b"", returncode: int = 0, **spawn) -> None:
         self.output = output
         self.returncode = returncode
+        sink = spawn.get("stdout")
+        if hasattr(sink, "write"):
+            sink.write(output)
 
     async def communicate(self):
         return self.output, b""
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.fixture(autouse=True)
+def _step_logs(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(update, "_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(update, "_LOG_FALLBACK_DIR", tmp_path / "fallback")
 
 
 def test_version_and_install_metadata(monkeypatch) -> None:
@@ -119,7 +136,7 @@ def test_remote_release_resolution_and_status(monkeypatch) -> None:
         )
 
         async def spawn(*args, **kwargs):
-            return _AsyncProc(tag_output)
+            return _AsyncProc(tag_output, **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
         assert await updater._resolve_latest_release("origin") == ("v2.0.0", "2.0.0")
@@ -132,7 +149,7 @@ def test_remote_release_resolution_and_status(monkeypatch) -> None:
         assert status["idle"] is True
 
         async def bad_spawn(*args, **kwargs):
-            return _AsyncProc(b"", returncode=2)
+            return _AsyncProc(b"", returncode=2, **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", bad_spawn)
         assert await updater._resolve_latest_release("origin") is None
@@ -194,7 +211,7 @@ def test_successful_update_and_provision(monkeypatch) -> None:
 
         async def spawn(*args, **kwargs):
             commands.append(args)
-            return _AsyncProc(b"done")
+            return _AsyncProc(b"done", **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
         exits: list[int] = []
@@ -227,7 +244,7 @@ def test_update_failures(monkeypatch, failure: str, message: str) -> None:
         async def spawn(*args, **kwargs):
             if failure == "missing":
                 raise OSError("not found")
-            return _AsyncProc(b"first\nlast line", returncode=1)
+            return _AsyncProc(b"first\nlast line", returncode=1, **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
         await updater._run_update()
@@ -252,8 +269,8 @@ def test_provision_failure_names_the_failed_step(monkeypatch) -> None:
 
         async def spawn(*args, **kwargs):
             if args[1] == "provision":
-                return _AsyncProc(b"log line\n" + tail, returncode=1)
-            return _AsyncProc(b"done")
+                return _AsyncProc(b"log line\n" + tail, returncode=1, **kwargs)
+            return _AsyncProc(b"done", **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
         await updater._run_update()
@@ -285,7 +302,7 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
         monkeypatch.setattr(update.shutil, "which", lambda name: "/bin/axol")
 
         async def failed(*args, **kwargs):
-            return _AsyncProc(b"bad provision", returncode=1)
+            return _AsyncProc(b"bad provision", returncode=1, **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", failed)
         assert not await updater._provision()
@@ -300,7 +317,7 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
 
         async def ok(*args, **kwargs):
             commands.append(args)
-            return _AsyncProc(b"done")
+            return _AsyncProc(b"done", **kwargs)
 
         monkeypatch.setattr(update.asyncio, "create_subprocess_exec", ok)
         assert await updater._provision()
@@ -314,8 +331,8 @@ def test_provision_once_and_failure_paths(monkeypatch) -> None:
 
 
 def _ok_spawn(*args, **kwargs):
-    async def spawn(*a, **k):
-        return _AsyncProc(b"done")
+    async def spawn(*a, **kwargs):
+        return _AsyncProc(b"done", **kwargs)
 
     return spawn
 
@@ -386,5 +403,164 @@ def test_busy_server_defers_the_reboot(monkeypatch) -> None:
         await updater._provision_on_startup()
         assert calls == []
         assert updater._restart_pending
+
+    asyncio.run(exercise())
+
+
+def test_step_returns_when_a_background_child_keeps_its_output_open() -> None:
+    # A daemon a provision step starts inherits the step's output. Waiting on
+    # that output (rather than the step's exit) hung updates indefinitely.
+    async def exercise() -> tuple[int | None, list[str]]:
+        return await asyncio.wait_for(
+            update._run_step(
+                ["sh", "-c", "sleep 3 & echo first; echo done"],
+                name="step",
+                timeout=10.0,
+            ),
+            2.0,
+        )
+
+    assert asyncio.run(exercise()) == (0, ["first", "done"])
+    log = (update._LOG_DIR / "step.log").read_text()
+    assert "$ sh -c" in log
+    assert "first\ndone\n" in log
+
+
+def test_hung_step_times_out_and_its_process_group_is_killed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(update, "_KILL_GRACE_S", 2.0)
+    marker = tmp_path / "survived"
+
+    async def exercise() -> tuple[int | None, list[str]]:
+        return await update._run_step(
+            [
+                "sh",
+                "-c",
+                f"(sleep 1; touch {marker}) & echo working; sleep 30",
+            ],
+            name="hung",
+            timeout=0.3,
+        )
+
+    assert asyncio.run(exercise()) == (None, ["working"])
+    time.sleep(1.5)
+    # The step's background child was in its process group and died with it.
+    assert not marker.exists()
+
+
+def test_timed_out_upgrade_fails_retryably(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        updater._remote_tag = "v2.0.0"
+        updater._remote_version = "2.0.0"
+        monkeypatch.setattr(update, "_UV_INSTALL_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(update, "_KILL_GRACE_S", 0.05)
+        signals: list[int] = []
+        released = asyncio.Event()
+
+        class _Hung(_AsyncProc):
+            async def wait(self):
+                await released.wait()
+                return -9
+
+        async def spawn(*args, **kwargs):
+            return _Hung(b"Resolved 300 packages\n", **kwargs)
+
+        def killpg(pid, sig):
+            signals.append(sig)
+            released.set()
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(update.os, "killpg", killpg)
+        await updater._run_update()
+        assert updater._state == "error"
+        assert "timed out" in (updater._error or "")
+        assert "Resolved 300 packages" in (updater._error or "")
+        assert signals == [update.signal.SIGTERM]
+        # Not wedged in "updating": the panel's retry is accepted again.
+        assert updater.start() == (True, None)
+        updater._update_task.cancel()
+
+    asyncio.run(exercise())
+
+
+def test_provision_timeout_names_the_last_output(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        monkeypatch.setattr(update, "_PROVISION_TIMEOUT_S", 0.05)
+        monkeypatch.setattr(update, "_KILL_GRACE_S", 0.05)
+
+        class _Hung(_AsyncProc):
+            async def wait(self):
+                await asyncio.sleep(3600)
+
+        async def spawn(*args, **kwargs):
+            return _Hung(b"==> GStreamer + PyGObject (gst.install)\n", **kwargs)
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(update.os, "killpg", lambda pid, sig: None)
+        assert not await updater._provision(require_rt=True)
+        assert "timed out" in updater._provision_failure_message()
+        assert "gst.install" in updater._provision_failure_message()
+
+    asyncio.run(exercise())
+
+
+def test_optional_provision_failures_still_restart_onto_the_new_code(
+    monkeypatch,
+) -> None:
+    # A host whose Lighthouse or zed-gstreamer build fails must not be stuck
+    # on the old release: every retry reinstalled and then refused to restart.
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        updater._remote_tag = "v2.0.0"
+        updater._remote_version = "2.0.0"
+        warning = (
+            update._OPTIONAL_FAILURE_PREFIX
+            + "Lighthouse tracking (tracker.install), patched zed-gstreamer "
+            "plugins (gst.build-zed). Axol runs without them."
+        )
+
+        async def spawn(*args, **kwargs):
+            if args[1] == "provision":
+                output = f"step log\n{warning}\nREBOOT REQUIRED: x. Left pending."
+                return _AsyncProc(output.encode(), **kwargs)
+            return _AsyncProc(b"done", **kwargs)
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        monkeypatch.setattr(update.reboot, "pending", lambda: [])
+        exits: list[int] = []
+        monkeypatch.setattr(update.os, "_exit", exits.append)
+        await updater._run_update()
+        assert exits == [0]
+        status = await updater.status()
+        assert status["warning"] == warning
+        assert status["error"] is None
+
+    asyncio.run(exercise())
+
+
+def test_optional_failure_prefix_matches_provision() -> None:
+    from almond_axol.cli import provision
+
+    assert update._OPTIONAL_FAILURE_PREFIX == provision.OPTIONAL_FAILURE_PREFIX
+
+
+def test_restart_waits_for_an_install_in_progress(monkeypatch) -> None:
+    # Exiting the service mid-provision takes its children down with it.
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        exits: list[int] = []
+        monkeypatch.setattr(update.os, "_exit", exits.append)
+        updater._restart_pending = True
+        async with updater._env_lock:
+            assert updater.installing
+            status = await updater.status()
+            assert status["installing"] is True
+            assert exits == []
+        assert not updater.installing
+        await updater.status()
+        assert exits == [0]
 
     asyncio.run(exercise())

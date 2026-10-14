@@ -55,8 +55,13 @@ of steps lives in exactly one place and can't drift between them. Plain
 ``axol provision`` keeps every step idempotent (each self-gates on the ZED SDK /
 apt / NVENC), so it is safe to run on any host; a step that self-gates is not a
 failure, but a step that fails to repair the host is reported and makes the
-command exit non-zero once every other step has had its chance. The hosted
-installer and post-upgrade path pass ``--require-rt`` (accepted for
+command exit non-zero once every other step has had its chance: 1 when the
+required ``axol-rt`` core (or the CAN security migration) failed,
+``OPTIONAL_STEPS_FAILED_EXIT`` (3) when only optional features did, and 0
+with the failed steps on the last line when ``axol serve`` spawned it. The
+installer and the self-updater still move onto the new release then; an
+optional feature that will not build must not strand a host on old code. The
+hosted installer and post-upgrade path pass ``--require-rt`` (accepted for
 compatibility: the required control-core install already fails the command).
 
 Some steps only take effect at boot (the ZED Box driver, a Jetson power mode
@@ -272,6 +277,18 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.set_defaults(func=run)
 
 
+# The step whose failure must block a restart onto new code: without a working
+# realtime core the robot cannot be driven at all. Every other step adds an
+# optional feature (Lighthouse tracking, the patched camera plugins, ...).
+_RT_STEP = "axol-rt realtime core (rt.install)"
+REQUIRED_STEPS = frozenset({_RT_STEP})
+# Exit code when every failed step was optional (the hosted installer then
+# finishes with a warning). A provision spawned by `axol serve` exits 0
+# instead; either way the last line starts with OPTIONAL_FAILURE_PREFIX.
+OPTIONAL_STEPS_FAILED_EXIT = 3
+OPTIONAL_FAILURE_PREFIX = "Optional provisioning steps failed: "
+
+
 def _step(label: str, fn: Callable[[], object]) -> bool:
     """Run one step and report failure without preventing later repairs."""
     try:
@@ -449,7 +466,7 @@ def _run_locked() -> None:
     # at the installed package's exact ref (tool installs). Like every other
     # step it is reported rather than aborting the run, and any failure makes
     # the command exit non-zero below.
-    step("axol-rt realtime core (rt.install)", rt_install.run)
+    step(_RT_STEP, rt_install.run)
     # Last, so the Argus daemon and CAN interfaces the earlier steps may have
     # (re)installed exist, and so this run leaves the host tuned now rather
     # than at its next boot. The same step is the unit's per-boot hook.
@@ -481,9 +498,26 @@ def _run_locked() -> None:
             if reboot.pending()
             else ""
         )
-        raise SystemExit(
-            "Provisioning failed for: "
+        if any(label in REQUIRED_STEPS for label in failed):
+            raise SystemExit(
+                "Provisioning failed for: "
+                + ", ".join(failed)
+                + ". See the log above, repair the host, and retry."
+                + pending
+            )
+        # Only optional features are missing: say so on the last line, which
+        # the self-updater surfaces as a warning.
+        print(
+            OPTIONAL_FAILURE_PREFIX
             + ", ".join(failed)
-            + ". See the log above, repair the host, and retry."
-            + pending
+            + ". Axol runs without them; see the log above, repair the host, "
+            "and re-run `sudo axol provision`." + pending,
+            file=sys.stderr,
+            flush=True,
         )
+        # Every released self-updater treats any non-zero exit as a failed
+        # update and stays on the old code, retry after retry, over a step
+        # that may never build on this host. Inside serve, report and succeed.
+        if spawned_by_serve():
+            return
+        raise SystemExit(OPTIONAL_STEPS_FAILED_EXIT)

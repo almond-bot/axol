@@ -21,6 +21,7 @@ from almond_axol.robot import __all__ as robot_exports
 from almond_axol.robot import axol as axol_module
 from almond_axol.robot import mantis as mantis_module
 from almond_axol.robot.axol import AxolHardware
+from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.robot.mantis import MantisHardware
 from almond_axol.rt import Axol as RtModuleAxol
 from almond_axol.rt import Mantis as RtModuleMantis
@@ -304,9 +305,37 @@ class AxolEnableRollbackBeforeCoreTest(unittest.IsolatedAsyncioTestCase):
         bus = self.hardware._left_bus
         bus._state = "closed"  # used earlier in this process, then closed
         self.assertFalse(bus.never_opened)
-        with patch.object(self.hardware, "disable", AsyncMock()) as disable:
+        self.robot._link._proc = None
+        calls: list[str] = []
+        with (
+            patch.object(
+                self.hardware,
+                "connect",
+                AsyncMock(side_effect=lambda **_: calls.append("connect")),
+            ) as connect,
+            patch.object(
+                self.hardware,
+                "disable",
+                AsyncMock(side_effect=lambda: calls.append("disable")),
+            ),
+        ):
             await self.robot.disable()
-        disable.assert_awaited_once()
+        # A rolled-back enable() closed the bus: the torque-off reopens it
+        # first, or every disable frame fails and teardown locks the robot.
+        self.assertEqual(calls, ["connect", "disable"])
+        connect.assert_awaited_once_with(purge_stale=False)
+
+    async def test_closed_bus_is_not_reopened_under_a_live_core(self) -> None:
+        self.hardware._left_bus._state = "closed"
+        self.robot._link._proc = MagicMock(poll=MagicMock(return_value=None))
+        with (
+            patch.object(self.hardware, "connect", AsyncMock()) as connect,
+            patch.object(self.hardware, "disable", AsyncMock()) as disable,
+        ):
+            with self.assertRaisesRegex(HardwareCleanupError, "still running"):
+                await self.robot.disable()
+        connect.assert_not_awaited()
+        disable.assert_not_awaited()
 
 
 class _BringUpFailed(Exception):
@@ -347,6 +376,28 @@ class AxolEnableRollbackKeepsHeldJointsTest(unittest.IsolatedAsyncioTestCase):
             joint: self.enterContext(patch.object(motor, "disable", AsyncMock()))
             for joint, motor in self.arm.motors.items()
         }
+        # The enable-time firmware-gain provisioning talks to the motors over
+        # the (mocked) bus like the other bring-up writes stubbed below.
+        self.enterContext(
+            patch(
+                "almond_axol.motor.myactuator.MyActuatorMotor.ensure_rom_gains",
+                AsyncMock(return_value={}),
+            )
+        )
+        self.enterContext(
+            patch(
+                "almond_axol.motor.damiao.DamiaoMotor.ensure_rom_gains",
+                AsyncMock(return_value={}),
+            )
+        )
+        # ... and so does the held-joint check that precedes it (reads only).
+        for cls in ("myactuator.MyActuatorMotor", "damiao.DamiaoMotor"):
+            self.enterContext(
+                patch(
+                    f"almond_axol.motor.{cls}.firmware_gain_mismatches",
+                    AsyncMock(return_value={}),
+                )
+            )
 
     def _assert_only_cold_joints_torqued_off(self) -> None:
         for joint, disable in self.disables.items():

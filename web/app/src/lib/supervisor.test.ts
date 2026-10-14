@@ -27,12 +27,16 @@ import {
   saveLocalHardwareProfile,
   saveOpSettings,
   serverHttpBase,
+  settingShown,
+  visibleAdvancedSections,
+  type AdvancedSection,
   type CameraSpec,
   type CommandSpec,
   type DatasetEpisode,
   type OperationId,
   type SchemaField,
   type SchemaNode,
+  type SettingsCategory,
 } from "./supervisor"
 
 const required: SchemaField = {
@@ -215,6 +219,36 @@ describe("supervisor pure helpers", () => {
     expect(defaultString(optional)).toBe("false")
   })
 
+  it("attaches the host's widget hints to per-run fields", () => {
+    const speed: SchemaField = {
+      kind: "field",
+      key: "speed_scale",
+      label: "Speed scale",
+      type: "number",
+      default: 1,
+      required: false,
+    }
+    const slider = { widget: "slider" as const, min: 0.1, max: 1, step: 0.05 }
+    const command = {
+      id: "waypoints",
+      label: "Waypoints",
+      description: "",
+      simCapable: true,
+      requiresHardware: false,
+      available: true,
+      error: null,
+      schema: [speed, optional],
+      required: [],
+      cli: "waypoints",
+      category: "Operate",
+      isOperation: true,
+      perRunFields: ["speed_scale", "sim"],
+      fieldUi: { speed_scale: slider },
+    } satisfies CommandSpec
+    const [meta] = operationsFromCommands([command])
+    expect(perRunFields(command, meta)).toEqual([{ ...speed, ui: slider }, optional])
+  })
+
   it("round-trips per-operation settings and drops the stale device flag", () => {
     const op = "teleop" as OperationId
     expect(loadOpSettings(op)).toEqual({})
@@ -257,5 +291,66 @@ describe("dataset preview sources", () => {
     const full = episodeVideoSource("org/ds", episode, "observation.images.left_arm", 60, 0)
     expect(new URL(full.url, "http://host").searchParams.get("fps")).toBe("60")
     expect(full.span).toEqual({ from: 0, to: 2 })
+  })
+})
+
+describe("showWhen gates", () => {
+  const parcelOnly = { key: "axol.gripper", equals: "parcel" }
+  const schema: SettingsCategory[] = [
+    {
+      key: "robot",
+      label: "Robot",
+      description: "",
+      settings: [
+        {
+          key: "axol.gripper",
+          label: "Gripper",
+          type: "select",
+          help: "",
+          options: ["parallel", "parcel"],
+          default: "parallel",
+          ui: {},
+          targets: {},
+        },
+      ],
+    },
+  ]
+  const advanced: AdvancedSection[] = [
+    {
+      key: "teleop",
+      label: "Teleop",
+      nodes: [
+        { ...optional, key: "teleop.frequency" },
+        { ...optional, key: "teleop.box_flush_deg", showWhen: parcelOnly },
+      ],
+    },
+  ]
+
+  it("reads the staged value, else the default", () => {
+    expect(settingShown(undefined, {}, schema)).toBe(true)
+    expect(settingShown(parcelOnly, {}, schema)).toBe(false)
+    expect(settingShown(parcelOnly, { "axol.gripper": "parcel" }, schema)).toBe(true)
+  })
+
+  it("reads a reset (null) value as the default", () => {
+    const parcelDefault: SettingsCategory[] = [
+      {
+        ...schema[0],
+        settings: [{ ...schema[0].settings[0], default: "parcel" }],
+      },
+    ]
+    const reset = { "axol.gripper": null } as unknown as Record<string, string>
+    expect(settingShown(parcelOnly, reset, parcelDefault)).toBe(true)
+    expect(settingShown(parcelOnly, reset, schema)).toBe(false)
+  })
+
+  it("prunes gated Advanced fields", () => {
+    const keys = (sections: AdvancedSection[]) =>
+      sections.flatMap((s) => flattenFields(s.nodes)).map((f) => f.key)
+    expect(keys(visibleAdvancedSections(advanced, {}, schema))).toEqual(["teleop.frequency"])
+    expect(keys(visibleAdvancedSections(advanced, { "axol.gripper": "parcel" }, schema))).toEqual([
+      "teleop.frequency",
+      "teleop.box_flush_deg",
+    ])
   })
 })

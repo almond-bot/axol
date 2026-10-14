@@ -1,21 +1,23 @@
 """
 axol zed.driver
 
-Upgrades a ZED Box's factory-flashed GMSL capture driver to the pinned
-known-good release for its carrier board. Stereolabs ships one driver package
-per carrier (``stereolabs-zedbox-duo`` for the ZED Box Duo, ``stereolabs-
-zedbox-mini`` for the ZED Box Mini, ...), and units leave the factory with
-whichever version was current when they were flashed. The ZED SDK is tightly
+Upgrades a GMSL capture driver to the pinned known-good release for its
+carrier board. Stereolabs ships one driver package per carrier
+(``stereolabs-zedbox-duo`` for the ZED Box Duo, ``stereolabs-zedbox-mini`` for
+the ZED Box Mini, ``stereolabs-zedlink-duo`` for a ZED Link Duo capture card
+on a Jetson AGX Orin, ...). ZED Boxes leave the factory with whichever version
+was current when they were flashed; an AGX gets its driver from the tools
+repo's ``agx-flashing/setup.sh``. The ZED SDK is tightly
 coupled to that driver: SDK 5.3+ needs driver >= 1.4.2, and Stereolabs pairs
 SDK 5.4.1 with driver 1.4.3. Running a newer SDK on an older ``ZEDX_Daemon``
 is not a benign mismatch -- the daemon restarts ``nvargus-daemon`` underneath
 a live capture, which kills the video relay mid-session.
 
 Gated hard on the target hardware: it only acts on a host where one of the
-pinned ``stereolabs-zed*`` packages is already installed (i.e. a factory-
-flashed ZED Box) *and* the running L4T release matches the one the pinned
-.deb was built for -- so it is a quiet no-op on any other machine and can
-never downgrade a newer driver (``dpkg --compare-versions`` guards that). A
+pinned ``stereolabs-zed*`` packages is already installed (a ZED Box, or an
+AGX with a ZED Link card) *and* the running L4T release matches the one that
+variant's pinned .deb was built for -- so it is a quiet no-op on any other
+machine and can never downgrade a newer driver (``dpkg --compare-versions`` guards that). A
 ``stereolabs-zed*`` package we have no pin for is reported loudly rather than
 ignored, because "no pin" means the SDK/driver pairing on that box is
 unmanaged.
@@ -38,6 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ...utils import reboot
+from ...utils.packages import run_package_manager
 from ...utils.state_files import (
     secure_atomic_copy_file,
     secure_ensure_directory,
@@ -53,6 +56,10 @@ class _Variant:
 
     package: str
     carrier: str
+    # The L4T release and major revision the .deb was built for, e.g.
+    # ("36", "4") for L4T 36.4.x. Installing it on any other L4T would leave
+    # the cameras dead, so the upgrade is skipped (with a warning) there.
+    l4t: tuple[str, str]
     target_version: str
     deb_version: str
     url: str
@@ -70,8 +77,10 @@ class _Variant:
 
 
 _DRIVER_BASE_URL = "https://download.stereolabs.com/drivers/zedx"
-# Every pin below is the 1.4.3 release Stereolabs pairs with ZED SDK 5.4.1,
-# built for L4T 36.4 (JetPack 6.x). Bump a variant's four fields together.
+# The ZED Box pins are the 1.4.3 release Stereolabs pairs with ZED SDK 5.4.1,
+# built for L4T 36.4 (JetPack 6.x). The ZED Link Duo pin is the 1.4.4 release
+# for ZED SDK 5.5 on L4T 39.2 (JetPack 7.2, the AGX Orin). Bump a variant's
+# l4t, version, URL and digest together.
 #
 # Stereolabs republishes a release in place without bumping its version: both
 # 1.4.3 debs were re-uploaded on 2026-09-18 (same Package/Version, new bytes),
@@ -82,6 +91,7 @@ _VARIANTS: tuple[_Variant, ...] = (
     _Variant(
         package="stereolabs-zedbox-duo",
         carrier="ZED Box Duo",
+        l4t=("36", "4"),
         target_version="1.4.3",
         deb_version="1.4.3-LI-MAX96712-ZEDBOX-L4T36.4.0",
         url=(
@@ -93,6 +103,7 @@ _VARIANTS: tuple[_Variant, ...] = (
     _Variant(
         package="stereolabs-zedbox-mini",
         carrier="ZED Box Mini",
+        l4t=("36", "4"),
         target_version="1.4.3",
         deb_version="1.4.3-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0",
         url=(
@@ -101,6 +112,18 @@ _VARIANTS: tuple[_Variant, ...] = (
         ),
         sha256="51b9b5ac726795ea1968b0945d8136d9c1be50637c53f156e2f969cedf311cf3",
     ),
+    _Variant(
+        package="stereolabs-zedlink-duo",
+        carrier="ZED Link Duo",
+        l4t=("39", "2"),
+        target_version="1.4.4",
+        deb_version="1.4.4-LI-MAX96712-L4T39.2.0",
+        url=(
+            f"{_DRIVER_BASE_URL}/1.4.4/R39.2/"
+            "stereolabs-zedlink-duo_1.4.4-LI-MAX96712-L4T39.2.0_arm64.deb"
+        ),
+        sha256="8b4ef7c6103beea5fc4161fb7b109c39f9823ec9c67a9549df8bbbbfd0577c02",
+    ),
 )
 _VARIANTS_BY_PACKAGE = {variant.package: variant for variant in _VARIANTS}
 _VARIANTS_BY_DEB_NAME = {variant.deb_name: variant for variant in _VARIANTS}
@@ -108,12 +131,6 @@ _VARIANTS_BY_DEB_NAME = {variant.deb_name: variant for variant in _VARIANTS}
 _MANAGED_PACKAGE_GLOB = "stereolabs-zed*"
 _DEB_ARCHITECTURE = "arm64"
 _DEB_MAX_BYTES = 16 * 1024 * 1024
-# The pinned .debs are built against L4T 36.4.x (JetPack 6.x). Installing them
-# on any other L4T would leave the cameras dead, so the upgrade is skipped
-# (with a warning) when the running release differs — bump the variant table
-# together with this when moving to a new L4T.
-_L4T_RELEASE = "36"
-_L4T_REVISION_MAJOR = "4"
 _L4T_RELEASE_FILE = Path("/etc/nv_tegra_release")
 # Persistent cache (like zed.install's wheel cache) so a failed install can be
 # recovered by re-running — or by the manual `dpkg -i` the failure prints —
@@ -155,8 +172,8 @@ def _installed_driver_packages() -> dict[str, str]:
     return installed
 
 
-def _l4t_matches() -> bool:
-    """True when the running L4T release matches the pinned .debs' target."""
+def _l4t_matches(variant: _Variant) -> bool:
+    """True when the running L4T release matches ``variant``'s pinned .deb."""
     try:
         first_line = _L4T_RELEASE_FILE.read_text().splitlines()[0]
     except (OSError, IndexError):
@@ -165,7 +182,7 @@ def _l4t_matches() -> bool:
     match = re.search(r"R(\d+)\s*\(release\),\s*REVISION:\s*(\d+)", first_line)
     if match is None:
         return False
-    return match.group(1) == _L4T_RELEASE and match.group(2) == _L4T_REVISION_MAJOR
+    return (match.group(1), match.group(2)) == variant.l4t
 
 
 def _is_older(installed: str, target: str) -> bool:
@@ -320,10 +337,10 @@ def _upgrade(variant: _Variant) -> None:
     # rather than upgrading in place; best-effort since a half-removed
     # package still gets replaced by the install below.
     print(f"Removing the factory {variant.package} package (requires sudo)...")
-    run_root(["dpkg", "-r", variant.package])
+    run_package_manager(["dpkg", "-r", variant.package])
     print(f"Installing {deb.name}...")
     try:
-        run_root(["dpkg", "-i", str(deb)], check=True)
+        run_package_manager(["dpkg", "-i", str(deb)], check=True)
     except RuntimeError:
         # The factory package is already removed at this point, so don't fail
         # silently: tell the operator exactly how to finish the install by
@@ -342,11 +359,11 @@ def _ensure_variant(variant: _Variant, installed: str) -> bool:
     if not _is_older(installed, variant.target_version):
         print(f"{variant.package} {installed} already >= {variant.target_version}.")
         return False
-    if not _l4t_matches():
+    if not _l4t_matches(variant):
         print(
             f"WARNING: {variant.package} {installed} is outdated, but the pinned "
-            f"{variant.target_version} driver targets L4T {_L4T_RELEASE}."
-            f"{_L4T_REVISION_MAJOR} and this host runs a different release — "
+            f"{variant.target_version} driver targets L4T {'.'.join(variant.l4t)} "
+            "and this host runs a different release — "
             "skipping. Update the pin in almond_axol/cli/zed/driver.py.",
             file=sys.stderr,
         )
@@ -367,12 +384,13 @@ def _ensure_variant(variant: _Variant, installed: str) -> bool:
 
 
 def ensure_driver() -> bool:
-    """Upgrade the ZED Box camera driver when the installed one is outdated.
+    """Upgrade the GMSL camera driver when the installed one is outdated.
 
-    Covers every pinned carrier variant (ZED Box Duo, ZED Box Mini). Returns
+    Covers every pinned carrier variant (ZED Box Duo, ZED Box Mini, ZED Link
+    Duo). Returns
     True when a driver was upgraded (a reboot is then required for it to
     load), False when there was nothing to do. Idempotent and self-gating (a
-    no-op on anything that isn't a ZED Box on the pinned L4T), so it is safe
+    no-op on anything without a pinned driver on its L4T), so it is safe
     to run from ``axol provision`` on every host. An installed Stereolabs
     driver package without a pin is reported on stderr: that box's SDK/driver
     pairing is unmanaged, which is exactly the state that lets a newer SDK
@@ -405,14 +423,15 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     subparsers.add_parser(
         "zed.driver",
         help=(
-            "Upgrade the ZED Box camera driver (stereolabs-zedbox-duo / "
-            "stereolabs-zedbox-mini) to the pinned release."
+            "Upgrade the GMSL camera driver (stereolabs-zedbox-duo / "
+            "stereolabs-zedbox-mini / stereolabs-zedlink-duo) to the pinned "
+            "release."
         ),
     ).set_defaults(func=run)
 
 
 def run(_args: object = None) -> None:
-    """Ensure the pinned ZED Box camera driver is installed."""
+    """Ensure the pinned GMSL camera driver is installed."""
     try:
         upgraded = ensure_driver()
     except Exception as exc:  # noqa: BLE001 - network/dpkg failures land here
@@ -420,8 +439,8 @@ def run(_args: object = None) -> None:
         sys.exit(1)
     if not upgraded and not _installed_driver_packages():
         print(
-            "No stereolabs-zed* driver package is installed — not a "
-            "factory-flashed ZED Box; nothing to do."
+            "No stereolabs-zed* driver package is installed — not a ZED Box "
+            "or ZED Link host; nothing to do."
         )
 
 

@@ -31,6 +31,8 @@ The back of the robot exposes the connectors used for power and camera control:
 - **1× XT90 connector** for power (**24V DC, 60A peak**).
 - **1× Locking USB-C connector** for control.
 
+Two grippers are supported: the stock two-finger **parallel** gripper and the hinged-plate **parcel** gripper used by [box mode](/guides/vr-interface#box-mode). Tell the software which one is fitted with the control panel's **Robot → Gripper** setting or `--axol.gripper parallel|parcel` ([`AxolConfig.gripper`](/api/robot)); the gripper's stroke is calibrated against its end stops on every cold enable.
+
 ### Reference diagrams
 
 - [Mounting holes](https://www.almond.bot/resources/axol_mounting_holes.pdf) (PDF)

@@ -165,6 +165,7 @@ class RunPolicySafetyTest(unittest.TestCase):
             cfg.exec_max_vel = 1.0
             cfg.exec_max_accel = 1.0
             cfg.policy_torque_threshold = 5.0
+            cfg.max_first_action_offset_rad = 0.15
 
             dataset = mock.Mock()
             robot = mock.Mock(
@@ -174,7 +175,9 @@ class RunPolicySafetyTest(unittest.TestCase):
             )
             reset_controller = mock.Mock()
             reset_controller.return_to_rest.return_value = True
-            client = mock.Mock(fatal_error=None, contact_tripped=None)
+            client = mock.Mock(
+                fatal_error=None, contact_tripped=None, start_rejected=None
+            )
             client.start.return_value = True
             publisher = mock.Mock()
             control = mock.Mock()

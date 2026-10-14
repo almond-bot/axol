@@ -34,6 +34,7 @@ import subprocess
 import sys
 
 from ...utils.jetson import _is_jetson
+from ...utils.packages import failure_detail, run_package_manager
 from ...utils.sudo import prime_sudo
 
 _logger = logging.getLogger(__name__)
@@ -169,9 +170,7 @@ def _apt_install() -> bool:
     if apt is None:
         _logger.info("apt-get not found; skipping system GStreamer install")
         return False
-    if os.geteuid() == 0:
-        prefix: list[str] = []
-    else:
+    if os.geteuid() != 0:
         # Prime sudo once (a tty prompt when run interactively); the hosted
         # installer runs this as root, so escalation is a no-op there.
         prime_sudo()
@@ -182,9 +181,14 @@ def _apt_install() -> bool:
                 " ".join(_APT_PACKAGES),
             )
             return False
-        prefix = ["sudo", "-n"]
-    _run([*prefix, apt, "update"])
-    return _run([*prefix, apt, "install", "-y", *_APT_PACKAGES])
+    run_package_manager([apt, "update"])
+    installed = run_package_manager([apt, "install", "-y", *_APT_PACKAGES])
+    if installed.returncode != 0:
+        _logger.warning(
+            "command failed (apt-get install): %s", failure_detail(installed)
+        )
+        return False
+    return True
 
 
 def _pip_install_pygobject() -> bool:

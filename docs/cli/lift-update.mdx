@@ -1,0 +1,30 @@
+---
+title: "lift.update"
+description: "Update the lift controller's firmware over CAN."
+---
+
+Installs a new jelly_legs firmware build on the lift controller over its CAN bus — no USB cable or opening the chest.
+
+```bash
+axol lift.update                                  # show the running firmware
+axol lift.update --firmware build/firmware.bin    # install a build
+axol lift.update --firmware firmware.bin --force  # reinstall the same build
+```
+
+Use the build's `firmware.bin` (not the `.uf2` or `.elf`). The update takes about a minute:
+
+1. The image streams into the board's spare flash partition while the current firmware keeps running. The board only accepts it once the whole image has arrived, its checksum matches, and it is a Jelly Legs build — another board's firmware or a truncated file is rejected without touching anything.
+2. The board reboots into the new firmware **on trial**, with lift motion locked.
+3. Once the new firmware answers with the expected build, the command confirms it and it becomes permanent.
+
+If the new firmware is never confirmed — it crashes, hangs, loses power, or the command is stopped — the board returns to the previous firmware within 15 s. The lift's saved height and homing are kept across the update. Ctrl-C (or **Stop** in the control panel) during the transfer aborts it with nothing installed. If the board already runs that exact build, the command says so and does nothing unless you pass `--force`.
+
+The lift must be idle; the update waits up to 10 s for a move or a pending position save to finish, and that save needs the 24 V supply on.
+
+<Warning>
+  Requires lift firmware **0.9 or newer**, installed once over USB together with its A/B partition table (see the jelly_legs firmware README in the circuits-py repo). Boards on older firmware do not answer this command and must be updated over USB. Flashing the board over SWD afterwards erases the partition table, so it needs the USB install again before it can update over CAN.
+</Warning>
+
+<Note>
+  Also available in the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Helpers → Update lift firmware**: choose the `firmware.bin` on your computer, the dialog uploads and checks it (showing its version and build date), then **Run** installs it. Uses the lift bus pinned by [`can.setup`](/cli/can-setup) (`can_alm_axol_c`, or the shared wheel bus `can_alm_axol_b`); pass `--channel` to use a different interface.
+</Note>

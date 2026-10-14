@@ -34,6 +34,17 @@ new ZED Box camera driver, say) the updater *reboots the host* in place of the
 service restart, under the same idle gate, so the new driver is live when the
 panel reconnects. The startup heal does the same.
 
+Only a required provisioning failure (the ``axol-rt`` core) blocks the
+restart. A provision spawned by serve succeeds when just optional features
+(Lighthouse tracking, the patched camera plugins) failed, naming them on a
+final line that :meth:`SelfUpdater.status` reports as ``warning``.
+
+Both steps are bounded (``_UV_INSTALL_TIMEOUT_S``, ``_PROVISION_TIMEOUT_S``):
+a step that hangs ends the update in an error the panel can retry, rather
+than an "updating" state that refuses every retry until the service restarts.
+Their full output is appended to ``/var/log/almond-axol/<step>.log``, and a
+failing step's tail is echoed to the service log.
+
 The read-only ``git ls-remote --tags`` indicator is deliberately separate from
 the *destructive* reinstall: the reinstall rebuilds (and so prunes
 pyzed/PyGObject from) the env on every run, so it only runs when the operator
@@ -60,6 +71,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from importlib.metadata import PackageNotFoundError, distribution
@@ -91,6 +103,27 @@ _REMOTE_DEBOUNCE_S = 60.0
 # systemd's Restart=always uses this code like any other; chosen to make the
 # intentional self-restart recognizable in `journalctl`.
 _RESTART_EXIT_CODE = 0
+# Ceilings on the two update steps. A step that hangs (a network fetch, apt
+# waiting on another dpkg, a wedged build) must end the update in an error the
+# panel can retry: while the server reports "updating", Update is refused. The
+# provision ceiling clears its slowest legitimate step (a cold libsurvive
+# build, bounded at 30 min itself).
+_UV_INSTALL_TIMEOUT_S = 15 * 60.0
+_PROVISION_TIMEOUT_S = 35 * 60.0
+# Grace between SIGTERM and SIGKILL for a timed-out step's process group.
+_KILL_GRACE_S = 10.0
+# Each step's full output, appended per run, so a failed or stuck update can
+# be diagnosed after the fact. Falls back under the home directory when /var/log
+# is not writable.
+_LOG_DIR = Path("/var/log/almond-axol")
+_LOG_FALLBACK_DIR = Path.home() / ".almond" / "logs"
+_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+# Output lines echoed into the service log when a step fails or times out.
+_LOG_TAIL_LINES = 20
+# How `axol provision` starts the line naming optional steps that failed while
+# the run still succeeded (almond_axol.cli.provision.OPTIONAL_FAILURE_PREFIX;
+# not imported, which would pull every provisioning module into serve).
+_OPTIONAL_FAILURE_PREFIX = "Optional provisioning steps failed: "
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
@@ -201,6 +234,90 @@ def installed_version() -> str | None:
         return None
 
 
+def _step_log(name: str) -> Path:
+    """The append-only output log for one update step, rotated past a cap."""
+    for directory in (_LOG_DIR, _LOG_FALLBACK_DIR):
+        path = directory / f"{name}.log"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size > _LOG_ROTATE_BYTES:
+                path.replace(path.with_suffix(".log.1"))
+            with path.open("a"):
+                pass
+        except OSError:
+            continue
+        return path
+    raise OSError(f"no writable directory for the {name} log")
+
+
+def _tail(path: Path, offset: int) -> list[str]:
+    """Non-empty output lines a step wrote to ``path`` past ``offset``."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            text = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [line.rstrip() for line in text.splitlines() if line.strip()]
+
+
+async def _run_step(
+    command: list[str], *, name: str, timeout: float
+) -> tuple[int | None, list[str]]:
+    """Run one update step; ``(returncode, its non-empty output lines)``.
+
+    Output goes to ``<log dir>/<name>.log`` rather than a pipe: a daemon the
+    step starts can inherit a pipe and hold it open after the step exits,
+    which would leave a pipe reader waiting forever. Only process exit is
+    awaited. The step runs in its own session so that on ``timeout`` its
+    whole process group (cargo, git, ...) is terminated; the returncode is
+    then ``None``. Package-manager runs inside it are deliberately out of
+    reach (their own session and systemd scope, see :mod:`..utils.packages`):
+    a killed dpkg breaks every later install on the host. On failure the output's tail is echoed to the service log.
+    Raises ``OSError`` when the command cannot be started.
+    """
+    log = _step_log(name)
+    with log.open("ab") as out:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        out.write(f"\n=== {stamp} $ {' '.join(command)}\n".encode())
+        out.flush()
+        offset = out.tell()
+        _logger.info("self-update: running %s (output: %s)", name, log)
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=out,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+    returncode: int | None
+    try:
+        returncode = await asyncio.wait_for(proc.wait(), timeout)
+    except TimeoutError:
+        _logger.warning("self-update: %s timed out after %.0f s", name, timeout)
+        await _kill_group(proc)
+        returncode = None
+    lines = _tail(log, offset)
+    if returncode != 0:
+        for line in lines[-_LOG_TAIL_LINES:]:
+            _logger.warning("%s: %s", name, line)
+    return returncode, lines
+
+
+async def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """SIGTERM a step's process group, then SIGKILL it after a grace period."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), _KILL_GRACE_S)
+            return
+        except TimeoutError:
+            continue
+
+
 class SelfUpdater:
     """Read-only release indicator + explicit, user-initiated upgrade.
 
@@ -249,6 +366,9 @@ class SelfUpdater:
         # failing steps), so the UI points at the real culprit rather than a
         # generic message.
         self._provision_failure: str | None = None
+        # Optional provisioning steps the last successful run could not
+        # install (provision's final warning line), shown by the panel.
+        self._provision_warning: str | None = None
         # Why the pending restart must be a host reboot (a provision step that
         # only takes effect at boot); empty for a plain service restart.
         self._reboot_reasons: list[str] = []
@@ -278,6 +398,16 @@ class SelfUpdater:
     def enabled(self) -> bool:
         """Updatable only for release installs with uv available."""
         return self.release_install and shutil.which("uv") is not None
+
+    @property
+    def installing(self) -> bool:
+        """Whether the tag-pinned reinstall or an ``axol provision`` is running.
+
+        Both rewrite the host (the tool env, system packages) and must not be
+        cut short: the restart waits for them, and the panel's power actions
+        are refused meanwhile.
+        """
+        return self._env_lock.locked()
 
     def ensure_provisioned(self) -> None:
         """Run the once-per-process ``axol provision`` startup heal (see below)."""
@@ -325,6 +455,8 @@ class SelfUpdater:
             "state": self._state,
             "phase": self._phase,
             "error": self._error,
+            "warning": self._provision_warning,
+            "installing": self.installing,
         }
 
     def start(self) -> tuple[bool, str | None]:
@@ -458,26 +590,32 @@ class SelfUpdater:
             self._phase = "upgrading"
             async with self._env_lock:
                 try:
-                    proc = await asyncio.create_subprocess_exec(
-                        "uv",
-                        "tool",
-                        "install",
-                        "--python",
-                        _PYTHON_VERSION,
-                        "--force",
-                        requirement,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
+                    returncode, lines = await _run_step(
+                        [
+                            "uv",
+                            "tool",
+                            "install",
+                            "--python",
+                            _PYTHON_VERSION,
+                            "--force",
+                            requirement,
+                        ],
+                        name="uv-tool-install",
+                        timeout=_UV_INSTALL_TIMEOUT_S,
                     )
-                    out, _ = await proc.communicate()
                 except OSError as exc:
                     self._fail(f"could not run uv: {exc}")
                     return
-                if proc.returncode != 0:
-                    tail = out.decode("utf-8", "replace").strip().splitlines()
+                last = lines[-1] if lines else None
+                if returncode is None:
                     self._fail(
-                        f"uv tool install failed: {tail[-1] if tail else 'no output'}"
+                        f"uv tool install timed out after "
+                        f"{_UV_INSTALL_TIMEOUT_S / 60:.0f} min "
+                        f"(last output: {last or 'none'})"
                     )
+                    return
+                if returncode != 0:
+                    self._fail(f"uv tool install failed: {last or 'no output'}")
                     return
 
             # The reinstall rebuilt the env, so reprovision before restarting
@@ -561,6 +699,7 @@ class SelfUpdater:
         the tool env).
         """
         self._provision_failure = None
+        self._provision_warning = None
         axol = shutil.which("axol")
         if axol is None:
             _logger.warning("self-update: axol not on PATH; cannot provision")
@@ -572,26 +711,41 @@ class SelfUpdater:
             command.append("--require-rt")
         async with self._env_lock:
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
+                returncode, lines = await _run_step(
+                    command, name="axol-provision", timeout=_PROVISION_TIMEOUT_S
                 )
-                out, _ = await proc.communicate()
             except OSError as exc:
                 _logger.warning("self-update: could not run axol provisioning: %s", exc)
                 self._provision_failure = f"could not run axol: {exc}"
                 return False
-        if proc.returncode != 0:
-            tail = out.decode("utf-8", "replace").strip().splitlines()
+        last = lines[-1] if lines else None
+        if returncode is None:
+            self._provision_failure = (
+                f"timed out after {_PROVISION_TIMEOUT_S / 60:.0f} min "
+                f"(last output: {last or 'none'})"
+            )
+            return False
+        if returncode != 0:
             # `axol provision` ends with "Provisioning failed for: <steps>. ..."
-            self._provision_failure = tail[-1] if tail else f"exit {proc.returncode}"
+            self._provision_failure = last or f"exit {returncode}"
             _logger.warning(
                 "self-update: `axol provision` failed (%s): %s",
-                proc.returncode,
+                returncode,
                 self._provision_failure,
             )
             return False
+        # Optional features (Lighthouse tracking, the patched camera plugins)
+        # that failed to install do not block the update; surface them.
+        self._provision_warning = next(
+            (
+                line
+                for line in reversed(lines)
+                if line.startswith(_OPTIONAL_FAILURE_PREFIX)
+            ),
+            None,
+        )
+        if self._provision_warning is not None:
+            _logger.warning("self-update: %s", self._provision_warning)
         suffix = " (axol-rt verified)" if require_rt else ""
         _logger.info("self-update: provisioning complete%s", suffix)
         return True
@@ -599,6 +753,12 @@ class SelfUpdater:
     def _maybe_restart(self) -> None:
         if not self._is_idle():
             _logger.info("self-update: server busy; restart deferred")
+            return
+        if self.installing:
+            # Exiting would take the provision's children down with the
+            # service (a package-manager run itself survives; see
+            # utils.packages). The next status poll retries.
+            _logger.info("self-update: provisioning in progress; restart deferred")
             return
         if self._reboot_reasons:
             self._restart_pending = False

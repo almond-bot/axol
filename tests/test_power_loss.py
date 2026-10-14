@@ -519,6 +519,28 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    async def test_host_power_waits_for_an_install_in_progress(self) -> None:
+        # Power cut mid-apt leaves dpkg half-configured: every later install
+        # on the host fails until `dpkg --configure -a`.
+        robot = _LockedOutLink([_motor("SHOULDER_1", reachable=False, status=None)])
+        runner = self._locked_out_runner(robot)
+        shutdown = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        client, updater = await self._client_and_updater(runner, robot)
+        updater.installing = True
+        async with client:
+            with (
+                patch.object(app_module.os, "geteuid", return_value=0),
+                patch.object(
+                    app_module.subprocess, "run", return_value=shutdown
+                ) as run,
+            ):
+                response = await client.post("/api/host/restart")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("installing", response.json()["error"])
+        run.assert_not_called()
+
     async def test_host_reads_idle_while_the_lockout_holds(self) -> None:
         # The panel disables the Restart / Shutdown confirmation on
         # ``update.idle``. The lockout reserves the robot, not the host, and

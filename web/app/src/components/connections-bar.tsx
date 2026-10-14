@@ -223,6 +223,7 @@ export function ConnectionsBar({
   onOpenSetup,
   onHostDisconnect,
   opRunning = false,
+  hostInstalling = false,
   robot,
   robotBusy,
   canProfiles,
@@ -251,6 +252,9 @@ export function ConnectionsBar({
   /** An operation or session is in flight — the server would refuse a power
    *  action (409), so the confirm button is disabled with an explanation. */
   opRunning?: boolean
+  /** The host is reinstalling or provisioning (apt/dpkg); a power action now
+   *  could leave its package manager half-configured, so the server refuses. */
+  hostInstalling?: boolean
   robot: RobotStatus | null
   robotBusy: boolean
   /** Configured profiles whose CAN netdevs or exact persisted USB hub exist. */
@@ -612,10 +616,16 @@ export function ConnectionsBar({
                 {POWER_ACTIONS[powerOpen].body}
               </p>
             </div>
-            {opRunning && (
+            {opRunning ? (
               <p className="text-xs text-amber-200/70">
                 A run or operation is in flight — stop it first.
               </p>
+            ) : (
+              hostInstalling && (
+                <p className="text-xs text-amber-200/70">
+                  The robot is installing an update or system packages — wait for it to finish.
+                </p>
+              )
             )}
             <div className="flex items-center justify-end gap-2 pt-1">
               <Button variant="ghost" size="sm" onClick={() => setPowerOpen(null)}>
@@ -625,7 +635,7 @@ export function ConnectionsBar({
                 variant="destructive"
                 size="sm"
                 onClick={() => confirmPower(powerOpen)}
-                disabled={powerBusy || opRunning}
+                disabled={powerBusy || opRunning || hostInstalling}
               >
                 {powerBusy ? (
                   <Loader2 className="animate-spin" />

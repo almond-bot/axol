@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import queue
 import sys
 import threading
@@ -87,7 +88,9 @@ class WaypointsCmdConfig:
 
     Playback speed is Cartesian: ``speed`` is how fast the gripper travels
     along the straight line between waypoints and ``ang_speed`` how fast it
-    reorients, whichever is slower setting the pace. A waypoint that changes
+    reorients, whichever is slower setting the pace. ``speed_scale`` (the
+    control panel's slider) slows every move of the session — both of those,
+    plus the joint-space approach and the return to rest — by one factor. A waypoint that changes
     a gripper works it there over ``grip_time`` with the arms held still, and
     every waypoint then holds still for ``dwell``. Grip force is the gripper's
     configured ``torque_limit``, shared with every other operation.
@@ -119,6 +122,11 @@ class WaypointsCmdConfig:
     ang_speed: float = 1.2
     """Angular speed (rad/s) of the gripper's reorientation along a leg,
     scaled to match ``speed`` so neither usually dominates the pace."""
+    speed_scale: float = 1.0
+    """Speed override in (0, 1]: multiplies ``speed`` and ``ang_speed`` and
+    the approach/return moves, so 0.25 plays the whole path at a quarter of
+    its configured pace. Try a new path slowly, then work up to full speed;
+    it can only slow playback down, never exceed the configured speeds."""
     dwell: float = 0.5
     """Seconds to hold still at each waypoint after its grippers have moved."""
     grip_time: float = 0.75
@@ -723,9 +731,9 @@ class _Session:
                     solver,
                     self._q_start,
                     q_waypoints[0],
-                    speed=rest_cfg.reset_speed,
+                    speed=rest_cfg.reset_speed * cfg.speed_scale,
                     rate=cfg.rate_hz,
-                    min_duration=rest_cfg.reset_min_duration,
+                    min_duration=rest_cfg.reset_min_duration / cfg.speed_scale,
                 ),
                 self._grip_start,
                 grips[0],
@@ -749,8 +757,8 @@ class _Session:
                         solver,
                         legs[-1][0][-1],
                         q_waypoints[j],
-                        speed=cfg.speed,
-                        ang_speed=cfg.ang_speed,
+                        speed=cfg.speed * cfg.speed_scale,
+                        ang_speed=cfg.ang_speed * cfg.speed_scale,
                         rate=cfg.rate_hz,
                         plan_rate=cfg.plan_rate_hz,
                         tool_offset=self._tool_offset,
@@ -849,9 +857,9 @@ class _Session:
             solver,
             q_now,
             q_rest,
-            speed=rest_cfg.reset_speed,
+            speed=rest_cfg.reset_speed * self._cfg.speed_scale,
             rate=self._cfg.rate_hz,
-            min_duration=rest_cfg.reset_min_duration,
+            min_duration=rest_cfg.reset_min_duration / self._cfg.speed_scale,
         )
         # Not interruptible: this is the teardown that gets the arms home, and
         # abandoning it would leave them stiff halfway there.
@@ -909,6 +917,11 @@ def _run(
         stop_event = threading.Event()
     if not cfg.sim and cfg.left_channel is None and cfg.right_channel is None:
         raise ValueError("Both arms disabled — nothing to do.")
+    if not (math.isfinite(cfg.speed_scale) and 0.0 < cfg.speed_scale <= 1.0):
+        raise ValueError(
+            f"speed_scale must be in (0, 1], got {cfg.speed_scale!r}: it can "
+            "only slow playback down. Raise speed / ang_speed to go faster."
+        )
     if (cfg.play_only or cfg.sim) and len(WaypointSet.load(cfg.file)) < 2:
         raise ValueError(
             f"{cfg.file} holds fewer than two waypoints, so there is nothing to "

@@ -31,6 +31,7 @@ from ..tracker.ultimate import (
     ultimate_wifi_config_error,
     ultimate_wifi_config_state,
 )
+from ..utils.packages import failure_detail, run_package_manager
 from ..utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -328,12 +329,11 @@ def _install_system_packages() -> bool:
     print("Installing Linux hidapi libraries…", flush=True)
     # Refreshing package indexes is best-effort; apt may already have a usable
     # cache.  Installing only missing packages avoids upgrading working ones.
-    run_root([apt, "update"])
-    proc = run_root([apt, "install", "-y", *missing])
+    run_package_manager([apt, "update"])
+    proc = run_package_manager([apt, "install", "-y", *missing])
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout).strip().splitlines()
         print(
-            "HID library installation failed" + (f": {detail[-1]}" if detail else "."),
+            f"HID library installation failed: {failure_detail(proc)}",
             file=sys.stderr,
         )
         return False

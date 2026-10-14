@@ -86,6 +86,7 @@ class TeleopStartupRefusalTest(unittest.IsolatedAsyncioTestCase):
         teleop._parent_conn = None
         teleop._ik_process = None
         teleop._jelly = None
+        teleop._live = SimpleNamespace(announce=Mock(), apply=Mock())
         teleop._robot = SimpleNamespace(
             enable=AsyncMock(),
             disable=AsyncMock(),

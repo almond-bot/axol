@@ -96,6 +96,16 @@ export async function fetchTuningRecordings(): Promise<{ recordings: TuningRecor
  */
 export type TuningGains = Record<string, Record<string, Record<string, number>>>
 
-export async function fetchTuningGains(): Promise<{ gains: TuningGains }> {
+/**
+ * `side → joint → "mit" | "a4"`: the controller each joint is configured to
+ * run on (impedance frame, or the firmware position loop behind `wire_mode
+ * a4`). A tune.motion run can put more joints on `a4` with `--a4`.
+ */
+export type TuningWireModes = Record<string, Record<string, string>>
+
+export async function fetchTuningGains(): Promise<{
+  gains: TuningGains
+  wire_modes?: TuningWireModes
+}> {
   return json(await fetch(apiUrl("/api/tuning/gains")))
 }

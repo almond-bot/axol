@@ -44,3 +44,7 @@ For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extr
 - Python 3.13+ is required (`.python-version` pins `3.13`). The VM ships with 3.12; use `uv python install 3.13` if needed.
 - The `uv` package manager must be on PATH (`$HOME/.local/bin`).
 - Hardware-dependent commands (`can.setup`, `motor.*`, `gravity-comp`, `tune.*`, `zed.*`, `collect-data`, `collect-dagger`, `run-policy`) will fail without physical robot/CAN bus — this is expected.
+
+### Tuning a real robot (guiding an operator)
+
+When asked to diagnose or tune a robot's arms (oscillation, shake, calibration, "one arm still oscillates"), follow the playbook skill `axol-robot-tuning` — `.claude/skills/axol-robot-tuning/SKILL.md` and its `reference/` files. Claude Code loads it from `.claude/skills/`, Codex from `.agents/skills/` (a symlink to the same folder — edit the `.claude` copy); any other agent should read it before acting. It sets the safety rules (no firmware position loops, guards on, the operator runs anything that moves), and the tools it drives: `scripts/robot_report.py` (read-only intake), `scripts/can_trace.py record|summary` (is the command or the controller oscillating), `scripts/creep_motions.py` (test motions), `scripts/tuning_queue.py` (guarded, interleaved A/B runs with a verdict) and `scripts/ext_imu.py` (an IMU the operator mounts on their own end-effector when the robot has no wrist cameras).

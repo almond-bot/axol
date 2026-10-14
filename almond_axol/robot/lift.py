@@ -115,6 +115,11 @@ _OP_SET_RATE = 0x05
 _OP_JOG = 0x06
 _OP_GET_POWER = 0x08
 
+# HOME mode byte (firmware v0.9+; older firmware ignores it and always homes
+# each leg against its own stops).
+HOME_MODE_TOGETHER = 0
+HOME_MODE_INDEPENDENT = 1
+
 # Default jog speed in encoder counts/s (650 ≈ the firmware's full speed).
 JOG_SPEED = 650
 
@@ -161,6 +166,10 @@ class LiftStatus:
     vm_present: bool | None = None
     flash_interlock: bool | None = None
     save_pending: bool | None = None
+    # v0.9 driver-state bits 4-6. Older eight-byte frames leave them clear.
+    fw_trial: bool | None = None  # new firmware on trial, motion locked
+    fw_updating: bool | None = None  # CAN firmware update, motion locked
+    independent_homing: bool | None = None  # HOME mode 1 in progress
 
     @property
     def height_percent(self) -> float | None:
@@ -199,6 +208,11 @@ def decode_status(data: bytes) -> LiftStatus:
             bool(driver_state & 0x04) if driver_state is not None else None
         ),
         save_pending=(bool(driver_state & 0x08) if driver_state is not None else None),
+        fw_trial=(bool(driver_state & 0x10) if driver_state is not None else None),
+        fw_updating=(bool(driver_state & 0x20) if driver_state is not None else None),
+        independent_homing=(
+            bool(driver_state & 0x40) if driver_state is not None else None
+        ),
     )
 
 
@@ -568,15 +582,25 @@ class Lift:
     async def home(
         self,
         *,
+        independent: bool = False,
         before_send: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Start the firmware's two-ended homing sequence (takes ~1-2 min).
 
-        Both legs drive down to the bottom stop, then up to the top stop;
-        on success the firmware rebases the counters, sets soft limits, and
-        saves both to flash — so homing normally happens once ever, not per
-        boot. Watch :attr:`status` (``homing`` while running, then ``homed``)
-        for completion; any abort rolls back to the previous calibration.
+        The legs drive up to the top stop, then down to the bottom stop; on
+        success the firmware rebases the counters (bottom = 0), sets soft
+        limits, and saves both to flash — so homing normally happens once
+        ever, not per boot. Watch :attr:`status` (``homing`` while running,
+        then ``homed``) for completion; any abort rolls back to the previous
+        calibration.
+
+        By default the legs home **together**, for legs bolted to the robot:
+        they move as one and the first leg to reach a stop ends the phase for
+        both, so the frame is never racked (any height offset they started
+        with is kept). ``independent=True`` homes each leg against its own
+        stops, which levels loose legs that start at different heights —
+        only with the legs off the robot. Firmware before v0.9 ignores the
+        mode and always homes the legs independently.
         """
         # Never let HOME implicitly supersede a jog or another one-shot move.
         await self.stop_motion()
@@ -584,7 +608,8 @@ class Lift:
             await before_send()
         self._one_shot_active = True
         try:
-            await self._send_required(_OP_HOME)
+            mode = HOME_MODE_INDEPENDENT if independent else HOME_MODE_TOGETHER
+            await self._send_required(_OP_HOME, bytes([mode]))
         except BaseException:
             self._one_shot_active = False
             raise

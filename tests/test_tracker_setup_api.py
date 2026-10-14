@@ -857,7 +857,10 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
                     value = response.json()
                     self.assertEqual(value["left"]["key"], quest_key)
                     self.assertEqual(value["left"]["status"], "measured")
-                    self.assertEqual(value["right"]["status"], "missing")
+                    # Quest 3 Touch Plus ships a factory transform, so the side
+                    # without an override falls back to it (factory values
+                    # are not echoed as editable pos/quat).
+                    self.assertEqual(value["right"]["status"], "factory")
                     self.assertIsNone(value["right"]["pos"])
                     response = await client.get("/api/tracker/calibration/quest")
                     self.assertEqual(response.status_code, 200)
@@ -872,7 +875,7 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
                         },
                     )
                     self.assertEqual(response.status_code, 200, response.text)
-                    self.assertEqual(response.json()["left"]["status"], "missing")
+                    self.assertEqual(response.json()["left"]["status"], "factory")
                     self.assertIsNone(response.json()["left"]["pos"])
                     self.assertNotIn("left", json.loads(path.read_text()))
 

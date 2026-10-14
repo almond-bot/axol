@@ -46,12 +46,29 @@ CAN_CHEST = "can_alm_axol_c"
 # cron/systemd, so it must live outside the operator-writable state tree.
 CAN_BRINGUP_SCRIPT: Path = Path("/etc/almond-axol/can/startup.sh")
 
+# USB-resets the arm hub, then runs CAN_BRINGUP_SCRIPT. The hub's firmware
+# keeps up to 10 frames per channel through the driver's link-down reset and
+# transmits them on the next open (kernel: "Unexpected unused echo id"), so a
+# flap cannot purge frames queued behind a stalled bus; this is what the
+# purge runs instead. Written by `axol can.setup`, root-owned like the above.
+CAN_RESET_SCRIPT: Path = Path("/etc/almond-axol/can/reset_adapter.sh")
+
 # Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
 CAN_MANTIS_LEFT = "can_mantis_l"
 CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
+
+# Fields per joint slot in a realtime-core command tuple — what an
+# ``AxolArm`` command sink hands to ``almond_axol.rt`` and what one ``T``
+# target slot carries on the wire: ``(p_des, mode, kp, kd, t_ff, kd_host,
+# damp_w0, damp_q, j_eff, tau_cap)``. The gripper slot repurposes the first
+# three (target, max_speed, max_torque) and zero-pads the rest. Must match
+# ``TARGET_FIELDS`` in ``rust/axol-rt/src/serve.rs``; the core's config
+# handshake (``proto``, ``almond_axol.rt.link.CONFIG_PROTO``) rejects a
+# mismatch, so bump that together with any change here.
+RT_TARGET_FIELDS = 10
 
 # Cap on the park a flow plays while shutting down — rest pose, then zero —
 # before it torques the arms off. It has to cover the IK plan plus both legs:

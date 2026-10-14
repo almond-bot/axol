@@ -9,6 +9,9 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(root, "app/src"),
+      // CI runs the tests before any build, so the workspace package's
+      // dist/ entry points don't exist yet.
+      "@almond/axol-vr-client": path.resolve(root, "packages/axol-vr-client/src/index.ts"),
     },
   },
   define: {

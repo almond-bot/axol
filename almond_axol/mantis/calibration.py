@@ -83,30 +83,16 @@ CURRENT_TRANSFORM_ENTRY = "current"
 STALE_TRANSFORM_ENTRY = "stale"
 INVALID_TRANSFORM_ENTRY = "invalid"
 
-# Tracker reference-origin positions reported in the shared gripper/CAD frame
-# G, in millimetres. These are not tracker→TCP transforms by themselves: their
-# difference establishes how the two device datums move relative to the
-# otherwise unchanged Mantis mount geometry.
+# Where each tracker's reported origin sits on the standard Mantis mount, in
+# the gripper frame (the URDF ``*_gripper`` link: origin at the centre of the
+# gripper motor's mounting face, +x along the jaw travel, -z towards the
+# fingertips), in millimetres. From the rig CAD (2026-10): both Vive trackers
+# sit 47 mm behind the motor face (gripper +z) and above it (gripper -y), the
+# Ultimate's origin 11 mm higher than the Tracker 3.0's.
 VIVE_TRACKER_CAD_ORIGINS_MM: dict[str, tuple[float, float, float]] = {
-    "survive": (47.0, 0.0, 35.0),
-    "ultimate": (47.0, 0.0, 46.0),
+    "survive": (0.0, -35.0, 47.0),
+    "ultimate": (0.0, -46.0, 47.0),
 }
-_ULTIMATE_CAD_ORIGIN_DELTA_Z_M = (
-    VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"][2]
-    - VIVE_TRACKER_CAD_ORIGINS_MM["survive"][2]
-) / 1000.0
-# Let G be the shared gripper/CAD frame and T the bridge-reported tracker
-# frame. The stored translation is the TCP origin expressed in T. Moving the
-# tracker origin by delta_O in G therefore changes that translation by
-#
-#     delta_p_TG = -R_TG @ delta_O,
-#
-# where R_TG is the stored tracker→gripper rotation. The translation was
-# derived (and the Ultimate delta applied) under the mount-CAD convention in
-# which CAD +z maps to tracker -y, so negating the +11 mm origin shift
-# produces +11 mm on the Ultimate tracker-y TCP component. This is a mount-
-# frame derivation, not the bridge's z-up-world -> y-up-world basis relabel.
-_ULTIMATE_TRACKER_Y_TCP_DELTA_M = _ULTIMATE_CAD_ORIGIN_DELTA_Z_M
 
 # Tracker→gripper rotation for the flat-back Vive mounts (Tracker 3.0 and
 # Ultimate), as a unit quaternion ``[qx, qy, qz, qw]``: Ry(180°). Field
@@ -123,11 +109,15 @@ LEGACY_VIVE_TCP_ROTATION_QUAT: tuple[float, float, float, float] = (
     0.0,
     0.7071068,
 )
-# Identifier written to a Mantis dataset's ``meta/axol.json`` (as
-# ``mantis_tcp_transform.id``) when it was recorded with the factory
-# constants below. Datasets without that field predate it and were recorded
-# with :data:`LEGACY_VIVE_TCP_ROTATION_QUAT`.
-DESIGN_TCP_TRANSFORM_ID = "vive-flat-back-ry180-v0.2.5"
+# Identifier axol 0.2.5–0.2.16 wrote to a Mantis dataset's ``meta/axol.json``
+# (as ``mantis_tcp_transform.id``) for the factory Vive constants of that era:
+# the corrected Ry(180°) rotation with the retired ``[0, 0.0355, -0.092]``
+# (Tracker 3.0) / ``[0, 0.0465, -0.092]`` (Ultimate) translation, which put
+# the tracker 92 mm in front of the gripper instead of 47 mm behind it.
+# ``migrate-dataset --mantis-tcp-rotation`` still stamps it, since that
+# migration replaces only the rotation. Datasets without the field predate it
+# and were recorded with :data:`LEGACY_VIVE_TCP_ROTATION_QUAT`.
+LEGACY_DESIGN_TCP_TRANSFORM_ID = "vive-flat-back-ry180-v0.2.5"
 # Marker id for a run whose transforms came from a per-unit measurement (the
 # override file or an explicit CLI value) rather than the factory constants.
 MEASURED_TCP_TRANSFORM_ID = "measured"
@@ -138,33 +128,49 @@ UNCALIBRATED_TCP_TRANSFORM_ID = "uncalibrated"
 # example entering 47 instead of 0.047) before it can authorize collection.
 MAX_TCP_TRANSLATION_M = 1.0
 
-# Tracker→gripper transform candidates and approved factory values for the
-# Mantis rig's standard mounts are keyed by tracker backend
-# family — the part of a tracker key before the ":" (``"survive:T20"`` →
-# ``"survive"``). Only entries promoted into ``DESIGN_TCP_TRANSFORMS`` below
-# are factory values that apply out of the box; a per-unit measured entry in
-# the override file always wins over them.
-#
-# survive (Vive Tracker 3.0, standard mount): translation derived from the
-# rig CAD (2026-08-10) — tracker seated flat, stabilizing-pin recess toward
-# the jaws, gripper flange 92 mm forward / 35.5 mm below the tracker's
-# mounting plane, gripper pointing forward, jaw travel lateral. Expressed in
-# the bridge's tracker frame (libsurvive head frame with the z-up→y-up body
-# relabel).
-#
-# Rotation: Ry(180°) (:data:`VIVE_TCP_ROTATION_QUAT`). The flat-back mount
-# puts the tracker's +z (its LED face normal, which after the bridge's
-# relabel is the tracker's "up") along the gripper's -z (the finger
-# direction, see ``constants.GRIPPER_TIP_OFFSET``) and the tracker's +x along
-# the gripper's -x, with the shared y axis unchanged. The original CAD
-# derivation shipped Rx(+90°) here (axol <= 0.2.4), which is the mount-CAD
-# frame's convention rather than the bridge's device frame: every recorded
-# gripper orientation was pitched ~90° from where the operator held the rig,
-# so an operator holding the rig exactly like the robot's rest gripper
-# produced a dataset that Axol could not replay (field report, isolate-5,
-# 2026-09). Ry(180°) is the rotation that maps that same engage pose onto the
-# rest FK gripper frame; ``axol migrate-dataset --mantis-tcp-rotation``
-# repairs datasets recorded with the old constant.
+
+def _rotate(quat: tuple[float, ...], vector: tuple[float, ...]) -> list[float]:
+    """Rotate ``vector`` by the unit ``(x, y, z, w)`` quaternion ``quat``."""
+    qx, qy, qz, qw = quat
+    vx, vy, vz = vector
+    # t = 2 q_vec × v;  v' = v + w t + q_vec × t
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return [
+        vx + qw * tx + (qy * tz - qz * ty),
+        vy + qw * ty + (qz * tx - qx * tz),
+        vz + qw * tz + (qx * ty - qy * tx),
+    ]
+
+
+def _tcp_transform_from_mount(
+    tracker_origin_mm: tuple[float, float, float],
+    tracker_to_gripper_quat: tuple[float, float, float, float],
+) -> list[float]:
+    """Stored ``[x, y, z, qx, qy, qz, qw]`` for a tracker placed on the rig.
+
+    ``tracker_origin_mm`` is the tracker origin in the gripper frame (what the
+    mount CAD measures); the stored translation is the inverse: the gripper
+    origin in the tracker frame, ``-R_TG @ origin``.
+    """
+    # CAD quaternions arrive rounded; store the unit one validation would use.
+    norm = math.sqrt(sum(value * value for value in tracker_to_gripper_quat))
+    quat = tuple(value / norm for value in tracker_to_gripper_quat)
+    origin_m = tuple(value / 1000.0 for value in tracker_origin_mm)
+    position = [-value for value in _rotate(quat, origin_m)]
+    # Drop float noise (-0.0, 1e-18) so the constants read as designed.
+    return [round(value, 9) + 0.0 for value in position] + list(quat)
+
+
+# Tracker→gripper transforms for the Mantis rig's standard mounts. Vive
+# entries are keyed by tracker backend family — the part of a tracker key
+# before the ":" (``"survive:T20"`` → ``"survive"``); Quest entries by their
+# full ``quest:<WebXR profile>:<pose space>`` key, since controller
+# generations and WebXR pose spaces do not share a local frame. Only entries
+# promoted into ``DESIGN_TCP_TRANSFORMS`` below are factory values that apply
+# out of the box; a per-unit measured entry in the override file always wins
+# over them.
 #
 # Each entry is ``[x, y, z, qx, qy, qz, qw]``: the gripper TCP frame
 # expressed in that tracker's device-local frame as the bridge/headset
@@ -172,43 +178,66 @@ MAX_TCP_TRANSLATION_M = 1.0
 # gripper axes expressed in tracker coordinates (equivalently, it maps
 # gripper-coordinate vectors into tracker coordinates).
 #
-# TODO(mantis-calibration): bench-verify the translation ``[0, 0.0355,
-# -0.092]`` under the corrected rotation with the URDF overlay (it was
-# derived alongside the retired rotation, so its sign convention has not
-# been confirmed on hardware).
+# Vive (Tracker 3.0 and Ultimate, flat-back mount): the tracker sits flat on
+# top of the rig, behind the gripper motor (see
+# :data:`VIVE_TRACKER_CAD_ORIGINS_MM`). Rotation: Ry(180°)
+# (:data:`VIVE_TCP_ROTATION_QUAT`) — the bridge-reported tracker +z runs along
+# the gripper's -z (the finger direction, see ``constants.GRIPPER_TIP_OFFSET``)
+# and its +x along the gripper's -x, with the y axis shared. The original
+# derivation shipped Rx(+90°) here (axol <= 0.2.4): every recorded gripper
+# orientation was pitched ~90° from where the operator held the rig (field
+# report, isolate-5, 2026-09). Rx(180°), which also puts the fingers along
+# tracker +z, was ruled out on the same data: under it the tracker side of the
+# gripper tilted down in 95-100% of frames and every rig would have been held
+# with its jaw axis reversed (handle away from the operator).
 #
-# TODO(mantis-calibration): Measure the Quest 3 cradle transform empirically.
-# The headset client streams WebXR ``gripSpace`` (with ``targetRaySpace`` only
-# as a compatibility fallback on runtimes that omit gripSpace). Cradle CAD may
-# therefore supply a starting physical transform, but the WebXR grip datum is
-# still not a dimensioned shell origin. Seat the controller, run the URDF
-# overlay, iterate the per-unit ``quest`` pos/quat entry until the physical and
-# rendered gripper TCPs coincide, then promote the result here. Until then the
-# engage snapshot aligns only the starting pose; later recorded TCP poses stay
-# mount-dependent, so production collection rejects the missing transform.
-#
-# ultimate (Vive Ultimate Tracker, standard mount): starts from the Tracker 3.0
-# factory transform above. :data:`VIVE_TRACKER_CAD_ORIGINS_MM` records their
-# respective [47, 0, 35] mm and [47, 0, 46] mm reference origins. The common 47/0
-# coordinates cancel and establish delta_O = [0, 0, +11] mm in the shared
-# gripper/CAD frame. Under the mount-CAD convention the translation was
-# derived in, delta_p_TG = [0, +11, 0] mm. Applying that tracker-y delta to
-# the V3 transform's independently derived 35.5 mm component gives 46.5 mm;
-# the -92 mm forward offset and mount rotation are inherited. The two tracker
-# families use the same local axis directions and the same flat-back mounting
-# orientation, so Ultimate needs no additional rotation.
-_SURVIVE_DESIGN_TCP_TRANSFORM: list[float] = [
-    0.0,
-    0.0355,
-    -0.092,
-    *VIVE_TCP_ROTATION_QUAT,
-]
-_ULTIMATE_DESIGN_TCP_TRANSFORM: list[float] = [
-    0.0,
-    0.0355 + _ULTIMATE_TRACKER_Y_TCP_DELTA_M,
-    -0.092,
-    *VIVE_TCP_ROTATION_QUAT,
-]
+# Quest 3 (Touch Plus, WebXR grip space): the controller seated in the right
+# Quest cradle has its grip origin 62 mm behind and 45 mm above the motor
+# face, with the grip axes (x right, y up, z back when held tips-forward) at
+# Rz(180°) from the gripper axes plus a ~10° cradle tilt. From the rig CAD
+# (2026-10), given as the controller pose in the gripper frame and inverted
+# here. The left cradle and controller are mirror images of the right ones
+# across the gripper's y-z plane, while both WebXR grip frames keep +x to the
+# right; reflecting the right pose (x -> -x in both frames) gives the left:
+# the origin keeps x = 0 and the tilt's y/z quaternion components flip.
+_QUEST_3_GRIP_ORIGIN_MM = (0.0, -45.0, 62.0)
+_QUEST_3_RIGHT_GRIP_IN_GRIPPER_QUAT = (-0.066552, 0.053497, -0.996292, 0.010540)
+QUEST_3_TRACKER_KEY = "quest:meta-quest-touch-plus:grip"
+
+
+def _mirror_across_gripper_yz(
+    origin_mm: tuple[float, float, float],
+    quat: tuple[float, float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+    """The mirror-image mount's pose: ``M p`` and ``M R M`` for ``M = diag(-1, 1, 1)``."""
+    x, y, z = origin_mm
+    qx, qy, qz, qw = quat
+    return (-x + 0.0, y, z), (qx, -qy, -qz, qw)
+
+
+def _quest_tcp_transform(
+    origin_mm: tuple[float, float, float],
+    grip_in_gripper_quat: tuple[float, float, float, float],
+) -> list[float]:
+    qx, qy, qz, qw = grip_in_gripper_quat
+    # The inverse rotation: the conjugate of the grip-in-gripper quaternion.
+    return _tcp_transform_from_mount(origin_mm, (-qx, -qy, -qz, qw))
+
+
+_SURVIVE_DESIGN_TCP_TRANSFORM = _tcp_transform_from_mount(
+    VIVE_TRACKER_CAD_ORIGINS_MM["survive"], VIVE_TCP_ROTATION_QUAT
+)
+_ULTIMATE_DESIGN_TCP_TRANSFORM = _tcp_transform_from_mount(
+    VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], VIVE_TCP_ROTATION_QUAT
+)
+_QUEST_3_RIGHT_DESIGN_TCP_TRANSFORM = _quest_tcp_transform(
+    _QUEST_3_GRIP_ORIGIN_MM, _QUEST_3_RIGHT_GRIP_IN_GRIPPER_QUAT
+)
+_QUEST_3_LEFT_DESIGN_TCP_TRANSFORM = _quest_tcp_transform(
+    *_mirror_across_gripper_yz(
+        _QUEST_3_GRIP_ORIGIN_MM, _QUEST_3_RIGHT_GRIP_IN_GRIPPER_QUAT
+    )
+)
 DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": list(_SURVIVE_DESIGN_TCP_TRANSFORM),
@@ -218,10 +247,23 @@ DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
         "left": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
         "right": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
     },
+    QUEST_3_TRACKER_KEY: {
+        "left": list(_QUEST_3_LEFT_DESIGN_TCP_TRANSFORM),
+        "right": list(_QUEST_3_RIGHT_DESIGN_TCP_TRANSFORM),
+    },
+}
+# Identifier written to a Mantis dataset's ``meta/axol.json`` (as
+# ``mantis_tcp_transform.id``) when both sides were recorded with one family's
+# factory constants above. Bump an id whenever its constant changes, so a
+# dataset recorded under the old value refuses to resume under the new one.
+DESIGN_TCP_TRANSFORM_IDS: dict[str, str] = {
+    "survive": "vive3-flat-back-v0.2.17",
+    "ultimate": "vive-ultimate-flat-back-v0.2.17",
+    QUEST_3_TRACKER_KEY: "quest3-touch-plus-grip-v0.2.17",
 }
 
 # Unapproved CAD starting points may be exposed here without making them
-# usable for production collection. All currently known Vive transforms above
+# usable for production collection. All currently known transforms above
 # are approved factory constants, so there are no remaining candidates.
 CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {}
 
@@ -341,28 +383,35 @@ def tcp_transform_provenance(
 
     The result is written verbatim into the dataset's ``meta/axol.json`` so a
     later constant change can be undone by ``migrate-dataset`` without
-    guessing. ``id`` is :data:`DESIGN_TCP_TRANSFORM_ID` when both sides use
-    the current factory constants, :data:`MEASURED_TCP_TRANSFORM_ID` when
-    either side carries a per-unit value, and
-    :data:`UNCALIBRATED_TCP_TRANSFORM_ID` when a side has no transform at all
-    (``--mantis_allow_uncalibrated`` bring-up capture).
+    guessing. ``id`` is the matching :data:`DESIGN_TCP_TRANSFORM_IDS` entry
+    when both sides use a family's current factory constants (two ids joined
+    by ``+`` when the sides carry different families),
+    :data:`MEASURED_TCP_TRANSFORM_ID` when either side carries a per-unit
+    value, and :data:`UNCALIBRATED_TCP_TRANSFORM_ID` when a side has no
+    transform at all (``--mantis_allow_uncalibrated`` bring-up capture).
     """
     transforms = {"left": left, "right": right}
     if any(value is None for value in transforms.values()):
         transform_id = UNCALIBRATED_TCP_TRANSFORM_ID
     else:
-        is_design = all(
-            any(
-                same_tcp_transform(
-                    validate_tcp_transform(transforms[side]),
-                    validate_tcp_transform(family[side]),
-                )
-                for family in DESIGN_TCP_TRANSFORMS.values()
+        side_ids = [
+            next(
+                (
+                    DESIGN_TCP_TRANSFORM_IDS[key]
+                    for key, family in DESIGN_TCP_TRANSFORMS.items()
+                    if same_tcp_transform(
+                        validate_tcp_transform(transforms[side]),
+                        validate_tcp_transform(family[side]),
+                    )
+                ),
+                None,
             )
             for side in ("left", "right")
-        )
+        ]
         transform_id = (
-            DESIGN_TCP_TRANSFORM_ID if is_design else MEASURED_TCP_TRANSFORM_ID
+            "+".join(dict.fromkeys(side_ids))
+            if None not in side_ids
+            else MEASURED_TCP_TRANSFORM_ID
         )
     return {
         "id": transform_id,
@@ -387,12 +436,13 @@ def has_conflicting_transform_override(
     transforms: Mapping[str, Mapping[str, object]],
     entry_statuses: Mapping[tuple[str, str], str] | None = None,
 ) -> bool:
-    """Whether saved state must suppress a hardware factory fallback.
+    """Whether saved state must suppress a factory fallback.
 
     An exact active-device entry is handled by the caller. Legacy, bare-family,
     and same-family entries for a different device may describe a non-standard
     mount, so silently replacing them after a rebind would be unsafe. Overrides
-    for another tracker family do not conflict.
+    for another tracker family do not conflict. For Quest, a bare ``quest``
+    entry or the same controller profile under another pose space conflicts.
     """
     saved_keys: set[str] = {
         key for key in transforms.get(side, {}) if isinstance(key, str)
@@ -406,6 +456,22 @@ def has_conflicting_transform_override(
     if LEGACY_TRACKER_KEY in saved_keys:
         return True
     family = tracker_key.split(":", 1)[0]
+    if family == "quest":
+        # A bare ``quest`` entry predates profile scoping and may describe a
+        # non-standard cradle; the same profile under another pose space is a
+        # measurement of this controller against a different datum. Either
+        # must suppress the Quest factory value. Other controller generations
+        # are different devices and do not conflict.
+        datum = parse_quest_tracker_key(tracker_key)
+        return "quest" in saved_keys or (
+            datum is not None
+            and any(
+                (saved := parse_quest_tracker_key(key)) is not None
+                and saved[0] == datum[0]
+                and key != tracker_key
+                for key in saved_keys
+            )
+        )
     if family not in {"survive", "ultimate"}:
         return False
     for saved_key in saved_keys:
@@ -438,15 +504,27 @@ def select_quest_transform_key(
 
     Multiple common profiles are deliberately ambiguous; callers need an
     explicit ``tracker_key`` in that case instead of guessing which connected
-    controller generation the operation will report.
+    controller generation the operation will report. A factory Quest profile
+    stands in only when no Quest entry is saved at all: a bare ``quest`` key
+    or a one-sided measurement may describe a non-standard cradle, so it
+    must fail closed rather than be silently replaced by the factory value.
     """
-    common = set(transforms.get("left", {})) & set(transforms.get("right", {}))
-    common.update(
-        key
-        for key, sides in DESIGN_TCP_TRANSFORMS.items()
-        if "left" in sides and "right" in sides
-    )
-    scoped = sorted(key for key in common if parse_quest_tracker_key(key) is not None)
+    saved = [set(transforms.get(side, {})) for side in ("left", "right")]
+    if any(
+        key == "quest" or key.startswith("quest:") for keys in saved for key in keys
+    ):
+        common = saved[0] & saved[1]
+        scoped = sorted(
+            key for key in common if parse_quest_tracker_key(key) is not None
+        )
+    else:
+        scoped = sorted(
+            key
+            for key, sides in DESIGN_TCP_TRANSFORMS.items()
+            if "left" in sides
+            and "right" in sides
+            and parse_quest_tracker_key(key) is not None
+        )
     return scoped[0] if len(scoped) == 1 else None
 
 

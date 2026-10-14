@@ -24,7 +24,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}engage_max_vel</F> | `0.628` | Joint speed cap (rad/s) right after engaging, so the first move is gentle. |
 | <F>--{prefix}engage_duration</F> | `1.0` | Seconds to ramp from `engage_max_vel` up to `teleop_max_vel`. |
 | <F>--{prefix}teleop_max_vel</F> | `6.283` | Maximum joint speed (rad/s) while tracking. |
-| <F>--{prefix}teleop_max_accel</F> | `21.99` | Maximum joint acceleration (rad/s²) while tracking. |
+| <F>--{prefix}teleop_max_accel</F> | `9.42` | Maximum joint acceleration (rad/s²) while tracking. |
 | <F>--{prefix}ik_alpha</F> | `0.3` | Smoothing on the IK output, `(0, 1]`. `1` is no smoothing; lower is smoother but adds lag. See [Latency tuning](/operations/teleop#latency-tuning). |
 | <F>--{prefix}pose_cutoff</F> | `2.5` | Low-pass cutoff (Hz) on raw controller poses before IK. Lower rejects more hand tremor but adds lag. |
 | <F>--{prefix}absolute_mode</F> | `false` | Mantis mapping: track controller poses 1:1 in a fixed world frame instead of relative to where you engaged. Forced `true` by `--mantis`. |

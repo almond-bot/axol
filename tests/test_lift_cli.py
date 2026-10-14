@@ -21,6 +21,8 @@ def _status(
     vm_present: bool | None = True,
     flash_interlock: bool | None = False,
     save_pending: bool | None = False,
+    fw_trial: bool | None = False,
+    fw_updating: bool | None = False,
 ) -> LiftStatus:
     return LiftStatus(
         position_permille=500,
@@ -39,6 +41,8 @@ def _status(
         vm_present=vm_present,
         flash_interlock=flash_interlock,
         save_pending=save_pending,
+        fw_trial=fw_trial,
+        fw_updating=fw_updating,
     )
 
 
@@ -79,6 +83,8 @@ class LiftCliPreflightTest(unittest.TestCase):
             (_status(vm_present=False), "24 V"),
             (_status(flash_interlock=True), "interlock"),
             (_status(save_pending=True), "save"),
+            (_status(fw_updating=True), "firmware update"),
+            (_status(fw_trial=True), "on trial"),
             (_status(moving=True), "already moving"),
             (_status(homed=False), "not homed"),
             (_status(driver_fault_mask=None), "current driver/interlock"),
@@ -239,7 +245,7 @@ class LiftCliCommandInterlockTest(unittest.IsolatedAsyncioTestCase):
             (
                 home,
                 "home",
-                SimpleNamespace(channel="can-test"),
+                SimpleNamespace(channel="can-test", independent=False),
                 _status(homed=False),
             ),
         ):
@@ -270,6 +276,32 @@ class LiftCliCommandInterlockTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertFalse(sent_motion)
                 lift.close.assert_awaited_once_with()
+
+
+class LiftCliHomeModeTest(unittest.TestCase):
+    def _parse(self, argv: list[str]):  # noqa: ANN202
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        home.add_parser(parser.add_subparsers())
+        return parser.parse_args(["lift.home", *argv])
+
+    def test_legs_home_together_by_default(self) -> None:
+        self.assertFalse(self._parse([]).independent)
+
+    def test_independent_flag(self) -> None:
+        self.assertTrue(self._parse(["--independent"]).independent)
+
+    def test_status_line_shows_mode_and_firmware_lockouts(self) -> None:
+        import dataclasses
+
+        st = dataclasses.replace(
+            _status(), homing=True, independent_homing=True, fw_trial=True
+        )
+        line = lift_cli.fmt_status(st)
+        self.assertIn("independent", line)
+        self.assertIn("FW_TRIAL", line)
+        self.assertNotIn("independent", lift_cli.fmt_status(_status()))
 
 
 if __name__ == "__main__":

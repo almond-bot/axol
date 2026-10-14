@@ -81,6 +81,7 @@ from ...constants import (
     CAN_LEFT,
     CAN_MANTIS_LEFT,
     CAN_MANTIS_RIGHT,
+    CAN_RESET_SCRIPT,
     CAN_RIGHT,
     Joint,
 )
@@ -1400,10 +1401,10 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> DualHubIdenti
         # a healthy first pass, but if either half is down recover the adapter
         # pair together before probing. Pair-wide ordering matters for this
         # dual-channel firmware: both channels go down before either comes up.
-        bring_up_interfaces(
-            ifaces,
-            force_cycle=reset or not all(iface_up(iface) for iface in ifaces),
-        )
+        if reset or not all(iface_up(iface) for iface in ifaces):
+            _recover_hub_pair(ifaces)
+        else:
+            bring_up_interfaces(ifaces, force_cycle=False)
     except RuntimeError:
         return "silent"
 
@@ -1429,7 +1430,7 @@ def _identify_dual_adapter(serial: str, *, reset: bool = False) -> DualHubIdenti
                 "    No identity response; recovering both CAN channels and retrying..."
             )
             try:
-                bring_up_interfaces(ifaces, force_cycle=True)
+                _recover_hub_pair(ifaces)
             except RuntimeError:
                 return "silent"
     return "silent"
@@ -1940,6 +1941,109 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
     print("  Done.")
 
 
+def _reset_script_text() -> str:
+    """The arm hub's USB reset: clears what a link flap cannot, then brings up.
+
+    ``gs_can_close()`` kills the host's in-flight URBs and sends the adapter a
+    mode reset, but the hub firmware keeps the frames it had already accepted
+    (up to ``GS_MAX_TX_URBS``, 10 per channel) and transmits them on the next
+    open: the kernel logs one "Unexpected unused echo id" per replayed frame.
+    Behind a stalled bus those are the session's last position commands, so a
+    flap only defers the jump to whatever brings the bus back. A USB port
+    reset re-enumerates the hub; the bring-up script then configures the
+    fresh interfaces. Only the arm hub is reset — the single-channel wheel
+    and chest adapters keep the plain flap the bring-up script gives them.
+    """
+    left, right = _AXOL_PROFILE.left, _AXOL_PROFILE.right
+    return (
+        f"#!/bin/bash\n"
+        f"# USB-reset the Almond Axol arm hub, then bring the CAN interfaces up.\n"
+        f"#\n"
+        f"# The hub firmware keeps frames it already accepted through a link\n"
+        f"# down/up and transmits them on the next open, so the purge after a\n"
+        f"# stalled bus resets the device instead of flapping its channels.\n"
+        f"# Written by `axol can.setup`; run by the realtime core's purge and by\n"
+        f"# can.setup's recovery (granted by `axol provision`).\n"
+        f"set -euo pipefail\n\n"
+        f'if [ "${{{_GLOBAL_LOCK_ENV}:-}}" != "1" ]; then\n'
+        f'    exec 8<"{_GLOBAL_LOCK_FILE}"\n'
+        f"    flock 8\n"
+        f"fi\n\n"
+        f"HUB=\n"
+        f"for IFACE in {left} {right}; do\n"
+        f'    if [ -e "/sys/class/net/${{IFACE}}/device" ]; then\n'
+        f'        HUB=$(readlink -f "/sys/class/net/${{IFACE}}/device/..")\n'
+        f"        break\n"
+        f"    fi\n"
+        f"done\n\n"
+        f'if [ -n "${{HUB}}" ] && [ -f "${{HUB}}/busnum" ]; then\n'
+        f'    BUS=$(cat "${{HUB}}/busnum")\n'
+        f'    DEV=$(cat "${{HUB}}/devnum")\n'
+        f"    if command -v usbreset >/dev/null 2>&1 && "
+        f'usbreset "$(printf "%03d/%03d" "${{BUS}}" "${{DEV}}")"; then\n'
+        f'        echo "arm hub ${{HUB##*/}}: USB reset"\n'
+        f"    else\n"
+        f"        # No usbreset (or it failed): deauthorize and reauthorize, which\n"
+        f"        # unbinds gs_usb and re-enumerates the hub the same way.\n"
+        f'        echo 0 > "${{HUB}}/authorized"\n'
+        f"        sleep 0.5\n"
+        f'        echo 1 > "${{HUB}}/authorized"\n'
+        f'        echo "arm hub ${{HUB##*/}}: reauthorized"\n'
+        f"    fi\n"
+        f"    # gs_usb rebinds inside the reset; udev renames the new netdevs.\n"
+        f"    for _ in $(seq 1 50); do\n"
+        f"        if ip link show {left} >/dev/null 2>&1 "
+        f"&& ip link show {right} >/dev/null 2>&1; then\n"
+        f"            break\n"
+        f"        fi\n"
+        f"        sleep 0.1\n"
+        f"    done\n"
+        f"else\n"
+        f'    echo "{left}/{right} not present — no hub to reset"\n'
+        f"fi\n\n"
+        f"# fd 8 (the global lock) survives the exec; the flag stops the bring-up\n"
+        f"# script from reopening it and deadlocking on itself.\n"
+        f'exec env {_GLOBAL_LOCK_ENV}=1 bash "{_AXOL_PROFILE.cron_script}"\n'
+    )
+
+
+def _write_reset_script() -> None:
+    """Install :func:`_reset_script_text` at :data:`CAN_RESET_SCRIPT`."""
+    print(f"Writing CAN adapter reset script to {CAN_RESET_SCRIPT}...")
+    _ensure_root_lock_file(_GLOBAL_LOCK_FILE)
+    _install_privileged_script(CAN_RESET_SCRIPT, _reset_script_text())
+    print("  Done.")
+
+
+def _root_script_command(script: Path) -> list[str]:
+    """``bash script``, flagged when this thread already holds the global lock.
+
+    The generated scripts take the global lock themselves; reopening it while
+    this thread owns it would deadlock. The unflagged form is the one
+    ``axol provision`` grants for non-interactive callers.
+    """
+    command = ["bash", str(script)]
+    if int(getattr(_LOCK_LOCAL, "depth", 0)):
+        command = ["env", f"{_GLOBAL_LOCK_ENV}=1", *command]
+    return command
+
+
+def _recover_hub_pair(channels: list[str]) -> None:
+    """Recover a silent dual hub: USB reset where installed, else a pair cycle.
+
+    Every recovery cycle of the arm hub is also a moment its firmware can
+    release frames queued behind an earlier stall (seen 2026-09-22: the right
+    arm drove to the stalled session's last pose during ``can.setup``). The
+    reset script clears them first; other hubs, and hosts that have not been
+    set up with it yet, keep the paired down/up cycle.
+    """
+    if CAN_RESET_SCRIPT.exists() and set(channels) == {_CAN_L, _CAN_R}:
+        print("  Arm hub: USB reset (drops frames the adapter still holds)...")
+        run_root(_root_script_command(CAN_RESET_SCRIPT), check=True)
+        return
+    bring_up_interfaces(channels, force_cycle=True)
+
+
 def _read_root_crontab() -> str:
     """Read root's crontab, distinguishing an empty table from inspection errors."""
     result = run_root(["env", "LC_ALL=C", "crontab", "-l"])
@@ -2226,7 +2330,7 @@ def _bring_up_can_locked(profile: _Profile = _AXOL_PROFILE) -> None:
     run_root(script_command, check=True)
     for attempt in range(3):
         if attempt:
-            bring_up_interfaces([profile.left, profile.right], force_cycle=True)
+            _recover_hub_pair([profile.left, profile.right])
         left, right = rx_alive_per_arm(profile)
         if left and right:
             print(f"  Done — motors responding on both {noun}s.")
@@ -2367,6 +2471,15 @@ def _flap_for_purge(channels: list[str]) -> None:
     ``can0``, a host that has never run ``can.setup`` — falls back to
     :func:`bring_up_interfaces`, which configures each channel explicitly.
     """
+    if (
+        CAN_RESET_SCRIPT.exists()
+        and set(channels) <= _SCRIPT_MANAGED_CHANNELS
+        and set(channels) & {_CAN_L, _CAN_R}
+    ):
+        # Frames on the arm hub may also be parked inside the adapter, where
+        # only a USB reset reaches them; the script then runs the bring-up.
+        run_root(["bash", str(CAN_RESET_SCRIPT)], check=True)
+        return
     if CAN_BRINGUP_SCRIPT.exists() and set(channels) <= _SCRIPT_MANAGED_CHANNELS:
         # The script takes its own locks, so this deliberately does not hold
         # the global setup lock: a caller that did would deadlock it.
@@ -2459,6 +2572,7 @@ def _apply_setup(
     _validate_adapter_assignments(hub_serial, wheels_serial, chest_serial)
     _write_udev_rules(hub_serial, wheels_serial, chest_serial)
     _write_cron_script()
+    _write_reset_script()
     _write_hotplug_unit()
     _reload_udev()
     _rename_interfaces(hub_serial, wheels_serial, chest_serial)
