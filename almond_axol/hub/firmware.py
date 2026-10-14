@@ -238,13 +238,28 @@ def _bootloader_disk(port: str, sysfs: Path) -> str | None:
 
 
 def _copy_uf2(disk: str, image: Path) -> None:
+    """Write ``image`` to the bootloader's disk.
+
+    The bootrom reboots the moment the last block lands, so the disk can
+    vanish under the tail of the write, the fsync, or the close. An I/O error
+    here therefore says nothing about whether the flash took; the caller
+    decides that by waiting for the hub to come back (:func:`flash`).
+    """
     mounted = subprocess.run(
         ["findmnt", "-n", "-o", "TARGET", "-S", disk], capture_output=True, text=True
     ).stdout.strip()
     own_mount = None
     if not mounted:
         own_mount = tempfile.mkdtemp(prefix="axol-hub-uf2-")
-        subprocess.run(["mount", disk, own_mount], check=True, capture_output=True)
+        result = subprocess.run(
+            ["mount", disk, own_mount], capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            os.rmdir(own_mount)
+            raise HubFirmwareError(
+                f"could not mount the bootloader disk {disk}: "
+                f"{(result.stderr or '').strip() or result.returncode}"
+            )
         mounted = own_mount
     try:
         target = os.path.join(mounted, image.name)
@@ -252,12 +267,16 @@ def _copy_uf2(disk: str, image: Path) -> None:
             shutil.copyfileobj(src, dst)
             dst.flush()
             os.fsync(dst.fileno())
+    except OSError as exc:
+        _logger.debug("bootloader disk went away during the copy: %s", exc)
     finally:
         if own_mount:
-            # The bootrom reboots as soon as the image lands, so the disk may
-            # already be gone; a lazy unmount cleans up either way.
+            # The disk may already be gone; a lazy unmount cleans up either way.
             subprocess.run(["umount", "-l", own_mount], capture_output=True)
-            os.rmdir(own_mount)
+            try:
+                os.rmdir(own_mount)
+            except OSError:
+                pass
 
 
 def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> int:
@@ -348,6 +367,7 @@ def ensure_hub_firmware(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hu
         if hub.outdated and hub.port not in _warned
     ]
     flashed: list[Hub] = []
+    attempted = False
     for hub in outdated:
         _logger.warning(
             "Axol hub %s (USB %s) runs firmware %s; updating to %s — the arm "
@@ -357,6 +377,9 @@ def ensure_hub_firmware(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hu
             format_version(hub.version),
             format_version(FIRMWARE_VERSION),
         )
+        # From here the hub may have rebooted (and its netdevs been
+        # recreated) whatever the outcome.
+        attempted = True
         try:
             if os.geteuid() == 0:
                 new_version = flash(hub.port, sysfs=sysfs)
@@ -388,7 +411,7 @@ def ensure_hub_firmware(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hu
             format_version(new_version),
         )
         flashed.append(hub)
-    if flashed:
+    if attempted:
         _wait_for_channels(channels)
     return flashed
 
@@ -397,15 +420,17 @@ def _flash_via_sudo(hub: Hub, *, sysfs: Path) -> int:
     """Run the flash as root through ``sudo`` (prompts on a terminal)."""
     from ..utils.sudo import run_root
 
-    try:
-        run_root(
-            [sys.executable, "-m", "almond_axol.hub", "flash", "--port", hub.port],
-            check=True,
-        )
-    except RuntimeError as exc:
+    proc = run_root(
+        [sys.executable, "-m", "almond_axol.hub", "flash", "--port", hub.port]
+    )
+    if proc.returncode != 0:
+        # The flash reports its failure on stderr (``ERROR: ...``), as does
+        # sudo when it cannot escalate; either way the last line says why.
+        lines = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()]
+        detail = lines[-1].removeprefix("ERROR: ") if lines else ""
         raise HubFirmwareError(
-            f"could not escalate to flash it ({exc}); run `sudo axol hub.flash`"
-        ) from exc
+            detail or f"`sudo axol hub.flash` exited {proc.returncode}"
+        )
     updated = _hub_at(_usb_device(hub.port, sysfs))
     if updated is None:
         raise HubFirmwareError(f"the hub at USB {hub.port} did not come back")

@@ -16,6 +16,7 @@ recovering a hub left in its bootloader.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 from ..hub import firmware as hub_fw
@@ -125,6 +126,8 @@ def run_flash(args: argparse.Namespace) -> None:
         try:
             version = hub_fw.flash(port)
         except hub_fw.HubFirmwareError as exc:
-            print(f"ERROR: {exc}")
+            # stderr: ensure_hub_firmware reports this line when it runs the
+            # flash through sudo.
+            print(f"ERROR: {exc}", file=sys.stderr)
             raise SystemExit(1) from None
         print(f"  Done — the hub runs firmware {hub_fw.format_version(version)}.")

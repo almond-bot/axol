@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import os
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -180,6 +181,9 @@ class EnsureFirmwareTest(unittest.TestCase):
             )
         flash.assert_called_once()
         self.assertIn("too old", "\n".join(logs.output))
+        # A failed attempt may still have rebooted the hub: its interfaces
+        # are awaited all the same (once — the retry is skipped).
+        hub_fw._wait_for_channels.assert_called_once_with([CAN_LEFT])
 
     def test_a_hub_left_in_its_bootloader_fails_the_bring_up(self) -> None:
         self._hub(0x0100)
@@ -206,6 +210,29 @@ class EnsureFirmwareTest(unittest.TestCase):
             )
             hub_fw.ensure_hub_firmware([CAN_LEFT], sysfs=self.sysfs.root)
         flash.assert_called_once()
+        # It rebooted, so its netdevs were recreated: wait for them.
+        hub_fw._wait_for_channels.assert_called_once_with([CAN_LEFT])
+
+    def test_a_sudo_flash_reports_the_real_failure(self) -> None:
+        # Not root: the flash runs through sudo, and its own error (here the
+        # manual-BOOTSEL instructions) must reach the log, not a generic
+        # "could not escalate".
+        self._hub(0x0100)
+        failed = subprocess.CompletedProcess(
+            [],
+            1,
+            stdout="Flashing Axol hub firmware 2.00 at USB 1-3...\n",
+            stderr="ERROR: firmware too old to update over USB; hold its BOOTSEL\n",
+        )
+        with (
+            patch.object(hub_fw.os, "geteuid", return_value=1000),
+            patch("almond_axol.utils.sudo.run_root", return_value=failed),
+            self.assertLogs(hub_fw._logger, "ERROR") as logs,
+        ):
+            hub_fw.ensure_hub_firmware([CAN_LEFT], sysfs=self.sysfs.root)
+        output = "\n".join(logs.output)
+        self.assertIn("hold its BOOTSEL", output)
+        self.assertNotIn("ERROR: firmware", output)
 
     def test_opt_out(self) -> None:
         self._hub(0x0100)
@@ -234,6 +261,36 @@ class FlashTest(unittest.TestCase):
         ):
             hub_fw.flash("1-3", sysfs=self.sysfs.root)
         self.assertIn("BOOTSEL", str(raised.exception))
+
+    def test_a_disk_that_vanishes_mid_copy_is_left_to_the_restart_check(
+        self,
+    ) -> None:
+        # The bootrom reboots once the image lands, so the copy's tail I/O
+        # can fail even though the flash took; flash() decides by waiting
+        # for the hub, never by the copy's errors.
+        mount = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        image = mount / "src.uf2"
+        image.write_bytes(b"\0" * 512)
+        mounted = subprocess.CompletedProcess([], 0, stdout=f"{mount}\n", stderr="")
+        with (
+            patch.object(hub_fw.subprocess, "run", return_value=mounted),
+            patch.object(hub_fw.os, "fsync", side_effect=OSError(errno.EIO, "I/O")),
+        ):
+            hub_fw._copy_uf2("/dev/sda1", image)
+
+    def test_a_failed_mount_is_a_firmware_error(self) -> None:
+        image = Path(self.enterContext(tempfile.TemporaryDirectory())) / "a.uf2"
+        image.write_bytes(b"")
+        results = [
+            subprocess.CompletedProcess([], 1, stdout="", stderr=""),  # findmnt
+            subprocess.CompletedProcess([], 32, stdout="", stderr="mount: bad fs"),
+        ]
+        with (
+            patch.object(hub_fw.subprocess, "run", side_effect=results),
+            self.assertRaises(hub_fw.HubFirmwareError) as raised,
+        ):
+            hub_fw._copy_uf2("/dev/sda1", image)
+        self.assertIn("bad fs", str(raised.exception))
 
     def test_refuses_without_root(self) -> None:
         with (
