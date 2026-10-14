@@ -6,6 +6,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// `CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG` — the kernel ORs these into
@@ -14,6 +15,20 @@ use std::time::{Duration, Instant};
 const CAN_FRAME_TYPE_FLAGS: u32 = 0xE000_0000;
 /// Standard-frame-format identifier mask (`CAN_SFF_MASK`).
 const CAN_SFF_MASK: u32 = 0x7FF;
+/// `CAN_ERR_FLAG`: the frame is an error report, not bus traffic.
+const CAN_ERR_FLAG: u32 = 0x2000_0000;
+/// `CAN_ERR_ACK`: a transmission received no ACK — no node on the wire is
+/// powered to acknowledge it.
+const CAN_ERR_ACK: u32 = 0x0000_0020;
+/// `SOL_CAN_RAW` / `CAN_RAW_ERR_FILTER` (linux/can/raw.h).
+const SOL_CAN_RAW: libc::c_int = libc::SOL_CAN_BASE + libc::CAN_RAW;
+const CAN_RAW_ERR_FILTER: libc::c_int = 2;
+
+/// Whether a received `can_id` is the adapter reporting a transmission
+/// nothing ACKed.
+fn is_ack_error(can_id: u32) -> bool {
+    can_id & CAN_ERR_FLAG != 0 && can_id & CAN_ERR_ACK != 0
+}
 
 /// Classic CAN frame as the kernel defines it (`struct can_frame`).
 #[repr(C)]
@@ -46,6 +61,10 @@ pub struct Frame {
 
 pub struct CanSock {
     fd: RawFd,
+    /// Latched once the adapter reports a transmission nothing ACKed (see
+    /// [`Self::watch_ack_errors`]). Never cleared: the session that saw its
+    /// bus die ends, and the next one opens a fresh socket.
+    ack_error: AtomicBool,
 }
 
 impl CanSock {
@@ -80,7 +99,45 @@ impl CanSock {
             unsafe { libc::close(fd) };
             return Err(err);
         }
-        Ok(Self { fd })
+        Ok(Self {
+            fd,
+            ack_error: AtomicBool::new(false),
+        })
+    }
+
+    /// Ask the kernel for the adapter's no-ACK error frames on this socket.
+    ///
+    /// The Axol hub (firmware 2.01+) reports `CAN_ERR_ACK` whenever a frame
+    /// gets no ACK for 50 ms — nothing on the wire is powered (the e-stop) —
+    /// and then drops it rather than holding it for when power returns, so
+    /// the TX queue never backs up and the `ENOBUFS` stall below never
+    /// fires. Any receive on this socket latches the report into
+    /// [`Self::saw_ack_error`], which [`crate::safety::guarded_send`] turns
+    /// into [`crate::safety::SendOutcome::Unacked`].
+    ///
+    /// Only for arm-bus owners: other adapters' error reporting is not
+    /// relied on, and a socket that never opts in behaves exactly as before.
+    pub fn watch_ack_errors(&self) -> io::Result<()> {
+        let mask: u32 = CAN_ERR_ACK;
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                SOL_CAN_RAW,
+                CAN_RAW_ERR_FILTER,
+                &mask as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Whether the adapter has reported a transmission nothing ACKed since
+    /// this socket opened (requires [`Self::watch_ack_errors`]).
+    pub fn saw_ack_error(&self) -> bool {
+        self.ack_error.load(Ordering::Acquire)
     }
 
     /// Set the blocking-receive timeout (`SO_RCVTIMEO`) for coarse,
@@ -223,8 +280,12 @@ impl CanSock {
             // extended, remote-request, or error frame whose low bits happen
             // to match a motor ID must not be mistaken for feedback (or, via
             // the proxy, for a `can.setup` identity reply), so drop it and
-            // keep reading instead of masking the flags away.
+            // keep reading instead of masking the flags away — after noting a
+            // no-ACK report (only delivered to sockets that asked for it).
             if frame.can_id & CAN_FRAME_TYPE_FLAGS != 0 {
+                if is_ack_error(frame.can_id) {
+                    self.ack_error.store(true, Ordering::Release);
+                }
                 continue;
             }
             return Ok(Some(Frame {
@@ -316,6 +377,15 @@ mod tests {
             median < timeout + Duration::from_millis(1),
             "wait overran its deadline: {median:?} for {timeout:?}"
         );
+    }
+
+    #[test]
+    fn only_no_ack_error_frames_count_as_a_dead_bus() {
+        assert!(is_ack_error(CAN_ERR_FLAG | CAN_ERR_ACK));
+        assert!(is_ack_error(CAN_ERR_FLAG | CAN_ERR_ACK | 0x04)); // with CAN_ERR_CRTL
+        assert!(!is_ack_error(CAN_ERR_FLAG | 0x04)); // controller state only
+        assert!(!is_ack_error(0x020)); // a data frame with ID 0x020
+        assert!(!is_ack_error(0x141));
     }
 
     #[test]

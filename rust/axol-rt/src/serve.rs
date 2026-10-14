@@ -211,7 +211,7 @@ use crate::can::CanSock;
 use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 use crate::stall;
 
 /// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
@@ -2396,7 +2396,7 @@ mod tests {
             match guarded_send(&sock, 0x7F0, &[0u8; 8], &mut since).unwrap() {
                 SendOutcome::Sent => sent += 1,
                 SendOutcome::Dropped => dropped += 1,
-                SendOutcome::Stalled => break,
+                SendOutcome::Stalled | SendOutcome::Unacked => break,
             }
             assert!(
                 start.elapsed() < Duration::from_secs(15),
@@ -3163,6 +3163,15 @@ fn bus_loop(
     };
     if let Err(err) = bringup::enable(&sock, iface, &motors) {
         let _ = ready_tx.send(Err(err));
+        return Ok(());
+    }
+    // From here a no-ACK report from the hub means motor power died under
+    // this session (see `SendOutcome::Unacked`). Subscribed only now, with
+    // the motors just shown to answer, so nothing from before can latch.
+    if let Err(err) = sock.watch_ack_errors() {
+        let _ = ready_tx.send(Err(io::Error::other(format!(
+            "{iface}: could not subscribe to CAN ACK errors: {err}"
+        ))));
         return Ok(());
     }
     let _ = ready_tx.send(Ok(()));
@@ -4117,6 +4126,20 @@ fn bus_loop(
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
                     SendOutcome::Sent => expected[motor_index] = 1,
                     SendOutcome::Dropped => {}
+                    SendOutcome::Unacked => {
+                        // The e-stop path on hub firmware 2.01+: the hub saw
+                        // nothing ACK for 50 ms and dropped the frame, so
+                        // there is no queue to purge — but this loop must
+                        // stop before power returns, or its next frames
+                        // command the motors the instant they wake. Same
+                        // fault and teardown as the stall below.
+                        bus_dead = true;
+                        fault.store(1, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                        return Err(io::Error::other(format!(
+                            "{iface}: {NO_ACK_REPORT}; commands stopped"
+                        )));
+                    }
                     SendOutcome::Stalled => {
                         // The e-stop path: nothing has ACKed for >1 s. Stop
                         // commanding, purge the poisoned TX queue so the

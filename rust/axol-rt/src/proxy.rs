@@ -7,7 +7,7 @@
 
 use crate::can::CanSock;
 use crate::experiment::{FeedbackStore, RawSample};
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 use crate::timing::TimingAggregator;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -148,6 +148,12 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
 
     let socket = Arc::new(CanSock::open(iface)?);
     socket.set_recv_timeout(Duration::from_millis(100))?;
+    // The hub's no-ACK reports (firmware 2.01+) are how this proxy learns the
+    // motors lost power: that hub drops unACKed frames instead of backing up,
+    // so the ENOBUFS stall never fires. Python's `CanBus.stalled` — what
+    // `Axol.disable()` needs to accept an all-silent arm as unpowered — rests
+    // on one or the other.
+    socket.watch_ack_errors()?;
     socket.set_send_timeout(Duration::from_millis(20))?;
 
     let output = Arc::new(Mutex::new(stream.try_clone()?));
@@ -191,6 +197,13 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
                     match guarded_send(&socket, id as u16, &payload[6..6 + len], &mut enobufs_since)
                     {
                         Ok(SendOutcome::Sent | SendOutcome::Dropped) => {}
+                        Ok(SendOutcome::Unacked) => {
+                            // Nothing queued anywhere to purge: the hub
+                            // dropped the frame it could not deliver.
+                            let message = format!("CAN {iface}: {NO_ACK_REPORT}; commands stopped");
+                            write_error(&output, &message);
+                            return Err(io::Error::other(message));
+                        }
                         Ok(SendOutcome::Stalled) => {
                             let purged = purge_tx_queue(iface);
                             let message = format!(

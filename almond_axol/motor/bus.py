@@ -30,10 +30,13 @@ _MAX_MESSAGE = 32 * 1024 * 1024
 # not end a healthy run.
 STALL_DETECT_S = 1.0
 
-# The text every Rust transport puts in its stall report (``proxy.rs``,
-# ``serve.rs``, ``hold.rs``): the one signal Python has that the bus is dead
-# rather than merely closed.
-_STALL_MARKER = "TX queue stalled"
+# The texts the Rust transports (``proxy.rs``, ``serve.rs``, ``hold.rs``) put
+# in a dead-bus report: the one signal Python has that the bus is dead rather
+# than merely closed. Which one depends on the arm hub's firmware: an older
+# hub backs up until the TX queue stalls; firmware 2.01+ drops what nothing
+# ACKs and reports it, which the transports pass on as ``NO_ACK_REPORT``
+# (``rust/axol-rt/src/safety.rs``).
+_STALL_MARKERS = ("TX queue stalled", "no node ACKing")
 
 # Channels currently stalled, across every bus owner in this process. A stall
 # is the motors losing power, which no single owner can see on its own: the
@@ -73,8 +76,13 @@ def stalled_channels() -> frozenset[str]:
 
 
 def is_stall_report(message: str) -> bool:
-    """True when a Rust transport's error/fault text reports a TX stall."""
-    return _STALL_MARKER in message
+    """True when a Rust transport's error/fault text reports a dead bus.
+
+    Either a TX queue that stopped draining, or the hub reporting that
+    nothing ACKs (see ``_STALL_MARKERS``): both mean no node on the wire is
+    powered.
+    """
+    return any(marker in message for marker in _STALL_MARKERS)
 
 
 class CanBus:
@@ -154,9 +162,10 @@ class CanBus:
     def stalled(self) -> bool:
         """Whether *this* bus has declared a stall: nothing on the wire is ACKing.
 
-        Set only by the proxy reporting a TX queue that stayed full past
-        :data:`STALL_DETECT_S`, which needs every node on the bus to be silent
-        (the motors are unpowered). Any other way the proxy can go away (it
+        Set only by the proxy reporting a dead bus — a TX queue that stayed
+        full past :data:`STALL_DETECT_S`, or (hub firmware 2.01+) the hub
+        reporting a frame nothing ACKed. Either needs every node on the bus
+        to be silent (the motors are unpowered). Any other way the proxy can go away (it
         crashed, the interface vanished, :meth:`close`) leaves this unset —
         the motors may well still be powered and holding torque.
         """

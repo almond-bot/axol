@@ -43,7 +43,7 @@ _logger = logging.getLogger(__name__)
 #: BCD firmware version of the bundled image (0x0200 = 2.00): the
 #: ``AXOL_HUB_FW_VERSION`` it was built with. The test suite checks the image
 #: itself reports it.
-FIRMWARE_VERSION = 0x0200
+FIRMWARE_VERSION = 0x0201
 
 #: The bundled image. The source lives in the circuits-py repository
 #: (``designs/axol_hub/firmware``); this is its built ``firmware.uf2``, copied

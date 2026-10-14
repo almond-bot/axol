@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor, WireMode};
 use crate::can::CanSock;
 use crate::proto;
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 
 /// Parameter sanity limits — a params file outside these is rejected whole.
 const KP_LIMIT: f64 = 250.0;
@@ -238,6 +238,9 @@ fn bus_hold(
     if !yes {
         return Ok(());
     }
+    // The motors just answered bring-up; from here a no-ACK report from the
+    // hub means motor power died (see `SendOutcome::Unacked`).
+    sock.watch_ack_errors()?;
 
     let readies: Vec<ReadyMotor> = motors.iter().map(|m| m.ready.clone()).collect();
     bringup::enable(&sock, iface, &readies)?;
@@ -300,6 +303,11 @@ fn stream(
             };
             match guarded_send(sock, command_id, &frame, &mut enobufs_since)? {
                 SendOutcome::Sent | SendOutcome::Dropped => {}
+                SendOutcome::Unacked => {
+                    return Err(io::Error::other(format!(
+                        "{iface}: hold stopped: {NO_ACK_REPORT}"
+                    )));
+                }
                 SendOutcome::Stalled => {
                     let purged = purge_tx_queue(iface);
                     return Err(io::Error::other(format!(

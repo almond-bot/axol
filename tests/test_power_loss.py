@@ -7,9 +7,11 @@ must do when that happens while an operation owns the CAN buses.
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -50,6 +52,13 @@ _CORE_STALL = (
     "fault: can-left: TX queue stalled >1s — no node ACKing frames (e-stop / "
     "motors unpowered?); commands stopped, stale queue purged"
 )
+# Hub firmware 2.01+ never backs up: it drops what nothing ACKs and reports it,
+# which the transports pass on as ``NO_ACK_REPORT`` (``safety.rs``).
+_NO_ACK_REPORT = (
+    "bus dead — the hub reports no node ACKing frames (e-stop / motors unpowered?)"
+)
+_PROXY_NO_ACK = f"CAN can-left: {_NO_ACK_REPORT}; commands stopped"
+_CORE_NO_ACK = f"fault: can-left: {_NO_ACK_REPORT}; commands stopped"
 
 
 class _FakeBus:
@@ -241,6 +250,18 @@ class StallReportClassificationTest(unittest.IsolatedAsyncioTestCase):
     def test_both_transports_stall_texts_are_recognised(self) -> None:
         self.assertTrue(is_stall_report(_PROXY_STALL))
         self.assertTrue(is_stall_report(_CORE_STALL))
+        self.assertTrue(is_stall_report(_PROXY_NO_ACK))
+        self.assertTrue(is_stall_report(_CORE_NO_ACK))
+
+    def test_the_rust_no_ack_report_is_the_one_recognised(self) -> None:
+        # The text is defined once, in safety.rs; Python matches it by marker.
+        source = (
+            Path(__file__).resolve().parents[1] / "rust/axol-rt/src/safety.rs"
+        ).read_text()
+        match = re.search(r'NO_ACK_REPORT: &str =\s*"([^"]+)"', source)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), _NO_ACK_REPORT)
+        self.assertTrue(is_stall_report(match.group(1)))
         self.assertFalse(is_stall_report("CAN can-left send failed: ENODEV"))
         self.assertFalse(is_stall_report("fault: arm: bus thread died"))
 
@@ -291,6 +312,15 @@ class CoreStallReportTest(unittest.TestCase):
 
         self.assertIn("can-left", stalled_channels())
         self.assertNotIn("can-right", stalled_channels())
+
+    def test_a_no_ack_fault_names_its_interface(self) -> None:
+        # Hub firmware 2.01+: the e-stop arrives as the hub's no-ACK report,
+        # never as a TX-queue stall.
+        link = self._link()
+
+        link._note_stall(_CORE_NO_ACK)
+
+        self.assertIn("can-left", stalled_channels())
 
     def test_other_faults_are_not_stalls(self) -> None:
         link = self._link()
