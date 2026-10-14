@@ -158,8 +158,8 @@ function StrictSelect({
 
 // -- uniform-subgroup tables --------------------------------------------------
 //
-// The per-joint gain configs are 7+ sibling groups with identical numeric
-// fields (kp, kd, friction.*, mass, com, …). Rendering those as repeated field
+// The per-joint gain configs are 7+ sibling groups with identical fields
+// (kp, kd, friction.*, mass, com, wire_mode, …). Rendering those as repeated field
 // lists is unreadable; a table — one row per joint, one column per parameter,
 // vectors split into per-component columns — is how you actually scan them.
 
@@ -172,21 +172,23 @@ interface TableColumn {
 }
 
 /**
- * The column set of a subgroup if it is purely numeric (numbers + numeric
- * vectors, possibly nested); null disqualifies it from table rendering.
+ * The column set of a subgroup if every field fits in a cell (numbers, numeric
+ * vectors, short text and selects, possibly nested); null disqualifies it from
+ * table rendering. A single text knob among the gains (``wire_mode``) must not
+ * break the joint table back into fourteen field lists.
  */
-function numericColumns(group: SchemaGroup, prefix = ""): TableColumn[] | null {
+function tableColumns(group: SchemaGroup, prefix = ""): TableColumn[] | null {
   const out: TableColumn[] = []
   for (const node of group.children) {
     if (node.kind === "group") {
-      const nested = numericColumns(node, prefix ? `${prefix}.${node.label}` : node.label)
+      const nested = tableColumns(node, prefix ? `${prefix}.${node.label}` : node.label)
       if (nested == null) return null
       out.push(...nested)
       continue
     }
     const sub = prefix ? `${prefix}.${node.label}` : node.label
     const leaf = sub.split(".").pop() ?? sub
-    if (node.type === "number") {
+    if (node.type === "number" || node.type === "text" || node.type === "select") {
       out.push({ sub, label: leaf, index: null })
     } else if (node.type === "vector") {
       const def = vectorDefault(node)
@@ -203,7 +205,7 @@ function numericColumns(group: SchemaGroup, prefix = ""): TableColumn[] | null {
 const columnsSignature = (cols: TableColumn[]) =>
   cols.map((c) => `${c.sub}:${c.index ?? ""}`).join("|")
 
-/** Look up the field at `sub` inside a subgroup (mirrors numericColumns). */
+/** Look up the field at `sub` inside a subgroup (mirrors tableColumns). */
 function fieldAt(group: SchemaGroup, sub: string): SchemaField | null {
   const [head, ...rest] = sub.split(".")
   for (const node of group.children) {
@@ -291,11 +293,34 @@ function TableCell({
     text = String(arr[index] ?? "")
     modified = has && String(arr[index]) !== String(vectorDefault(field)[index])
   }
+  const cellClass = cn(
+    "h-8 w-full min-w-14 rounded border bg-white/[0.02] px-1.5 text-center text-xs text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50",
+    modified ? "border-[#eff483]/50" : "border-white/10"
+  )
+  if (field.type === "select") {
+    return (
+      <td>
+        <select
+          value={text}
+          disabled={disabled}
+          title={field.key}
+          onChange={(e) => onChange(field.key, e.target.value)}
+          className={cellClass}
+        >
+          {(field.options ?? []).map((opt) => (
+            <option key={opt} value={opt} className="bg-[#1a1a1a]">
+              {opt}
+            </option>
+          ))}
+        </select>
+      </td>
+    )
+  }
   return (
     <td>
       <input
         value={text}
-        inputMode="decimal"
+        inputMode={field.type === "text" ? undefined : "decimal"}
         disabled={disabled}
         title={`${field.key}${index != null ? ` [${index}]` : ""}`}
         onChange={(e) => {
@@ -307,10 +332,7 @@ function TableCell({
             setVectorComponent(field, value, index, raw, onChange, onReset)
           }
         }}
-        className={cn(
-          "h-8 w-full min-w-14 rounded border bg-white/[0.02] px-1.5 text-center text-xs text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50",
-          modified ? "border-[#eff483]/50" : "border-white/10"
-        )}
+        className={cellClass}
       />
     </td>
   )
@@ -320,7 +342,7 @@ function TableCell({
  * A config subtree rendered flat: every field visible (no collapsed groups to
  * dig through). Nested groups become plain section headings ("left › elbow")
  * with their fields in a compact grid — except runs of sibling groups with
- * identical numeric fields (the per-joint gains), which collapse into one
+ * identical fields (the per-joint gains), which collapse into one
  * table: a row per joint, a column per parameter. Used by the settings
  * Advanced tab.
  */
@@ -332,12 +354,12 @@ export function FlatSchemaForm({
   const fields = nodes.filter((n): n is SchemaField => n.kind === "field")
   const groups = nodes.filter((n): n is SchemaGroup => n.kind === "group")
 
-  // Cluster sibling groups by their numeric-column signature; a cluster of 3+
+  // Cluster sibling groups by their column signature; a cluster of 3+
   // renders as one table (keyed by its first member's position).
   const signatures = new Map<string, { cols: TableColumn[] | null; sig: string | null }>()
   const clusterSizes = new Map<string, number>()
   for (const g of groups) {
-    const cols = numericColumns(g)
+    const cols = tableColumns(g)
     const sig = cols && cols.length >= 2 ? columnsSignature(cols) : null
     signatures.set(g.key, { cols, sig })
     if (sig) clusterSizes.set(sig, (clusterSizes.get(sig) ?? 0) + 1)
