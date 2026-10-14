@@ -31,6 +31,13 @@ _TEST_PARK_TIMEOUT_S = 0.5
 
 # Where the arms are left before teardown, in radians on every arm joint.
 _RAISED = 0.5
+# The stand-in planner's rest pose, on every joint: distinct from zero so a
+# park is seen to pass through rest on its way to zero.
+_REST = 0.2
+
+
+def _line(start: np.ndarray, goal: np.ndarray) -> list[np.ndarray]:
+    return [start + (goal - start) * (i / 10) for i in range(11)]
 
 
 class _FakeArm:
@@ -116,20 +123,34 @@ class _FakeIKProcess:
 class _FakeIKPipe:
     """Stands in for the parent end of the IK worker pipe.
 
-    Answers a reset request the way the worker's planner does — a short
-    straight-line trajectory from the requested joints to the rest pose
-    (all zeros here) — so the real IK dispatch loop can plan the park.
+    Answers reset requests the way the worker's planner does — short
+    straight-line legs from the requested joints to the rest pose, or through
+    the named goals of a ``reset_path`` — so the real IK dispatch loop can
+    plan the park. Records each request's kind in ``requests``.
     """
 
     def __init__(self) -> None:
         self._replies: collections.deque[object] = collections.deque()
+        self.requests: list[tuple[str, ...]] = []
 
     def send(self, msg: object) -> None:
-        if isinstance(msg, tuple) and msg[0] == "reset":
-            start = np.asarray(msg[1], dtype=np.float32)
-            rest = np.zeros_like(start)
-            traj = [start + (rest - start) * (i / 20) for i in range(21)]
-            self._replies.append(("reset_traj", rest, traj))
+        if not isinstance(msg, tuple):
+            return
+        start = np.asarray(msg[1], dtype=np.float32)
+        goals = {"rest": np.full_like(start, _REST), "zero": np.zeros_like(start)}
+        if msg[0] == "reset":
+            self.requests.append(("rest",))
+            self._replies.append(
+                ("reset_traj", goals["rest"], _line(start, goals["rest"]))
+            )
+        elif msg[0] == "reset_path":
+            self.requests.append(tuple(msg[2]))
+            traj: list[np.ndarray] = []
+            q = start
+            for name in msg[2]:
+                traj += _line(q, goals[name])
+                q = goals[name]
+            self._replies.append(("reset_traj", q, traj))
 
     def recv(self) -> object:
         return self._replies.popleft()
@@ -161,9 +182,10 @@ def _teleop(
     session._ik_process = _FakeIKProcess(alive=ik_worker_alive)  # noqa: SLF001
     if ik_thread:
         stop = session._ik_stop  # noqa: SLF001
+        session.fake_pipe = _FakeIKPipe()  # type: ignore[attr-defined]
         thread = threading.Thread(
             target=core.run_ik_loop,
-            args=(_FakeIKPipe(), lambda: None, stop, lambda: True, lambda _t: None),
+            args=(session.fake_pipe, lambda: None, stop, lambda: True, lambda _t: None),
             daemon=True,
         )
         thread.start()
@@ -201,7 +223,9 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(_stop_ik_thread, session)
         return session
 
-    async def test_position_controlled_arms_are_returned_to_rest(self) -> None:
+    async def test_position_controlled_arms_are_parked_through_rest_to_zero(
+        self,
+    ) -> None:
         robot = _FakeRobot()
         session = self._session(robot)
         _leave_rest(session)
@@ -210,13 +234,19 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
         await session._park_arms()  # noqa: SLF001
         elapsed = time.perf_counter() - started
 
-        # The move has to be driven all the way home, not merely started: a
+        # The move has to be driven all the way to zero, not merely started: a
         # park that held position until its deadline would leave the arms
-        # raised.
+        # raised. Both legs are one planned path, through rest.
+        self.assertEqual(session.fake_pipe.requests, [("rest", "zero")])
         self.assertGreater(
             len(robot.commands), 1, "teardown did not drive the arms home"
         )
+        self.assertTrue(
+            any(np.allclose(c[:7], _REST, atol=1e-5) for c in robot.commands),
+            "the park did not pass through the rest pose",
+        )
         np.testing.assert_allclose(robot.commands[-1][:7], 0.0, atol=1e-5)
+        self.assertTrue(session._core.at_zero)  # noqa: SLF001
         self.assertLess(elapsed, _TEST_PARK_TIMEOUT_S)
 
     async def test_a_stop_mid_reset_finishes_that_move(self) -> None:
@@ -233,6 +263,8 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
 
         await session._park_arms()  # noqa: SLF001
 
+        # The X reset plays out to rest, then the zero leg is planned from there.
+        self.assertEqual(session.fake_pipe.requests, [("rest",), ("zero",)])
         self.assertGreater(len(robot.commands), 1)
         np.testing.assert_allclose(robot.commands[-1][:7], 0.0, atol=1e-5)
 
@@ -285,9 +317,20 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(robot.commands, [])
 
-    async def test_arms_already_at_rest_are_not_moved(self) -> None:
+    async def test_arms_at_rest_are_still_parked_at_zero(self) -> None:
         robot = _FakeRobot()
         session = self._session(robot)
+        self.assertTrue(session._core.at_rest)  # noqa: SLF001
+
+        await session._park_arms()  # noqa: SLF001
+
+        self.assertEqual(session.fake_pipe.requests, [("rest", "zero")])
+        np.testing.assert_allclose(robot.commands[-1][:7], 0.0, atol=1e-5)
+
+    async def test_arms_already_parked_at_zero_are_not_moved(self) -> None:
+        robot = _FakeRobot()
+        session = self._session(robot)
+        session._core._at_zero = True  # noqa: SLF001
 
         await session._park_arms()  # noqa: SLF001
 
