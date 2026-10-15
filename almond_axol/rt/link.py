@@ -47,8 +47,10 @@ _ARM_TIMEOUT_S = 15.0
 #: ``CONFIG_PROTO`` in ``rust/axol-rt/src/serve.rs`` for the history). Bump
 #: both together whenever the config or target layout changes meaning — a
 #: package and a binary from different checkouts must fail at configure
-#: time, not arm and then silently reject every target.
-CONFIG_PROTO = 17
+#: time, not arm and then silently reject every target. 18 changes no layout:
+#: it requires a core that stops on the arm hub's no-ACK report, because this
+#: package flashes hubs to the firmware that no longer backs up on an e-stop.
+CONFIG_PROTO = 18
 
 
 def config_header() -> list[str]:
