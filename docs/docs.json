@@ -150,7 +150,9 @@
                 "pages": [
                   "cli/can-setup",
                   "cli/can-enable",
-                  "cli/can-driver"
+                  "cli/can-driver",
+                  "cli/hub-info",
+                  "cli/hub-flash"
                 ]
               },
               {
