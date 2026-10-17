@@ -61,6 +61,10 @@ pub struct Frame {
 
 pub struct CanSock {
     fd: RawFd,
+    /// Whether this bus's no-ACK reports are trusted
+    /// ([`crate::safety::reports_no_ack`]). Decided at open so that no caller
+    /// of [`Self::watch_ack_errors`] can subscribe on another adapter.
+    hub_channel: bool,
     /// Latched once the adapter reports a transmission nothing ACKed (see
     /// [`Self::watch_ack_errors`]). Never cleared: the session that saw its
     /// bus die ends, and the next one opens a fresh socket.
@@ -99,10 +103,15 @@ impl CanSock {
             unsafe { libc::close(fd) };
             return Err(err);
         }
-        Ok(Self {
+        Ok(Self::with_fd(fd, iface))
+    }
+
+    fn with_fd(fd: RawFd, iface: &str) -> Self {
+        Self {
             fd,
+            hub_channel: crate::safety::reports_no_ack(iface),
             ack_error: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Ask the kernel for the adapter's no-ACK error frames on this socket.
@@ -115,10 +124,15 @@ impl CanSock {
     /// [`Self::saw_ack_error`], which [`crate::safety::guarded_send`] turns
     /// into [`crate::safety::SendOutcome::Unacked`].
     ///
-    /// Only for hub-channel owners (arm and Mantis, see
-    /// [`crate::safety::reports_no_ack`]): other adapters' error reporting is not
-    /// relied on, and a socket that never opts in behaves exactly as before.
-    pub fn watch_ack_errors(&self) -> io::Result<()> {
+    /// Hub channels only (arm and Mantis, see
+    /// [`crate::safety::reports_no_ack`]): on any other bus this is a no-op
+    /// returning `Ok(false)`, and the socket behaves exactly as before. Other
+    /// adapters report transient ACK errors too, which would end a healthy
+    /// session (#385). `Ok(true)` once subscribed.
+    pub fn watch_ack_errors(&self) -> io::Result<bool> {
+        if !self.hub_channel {
+            return Ok(false);
+        }
         let mask: u32 = CAN_ERR_ACK;
         let rc = unsafe {
             libc::setsockopt(
@@ -132,7 +146,7 @@ impl CanSock {
         if rc < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Whether the adapter has reported a transmission nothing ACKed since
@@ -378,6 +392,29 @@ mod tests {
             median < timeout + Duration::from_millis(1),
             "wait overran its deadline: {median:?} for {timeout:?}"
         );
+    }
+
+    #[test]
+    fn only_hub_channels_subscribe_to_no_ack_reports() {
+        // #385: the proxy on the Jelly wheel bus (a CANable, shared with the
+        // lift) subscribed, and one transient no-ACK report killed the lift
+        // mid-teleop. The socket refuses on such buses whoever asks. fd -1
+        // makes any setsockopt fail with EBADF, so `Ok(false)` proves no
+        // subscription was attempted and an error proves one was.
+        for iface in ["can_alm_axol_b", "can_alm_axol_c", "vcan0"] {
+            let sock = CanSock::with_fd(-1, iface);
+            assert_eq!(sock.watch_ack_errors().ok(), Some(false), "{iface}");
+        }
+        for iface in [
+            "can_alm_axol_l",
+            "can_alm_axol_r",
+            "can_mantis_l",
+            "can_mantis_r",
+        ] {
+            let sock = CanSock::with_fd(-1, iface);
+            let err = sock.watch_ack_errors().expect_err(iface);
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{iface}");
+        }
     }
 
     #[test]
