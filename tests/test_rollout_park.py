@@ -237,6 +237,7 @@ def test_worker_honors_explicit_zero_target_without_changing_rest_protocol():
         start.copy(),
         goal.copy(),
     ]
+    worker.compute_path_trajectory.return_value = []
     conn = mock.Mock()
     conn.recv.side_effect = [("reset", current), ("reset", rest, zero), None]
     with (

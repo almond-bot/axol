@@ -133,6 +133,7 @@ def run_session(
         )
         stack.enter_context(mock.patch.object(run_policy.time, "sleep"))
         stack.enter_context(mock.patch.object(run_policy, "_check_training_fps"))
+        stack.enter_context(mock.patch.object(run_policy, "check_start_pose"))
         stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
         if episode_choice is None and fault is None:
             from itertools import count
@@ -252,6 +253,10 @@ def test_lerobot_fault_off_rest_returns_to_rest_before_disabling():
     assert result.events == ["workers stopped", "disable"]
     assert result.reset.return_to_rest.call_count == 2  # setup + teardown park
     assert result.reset.return_to_rest.call_args.kwargs["on_contact"] is not None
+    # The first home goes out through zero; the teardown parks back to zero.
+    setup, teardown = result.reset.return_to_rest.call_args_list
+    assert setup.kwargs["path"] == ("zero", "rest")
+    assert teardown.kwargs["path"] == ("rest", "zero")
 
 
 def test_custom_fault_holds_without_a_teardown_rest_move():

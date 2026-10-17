@@ -885,6 +885,15 @@ class AxolVRTeleop(Teleoperator):
         return self._core.at_rest
 
     @property
+    def at_zero(self) -> bool:
+        """True while the last completed move was a park that ended at zero.
+
+        See :attr:`VRTeleopCore.at_zero`; a teardown park reads it to skip a
+        park the arms already finished.
+        """
+        return self._core.at_zero
+
+    @property
     def ik_paused(self) -> bool:
         """True while the IK pipeline is frozen for an out-of-band move.
 
@@ -982,6 +991,14 @@ class AxolVRTeleop(Teleoperator):
         with a reset already pending or playing.
         """
         await self._core.guarded_return(**kwargs)
+
+    async def guarded_park(self, **kwargs: Any) -> None:
+        """Teardown park — rest pose, then zero — guarded; see the shared engine.
+
+        Thin passthrough to :meth:`VRTeleopCore.guarded_park`, with the same
+        hooks as :meth:`guarded_return`.
+        """
+        await self._core.guarded_park(**kwargs)
 
     async def contact_hold(self, **kwargs: Any) -> None:
         """Limp gravity-comp hold after a tracking-time contact trip.
