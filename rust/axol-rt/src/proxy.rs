@@ -7,9 +7,7 @@
 
 use crate::can::CanSock;
 use crate::experiment::{FeedbackStore, RawSample};
-use crate::safety::{
-    guarded_send, purge_tx_queue, reports_no_ack, SendOutcome, NO_ACK_REPORT, STALL_DETECT,
-};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 use crate::timing::TimingAggregator;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -154,12 +152,10 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
     // motors lost power: that hub drops unACKed frames instead of backing up,
     // so the ENOBUFS stall never fires. Python's `CanBus.stalled` — what
     // `Axol.disable()` needs to accept an all-silent arm as unpowered — rests
-    // on one or the other. Hub channels (arm and Mantis) only: other
-    // adapters report transient ACK errors too, which would end a healthy
-    // session.
-    if reports_no_ack(iface) {
-        socket.watch_ack_errors()?;
-    }
+    // on one or the other. A no-op off the hub channels (arm and Mantis):
+    // other adapters report transient ACK errors too, which would end a
+    // healthy session.
+    socket.watch_ack_errors()?;
     socket.set_send_timeout(Duration::from_millis(20))?;
 
     let output = Arc::new(Mutex::new(stream.try_clone()?));
