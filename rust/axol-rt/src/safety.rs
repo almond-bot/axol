@@ -51,14 +51,18 @@ const RESET_SCRIPT: &str = "/etc/almond-axol/can/reset_adapter.sh";
 /// `almond_axol.constants`), the only interfaces the reset script covers.
 const ARM_HUB_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
 
-/// Whether `iface` is an arm-hub channel, whose no-ACK reports mean the
-/// motors lost power ([`CanSock::watch_ack_errors`]). The Jelly wheel and
-/// chest buses run on CANable (candleLight) adapters, which report every
-/// unACKed attempt, including one the controller then retransmits fine: on
-/// the wheel bus the lift shares, one such report killed the lift's proxy
-/// mid-teleop while the wheels kept driving.
+/// The Mantis rig's channels (`CAN_MANTIS_LEFT` / `CAN_MANTIS_RIGHT`): the
+/// same dual-channel hub as the arms, so the same no-ACK reports.
+const MANTIS_HUB_IFACES: [&str; 2] = ["can_mantis_l", "can_mantis_r"];
+
+/// Whether `iface` is a dual-channel hub channel (arm or Mantis), whose
+/// no-ACK reports mean the motors lost power ([`CanSock::watch_ack_errors`]).
+/// The Jelly wheel and chest buses run on CANable (candleLight) adapters,
+/// which report every unACKed attempt, including one the controller then
+/// retransmits fine: on the wheel bus the lift shares, one such report killed
+/// the lift's proxy mid-teleop while the wheels kept driving.
 pub fn reports_no_ack(iface: &str) -> bool {
-    ARM_HUB_IFACES.contains(&iface)
+    ARM_HUB_IFACES.contains(&iface) || MANTIS_HUB_IFACES.contains(&iface)
 }
 
 fn is_tx_full(err: &io::Error) -> bool {
@@ -263,8 +267,8 @@ mod tests {
     }
 
     #[test]
-    fn only_arm_hub_channels_trust_no_ack_reports() {
-        for iface in ARM_HUB_IFACES {
+    fn only_hub_channels_trust_no_ack_reports() {
+        for iface in ARM_HUB_IFACES.into_iter().chain(MANTIS_HUB_IFACES) {
             assert!(reports_no_ack(iface));
         }
         // CANable adapters: the Jelly wheel bus (shared with the lift) and

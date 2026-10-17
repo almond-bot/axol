@@ -115,7 +115,8 @@ impl CanSock {
     /// [`Self::saw_ack_error`], which [`crate::safety::guarded_send`] turns
     /// into [`crate::safety::SendOutcome::Unacked`].
     ///
-    /// Only for arm-bus owners: other adapters' error reporting is not
+    /// Only for hub-channel owners (arm and Mantis, see
+    /// [`crate::safety::reports_no_ack`]): other adapters' error reporting is not
     /// relied on, and a socket that never opts in behaves exactly as before.
     pub fn watch_ack_errors(&self) -> io::Result<()> {
         let mask: u32 = CAN_ERR_ACK;
