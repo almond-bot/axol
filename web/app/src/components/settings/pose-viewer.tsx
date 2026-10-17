@@ -13,7 +13,7 @@ import { OrbitControls } from "@react-three/drei"
 import { Box3, Group, LoadingManager, Vector3 } from "three"
 import URDFLoader, { type URDFRobot } from "urdf-loader"
 import { Loader2 } from "lucide-react"
-import { apiUrl, urdfUrl } from "@/lib/supervisor"
+import { apiUrl, urdfUrl, type AxolModel, type GripperType } from "@/lib/supervisor"
 
 export interface JointLimits {
   [jointName: string]: { lower: number; upper: number }
@@ -26,16 +26,31 @@ interface LoadedModel {
   center: Vector3
   /** Rough model diameter, for camera placement. */
   size: number
+  /** Where the ground plane goes (three.js coords): the URDF's `floor` frame
+   *  when it has one (Axol Mobile), else the world origin. */
+  floor: Vector3
 }
 
 export default function PoseViewer({
   jointValues,
   onLoaded,
+  robotModel = "classic",
+  gripper = "parallel",
+  autoRotate = false,
+  distance = 1,
 }: {
   /** URDF joint name -> angle (rad). */
   jointValues: Record<string, number>
   /** Reports the movable joints' limits once the URDF is in. */
   onLoaded?: (limits: JointLimits) => void
+  /** Which Axol version's URDF to show. Fixed per mount: key the viewer by it. */
+  robotModel?: AxolModel
+  /** The fitted gripper (the mobile Axol has a URDF per gripper). Fixed per mount too. */
+  gripper?: GripperType
+  /** Slowly turn the model (a showcase turntable); dragging still orbits. */
+  autoRotate?: boolean
+  /** Camera distance, as a multiple of the default framing. */
+  distance?: number
 }) {
   const [model, setModel] = useState<LoadedModel | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -52,7 +67,7 @@ export default function PoseViewer({
     // serve host exposes that directory at /api/urdf.
     loader.packages = { assembly: apiUrl("/api/urdf") }
     let robot: URDFRobot | null = null
-    loader.load(urdfUrl(), (r) => {
+    loader.load(urdfUrl(robotModel, gripper), (r) => {
       robot = r
     })
     manager.onError = (url) => {
@@ -70,18 +85,20 @@ export default function PoseViewer({
       const box = new Box3().setFromObject(scene)
       const center = box.getCenter(new Vector3())
       const size = Math.max(box.getSize(new Vector3()).length(), 0.1)
+      const floor = new Vector3()
+      robot.links.floor?.getWorldPosition(floor)
       const limits: JointLimits = {}
       for (const [name, joint] of Object.entries(robot.joints)) {
         if (joint.jointType === "fixed") continue
         limits[name] = { lower: Number(joint.limit.lower), upper: Number(joint.limit.upper) }
       }
-      setModel({ scene, robot, center, size })
+      setModel({ scene, robot, center, size, floor })
       onLoadedRef.current?.(limits)
     }
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [robotModel, gripper])
 
   useEffect(() => {
     if (!model) return
@@ -107,9 +124,9 @@ export default function PoseViewer({
 
   const { center, size } = model
   const camPos: [number, number, number] = [
-    center.x + size * 0.9,
-    center.y + size * 0.45,
-    center.z + size * 0.9,
+    center.x + size * 0.9 * distance,
+    center.y + size * 0.45 * distance,
+    center.z + size * 0.9 * distance,
   ]
   return (
     <Canvas camera={{ position: camPos, fov: 40, near: size / 100, far: size * 20 }}>
@@ -117,8 +134,14 @@ export default function PoseViewer({
       <directionalLight position={[2, 4, 3]} intensity={1.6} />
       <directionalLight position={[-3, 2, -2]} intensity={0.5} />
       <primitive object={model.scene} />
-      <gridHelper args={[size * 2, 20, "#3a3a3a", "#242424"]} />
-      <OrbitControls target={center.toArray()} enableDamping makeDefault />
+      <gridHelper args={[size * 2, 20, "#3a3a3a", "#242424"]} position={model.floor.toArray()} />
+      <OrbitControls
+        target={center.toArray()}
+        enableDamping
+        makeDefault
+        autoRotate={autoRotate}
+        autoRotateSpeed={1.2}
+      />
     </Canvas>
   )
 }

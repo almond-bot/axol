@@ -45,15 +45,18 @@ import threading
 import time
 from typing import Any
 
+from dataclasses import replace
+
 import numpy as np
 from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-from ...constants import Joint
+from ...constants import AxolModel, Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
+from ...settings import resolve_gripper, resolve_robot_model
 from ...teleop.core import (
     TCPPoseSnapshot,
     VRTeleopCore,
@@ -119,6 +122,42 @@ class AxolVRTeleop(Teleoperator):
         self._ik_thread: threading.Thread | None = None
         self._ik_stop = threading.Event()
 
+        # Jelly (x-drive base + telescoping lift), operator-only
+        # mobility on robots that have one: the thumbsticks reposition the
+        # base/lift during a session, exactly as in native teleop. Whether the
+        # robot has Jelly is inferred from the CAN interfaces attached (see
+        # detect_jelly), gated by the jelly.wheels / jelly.lift switches. Jelly
+        # state is NOT part of the action/observation space — it is never
+        # recorded into the dataset and policies never control it.
+        jelly_cfg = detect_jelly(config.jelly)
+        self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
+
+        if config.kinematics_config.whole_body:
+            raise ValueError(
+                "whole-body IK is teleop-only (axol teleop --sim): recorded "
+                "datasets carry arm joints only, so a policy could not "
+                "reproduce base or lift motion"
+            )
+        # Enabling Jelly means this is the mobile Axol: the IK solver and the
+        # headset overlay use its URDF unless the kinematics config names one.
+        # Written back so the session's config records the version it ran.
+        config.kinematics_config = replace(
+            config.kinematics_config,
+            robot_model=resolve_robot_model(
+                config.kinematics_config.robot_model,
+                jelly_enabled=jelly_cfg is not None,
+                mount=config.kinematics_config.mount,
+            ).value,
+        )
+        # The mobile Axol has a URDF per gripper: solve with the fitted one.
+        if config.kinematics_config.robot_model == AxolModel.MOBILE.value:
+            config.kinematics_config = replace(
+                config.kinematics_config,
+                gripper=resolve_gripper(
+                    config.kinematics_config.gripper or config.vr_teleop_config.gripper
+                ),
+            )
+
         # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
         # in the shared core so this flow and native `axol teleop` (VRTeleop)
         # cannot drift apart.
@@ -128,6 +167,7 @@ class AxolVRTeleop(Teleoperator):
             self._broadcast_tracking,
             broadcast_mode=lambda key, value: self._live.on_changed(key, value),
             broadcast_json=self._broadcast_json,
+            robot_model=config.kinematics_config.robot_model,
         )
         # Live session settings (box mode, re-engage, reach, speed…) from the
         # headset HUD / control panel. This teleoperator never holds the robot
@@ -138,16 +178,6 @@ class AxolVRTeleop(Teleoperator):
         # VRTeleopCore.run_ik_loop / measured_arms); collect-data sets it
         # once it owns the hardware. None (the default) adds no lean.
         self.measured_robot: object | None = None
-
-        # Jelly (x-drive base + telescoping lift), operator-only
-        # mobility on robots that have one: the thumbsticks reposition the
-        # base/lift during a session, exactly as in native teleop. Whether the
-        # robot has Jelly is inferred from the CAN interfaces attached (see
-        # detect_jelly), gated by the jelly.wheels / jelly.lift switches. Jelly
-        # state is NOT part of the action/observation space — it is never
-        # recorded into the dataset and policies never control it.
-        jelly_cfg = detect_jelly(config.jelly)
-        self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).

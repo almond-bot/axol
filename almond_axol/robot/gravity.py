@@ -10,6 +10,12 @@ Gravity is evaluated by setting the joint positions on a MuJoCo model loaded
 from the bundled URDF and reading ``qfrc_bias`` with ``qvel=0`` (which equals
 the gravitational generalized force vector — Coriolis terms drop out).
 
+The model is always loaded from the classic URDF: every Axol version shares
+the same arm link frames, joint axes and (placeholder) inertials — the mobile
+URDF copies them verbatim, and ``tests/test_urdf_contract.py`` checks it — so
+gravity torques, and the ``mass`` / ``com`` parameters tuned for them, are the
+same on both versions.
+
 The bundled URDF has placeholder Onshape masses on every link (sub-gram
 values that are basically zero). The mass and centre-of-mass of each link is
 therefore overridden at load time from each :class:`JointConfig`'s ``mass``
