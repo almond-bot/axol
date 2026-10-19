@@ -12,9 +12,11 @@ Axol uses the pinned, installer-attested **survive-cli** build with
 Arbitrary PATH executables and separately installed ``pysurvive`` bindings are
 not selected because they are not covered by the native artifact manifest.
 
-Device keys are libsurvive codenames (``T20``, ``WM0``…), stable per
-physical device (derived from its serial), so the left/right binding
-saved by ``axol tracker.identify`` survives restarts.
+Device keys are the trackers' serial numbers (``LHR-E0FCD01B``), read from
+the ``<codename> CONFIG`` record libsurvive prints when a device connects.
+libsurvive's own codenames (``WM0``, ``WM1``…) name the Watchman dongle slot
+in the order the dongles were opened, so they can swap between runs; the
+left/right binding saved by ``axol tracker.identify`` must not follow them.
 """
 
 from __future__ import annotations
@@ -120,6 +122,9 @@ _LIVE_CHANNEL = re.compile(
 # Logged when a station's OOTX frame decodes and it is not the station the saved
 # calibration expected on that channel (or none was saved), naming it.
 _OOTX_PACKET = re.compile(r"Got OOTX packet (\d+) ([0-9a-fA-F]{1,8})\b")
+# The device's JSON config, recorded as ``<ts> <codename> CONFIG {...}`` when it
+# connects (before any of its poses).
+_DEVICE_SERIAL = re.compile(r'"device_serial_number"\s*:\s*"([^"]+)"')
 
 
 def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
@@ -643,6 +648,7 @@ class SurviveSource(TrackerSource):
         # sensor time. Mapping its relative clock still removes pipe/buffering
         # delay; label it receipt/output time rather than true capture time.
         output_clock = _OutputClockMapper()
+        serials: dict[str, str] = {}
         for line in self._proc.stdout:
             if self._stop.is_set():
                 break
@@ -660,9 +666,18 @@ class SurviveSource(TrackerSource):
             if lighthouse is not None:
                 self._note_lighthouse(*lighthouse)
                 continue
+            if len(parts) >= 3 and parts[2] == "CONFIG":
+                serial = _DEVICE_SERIAL.search(line)
+                if serial is not None:
+                    serials[parts[1]] = serial.group(1)
+                continue
             if len(parts) < 10 or parts[2] != "POSE":
                 continue
-            key = parts[1]
+            # A device whose serial is unknown cannot be told apart from the
+            # other tracker, so it is never published under a binding key.
+            key = serials.get(parts[1])
+            if key is None:
+                continue
             try:
                 output_time = float(parts[0])
                 vals = [float(v) for v in parts[3:10]]

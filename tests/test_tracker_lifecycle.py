@@ -220,6 +220,15 @@ class ManagedControlsTest(unittest.TestCase):
         self.assertTrue(captured_stop[0].is_set())
 
 
+def _device_configs():  # type: ignore[no-untyped-def]
+    """The CONFIG records survive-cli prints as each tracker connects."""
+    for codename, serial in (("T20", "LHR-00000020"), ("T21", "LHR-00000021")):
+        yield (
+            f'0.500 {codename} CONFIG {{ "device_class": "generic_tracker", '
+            f'"device_serial_number": "{serial}" }}\n'
+        )
+
+
 class SurviveLifecycleTest(unittest.TestCase):
     def test_pysurvive_uses_native_pose_epoch_on_host_monotonic_clock(self) -> None:
         source = SurviveSource()
@@ -439,6 +448,7 @@ class SurviveLifecycleTest(unittest.TestCase):
         source._cli_executable = Path("/attested/survive-cli")
 
         def lines():  # type: ignore[no-untyped-def]
+            yield from _device_configs()
             yield "1.000 T20 POSE 0 0 0 1 0 0 0\n"
             yield "2.000 T21 POSE 0 0 0 1 0 0 0\n"
             yield "3.000 T20 POSE 0 0 0 1 0 0 0\n"
@@ -458,9 +468,9 @@ class SurviveLifecycleTest(unittest.TestCase):
             source._run_cli()
 
         poses = source.poses()
-        self.assertAlmostEqual(poses["T20"].t, 13.03)
-        self.assertAlmostEqual(poses["T21"].t, 12.03)
-        self.assertFalse(poses["T20"].timestamp_is_capture)
+        self.assertAlmostEqual(poses["LHR-00000020"].t, 13.03)
+        self.assertAlmostEqual(poses["LHR-00000021"].t, 12.03)
+        self.assertFalse(poses["LHR-00000020"].timestamp_is_capture)
 
     @staticmethod
     def _survive_cli_stream(
@@ -572,6 +582,7 @@ class SurviveLifecycleTest(unittest.TestCase):
         )
 
         def lines():  # type: ignore[no-untyped-def]
+            yield from _device_configs()
             for k, output_time in enumerate(output_times):
                 yield f"{output_time:.3f} T2{k % 2} POSE 0 0 0 1 0 0 0\n"
             source._stop.set()
@@ -616,9 +627,13 @@ class SurviveLifecycleTest(unittest.TestCase):
         self.assertLessEqual(len(stale), 52)
         self.assertTrue(all(age <= 0.015 + 1e-9 for age in published[stale[-1] + 1 :]))
         poses = source.poses()
-        self.assertLessEqual(receipts[-1] - poses["T20"].t, TRACKER_POSE_MAX_AGE_S)
-        self.assertLessEqual(receipts[-1] - poses["T21"].t, TRACKER_POSE_MAX_AGE_S)
-        self.assertFalse(poses["T20"].timestamp_is_capture)
+        self.assertLessEqual(
+            receipts[-1] - poses["LHR-00000020"].t, TRACKER_POSE_MAX_AGE_S
+        )
+        self.assertLessEqual(
+            receipts[-1] - poses["LHR-00000021"].t, TRACKER_POSE_MAX_AGE_S
+        )
+        self.assertFalse(poses["LHR-00000020"].timestamp_is_capture)
 
     def test_start_selects_only_manifest_attested_cli(self) -> None:
         source = SurviveSource()

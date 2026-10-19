@@ -3,8 +3,8 @@ axol tracker.identify
 
 Bind discovered Vive trackers to the left/right Mantis rig sides.
 
-Trackers report under backend-native keys (a libsurvive codename like
-``T20``, an Ultimate tracker MAC) that say nothing about which rig they
+Trackers report under backend-native keys (a Lighthouse tracker serial like
+``LHR-E0FCD01B``, an Ultimate tracker MAC) that say nothing about which rig they
 are bolted to. This command discovers the powered-on trackers, then asks
 the operator to shake each rig in turn; the device with the most motion
 during the capture window is bound to that side. The binding (plus the

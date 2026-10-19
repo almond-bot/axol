@@ -36,7 +36,7 @@ Streams a hardware tracker backend's poses (and each side's trigger value) to th
 | Flag | Description |
 |---|---|
 | `--backend {survive,ultimate,synthetic,static}` | Tracker backend. Default: the saved config (`~/.almond/tracker/config.json`), else `survive`. `synthetic` streams generated motion; `static` holds fixed poses for standalone protocol tests without tracker hardware. |
-| `--left KEY` / `--right KEY` | Override the saved device binding (libsurvive codename like `T20`, or an Ultimate tracker MAC). |
+| `--left KEY` / `--right KEY` | Override the saved device binding (Lighthouse tracker serial like `LHR-E0FCD01B`, or an Ultimate tracker MAC). |
 | `--host HOST` | VR server host — the machine running teleop/collect-data. Default: `localhost`. |
 | `--port INT` | VR server port. Default: 8000. |
 | `--hz FLOAT` | Frame streaming rate. Default: 120. |
@@ -68,16 +68,18 @@ Saves `~/.almond/tracker/config.json`:
 ```json
 {
   "backend": "survive",
-  "left": "T20",
-  "right": "T21",
+  "left": "LHR-E0FCD01B",
+  "right": "LHR-BDD65467",
   "bindings": {
-    "survive": {"left": "T20", "right": "T21"},
+    "survive": {"left": "LHR-E0FCD01B", "right": "LHR-BDD65467"},
     "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
   },
   "ultimate_quat_order": "wxyz",
   "ultimate_up_axis": "z"
 }
 ```
+
+Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so earlier releases, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
 
 ## `axol tracker.pair`
 
@@ -171,7 +173,7 @@ Non-invasive dependency, USB, permission, binding, pose-convention, and redacted
 ```json
 {
   "left": {
-    "survive:T20": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
+    "survive:LHR-E0FCD01B": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
     "ultimate:AA:BB:CC:DD:EE:01": {
       "pos": [0.0, 0.0, 0.0],
       "quat": [0.0, 0.0, 0.0, 1.0],

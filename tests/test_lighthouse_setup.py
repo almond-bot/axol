@@ -218,3 +218,93 @@ class AlreadyPairedTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _config_line(codename: str, serial: str) -> str:
+    return (
+        f'0.5 {codename} CONFIG {{ "device_class": "generic_tracker", '
+        f'"device_serial_number": "{serial}" }}\n'
+    )
+
+
+class TrackerSerialKeyTest(unittest.TestCase):
+    def _poses(self, lines: list[str]) -> dict[str, TrackerPose]:
+        source = survive.SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+
+        def stream():  # type: ignore[no-untyped-def]
+            yield from lines
+            source._stop.set()
+
+        process = SimpleNamespace(stdout=stream(), poll=lambda: 0)
+        with patch.object(survive.subprocess, "Popen", return_value=process):
+            source._run_cli()
+        return source.poses()
+
+    def test_poses_follow_the_tracker_not_the_dongle_slot(self) -> None:
+        first = self._poses(
+            [
+                _config_line("WM0", "LHR-E0FCD01B"),
+                _config_line("WM1", "LHR-BDD65467"),
+                "1.0 WM0 POSE 0.1 0 0 1 0 0 0\n",
+                "1.0 WM1 POSE 0.2 0 0 1 0 0 0\n",
+            ]
+        )
+        # The next run opens the dongles in the other order: the codenames
+        # swap (seen on the AGX Orin), but each serial keeps its own pose.
+        second = self._poses(
+            [
+                _config_line("WM0", "LHR-BDD65467"),
+                _config_line("WM1", "LHR-E0FCD01B"),
+                "1.0 WM0 POSE 0.2 0 0 1 0 0 0\n",
+                "1.0 WM1 POSE 0.1 0 0 1 0 0 0\n",
+            ]
+        )
+
+        for poses in (first, second):
+            self.assertEqual(set(poses), {"LHR-E0FCD01B", "LHR-BDD65467"})
+            self.assertAlmostEqual(float(poses["LHR-E0FCD01B"].pos[0]), 0.1)
+            self.assertAlmostEqual(float(poses["LHR-BDD65467"].pos[0]), 0.2)
+
+    def test_a_device_without_a_serial_is_never_published(self) -> None:
+        poses = self._poses(["1.0 WM0 POSE 0 0 0 1 0 0 0\n"])
+        self.assertEqual(poses, {})
+
+
+class CodenameBindingMigrationTest(unittest.TestCase):
+    def test_codename_bindings_are_dropped_so_setup_asks_for_identify(self) -> None:
+        from almond_axol.tracker.config import load_tracker_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                '{"backend": "survive", "left": "WM1", "right": "WM0", '
+                '"bindings": {"survive": {"left": "WM1", "right": "WM0"}, '
+                '"ultimate": {"left": "aa:bb", "right": "cc:dd"}}}'
+            )
+            path.chmod(0o600)
+
+            config = load_tracker_config(path)
+            reloaded = load_tracker_config(path)
+
+        for loaded in (config, reloaded):
+            self.assertIsNone(loaded.left)
+            self.assertIsNone(loaded.right)
+            self.assertEqual(loaded.bindings["survive"], {"left": None, "right": None})
+            self.assertEqual(
+                loaded.bindings["ultimate"], {"left": "aa:bb", "right": "cc:dd"}
+            )
+
+    def test_serial_bindings_are_kept(self) -> None:
+        from almond_axol.tracker.config import load_tracker_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                '{"backend": "survive", "left": "LHR-E0FCD01B", '
+                '"right": "LHR-BDD65467"}'
+            )
+            path.chmod(0o600)
+            config = load_tracker_config(path)
+
+        self.assertEqual((config.left, config.right), ("LHR-E0FCD01B", "LHR-BDD65467"))

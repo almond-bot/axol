@@ -170,7 +170,7 @@ class TrackerSource(abc.ABC):
     """A backend producing per-device 6-DOF poses in the y-up convention.
 
     Device keys are backend-native, stable identifiers (a libsurvive
-    codename like ``T20``, an Ultimate tracker MAC). The operator binds
+    tracker serial like ``LHR-E0FCD01B``, an Ultimate tracker MAC). The operator binds
     them to the left/right rig sides once with ``axol tracker.identify``;
     the bridge then maps ``poses()[config.left]`` → ``l_ee`` etc.
     """
