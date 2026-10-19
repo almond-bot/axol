@@ -68,9 +68,9 @@ arms hold through the stall and then follow the current pose.
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
 jittery relay adds just enough to stay ahead of the bursts. Control-state fields
-(locks / reset / session state) are taken from the *latest* received frame, not
-the delayed playout, so engage/disengage/reset stay responsive while only the
-motion is smoothed.
+(locks / reset / session state, and a managed tracker's grips) are taken from
+the *latest* received frame, not the delayed playout, so engage/disengage/reset
+and the Mantis grippers stay responsive while only the motion is smoothed.
 
 Transports that don't stamp ``t`` (the USB link, or an older web build) degrade
 gracefully to the original latest-wins behaviour — capture time falls back to
@@ -982,7 +982,16 @@ def _build_frame(
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields
     are numerics we computed ourselves, so validation is pure overhead.
+
+    Grips from a managed tracker bridge are control state too: they are the
+    rig triggers' latest CAN reads, sampled independently of the tracker
+    pose, and Mantis recording pairs them with the newest tracker pose rather
+    than the delayed playout. Delaying and smoothing them like motion made the
+    grippers lag the triggers by the full playout delay, and left the recorded
+    grip command that far behind the recorded pose.
     """
+    if latest.pose_source_kind == "tracker":
+        l_grip, r_grip = latest.l_grip, latest.r_grip
     frame = VRFrame.model_construct(
         l_ee=VRPose.model_construct(
             position=VRPosition.model_construct(
