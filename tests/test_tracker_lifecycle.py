@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -576,6 +577,18 @@ class SurviveLifecycleTest(unittest.TestCase):
             source._stop.set()
 
         process = SimpleNamespace(stdout=lines(), poll=lambda: 0)
+        # The patch replaces time.perf_counter process-wide; hand the scripted
+        # receipts to this thread's _run_cli only, so a background thread left
+        # by another test can't consume one and exhaust the sequence.
+        real_perf_counter = time.perf_counter
+        scripted = iter(receipts)
+        reader = threading.get_ident()
+
+        def perf_counter() -> float:
+            if threading.get_ident() == reader:
+                return next(scripted)
+            return real_perf_counter()
+
         with (
             patch(
                 "almond_axol.tracker.survive.subprocess.Popen",
@@ -583,7 +596,7 @@ class SurviveLifecycleTest(unittest.TestCase):
             ),
             patch(
                 "almond_axol.tracker.survive.time.perf_counter",
-                side_effect=receipts,
+                side_effect=perf_counter,
             ),
             patch.object(source, "_publish", wraps=source._publish) as publish,
         ):
