@@ -85,7 +85,12 @@ Pairs one VIVE Tracker 3.0 with its Watchman dongle through `survive-cli --pair-
 
 ## `axol tracker.install`
 
-Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0`: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
+Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0` with two fixes applied on top: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. The fixes ship in the package (`almond_axol/tracker/libsurvive_patches/`, each with a regression test in libsurvive's own suite):
+
+- **Timestamps across the tracker clock rollover.** The tracker's 48 MHz clock wraps every ~89 s; a laser measurement taken just before the wrap was stamped ~350 ms in the future, which could stall pose output while tracker data kept arriving.
+- **Base-station identity through every tracker.** Each base station's OOTX broadcast (its identity and calibration) was decoded only through the first tracker that saw it; if that tracker received it poorly, the other tracker's clean copy was ignored and calibration could stall. Every tracker now decodes it, and the first valid packet wins.
+
+A build from before these fixes is rebuilt, not re-attested. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
 
 ```bash
 axol tracker.install
@@ -98,6 +103,8 @@ sudo apt install build-essential cmake zlib1g-dev libx11-dev libusb-1.0-0-dev \
                  freeglut3-dev liblapacke-dev libhidapi-dev libudev-dev
 git clone https://github.com/collabora/libsurvive.git && cd libsurvive
 git checkout f1e6eddb669320f2a30760f4b42936bdb4306da0
+# Axol's fixes, from the installed almond_axol package
+git apply /path/to/almond_axol/tracker/libsurvive_patches/*.patch
 # udev rules so the trackers are readable without root
 sudo cp ./useful_files/81-vive.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger

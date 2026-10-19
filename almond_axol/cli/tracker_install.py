@@ -26,12 +26,19 @@ _logger = logging.getLogger(__name__)
 
 _REPO_URL = "https://github.com/collabora/libsurvive.git"
 _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
-# Bump this whenever build options change so existing installations are rebuilt.
-_BUILD_REVISION = "libusb-v2-runtime-attestation"
-# Earlier revisions compiled with the same CMake options as the current one.
-# A build cache stamped with any of these holds byte-identical artifacts, so a
-# stale machine manifest only needs re-attesting rather than a native rebuild.
-_REATTESTABLE_BUILD_REVISIONS = frozenset({_BUILD_REVISION, "libusb-v1"})
+# Fixes carried on top of the pinned commit, applied in name order after every
+# checkout (see the patch headers): lightcap timestamps across the 32-bit
+# device clock rollover, and OOTX decoding through every tracker that sees a
+# base station.
+_PATCH_DIR = Path(__file__).resolve().parent.parent / "tracker" / "libsurvive_patches"
+# Bump this whenever build options or the patch set change so existing
+# installations are rebuilt.
+_BUILD_REVISION = "libusb-v3-axol-patches-1"
+# Earlier revisions compiled to byte-identical artifacts (same CMake options,
+# same patches). A build cache stamped with any of these only needs a stale
+# machine manifest re-attested rather than a native rebuild. Builds before
+# libusb-v3 lack the patches, so they are rebuilt.
+_REATTESTABLE_BUILD_REVISIONS = frozenset({_BUILD_REVISION})
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
 _MACHINE_STAMP = Path("/var/lib/almond/libsurvive-build-stamp")
@@ -178,7 +185,21 @@ def _sync_source(src: Path) -> bool:
         _run([git, "checkout", "--quiet", _PINNED_REF], cwd=src)
         and _run([git, "reset", "--hard", _PINNED_REF], cwd=src)
         and _run([git, "clean", "-fdq"], cwd=src)
+        and _apply_patches(git, src)
     )
+
+
+def _patches() -> tuple[Path, ...]:
+    return tuple(sorted(_PATCH_DIR.glob("*.patch")))
+
+
+def _apply_patches(git: str, src: Path) -> bool:
+    """Apply the carried fixes to a clean checkout of the pinned commit."""
+    patches = _patches()
+    if not patches:
+        _logger.warning("libsurvive patches are missing from %s", _PATCH_DIR)
+        return False
+    return _run([git, "apply", "--whitespace=nowarn", *map(str, patches)], cwd=src)
 
 
 def _build_and_install(src: Path) -> bool:
