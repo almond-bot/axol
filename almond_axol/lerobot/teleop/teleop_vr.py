@@ -1225,6 +1225,20 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.last_tcp_snapshot
 
+    def recording_pose_snapshot(self) -> TCPPoseSnapshot | None:
+        """The pose sample Mantis data collection records this tick.
+
+        While a managed tracker drives an engaged session this is the newest
+        received tracker frame mapped through the engage calibration, stamped
+        with its original capture time (see
+        :meth:`VRTeleopCore.calibrated_pose_snapshot`), so recording never
+        waits on the IK solve. Otherwise it is :meth:`tcp_pose_snapshot`.
+        """
+        server = self._vr_server
+        frame = server.get_frame() if server is not None else None
+        snapshot = self._core.calibrated_pose_snapshot(frame)
+        return snapshot if snapshot is not None else self._core.last_tcp_snapshot
+
     def tcp_last_change_ts(self) -> float | None:
         """Monotonic time the tracked TCP pose last took a *new* value.
 

@@ -43,6 +43,7 @@ import numpy as np
 
 from ..constants import ARM_JOINTS, Joint
 from ..robot.control import ContactWatchdog
+from .absolute_pose import AbsoluteCalibration
 from .config import VRTeleopConfig
 from .filter import (
     AlphaSmoothFilter,
@@ -154,6 +155,21 @@ class TCPPoseSnapshot:
             right=tuple(tcp["right"]),
             out_of_reach=tuple(tcp.get("out_of_reach") or ()),
         )
+
+
+def _split_calibration(
+    base_msg: object,
+) -> tuple[object, AbsoluteCalibration | None]:
+    """Separate the worker's engage calibration from an absolute base message.
+
+    The rest of the base message is broadcast to the headset's URDF overlay
+    as is, so the calibration (see ``IKWorker.absolute_reply_base_msg``) is
+    removed from a copy rather than passed along.
+    """
+    if not isinstance(base_msg, dict) or "calibration" not in base_msg:
+        return base_msg, None
+    rest = dict(base_msg)
+    return rest, AbsoluteCalibration.from_message(rest.pop("calibration"))
 
 
 def _is_absolute_reply(result: object) -> bool:
@@ -318,6 +334,11 @@ class VRTeleopCore:
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
+        # Absolute (Mantis) mode: the calibration behind the active engage fit,
+        # as the IK worker applies it. Present only while the worker reports an
+        # active fit; Mantis recording maps raw tracker poses through it (see
+        # calibrated_pose_snapshot).
+        self.abs_calibration: AbsoluteCalibration | None = None
         # Last engage rejection reason the IK worker reported (logged once per
         # distinct reason; see _handle_engage_rejection).
         self._last_engage_rejection: str | None = None
@@ -1998,11 +2019,14 @@ class VRTeleopCore:
                     if _is_absolute_reply(result):
                         _, q_arr, base_msg, tcp_msg = result
                         self.set_target(q_arr)
+                        base_msg, calibration = _split_calibration(base_msg)
                         if self._handle_engage_rejection(base_msg):
                             # The worker refused the base fit; no anchor exists,
                             # so the arms hold and the operator must re-engage.
                             base_msg = None
+                            calibration = None
                         self.abs_base = base_msg
+                        self.abs_calibration = calibration
                         pose_host_ts = getattr(frame, "t_host", None)
                         self._publish_tcp_pose(tcp_msg, pose_host_ts)
                         self._maybe_broadcast_urdf_state()
@@ -2063,6 +2087,52 @@ class VRTeleopCore:
             self.last_tcp_change_ts = time.perf_counter()
         # This single reference write is the synchronization point for readers.
         self.last_tcp_snapshot = snapshot
+
+    def calibrated_pose_snapshot(self, frame: object) -> TCPPoseSnapshot | None:
+        """Map a raw managed-tracker frame into the base frame at its capture time.
+
+        Mantis recording reads this instead of :attr:`last_tcp_snapshot`: the
+        IK path publishes a pose only after its solve returns, and stamps it
+        with the interpolator's playout instant, so a fresh tracker pose could
+        already be on hand while the recorded one was still the older,
+        processed sample (and stale-pose QA rejected the take). The tracker
+        bridge stamps each frame with its poses' host capture time, which is
+        kept as is.
+
+        ``None`` unless both arms are engaged under a calibration the worker
+        still reports as active, the frame comes from a managed tracker, and
+        both sides are tracked; callers then fall back to the IK snapshot.
+        """
+        calibration = self.abs_calibration
+        if (
+            calibration is None
+            or frame is None
+            or not (self.left_enabled and self.right_enabled)
+            or getattr(frame, "pose_source_kind", None) != "tracker"
+            or getattr(frame, "t", None) is None
+            or not (frame.l_tracked and frame.r_tracked)
+            or not all(self.last_tracking.values())
+        ):
+            return None
+        poses = []
+        for ee, side in ((frame.l_ee, "left"), (frame.r_ee, "right")):
+            pos = np.array([ee.position.x, ee.position.y, ee.position.z])
+            quat = np.array(
+                [ee.quaternion.x, ee.quaternion.y, ee.quaternion.z, ee.quaternion.w]
+            )
+            if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+                return None
+            if np.linalg.norm(quat) < 1e-6:
+                return None
+            poses.append(calibration.base_pose(side, pos, quat))
+        previous = self.last_tcp_snapshot
+        return TCPPoseSnapshot(
+            pose_host_ts=float(frame.t) / 1000.0,
+            left=poses[0],
+            right=poses[1],
+            # Reach is judged on the IK target; carry the latest verdict.
+            out_of_reach=previous.out_of_reach if previous is not None else (),
+        )
 
     def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
         """Push the joint state and pair status to the headset, throttled.

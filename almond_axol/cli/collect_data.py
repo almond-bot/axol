@@ -902,6 +902,25 @@ class EpisodeQAStats:
         )
 
 
+def _newer_pose(
+    snapshot: TCPPoseSnapshot | None, previous: TCPPoseSnapshot | None
+) -> bool:
+    """Whether ``snapshot`` should replace ``previous`` as the recorded pose.
+
+    Falling back from the calibrated tracker pose to the IK snapshot (on a
+    disengage) hands back an older capture; recording it would step the row
+    timestamps backwards, which the recorder's snapshot ring cannot bracket.
+    Keep the newer sample until the IK path catches up.
+    """
+    if snapshot is None:
+        return False
+    if previous is None or previous.pose_host_ts is None:
+        return True
+    if snapshot.pose_host_ts is None:
+        return False
+    return snapshot.pose_host_ts >= previous.pose_host_ts
+
+
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     """Quality verdict for a recorded episode: ``(ok, reasons)``.
 
@@ -2073,9 +2092,11 @@ def _run_session(
             if mantis_mode:
                 # Pose and host capture time are one immutable sample. Reading
                 # them through separate accessors could straddle an IK publish
-                # and stamp pose N+1 with pose N's timestamp.
-                tcp_snapshot = teleop.tcp_pose_snapshot()
-                if tcp_snapshot is not None:
+                # and stamp pose N+1 with pose N's timestamp. While engaged on
+                # a managed tracker this is the calibrated tracker pose at its
+                # own capture time, not the IK path's older processed pose.
+                tcp_snapshot = teleop.recording_pose_snapshot()
+                if _newer_pose(tcp_snapshot, last_tcp):
                     last_tcp = tcp_snapshot
                 pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
                 if pose_ts is not None:
