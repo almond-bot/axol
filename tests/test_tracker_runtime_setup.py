@@ -260,14 +260,21 @@ class LighthousePatchTest(unittest.TestCase):
         patches = tracker_install._patches()  # noqa: SLF001
         names = [path.name for path in patches]
 
-        self.assertEqual(len(patches), 2)
+        self.assertEqual(len(patches), 4)
         self.assertTrue(names[0].startswith("0001-driver_vive-"))
         self.assertTrue(names[1].startswith("0002-ootx-"))
+        self.assertTrue(names[2].startswith("0003-fix-correct-MPFIT-covariance"))
+        self.assertTrue(names[3].startswith("0004-recording-line-buffer"))
         for path in patches:
-            text = path.read_text()
-            self.assertIn("diff --git", text)
-            # Every fix carries the regression test that reproduces it.
-            self.assertIn("src/test_cases/", text)
+            self.assertIn("diff --git", path.read_text())
+        # Axol's own fixes carry the regression test that reproduces them;
+        # 0003 is upstream's commit, backported verbatim.
+        for path in patches[:2]:
+            self.assertIn("src/test_cases/", path.read_text())
+        self.assertIn(
+            "(cherry picked from commit df22f2d6be34cb54d43c46e8838eae8b326b88ff)",
+            patches[2].read_text(),
+        )
 
     def test_sync_applies_every_patch_after_a_clean_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,7 +1,7 @@
 From c5bd923096722cd27ef0d31555e0d4f5d06b6255 Mon Sep 17 00:00:00 2001
 From: Shawn Patel <shawn@almondbot.com>
 Date: Mon, 19 Oct 2026 17:28:15 +0000
-Subject: [PATCH 1/2] driver_vive: keep lightcap timestamps right across the
+Subject: [PATCH 1/4] driver_vive: keep lightcap timestamps right across the
  32-bit clock rollover
 
 fix_time24 extended 24-bit lightcap times against the IMU reference
