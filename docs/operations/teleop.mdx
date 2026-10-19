@@ -103,7 +103,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 | 7 | Y | **Exit AR** — closes the VR session (the arms return to rest on the way out) |
 
 <Note>
-  **Per-arm engage.** From rest, press both grips together to start moving the arms. After that each grip is independent: a click **toggles just that arm** between tracking and frozen — a frozen arm holds its pose and keeps its gripper where it is (handy for steadying a grasped object) while the other keeps tracking. Prefer a hold instead of a toggle? Turn on **Hold grips to engage** (`--teleop.hold_to_engage`): hold both grips to start, release one to freeze that arm, keep holding to keep it going. Either way a forced disengage (reset, contact stop, or dropped link) drops both arms and needs a deliberate both-grips re-engage.
+  **Per-arm engage.** From rest, press both grips together to start moving the arms. After that each grip is independent: a click **toggles just that arm** between tracking and frozen — a frozen arm holds its pose and keeps its gripper where it is (handy for steadying a grasped object) while the other keeps tracking. A forced disengage (reset, contact stop, or dropped link) drops both arms and needs a deliberate both-grips re-engage. Prefer a hold instead of a toggle? Turn on **Hold grips to engage** (`--teleop.hold_to_engage`): each arm moves exactly while you hold its own grip — either grip alone engages its arm, from rest too — and releasing a grip freezes that arm where it is. After a forced disengage, release a grip you were still holding before it engages again.
 </Note>
 
 <Note>
@@ -111,7 +111,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 6 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
+  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and then, with **Park to zero on stop** (`--teleop.park_to_zero`, on by default), on to the all-zero joint pose, hanging straight down, holding whatever grasp was commanded; only then are the motors torqued off, so nothing drops under gravity on the way out. Both legs are the guarded return described above, capped at 6 s (rest) and 10 s (zero); if a leg runs out of time or hits something, the arms are torqued off where they are, and a second `Ctrl+C` aborts the park where it is. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when a contact hold has left the arms limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions. Turn **Park to zero on stop** off to stop at the rest pose.
 </Note>
 
 <Note>

@@ -119,6 +119,10 @@ _BOX_EXIT_MARGIN_S = 0.25
 # a frame gap under load; far shorter than the walk from the panel to the
 # headset.
 _AUTO_ENGAGE_WINDOW_S = 1.0
+# Largest gap (rad, any arm joint) a shutdown park accepts between the planned
+# zero-leg trajectory's ends and the pose it was planned from / its goal. A
+# plan outside it is refused rather than played (``_check_park_plan``).
+_PARK_PLAN_TOLERANCE_RAD = 0.05
 
 
 def _sticks_neutral(frame: object) -> bool:
@@ -383,6 +387,12 @@ class VRTeleopCore:
         # always deliberate; cleared once engaged, so an operator who froze
         # both arms mid-task can resume either with a single click.
         self._require_both_engage: bool = True
+        # Dead-man scheme (``config.hold_to_engage``): a grip that was held
+        # when a forced disengage landed (reset, stale stream, contact) must
+        # be released once before it can engage its arm again, so an arm
+        # never resumes on its own the moment the disengage lifts.
+        self._l_inhibit: bool = False
+        self._r_inhibit: bool = False
         # Absolute tracker poses can snap when optical tracking returns. A
         # lost side therefore freezes both arms and blocks re-engagement until
         # the core itself has consumed a fully released frame followed by a
@@ -464,6 +474,19 @@ class VRTeleopCore:
         # round trip can't be interrupted, so the dispatch drops its result
         # instead of adopting a trajectory the caller no longer wants.
         self._reset_cancel: bool = False
+        # Shutdown park (see :meth:`begin_park`). While set, the owner's park
+        # owns the arms: headset reset presses and grips are ignored, every
+        # reset leg plays with the grippers held at the grasp that was
+        # commanded when the park began (``_park_grippers``), and
+        # ``_reset_goal`` selects whether the next latched reset plans to the
+        # rest pose or to all-zero joints (:meth:`request_zero`).
+        self._parking: bool = False
+        self._park_grippers: tuple[float, float] | None = None
+        self._reset_goal: str = "rest"
+        # Why the last reset dispatch failed to adopt a plan (``None`` while
+        # none has): a park reads it after each leg, since the guarded
+        # return cannot tell a refused plan from a finished move.
+        self.reset_error: str | None = None
 
         # IK pipeline pause (set while the arms are moved out-of-band, e.g.
         # hand-guided under gravity compensation). While paused the IK loop
@@ -511,6 +534,13 @@ class VRTeleopCore:
         self, q_init: np.ndarray, left_indices: list[int], right_indices: list[int]
     ) -> None:
         """Adopt the IK worker's initial solution + per-arm joint index maps."""
+        if self._parking:
+            # A fresh worker handshake (a disconnected session enabled again)
+            # is the only exit from shutdown-park mode.
+            self._parking = False
+            self._park_grippers = None
+            self._reset_goal = "rest"
+            self.reset_error = None
         self._hold_target(np.asarray(q_init, dtype=np.float32))
         self.left_indices = left_indices
         self.right_indices = right_indices
@@ -586,13 +616,50 @@ class VRTeleopCore:
         :meth:`_maybe_disengage_stale`).
         """
         self._last_frame_time = time.perf_counter()
-        if reset and not self._prev_reset:
+        if reset and not self._prev_reset and not self._parking:
             self._reset_latched = True
         self._prev_reset = reset
 
     def request_reset(self) -> None:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
+        self._reset_goal = "rest"
         self._reset_latched = True
+
+    def begin_park(self) -> None:
+        """Enter shutdown-park mode (the owner, before its teardown park).
+
+        From here until a fresh worker handshake (:meth:`set_solution`) the
+        park owns the arms: tracking is disengaged, the grips and the
+        headset's reset button are ignored, and every reset leg the owner
+        latches (:meth:`request_reset`, then :meth:`request_zero`) plays
+        with the grippers held at their last *commanded* value instead of
+        ramping open — a parked arm may still be holding something, and the
+        grasp force lives in the commanded-vs-measured gap, so the snapshot
+        is taken once, here, from the command stream. Safe from any thread.
+        """
+        last = self._last_cmd
+        if last is not None:
+            self._park_grippers = (float(last[7]), float(last[15]))
+        else:
+            self._park_grippers = (float(self.l_grip), float(self.r_grip))
+        self._parking = True
+
+    def request_zero(self) -> None:
+        """Latch a collision-aware move of both arms to all-zero joints.
+
+        The second leg of the shutdown park, once :meth:`request_reset` has
+        brought the arms home. Only valid in shutdown-park mode: zero is a
+        torque-off pose, not a teleop one. Safe from any thread.
+        """
+        if not self._parking:
+            raise RuntimeError("request_zero() needs begin_park() first")
+        self._reset_goal = "zero"
+        self._reset_latched = True
+
+    @property
+    def is_parking(self) -> bool:
+        """True from :meth:`begin_park` until a fresh worker handshake."""
+        return self._parking
 
     @property
     def box_available(self) -> bool:
@@ -701,6 +768,7 @@ class VRTeleopCore:
         so no new dispatch can start, then this. Safe from any thread.
         """
         self._reset_latched = False
+        self._reset_goal = "rest"
         self._reset_cancel = True
         self.reset_interp.clear()
 
@@ -857,6 +925,8 @@ class VRTeleopCore:
         self._prev_l_lock = False
         self._prev_r_lock = False
         self._require_both_engage = True
+        self._l_inhibit = True
+        self._r_inhibit = True
         self._engage_time = None
         if self._box_leader is not None:
             self._box_sticks_held = True
@@ -1064,17 +1134,20 @@ class VRTeleopCore:
     def update_engage(self, frame: object) -> None:
         """Advance the per-arm engage state and grip tracking for one VR frame.
 
-        From rest — and after any forced disengage (reset, stale stream,
-        contact) — both grips together are required to engage, and both arms
-        start tracking. Once engaged, grips act per-arm:
+        Toggle scheme (default): from rest — and after any forced disengage
+        (reset, stale stream, contact) — both grips together are required to
+        engage, and both arms start tracking. Once engaged, a rising edge on
+        a grip toggles *that* arm between tracking and frozen. A frozen arm
+        holds its pose and gripper while the other keeps tracking; a click
+        re-engages it.
 
-          - Toggle scheme (default): a rising edge on a grip toggles *that*
-            arm between tracking and frozen. A frozen arm holds its pose and
-            gripper while the other keeps tracking; a click re-engages it.
-          - Dead-man scheme (``config.hold_to_engage``): each arm tracks only
-            while its grip is held; releasing a grip freezes that arm, and
-            releasing both disengages the session (both grips must be held
-            again to resume).
+        Dead-man scheme (``config.hold_to_engage``): the grips are
+        independent per arm, including from rest. Each arm tracks exactly
+        while its own grip is held — either grip alone engages its arm —
+        and releasing a grip freezes that arm (pose and gripper) where it
+        is. A grip still held when a forced disengage lands is inhibited
+        until it is released once, so an arm never resumes on its own the
+        moment the disengage lifts.
 
         In **box mode** (:attr:`box_mode`) the arms only ever move as a pair
         and a single grip drives them — see :meth:`_update_engage_box`.
@@ -1087,6 +1160,11 @@ class VRTeleopCore:
         still-engaged session is disengaged); afterwards a fully released
         frame must arrive before the both-grips engage is accepted again.
         """
+        if self._parking:
+            # The shutdown park owns the arms: no live changes, no engage.
+            if self.teleop_enabled:
+                self._disengage_all("Teleop disabled (parking)")
+            return
         self._apply_live_requests()
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
@@ -1120,23 +1198,26 @@ class VRTeleopCore:
         was_right = self.right_enabled
         was_enabled = was_left or was_right
 
-        if not was_enabled and (
-            self._require_both_engage or self.config.hold_to_engage
-        ):
-            # Engage gate: both grips together. Rising-edge in toggle mode so
-            # a held-over press can't re-engage; level-triggered in hold mode
-            # (the operator is *holding*, there is no release to edge on).
-            engage = (
-                both if self.config.hold_to_engage else (both and not self._prev_both)
-            )
-            if engage:
+        if self.config.hold_to_engage:
+            # Dead-man, per arm: each arm tracks exactly while its own grip
+            # is held, and either grip alone engages its arm (from rest
+            # too). A grip held through a forced disengage stays inhibited
+            # until it is released once (see _disengage_all).
+            if not l_lock:
+                self._l_inhibit = False
+            if not r_lock:
+                self._r_inhibit = False
+            self.left_enabled = l_lock and not self._l_inhibit
+            self.right_enabled = r_lock and not self._r_inhibit
+            if self.left_enabled or self.right_enabled:
+                self._require_both_engage = False
+        elif not was_enabled and self._require_both_engage:
+            # Engage gate (toggle scheme): both grips together, rising-edge
+            # so a held-over press can't re-engage.
+            if both and not self._prev_both:
                 self.left_enabled = True
                 self.right_enabled = True
                 self._require_both_engage = False
-        elif self.config.hold_to_engage:
-            # Dead-man: each arm tracks exactly while its grip is held.
-            self.left_enabled = l_lock
-            self.right_enabled = r_lock
         else:
             # Toggle: a rising edge on a grip flips that arm. Also reached
             # fully-disengaged when the operator froze both arms themselves
@@ -1442,6 +1523,36 @@ class VRTeleopCore:
         if u <= 0.0:
             return start.copy()
         return (start + u * (end - start)).astype(np.float32)
+
+    def _check_park_plan(
+        self,
+        q_plan: np.ndarray,
+        q_goal: np.ndarray,
+        q_default: object,
+        trajectory: object,
+    ) -> list[np.ndarray]:
+        """Validate a zero-leg plan before it is played (IK thread).
+
+        The zero pose is a torque-off pose, so a plan that does not honour
+        it, or that does not start where the arms are and end at the goal,
+        is refused (``ValueError``) rather than played — the owner's park
+        then stops at rest and reports :attr:`reset_error`.
+        """
+        idx = list(self.left_indices) + list(self.right_indices)
+        goal = np.asarray(q_default, dtype=np.float32)
+        if goal.shape != q_goal.shape or not np.allclose(goal, q_goal, atol=1e-6):
+            raise ValueError("park planner did not honour the zero goal")
+        waypoints = [np.asarray(q, dtype=np.float32) for q in trajectory] or [goal]
+        if any(q.shape != q_plan.shape or not np.isfinite(q).all() for q in waypoints):
+            raise ValueError("park planner returned an invalid trajectory")
+        start_gap = float(np.max(np.abs(waypoints[0][idx] - q_plan[idx])))
+        end_gap = float(np.max(np.abs(waypoints[-1][idx] - goal[idx])))
+        if max(start_gap, end_gap) > _PARK_PLAN_TOLERANCE_RAD:
+            raise ValueError(
+                "park plan is incomplete "
+                f"(start gap {start_gap:.3f} rad, end gap {end_gap:.3f} rad)"
+            )
+        return waypoints
 
     def _hold_target(self, q: np.ndarray) -> None:
         """Adopt ``q`` as a stationary target (reset/startup adoption paths)."""
@@ -1830,6 +1941,10 @@ class VRTeleopCore:
             ):
                 self._reset_latched = False
                 self._reset_cancel = False
+                goal = self._reset_goal
+                self._reset_goal = "rest"
+                hold = self._park_grippers if self._parking else None
+                self.reset_error = None
                 if self.box_mode:
                     # Going home leaves box mode: the arms come back as two
                     # arms, and the next engage is a deliberate one.
@@ -1856,7 +1971,16 @@ class VRTeleopCore:
                     if pos_r is not None and self.right_indices:
                         q_plan[self.right_indices] = pos_r
                     self._hold_target(q_plan)
-                    conn.send(("reset", q_plan.copy()))
+                    q_goal: np.ndarray | None = None
+                    if goal == "zero":
+                        # Shutdown park's second leg: an explicit all-zero
+                        # goal for the same collision-aware planner.
+                        q_goal = q_plan.copy()
+                        q_goal[self.left_indices] = 0.0
+                        q_goal[self.right_indices] = 0.0
+                        conn.send(("reset", q_plan.copy(), q_goal.copy()))
+                    else:
+                        conn.send(("reset", q_plan.copy()))
                     result = conn.recv()
                     if self._reset_cancel:
                         # cancel_reset() fired mid-planning: drop the plan —
@@ -1865,14 +1989,28 @@ class VRTeleopCore:
                         pass
                     elif isinstance(result, tuple) and result[0] == "reset_traj":
                         _, q_default, trajectory = result
+                        if q_goal is not None:
+                            trajectory = self._check_park_plan(
+                                q_plan, q_goal, q_default, trajectory
+                            )
+                        if hold is not None:
+                            # Shutdown park: the grippers stay at the grasp
+                            # that was commanded when the park began.
+                            self.l_grip, self.r_grip = hold
                         if trajectory:
                             self.reset_interp.set_trajectory(
-                                trajectory, self.l_grip, self.r_grip
+                                trajectory,
+                                self.l_grip,
+                                self.r_grip,
+                                hold_grippers=hold is not None,
                             )
                             self._disengage_all()
                             self._at_rest = True
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
+                    elif q_goal is not None:
+                        raise ValueError(f"unexpected park planner reply: {result!r}")
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
+                    self.reset_error = str(e)
                     self._logger.error("Reset error: %s", e)
                 finally:
                     self._reset_dispatching = False

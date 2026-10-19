@@ -86,7 +86,7 @@ The headset only shows feeds that are actually being streamed (set under [the Ax
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | From rest, press both grips (1 + 2) together to **engage** tracking. Once engaged, each grip **toggles its own arm** — click to freeze that arm in place (holding its pose *and* its grasp, e.g. to keep a held object steady) and click again to resume it. With the **Hold grips to engage** setting the grips are **dead-man** switches instead: hold both to start, release one to freeze that arm, keep holding to keep it going |
+| 1 | Left grip | From rest, press both grips (1 + 2) together to **engage** tracking. Once engaged, each grip **toggles its own arm** — click to freeze that arm in place (holding its pose *and* its grasp, e.g. to keep a held object steady) and click again to resume it. With the **Hold grips to engage** setting the grips are **per-arm dead-man** switches instead: hold a grip to move that arm (either grip alone, from rest too), release it to freeze that arm, hold again to resume it |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
@@ -101,7 +101,7 @@ The headset only shows feeds that are actually being streamed (set under [the Ax
 | — | Both thumbsticks (click together) | Toggle [**box mode**](#box-mode) — the controller shortcut for the HUD's **Box** button |
 
 <Note>
-  **Engaging and freezing arms.** Tracking always *starts* with both grips together from rest. Once engaged, the grips act **per arm**: a click freezes only that arm — it holds its pose and keeps its gripper where it is, so it can steady a grasped object while the other arm keeps working — and another click resumes it. A forced disengage (a reset, a [contact stop](/operations/teleop), or a dropped link) drops **both** arms and needs a deliberate both-grips re-engage. Prefer a dead-man feel? Turn on **Hold grips to engage** (the `hold_to_engage` setting, or `--teleop.hold_to_engage`) and each arm tracks only while you hold its grip.
+  **Engaging and freezing arms.** Tracking *starts* with both grips together from rest. Once engaged, the grips act **per arm**: a click freezes only that arm — it holds its pose and keeps its gripper where it is, so it can steady a grasped object while the other arm keeps working — and another click resumes it. A forced disengage (a reset, a [contact stop](/operations/teleop), or a dropped link) drops **both** arms and needs a deliberate both-grips re-engage. Prefer a dead-man feel? Turn on **Hold grips to engage** (the `hold_to_engage` setting, or `--teleop.hold_to_engage`): each arm tracks exactly while you hold its own grip — either grip alone engages its arm, from rest too — and after a forced disengage a grip you were still holding must be released once before it engages again.
 </Note>
 
 <Note>
@@ -198,7 +198,7 @@ A few settings are worth changing *during* a session rather than restarting for.
 |---|---|
 | **Box mode** | One controller drives both arms as a parallel pair ([above](#box-mode)). Also: both stick clicks |
 | **Re-engage** | *clutch* / *ramp* — who moves when a grip re-engages ([above](#re-engaging)) |
-| **Hold to engage** | Grips as dead-man switches instead of toggles |
+| **Hold to engage** | Grips as per-arm dead-man switches instead of toggles |
 | **Elbows out** (°) | Box mode: how far out the elbows are held, 0 (hanging under the shoulder-wrist line) to 90 (level); the sticks' forward/back jogs it live ([above](#box-mode)) |
 | **Squeeze lean** (×) | Box mode: how much each gripper leans into the box as the squeeze builds so the clamp presses evenly on the parcel gripper's facet and tip ([above](#box-mode)); 1 = the arm model, 0 = off. Hardware only |
 | **Squeeze trim** (°) | Box mode: the most extra inward yaw the trim may add while the grippers press, closing on the measured faces parallel to the box ([above](#box-mode)); 0 = off. Hardware only |

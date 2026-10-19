@@ -1609,8 +1609,10 @@ export default function ControlPanel() {
     if (generation !== connectionGenerationRef.current) return false
     setSession(stopped)
     // Bounded so an unkillable op (abandoned server-side) can't wedge the UI;
-    // we proceed best-effort after the deadline.
-    const deadline = Date.now() + 30_000
+    // we proceed best-effort after the deadline. Long enough for teleop /
+    // collect-data's shutdown park (rest, then zero: up to ~20 s before the
+    // server even starts force-killing) plus the dataset finalize.
+    const deadline = Date.now() + 60_000
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500))
       if (generation !== connectionGenerationRef.current) return false
