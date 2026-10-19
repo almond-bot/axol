@@ -32,12 +32,14 @@ _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
 # station, upstream's MPFIT covariance sizing (the fixed 28x28 buffer
 # overflowed once enough base stations were in the solve), a line-buffered
 # --record-stdout stream (block buffering held poses back by up to ~110 ms),
-# and the global scene solver's out-of-bounds read once its 32-scene ring
-# wrapped (the mid-session SIGSEGV seen with four base stations).
+# the global scene solver's out-of-bounds read once its 32-scene ring wrapped,
+# and mpfit's work arrays moved off the stack (a global-scene solve's Jacobian
+# overflowed the solver thread's stack) — the two mid-session SIGSEGVs seen
+# with four base stations.
 _PATCH_DIR = Path(__file__).resolve().parent.parent / "tracker" / "libsurvive_patches"
 # Bump this whenever build options or the patch set change so existing
 # installations are rebuilt.
-_BUILD_REVISION = "libusb-v3-axol-patches-4"
+_BUILD_REVISION = "libusb-v3-axol-patches-5"
 # Earlier revisions compiled to byte-identical artifacts (same CMake options,
 # same patches). A build cache stamped with any of these only needs a stale
 # machine manifest re-attested rather than a native rebuild. Builds before

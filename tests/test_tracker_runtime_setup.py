@@ -260,13 +260,15 @@ class LighthousePatchTest(unittest.TestCase):
         patches = tracker_install._patches()  # noqa: SLF001
         names = [path.name for path in patches]
 
-        self.assertEqual(len(patches), 5)
+        self.assertEqual(len(patches), 6)
         self.assertTrue(names[0].startswith("0001-driver_vive-"))
         self.assertTrue(names[1].startswith("0002-ootx-"))
         self.assertTrue(names[2].startswith("0003-fix-correct-MPFIT-covariance"))
         self.assertTrue(names[3].startswith("0004-recording-line-buffer"))
         self.assertTrue(names[4].startswith("0005-gss-never-read-past"))
         self.assertIn("src/test_cases/gss.c", patches[4].read_text())
+        self.assertTrue(names[5].startswith("0006-mpfit-allocate-the-work-arrays"))
+        self.assertIn("src/test_cases/mpfit_stack.c", patches[5].read_text())
         for path in patches:
             self.assertIn("diff --git", path.read_text())
         # Axol's own fixes carry the regression test that reproduces them;

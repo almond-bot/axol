@@ -1,7 +1,7 @@
 From b697f84b18ac2733332986e9bb6d9bf596815986 Mon Sep 17 00:00:00 2001
 From: Shawn Patel <shawn@almondbot.com>
 Date: Mon, 19 Oct 2026 17:28:15 +0000
-Subject: [PATCH 2/5] ootx: decode each base station through every device that
+Subject: [PATCH 2/6] ootx: decode each base station through every device that
  sees it
 
 The first device to report a station's sync pulses owned its only OOTX
