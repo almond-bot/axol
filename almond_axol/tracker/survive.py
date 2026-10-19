@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -97,6 +98,28 @@ def prepare_survive_config() -> Path:
     return path
 
 
+def _drain_lines(stream, tail: deque[str]) -> None:  # type: ignore[no-untyped-def]
+    """Read a pipe to EOF, keeping its last lines (it must never fill up)."""
+    try:
+        for line in stream:
+            line = _ANSI_ESCAPE.sub("", line).rstrip()
+            if line:
+                tail.append(line)
+    except (OSError, ValueError):
+        pass
+
+
+def _describe_exit(code: int | None) -> str:
+    if code is None:
+        return "exit status unknown"
+    if code < 0:
+        try:
+            return f"killed by {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"code {code}"
+
+
 def _convert(
     pos_zup: np.ndarray, quat_wxyz: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -162,6 +185,32 @@ def _lighthouse_record(parts: list[str]) -> tuple[int, str | None] | None:
 _OUTPUT_CLOCK_WINDOW_S = 5.0
 _OUTPUT_CLOCK_RESET_JUMP_S = TRACKER_POSE_MAX_AGE_S
 _OUTPUT_CLOCK_STEP_CONFIRM_S = 0.5
+
+# survive-cli can die mid-session (SIGSEGV/SIGABRT inside libsurvive). Its
+# calibration is on disk, so a fresh process tracks again within seconds; the
+# bridge holds the rigs frozen meanwhile, exactly as for any tracking loss.
+# Restart it, but give up on a crash loop rather than retrying forever.
+_RESTART_BACKOFF_S = 1.0
+_MAX_RESTARTS = 3
+_RESTART_WINDOW_S = 60.0
+# Lines of survive-cli stderr kept for the report when it dies (glibc's heap
+# check or a sanitizer prints its diagnosis there).
+_STDERR_TAIL_LINES = 40
+# libsurvive enumerates USB devices only at startup: a tracker that drops off
+# the bus (a cable tugged on a moving rig, a wireless tracker leaving range)
+# never comes back in the same process. A fresh process also sometimes fails
+# to switch one tracker into light-capture mode, leaving it connected but
+# silent. After a disconnect or a crash, restart survive-cli and keep
+# re-checking at this interval, for up to the recovery window, until every
+# tracker seen earlier is reporting poses again.
+_RECONNECT_DELAY_S = 2.0
+_RECONNECT_RETRY_S = 5.0
+_RECONNECT_WINDOW_S = 60.0
+_DEVICE_DISCONNECT = re.compile(r"(\S+) Device disconnect\b")
+
+
+class _PlannedRestart(Exception):
+    """survive-cli was stopped on purpose to re-enumerate USB devices."""
 
 
 class _OutputClockMapper:
@@ -298,6 +347,10 @@ class SurviveSource(TrackerSource):
         self._failure: TrackerSourceError | None = None
         self._warnings: list[str] = []
         self._survey = LighthouseSurvey()
+        # Every tracker serial seen since start(), and until when a lost one
+        # is still being looked for (see _RECONNECT_WINDOW_S).
+        self._known_serials: set[str] = set()
+        self._recover_until = 0.0
         # ``SimpleContext`` owns native USB/libsurvive state.  Keep a strong
         # reference until its polling loop has exited and the generated close
         # function has returned successfully.  A failed native call is
@@ -346,7 +399,7 @@ class SurviveSource(TrackerSource):
                 "or run `axol tracker.install`."
             )
         self._cli_executable = executable
-        target = self._run_cli
+        target = self._run_cli_supervised
         _logger.info("survive backend: using attested survive-cli subprocess")
         self._thread = threading.Thread(
             target=self._run_worker,
@@ -612,6 +665,43 @@ class SurviveSource(TrackerSource):
                 self._simple_context = None
                 self._pysurvive_module = None
 
+    def _run_cli_supervised(self) -> None:
+        """Run survive-cli, restarting it after an unexpected exit.
+
+        Poses already published are kept: they age out on their own capture
+        time, so consumers see the gap as stale tracking rather than a
+        backend failure. Only a crash loop (more than ``_MAX_RESTARTS`` exits
+        within ``_RESTART_WINDOW_S``) is surfaced as the source's failure.
+        """
+        restarts: deque[float] = deque()
+        while True:
+            try:
+                self._run_cli()
+                return
+            except _PlannedRestart:
+                if self._stop.is_set():
+                    return
+                continue
+            except TrackerSourceError as exc:
+                if self._stop.is_set():
+                    return
+                now = time.monotonic()
+                while restarts and now - restarts[0] > _RESTART_WINDOW_S:
+                    restarts.popleft()
+                if len(restarts) >= _MAX_RESTARTS:
+                    raise
+                restarts.append(now)
+                _logger.error(
+                    "%s; restarting it (%d of %d within %.0f s)",
+                    exc,
+                    len(restarts),
+                    _MAX_RESTARTS,
+                    _RESTART_WINDOW_S,
+                )
+            self._recover_until = time.monotonic() + _RECONNECT_WINDOW_S
+            if self._stop.wait(_RESTART_BACKOFF_S):
+                return
+
     def _run_cli(self) -> None:
         """Parse POSE lines from a ``survive-cli --record-stdout`` stream."""
         executable = self._cli_executable
@@ -636,20 +726,60 @@ class SurviveSource(TrackerSource):
             "--record-angle",
             "0",
         ]
-        self._proc = subprocess.Popen(
+        proc = subprocess.Popen(
             args,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
-        assert self._proc.stdout is not None
+        self._proc = proc
+        if self._stop.is_set():
+            # stop() ran between the previous exit and this launch; it can no
+            # longer see this process, so end it here.
+            proc.terminate()
+        assert proc.stdout is not None
+        stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
+        stderr_reader = None
+        if getattr(proc, "stderr", None) is not None:
+            stderr_reader = threading.Thread(
+                target=_drain_lines,
+                args=(proc.stderr, stderr_tail),
+                daemon=True,
+                name="survive-stderr",
+            )
+            stderr_reader.start()
+        planned_restart = threading.Event()
+
+        def restart_for_devices() -> None:
+            if self._stop.is_set() or proc.poll() is not None:
+                return
+            planned_restart.set()
+            proc.terminate()
+
+        def check_devices() -> None:
+            missing = self._known_serials - reporting
+            if missing and time.monotonic() < self._recover_until:
+                _logger.info(
+                    "tracker %s not reporting; restarting survive-cli to look "
+                    "for it again",
+                    ", ".join(sorted(missing)),
+                )
+                restart_for_devices()
+
+        # Trackers that published a pose in this run.
+        reporting: set[str] = set()
+        timers: list[threading.Timer] = []
+        if self._recover_until > time.monotonic():
+            timers.append(threading.Timer(_RECONNECT_RETRY_S, check_devices))
+            timers[-1].daemon = True
+            timers[-1].start()
         # Recording lines carry libsurvive run time at output, not the pose's
         # sensor time. Mapping its relative clock still removes pipe/buffering
         # delay; label it receipt/output time rather than true capture time.
         output_clock = _OutputClockMapper()
         serials: dict[str, str] = {}
-        for line in self._proc.stdout:
+        for line in proc.stdout:
             if self._stop.is_set():
                 break
             # Format: "<run_ts> <codename> POSE x y z qw qx qy qz"
@@ -670,6 +800,26 @@ class SurviveSource(TrackerSource):
                 serial = _DEVICE_SERIAL.search(line)
                 if serial is not None:
                     serials[parts[1]] = serial.group(1)
+                    self._known_serials.add(serial.group(1))
+                continue
+            disconnect = _DEVICE_DISCONNECT.search(line)
+            if disconnect is not None:
+                # libsurvive logs each disconnect more than once; act on the
+                # first, while the device is still known.
+                lost = serials.pop(disconnect.group(1), None)
+                if lost is None:
+                    continue
+                reporting.discard(lost)
+                _logger.warning(
+                    "tracker %s disconnected; restarting survive-cli in %.0f s "
+                    "so it is picked up again when it returns",
+                    lost,
+                    _RECONNECT_DELAY_S,
+                )
+                self._recover_until = time.monotonic() + _RECONNECT_WINDOW_S
+                timers.append(threading.Timer(_RECONNECT_DELAY_S, restart_for_devices))
+                timers[-1].daemon = True
+                timers[-1].start()
                 continue
             if len(parts) < 10 or parts[2] != "POSE":
                 continue
@@ -684,12 +834,34 @@ class SurviveSource(TrackerSource):
             except ValueError:
                 continue
             sample_time = output_clock.map(output_time, time.perf_counter())
+            reporting.add(key)
             self._publish(
                 key,
                 np.array(vals[0:3]),
                 np.array(vals[3:7]),  # (w, x, y, z)
                 timestamp=sample_time,
             )
-        code = self._proc.poll() if self._proc is not None else None
-        if not self._stop.is_set():
-            raise TrackerSourceError(f"survive-cli exited unexpectedly (code {code})")
+        for timer in timers:
+            timer.cancel()
+        if self._stop.is_set():
+            return
+        if planned_restart.is_set():
+            try:
+                proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                # survive-cli can hang in its own shutdown; it must release
+                # the USB devices before the next one opens them.
+                proc.kill()
+                proc.wait(timeout=3.0)
+            raise _PlannedRestart
+        code = proc.poll()
+        deadline = time.monotonic() + 2.0
+        while code is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+            code = proc.poll()
+        if stderr_reader is not None:
+            stderr_reader.join(timeout=1.0)
+        message = f"survive-cli exited unexpectedly ({_describe_exit(code)})"
+        if stderr_tail:
+            message += "; its last output:\n" + "\n".join(stderr_tail)
+        raise TrackerSourceError(message)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import threading
 import os
 import tempfile
 import unittest
@@ -79,9 +80,11 @@ class SurviveConfigPathTest(unittest.TestCase):
         source = survive.SurviveSource()
         source._cli_executable = Path("/attested/survive-cli")
         source._stop.set()
-        process = SimpleNamespace(stdout=iter(()), poll=lambda: 0)
+        process = SimpleNamespace(stdout=iter(()), poll=lambda: 0, terminate=Mock())
         with patch.object(survive.subprocess, "Popen", return_value=process) as popen:
             source._run_cli()
+        # Stopped before the launch: the process is ended straight away.
+        process.terminate.assert_called_once_with()
         args = popen.call_args.args[0]
         self.assertEqual(
             args[1:3], ["--configfile", str(survive.survive_config_path())]
@@ -308,3 +311,151 @@ class CodenameBindingMigrationTest(unittest.TestCase):
             config = load_tracker_config(path)
 
         self.assertEqual((config.left, config.right), ("LHR-E0FCD01B", "LHR-BDD65467"))
+
+
+class _Crash:
+    """A survive-cli run that streams some poses, then dies by a signal."""
+
+    def __init__(self, lines: list[str], code: int, stderr: list[str] = ()) -> None:
+        self.stdout = iter(lines)
+        self.stderr = iter(stderr)
+        self._code = code
+        self.terminate = Mock()
+
+    def poll(self) -> int:
+        return self._code
+
+
+class SurviveRestartTest(unittest.TestCase):
+    def _source(self) -> survive.SurviveSource:
+        source = survive.SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+        return source
+
+    def test_a_crash_restarts_survive_cli_and_tracking_resumes(self) -> None:
+        source = self._source()
+        good = [
+            _config_line("WM0", "LHR-E0FCD01B"),
+            "1.0 WM0 POSE 0.1 0 0 1 0 0 0\n",
+        ]
+
+        def after_restart():  # type: ignore[no-untyped-def]
+            yield from good
+            source._stop.set()
+
+        crashed = _Crash(good, -11, ["free(): corrupted unsorted chunks"])
+        recovered = SimpleNamespace(
+            stdout=after_restart(), stderr=iter(()), poll=lambda: 0, terminate=Mock()
+        )
+        with (
+            patch.object(
+                survive.subprocess, "Popen", side_effect=[crashed, recovered]
+            ) as popen,
+            patch.object(survive, "_RESTART_BACKOFF_S", 0.0),
+            self.assertLogs(survive._logger, "ERROR") as logs,
+        ):
+            source._run_worker(source._run_cli_supervised)
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertIn("LHR-E0FCD01B", source.poses())  # no failure raised
+        self.assertIn("killed by SIGSEGV", logs.output[0])
+        self.assertIn("free(): corrupted unsorted chunks", logs.output[0])
+        self.assertIn("restarting it (1 of 3", logs.output[0])
+
+    def test_a_crash_loop_becomes_the_source_failure(self) -> None:
+        source = self._source()
+        crashes = [_Crash([], -6, ["malloc(): invalid size"]) for _ in range(4)]
+        with (
+            patch.object(survive.subprocess, "Popen", side_effect=crashes) as popen,
+            patch.object(survive, "_RESTART_BACKOFF_S", 0.0),
+            self.assertLogs(survive._logger, "ERROR"),
+        ):
+            source._run_worker(source._run_cli_supervised)
+
+        self.assertEqual(popen.call_count, survive._MAX_RESTARTS + 1)
+        with self.assertRaisesRegex(
+            survive.TrackerSourceError,
+            "(?s)killed by SIGABRT.*malloc\\(\\): invalid size",
+        ):
+            source.poses()
+
+    def test_stop_during_the_backoff_does_not_relaunch(self) -> None:
+        source = self._source()
+        crashed = _Crash([], -11)
+        with (
+            patch.object(survive.subprocess, "Popen", side_effect=[crashed]) as popen,
+            # Stop arrives while the restart is backing off.
+            patch.object(
+                source._stop,
+                "wait",
+                side_effect=lambda _t: source._stop.set() or True,
+            ),
+            self.assertLogs(survive._logger, "ERROR"),
+        ):
+            source._run_worker(source._run_cli_supervised)
+
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(source.poses(), {})
+
+
+class _Run:
+    """A survive-cli run whose stdout stays open until it is terminated."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self._lines = lines
+        self._ended = threading.Event()
+        self.stderr = iter(())
+        self.terminate = Mock(side_effect=self._ended.set)
+        self.kill = Mock(side_effect=self._ended.set)
+        self.stdout = self._stream()
+
+    def _stream(self):  # type: ignore[no-untyped-def]
+        yield from self._lines
+        self._ended.wait(5.0)
+
+    def poll(self) -> int | None:
+        return -15 if self._ended.is_set() else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._ended.wait(timeout)
+        return -15
+
+
+class TrackerReconnectTest(unittest.TestCase):
+    def test_a_disconnected_tracker_is_looked_for_again(self) -> None:
+        source = survive.SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+        both = [
+            _config_line("WM0", "LHR-E0FCD01B"),
+            _config_line("WM1", "LHR-BDD65467"),
+        ]
+        first = _Run(
+            [
+                *both,
+                "1.0 WM0 POSE 0.1 0 0 1 0 0 0\n",
+                "2.0 INFO LOG 2.0 WM1 Device disconnect: 5\n",
+            ]
+        )
+
+        def second_stream():  # type: ignore[no-untyped-def]
+            yield from both
+            yield "3.0 WM1 POSE 0.2 0 0 1 0 0 0\n"
+            source._stop.set()
+
+        second = SimpleNamespace(
+            stdout=second_stream(), stderr=iter(()), poll=lambda: 0, terminate=Mock()
+        )
+        with (
+            patch.object(
+                survive.subprocess, "Popen", side_effect=[first, second]
+            ) as popen,
+            patch.object(survive, "_RECONNECT_DELAY_S", 0.01),
+            self.assertLogs(survive._logger, "WARNING") as logs,
+        ):
+            source._run_worker(source._run_cli_supervised)
+
+        self.assertEqual(popen.call_count, 2)
+        first.terminate.assert_called_once_with()
+        self.assertIn("tracker LHR-BDD65467 disconnected", logs.output[0])
+        # A planned restart is not a failure and not counted as a crash.
+        self.assertEqual(set(source.poses()), {"LHR-E0FCD01B", "LHR-BDD65467"})
