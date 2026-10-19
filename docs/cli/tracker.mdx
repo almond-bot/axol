@@ -83,6 +83,8 @@ Saves `~/.almond/tracker/config.json`:
 
 Pairs one VIVE Tracker 3.0 with its Watchman dongle through `survive-cli --pair-device 1` (which needs the libusb backend `tracker.install` builds). The tracker must be unplugged from USB and blinking blue. Run it once per tracker/dongle pair.
 
+libsurvive only opens pairing mode on a dongle that has no tracker connected. If every connected dongle already brings up a powered tracker, the command says they are already paired instead of waiting; to pair a different tracker to a dongle, switch off the tracker currently paired to it first.
+
 ## `axol tracker.install`
 
 Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0` with two fixes applied on top: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. The fixes ship in the package (`almond_axol/tracker/libsurvive_patches/`, each with a regression test in libsurvive's own suite):
@@ -125,7 +127,9 @@ uv pip install ./bindings/python
 axol tracker.lighthouse.check
 ```
 
-Listens to libsurvive for about 20 seconds with both trackers powered and in view, then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
+Listens to libsurvive for about 20 seconds with both trackers powered and in view. When base stations are live but the trackers are not reporting yet, libsurvive is still calibrating: it reports no pose until it has every live station's identity and position, which can take a minute or more on a new host or after stations are added or re-channelled. The check then keeps listening, up to 150 seconds in total, until both trackers report; keep them still and in view meanwhile. It then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
+
+Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before this one let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept.
 
 ## `axol tracker.ultimate.install`
 

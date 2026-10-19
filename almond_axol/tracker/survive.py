@@ -20,7 +20,9 @@ saved by ``axol tracker.identify`` survives restarts.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -49,6 +51,48 @@ def is_available() -> bool:
     from ..cli.tracker_install import verified_survive_cli
 
     return verified_survive_cli() is not None
+
+
+# Where libsurvive resolves its default ``config.json`` when neither HOME nor
+# XDG_CONFIG_HOME is set: the filesystem root. ``axol.service`` runs as root
+# without HOME, so every service-launched survive-cli kept its base-station
+# calibration there.
+_LEGACY_ROOTLESS_CONFIG = Path("/config.json")
+
+
+def survive_config_path() -> Path:
+    """The libsurvive calibration file every Axol survive-cli run shares.
+
+    libsurvive's own default (``$XDG_CONFIG_HOME/libsurvive`` or
+    ``~/.config/libsurvive``), but resolved here and passed explicitly: the
+    service has no HOME, and libsurvive would otherwise write to
+    ``/config.json``. :meth:`Path.home` falls back to the passwd entry.
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "libsurvive" / "config.json"
+
+
+def prepare_survive_config() -> Path:
+    """Create the calibration directory and adopt a service-era calibration.
+
+    A host whose service already calibrated its base stations into
+    ``/config.json`` keeps that calibration instead of solving every station
+    again from scratch.
+    """
+    path = survive_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists() and os.geteuid() == 0:
+        try:
+            if "configed-lighthouse-gen" in _LEGACY_ROOTLESS_CONFIG.read_text():
+                shutil.copy2(_LEGACY_ROOTLESS_CONFIG, path)
+                _logger.info(
+                    "adopted the libsurvive calibration from %s",
+                    _LEGACY_ROOTLESS_CONFIG,
+                )
+        except (OSError, UnicodeError):
+            pass
+    return path
 
 
 def _convert(
@@ -574,6 +618,8 @@ class SurviveSource(TrackerSource):
             raise TrackerSourceError("the attested survive-cli is unavailable")
         args = [
             str(executable),
+            "--configfile",
+            str(prepare_survive_config()),
             "--record-stdout",
             "1",
             # Only poses are consumed; muting the raw light/IMU/angle streams
