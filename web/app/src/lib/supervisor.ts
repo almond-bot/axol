@@ -805,6 +805,9 @@ export interface PolicyState {
   dataset?: { repoId: string; root: string }
   /** What to set up / do for this episode, as a card above the status line. */
   brief?: EpisodeBrief
+  /** Why the last episode was not saved (quality-gate rejection, capture or
+   *  save failure). Persists until the next episode starts recording. */
+  notice?: { level: "error"; message: string }
 }
 
 export interface OpStatus {

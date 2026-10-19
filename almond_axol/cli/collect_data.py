@@ -1040,6 +1040,9 @@ class _NullCollectControl:
     def note_returning(self) -> None:
         pass
 
+    def note_rejected(self, reason: str) -> None:
+        pass
+
     def note_dataset(self, repo_id: str, root: Path) -> None:
         pass
 
@@ -1073,6 +1076,10 @@ class _QueueCollectControl:
         # The dataset this session records into (note_dataset), so the
         # panel's dataset preview can follow it.
         self._dataset: dict[str, str] | None = None
+        # Why the last take was not saved (note_rejected). Unlike the phase
+        # message it survives the return to "ready", so a refused take can't
+        # read as a quiet success; the next take's recording start clears it.
+        self._rejection: str | None = None
 
     # -- serve API surface --------------------------------------------------
 
@@ -1097,6 +1104,8 @@ class _QueueCollectControl:
                 snap["episode"] = self._episode
             if self._dataset is not None:
                 snap["dataset"] = dict(self._dataset)
+            if self._rejection is not None:
+                snap["notice"] = {"level": "error", "message": self._rejection}
             return snap
 
     def note_dataset(self, repo_id: str, root: Path) -> None:
@@ -1145,6 +1154,8 @@ class _QueueCollectControl:
             self._countdown_deadline = deadline
 
     def note_recording(self) -> None:
+        with self._lock:
+            self._rejection = None
         self._set("recording", "Recording — save or discard the episode to end it.")
 
     def note_saving(self) -> None:
@@ -1164,6 +1175,11 @@ class _QueueCollectControl:
 
     def note_returning(self) -> None:
         self._set("resetting", "Returning to rest…")
+
+    def note_rejected(self, reason: str) -> None:
+        """The take just ended was discarded or failed to save, and why."""
+        with self._lock:
+            self._rejection = reason
 
 
 Control = _NullCollectControl | _QueueCollectControl
@@ -2714,6 +2730,15 @@ def _run_session(
         except RuntimeError as exc:
             _logger.error("episode discard failed; continuing: %s", exc)
 
+    def _reject_take(reason: str) -> None:
+        """Log a discarded or refused take and keep it on the panel.
+
+        The headset and the panel otherwise return to their ready state, so
+        without this a rejected take looked exactly like a saved one.
+        """
+        _logger.warning(reason)
+        control.note_rejected(reason)
+
     def _wrap_up_episode(
         recording: bool,
         rerecord: bool,
@@ -2723,8 +2748,9 @@ def _run_session(
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if capture_failure is not None:
-            _logger.info(
-                f"Episode discarded because camera capture failed: {capture_failure}"
+            _reject_take(
+                f"Episode {episode_idx + 1} was not saved: camera capture "
+                f"failed ({capture_failure})."
             )
             # finish_episode already joined capture and cleared the rejected
             # buffer. cancel_episode is an idempotent lifecycle reset and also
@@ -2756,7 +2782,7 @@ def _run_session(
                 # up like collect-dagger does instead of tearing everything
                 # down over one lost episode. Durability failures are a
                 # different type (EpisodeDurabilityError) and still unwind.
-                _logger.info(f"Episode NOT saved: {exc}")
+                _reject_take(f"Episode {episode_idx + 1} was NOT saved: {exc}")
                 return
             # The serve unit records as root into the operator's home; hand the
             # tree back after every save so a crash never leaves a root-owned
@@ -2839,16 +2865,17 @@ def _run_session(
             # the same episode again instead of tearing down robot control.
             if recording and not rerecord and capture_failure is None:
                 if captured_rows == 0 and qa.end_t_host is not None:
-                    _logger.info(
-                        "Episode has no dataset rows before the end gesture "
-                        "began — it was ended as soon as it started. Discarding "
-                        "and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it has no "
+                        "dataset rows before the end gesture began (it was "
+                        "ended as soon as it started). Record it again."
                     )
                     rerecord = True
                 elif captured_rows == 0:
-                    _logger.info(
-                        "Episode captured no dataset rows — it ended before the "
-                        "first camera frame arrived. Discarding and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it captured "
+                        "no dataset rows (it ended before the first camera "
+                        "frame arrived). Record it again."
                     )
                     rerecord = True
 
@@ -2895,9 +2922,11 @@ def _run_session(
                     )
                 if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
-                        _logger.info(
-                            "Episode REJECTED by the quality gate — "
-                            "discarding and re-recording. " + " ".join(qa_reasons)
+                        _reject_take(
+                            f"Episode {episode_idx + 1} was REJECTED by the "
+                            "quality gate and discarded: "
+                            + "; ".join(qa_reasons)
+                            + ". Record it again."
                         )
                         rerecord = True
                     else:

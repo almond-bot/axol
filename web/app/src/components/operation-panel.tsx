@@ -971,6 +971,14 @@ export function EpisodeControls({
         </span>
       </div>
       {policy?.brief && <EpisodeBriefCard brief={policy.brief} phase={phase} />}
+      {policy?.notice && (
+        <div
+          role="alert"
+          className="rounded-lg border border-red-400/40 bg-red-400/[0.08] p-3 text-sm text-red-200"
+        >
+          {policy.notice.message}
+        </div>
+      )}
       <span className="text-sm text-white/60">{displayStatus}</span>
       {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
