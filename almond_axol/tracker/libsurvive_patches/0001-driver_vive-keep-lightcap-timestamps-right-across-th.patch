@@ -1,0 +1,176 @@
+From c5bd923096722cd27ef0d31555e0d4f5d06b6255 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Mon, 19 Oct 2026 17:28:15 +0000
+Subject: [PATCH 1/7] driver_vive: keep lightcap timestamps right across the
+ 32-bit clock rollover
+
+fix_time24 extended 24-bit lightcap times against the IMU reference
+truncated to 32 bits. Just after the 48MHz device clock rolls over (every
+~89s) the reference's upper byte is 0, and the guard that kept times from
+going negative stopped a measurement taken just before the rollover from
+stepping back an epoch: it was stamped 2^24 ticks (~350ms) in the future,
+which pushed last_light ahead and stalled pose output while data kept
+arriving. Extend against the 64-bit reference instead, and compare the
+gen1 packet times modulo 2^32.
+---
+ src/driver_vive.c         | 58 ++++++++++++++++++++++-----------------
+ src/driver_vive.h         |  1 +
+ src/test_cases/watchman.c | 26 +++++++++++++++++-
+ 3 files changed, 59 insertions(+), 26 deletions(-)
+
+diff --git a/src/driver_vive.c b/src/driver_vive.c
+index 005cfff..04c2fe5 100755
+--- a/src/driver_vive.c
++++ b/src/driver_vive.c
+@@ -1066,20 +1066,36 @@ int survive_vive_usb_poll(SurviveContext *ctx, void *v) {
+ 	return 0;
+ }
+ 
+-static inline survive_timecode fix_time24(SurviveContext *ctx, survive_timecode time24, survive_timecode refTime) {
+-	survive_timecode upper_ref = refTime & 0xFF000000u;
+-	survive_timecode lower_ref = refTime & 0x00FFFFFFu;
++// Extend a 24-bit lightcap timestamp to the device's 32-bit 48MHz clock using the closest instant to refTime.
++//
++// refTime is the object's 64-bit (rollover-extended) IMU time, so the arithmetic stays exact across the 32-bit
++// device clock rollover (every ~89s). Working with only the truncated 32-bit reference broke there: just after the
++// rollover the reference's upper byte is 0, and a measurement stamped shortly before it -- light routinely lags
++// the IMU -- was placed 2^24 ticks (~350ms) in the future instead of just in the past.
++SURVIVE_EXPORT survive_timecode survive_fix_time24(survive_timecode time24, survive_long_timecode refTime) {
++	const survive_long_timecode half = 1u << 23u;
++	survive_long_timecode rtn = (refTime & ~(survive_long_timecode)0xFFFFFFu) | (time24 & 0xFFFFFFu);
++
++	if (rtn + half < refTime) {
++		rtn += 0x01000000;
++	} else if (rtn > refTime + half && rtn >= 0x01000000) {
++		// Never step back before the first 24-bit epoch (a reference near zero has no earlier epoch).
++		rtn -= 0x01000000;
++	}
++
++	return (survive_timecode)rtn;
++}
+ 
+-	if (lower_ref > time24 && lower_ref - time24 > (1 << 23u)) {
+-		upper_ref += 0x01000000;
+-	} else if (lower_ref < time24 && time24 - lower_ref > (1 << 23u) && upper_ref > 0) {
+-		upper_ref -= 0x01000000;
++// Move a 32-bit packet time by +/-2^24 ticks onto the closest instant to reference_time. The difference is taken
++// modulo 2^32 so that it also holds when the two straddle the 32-bit device clock rollover.
++static inline uint32_t align_time24_epoch(uint32_t time, uint32_t reference_time) {
++	int32_t delta = (int32_t)(time - reference_time);
++	if (delta > (1 << 23)) {
++		time -= (1 << 24);
++	} else if (delta < -(1 << 23)) {
++		time += (1 << 24);
+ 	}
+-
+-	//	SV_VERBOSE(250, "fix_time24 time24: %x refTime: %x upper_ref: %x (%x) rtn: %x", time24, refTime, upper_ref,
+-	//refTime & 0xFF000000u, upper_ref | time24);
+-
+-	return upper_ref | time24;
++	return time;
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -1687,11 +1703,7 @@ static int32_t read_light_data(SurviveObject *w, uint16_t time, uint8_t **readPt
+ 	// We base it off IMU as a reference because light events can get blocked and it's not out of the ordinary
+ 	// to not see them for a second or two. (1 << 23) on a 48mhz clock is ~150ms; and the IMU is consistently
+ 	// much faster than that.
+-	if (lastEventTime > reference_time && lastEventTime - reference_time > (1 << 23)) {
+-		lastEventTime -= (1 << 24);
+-	} else if (reference_time > lastEventTime && reference_time - lastEventTime > (1 << 23)) {
+-		lastEventTime += (1 << 24);
+-	}
++	lastEventTime = align_time24_epoch(lastEventTime, reference_time);
+ 
+ 	times[0] = lastEventTime;
+ 	SV_VERBOSE(750, "Packet Start Time: %u (0x%x) (ref: %u) Payload: %s", lastEventTime, lastEventTime, reference_time,
+@@ -2118,7 +2130,7 @@ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, ui
+ 			uint32_t timecode = 0;
+ 			memcpy(&timecode, packet + idx, sizeof(uint32_t));
+ 
+-			uint32_t reference_time = (obj->activations.last_imu);
++			survive_long_timecode reference_time = obj->activations.last_imu;
+ 
+ 			bool sync = timecode & 0x2u;
+ 			if (!sync) {
+@@ -2130,7 +2142,7 @@ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, ui
+ 				bool ootx = (timecode >> 26u) & 1u;
+ 				bool g = (timecode >> 27u) & 1u;
+ 				uint32_t time24 = (timecode >> 2u) & 0xFFFFFFu;
+-				timecode = fix_time24(ctx, time24, reference_time);
++				timecode = survive_fix_time24(time24, reference_time);
+ 				uint8_t unused = timecode >> 28;
+ 				if (unused && dump_binary) {
+ 					SV_WARN("Not sure what this is: %x", unused);
+@@ -2153,7 +2165,7 @@ static int parse_and_process_raw1_lightcap(SurviveObject *obj, uint16_t time, ui
+ 				// Since nothing in libsurvive thinks anything is 96mhz; pass in a flag
+ 				bool half_clock_flag = timecode & 0x4u;
+ 				uint8_t sensor = (timecode >> 27u);
+-				timecode = fix_time24(ctx, (timecode >> 3u) & 0xFFFFFFu, reference_time);
++				timecode = survive_fix_time24((timecode >> 3u) & 0xFFFFFFu, reference_time);
+ 				SV_VERBOSE(750, "Sweep %s %02d.%02d %8u", obj->codename, channel, sensor, timecode);
+ 				if (channel == 255) {
+ 					SV_WARN("No channel specified for sweep");
+@@ -2625,11 +2637,7 @@ SURVIVE_EXPORT int parse_watchman_lightcap(struct SurviveContext *ctx, const cha
+ 	// We base it off IMU as a reference because light events can get blocked and it's not out of the ordinary
+ 	// to not see them for a second or two. (1 << 23) on a 48mhz clock is ~150ms; and the IMU is consistently
+ 	// much faster than that.
+-	if (mytime > reference_time && mytime - reference_time > (1 << 23)) {
+-		mytime -= (1 << 24);
+-	} else if (reference_time > mytime && reference_time - mytime > (1 << 23)) {
+-		mytime += (1 << 24);
+-	}
++	mytime = align_time24_epoch(mytime, reference_time);
+ 
+ 	times[timecount++] = mytime; //
+ 	DEBUG_WATCHMAN_PRINTF("_%s Packet Start Time: %u\n", codename, mytime);
+diff --git a/src/driver_vive.h b/src/driver_vive.h
+index 4aa7833..cb6a33b 100644
+--- a/src/driver_vive.h
++++ b/src/driver_vive.h
+@@ -118,6 +118,7 @@ SURVIVE_EXPORT void survive_usb_feature_read(SurviveObject *, const uint8_t *dat
+ SURVIVE_EXPORT int parse_watchman_lightcap(struct SurviveContext *ctx, const char *codename, uint8_t time1,
+ 										   survive_timecode reference_time, uint8_t *readdata, size_t qty,
+ 										   LightcapElement *les, size_t output_cnt);
++SURVIVE_EXPORT survive_timecode survive_fix_time24(survive_timecode time24, survive_long_timecode refTime);
+ SURVIVE_EXPORT void survive_handle_watchman(SurviveObject *w, uint64_t time_in_us, uint8_t *readdata);
+ struct SurviveUSBInfo;
+ SURVIVE_EXPORT struct SurviveUSBInfo *survive_vive_register_driver(SurviveObject *so, uint16_t vid, uint16_t pid);
+diff --git a/src/test_cases/watchman.c b/src/test_cases/watchman.c
+index 4254f9d..6ffa390 100644
+--- a/src/test_cases/watchman.c
++++ b/src/test_cases/watchman.c
+@@ -31,4 +31,28 @@ TEST(ViveDriver, TestWatchmanParsing) {
+ 		int cnt = parse_watchman_lightcap(0, "WW0", 224, 3761897504, readdata, sizeof(readdata), les, 10);
+ 	}
+ 	return 0;
+-}
+\ No newline at end of file
++}
++TEST(ViveDriver, FixTime24) {
++	// Mid-epoch: the reference's upper byte is used as is.
++	ASSERT_EQ(survive_fix_time24(0x123456, 0x12123400ull), 0x12123456u);
++
++	// The 24-bit field rolled over ahead of the reference (light newer than the last IMU sample).
++	ASSERT_EQ(survive_fix_time24(0x000010, 0x12FFFF00ull), 0x13000010u);
++
++	// The 24-bit field from before a rollover the reference has already passed (light older than the IMU).
++	ASSERT_EQ(survive_fix_time24(0xFFFFF0, 0x13000100ull), 0x12FFFFF0u);
++
++	// Same across the 32-bit device clock rollover: the IMU reference just wrapped (extended time 0x1_00000100)
++	// while the light measurement was taken just before it. The truncated reference's upper byte is 0 there, which
++	// used to stamp the measurement 0x00FFFFF0 -- ~350ms in the future -- instead of 0xFFFFFFF0.
++	ASSERT_EQ(survive_fix_time24(0xFFFFF0, 0x100000100ull), 0xFFFFFFF0u);
++	ASSERT_EQ(survive_fix_time24(0xFFFFF0, 0x500000100ull), 0xFFFFFFF0u);
++
++	// The light measurement just after the 32-bit rollover with the IMU reference just before it.
++	ASSERT_EQ(survive_fix_time24(0x000010, 0xFFFFFF00ull), 0x00000010u);
++
++	// No earlier epoch exists before the first 2^24 ticks, so never step below zero.
++	ASSERT_EQ(survive_fix_time24(0xFFFFF0, 0x100ull), 0x00FFFFF0u);
++	ASSERT_EQ(survive_fix_time24(0x000100, 0ull), 0x00000100u);
++	return 0;
++}
+-- 
+2.53.0
+

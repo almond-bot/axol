@@ -923,6 +923,34 @@ class AxolRobot(Robot):
 
         return obs
 
+    def joint_observation_at(
+        self, ts: float, max_skew_s: float = 0.010
+    ) -> RobotObservation | None:
+        """Joint state from the core's telemetry history nearest ``ts``.
+
+        For rows stamped with an earlier instant than the control tick (Mantis
+        rows carry the tracker pose's capture time), so the measured values in
+        the row describe the same moment as the pose. Never waits: returns
+        ``None`` when the core keeps no history (it does only while armed), the
+        instant is outside it, or the nearest sample is more than
+        ``max_skew_s`` away; callers then keep the live reading.
+        """
+        state_nearest = getattr(self._axol, "state_nearest", None)
+        if state_nearest is None:
+            return None
+        state = state_nearest(ts, timeout=0.0)
+        if state is None:
+            return None
+        left_pos, right_pos, left_trq, right_trq, state_ts = state
+        if abs(state_ts - ts) > max_skew_s:
+            return None
+        return self._joint_state_from_arrays(
+            left_pos,
+            right_pos,
+            left_trq if self.config.observe_torques else None,
+            right_trq if self.config.observe_torques else None,
+        )
+
     @check_if_not_connected
     def get_joint_observation(self) -> RobotObservation:
         """Return cached joint state only — no camera reads.

@@ -1,0 +1,32 @@
+From a5c5a073b682200cd95e05437f5abadcb1edadf3 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Mon, 19 Oct 2026 19:10:15 +0000
+Subject: [PATCH 4/7] recording: line-buffer the stdout recording
+
+With --record-stdout writing into a pipe, glibc fully buffers stdout and
+the consumer receives the stream in 4 KB blocks. Two trackers' POSE and
+VELOCITY records fill that in ~110 ms, so every pose reached the reader
+up to ~110 ms (median ~50 ms) after libsurvive produced it. Line-buffer
+stdout whenever the recording goes there.
+---
+ src/survive_recording.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/survive_recording.c b/src/survive_recording.c
+index ad08a22..af3d2d7 100644
+--- a/src/survive_recording.c
++++ b/src/survive_recording.c
+@@ -425,6 +425,10 @@ void survive_install_recording(SurviveContext *ctx) {
+ 
+ 		ctx->recptr->alwaysWriteStdOut = record_to_stdout;
+ 		if (record_to_stdout) {
++			// A consumer reading the recording live from a pipe would otherwise get it in 4 KB blocks: at two
++			// trackers' pose rate that holds every pose back by up to ~110ms. Hand over each record as it is
++			// written.
++			setvbuf(stdout, NULL, _IOLBF, 0);
+ 			SV_INFO("Recording to stdout");
+ 		}
+ 	}
+-- 
+2.53.0
+

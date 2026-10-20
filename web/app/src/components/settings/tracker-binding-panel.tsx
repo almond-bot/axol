@@ -841,8 +841,9 @@ export function TrackerBindingPanel({
               </SetupStep>
               <SetupStep number={3}>
                 Connect both dongles, power both trackers in view of the base stations, and use
-                Check base stations. It listens to libsurvive for 20 seconds and must see every base
-                station on its own channel.
+                Check base stations. It listens to libsurvive for 20 seconds, or up to 150 seconds
+                while libsurvive calibrates newly added or moved base stations (keep the trackers
+                still), and must see every base station on its own channel.
               </SetupStep>
             </ol>
             <div className="flex flex-wrap gap-2">

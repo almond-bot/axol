@@ -57,7 +57,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--left",
         default=None,
-        help="Left-side device key (libsurvive codename / Ultimate MAC); "
+        help="Left-side device key (Lighthouse tracker serial / Ultimate MAC); "
         "overrides the saved binding.",
     )
     parser.add_argument(

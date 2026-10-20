@@ -95,7 +95,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
       </Step>
 
       <Step title="Treat any tracking or input break as a failed take">
-        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
+        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check; the panel then shows why the take was not saved (see [Driving from the panel](#driving-from-the-panel)). Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
       </Step>
     </Steps>
 
@@ -183,6 +183,8 @@ Collection resumes from an existing dataset at `--root`; an aborted session that
 The Axol flow above assumes the headset is on your face; managed Lighthouse/Ultimate does not require one. When you launch from the [control panel](/guides/control-panel), it doubles as an operator display and can take the same episode decisions for either profile.
 
 The panel mirrors the **camera feeds** the headset receives (with a fullscreen toggle for a proper operator display) and an **Episode control** box carrying the phase, the episode number, the saved count, and the buttons that make sense right now: **Start recording** (a 3-second countdown mirroring the in-headset one, so you can pick the controllers back up; click again to cancel), **Save episode**, and **Discard episode** — the last two click-to-confirm, standing in for the controller's double-press. During a contact hold a **Return to rest** button appears, which does what **X** does: replan the return from wherever you left the arms.
+
+A take that ends without being saved — refused by the Mantis quality gate, emptied by a camera-capture failure, ended before its first dataset row, or refused by the recorder at save — leaves a red explanation in the Episode control box. It stays through the return to **Ready** until the next take starts recording, so a lost take never reads as a saved one; the same reason is in the log.
 
 The controller stays live the whole time — the panel is a parallel input, and whichever arrives first ends the take. Anything you arm on the controller (the confirmation popup, the record countdown) is mirrored into the panel too, so the dashboard follows a controller-driven session as well as a panel-driven one. See [Episode controls](/guides/control-panel#episode-controls).
 

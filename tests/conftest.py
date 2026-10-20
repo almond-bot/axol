@@ -7,6 +7,12 @@ import pytest
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
 
+@pytest.fixture(autouse=True)
+def _isolated_libsurvive_config(tmp_path, monkeypatch) -> None:
+    """Keep survive-cli launches in tests from creating ~/.config/libsurvive."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+
+
 @pytest.fixture
 def frame_factory() -> Callable[..., VRFrame]:
     def make(**overrides: object) -> VRFrame:

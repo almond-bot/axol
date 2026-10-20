@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import selectors
 import subprocess
 import time
 
 _DEFAULT_TIMEOUT_S = 90.0
 _PAIRING_START_TIMEOUT_S = 15.0
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_TRACKED_OBJECT = re.compile(r"Adding tracked object (\S+)")
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -38,6 +41,17 @@ def _stop_process(proc: subprocess.Popen[str]) -> None:
             proc.communicate()
 
 
+def _already_paired_message(connected: list[str]) -> str:
+    names = ", ".join(connected)
+    return (
+        f"Already paired: every connected dongle has a tracker ({names}) "
+        "switched on, and pairing mode only opens for a dongle without one. "
+        "If this is the tracker you meant to pair, there is nothing to do. To "
+        "pair a different tracker to a dongle, switch off the tracker "
+        "currently paired to it, then try again."
+    )
+
+
 def run(args) -> None:  # type: ignore[no-untyped-def]
     """Open libsurvive pairing mode and exit once a new tracker connects."""
     if args.timeout <= 0:
@@ -53,6 +67,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
+    from ..tracker.survive import prepare_survive_config
     from .tracker_install import verified_survive_cli
 
     executable = verified_survive_cli()
@@ -73,7 +88,15 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     )
 
     proc = subprocess.Popen(
-        [str(executable), "--pair-device", "1", "--v", "100"],
+        [
+            str(executable),
+            "--configfile",
+            str(prepare_survive_config()),
+            "--pair-device",
+            "1",
+            "--v",
+            "100",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -86,11 +109,15 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     deadline = started + args.timeout
     saw_attempt = False
     seen_dongles: set[str] = set()
+    # Trackers that came up on their dongle before pairing mode opened:
+    # libsurvive only sends a pairing request to a dongle with no tracker, so
+    # these are already paired (and powered).
+    connected: list[str] = []
 
     try:
         while time.monotonic() < deadline:
             for key, _ in selector.select(timeout=0.25):
-                line = key.fileobj.readline().strip()
+                line = _ANSI_ESCAPE.sub("", key.fileobj.readline()).strip()
                 if not line:
                     continue
 
@@ -114,6 +141,8 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                         flush=True,
                     )
                     return
+                elif (match := _TRACKED_OBJECT.search(line)) is not None:
+                    connected.append(match.group(1))
                 elif "Error:" in line or "Warning:" in line:
                     print(line, flush=True)
 
@@ -126,6 +155,8 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 not saw_attempt
                 and time.monotonic() - started >= _PAIRING_START_TIMEOUT_S
             ):
+                if connected:
+                    raise SystemExit(_already_paired_message(connected))
                 raise SystemExit(
                     "The dongle did not enter pairing mode. Run `axol tracker.install` "
                     "to install the libusb build, reconnect the dongle, and try again."

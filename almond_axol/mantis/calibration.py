@@ -14,7 +14,7 @@ transform per rig side *and tracker identity*::
       "left": {
         "quest:meta-quest-touch-plus:grip":
                         {"pos": [x, y, z], "quat": [qx, qy, qz, qw]},
-        "survive:T20":  {"pos": [...], "quat": [...]},
+        "survive:LHR-E0FCD01B":  {"pos": [...], "quat": [...]},
         "ultimate:a:b:c:d:e:f": {
           "pos": [...], "quat": [...],
           "ultimate_pose_convention": {"quat_order": "wxyz", "up_axis": "z"}
@@ -25,7 +25,7 @@ transform per rig side *and tracker identity*::
 
 The tracker key is the tracking backend plus its exact device-local datum:
 ``"quest:<WebXR-profile>:grip"`` for the headset path, or
-``"survive:<codename>"`` / ``"ultimate:<mac>"`` for Vive backends (see
+``"survive:<tracker serial>"`` / ``"ultimate:<mac>"`` for Vive backends (see
 :func:`tracker_key_for_side`). Hardware design defaults are keyed by backend
 family; Quest defaults must remain profile/pose-space scoped. Ultimate saved
 measurements additionally carry its quaternion-order/up-axis parser convention,
@@ -165,7 +165,7 @@ def _tcp_transform_from_mount(
 
 # Tracker→gripper transforms for the Mantis rig's standard mounts. Vive
 # entries are keyed by tracker backend family — the part of a tracker key
-# before the ":" (``"survive:T20"`` → ``"survive"``); Quest entries by their
+# before the ":" (``"survive:LHR-E0FCD01B"`` → ``"survive"``); Quest entries by their
 # full ``quest:<WebXR profile>:<pose space>`` key, since controller
 # generations and WebXR pose spaces do not share a local frame. Only entries
 # promoted into ``DESIGN_TCP_TRANSFORMS`` below are factory values that apply
@@ -540,7 +540,7 @@ def tracker_key_for_side(
     ``"quest"`` for the headset path (which has no tracker backend config at
     all), otherwise ``"<backend>"`` or ``"<backend>:<device>"`` from the
     saved tracker config (``~/.almond/tracker/config.json``, written by
-    ``axol tracker.identify``) — e.g. ``"survive:T20"`` or
+    ``axol tracker.identify``) — e.g. ``"survive:LHR-E0FCD01B"`` or
     ``"ultimate:<mac>"``.
 
     ``source`` is the selected Mantis source (``quest``, ``lighthouse``, or
@@ -704,7 +704,7 @@ def load_tcp_transforms(
         _logger.warning(
             "%s holds calibration(s) in the legacy per-side format (no tracker "
             "key — measured with an unknown tracker); re-key the entries under "
-            'the active tracker (e.g. "survive:<codename>") or delete them '
+            'the active tracker (e.g. "survive:<tracker serial>") or delete them '
             "to use the rig's factory design transform.",
             path,
         )

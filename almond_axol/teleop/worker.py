@@ -22,6 +22,8 @@ import numpy as np
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
+from .absolute_pose import AbsoluteCalibration
+from .absolute_pose import matrix_to_quat_xyzw as _matrix_to_quat_xyzw
 from .box import (
     URDF_TOOL,
     BoxState,
@@ -194,42 +196,6 @@ def _dominant_axis(x: float, y: float) -> tuple[float, float]:
     if abs(x) >= abs(y):
         return x, 0.0
     return 0.0, y
-
-
-def _matrix_to_quat_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
-    """Convert a 3x3 rotation matrix to an ``(x, y, z, w)`` quaternion."""
-    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
-    if tr > 0.0:
-        s = math.sqrt(tr + 1.0) * 2.0
-        return (
-            float(R[2, 1] - R[1, 2]) / s,
-            float(R[0, 2] - R[2, 0]) / s,
-            float(R[1, 0] - R[0, 1]) / s,
-            0.25 * s,
-        )
-    if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-        return (
-            0.25 * s,
-            float(R[0, 1] + R[1, 0]) / s,
-            float(R[0, 2] + R[2, 0]) / s,
-            float(R[2, 1] - R[1, 2]) / s,
-        )
-    if R[1, 1] > R[2, 2]:
-        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-        return (
-            float(R[0, 1] + R[1, 0]) / s,
-            0.25 * s,
-            float(R[1, 2] + R[2, 1]) / s,
-            float(R[0, 2] - R[2, 0]) / s,
-        )
-    s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-    return (
-        float(R[0, 2] + R[2, 0]) / s,
-        float(R[1, 2] + R[2, 1]) / s,
-        0.25 * s,
-        float(R[1, 0] - R[0, 1]) / s,
-    )
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -2192,6 +2158,36 @@ class IKWorker:
         self._last_mapped_quat[side] = out_quat
         return out_pos, out_quat
 
+    def absolute_reply_base_msg(self) -> dict[str, Any] | None:
+        """:attr:`abs_base_msg` plus the live calibration while engaged.
+
+        The ``"calibration"`` entry (:meth:`AbsoluteCalibration.to_message`)
+        is present only while an engage fit is active, so a reply to any
+        disengaged frame withdraws it: the core must never map later tracker
+        poses through a fit the next engage is about to replace.
+        """
+        msg = self.abs_base_msg
+        if not (
+            self._abs_active
+            and self._abs_base is not None
+            and isinstance(msg, dict)
+            and "rejected" not in msg
+        ):
+            return msg
+        R_wb, t_wb = self._abs_base
+        calibration = AbsoluteCalibration(
+            base=(np.asarray(t_wb, dtype=np.float64), np.asarray(R_wb, np.float64)),
+            tcp={side: self._tcp_transforms.get(side) for side in ("left", "right")},
+            offset={
+                side: (
+                    np.asarray(self._abs_offset[side][0], dtype=np.float64),
+                    np.asarray(self._abs_offset[side][1], dtype=np.float64),
+                )
+                for side in ("left", "right")
+            },
+        )
+        return {**msg, "calibration": calibration.to_message()}
+
     @staticmethod
     def _encode_tcp_msg(
         left: tuple[np.ndarray, np.ndarray],
@@ -2696,7 +2692,17 @@ def run_ik_worker(
                     # base transform (for the headset's URDF overlay) and the
                     # base-frame TCP targets (recorded per dataset row by Mantis
                     # data collection) alongside the joint solution.
-                    conn.send(("q", q.copy(), worker.abs_base_msg, worker.last_tcp_msg))
+                    # The base message also carries the engage calibration
+                    # (see absolute_reply_base_msg) so recording can map raw
+                    # tracker poses itself instead of waiting for this solve.
+                    conn.send(
+                        (
+                            "q",
+                            q.copy(),
+                            worker.absolute_reply_base_msg(),
+                            worker.last_tcp_msg,
+                        )
+                    )
                 else:
                     # Relative-mode replies pair the joint solution with the
                     # gripper-pair status (box-mode "aligned" cue), refreshed
