@@ -13,6 +13,7 @@ with the fix.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from ..tracker.base import TRACKER_POSE_MAX_AGE_S, valid_tracker_pose
 from ..tracker.lighthouse_survey import (
@@ -27,6 +28,11 @@ from ..tracker.lighthouse_survey import (
 # decode; the channel-clash warning repeats about once a second. Hold the survey
 # open long enough to name the stations before deciding.
 _SURVEY_S = 20.0
+# Trackers report no pose until libsurvive has every live station's identity
+# and has solved where each one is. With no saved calibration (a new host, or
+# stations added or re-channelled) that took 35-92 s for four stations, so a
+# survey that sees live stations but no trackers keeps listening this long.
+_CALIBRATION_S = 150.0
 _EXPECTED_TRACKERS = 2
 
 
@@ -43,19 +49,49 @@ def _result(level: str, label: str, detail: str) -> None:
     print(f"{level:<4} {label:<18} {detail}", flush=True)
 
 
-def survey_lighthouses(source, window_s: float = _SURVEY_S) -> LighthouseSurvey:  # type: ignore[no-untyped-def]
-    """Run a started ``SurviveSource`` for ``window_s`` and return its survey."""
-    deadline = time.perf_counter() + window_s
-    while time.perf_counter() < deadline:
-        source.poses()  # surfaces a backend failure promptly
-        time.sleep(0.2)
-    survey = source.lighthouse_survey()
+def _reporting_trackers(source) -> set[str]:  # type: ignore[no-untyped-def]
     now = time.perf_counter()
-    survey.trackers = {
+    return {
         key
         for key, sample in source.poses().items()
         if valid_tracker_pose(sample) and now - sample.t <= TRACKER_POSE_MAX_AGE_S
     }
+
+
+def survey_lighthouses(  # type: ignore[no-untyped-def]
+    source,
+    window_s: float = _SURVEY_S,
+    calibration_s: float = _CALIBRATION_S,
+    on_calibrating: Callable[[int], None] | None = None,
+) -> LighthouseSurvey:
+    """Run a started ``SurviveSource`` and return its survey.
+
+    Listens for ``window_s``. If base stations are live by then but the
+    trackers have not reported yet, libsurvive is still calibrating (a tracker
+    only receives a station's sweeps when it is powered and in view), so it
+    keeps listening until both trackers report or ``calibration_s`` has passed
+    since the start; ``on_calibrating`` is called once, with the number of
+    live stations, when that wait begins.
+    """
+    started = time.perf_counter()
+    waiting = False
+    while True:
+        source.poses()  # surfaces a backend failure promptly
+        elapsed = time.perf_counter() - started
+        if elapsed >= window_s:
+            live = len(source.lighthouse_survey().channels)
+            if (
+                elapsed >= calibration_s
+                or not live
+                or len(_reporting_trackers(source)) >= _EXPECTED_TRACKERS
+            ):
+                break
+            if not waiting and on_calibrating is not None:
+                on_calibrating(live)
+            waiting = True
+        time.sleep(0.2)
+    survey = source.lighthouse_survey()
+    survey.trackers = _reporting_trackers(source)
     return survey
 
 
@@ -123,7 +159,15 @@ def run_check(_args: object = None) -> None:
             "powered and in view)...",
             flush=True,
         )
-        survey = survey_lighthouses(source)
+        survey = survey_lighthouses(
+            source,
+            on_calibrating=lambda live: print(
+                f"{live} base station(s) live but the trackers are not reporting "
+                "yet: libsurvive is calibrating. Keep both trackers still and in "
+                f"view; listening for up to {_CALIBRATION_S:.0f} s in total...",
+                flush=True,
+            ),
+        )
     finally:
         source.stop()
 

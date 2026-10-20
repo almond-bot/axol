@@ -1,0 +1,346 @@
+From b697f84b18ac2733332986e9bb6d9bf596815986 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Mon, 19 Oct 2026 17:28:15 +0000
+Subject: [PATCH 2/7] ootx: decode each base station through every device that
+ sees it
+
+The first device to report a station's sync pulses owned its only OOTX
+decoder; bits from every other device were dropped. If that receiver kept
+corrupting the slow OOTX stream (occluded, weak radio link) the station's
+identity and calibration never decoded even while a second tracker
+received it cleanly, and a disconnected owner left the decoder bound to a
+freed device for good. Give each device its own decoder per station (the
+first CRC-valid packet wins) and drop a device's decoders when it is
+destroyed.
+---
+ include/libsurvive/survive.h  |   4 ++
+ src/ootx_decoder.h            |   3 +
+ src/survive.c                 |   5 --
+ src/survive_default_devices.c |   1 +
+ src/survive_process_gen1.c    |   2 +
+ src/survive_process_gen2.c    | 109 +++++++++++++++++++++++-----------
+ src/test_cases/CMakeLists.txt |   2 +-
+ src/test_cases/ootx.c         |  92 ++++++++++++++++++++++++++++
+ 8 files changed, 176 insertions(+), 42 deletions(-)
+ create mode 100644 src/test_cases/ootx.c
+
+diff --git a/include/libsurvive/survive.h b/include/libsurvive/survive.h
+index 6c5ef82..015e9bc 100644
+--- a/include/libsurvive/survive.h
++++ b/include/libsurvive/survive.h
+@@ -602,6 +602,10 @@ SURVIVE_EXPORT int survive_cal_get_status(SurviveContext *ctx, char *description
+ // Induce haptic feedback
+ SURVIVE_EXPORT int survive_haptic(SurviveObject *so, FLT freq, FLT amp, FLT duration);
+ SURVIVE_EXPORT void survive_ootx_free_decoder_context(struct SurviveContext *ctx, int bsd_idx);
++// Drop the OOTX decoders a device owns; called before the device is destroyed.
++SURVIVE_EXPORT void survive_ootx_detach_device(SurviveObject *so);
++// Feed one OOTX bit (-1 when unknown) that so received from base station bsd_idx.
++SURVIVE_EXPORT void survive_ootx_behavior(SurviveObject *so, int8_t bsd_idx, int8_t lh_version, int ootx);
+ SURVIVE_EXPORT void survive_find_ang_velocity(SurviveAngularVelocity out, FLT tdiff, const LinmathQuat from,
+ 											  const LinmathQuat to);
+ SURVIVE_EXPORT void survive_apply_ang_velocity(LinmathQuat out, const SurviveAngularVelocity v, FLT t,
+diff --git a/src/ootx_decoder.h b/src/ootx_decoder.h
+index b168ea6..8f8a5b8 100644
+--- a/src/ootx_decoder.h
++++ b/src/ootx_decoder.h
+@@ -36,6 +36,9 @@ typedef struct ootx_decoder_context {
+ 	void * user;
+ 	int user1;
+ 
++	// Next decoder listening to the same base station through another device.
++	struct ootx_decoder_context *next;
++
+ 	struct {
+ 		uint32_t bits_seen;
+ 		uint32_t bad_sync_bits;
+diff --git a/src/survive.c b/src/survive.c
+index 76e2afa..b0b7f25 100644
+--- a/src/survive.c
++++ b/src/survive.c
+@@ -1060,11 +1060,6 @@ void survive_close(SurviveContext *ctx) {
+ 	destroy_config_group(ctx->temporary_config_values);
+ 
+ 	for (int lh = 0; lh < NUM_GEN2_LIGHTHOUSES; lh++) {
+-		ootx_decoder_context *decoderContext = ctx->bsd[lh].ootx_data;
+-		if (decoderContext) {
+-			ootx_free_decoder_context(decoderContext);
+-			free(decoderContext);
+-		}
+ 		destroy_config_group(ctx->lh_config + lh);
+ 	}
+ 
+diff --git a/src/survive_default_devices.c b/src/survive_default_devices.c
+index dda231e..a3adb9d 100644
+--- a/src/survive_default_devices.c
++++ b/src/survive_default_devices.c
+@@ -675,6 +675,7 @@ void survive_destroy_device(SurviveObject *so) {
+ 		ctx->PoserFn(so, &pd);
+ 	}
+ 	SURVIVE_INVOKE_HOOK_SO(lightcap, so, 0);
++	survive_ootx_detach_device(so);
+ 
+ 	SV_VERBOSE(5, "Statistics for %s (driver %s)", so->codename, so->drivername);
+ 	SV_VERBOSE(5, "\tExtent hits               %6u", so->stats.extent_hits);
+diff --git a/src/survive_process_gen1.c b/src/survive_process_gen1.c
+index 519b054..5425a08 100644
+--- a/src/survive_process_gen1.c
++++ b/src/survive_process_gen1.c
+@@ -53,6 +53,8 @@ void survive_default_light_process(SurviveObject *so, int sensor_id, int acode,
+ 			SurviveSensorActivations_add_sync(&so->activations, &l.common);
+ 
+ 		ootx_decoder_context *decoderContext = ctx->bsd[lh].ootx_data;
++		while (decoderContext && decoderContext->user != so)
++			decoderContext = decoderContext->next;
+ 		uint32_t ootxOffset = decoderContext ? decoderContext->offset : 0;
+ 		uint32_t ootxTotalOffset = decoderContext ? decoderContext->total_offset : 0;
+ 		SV_VERBOSE(600, "%s Sync    %8x %3d.%2d.%d %8u %u %d %d / %d", survive_colorize_codename(so),
+diff --git a/src/survive_process_gen2.c b/src/survive_process_gen2.c
+index aa2c9da..f8e4208 100644
+--- a/src/survive_process_gen2.c
++++ b/src/survive_process_gen2.c
+@@ -125,12 +125,11 @@ static void ootx_packet_cblk_d_gen1(ootx_decoder_context *ct, ootx_packet *packe
+ 		SURVIVE_INVOKE_HOOK(ootx_received, ctx, id);
+ 	}
+ }
+-void survive_ootx_dump_decoder_context(struct SurviveContext *ctx, int bsd_idx) {
+-	ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
+-	if (decoderContext == 0)
+-		return;
+-
+-	SV_VERBOSE(105, "OOTX stats for LH%d (mode: %d, %u)", bsd_idx, ctx->bsd[bsd_idx].mode, ctx->bsd[bsd_idx].BaseStationID);
++static void survive_ootx_dump_one_decoder_context(struct SurviveContext *ctx, int bsd_idx,
++												  ootx_decoder_context *decoderContext) {
++	SurviveObject *so = decoderContext->user;
++	SV_VERBOSE(105, "OOTX stats for LH%d (mode: %d, %u) via %s", bsd_idx, ctx->bsd[bsd_idx].mode,
++			   ctx->bsd[bsd_idx].BaseStationID, so ? so->codename : "?");
+ 	SV_VERBOSE(105, "\tBits seen:         %u (%d bytes)", decoderContext->stats.bits_seen,
+ 			   decoderContext->stats.bits_seen / 8);
+ 	SV_VERBOSE(105, "\tBad CRCs:          %u", decoderContext->stats.bad_crcs);
+@@ -144,45 +143,83 @@ void survive_ootx_dump_decoder_context(struct SurviveContext *ctx, int bsd_idx)
+ 	SV_VERBOSE(105, "\tTime:              %2.2f (%2.2fb/s, %2.2fb/s)", d, decoderContext->stats.bits_seen / d,
+ 			   decoderContext->stats.used_bytes * 8 / d);
+ }
++void survive_ootx_dump_decoder_context(struct SurviveContext *ctx, int bsd_idx) {
++	for (ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data; decoderContext;
++		 decoderContext = decoderContext->next) {
++		survive_ootx_dump_one_decoder_context(ctx, bsd_idx, decoderContext);
++	}
++}
+ void survive_ootx_free_decoder_context(struct SurviveContext *ctx, int bsd_idx) {
+-	ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
+-	ctx->bsd[bsd_idx].ootx_data = 0;
+-	if (decoderContext == 0)
++	if (ctx->bsd[bsd_idx].ootx_data == 0)
+ 		return;
+ 
+ 	survive_ootx_dump_decoder_context(ctx, bsd_idx);
+-	ootx_free_decoder_context(decoderContext);
+-	free(decoderContext);
++	ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
++	ctx->bsd[bsd_idx].ootx_data = 0;
++	while (decoderContext) {
++		ootx_decoder_context *next = decoderContext->next;
++		ootx_free_decoder_context(decoderContext);
++		free(decoderContext);
++		decoderContext = next;
++	}
+ }
+-void survive_ootx_behavior(SurviveObject *so, int8_t bsd_idx, int8_t lh_version, int ootx) {
++
++void survive_ootx_detach_device(SurviveObject *so) {
+ 	struct SurviveContext *ctx = so->ctx;
+-	if (ctx->bsd[bsd_idx].OOTXChecked == false) {
+-		ootx_decoder_context *decoderContext = ctx->bsd[bsd_idx].ootx_data;
+-
+-		if (decoderContext == 0) {
+-			if (lh_version == 1) {
+-				SV_INFO("OOTX not set for LH in channel %d; attaching ootx decoder using device %s",
+-						ctx->bsd[bsd_idx].mode, so->codename);
+-			} else {
+-				SV_INFO("OOTX not set for LH %d; attaching ootx decoder using device %s", bsd_idx, so->codename);
++	for (int bsd_idx = 0; bsd_idx < NUM_GEN2_LIGHTHOUSES; bsd_idx++) {
++		ootx_decoder_context **slot = (ootx_decoder_context **)&ctx->bsd[bsd_idx].ootx_data;
++		while (*slot) {
++			ootx_decoder_context *decoderContext = *slot;
++			if (decoderContext->user != so) {
++				slot = &decoderContext->next;
++				continue;
+ 			}
+-			decoderContext = ctx->bsd[bsd_idx].ootx_data = SV_CALLOC(sizeof(ootx_decoder_context));
+-			ootx_init_decoder_context(decoderContext, survive_run_time(ctx));
+-			decoderContext->user1 = bsd_idx;
+-			decoderContext->user = so;
+-			decoderContext->ignore_sync_bit_error = survive_configi(ctx, "ootx-ignore-sync-error", SC_SETCONFIG, 0);
+-			decoderContext->ootx_packet_clbk = lh_version ? ootx_packet_clbk_d_gen2 : ootx_packet_cblk_d_gen1;
+-			decoderContext->ootx_error_clbk = ootx_error_clbk_d;
+-			decoderContext->ootx_bad_crc_clbk = ootx_bad_crc_clbk;
++			*slot = decoderContext->next;
++			survive_ootx_dump_one_decoder_context(ctx, bsd_idx, decoderContext);
++			ootx_free_decoder_context(decoderContext);
++			free(decoderContext);
+ 		}
+-		if (decoderContext->user == so) {
+-			ootx_pump_bit(decoderContext, ootx);
++	}
++}
+ 
+-			if (ctx->bsd[bsd_idx].OOTXChecked) {
+-				ctx->bsd[bsd_idx].OOTXChecked = false;
+-				survive_ootx_dump_decoder_context(ctx, bsd_idx);
+-				// survive_ootx_free_decoder_context(ctx, bsd_idx);
+-			}
++// Every device that sees a base station decodes its OOTX stream with its own decoder. The stream is a slow (one bit
++// per sweep) broadcast, so a single receiver that keeps dropping or corrupting bits -- partly occluded, a weak radio
++// link, a busy USB bus -- could otherwise hold the station's identity and calibration hostage while another tracker
++// receives it cleanly. The first decoder to complete a CRC-checked packet sets the station data.
++static ootx_decoder_context *survive_ootx_decoder_for(SurviveObject *so, int8_t bsd_idx, int8_t lh_version) {
++	struct SurviveContext *ctx = so->ctx;
++	ootx_decoder_context **slot = (ootx_decoder_context **)&ctx->bsd[bsd_idx].ootx_data;
++	for (; *slot; slot = &(*slot)->next) {
++		if ((*slot)->user == so)
++			return *slot;
++	}
++
++	if (lh_version == 1) {
++		SV_INFO("OOTX not set for LH in channel %d; attaching ootx decoder using device %s", ctx->bsd[bsd_idx].mode,
++				so->codename);
++	} else {
++		SV_INFO("OOTX not set for LH %d; attaching ootx decoder using device %s", bsd_idx, so->codename);
++	}
++	ootx_decoder_context *decoderContext = *slot = SV_CALLOC(sizeof(ootx_decoder_context));
++	ootx_init_decoder_context(decoderContext, survive_run_time(ctx));
++	decoderContext->user1 = bsd_idx;
++	decoderContext->user = so;
++	decoderContext->ignore_sync_bit_error = survive_configi(ctx, "ootx-ignore-sync-error", SC_SETCONFIG, 0);
++	decoderContext->ootx_packet_clbk = lh_version ? ootx_packet_clbk_d_gen2 : ootx_packet_cblk_d_gen1;
++	decoderContext->ootx_error_clbk = ootx_error_clbk_d;
++	decoderContext->ootx_bad_crc_clbk = ootx_bad_crc_clbk;
++	return decoderContext;
++}
++
++SURVIVE_EXPORT void survive_ootx_behavior(SurviveObject *so, int8_t bsd_idx, int8_t lh_version, int ootx) {
++	struct SurviveContext *ctx = so->ctx;
++	if (ctx->bsd[bsd_idx].OOTXChecked == false) {
++		ootx_decoder_context *decoderContext = survive_ootx_decoder_for(so, bsd_idx, lh_version);
++		ootx_pump_bit(decoderContext, ootx);
++
++		if (ctx->bsd[bsd_idx].OOTXChecked) {
++			ctx->bsd[bsd_idx].OOTXChecked = false;
++			survive_ootx_dump_one_decoder_context(ctx, bsd_idx, decoderContext);
+ 		}
+ 	}
+ }
+diff --git a/src/test_cases/CMakeLists.txt b/src/test_cases/CMakeLists.txt
+index 3e376e5..2a893cd 100644
+--- a/src/test_cases/CMakeLists.txt
++++ b/src/test_cases/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(SURVIVE_TESTS
+         reproject
+         check_generated barycentric_svd optimizer
+-        rotate_angvel export_config)
++        rotate_angvel export_config ootx)
+ 
+ set(barycentric_svd_ADDITIONAL_SRCS ../barycentric_svd/barycentric_svd.c)
+ 
+diff --git a/src/test_cases/ootx.c b/src/test_cases/ootx.c
+new file mode 100644
+index 0000000..e97a60c
+--- /dev/null
++++ b/src/test_cases/ootx.c
+@@ -0,0 +1,92 @@
++#include "../ootx_decoder.h"
++#include "../survive_default_devices.h"
++#include "test_case.h"
++
++#include <string.h>
++#include <zlib.h>
++
++// 17 zeros and a one, then the payload's bits MSB first with a one (sync) bit after every 16 data bits.
++static size_t encode_ootx(const uint8_t *payload, uint16_t length, int8_t *bits, size_t max_bits) {
++	uint8_t frame[64] = {0};
++	uint16_t padded = length + (length & 1);
++	memcpy(frame, &length, sizeof(length));
++	memcpy(frame + 2, payload, length);
++	uint32_t crc = crc32(crc32(0L, 0, 0), payload, length);
++	memcpy(frame + 2 + padded, &crc, sizeof(crc));
++	size_t frame_len = 2 + padded + 4;
++
++	size_t n = 0;
++	for (int i = 0; i < 17; i++)
++		bits[n++] = 0;
++	bits[n++] = 1;
++	for (size_t i = 0; i < frame_len * 8; i++) {
++		bits[n++] = (frame[i / 8] >> (7 - i % 8)) & 1;
++		if (i % 16 == 15)
++			bits[n++] = 1;
++	}
++	assert(n <= max_bits);
++	return n;
++}
++
++static int ootx_packets_received = 0;
++static void count_ootx(struct SurviveContext *ctx, uint8_t bsd_idx) { ootx_packets_received++; }
++
++// Pump both devices' views of one base station bit by bit, the first device always first.
++static void pump(SurviveObject *a, const int8_t *a_bits, SurviveObject *b, const int8_t *b_bits, size_t n) {
++	for (size_t i = 0; i < n; i++) {
++		if (a)
++			survive_ootx_behavior(a, 0, 1, a_bits[i]);
++		if (b)
++			survive_ootx_behavior(b, 0, 1, b_bits[i]);
++	}
++}
++
++TEST(OOTX, SecondDeviceDecodesStation) {
++	char *const args[] = {"test-ootx", "--configfile", "./test-ootx-config.json", 0};
++	remove("./test-ootx-config.json");
++	SurviveContext *ctx = survive_init_internal(3, args, 0, 0);
++	if (ctx == 0)
++		return survive_test_assert();
++	survive_install_ootx_received_fn(ctx, count_ootx);
++
++	SurviveObject *a = survive_create_device(ctx, "TST", 0, "TA0", 0);
++	SurviveObject *b = survive_create_device(ctx, "TST", 0, "TB0", 0);
++	survive_add_object(ctx, a);
++	survive_add_object(ctx, b);
++
++	uint8_t payload[43] = {0};
++	const uint32_t station_id = 0x1234abcd;
++	memcpy(payload + 2, &station_id, sizeof(station_id));
++	payload[31] = 3; // mode_current
++
++	int8_t clean[1024], corrupted[1024];
++	size_t n = encode_ootx(payload, sizeof(payload), clean, 1024);
++	memcpy(corrupted, clean, n);
++	corrupted[60] = !corrupted[60]; // a payload bit, so the CRC fails
++
++	// Device a sees the station first but only ever receives the stream with errors; b receives it cleanly.
++	// a used to own the station's only decoder, so b's clean stream was ignored and the station never decoded.
++	for (int i = 0; i < 3; i++)
++		pump(a, corrupted, b, clean, n);
++
++	ASSERT_EQ(ctx->bsd[0].OOTXSet, 1);
++	ASSERT_EQ(ctx->bsd[0].BaseStationID, station_id);
++	ASSERT_EQ(ctx->bsd[0].mode, 3);
++	ASSERT_EQ(ootx_packets_received, 1);
++
++	// A device that goes away takes its decoders with it; the remaining device keeps decoding.
++	survive_destroy_device(b);
++	const uint32_t new_id = 0x0badf00d;
++	memcpy(payload + 2, &new_id, sizeof(new_id));
++	n = encode_ootx(payload, sizeof(payload), clean, 1024);
++	pump(a, clean, 0, 0, n);
++	ASSERT_EQ(ctx->bsd[0].BaseStationID, new_id);
++	ASSERT_EQ(ootx_packets_received, 2);
++
++	// The last device's decoders go with it too. (The context was never started, so it is not closed.)
++	survive_destroy_device(a);
++	ASSERT_EQ(ctx->bsd[0].ootx_data, 0);
++
++	remove("./test-ootx-config.json");
++	return 0;
++}
+-- 
+2.53.0
+

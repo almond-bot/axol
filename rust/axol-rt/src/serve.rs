@@ -211,7 +211,7 @@ use crate::can::CanSock;
 use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 use crate::stall;
 
 /// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
@@ -281,7 +281,12 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   floats — the 10th a per-command cap that tightens it (box mode's
 ///   wrist and squeeze caps; 0 = the config cap alone). A proto-16 core
 ///   would reject every target on its length.
-const CONFIG_PROTO: u32 = 17;
+/// - 18: no layout change — the core stops on the arm hub's no-ACK report
+///   (`SendOutcome::Unacked`, hub firmware 2.01). This package flashes every
+///   hub to 2.01, which drops unACKed frames instead of backing up, so a
+///   proto-17 core would never see the e-stop as a TX stall and would keep
+///   streaming into the dead bus; it must refuse to arm instead.
+const CONFIG_PROTO: u32 = 18;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -2199,10 +2204,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 17\ngripper 0 canL 8\n".to_string()
+                "proto 18\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2396,7 +2401,7 @@ mod tests {
             match guarded_send(&sock, 0x7F0, &[0u8; 8], &mut since).unwrap() {
                 SendOutcome::Sent => sent += 1,
                 SendOutcome::Dropped => dropped += 1,
-                SendOutcome::Stalled => break,
+                SendOutcome::Stalled | SendOutcome::Unacked => break,
             }
             assert!(
                 start.elapsed() < Duration::from_secs(15),
@@ -2439,7 +2444,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 18\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2491,39 +2496,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 17\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 18\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2534,7 +2539,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 17\n\
+            "proto 18\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2548,15 +2553,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 17\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 18\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 18\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 17\n\
+            "proto 18\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2587,7 +2592,7 @@ mod tests {
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 17\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 18\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2596,7 +2601,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
-            "proto 17\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 18\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
@@ -2611,27 +2616,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 18\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 17\n{mit}"))
+            parse_config(&format!("proto 18\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 17\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 18\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 17\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 18\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 17\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 18\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2647,7 +2652,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 17\nloop_hz 480\n{}{}{}{}",
+            "proto 18\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -3163,6 +3168,15 @@ fn bus_loop(
     };
     if let Err(err) = bringup::enable(&sock, iface, &motors) {
         let _ = ready_tx.send(Err(err));
+        return Ok(());
+    }
+    // From here a no-ACK report from the hub means motor power died under
+    // this session (see `SendOutcome::Unacked`). Subscribed only now, with
+    // the motors just shown to answer, so nothing from before can latch.
+    if let Err(err) = sock.watch_ack_errors() {
+        let _ = ready_tx.send(Err(io::Error::other(format!(
+            "{iface}: could not subscribe to CAN ACK errors: {err}"
+        ))));
         return Ok(());
     }
     let _ = ready_tx.send(Ok(()));
@@ -4117,6 +4131,20 @@ fn bus_loop(
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
                     SendOutcome::Sent => expected[motor_index] = 1,
                     SendOutcome::Dropped => {}
+                    SendOutcome::Unacked => {
+                        // The e-stop path on hub firmware 2.01+: the hub saw
+                        // nothing ACK for 50 ms and dropped the frame, so
+                        // there is no queue to purge — but this loop must
+                        // stop before power returns, or its next frames
+                        // command the motors the instant they wake. Same
+                        // fault and teardown as the stall below.
+                        bus_dead = true;
+                        fault.store(1, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                        return Err(io::Error::other(format!(
+                            "{iface}: {NO_ACK_REPORT}; commands stopped"
+                        )));
+                    }
                     SendOutcome::Stalled => {
                         // The e-stop path: nothing has ACKed for >1 s. Stop
                         // commanding, purge the poisoned TX queue so the

@@ -1,0 +1,15 @@
+---
+title: "hub.info"
+description: "Show the Axol arm hub's firmware version and last reset."
+---
+
+Prints each Axol arm hub (the RP2350 USB-to-CAN bridge for both arms) found behind the configured arm CAN channels: its USB serial and port, the firmware version it reports, and whether that is **current** or **outdated** against the firmware bundled with this package.
+
+```bash
+axol hub.info
+sudo axol hub.info
+```
+
+Run as root, it also reads the hub's last reset cause (power-on, brown-out, watchdog, …) and uptime — useful when an arm bus dropped out and you want to know whether the hub itself rebooted. That needs hub firmware 1.00 or newer; otherwise it prints `last reset unavailable`. The `USB` port path it prints (e.g. `1-3`) is what [`hub.flash --port`](/cli/hub-flash) takes.
+
+It exits non-zero with `No Axol hub found behind the configured arm channels.` when no hub is attached or the arm interfaces have not been set up yet (run [`can.setup`](/cli/can-setup)).

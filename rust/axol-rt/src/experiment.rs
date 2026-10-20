@@ -7,7 +7,7 @@
 use crate::can::CanSock;
 use crate::filter::{self, BandPass, LpDiff};
 use crate::proto::{self, MitRanges};
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -246,6 +246,11 @@ pub fn run(
         match guarded_send(socket, command_id, &frame, enobufs_since)? {
             SendOutcome::Sent => {}
             SendOutcome::Dropped => {}
+            SendOutcome::Unacked => {
+                return Err(io::Error::other(format!(
+                    "CAN {iface} tuning experiment stopped: {NO_ACK_REPORT}"
+                )));
+            }
             SendOutcome::Stalled => {
                 let purged = purge_tx_queue(iface);
                 return Err(io::Error::other(format!(

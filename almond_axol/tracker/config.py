@@ -9,6 +9,7 @@ editable by hand.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -27,7 +28,7 @@ class TrackerConfig:
         backend: ``"survive"`` (Vive Tracker 3.0 via libsurvive),
             ``"ultimate"`` (Vive Ultimate Tracker via the dongle), or
             ``"synthetic"`` (generated motion for tests).
-        left:  Device key of the left-rig tracker (libsurvive codename /
+        left:  Device key of the left-rig tracker (Lighthouse tracker serial /
             Ultimate MAC), or ``None`` if unassigned.
         right: Device key of the right-rig tracker, or ``None``.
         bindings: Per-backend device bindings. This lets the control panel
@@ -67,6 +68,17 @@ class TrackerConfig:
     allow_single_side: bool = False
 
 
+# A libsurvive codename (``WM0``, ``T20``…) rather than a tracker serial
+# (``LHR-…``). Bindings saved by earlier releases used these, but a codename
+# names the dongle slot in open order and can swap between runs, which bound
+# each rig to the other's tracker.
+_SURVIVE_CODENAME = re.compile(r"[A-Z]+[0-9]*")
+
+
+def _is_survive_codename(key: object) -> bool:
+    return isinstance(key, str) and _SURVIVE_CODENAME.fullmatch(key) is not None
+
+
 def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
     """Load the saved config, tolerating a missing file or unknown keys."""
     try:
@@ -95,6 +107,20 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
         for backend, binding in list(config.bindings.items()):
             if not isinstance(binding, dict):
                 config.bindings.pop(backend)
+                migrated = True
+    # Codename bindings can no longer be trusted (see _SURVIVE_CODENAME):
+    # drop them so setup asks for Identify again instead of engaging each rig
+    # with the other's tracker.
+    survive_binding = config.bindings.get("survive")
+    if survive_binding is not None:
+        for side in ("left", "right"):
+            if _is_survive_codename(survive_binding.get(side)):
+                survive_binding[side] = None
+                migrated = True
+    if config.backend == "survive":
+        for side in ("left", "right"):
+            if _is_survive_codename(getattr(config, side)):
+                setattr(config, side, None)
                 migrated = True
     if config.backend in {"survive", "ultimate"} and (
         config.left is not None or config.right is not None

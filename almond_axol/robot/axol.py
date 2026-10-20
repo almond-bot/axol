@@ -2742,9 +2742,10 @@ class AxolHardware(RobotBase):
         (idempotent — safe to call again) before its first per-arm call.
 
         Args:
-            purge_stale: Whether to clear frames a dead bus left queued
-                         before opening (see
-                         :meth:`_purge_stale_can_queues`). Pass ``False``
+            purge_stale: Whether to prepare the interfaces before opening:
+                         update the arm hub's firmware if it is outdated and
+                         clear frames a dead bus left queued (see
+                         :meth:`_prepare_can_interfaces`). Pass ``False``
                          only when the interfaces are not this call's to
                          flap — the realtime core owns them, or a caller
                          purged already before handing them over — which is
@@ -2756,13 +2757,50 @@ class AxolHardware(RobotBase):
                 "robot shutdown is incomplete; retry disable before reconnecting"
             )
         if purge_stale:
-            await self._purge_stale_can_queues()
+            await self._prepare_can_interfaces()
         bus_tasks = []
         if self.left is not None:
             bus_tasks.append(self._left_bus.start())
         if self.right is not None:
             bus_tasks.append(self._right_bus.start())
         await _await_all_hardware_actions(*bus_tasks)
+
+    def _can_channels(self) -> list[str]:
+        """The interfaces of the arms this robot drives."""
+        return [
+            bus.channel
+            for arm, bus in (
+                (self.left, getattr(self, "_left_bus", None)),
+                (self.right, getattr(self, "_right_bus", None)),
+            )
+            if arm is not None and bus is not None
+        ]
+
+    async def _prepare_can_interfaces(self) -> None:
+        """Ready the arm interfaces for a bring-up while nobody owns them.
+
+        Two steps that both need the interfaces free, in order:
+
+        1. :func:`almond_axol.hub.ensure_hub_firmware` — reflash the arm hub
+           when it runs older firmware than this package ships. Its firmware
+           decides whether a command parked behind a dead bus can reach the
+           motors when they are powered back on, so a robot must not keep
+           running an old build. Normally one sysfs read per hub.
+        2. :meth:`_purge_stale_can_queues`.
+
+        Raises:
+            MotorError: A hub flash left the buses unusable, or a poisoned
+                queue could not be cleared.
+        """
+        from ..hub import HubFirmwareError, ensure_hub_firmware
+
+        channels = self._can_channels()
+        if channels:
+            try:
+                await asyncio.to_thread(ensure_hub_firmware, channels)
+            except HubFirmwareError as exc:
+                raise MotorError(f"Axol hub firmware update failed: {exc}") from exc
+        await self._purge_stale_can_queues()
 
     async def _purge_stale_can_queues(self) -> None:
         """Drop frames a dead bus left queued, before anything can enable motors.
@@ -2796,14 +2834,7 @@ class AxolHardware(RobotBase):
         """
         from ..cli.can.setup import purge_stale_tx
 
-        channels = [
-            bus.channel
-            for arm, bus in (
-                (self.left, getattr(self, "_left_bus", None)),
-                (self.right, getattr(self, "_right_bus", None)),
-            )
-            if arm is not None and bus is not None
-        ]
+        channels = self._can_channels()
         if not channels:
             return
         try:

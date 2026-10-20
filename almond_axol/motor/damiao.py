@@ -429,6 +429,13 @@ class DamiaoMotor(MotorDriver):
                 feedback = await self._request_feedback(attempts=1)
                 if feedback.status == _DamiaoStatus.DISABLED:
                     return
+                if feedback.status == _DamiaoStatus.LOST_COMM:
+                    # The comm-timeout fault already switched the output off,
+                    # but the motor reports the fault, not DISABLED, until it
+                    # is cleared. Clearing it never enables the motor, and it
+                    # is what a session that ended without a clean teardown
+                    # (a crash, a killed process) always leaves behind.
+                    await self.clear_errors()
             except MotorError:
                 pass
         raise MotorError(

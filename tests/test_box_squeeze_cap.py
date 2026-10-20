@@ -322,8 +322,9 @@ class WireTest(unittest.TestCase):
         from almond_axol.rt.mantis import Mantis
         from almond_axol.rt.robot import Axol
 
-        # Proto 17 is the 10-float target slot with the tau_cap field.
-        self.assertEqual(CONFIG_PROTO, 17)
+        # Proto 17 brought the 10-float target slot with the tau_cap field
+        # (18 keeps the layout).
+        self.assertEqual(CONFIG_PROTO, 18)
         for cls, robot in (
             (
                 Axol,

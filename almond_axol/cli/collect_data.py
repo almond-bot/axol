@@ -902,6 +902,43 @@ class EpisodeQAStats:
         )
 
 
+def _newer_pose(
+    snapshot: TCPPoseSnapshot | None, previous: TCPPoseSnapshot | None
+) -> bool:
+    """Whether ``snapshot`` should replace ``previous`` as the recorded pose.
+
+    Falling back from the calibrated tracker pose to the IK snapshot (on a
+    disengage) hands back an older capture; recording it would step the row
+    timestamps backwards, which the recorder's snapshot ring cannot bracket.
+    Keep the newer sample until the IK path catches up.
+    """
+    if snapshot is None:
+        return False
+    if previous is None or previous.pose_host_ts is None:
+        return True
+    if snapshot.pose_host_ts is None:
+        return False
+    return snapshot.pose_host_ts >= previous.pose_host_ts
+
+
+def _row_observation(
+    robot: Any, live: dict[str, Any], pose_ts: float | None
+) -> dict[str, Any]:
+    """The measured state to record in a row stamped with ``pose_ts``.
+
+    The live reading is taken at the control tick, up to one pose lag (tens of
+    ms) after the pose capture the row is stamped with; the gripper position
+    in it would lead the recorded pose by that much. Use the core's
+    telemetry nearest the capture instead, and the live reading only when no
+    such sample is retained.
+    """
+    if pose_ts is None:
+        return live
+    at = getattr(robot, "joint_observation_at", None)
+    measured = at(pose_ts) if at is not None else None
+    return measured if measured is not None else live
+
+
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     """Quality verdict for a recorded episode: ``(ok, reasons)``.
 
@@ -1021,6 +1058,9 @@ class _NullCollectControl:
     def note_returning(self) -> None:
         pass
 
+    def note_rejected(self, reason: str) -> None:
+        pass
+
     def note_dataset(self, repo_id: str, root: Path) -> None:
         pass
 
@@ -1054,6 +1094,10 @@ class _QueueCollectControl:
         # The dataset this session records into (note_dataset), so the
         # panel's dataset preview can follow it.
         self._dataset: dict[str, str] | None = None
+        # Why the last take was not saved (note_rejected). Unlike the phase
+        # message it survives the return to "ready", so a refused take can't
+        # read as a quiet success; the next take's recording start clears it.
+        self._rejection: str | None = None
 
     # -- serve API surface --------------------------------------------------
 
@@ -1078,6 +1122,8 @@ class _QueueCollectControl:
                 snap["episode"] = self._episode
             if self._dataset is not None:
                 snap["dataset"] = dict(self._dataset)
+            if self._rejection is not None:
+                snap["notice"] = {"level": "error", "message": self._rejection}
             return snap
 
     def note_dataset(self, repo_id: str, root: Path) -> None:
@@ -1126,6 +1172,8 @@ class _QueueCollectControl:
             self._countdown_deadline = deadline
 
     def note_recording(self) -> None:
+        with self._lock:
+            self._rejection = None
         self._set("recording", "Recording — save or discard the episode to end it.")
 
     def note_saving(self) -> None:
@@ -1145,6 +1193,11 @@ class _QueueCollectControl:
 
     def note_returning(self) -> None:
         self._set("resetting", "Returning to rest…")
+
+    def note_rejected(self, reason: str) -> None:
+        """The take just ended was discarded or failed to save, and why."""
+        with self._lock:
+            self._rejection = reason
 
 
 Control = _NullCollectControl | _QueueCollectControl
@@ -2073,9 +2126,11 @@ def _run_session(
             if mantis_mode:
                 # Pose and host capture time are one immutable sample. Reading
                 # them through separate accessors could straddle an IK publish
-                # and stamp pose N+1 with pose N's timestamp.
-                tcp_snapshot = teleop.tcp_pose_snapshot()
-                if tcp_snapshot is not None:
+                # and stamp pose N+1 with pose N's timestamp. While engaged on
+                # a managed tracker this is the calibrated tracker pose at its
+                # own capture time, not the IK path's older processed pose.
+                tcp_snapshot = teleop.recording_pose_snapshot()
+                if _newer_pose(tcp_snapshot, last_tcp):
                     last_tcp = tcp_snapshot
                 pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
                 if pose_ts is not None:
@@ -2091,6 +2146,9 @@ def _run_session(
                 # where the gripper physically is, and training must not
                 # inherit filter/solver artifacts. Grippers stay as-is —
                 # measured feedback in the state, commanded in the action.
+                # Measured values (the grippers) as of the pose capture, not
+                # the later control tick.
+                joint_obs = _row_observation(robot, joint_obs, pose_ts)
                 if last_tcp is not None:
                     joint_obs = dict(joint_obs)
                     dataset_act = dict(dataset_act)
@@ -2693,6 +2751,15 @@ def _run_session(
         except RuntimeError as exc:
             _logger.error("episode discard failed; continuing: %s", exc)
 
+    def _reject_take(reason: str) -> None:
+        """Log a discarded or refused take and keep it on the panel.
+
+        The headset and the panel otherwise return to their ready state, so
+        without this a rejected take looked exactly like a saved one.
+        """
+        _logger.warning(reason)
+        control.note_rejected(reason)
+
     def _wrap_up_episode(
         recording: bool,
         rerecord: bool,
@@ -2702,8 +2769,9 @@ def _run_session(
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if capture_failure is not None:
-            _logger.info(
-                f"Episode discarded because camera capture failed: {capture_failure}"
+            _reject_take(
+                f"Episode {episode_idx + 1} was not saved: camera capture "
+                f"failed ({capture_failure})."
             )
             # finish_episode already joined capture and cleared the rejected
             # buffer. cancel_episode is an idempotent lifecycle reset and also
@@ -2735,7 +2803,7 @@ def _run_session(
                 # up like collect-dagger does instead of tearing everything
                 # down over one lost episode. Durability failures are a
                 # different type (EpisodeDurabilityError) and still unwind.
-                _logger.info(f"Episode NOT saved: {exc}")
+                _reject_take(f"Episode {episode_idx + 1} was NOT saved: {exc}")
                 return
             # The serve unit records as root into the operator's home; hand the
             # tree back after every save so a crash never leaves a root-owned
@@ -2818,16 +2886,17 @@ def _run_session(
             # the same episode again instead of tearing down robot control.
             if recording and not rerecord and capture_failure is None:
                 if captured_rows == 0 and qa.end_t_host is not None:
-                    _logger.info(
-                        "Episode has no dataset rows before the end gesture "
-                        "began — it was ended as soon as it started. Discarding "
-                        "and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it has no "
+                        "dataset rows before the end gesture began (it was "
+                        "ended as soon as it started). Record it again."
                     )
                     rerecord = True
                 elif captured_rows == 0:
-                    _logger.info(
-                        "Episode captured no dataset rows — it ended before the "
-                        "first camera frame arrived. Discarding and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it captured "
+                        "no dataset rows (it ended before the first camera "
+                        "frame arrived). Record it again."
                     )
                     rerecord = True
 
@@ -2874,9 +2943,11 @@ def _run_session(
                     )
                 if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
-                        _logger.info(
-                            "Episode REJECTED by the quality gate — "
-                            "discarding and re-recording. " + " ".join(qa_reasons)
+                        _reject_take(
+                            f"Episode {episode_idx + 1} was REJECTED by the "
+                            "quality gate and discarded: "
+                            + "; ".join(qa_reasons)
+                            + ". Record it again."
                         )
                         rerecord = True
                     else:

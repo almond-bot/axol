@@ -1,0 +1,144 @@
+From e67f02ac2dab777b117cc42c49332005cec1ca44 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Mon, 19 Oct 2026 22:49:51 +0000
+Subject: [PATCH 6/7] mpfit: allocate the work arrays on the heap
+
+mp_malloc used alloca for every work array, including the m * nfree
+Jacobian. A global-scene solve feeds mpfit every stored scene of every
+device against every base station, so with four base stations and a
+full scene ring that is several megabytes on the global scene solver
+thread's ~8 MB stack, next to the caller's covariance matrices. It
+overflowed it: survive-cli died with SIGSEGV in mpfit's stack probe
+(captured on the AGX Orin after the scene-ring fix).
+
+Allocate with calloc and free at CLEANUP, which every exit after the
+first allocation already goes through (the original cmpfit layout this
+was derived from). test-mpfit_stack runs a fit whose arrays do not fit
+on a 512 KB thread stack: the alloca version segfaults, this one solves.
+---
+ redist/mpfit/mpfit.c          | 14 ++++----
+ src/test_cases/CMakeLists.txt |  3 +-
+ src/test_cases/mpfit_stack.c  | 60 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+), 7 deletions(-)
+ create mode 100644 src/test_cases/mpfit_stack.c
+
+diff --git a/redist/mpfit/mpfit.c b/redist/mpfit/mpfit.c
+index 5efa795..c22567c 100644
+--- a/redist/mpfit/mpfit.c
++++ b/redist/mpfit/mpfit.c
+@@ -48,22 +48,24 @@ static int mp_covar(int n, FLT *r, int ldr, int *ipvt, FLT tol, FLT *wa);
+ 	int verify_alloc_free_##dest;                                                                                      \
+ 	type *dest = 0;
+ 
+-/* Macro to safely allocate memory */
++/* Macro to safely allocate memory.
++ *
++ * Heap, not alloca: the Jacobian alone is m * nfree doubles, and a global-scene solve (every stored scene of every
++ * device against every base station) makes that several megabytes. On the solver thread's ~8 MB stack, next to the
++ * caller's covariance matrices, alloca overflowed it and survive-cli died with SIGSEGV in mpfit's stack probe. */
+ #define mp_malloc(dest, type, size)                                                                                    \
+ 	(void)(verify_alloc_free_##dest);                                                                                  \
+-	dest = (type *)alloca(sizeof(type) * (size));                                                                      \
++	dest = (type *)calloc((size) > 0 ? (size) : 1, sizeof(type));                                                     \
+ 	if (dest == 0) {                                                                                                   \
+ 		info = MP_ERR_MEMORY;                                                                                          \
+ 		goto CLEANUP;                                                                                                  \
+-	} else {                                                                                                           \
+-		for (int _k = 0; _k < (size); _k++)                                                                            \
+-			dest[_k] = 0;                                                                                              \
+ 	}
+ 
+-//#define mp_free(dest) if(dest) { free(dest); }
+ #define mp_free(dest)                                                                                                  \
+ 	{                                                                                                                  \
+ 		(void)(verify_alloc_free_##dest);                                                                              \
++		free(dest);                                                                                                    \
++		dest = 0;                                                                                                      \
+ 	};
+ /*
+  *     **********
+diff --git a/src/test_cases/CMakeLists.txt b/src/test_cases/CMakeLists.txt
+index 7eb9ddc..1ac1367 100644
+--- a/src/test_cases/CMakeLists.txt
++++ b/src/test_cases/CMakeLists.txt
+@@ -1,9 +1,10 @@
+ SET(SURVIVE_TESTS
+         reproject
+         check_generated barycentric_svd optimizer
+-        rotate_angvel export_config ootx gss)
++        rotate_angvel export_config ootx gss mpfit_stack)
+ 
+ set(barycentric_svd_ADDITIONAL_SRCS ../barycentric_svd/barycentric_svd.c)
++set(mpfit_stack_ADDITIONAL_LIBS mpfit)
+ 
+ IF(NOT WIN32)
+     LIST(APPEND SURVIVE_TESTS watchman)
+diff --git a/src/test_cases/mpfit_stack.c b/src/test_cases/mpfit_stack.c
+new file mode 100644
+index 0000000..ac3e23c
+--- /dev/null
++++ b/src/test_cases/mpfit_stack.c
+@@ -0,0 +1,60 @@
++#include "test_case.h"
++
++#include "mpfit/mpfit.h"
++
++#include <pthread.h>
++#include <string.h>
++
++// Big enough that mpfit's Jacobian (M * N doubles = 640 KB) cannot fit on the small thread stack below.
++#define M 4000
++#define N 20
++#define SMALL_STACK (512 * 1024)
++
++// Linear least squares with a known solution: residual_i = sum_j x_j * basis_ij - target_i, target built from
++// x_j = j + 1.
++static double basis(int i, int j) { return ((i * 31 + j * 17) % 97) / 97.0 + (i % N == j ? 1.0 : 0.0); }
++
++static int residuals(int m, int n, FLT *x, FLT *fvec, FLT **dvec, void *priv) {
++	for (int i = 0; i < m; i++) {
++		double model = 0, target = 0;
++		for (int j = 0; j < n; j++) {
++			model += x[j] * basis(i, j);
++			target += (j + 1) * basis(i, j);
++		}
++		fvec[i] = model - target;
++	}
++	return 0;
++}
++
++struct fit {
++	int status;
++	FLT x[N];
++};
++
++static void *run_fit(void *arg) {
++	struct fit *fit = arg;
++	memset(fit->x, 0, sizeof(fit->x));
++	mp_result result = {0};
++	fit->status = mpfit(residuals, M, N, fit->x, 0, 0, 0, &result);
++	return 0;
++}
++
++// mpfit used to alloca every work array; a global-scene solve has enough measurements that the Jacobian alone
++// overflowed the solver thread's stack (SIGSEGV in mpfit's stack probe). Run a fit whose work arrays do not fit on
++// a small thread stack: it must solve, not crash.
++TEST(MPFIT, LargeProblemDoesNotNeedTheStack) {
++	pthread_attr_t attr;
++	pthread_attr_init(&attr);
++	pthread_attr_setstacksize(&attr, SMALL_STACK);
++	struct fit fit = {0};
++	pthread_t thread;
++	ASSERT_EQ(pthread_create(&thread, &attr, run_fit, &fit), 0);
++	pthread_join(thread, 0);
++	pthread_attr_destroy(&attr);
++
++	ASSERT_GT(fit.status, 0);
++	for (int j = 0; j < N; j++) {
++		ASSERT_DOUBLE_EQ(fit.x[j], (FLT)(j + 1));
++	}
++	return 0;
++}
+-- 
+2.53.0
+

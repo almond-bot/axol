@@ -28,6 +28,8 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 - MuJoCo is pinned to one API line (`mujoco>=3.8.0,<3.10` in `pyproject.toml`): 3.10 changed the `mj_fullM` signature and 3.11 removed `mjData.qM`, both used by `almond_axol/robot/gravity.py`. `uv.lock` alone does not protect `uv tool install` / `pip install` (they re-resolve), so the upper bound is deliberate. To move to a newer MuJoCo, update the call in `gravity.py`, the bound, and `uv lock` together; `tests/test_gravity.py` guards the pin.
 - The Rust realtime core (`rust/axol-rt`, the required hardware control backend) has a `cargo test` suite: golden filter vectors pinned to the Python originals, wire-protocol round trips, and a damping dissipated-power comparison. `uv run python rust/axol-rt/tools/rt_proto_check.py` exercises the built binary's Unix-socket protocol without CAN. `cargo test stall_detection_live -- --ignored` needs the CAN interfaces up with motors unpowered.
 
+- The arm hub firmware (RP2350) is developed in the circuits-py repo (`designs/axol_hub/firmware`); only the built image ships here, as `almond_axol/hub/axol_hub.uf2`, and every bring-up reflashes a hub reporting an older `bcdDevice` (`almond_axol/hub/firmware.py`). To take a new firmware, copy circuits-py's built `firmware.uf2` over `axol_hub.uf2` and set `FIRMWARE_VERSION` to the `AXOL_HUB_FW_VERSION` it was built with; `tests/test_hub_firmware.py` checks the image reports that version.
+
 ### Dependency extras
 
 | Extra | Purpose |

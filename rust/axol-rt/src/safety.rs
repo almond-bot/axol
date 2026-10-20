@@ -1,9 +1,20 @@
 //! Shared SocketCAN transmit-stall protection.
 //!
-//! A powered-off Axol bus cannot ACK frames. Linux then fills the interface
-//! TX queue and returns `ENOBUFS`; frames already accepted by that queue can
-//! replay when power returns. Every Rust CAN owner uses this module so both
-//! realtime control and maintenance traffic stop and purge identically.
+//! A powered-off Axol bus cannot ACK frames. How that surfaces depends on the
+//! arm hub's firmware:
+//!
+//! - **Hub firmware 2.01+** drops a frame nothing ACKs within 50 ms and
+//!   reports it as a `CAN_ERR_ACK` error frame. The TX queue never backs up;
+//!   a socket that asked for the reports ([`CanSock::watch_ack_errors`])
+//!   sees [`SendOutcome::Unacked`]. Nothing is left queued anywhere, so
+//!   there is nothing to purge.
+//! - **Older hubs** (and other adapters) back up instead: Linux fills the
+//!   interface TX queue and returns `ENOBUFS`, and frames already accepted
+//!   can replay when power returns — [`SendOutcome::Stalled`], after which
+//!   the caller purges ([`purge_tx_queue`]).
+//!
+//! Every Rust CAN owner uses this module so both realtime control and
+//! maintenance traffic stop identically.
 
 use crate::can::CanSock;
 use std::io;
@@ -12,6 +23,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const STALL_DETECT: Duration = Duration::from_secs(1);
+
+/// The report for [`SendOutcome::Unacked`], after the interface name. Python
+/// recognises a dead bus by this text (`almond_axol.motor.bus.is_stall_report`)
+/// as it does `TX queue stalled`.
+pub const NO_ACK_REPORT: &str =
+    "bus dead — the hub reports no node ACKing frames (e-stop / motors unpowered?)";
 const PURGE_DEDUPE: Duration = Duration::from_secs(3);
 static LAST_PURGE: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -34,6 +51,20 @@ const RESET_SCRIPT: &str = "/etc/almond-axol/can/reset_adapter.sh";
 /// `almond_axol.constants`), the only interfaces the reset script covers.
 const ARM_HUB_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
 
+/// The Mantis rig's channels (`CAN_MANTIS_LEFT` / `CAN_MANTIS_RIGHT`): the
+/// same dual-channel hub as the arms, so the same no-ACK reports.
+const MANTIS_HUB_IFACES: [&str; 2] = ["can_mantis_l", "can_mantis_r"];
+
+/// Whether `iface` is a dual-channel hub channel (arm or Mantis), whose
+/// no-ACK reports mean the motors lost power ([`CanSock::watch_ack_errors`]).
+/// The Jelly wheel and chest buses run on CANable (candleLight) adapters,
+/// which report every unACKed attempt, including one the controller then
+/// retransmits fine: on the wheel bus the lift shares, one such report killed
+/// the lift's proxy mid-teleop while the wheels kept driving.
+pub fn reports_no_ack(iface: &str) -> bool {
+    ARM_HUB_IFACES.contains(&iface) || MANTIS_HUB_IFACES.contains(&iface)
+}
+
 fn is_tx_full(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EAGAIN))
         || err.kind() == io::ErrorKind::WouldBlock
@@ -43,8 +74,13 @@ pub enum SendOutcome {
     Sent,
     /// Transient congestion: this frame was dropped.
     Dropped,
-    /// Nothing has ACKed frames for `STALL_DETECT`.
+    /// Nothing has ACKed frames for `STALL_DETECT`: the TX queue is full of
+    /// frames that would replay on re-power, so the caller purges it.
     Stalled,
+    /// The adapter reported a transmission nothing ACKed (hub firmware
+    /// 2.01+, see [`CanSock::watch_ack_errors`]): the bus is dead, but the hub
+    /// dropped the frame instead of holding it, so nothing needs purging.
+    Unacked,
 }
 
 pub fn guarded_send(
@@ -53,6 +89,12 @@ pub fn guarded_send(
     data: &[u8],
     enobufs_since: &mut Option<Instant>,
 ) -> io::Result<SendOutcome> {
+    // Latched by any receive on this socket. Checked before sending: a frame
+    // sent now would go out the moment power returns, which is what a dead
+    // bus must not do.
+    if sock.saw_ack_error() {
+        return Ok(SendOutcome::Unacked);
+    }
     match sock.send(id, data) {
         Ok(()) => {
             *enobufs_since = None;
@@ -222,6 +264,17 @@ mod tests {
         for iface in ARM_HUB_IFACES {
             assert_eq!(reset_script_for(iface, &reset), Some(reset.clone()));
         }
+    }
+
+    #[test]
+    fn only_hub_channels_trust_no_ack_reports() {
+        for iface in ARM_HUB_IFACES.into_iter().chain(MANTIS_HUB_IFACES) {
+            assert!(reports_no_ack(iface));
+        }
+        // CANable adapters: the Jelly wheel bus (shared with the lift) and
+        // the chest bus.
+        assert!(!reports_no_ack("can_alm_axol_b"));
+        assert!(!reports_no_ack("can_alm_axol_c"));
     }
 
     #[test]

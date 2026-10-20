@@ -1,0 +1,123 @@
+From 46c3ae1fe7afd1dcc24e9aa140146467bd4b1feb Mon Sep 17 00:00:00 2001
+From: shkwon <shkwon@tommoro.ai>
+Date: Thu, 10 Sep 2026 14:41:13 +0900
+Subject: [PATCH 3/7] fix: correct MPFIT covariance extraction and lighthouse
+ indexing
+
+- Expand free-parameter covariance before extracting lighthouse and object pose blocks, preserving indices for fixed parameters.
+- Select lighthouse covariance by the actual lighthouse index when poses are skipped or reordered for the reference lighthouse.
+- Size optimizer covariance storage from the full parameter count instead of a fixed 28x28 buffer, and return only the object pose's 7x7 block.
+
+Validation: built survive and poser_mpfit in Debug mode; git diff --cached --check passed. Runtime and regression tests have not been run.
+(cherry picked from commit df22f2d6be34cb54d43c46e8838eae8b326b88ff)
+---
+ src/poser.c       |  8 +++-----
+ src/poser_mpfit.c | 31 ++++++++++++++++++++++++-------
+ 2 files changed, 27 insertions(+), 12 deletions(-)
+
+diff --git a/src/poser.c b/src/poser.c
+index a6b28cc..d86f08b 100644
+--- a/src/poser.c
++++ b/src/poser.c
+@@ -292,19 +292,17 @@ void PoserData_normalize_scene(SurviveContext *ctx, SurvivePose *lighthouse_pose
+ 	}
+ 
+ 	ApplyPoseToPose(object_pose, &arb2world, &object2arb);
+-	int lh_idx = 0;
+ 	for (int lh = 0; lh < lighthouse_count; lh++) {
+ 		SurvivePose *lh2object = &lighthouse_pose[lh];
+ 		if (quatmagnitude(lh2object->Rot) != 0.0) {
+ 			ApplyPoseToPose(lh2object, &arb2world, lh2object);
+ 
+ 			if(R) {
+-				CnMat LH_R = cnMatConstView(7, 7, R, lh_idx * 7, lh_idx * 7);
++				CnMat LH_R = cnMatConstView(7, 7, R, lh * 7, lh * 7);
+ 				CN_CREATE_STACK_MAT(jac, 7, 7);
+ 				apply_pose_to_pose_jac_rhs(&jac, &arb2world, lh2object);
+ 				cn_ABAt_add(&LH_R, &jac, &LH_R, 0);
+ 			}
+-			lh_idx++;
+ 		}
+ 	}
+ }
+@@ -366,7 +364,7 @@ void PoserData_lighthouse_poses_func(PoserData *poser_data, SurviveObject *so, S
+ 			SurvivePose lh2world = lh2object;
+ 			CnMat LH_R;
+ 			if(R)
+-				LH_R = cnMatConstView(7, 7, R, lh_idx * 7, lh_idx * 7);
++				LH_R = cnMatConstView(7, 7, R, lh * 7, lh * 7);
+ 			if (!quatiszero(object2World.Rot) && worldEstablished == false) {
+ 				ApplyPoseToPose(&lh2world, &object2World, &lh2object);
+ 			}
+@@ -523,4 +521,4 @@ SURVIVE_EXPORT int PoserDataLight_axis(const struct PoserDataLight *pdl) {
+ 		assert(0);
+ 	}
+ 	return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/src/poser_mpfit.c b/src/poser_mpfit.c
+index 0f7b68d..791bf09 100644
+--- a/src/poser_mpfit.c
++++ b/src/poser_mpfit.c
+@@ -557,11 +557,21 @@ static FLT handle_optimizer_results(survive_optimizer *mpfitctx, int res, const
+ 				}
+ 			}
+ 
++			// The optimizer returns only free parameters, including the object pose.
++			// Restore parameter indices before selecting the lighthouse covariance.
++			CN_CREATE_STACK_MAT(full_R, R ? mpfitctx->parametersCnt : 0, R ? mpfitctx->parametersCnt : 0);
++			CnMat lighthouse_R;
++			if (R) {
++				survive_optimizer_covariance_expand(mpfitctx, R, &full_R);
++				int camera_idx = survive_optimizer_get_camera_index(mpfitctx);
++				lighthouse_R = cnMatView(mpfitctx->cameraLength * 7, mpfitctx->cameraLength * 7,
++										&full_R, camera_idx, camera_idx);
++			}
+ 			if (!worldEstablished) {
+-				PoserData_normalize_scene(ctx, cameras, ctx->activeLighthouses, soLocation, R);
++				PoserData_normalize_scene(ctx, cameras, mpfitctx->cameraLength, soLocation, R ? &lighthouse_R : 0);
+ 			}
+ 
+-			PoserData_lighthouse_poses_func(&pdl->hdr, so, cameras, R, ctx->activeLighthouses,
++			PoserData_lighthouse_poses_func(&pdl->hdr, so, cameras, R ? &lighthouse_R : 0, mpfitctx->cameraLength,
+ 											soLocation);
+ 			solvedLHPoses = true;
+ 		}
+@@ -712,13 +722,20 @@ static FLT run_mpfit_find_3d_structure(MPFITData *d, PoserDataLight *pdl, Surviv
+ 
+ 	mp_result result = {0};
+ 
+-	int nfree = survive_optimizer_get_free_parameters_count(&mpfitctx);
++	// Free parameters can include additional lighthouses, velocity and corrections.
++	CN_CREATE_STACK_MAT(free_R, R ? mpfitctx.parametersCnt : 0, R ? mpfitctx.parametersCnt : 0);
+ 	survive_release_ctx_lock(ctx);
+-	int res = survive_optimizer_run(&mpfitctx, &result, R);
+-//	cn_print_mat(R);
++	int res = survive_optimizer_run(&mpfitctx, &result, R ? &free_R : 0);
+ 	survive_get_ctx_lock(ctx);
+ 
+-	return handle_optimizer_results(&mpfitctx, res, &result, &user_data, R, out);
++	FLT error = handle_optimizer_results(&mpfitctx, res, &result, &user_data, R ? &free_R : 0, out);
++	if (R && error > 0) {
++		CN_CREATE_STACK_MAT(full_R, mpfitctx.parametersCnt, mpfitctx.parametersCnt);
++		survive_optimizer_covariance_expand(&mpfitctx, &free_R, &full_R);
++		CnMat object_R = cnMatView(7, 7, &full_R, 0, 0);
++		cnCopy(&object_R, R, 0);
++	}
++	return error;
+ }
+ 
+ static inline void print_stats(SurviveContext *ctx, MPFITStats *stats) {
+@@ -1151,7 +1168,7 @@ int PoserMPFIT(SurviveObject *so, PoserData *pd) {
+ 		FLT error = -1;
+ 		if (++d->syncs_per_run_cnt >= d->syncs_per_run) {
+ 			d->syncs_per_run_cnt = 0;
+-			CN_CREATE_STACK_MAT(R, 7 * 4, 7 * 4);
++			CN_CREATE_STACK_MAT(R, 7, 7);
+ 			bool useCovariance = survive_configf(ctx, MPFIT_FULL_COV_TAG, SC_GET, 1.);
+ 			error = run_mpfit_find_3d_structure(d, lightData, scene, &estimate, useCovariance ? &R : 0);
+ 			handle_results(d, lightData, error, &estimate, useCovariance ? &R : 0);
+-- 
+2.53.0
+

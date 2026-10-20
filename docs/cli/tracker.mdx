@@ -36,11 +36,13 @@ Streams a hardware tracker backend's poses (and each side's trigger value) to th
 | Flag | Description |
 |---|---|
 | `--backend {survive,ultimate,synthetic,static}` | Tracker backend. Default: the saved config (`~/.almond/tracker/config.json`), else `survive`. `synthetic` streams generated motion; `static` holds fixed poses for standalone protocol tests without tracker hardware. |
-| `--left KEY` / `--right KEY` | Override the saved device binding (libsurvive codename like `T20`, or an Ultimate tracker MAC). |
+| `--left KEY` / `--right KEY` | Override the saved device binding (Lighthouse tracker serial like `LHR-E0FCD01B`, or an Ultimate tracker MAC). |
 | `--host HOST` | VR server host — the machine running teleop/collect-data. Default: `localhost`. |
 | `--port INT` | VR server port. Default: 8000. |
 | `--hz FLOAT` | Frame streaming rate. Default: 120. |
 | `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | SocketCAN interface of that side's trigger node; overrides the saved config, which defaults to `can_mantis_l` / `can_mantis_r`. The node publishes its analog trigger position at 100 Hz on CAN ID `0x009`. |
+
+With the `survive` backend, an unexpected `survive-cli` exit (a crash) no longer ends the bridge: it is restarted after about a second, and since its calibration is saved both trackers report again a few seconds later; the rigs freeze meanwhile as for any tracking loss. More than 3 exits within a minute is treated as a crash loop and fails the source, and the exit report names the signal and the last lines of `survive-cli`'s stderr. libsurvive only enumerates USB devices at startup, so when a tracker drops off the bus (or a fresh process leaves one silent) the bridge restarts `survive-cli` and re-checks every 5 seconds, for up to 60 seconds, until every tracker seen earlier reports again.
 
 A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its last good pose and logs a warning rather than feeding IK a glitch. A stale trigger node (no frames for ~250 ms) likewise holds the last grip command and logs the dropout. A managed bridge freezes motion, waits for both trackers to become fresh, then requires the two-trigger start gesture before it re-anchors; the standalone bridge keeps its manual controls: **Enter** toggles engage, **r** returns to rest, **q** quits. A standalone bridge warns and continues fully open when a configured trigger is absent; a managed production run fails readiness instead.
 
@@ -68,10 +70,10 @@ Saves `~/.almond/tracker/config.json`:
 ```json
 {
   "backend": "survive",
-  "left": "T20",
-  "right": "T21",
+  "left": "LHR-E0FCD01B",
+  "right": "LHR-BDD65467",
   "bindings": {
-    "survive": {"left": "T20", "right": "T21"},
+    "survive": {"left": "LHR-E0FCD01B", "right": "LHR-BDD65467"},
     "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
   },
   "ultimate_quat_order": "wxyz",
@@ -79,13 +81,27 @@ Saves `~/.almond/tracker/config.json`:
 }
 ```
 
+Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so releases before 0.2.25, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
+
 ## `axol tracker.pair`
 
 Pairs one VIVE Tracker 3.0 with its Watchman dongle through `survive-cli --pair-device 1` (which needs the libusb backend `tracker.install` builds). The tracker must be unplugged from USB and blinking blue. Run it once per tracker/dongle pair.
 
+libsurvive only opens pairing mode on a dongle that has no tracker connected. If every connected dongle already brings up a powered tracker, the command says they are already paired instead of waiting; to pair a different tracker to a dongle, switch off the tracker currently paired to it first.
+
 ## `axol tracker.install`
 
-Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0`: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
+Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0` with seven fixes applied on top: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. The fixes ship in the package (`almond_axol/tracker/libsurvive_patches/`; the timestamp, base-station, scene-solver and solver-stack fixes carry a regression test in libsurvive's own suite):
+
+- **Timestamps across the tracker clock rollover.** The tracker's 48 MHz clock wraps every ~89 s; a laser measurement taken just before the wrap was stamped ~350 ms in the future, which could stall pose output while tracker data kept arriving.
+- **Solver buffer overflow with more base stations.** Upstream libsurvive's fix (`df22f2d`, backported verbatim): the MPFIT poser copied the solver's covariance into a fixed 28×28 buffer, which overflows once the tracker pose, per-station corrections and stations being re-solved exceed 28 parameters. That is reachable with four base stations and can crash `survive-cli`.
+- **Scene-solver crash.** libsurvive's global scene solver keeps 32 calibration scenes; once a long session filled that ring, the loops after each solve read one past its end and crashed `survive-cli` (SIGSEGV), ending the session. Setups with more base stations fill it sooner. Those loops are now bounded, and scenes of a disconnected tracker are compacted without mixing up the remaining scenes' measurements.
+- **Solver stack overflow.** The optimizer (mpfit) put its work arrays, including the Jacobian, on the stack. A global solve over a full scene ring with four base stations needs several megabytes for it, which overflowed the solver thread's stack and crashed `survive-cli`. They are now heap-allocated.
+- **Smaller fixes.** A data race on the scene solver's "solve needed" flag, a mis-indexed measurement count in the optional per-station correction setup (off by default), and a read past the end of an empty config file's parse.
+- **Poses delivered as they are produced.** `survive-cli --record-stdout` never flushed its output, so through a pipe the poses arrived in 4 KB blocks: about 50 ms late at the median and up to about 110 ms with two trackers. The stream is now line-buffered.
+- **Base-station identity through every tracker.** Each base station's OOTX broadcast (its identity and calibration) was decoded only through the first tracker that saw it; if that tracker received it poorly, the other tracker's clean copy was ignored and calibration could stall. Every tracker now decodes it, and the first valid packet wins.
+
+A build from before these fixes is rebuilt, not re-attested. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
 
 ```bash
 axol tracker.install
@@ -98,6 +114,8 @@ sudo apt install build-essential cmake zlib1g-dev libx11-dev libusb-1.0-0-dev \
                  freeglut3-dev liblapacke-dev libhidapi-dev libudev-dev
 git clone https://github.com/collabora/libsurvive.git && cd libsurvive
 git checkout f1e6eddb669320f2a30760f4b42936bdb4306da0
+# Axol's fixes, from the installed almond_axol package
+git apply /path/to/almond_axol/tracker/libsurvive_patches/*.patch
 # udev rules so the trackers are readable without root
 sudo cp ./useful_files/81-vive.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
@@ -118,7 +136,9 @@ uv pip install ./bindings/python
 axol tracker.lighthouse.check
 ```
 
-Listens to libsurvive for about 20 seconds with both trackers powered and in view, then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
+Listens to libsurvive for about 20 seconds with both trackers powered and in view. When base stations are live but the trackers are not reporting yet, libsurvive is still calibrating: it reports no pose until it has every live station's identity and position, which can take a minute or more on a new host or after stations are added or re-channelled. The check then keeps listening, up to 150 seconds in total, until both trackers report; keep them still and in view meanwhile. It then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
+
+Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before 0.2.25 let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept.
 
 ## `axol tracker.ultimate.install`
 
@@ -158,7 +178,7 @@ Non-invasive dependency, USB, permission, binding, pose-convention, and redacted
 ```json
 {
   "left": {
-    "survive:T20": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
+    "survive:LHR-E0FCD01B": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
     "ultimate:AA:BB:CC:DD:EE:01": {
       "pos": [0.0, 0.0, 0.0],
       "quat": [0.0, 0.0, 0.0, 1.0],

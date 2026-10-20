@@ -1,0 +1,238 @@
+From 5326d3bfe991cee49deb08a592ef2df9f7ff07b2 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Mon, 19 Oct 2026 21:19:31 +0000
+Subject: [PATCH 5/7] gss: never read past the scene ring; keep scenes whole
+ when compacting
+
+The global scene solver keeps up to GSS_NUM_STORED_SCENES (32) scenes.
+add_scenes resets scenes_cnt to the live-scene count and then increments
+it, so once the ring is full it runs one past the capacity. The solve
+itself was capped, but the floor search and the SPHERE recording loop
+after it iterated to scenes_cnt, reading scenes[32]: the fields that
+follow the array, taking last_capture_time_cnt for the scene's
+SurviveObject and crashing in the codename printf (SIGSEGV in strlen
+from run_optimization, captured on a 4-base-station setup, where the
+extra coverage bins let a long session fill the ring). Bound both loops
+by the ring.
+
+Compacting out the scenes of a destroyed device moved only each
+survivor's .so, pairing it with the pose and measurements of the slot it
+landed in. Swap whole scenes instead and forget the destroyed owner.
+
+test-gss reproduces the crash (the unpatched solver segfaults) and the
+compaction mix-up. survive_install_recording is exported for it.
+---
+ src/driver_global_scene_solver.c | 35 +++++++++---
+ src/survive_recording.h          |  2 +-
+ src/test_cases/CMakeLists.txt    |  2 +-
+ src/test_cases/gss.c             | 97 ++++++++++++++++++++++++++++++++
+ 4 files changed, 127 insertions(+), 9 deletions(-)
+ create mode 100644 src/test_cases/gss.c
+
+diff --git a/src/driver_global_scene_solver.c b/src/driver_global_scene_solver.c
+index 21cf8ed..753fad9 100644
+--- a/src/driver_global_scene_solver.c
++++ b/src/driver_global_scene_solver.c
+@@ -54,6 +54,12 @@ STRUCT_CONFIG_SECTION(global_scene_solver)
+ 	STRUCT_CONFIG_ITEM("gss-auto-floor-height", "Automatically use the lowest position to set the floor offset", 1, t->auto_floor)
+ END_STRUCT_CONFIG_SECTION(global_scene_solver)
+ 
++// Scenes held in the ring. scenes_cnt runs one past the capacity once the ring has wrapped (the next scene
++// overwrites the oldest), so it must never be used directly as an index bound.
++static size_t stored_scene_count(const struct global_scene_solver *gss) {
++	return gss->scenes_cnt < GSS_NUM_STORED_SCENES ? gss->scenes_cnt : GSS_NUM_STORED_SCENES;
++}
++
+ static size_t add_scenes(struct global_scene_solver *gss, SurviveObject *so) {
+ 	size_t rtn = 0;
+ 	SurviveContext *ctx = so->ctx;
+@@ -80,10 +86,23 @@ static size_t add_scenes(struct global_scene_solver *gss, SurviveObject *so) {
+ 		}
+ 
+ 		if (is_still_valid) {
+-			gss->scenes[free_idx].so = gss->scenes[i].so;
++			// Move the whole scene, not just its owner: moving .so alone paired the surviving scenes with the
++			// poses and measurements of the slots they landed in. Swapping keeps every meas buffer owned by
++			// exactly one slot.
++			if (free_idx != i) {
++				struct PoserDataGlobalScene moved = gss->scenes[free_idx];
++				gss->scenes[free_idx] = gss->scenes[i];
++				gss->scenes[i] = moved;
++				gss->scenes[i].so = NULL;
++				gss->scenes[i].meas_cnt = 0;
++			}
+ 			free_idx++;
+ 		} else {
+-			SV_WARN("in GlobalSceneSolver: deleted scene %d with SurviveObject at adress &%p", i, (void* )so);
++			SV_WARN("in GlobalSceneSolver: deleted scene %d with SurviveObject at adress &%p", i,
++					(void *)gss->scenes[i].so);
++			// Forget the destroyed owner; the slot (and its meas buffer) is reused.
++			gss->scenes[i].so = NULL;
++			gss->scenes[i].meas_cnt = 0;
+ 		}
+ 	}
+ 	gss->scenes_cnt = free_idx;
+@@ -162,24 +181,26 @@ static bool run_optimization(global_scene_solver *gss) {
+ 
+ 	OGLockMutex(gss->scenes_lock);
+ 
++	size_t scenes_cnt = stored_scene_count(gss);
+ 	PoserDataGlobalScenes pgss = {
+-		.hdr = {.pt = POSERDATA_GLOBAL_SCENES}, .scenes_cnt = gss->scenes_cnt, .scenes = gss->scenes};
+-	if (pgss.scenes_cnt > GSS_NUM_STORED_SCENES)
+-		pgss.scenes_cnt = GSS_NUM_STORED_SCENES;
++		.hdr = {.pt = POSERDATA_GLOBAL_SCENES}, .scenes_cnt = scenes_cnt, .scenes = gss->scenes};
+ 	gss->solve_counts++;
+ 
+ 	bool success = gss->ctx->PoserFn(gss->ctx->objs[0], (PoserData *)&pgss) == 0;
+ 	if(success) {
+ 		if(gss->auto_floor) {
+ 			FLT min_z = gss->ctx->floor_offset;
+-			for (int i = 0; i < gss->scenes_cnt; i++) {
++			for (size_t i = 0; i < scenes_cnt; i++) {
+ 				min_z = linmath_min(min_z, gss->scenes[i].pose.Pos[2]);
+ 			}
+ 			if (isfinite(min_z))
+ 				survive_set_floor_offset(gss->ctx, min_z);
+ 		}
+ 
+-		for (int i = 0; i < gss->scenes_cnt; i++) {
++		// Bounded by the ring, not by scenes_cnt: once the ring has wrapped scenes_cnt is one past it, and
++		// reading scenes[GSS_NUM_STORED_SCENES] took the next field for a SurviveObject pointer and crashed in
++		// the codename printf below.
++		for (size_t i = 0; i < scenes_cnt; i++) {
+ 			SurvivePose p = gss->scenes[i].pose;
+ 
+ 			if (!quatiszero(p.Rot)) {
+diff --git a/src/survive_recording.h b/src/survive_recording.h
+index 024ec29..6da7376 100644
+--- a/src/survive_recording.h
++++ b/src/survive_recording.h
+@@ -36,7 +36,7 @@ SURVIVE_EXPORT void survive_recording_write_to_output(struct SurviveRecordingDat
+ SURVIVE_EXPORT void survive_recording_write_to_output_nopreamble(struct SurviveRecordingData *recordingData,
+ 																 const char *format, ...);
+ void survive_destroy_recording(SurviveContext *ctx);
+-void survive_install_recording(SurviveContext *ctx);
++SURVIVE_EXPORT void survive_install_recording(SurviveContext *ctx);
+ void survive_recording_config_process(SurviveObject *so, char *ct0conf, int len);
+ 
+ void survive_recording_lighthouse_process(SurviveContext *ctx, uint8_t lighthouse, const SurvivePose *lh_pose);
+diff --git a/src/test_cases/CMakeLists.txt b/src/test_cases/CMakeLists.txt
+index 2a893cd..7eb9ddc 100644
+--- a/src/test_cases/CMakeLists.txt
++++ b/src/test_cases/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ SET(SURVIVE_TESTS
+         reproject
+         check_generated barycentric_svd optimizer
+-        rotate_angvel export_config ootx)
++        rotate_angvel export_config ootx gss)
+ 
+ set(barycentric_svd_ADDITIONAL_SRCS ../barycentric_svd/barycentric_svd.c)
+ 
+diff --git a/src/test_cases/gss.c b/src/test_cases/gss.c
+new file mode 100644
+index 0000000..aef57fb
+--- /dev/null
++++ b/src/test_cases/gss.c
+@@ -0,0 +1,97 @@
++// The global scene solver compiled with a small ring so the wrap-around is cheap to reach.
++#define GSS_NUM_STORED_SCENES 4
++#include "../driver_global_scene_solver.c"
++
++#include "test_case.h"
++
++#include <string.h>
++
++static int solves = 0;
++static int count_solve(SurviveObject *so, PoserData *pd) {
++	solves++;
++	return 0;
++}
++
++static SurviveContext *make_ctx(SurviveObject **objs, size_t objs_ct) {
++	SurviveContext *ctx = SV_CALLOC(sizeof(SurviveContext));
++	ctx->objs = objs;
++	ctx->objs_ct = objs_ct;
++	ctx->activeLighthouses = 1;
++	ctx->PoserFn = count_solve;
++	return ctx;
++}
++
++TEST(GSS, WrappedRingIsNotReadPastItsEnd) {
++	// A real context recording to stdout, as survive-cli --record-stdout runs: the post-solve loop prints each
++	// scene's owner codename there.
++	char *const args[] = {"test-gss", "--configfile", "./test-gss-config.json", "--record-stdout", "1", 0};
++	remove("./test-gss-config.json");
++	SurviveContext *ctx = survive_init_internal(5, args, 0, 0);
++	if (ctx)
++		survive_install_recording(ctx); // done by survive_startup, which would also start the drivers
++	if (ctx == 0 || ctx->recptr == 0)
++		return survive_test_assert();
++	ctx->PoserFn = count_solve;
++
++	SurviveObject obj = {0};
++	strcpy(obj.codename, "TS0");
++	obj.ctx = ctx;
++	SurviveObject *objs[] = {&obj};
++	SurviveObject **ctx_objs = ctx->objs;
++	size_t ctx_objs_ct = ctx->objs_ct;
++	ctx->objs = objs;
++	ctx->objs_ct = 1;
++
++	global_scene_solver gss = {0};
++	gss.ctx = ctx;
++	for (int i = 0; i < GSS_NUM_STORED_SCENES; i++) {
++		gss.scenes[i].so = &obj;
++		gss.scenes[i].pose.Rot[0] = 1;
++	}
++	// The ring has wrapped: scenes_cnt is one past its capacity, and the field after the array is not a
++	// SurviveObject. Iterating to scenes_cnt used to read it as one and crash printing its codename.
++	gss.scenes_cnt = GSS_NUM_STORED_SCENES + 1;
++	// What a running session has after the array: a small count where scenes[N].so would be, and the time of the
++	// last scene addition where its orientation would be (non-zero, so the scene is not skipped as unset).
++	gss.last_capture_time_cnt = 2;
++	gss.last_addition = 12.5;
++
++	ASSERT_EQ(run_optimization(&gss), 1);
++	ASSERT_EQ(solves, 1);
++	ctx->objs = ctx_objs;
++	ctx->objs_ct = ctx_objs_ct;
++	remove("./test-gss-config.json");
++	return 0;
++}
++
++TEST(GSS, DroppedSceneKeepsSurvivorsWithTheirOwnMeasurements) {
++	SurviveObject gone = {0}, kept = {0};
++	strcpy(kept.codename, "TS1");
++	SurviveObject *objs[] = {&kept}; // `gone` was destroyed
++	SurviveContext *ctx = make_ctx(objs, 1);
++	kept.ctx = ctx;
++
++	global_scene_solver gss = {0};
++	gss.ctx = ctx;
++	PoserDataGlobalSceneMeasurement *gone_meas = SV_CALLOC(sizeof(PoserDataGlobalSceneMeasurement) * 64);
++	PoserDataGlobalSceneMeasurement *kept_meas = SV_CALLOC(sizeof(PoserDataGlobalSceneMeasurement) * 64);
++	gss.scenes[0] = (struct PoserDataGlobalScene){.so = &gone, .meas = gone_meas, .meas_cnt = 5};
++	gss.scenes[1] = (struct PoserDataGlobalScene){.so = &kept, .meas = kept_meas, .meas_cnt = 7};
++	gss.scenes[1].pose.Pos[0] = 0.5;
++	gss.scenes_cnt = 2;
++
++	add_scenes(&gss, &kept);
++
++	// The surviving scene moved down as a whole: owner, pose and measurements together.
++	ASSERT_EQ(gss.scenes[0].so == &kept, 1);
++	ASSERT_EQ(gss.scenes[0].meas == kept_meas, 1);
++	ASSERT_EQ(gss.scenes[0].meas_cnt, 7);
++	ASSERT_DOUBLE_EQ(gss.scenes[0].pose.Pos[0], 0.5);
++	// The destroyed owner is forgotten.
++	ASSERT_EQ(gss.scenes[1].so == &gone, 0);
++
++	for (int i = 0; i < GSS_NUM_STORED_SCENES; i++)
++		free(gss.scenes[i].meas);
++	free(ctx);
++	return 0;
++}
+-- 
+2.53.0
+
