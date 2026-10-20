@@ -1,0 +1,171 @@
+---
+title: "Advantech Thor (MIC-742)"
+description: "Wire, flash, and bring up the Advantech MIC-742 Jetson Thor Compute Kit with GMSL cameras."
+---
+
+The Jetson Thor Compute Kit is the **Advantech MIC-742-AT** (Jetson T5000, 128GB) fitted with a GMSL2 frame grabber and Wi-Fi. This guide covers what's in the box, wiring the Camera Kit to it, and putting the right OS image and camera driver on it before you [install Axol](/installation).
+
+<Warning>
+  **Never flash the MIC-742 with NVIDIA's stock JetPack image.** JetPack BSPs are built per carrier board: the image NVIDIA publishes for its Thor developer kit does not match the MIC-742's carrier. With it, the Stereolabs MIC-742 camera driver hangs `nvidia_drm` at boot. Always use Advantech's MIC-742 image (see [Flash the OS](#flash-the-os)).
+</Warning>
+
+## What's in the box
+
+| Part | Advantech P/N | Notes |
+|---|---|---|
+| MIC-742 Thor system | `MIC-742-AT7A1` | Jetson T5000 128GB, SSD |
+| DC power adapter | `XMIC-FSP230-AAAN3` | Use only this adapter |
+| AC power cord | `1702002600` | |
+| GMSL2 frame grabber | `MIC-FG-8G2C1` | Factory-installed |
+| Frame grabber power cable | `1700026907-01` | Factory-installed |
+| Mini-FAKRA to FAKRA adapter cable | `1751000758-01` | One per 4 cameras |
+| Wi-Fi module | `EWM-W179M201E` | Factory-installed |
+| Wi-Fi antenna cables and antennas | `1751000620-01` ×2, `1751000460-01` ×2 | |
+
+GMSL and Wi-Fi are factory options on the MIC-742. Advantech fits them before the unit ships, and installing them yourself voids the warranty. If a unit arrives without them, contact Almond rather than opening the chassis.
+
+## Power
+
+The MIC-742 takes DC through a **2-pin plug-in terminal block** on the chassis. The mating plug ships with the system. For a spare, or to build your own harness (for example, to power the Thor from a Jelly base), the plug is Advantech `1652002202`, which is **Dinkle `5ESDVM-02P`** ([DigiKey](https://www.digikey.com/en/products/detail/dinkle-corporation-usa/5ESDVM-02P/14566173)).
+
+<Note>
+  Abruptly cutting power to the Jetson can corrupt the OS. Shut it down from the OS first, then unplug its adapter.
+</Note>
+
+## Wire the cameras
+
+The Camera Kit's GMSL cables end in standard FAKRA connectors, and the MIC-742 frame grabber takes **Mini-FAKRA**. The `1751000758-01` adapter cable converts between them, carrying up to **4 cameras** per cable. The Camera Kit's three cameras (two wrist, one head) fit on one adapter.
+
+<Steps>
+  <Step title="Mount the cameras on Axol">
+    Follow [Axol Cameras](/hardware-setup/cameras) to fit the wrist and head cameras, and note which serial goes where.
+  </Step>
+  <Step title="Connect the adapter cable">
+    Plug the adapter's Mini-FAKRA end into the frame grabber's GMSL2 port on the MIC-742.
+  </Step>
+  <Step title="Connect the cameras">
+    Plug the head camera's GMSL cable and the two GMSL cables from the wrist-camera ports on the back of the robot into the adapter's FAKRA inputs.
+  </Step>
+  <Step title="Connect USB and power">
+    Run the USB cable from the back of the robot to the MIC-742, then connect the MIC-742's DC adapter.
+  </Step>
+</Steps>
+
+## Flash the OS
+
+Axol targets Advantech's MIC-742 image for **JetPack 7.2 (L4T 39.2)**. Units can arrive with an earlier JetPack 7 release, so reflash unless the unit already reports L4T 39.2 (see [Verify](#verify)).
+
+| File | Download | MD5 |
+|---|---|---|
+| OS image (BSP), 4.2 GB | [MIC-742_Thor_7.2_V1.0.0_SDK.tbz2](https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.tbz2) | `67807ecc0d316637fecbe7b282d56c4f` |
+| Advantech flashing SOP | [MIC-742_Jetpack_7_Flash_SOP.pdf](https://downloads.almond.bot/mic742/jp7.2/MIC-742_Jetpack_7_Flash_SOP.pdf) | |
+
+<Warning>
+  Flashing erases the SSD. Copy off any datasets or calibration you want to keep first.
+</Warning>
+
+You need a separate **x86_64 host PC running Ubuntu 24.04**, a **USB-A to Micro-USB** cable, and an HDMI monitor for the MIC-742. Advantech's notes for the host:
+
+- Use a physical machine, not a virtual machine. USB passthrough to VMs drops the connection mid-flash.
+- Plug the cable straight into the host, with no USB hub in between.
+- Run the commands as a normal user with `sudo`, not logged in as `root`.
+- Keep the HDMI monitor attached to the MIC-742 until the flash finishes and it boots to the desktop.
+
+<Steps>
+  <Step title="Download and check the image">
+    On the host PC:
+
+    ```bash
+    cd ~/Desktop
+    curl -LO https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.tbz2
+    curl -LO https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.md5sum
+    md5sum -c MIC-742_Thor_7.2_V1.0.0_SDK.md5sum   # expect: OK
+    ```
+  </Step>
+  <Step title="Extract it">
+    ```bash
+    sudo tar xvpf MIC-742_Thor_7.2_V1.0.0_SDK.tbz2
+    ```
+
+    This creates `~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK`.
+  </Step>
+  <Step title="Install the flashing prerequisites">
+    The host needs internet access for this step.
+
+    ```bash
+    cd ~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK
+    sudo ./tools/l4t_flash_prerequisites.sh
+    ```
+  </Step>
+  <Step title="Put the MIC-742 in recovery mode">
+    1. Shut the MIC-742 down and unplug its power.
+    2. Connect the Micro-USB port next to the **REC** and **RST** buttons to the host PC.
+    3. Press and hold **REC**.
+    4. Plug in power and press **RST**, keeping **REC** held. Release **REC** 5–10 seconds after pressing **RST**.
+
+    Confirm it from the host:
+
+    ```bash
+    lsusb | grep 0955:7026   # expect: NVIDIA Corp. APX
+    ```
+
+    If nothing shows, repeat the button sequence.
+  </Step>
+  <Step title="Flash">
+    ```bash
+    cd ~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK
+    sudo bash advantech/only_flash.sh
+    ```
+  </Step>
+  <Step title="Reboot">
+    When the script reports success, press **RST**. The MIC-742 boots into the new image. Complete the Ubuntu first-boot setup on the HDMI monitor.
+  </Step>
+</Steps>
+
+## Install the camera driver
+
+Once the image boots, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that pairs with Advantech's image. Driver packages for the ZED Box, the ZED Link, or NVIDIA's devkit will not work on this carrier.
+
+| File | Download | MD5 |
+|---|---|---|
+| Camera driver | [stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb](https://downloads.almond.bot/mic742/jp7.2/stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb) | `e92cdd0b2e4bb2f81a4a43eb9bda1b4d` |
+
+On the MIC-742:
+
+```bash
+curl -LO https://downloads.almond.bot/mic742/jp7.2/stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb
+sudo dpkg -i stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb
+sudo reboot
+```
+
+Then install the ZED SDK release for JetPack 7.2 (L4T 39.2) from the [Stereolabs download page](https://www.stereolabs.com/developers/release).
+
+<Note>
+  Axol's [`zed.driver`](/cli/zed-driver) step manages only the ZED Box and ZED Link driver packages (`stereolabs-zed*`). It leaves the MIC-742 driver alone, so the installer and self-updater never replace it. Upgrade it by hand, and only to a release built for the L4T version Advantech's image runs.
+</Note>
+
+## Verify
+
+Check the L4T release and the driver before installing Axol:
+
+```bash
+head -1 /etc/nv_tegra_release      # expect: # R39 (release), REVISION: 2.x
+dpkg -l | grep stereolabs           # expect: stereolabs-advantech-mic742  1.4.3-L4T39.2.0
+```
+
+If the first line doesn't say `R39` with revision `2`, reflash with Advantech's image. If the system hangs at boot after the driver install, the unit is running a non-Advantech image: reflash it from [Flash the OS](#flash-the-os). The driver install alone can't fix it.
+
+## Install Axol
+
+With the image and driver in place, run the [one-command install](/installation). On the Thor it also applies the real-time tuning for the T5000 ([`jetson.setup`](/cli/jetson-setup)): max power mode, the GPU's `performance` governor, the CAN interrupt, and the camera daemon's scheduling.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the Thor and open the web control panel.
+  </Card>
+  <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
+    Mount the Camera Kit's wrist and head cameras.
+  </Card>
+</CardGroup>
