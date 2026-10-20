@@ -28,7 +28,8 @@
               "hardware-setup/owl-mount",
               "hardware-setup/ox-cart",
               "hardware-setup/jelly",
-              "hardware-setup/cameras"
+              "hardware-setup/cameras",
+              "hardware-setup/thor"
             ]
           },
           "installation"
