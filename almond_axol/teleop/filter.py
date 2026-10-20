@@ -458,6 +458,20 @@ class ResetInterpolator:
             self._traj_index = 0
         return q, l_grip, r_grip, done
 
+    def freeze_grippers(self, l_grip: float, r_grip: float) -> None:
+        """Hold the grippers at ``l_grip`` / ``r_grip`` for the rest of playback.
+
+        For a trajectory already playing when a shutdown park begins: its
+        gripper ramp stops where it is instead of finishing open, so the
+        in-flight move and the park's later legs hold the same grasp. A no-op
+        when nothing is playing.
+        """
+        if not self.is_active():
+            return
+        self._l_grip_start = l_grip
+        self._r_grip_start = r_grip
+        self._hold_grippers = True
+
     def is_active(self) -> bool:
         """True if trajectory playback is in progress."""
         return self._trajectory is not None and self._traj_index < len(self._trajectory)

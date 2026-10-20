@@ -656,13 +656,17 @@ class VRTeleopCore:
         with the grippers held at their last *commanded* value instead of
         ramping open — a parked arm may still be holding something, and the
         grasp force lives in the commanded-vs-measured gap, so the snapshot
-        is taken once, here, from the command stream. Safe from any thread.
+        is taken once, here, from the command stream. A reset already playing
+        (an X press, the startup move) has its gripper ramp frozen at the
+        same snapshot, so it can't keep opening the grippers only for the
+        zero leg to close them again. Safe from any thread.
         """
         last = self._last_cmd
         if last is not None:
             self._park_grippers = (float(last[7]), float(last[15]))
         else:
             self._park_grippers = (float(self.l_grip), float(self.r_grip))
+        self.reset_interp.freeze_grippers(*self._park_grippers)
         self._parking = True
 
     def request_zero(self) -> None:

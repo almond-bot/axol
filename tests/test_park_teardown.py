@@ -350,6 +350,32 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_visited(robot, _REST))
         np.testing.assert_allclose(robot.commands[-1][:7], 0.0, atol=1e-5)
 
+    async def test_a_stop_mid_reset_holds_the_grasp_it_found(self) -> None:
+        # An X reset ramps the grippers open as it plays. A park that lands
+        # mid-ramp must freeze them where they are for the rest of that move
+        # and the zero leg — not let them finish opening (dropping what they
+        # hold) and then close them back to the park's grasp.
+        robot = _FakeRobot()
+        session = self._session(robot)
+        core = session._core  # noqa: SLF001
+        core.set_initial_grips(0.3, 0.6)
+        core.seed_filters(robot.left.positions, robot.right.positions)
+        core.request_reset()
+        deadline = time.perf_counter() + 1.0
+        while not core.reset_interp.is_active():
+            self.assertLess(time.perf_counter(), deadline, "reset never planned")
+            await asyncio.sleep(0.001)
+        for _ in range(4):  # a few control ticks into the reset's ramp
+            core.compute_output()
+        found = float(core._last_cmd[7])  # noqa: SLF001
+        self.assertGreater(found, 0.3, "the reset's ramp never started opening")
+
+        await session._park_arms()  # noqa: SLF001
+
+        self.assertTrue(_visited(robot, 0.0))
+        grips = {round(float(cmd[7]), 6) for cmd in robot.commands}
+        self.assertEqual(grips, {round(found, 6)}, "the grasp moved during the park")
+
     async def test_contact_ends_the_park_without_a_limp_hold(self) -> None:
         # Nobody is left to hand-guide the arms and press reset, so holding
         # them limp until the cap would only delay the same torque-off — and
