@@ -93,7 +93,6 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
-from ..robot.start_pose import check_start_pose
 from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
@@ -1664,10 +1663,6 @@ def _run_session(
 
     try:
         robot.connect()
-        if not mantis_mode:
-            # The teleop's startup move to rest plays unsupervised; refuse it
-            # from far away (a Mantis rig has no arm joints to check).
-            check_start_pose(robot.positions)
         if mantis_mode:
             # Open both grippers all the way (this is also the one-time
             # hard-stop calibration), then drop torque again, so the jaws are
@@ -2641,7 +2636,7 @@ def _run_session(
             robot.set_control_trace_active(False)
 
     async def _park_before_disconnect() -> None:
-        """Teardown park (rest pose, then zero), bounded and unattended.
+        """Teardown return: the post-episode move, bounded and unattended.
 
         The session has already stopped by the time this runs, so a deadline
         bounds the move and none of the operator hooks are offered: there is
@@ -2659,7 +2654,9 @@ def _run_session(
         # A both-grips squeeze mid-park would steer the arms off the path.
         teleop.block_engage()
         try:
-            await teleop.guarded_park(
+            if not teleop.is_resetting:
+                teleop.request_reset()
+            await teleop.guarded_return(
                 send_step=_guard_send_step,
                 gravity_step=_guard_gravity_step,
                 torque_residuals=robot.torque_residuals,
@@ -2673,7 +2670,7 @@ def _run_session(
             )
             if contact:
                 _logger.warning(
-                    "park before disconnect stopped on contact; "
+                    "return to rest before disconnect stopped on contact; "
                     "disabling the arms where they are"
                 )
         finally:
@@ -3054,12 +3051,11 @@ def _run_session(
             _cleanup("board gyro", imu_src.close)
         _cleanup("teleop activity marker", activity.stop)
         _cleanup("control trace", lambda: robot.set_control_trace_active(False))
-        # Park — rest pose, then zero — before the torque comes off:
-        # ``disconnect()`` disables the motors, and arms left raised drop under
-        # gravity; ending at zero leaves them where they would settle anyway.
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
         #
         # Skipped on Mantis (handheld grippers, no arms to park), when the
-        # arms are already parked at zero, when a limp contact hold left them in the
+        # arms are already at rest, when a limp contact hold left them in the
         # operator's hands, when the IK worker that plans the move is gone, or
         # when the bus no longer reports a pose to plan from. A stop that
         # lands mid-reset finishes that move. The rest states come off the
@@ -3074,14 +3070,12 @@ def _run_session(
         try:
             if (
                 not mantis_mode
-                and (not teleop.at_zero or teleop.is_resetting)
+                and (not teleop.at_rest or teleop.is_resetting)
                 and not teleop.ik_paused
                 and teleop.ik_worker_alive
                 and arms_reporting(robot)
             ):
-                _logger.info(
-                    "Parking the arms (rest pose, then zero) before disabling them."
-                )
+                _logger.info("Returning to rest before disabling the arms.")
                 park = asyncio.run_coroutine_threadsafe(
                     _park_before_disconnect(), robot.event_loop
                 )

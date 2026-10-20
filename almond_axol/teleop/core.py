@@ -412,10 +412,6 @@ class VRTeleopCore:
         self._tracking_reengage_blocked: bool = False
         self._tracking_release_seen: bool = False
         self._at_rest: bool = True
-        # True while the last completed move was a park that ended at joint
-        # zero (see :meth:`guarded_park`); cleared by the next engage or rest
-        # move. Lets a teardown skip a park the arms already finished.
-        self._at_zero: bool = False
         self._engage_time: float | None = None
 
         # Box mode (bimanual carry, see :mod:`.box`): one controller leads
@@ -481,10 +477,6 @@ class VRTeleopCore:
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
         self._reset_latched: bool = False
-        # Named goals (``"rest"`` / ``"zero"``) the latched reset plans
-        # through, or ``None`` for the plain return to rest. Set only by
-        # :meth:`request_reset`; a headset press always means rest.
-        self._reset_path: tuple[str, ...] | None = None
         # True from reset dispatch (latch consumed) until the planned
         # trajectory is adopted, so ``is_resetting`` has no false window
         # while the IK worker plans (planning can take seconds).
@@ -616,19 +608,11 @@ class VRTeleopCore:
         """
         self._last_frame_time = time.perf_counter()
         if reset and not self._prev_reset:
-            self._reset_path = None
             self._reset_latched = True
         self._prev_reset = reset
 
-    def request_reset(self, path: tuple[str, ...] | None = None) -> None:
-        """Programmatically trigger a return-to-rest move. Safe from any thread.
-
-        ``path`` instead chains the move through named goals, planned as one
-        trajectory by the IK worker (see ``("reset_path", …)`` in
-        :func:`~almond_axol.teleop.worker.run_ik_worker`) — e.g.
-        ``("rest", "zero")`` for a park.
-        """
-        self._reset_path = path
+    def request_reset(self) -> None:
+        """Programmatically trigger a return-to-rest move. Safe from any thread."""
         self._reset_latched = True
 
     @property
@@ -727,7 +711,6 @@ class VRTeleopCore:
         reset press shouldn't also trigger a rest-pose move.
         """
         self._reset_latched = False
-        self._reset_path = None
 
     def cancel_reset(self) -> None:
         """Abandon a pending, planning, or playing reset move.
@@ -739,7 +722,6 @@ class VRTeleopCore:
         so no new dispatch can start, then this. Safe from any thread.
         """
         self._reset_latched = False
-        self._reset_path = None
         self._reset_cancel = True
         self.reset_interp.clear()
 
@@ -773,16 +755,6 @@ class VRTeleopCore:
         asks before commanding anything.
         """
         return self._at_rest
-
-    @property
-    def at_zero(self) -> bool:
-        """True while the last completed move was a park that ended at zero.
-
-        Set when a :meth:`guarded_park` trajectory is adopted; cleared the
-        moment tracking engages or a rest move is adopted. A teardown park
-        asks this before commanding anything.
-        """
-        return self._at_zero
 
     # ------------------------------------------------------------------
     # IK pipeline pause (out-of-band moves)
@@ -1050,11 +1022,7 @@ class VRTeleopCore:
 
     def _start_engage_ramp(self) -> None:
         """Begin the out-of-rest velocity ramp (``engage_max_vel`` →
-        ``teleop_max_vel`` over ``engage_duration``) if the arms were at rest.
-
-        Any engage also leaves a completed park at zero behind.
-        """
-        self._at_zero = False
+        ``teleop_max_vel`` over ``engage_duration``) if the arms were at rest."""
         if self._at_rest:
             self.smooth_left.max_vel = self.config.engage_max_vel
             self.smooth_right.max_vel = self.config.engage_max_vel
@@ -1560,7 +1528,7 @@ class VRTeleopCore:
                 self._hold_target(q.copy())
                 self.l_grip = l_grip
                 self.r_grip = r_grip
-                self._at_rest = not self._at_zero
+                self._at_rest = True
                 seed_l = np.append(q[self.left_indices], l_grip)
                 seed_r = np.append(q[self.right_indices], r_grip)
                 self.ema_left.reset(seed=seed_l)
@@ -1734,29 +1702,6 @@ class VRTeleopCore:
                 return
             announce("Returning to rest pose.")
 
-    async def guarded_park(self, **guard: Any) -> None:
-        """Teardown park: rest pose, then zero, guarded like a return to rest.
-
-        Ending at zero — the arms' natural resting pose — means the torque-off
-        that follows leaves them where they would settle anyway, whatever the
-        configured rest pose. Both legs are planned as one trajectory before
-        anything plays, so a stop that kills the IK worker mid-move cannot
-        strand the park between them. A reset already in flight (an X press,
-        the startup move) is finished first and the zero leg planned from
-        where it ends. Takes :meth:`guarded_return`'s arguments; ``stopped``
-        must also cover the caller's deadline and a contact trip, and the
-        park ends as soon as it fires.
-        """
-        stopped: Callable[[], bool] = guard["stopped"]
-        path: tuple[str, ...] = ("rest", "zero")
-        if self.is_resetting:
-            await self.guarded_return(**guard)
-            if stopped() or self.is_resetting:
-                return
-            path = ("zero",)
-        self.request_reset(path)
-        await self.guarded_return(**guard)
-
     async def contact_hold(
         self,
         *,
@@ -1906,8 +1851,6 @@ class VRTeleopCore:
             ):
                 self._reset_latched = False
                 self._reset_cancel = False
-                path = self._reset_path
-                self._reset_path = None
                 if self.box_mode:
                     # Going home leaves box mode: the arms come back as two
                     # arms, and the next engage is a deliberate one.
@@ -1934,10 +1877,7 @@ class VRTeleopCore:
                     if pos_r is not None and self.right_indices:
                         q_plan[self.right_indices] = pos_r
                     self._hold_target(q_plan)
-                    if path is None:
-                        conn.send(("reset", q_plan.copy()))
-                    else:
-                        conn.send(("reset_path", q_plan.copy(), path))
+                    conn.send(("reset", q_plan.copy()))
                     result = conn.recv()
                     if self._reset_cancel:
                         # cancel_reset() fired mid-planning: drop the plan —
@@ -1951,9 +1891,7 @@ class VRTeleopCore:
                                 trajectory, self.l_grip, self.r_grip
                             )
                             self._disengage_all()
-                            ends_at_zero = path is not None and path[-1] == "zero"
-                            self._at_zero = ends_at_zero
-                            self._at_rest = not ends_at_zero
+                            self._at_rest = True
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
                     self._logger.error("Reset error: %s", e)

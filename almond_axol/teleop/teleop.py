@@ -50,7 +50,6 @@ from ..robot.base import (
 )
 from ..robot.control import ContactWatchdog
 from ..robot.jelly import Jelly
-from ..robot.start_pose import check_start_pose
 from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -395,16 +394,13 @@ class VRTeleop:
         self._live.announce()
 
         await self._robot.enable()
-        pos_l, pos_r = await self._robot.get_positions()
-        # The startup trajectory plays from here to rest unsupervised; refuse
-        # it from far away. __aenter__'s teardown torques the arms back off.
-        check_start_pose((pos_l, pos_r))
         if self._jelly is not None:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
             await self._jelly.enable()
 
+        pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
             pos_l[7] if pos_l is not None else None,
             pos_r[7] if pos_r is not None else None,
@@ -776,18 +772,16 @@ class VRTeleop:
         )
 
     async def _park_arms(self) -> None:
-        """Park the arms — rest pose, then zero — before the torque comes off.
+        """Return the arms to rest before the torque comes off.
 
         Raised arms drop under gravity the moment they are disabled, so
-        teardown parks them first, ending at zero (their natural resting
-        pose) so the torque-off leaves them where they would settle anyway
-        (see :meth:`VRTeleopCore.guarded_park`). The move is skipped when
-        there is nothing to park or no safe way to park it: a target with no
-        guarded engine (Sim), arms already limp for hand-guiding (a contact
-        hold — pulling them would fight the operator), no IK worker or
-        dispatch thread (nothing can plan the path), arms already parked at
-        zero, or a bus that no longer reports positions. A stop that lands
-        mid-reset (an X press, the startup move) finishes that move first.
+        teardown parks them first. The move is skipped when there is nothing
+        to park or no safe way to park it: a target with no guarded engine
+        (Sim), arms already limp for hand-guiding (a contact hold — pulling
+        them would fight the operator), no IK worker or dispatch thread
+        (nothing can plan the path), arms already at rest, or a bus that no
+        longer reports positions. A stop that lands mid-reset (an X press,
+        the startup move) finishes that move instead of starting a new one.
 
         The whole move is capped at :data:`PARK_TIMEOUT_S` and every failure is
         swallowed, so the torque-off that follows is never skipped. A contact
@@ -800,7 +794,7 @@ class VRTeleop:
             return
         if self._core.ik_paused:
             return
-        if self._core.at_zero and not self._core.is_resetting:
+        if self._core.at_rest and not self._core.is_resetting:
             return
         if self._ik_process is None or not self._ik_process.is_alive():
             return
@@ -821,9 +815,11 @@ class VRTeleop:
             )
             if left is None and right is None:
                 return
-            _logger.info("Parking the arms (rest pose, then zero) before torque-off.")
+            _logger.info("Returning the arms to rest before torque-off.")
             deadline = time.perf_counter() + PARK_TIMEOUT_S
-            await self._core.guarded_park(
+            if not self._core.is_resetting:
+                self._core.request_reset()
+            await self._core.guarded_return(
                 send_step=self._guard_send_step,
                 gravity_step=self._guard_gravity_step,
                 torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
@@ -837,12 +833,12 @@ class VRTeleop:
             )
             if contact:
                 _logger.warning(
-                    "park before torque-off stopped on contact; "
+                    "return to rest before torque-off stopped on contact; "
                     "disabling the arms where they are"
                 )
         except BaseException:
             _logger.warning(
-                "park before torque-off did not finish; disabling "
+                "return to rest before torque-off did not finish; disabling "
                 "the arms where they are",
                 exc_info=True,
             )

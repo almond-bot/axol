@@ -227,7 +227,6 @@ class RunPolicySafetyTest(unittest.TestCase):
                     )
                 )
                 stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
-                stack.enter_context(mock.patch.object(run_policy, "check_start_pose"))
                 stack.enter_context(
                     mock.patch(
                         "lerobot.async_inference.configs.RobotClientConfig",

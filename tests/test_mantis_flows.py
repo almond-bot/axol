@@ -276,7 +276,6 @@ class MantisFlowTest(unittest.TestCase):
 
         with (
             mock.patch.object(collect_data, "_prepare_recording_cameras"),
-            mock.patch.object(collect_data, "check_start_pose"),
             mock.patch.object(collect_data.affinity, "pin_realtime"),
             mock.patch.object(
                 collect_data.os,

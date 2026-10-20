@@ -201,9 +201,6 @@ def remote_startup_session(tmp_path):
                 return_value=worker,
             )
         )
-        check_start_pose = stack.enter_context(
-            patch.object(collect_dagger, "check_start_pose")
-        )
         yield SimpleNamespace(
             config=config,
             robot=robot,
@@ -213,7 +210,6 @@ def remote_startup_session(tmp_path):
             recorder=recorder,
             worker=worker,
             construct_worker=construct_worker,
-            check_start_pose=check_start_pose,
             events=events,
             stop_event=threading.Event(),
         )
@@ -239,13 +235,6 @@ def test_startup_home_is_separate_from_current_pose_episode_start(
     collect_dagger._run(session.config, stop_event=session.stop_event, control=control)
 
     assert session.reset.return_to_rest.call_count == expected_homes
-    # The session's first home goes out through zero; later homes go to rest.
-    paths = [c.kwargs.get("path") for c in session.reset.return_to_rest.call_args_list]
-    assert paths == [("zero", "rest"), None][:expected_homes]
-    # Only a session that homes on start refuses a far-from-zero start.
-    assert session.check_start_pose.call_count == (
-        1 if home_on_start or not start_from_current_pose else 0
-    )
     assert (
         session.events.index("reset ready")
         < session.events.index("IK ready")

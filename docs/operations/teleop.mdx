@@ -111,11 +111,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  **Starting needs the arms near zero.** Teleop, data collection, DAgger, run-policy and replay all refuse to start while any arm joint is more than 25° from zero — the robot's natural resting pose, where the arms settle once torqued off — and name each offending joint. The check is against zero, not the configured rest pose. Move the arms back by hand (e.g. under `axol gravity-comp`) and start again. Not applied to `collect-dagger --start_from_current_pose`, which never homes on start. Once the check passes, the first move goes to zero and then out to the rest pose, so it follows the same path every session whatever rest pose is configured.
-</Note>
-
-<Note>
-  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — parks the arms — rest pose, then zero (their natural resting pose) — and only then torques the motors off, so raised arms no longer drop under gravity on the way out and end where they would settle anyway. The park is guarded like the return described above, with both legs planned up front and the whole move capped at 12 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already parked at zero, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
+  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and only then torques the motors off, so raised arms no longer drop under gravity on the way out. The move is the same guarded return described above, capped at 6 s; if it runs out of time or hits something, the arms are torqued off where they are. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when the arms are already at rest, when a contact hold has left them limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions.
 </Note>
 
 <Note>

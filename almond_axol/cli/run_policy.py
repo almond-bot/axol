@@ -52,7 +52,6 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
-from ..robot.start_pose import check_start_pose
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from ..utils.logquiet import quiet_noisy_loggers
@@ -3007,10 +3006,8 @@ def _run(
     normal_quit = False
     abort_requested = False
     # Disabling raised arms drops them under gravity, so the cleanup below
-    # parks them (rest pose, then zero) first — once this session has moved
-    # them, or whenever they are somewhere other than rest.
+    # returns them to rest first — but only when they are somewhere else.
     arms_at_rest = True
-    arms_moved = False
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -3066,19 +3063,13 @@ def _run(
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded(
-            *, final: bool = False, startup: bool = False
-        ) -> bool:
+        def _return_to_rest_guarded(*, final: bool = False) -> bool:
             """Guarded return to rest; ``False`` when the operator aborted.
 
-            ``startup=True`` is the session's first home, played through zero
-            (the arms' natural resting pose) on the way out to rest.
-
-            ``final=True`` is the teardown park played on the way out: rest,
-            then zero, so the torque-off leaves the arms where they would
-            settle anyway. The stop flag is already set by then, so a deadline
-            bounds the move instead and there is no operator left to answer a
-            contact retry.
+            ``final=True`` is the teardown park played on the way out. The
+            stop flag is already set by then, so a deadline bounds the move
+            instead — well inside the caller's stop grace — and there is no
+            operator left to answer a contact retry.
             """
             nonlocal arms_at_rest
             assert reset_controller is not None
@@ -3095,7 +3086,6 @@ def _run(
                         contact.is_set() or time.perf_counter() >= deadline
                     ),
                     on_contact=contact.set,
-                    path=("rest", "zero"),
                 )
                 return arms_at_rest
             arms_at_rest = reset_controller.return_to_rest(
@@ -3104,7 +3094,6 @@ def _run(
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
                 stopped=stop_event.is_set,
                 wait_retry=control.await_contact_clear,
-                path=("zero", "rest") if startup else None,
             )
             return arms_at_rest
 
@@ -3165,8 +3154,6 @@ def _run(
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
-        # The first return to rest plays unsupervised; refuse it from far away.
-        check_start_pose(robot.positions)
 
         # A Cartesian-action policy resolves each action to joints via IK in
         # send_action. Build that solver now, before the control loop, so its
@@ -3180,9 +3167,8 @@ def _run(
             _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
-        _logger.info("Returning to rest pose (through zero).")
-        arms_moved = True
-        if not _return_to_rest_guarded(startup=True):
+        _logger.info("Returning to rest pose.")
+        if not _return_to_rest_guarded():
             return
         if not control.await_continue("Reset the scene, then start the first episode."):
             return
@@ -3644,15 +3630,13 @@ def _run(
             except BaseException as exc:
                 _logger.exception("policy client cleanup failed")
                 cleanup_failures.append(("policy client", exc))
-        # Park — rest pose, then zero — before the torque comes off:
-        # ``disconnect()`` disables the motors, and arms left raised drop under
-        # gravity; ending at zero leaves them where they would settle anyway.
+        # Park before the torque comes off: ``disconnect()`` disables the
+        # motors, and arms left raised drop under gravity.
         #
         # Skipped when the motors are being left energized instead (a custom
         # policy fault, or a failed soft park: preserve_position), after a
         # completed soft park (the arms are parked at zero on purpose), when
-        # this session never moved the arms and they are at rest, when a limp
-        # hold left
+        # the arms are already at rest, when a limp hold left
         # them in the operator's hands, when the bus no longer reports a pose
         # to plan from, or when a live episode worker may still be inside the
         # robot. (``collect-data`` reads the same three states off its teleop
@@ -3668,14 +3652,12 @@ def _run(
                 episode_workers_stopped
                 and not preserve_position
                 and not soft_parked
-                and (arms_moved or not arms_at_rest)
+                and not arms_at_rest
                 and reset_controller is not None
                 and not reset_controller.arms_limp
                 and arms_reporting(robot)
             ):
-                _logger.info(
-                    "Parking the arms (rest pose, then zero) before disabling them."
-                )
+                _logger.info("Returning to rest before disabling the arms.")
                 _return_to_rest_guarded(final=True)
         except BaseException:
             _logger.exception("return to rest before disconnect failed")
