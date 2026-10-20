@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import io
-import threading
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace

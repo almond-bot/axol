@@ -42,6 +42,8 @@ Streams a hardware tracker backend's poses (and each side's trigger value) to th
 | `--hz FLOAT` | Frame streaming rate. Default: 120. |
 | `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | SocketCAN interface of that side's trigger node; overrides the saved config, which defaults to `can_mantis_l` / `can_mantis_r`. The node publishes its analog trigger position at 100 Hz on CAN ID `0x009`. |
 
+With the `survive` backend, an unexpected `survive-cli` exit (a crash) no longer ends the bridge: it is restarted after about a second, and since its calibration is saved both trackers report again a few seconds later; the rigs freeze meanwhile as for any tracking loss. More than 3 exits within a minute is treated as a crash loop and fails the source, and the exit report names the signal and the last lines of `survive-cli`'s stderr. libsurvive only enumerates USB devices at startup, so when a tracker drops off the bus (or a fresh process leaves one silent) the bridge restarts `survive-cli` and re-checks every 5 seconds, for up to 60 seconds, until every tracker seen earlier reports again.
+
 A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its last good pose and logs a warning rather than feeding IK a glitch. A stale trigger node (no frames for ~250 ms) likewise holds the last grip command and logs the dropout. A managed bridge freezes motion, waits for both trackers to become fresh, then requires the two-trigger start gesture before it re-anchors; the standalone bridge keeps its manual controls: **Enter** toggles engage, **r** returns to rest, **q** quits. A standalone bridge warns and continues fully open when a configured trigger is absent; a managed production run fails readiness instead.
 
 ### Hardware-free protocol demo
@@ -79,7 +81,7 @@ Saves `~/.almond/tracker/config.json`:
 }
 ```
 
-Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so earlier releases, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
+Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so releases before 0.2.25, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
 
 ## `axol tracker.pair`
 
@@ -136,7 +138,7 @@ axol tracker.lighthouse.check
 
 Listens to libsurvive for about 20 seconds with both trackers powered and in view. When base stations are live but the trackers are not reporting yet, libsurvive is still calibrating: it reports no pose until it has every live station's identity and position, which can take a minute or more on a new host or after stations are added or re-channelled. The check then keeps listening, up to 150 seconds in total, until both trackers report; keep them still and in view meanwhile. It then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
 
-Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before this one let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept.
+Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before 0.2.25 let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept.
 
 ## `axol tracker.ultimate.install`
 
