@@ -223,8 +223,7 @@ class MobileUrdfContractTest(unittest.TestCase):
 
     def test_ik_collides_the_body_and_arms_only(self) -> None:
         links = {ln.attrib["name"]: ln for ln in self.ik_root.findall("link")}
-        whole_body = self.model is AxolModel.MOBILE
-        torso = set(torso_links(self.model, whole_body=whole_body))
+        torso = set(torso_links(self.model))
         for link in sorted(torso) + _arm_bodies():
             with self.subTest(link=link):
                 self.assertIsNotNone(links[link].find("collision"))

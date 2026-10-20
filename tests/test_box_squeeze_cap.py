@@ -426,7 +426,6 @@ class TeleopLoopTest(unittest.TestCase):
         teleop._config = core.config
         teleop._core = core
         teleop._robot = robot
-        teleop._body_sink = None  # arm IK: no Jelly body to drive
         teleop._ik_process = None
         teleop._ik_thread = None
         teleop._video_manager = None

@@ -30,7 +30,6 @@ import pyroki as pk
 from ..constants import (
     ARM_JOINTS,
     AxolModel,
-    BODY_JOINTS,
     Joint,
     upper_arm_guard_links,
     urdf_arm_joint_names,
@@ -42,8 +41,8 @@ from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
     collision_cost_params,
-    upper_arm_guard_floor,
     shared_robot,
+    upper_arm_guard_floor,
     shared_robot_collision,
     shared_urdf,
 )
@@ -118,25 +117,12 @@ _MANIP_BARRIER_EPS = 1e-2
 
 
 def _manip_yoshikawa(
-    cfg: jax.Array,
-    robot: pk.Robot,
-    target_link_index: jax.Array,
-    joint_indices: jax.Array,
+    cfg: jax.Array, robot: pk.Robot, target_link_index: jax.Array
 ) -> jax.Array:
-    """Yoshikawa manipulability index of one link's translation Jacobian.
-
-    Only the columns of ``joint_indices`` (the link's own arm) count: the
-    other arm's columns are zero anyway, and whole-body IK's base and lift
-    columns would otherwise keep the index high right at an arm singularity.
-    """
-
-    # Differentiate along those joints only: forward-mode cost scales with
-    # the number of directions, and the solver differentiates this again.
-    def position(q_arm: jax.Array) -> jax.Array:
-        q = cfg.at[joint_indices].set(q_arm)
-        return jaxlie.SE3(robot.forward_kinematics(q)).translation()[target_link_index]
-
-    jacobian = jax.jacfwd(position)(cfg[joint_indices])
+    """Yoshikawa manipulability index of one link's translation Jacobian."""
+    jacobian = jax.jacfwd(
+        lambda q: jaxlie.SE3(robot.forward_kinematics(q)).translation()
+    )(cfg)[target_link_index]
     return jnp.sqrt(jnp.maximum(0.0, jnp.linalg.det(jacobian @ jacobian.T)))
 
 
@@ -145,13 +131,12 @@ def _bounded_manipulability_residual(
     robot: pk.Robot,
     joint_var: jaxls.Var[jax.Array],
     target_link_indices: jax.Array,
-    target_joint_indices: jax.Array,
     weight: jax.Array | float,
 ) -> jax.Array:
     """pyroki's manipulability residual with the barrier bounded near singularities."""
     cfg = vals[joint_var]
-    manip = jax.vmap(_manip_yoshikawa, in_axes=(None, None, 0, 0))(
-        cfg, robot, target_link_indices, target_joint_indices
+    manip = jax.vmap(_manip_yoshikawa, in_axes=(None, None, 0))(
+        cfg, robot, target_link_indices
     )
     return (weight / (manip + _MANIP_BARRIER_EPS)).flatten()
 
@@ -256,12 +241,6 @@ _self_collision_cost = jaxls.Cost.factory(_self_collision_residual)
 
 
 @jax.jit
-def _link_poses(robot: pk.Robot, q: jax.Array) -> jax.Array:
-    """Every link's world pose at ``q`` (jitted: eager FK costs ~5 ms)."""
-    return robot.forward_kinematics(q)
-
-
-@jax.jit
 def _base_collision_safe_step(
     robot: pk.Robot,
     robot_coll: pk.collision.RobotCollision,
@@ -309,14 +288,10 @@ def _base_collision_safe_step(
         )
         delta = jnp.where(outward, 0.0, delta)
 
-        # ``max_joint_delta`` is per joint (whole-body IK's base and lift have
-        # their own budgets); with one uniform budget this is exactly
-        # budget / max|delta|.
+        max_abs = jnp.max(jnp.abs(delta))
         rate_scale = jnp.minimum(
             1.0,
-            jnp.min(
-                jnp.maximum(max_joint_delta, 0.0) / jnp.maximum(jnp.abs(delta), 1e-12)
-            ),
+            jnp.maximum(max_joint_delta, 0.0) / jnp.maximum(max_abs, 1e-12),
         )
         delta = delta * rate_scale
 
@@ -490,8 +465,8 @@ def _solve_ik(
     shoulder_R: jax.Array,
     pos_weight: float,
     ori_weight: float,
-    rest_weight: jax.Array,
-    posture_weight: jax.Array,
+    rest_weight: float,
+    posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
     self_collision_start: jax.Array,
@@ -521,9 +496,9 @@ def _solve_ik(
             jnp.clip(1.0 - m / jnp.maximum(manip_damping_threshold, 1e-9), 0.0, 1.0)
         )
 
-    manip_L = _manip_yoshikawa(q_current, robot, L_ee_idx, left_joint_idx)
-    manip_R = _manip_yoshikawa(q_current, robot, R_ee_idx, right_joint_idx)
-    rest_w = jnp.asarray(rest_weight, dtype=jnp.float32)
+    manip_L = _manip_yoshikawa(q_current, robot, L_ee_idx)
+    manip_R = _manip_yoshikawa(q_current, robot, R_ee_idx)
+    rest_w = jnp.full(q_current.shape, rest_weight, dtype=jnp.float32)
     rest_w = rest_w.at[left_joint_idx].add(manip_damping_boost * _ramp(manip_L))
     rest_w = rest_w.at[right_joint_idx].add(manip_damping_boost * _ramp(manip_R))
 
@@ -566,7 +541,6 @@ def _solve_ik(
             robot,
             JointVar(0),
             jnp.array([L_ee_idx, R_ee_idx], dtype=jnp.int32),
-            jnp.stack([left_joint_idx, right_joint_idx]),
             weight=manipulability_weight,
         ),
     ]
@@ -833,17 +807,11 @@ class KinematicsSolver:
 
         Args:
             config: Cost weights and solver parameters. ``config.robot_model``
-                picks the Axol version's URDF (mobile when Jelly is enabled if
-                ``None``).
+                picks the Axol version's URDF (mobile when Jelly is enabled,
+                else ``config.mount``, if ``None``).
         """
         self.config = config
-        # Whole-body IK is only defined for the mobile Axol, so it implies it.
-        self.whole_body = bool(config.whole_body)
-        self.robot_model = resolve_robot_model(
-            config.robot_model,
-            jelly_enabled=True if self.whole_body else None,
-            mount=config.mount,
-        )
+        self.robot_model = resolve_robot_model(config.robot_model, mount=config.mount)
         # The fitted gripper (the mobile Axol has a URDF per gripper).
         self.gripper = (
             resolve_gripper(config.gripper)
@@ -857,17 +825,13 @@ class KinematicsSolver:
         # including pyroki's per-instance JointVar class, a static field —
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
-        self.robot = shared_robot(
-            self.robot_model, whole_body=self.whole_body, gripper=self.gripper
-        )
+        self.robot = shared_robot(self.robot_model, gripper=self.gripper)
         # Base collision detection is opt-in (config.self_collision): when
         # off, no collision model is built at all — the soft cost is left out
         # of the solve graph and the hard base guard below is skipped, so the
         # only geometric constraint on the arms is their joint limits.
         self.robot_coll: pk.collision.RobotCollision | None = (
-            shared_robot_collision(
-                self.robot_model, whole_body=self.whole_body, gripper=self.gripper
-            )
+            shared_robot_collision(self.robot_model, gripper=self.gripper)
             if config.self_collision
             else None
         )
@@ -891,7 +855,7 @@ class KinematicsSolver:
             home_distances = np.asarray(
                 self.robot_coll.compute_self_collision_distance(self.robot, q_home)
             )
-            torso = upper_arm_guard_links(self.robot_model, whole_body=self.whole_body)
+            torso = upper_arm_guard_links(self.robot_model)
             for k, (i, j) in enumerate(
                 zip(
                     np.asarray(self.robot_coll.active_idx_i),
@@ -917,11 +881,7 @@ class KinematicsSolver:
         self._l_elbow_idx_jax = jnp.asarray(self.l_elbow_idx, dtype=jnp.int32)
         self._r_elbow_idx_jax = jnp.asarray(self.r_elbow_idx, dtype=jnp.int32)
 
-        # Shoulder positions at the home pose. Arm IK: fixed in the world frame
-        # (independent of the arm joints). Whole-body IK: the base and lift
-        # carry them, so ik() recomputes them from each seed.
-        self._l_sh_idx = names.index(_LEFT_SHOULDER)
-        self._r_sh_idx = names.index(_RIGHT_SHOULDER)
+        # Shoulder positions are fixed in world frame (independent of joint angles)
         L_sh_idx = names.index(_LEFT_SHOULDER)
         R_sh_idx = names.index(_RIGHT_SHOULDER)
         fk0 = self.robot.forward_kinematics(
@@ -941,9 +901,7 @@ class KinematicsSolver:
         # centre — the three shoulder axes meet at one point, fixed in the
         # world — and its wrist centre, where the forearm roll (wrist_1)
         # meets wrist_2, fixed in wrist_2's link.
-        urdf = shared_urdf(
-            self.robot_model, whole_body=self.whole_body, gripper=self.gripper
-        )
+        urdf = shared_urdf(self.robot_model, gripper=self.gripper)
         fk0_np = np.asarray(fk0, np.float64)
         self._swivel: dict[str, _ArmSwivel] = {}
         for side, is_left in (("left", True), ("right", False)):
@@ -974,8 +932,6 @@ class KinematicsSolver:
         # permutation between the two is applied at every public boundary,
         # so callers never deal with pyroki's ordering.
         canonical = _LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES
-        if self.whole_body:
-            canonical = canonical + list(BODY_JOINTS)
         actuated = list(self.robot.joints.actuated_names)
         self._pyroki_index = np.array(
             [actuated.index(n) for n in canonical], dtype=np.intp
@@ -995,16 +951,6 @@ class KinematicsSolver:
         n_arm = len(_LEFT_JOINT_NAMES)
         self.left_indices = list(range(n_arm))
         self.right_indices = list(range(n_arm, 2 * n_arm))
-        # Whole-body IK: the Jelly joints (BODY_JOINTS order) after the arms.
-        self.body_indices = (
-            list(range(2 * n_arm, 2 * n_arm + len(BODY_JOINTS)))
-            if self.whole_body
-            else []
-        )
-        self._body_pyroki_idx = np.array(
-            [actuated.index(n) for n in BODY_JOINTS] if self.whole_body else [],
-            dtype=np.intp,
-        )
 
         self._posture_pose = jnp.zeros(
             self.robot.joints.num_actuated_joints, dtype=jnp.float32
@@ -1042,9 +988,7 @@ class KinematicsSolver:
         """Base-frame shoulder origins the reach soft-clamp is centred on.
 
         Fixed by the URDF (the shoulder body does not move with the arm
-        joints); the same centres :meth:`ik` clamps its targets around. With
-        whole-body IK these are the home-pose origins; the base and lift move
-        them, and :meth:`ik` does not reach-clamp at all.
+        joints); the same centres :meth:`ik` clamps its targets around.
         """
         return {
             "left": np.asarray(self._left_shoulder_pos, dtype=np.float64),
@@ -1053,14 +997,12 @@ class KinematicsSolver:
 
     @property
     def joint_names(self) -> list[str]:
-        """All actuated joint names — left arm then right arm, ARM_JOINTS order,
-        then (whole-body IK) :data:`~almond_axol.constants.BODY_JOINTS`."""
-        names = list(_LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES)
-        return names + list(BODY_JOINTS) if self.whole_body else names
+        """All actuated joint names — left arm then right arm, ARM_JOINTS order."""
+        return list(_LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES)
 
     @property
     def num_joints(self) -> int:
-        """Length of the public joint vector: 14 arm joints (+4 whole-body)."""
+        """Total number of actuated joints across both arms."""
         return int(self._pyroki_index.size)
 
     # -- Joint-order conversion ----------------------------------------------
@@ -1155,13 +1097,6 @@ class KinematicsSolver:
             np.asarray(jaxlie.SE3(fk[self.r_elbow_idx]).translation(), np.float32),
         )
 
-    def _shoulder_centre(self, side: str, poses: np.ndarray) -> np.ndarray:
-        """``side``'s shoulder centre (where its first two axes meet), world
-        frame, from link ``poses``: fixed for arm IK, carried by the base and
-        lift for whole-body IK."""
-        axes = self._swivel[side].axes
-        return _axes_meet(*_axis_line(poses, *axes[0]), *_axis_line(poses, *axes[1]))
-
     def elbow_swivel(self, q: np.ndarray) -> dict[str, ElbowSwivel]:
         """Each arm's elbow swivel at joint positions ``q``.
 
@@ -1207,11 +1142,7 @@ class KinematicsSolver:
             direction = elbow_jac @ null
             norm = float(np.linalg.norm(direction))
             out[side] = ElbowSwivel(
-                shoulder=(
-                    self._shoulder_centre(side, poses)
-                    if self.whole_body
-                    else geo.shoulder.copy()
-                ),
+                shoulder=geo.shoulder.copy(),
                 elbow=elbow,
                 wrist_in_mount=ee_rot.T @ (wrist - ee_pos),
                 direction=direction / norm if norm > 1e-9 else np.zeros(3),
@@ -1279,36 +1210,29 @@ class KinematicsSolver:
         q_current = self.to_pyroki_order(q_current)
 
         cfg = self.config
-        if self.whole_body:
-            poses = np.asarray(
-                _link_poses(self.robot, jnp.asarray(q_current)), np.float64
-            )
-            sh_l = poses[self._l_sh_idx, 4:].astype(np.float32)
-            sh_r = poses[self._r_sh_idx, 4:].astype(np.float32)
-            swivel_l = self._shoulder_centre("left", poses).astype(np.float32)
-            swivel_r = self._shoulder_centre("right", poses).astype(np.float32)
-        else:
-            sh_l, sh_r = self._left_shoulder_pos, self._right_shoulder_pos
-
-        def clamp(pos: np.ndarray, shoulder: np.ndarray) -> np.ndarray:
-            # Whole-body IK: the base and lift extend the reach, so a target
-            # past the arm's reach is what should move them.
-            if self.whole_body:
-                return pos
-            return _clamp_reach(pos, shoulder, cfg.reach_soft_start, cfg.max_reach)
 
         target_L: jaxlie.SE3 | None = None
         lp: np.ndarray | None = None
         if left_pose is not None:
             lp, lr = left_pose
-            lp = clamp(np.asarray(lp, dtype=np.float32), sh_l)
+            lp = _clamp_reach(
+                np.asarray(lp, dtype=np.float32),
+                self._left_shoulder_pos,
+                cfg.reach_soft_start,
+                cfg.max_reach,
+            )
             target_L = _np_to_se3(lp, np.asarray(lr, dtype=np.float32))
 
         target_R: jaxlie.SE3 | None = None
         rp: np.ndarray | None = None
         if right_pose is not None:
             rp, rr = right_pose
-            rp = clamp(np.asarray(rp, dtype=np.float32), sh_r)
+            rp = _clamp_reach(
+                np.asarray(rp, dtype=np.float32),
+                self._right_shoulder_pos,
+                cfg.reach_soft_start,
+                cfg.max_reach,
+            )
             target_R = _np_to_se3(rp, np.asarray(rr, dtype=np.float32))
 
         elbow_L = (
@@ -1326,14 +1250,13 @@ class KinematicsSolver:
         # elbow is inferred rather than tracked and degrades sharply once the
         # hand rises to shoulder height, exactly where the shoulder nears its
         # joint limits and bad swivel targets do the most damage.
-        rest_w, posture_w, budget = self._per_joint(
-            cfg, delta_scale, self._body_release((lp, sh_l), (rp, sh_r))
-        )
         if elbow_weight is not None:
             elbow_w_l = elbow_w_r = float(elbow_weight)
         else:
-            elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, sh_l)
-            elbow_w_r = cfg.elbow_weight * self._elbow_fade(rp, sh_r)
+            elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
+            elbow_w_r = cfg.elbow_weight * self._elbow_fade(
+                rp, self._right_shoulder_pos
+            )
 
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
@@ -1354,12 +1277,12 @@ class KinematicsSolver:
             self._posture_pose,
             self._left_idx_jax,
             self._right_idx_jax,
-            jnp.asarray(swivel_l) if self.whole_body else self._left_swivel_jax,
-            jnp.asarray(swivel_r) if self.whole_body else self._right_swivel_jax,
+            self._left_swivel_jax,
+            self._right_swivel_jax,
             cfg.pos_weight * float(pose_weight_scale[0]),
             cfg.ori_weight * float(pose_weight_scale[1]),
-            jnp.asarray(rest_w, dtype=jnp.float32),
-            jnp.asarray(posture_w, dtype=jnp.float32),
+            cfg.rest_weight,
+            cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
             self._collision_starts,
@@ -1397,17 +1320,16 @@ class KinematicsSolver:
             )
         self._last_solve_had_nan = nan_proposals
 
-        # Direction-preserving rate limit: scale the whole step so the joint
-        # furthest over its budget (max_joint_delta for the arms; the base and
-        # lift budgets for whole-body IK) lands on it, rather than clipping per
-        # joint. Per-joint clipping distorted the step direction (each joint
-        # saturated differently), pushing the commanded pose off the solver's
-        # path and releasing with a velocity discontinuity.
+        # Direction-preserving rate limit: scale the whole step so its largest
+        # component hits max_joint_delta, rather than clipping per joint. Per-
+        # joint clipping distorted the step direction (each joint saturated
+        # differently), pushing the commanded pose off the solver's path and
+        # releasing with a velocity discontinuity.
         delta = q_result_np - q_current
-        if delta.size:
-            scale = float(np.min(budget / np.maximum(np.abs(delta), 1e-12)))
-            if scale < 1.0:
-                delta = delta * scale
+        max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
+        delta_budget = cfg.max_joint_delta * delta_scale
+        if max_abs > delta_budget:
+            delta = delta * (delta_budget / max_abs)
         q_out = (q_current + delta).astype(np.float32)
         if self.robot_coll is None:
             # Collision detection off: the guard's projection is skipped, but
@@ -1420,7 +1342,7 @@ class KinematicsSolver:
             jnp.asarray(q_current, dtype=jnp.float32),
             jnp.asarray(q_out, dtype=jnp.float32),
             self._base_clearance_floor,
-            jnp.asarray(budget, dtype=jnp.float32),
+            jnp.asarray(delta_budget, dtype=jnp.float32),
         )
         guard_active = bool(guard_active_jax)
         if guard_active and not self._base_collision_guard_active:
@@ -1433,53 +1355,6 @@ class KinematicsSolver:
         self._base_collision_guard_active = guard_active
         q_out = np.asarray(q_out, dtype=np.float32)
         return self.from_pyroki_order(q_out)
-
-    def _body_release(self, *targets: tuple[np.ndarray | None, np.ndarray]) -> float:
-        """Whole-body IK: 0 while every hand target is within comfortable reach
-        of its shoulder (the body holds still), rising to 1 over
-        ``body_reach_band`` past ``body_reach_start`` (the body may move)."""
-        if not self.whole_body:
-            return 0.0
-        cfg = self.config
-        release = 0.0
-        for target, shoulder in targets:
-            if target is None:
-                continue
-            u = (float(np.linalg.norm(target - shoulder)) - cfg.body_reach_start) / max(
-                cfg.body_reach_band, 1e-6
-            )
-            u = min(max(u, 0.0), 1.0)
-            release = max(release, u * u * (3.0 - 2.0 * u))
-        return release
-
-    def _per_joint(
-        self, cfg: KinematicsConfig, delta_scale: float, release: float = 0.0
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Per-joint (rest weight, posture weight, step budget), pyroki order.
-
-        Arm IK: uniform. Whole-body IK: the body joints are held by
-        ``body_hold_weight`` until a target leaves comfortable reach
-        (``release`` -> 1), then damped by ``body_rest_weight``; they have no
-        posture attractor (the base must not be pulled back to where the
-        session started) and get their own step budgets.
-        """
-        n = self.robot.joints.num_actuated_joints
-        rest = np.full(n, cfg.rest_weight, dtype=np.float64)
-        posture = np.full(n, cfg.posture_weight, dtype=np.float64)
-        budget = np.full(n, cfg.max_joint_delta, dtype=np.float64)
-        if self.whole_body:
-            body_budget = (
-                cfg.base_max_delta,
-                cfg.base_max_delta,
-                cfg.base_yaw_max_delta,
-                cfg.lift_max_delta,
-            )
-            rest[self._body_pyroki_idx] = (
-                cfg.body_rest_weight + (1.0 - release) * cfg.body_hold_weight
-            )
-            posture[self._body_pyroki_idx] = 0.0
-            budget[self._body_pyroki_idx] = body_budget
-        return rest, posture, budget * delta_scale
 
     def _elbow_fade(
         self, ee_target: np.ndarray | None, shoulder_pos: np.ndarray

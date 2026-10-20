@@ -27,9 +27,9 @@ the viewers and physics simulators (Isaac Sim, MuJoCo) all load:
   ``<collision>``, for physics, and capsule-friendly pieces in the custom
   ``<ik_collision>`` (pyroki fits one capsule per link): the shoulder bar,
   the head-camera mount, the lift column's top plate and each section, the
-  Jelly deck and Owl foot plate as strips, and each gripper's jaws as one
-  body over their whole motion. IK (``almond_axol.kinematics.model``)
-  freezes the joints it does not solve and collides the second set.
+  Owl foot plate as strips, and each gripper's jaws as one body over their
+  whole motion. IK (``almond_axol.kinematics.model``) freezes every joint
+  but the arms' and collides the second set.
 - **Masses and drives** from :class:`~almond_axol.robot.config.AxolConfig`
   for the arms (wrist_3's lump split across the gripper parts), estimates
   elsewhere (``Body.masses``); friction and impedance gains on the arm
@@ -77,8 +77,7 @@ REPO = Path(__file__).resolve().parents[1]
 URDF_DIR = REPO / "almond_axol" / "kinematics" / "urdf"
 CLASSIC_URDF = URDF_DIR / "axol.urdf"
 MESH_SUBDIR = "meshes/jelly"
-# Travel of each planar base joint in the whole-body model (m): far beyond
-# any single session, so the joint limits never shape the solve.
+# Travel of each planar base joint (m): far beyond any single session.
 BASE_TRAVEL = 10.0
 
 # Classic arm joints (ARM_JOINTS order) and their export counterparts.
@@ -197,7 +196,7 @@ class Body:
     title: str  # what the URDF's header calls the robot
     note: str  # what IK keeps the arms clear of, for the header
     # The Jelly base drives in the plane: base_x / base_y / base_yaw joints
-    # (whole-body IK solves them; a simulator can drive them).
+    # a simulator can drive.
     planar: bool = False
 
 
@@ -251,7 +250,7 @@ JELLY = Body(
         "lift_stage": ("column_mid",),
         "jelly": ("column_stub",),
     },
-    strips={"deck": ("jelly", "deck", DECK_STRIPS)},
+    strips={},
     sim_hulls={
         "lift_plate": (("lift_plate",),),
         "base": (("column_top",),),
@@ -276,9 +275,9 @@ JELLY = Body(
     note=(
         "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
         "mount (head), the lift column's top plate (lift_plate) and its three "
-        "sections (base, lift_stage, jelly), and, for whole-body IK, the deck "
-        "(deck_0..2). Arm IK freezes the base and lift at zero, the lift "
-        "fully raised, where the deck is below anything the arms can reach."
+        "sections (base, lift_stage, jelly). IK freezes the base and lift at "
+        "zero, the lift fully raised, where the deck is below anything the "
+        "arms can reach."
     ),
     planar=True,
 )
@@ -396,8 +395,7 @@ MODEL_NOTE = (
     "arm joints, {body_joints}{gripper_joints}. "
     "With every body joint at zero the torso root (link root) is the "
     "world origin, so poses match the classic axol.urdf. IK "
-    "(almond_axol.kinematics.model) freezes every joint it does not solve "
-    "(arm IK: all but the arms; whole-body IK: the body joints too) and "
+    "(almond_axol.kinematics.model) freezes every joint but the arms' and "
     "collides capsule-friendly pieces, the custom ik_collision elements, "
     "instead of each part's collision hull; importers ignore them. {ik} "
     "Physics: arm joints carry AxolConfig's measured friction as <dynamics "
