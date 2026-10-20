@@ -921,6 +921,24 @@ def _newer_pose(
     return snapshot.pose_host_ts >= previous.pose_host_ts
 
 
+def _row_observation(
+    robot: Any, live: dict[str, Any], pose_ts: float | None
+) -> dict[str, Any]:
+    """The measured state to record in a row stamped with ``pose_ts``.
+
+    The live reading is taken at the control tick, up to one pose lag (tens of
+    ms) after the pose capture the row is stamped with; the gripper position
+    in it would lead the recorded pose by that much. Use the core's
+    telemetry nearest the capture instead, and the live reading only when no
+    such sample is retained.
+    """
+    if pose_ts is None:
+        return live
+    at = getattr(robot, "joint_observation_at", None)
+    measured = at(pose_ts) if at is not None else None
+    return measured if measured is not None else live
+
+
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     """Quality verdict for a recorded episode: ``(ok, reasons)``.
 
@@ -2128,6 +2146,9 @@ def _run_session(
                 # where the gripper physically is, and training must not
                 # inherit filter/solver artifacts. Grippers stay as-is —
                 # measured feedback in the state, commanded in the action.
+                # Measured values (the grippers) as of the pose capture, not
+                # the later control tick.
+                joint_obs = _row_observation(robot, joint_obs, pose_ts)
                 if last_tcp is not None:
                     joint_obs = dict(joint_obs)
                     dataset_act = dict(dataset_act)

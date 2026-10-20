@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from almond_axol.cli.collect_data import _newer_pose
+from almond_axol.cli.collect_data import _newer_pose, _row_observation
+from almond_axol.lerobot.robot.robot_axol import AxolRobot
 from almond_axol.mantis.relative import quat_xyzw_to_matrix
 from almond_axol.teleop.absolute_pose import AbsoluteCalibration
 from almond_axol.teleop.config import VRTeleopConfig
@@ -230,3 +232,55 @@ class NewerPoseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _History:
+    """A realtime core's timestamped telemetry with one gripper sample."""
+
+    def __init__(self, ts: float) -> None:
+        self.ts = ts
+        self.calls: list[tuple[float, float]] = []
+
+    def state_nearest(self, target: float, timeout: float = 0.1):  # type: ignore[no-untyped-def]
+        self.calls.append((target, timeout))
+        return (
+            np.array([0.25]),
+            np.array([0.75]),
+            np.zeros(1),
+            np.zeros(1),
+            self.ts,
+        )
+
+
+def _robot(core: object) -> AxolRobot:
+    robot = object.__new__(AxolRobot)
+    robot.config = SimpleNamespace(observe_cartesian=False, observe_torques=False)
+    robot._left_pos_keys = ["left_gripper.pos"]
+    robot._right_pos_keys = ["right_gripper.pos"]
+    robot._axol = core
+    return robot
+
+
+class RowObservationTest(unittest.TestCase):
+    def test_gripper_state_is_taken_at_the_pose_capture(self) -> None:
+        core = _History(ts=10.003)
+        robot = _robot(core)
+
+        obs = _row_observation(robot, {"left_gripper.pos": 9.0}, pose_ts=10.0)
+
+        self.assertEqual(obs, {"left_gripper.pos": 0.25, "right_gripper.pos": 0.75})
+        # Read at the pose's capture time, without waiting on the control loop.
+        self.assertEqual(core.calls, [(10.0, 0.0)])
+
+    def test_live_reading_is_kept_when_no_sample_is_close_enough(self) -> None:
+        live = {"left_gripper.pos": 9.0}
+        far = _robot(_History(ts=10.05))  # 50 ms from the capture
+        self.assertIs(_row_observation(far, live, pose_ts=10.0), live)
+
+        no_history = _robot(SimpleNamespace(state_nearest=lambda *_a, **_k: None))
+        self.assertIs(_row_observation(no_history, live, pose_ts=10.0), live)
+
+        no_core = _robot(object())
+        self.assertIs(_row_observation(no_core, live, pose_ts=10.0), live)
+
+        self.assertIs(_row_observation(_robot(_History(10.0)), live, None), live)
