@@ -1153,6 +1153,7 @@ class VRTeleop:
             ):
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
+        self._core.note_tracking_quality(frame)
         if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't

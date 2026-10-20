@@ -105,8 +105,9 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | Tab | What's in it |
 |---|---|
 | **Tracking** | The Quest/Lighthouse/Ultimate pose source and its step-by-step setup flow (each step gated on host-reported readiness), ending once the sides are identified. See [Mantis Tracking](/mantis/tracking). |
-| **Cameras** | The Left Mantis / Right Mantis camera layout, stored separately from the Axol layout. |
+| **Cameras** | The Head / Left Mantis / Right Mantis camera layout, stored separately from the Axol layout. |
 | **CAN** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
+| **Triggers** | Per-side **trigger full squeeze** endpoints scale each rig's analog trigger to a full close command (default `1.0`); see [Testing the triggers and grippers](/mantis/hardware#testing-the-triggers-and-grippers). |
 
 **General settings** — the host, shared by both devices:
 
@@ -124,9 +125,9 @@ Every setting on these tabs — and every field under **Advanced** — is docume
 
 ### Cameras
 
-Data collection and policy inference also need ZED cameras attached to the host. Axol cameras are assigned under **Axol settings → Cameras**; the two Mantis slots live under **Mantis settings → Cameras**.
+Data collection and policy inference also need ZED cameras attached to the host. Axol cameras are assigned under **Axol settings → Cameras**; the three Mantis slots live under **Mantis settings → Cameras**.
 
-Both camera panels **detect the cameras** plugged into the host and show each serial, automatically detected type (**stereo** ZED X / **mono** ZED-X One), model, and a **live preview frame**, so you can identify the physical view before assigning it. The Axol panel offers overhead / left arm / right arm. The Mantis panel offers only Left Mantis / Right Mantis and stores that mapping separately, so changing it never overwrites Axol. Press **Refresh** to re-query the device list and grab previews, or **Restart daemon** after plugging/unplugging a GMSL camera so the daemon re-scans. Previews are unavailable while an operation owns the cameras.
+Both camera panels **detect the cameras** plugged into the host and show each serial, automatically detected type (**stereo** ZED X / **mono** ZED-X One), model, and a **live preview frame**, so you can identify the physical view before assigning it. The Axol panel offers overhead / left arm / right arm. The Mantis panel offers Head / Left Mantis / Right Mantis and stores that mapping separately, so changing it never overwrites Axol. Press **Refresh** to re-query the device list and grab previews, or **Restart daemon** after plugging/unplugging a GMSL camera so the daemon re-scans. Previews are unavailable while an operation owns the cameras.
 
 These two hardware-layout panels are the single source of truth for camera settings. Each controls two independent branches:
 
@@ -137,9 +138,9 @@ Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, o
 
 An operation that records a dataset requires at least one assigned camera participating in **Record**; an assigned stream-only camera does not satisfy Start. Conversely, a camera disabled in both branches is omitted and does not create a false “not detected” blocker.
 
-A stereo **overhead** captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
+A stereo **overhead** (the **Head** slot in Mantis) captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. Both profiles can record these two head views alongside both wrists. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. A Mantis run automatically passes only its left/right Mantis mapping to data collection; an Axol run uses the Axol mapping. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every participating camera assigned to the active hardware profile is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the matching Axol or Mantis Cameras panel. Teleop streams whatever is configured and is never blocked by this check.
+The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. A Mantis run passes its head and wrist mapping to data collection; an Axol run uses the Axol mapping. Older settings without a Mantis assignment for a slot inherit that slot's Axol serial until you save a Mantis selection; Head inherits only if that camera is not already assigned to a Mantis wrist. Explicitly leaving a slot unassigned disables it for Mantis. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every participating camera assigned to the active hardware profile is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the matching Axol or Mantis Cameras panel. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 

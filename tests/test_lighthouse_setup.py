@@ -31,7 +31,20 @@ class _Clock:
         return self.now
 
 
-class SurviveConfigPathTest(unittest.TestCase):
+class _NativeConfigFixture(unittest.TestCase):
+    def setUp(self) -> None:
+        # These tests cover process ownership/recovery, never the host's saved
+        # room calibration. Full config validation is exercised in runtime modes.
+        native = patch.object(
+            survive.SurviveSource,
+            "_prepare_native_config",
+            return_value=Path("/private/config.json"),
+        )
+        native.start()
+        self.addCleanup(native.stop)
+
+
+class SurviveConfigPathTest(_NativeConfigFixture):
     def test_follows_xdg_then_the_passwd_home(self) -> None:
         with patch.dict(os.environ, {"XDG_CONFIG_HOME": "/xdg"}):
             self.assertEqual(
@@ -40,6 +53,16 @@ class SurviveConfigPathTest(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in ("XDG_CONFIG_HOME",)}
         with (
             patch.dict(os.environ, env, clear=True),
+            patch.object(survive.Path, "home", return_value=Path("/root")),
+        ):
+            self.assertEqual(
+                survive.survive_config_path(),
+                Path("/root/.config/libsurvive/config.json"),
+            )
+
+    def test_empty_xdg_uses_the_passwd_home(self) -> None:
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}),
             patch.object(survive.Path, "home", return_value=Path("/root")),
         ):
             self.assertEqual(
@@ -83,12 +106,10 @@ class SurviveConfigPathTest(unittest.TestCase):
         process = SimpleNamespace(stdout=iter(()), poll=lambda: 0, terminate=Mock())
         with patch.object(survive.subprocess, "Popen", return_value=process) as popen:
             source._run_cli()
-        # Stopped before the launch: the process is ended straight away.
-        process.terminate.assert_called_once_with()
+        # This child has already exited, so it needs no termination signal.
+        process.terminate.assert_not_called()
         args = popen.call_args.args[0]
-        self.assertEqual(
-            args[1:3], ["--configfile", str(survive.survive_config_path())]
-        )
+        self.assertEqual(args[args.index("--configfile") + 1], "/private/config.json")
 
 
 class _SurveySource:
@@ -230,7 +251,7 @@ def _config_line(codename: str, serial: str) -> str:
     )
 
 
-class TrackerSerialKeyTest(unittest.TestCase):
+class TrackerSerialKeyTest(_NativeConfigFixture):
     def _poses(self, lines: list[str]) -> dict[str, TrackerPose]:
         source = survive.SurviveSource()
         source._cli_executable = Path("/attested/survive-cli")
@@ -326,11 +347,39 @@ class _Crash:
         return self._code
 
 
-class SurviveRestartTest(unittest.TestCase):
+class SurviveRestartTest(_NativeConfigFixture):
     def _source(self) -> survive.SurviveSource:
         source = survive.SurviveSource()
         source._cli_executable = Path("/attested/survive-cli")
         return source
+
+    def test_restart_requires_fresh_station_and_optical_evidence(self) -> None:
+        source = self._source()
+        source._quality._armed = True
+        source._quality.fault("old", "earlier fault", 1.0)
+        source._quality.required_trackers = {"LHR-LEFT"}
+        source._quality.optical("LHR-LEFT", 0, 1, 0, 100, 1.0)
+        source._survey.note_channel(0)
+        source._serials["WM0"] = "LHR-LEFT"
+        source._known_serials.add("LHR-LEFT")
+        source._checked_ootx.add((0, "abcd1234"))
+        source._reset_native_evidence()
+        self.assertFalse(source._quality.trackers)
+        self.assertFalse(source._serials)
+        self.assertFalse(source._checked_ootx)
+        self.assertFalse(source._survey.channels)
+        self.assertEqual(source._known_serials, {"LHR-LEFT"})
+        self.assertEqual(source._quality.required_trackers, {"LHR-LEFT"})
+        self.assertEqual(source._quality.fault_count, 2)
+        self.assertNotEqual(source.tracking_quality()["status"], "ready")
+
+    def test_restart_never_replaces_a_still_live_native_owner(self) -> None:
+        source = self._source()
+        source._proc = SimpleNamespace(poll=lambda: None)
+        with self.assertRaisesRegex(
+            survive.TrackerSourceError, "previous native owner is alive"
+        ):
+            source._reset_native_evidence()
 
     def test_a_crash_restarts_survive_cli_and_tracking_resumes(self) -> None:
         source = self._source()
@@ -421,7 +470,7 @@ class _Run:
         return -15
 
 
-class TrackerReconnectTest(unittest.TestCase):
+class TrackerReconnectTest(_NativeConfigFixture):
     def test_a_disconnected_tracker_is_looked_for_again(self) -> None:
         source = survive.SurviveSource()
         source._cli_executable = Path("/attested/survive-cli")

@@ -93,7 +93,9 @@ async def run_grippers_only(
     left_channel: str,
     right_channel: str,
     *,
-    reader_factory: Callable[[str], Any] = TriggerReader,
+    left_trigger_full_scale: float = 1.0,
+    right_trigger_full_scale: float = 1.0,
+    reader_factory: Callable[..., Any] = TriggerReader,
     robot_factory: Callable[..., Any] = _rt_mantis,
     wait_timeout: float = _TRIGGER_WAIT_TIMEOUT_S,
     poll_interval: float = _CONTROL_INTERVAL_S,
@@ -108,13 +110,17 @@ async def run_grippers_only(
     command.
     """
     channels = {"left": left_channel, "right": right_channel}
+    full_scales = {
+        "left": left_trigger_full_scale,
+        "right": right_trigger_full_scale,
+    }
     readers: dict[str, Any] = {}
     robot: Any | None = None
     status_started = False
 
     try:
         for side, channel in channels.items():
-            readers[side] = reader_factory(channel)
+            readers[side] = reader_factory(channel, full_scale=full_scales[side])
 
         # Deferred mode lets us establish a known torque-off state before the
         # input preflight. No gripper is enabled until both trigger streams are

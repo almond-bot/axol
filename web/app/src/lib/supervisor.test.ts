@@ -5,6 +5,7 @@ import {
   CUSTOM_POLICY_TYPE,
   applyPolicyTypeRules,
   cameraCount,
+  cameraSerials,
   computeArgs,
   curatedFields,
   defaultString,
@@ -23,6 +24,7 @@ import {
   participatingCameraSerials,
   perRunFields,
   previewStep,
+  recordingCameraCount,
   runFieldVisible,
   saveLocalHardwareProfile,
   saveOpSettings,
@@ -83,8 +85,8 @@ describe("supervisor pure helpers", () => {
     expect(missingCameraSerials(cameras, [{ serial: 2, model: "one", kind: "mono" }])).toEqual([
       "1",
     ])
-    // Mantis reuses the Axol wrist serials unless it has its own.
-    expect(cameraCount(cameras, true)).toBe(1)
+    // Mantis reuses the Axol head and wrist serials unless it has its own.
+    expect(cameraCount(cameras, true)).toBe(2)
     // A camera disabled on the stream branch still participates via recording.
     expect(participatingCameraSerials({ ...cameras, stream: { left_arm: false } })).toEqual([
       "1",
@@ -97,6 +99,86 @@ describe("supervisor pure helpers", () => {
         record: { left_arm: false },
       })
     ).toEqual(["1"])
+  })
+
+  it("includes the inherited head alongside separately mapped Mantis wrists", () => {
+    const cameras: CameraSpec = {
+      serials: { overhead: "101", left_arm: "102", right_arm: "103" },
+      mantis_serials: { left_arm: "202", right_arm: "203" },
+    }
+    expect(cameraSerials(cameras, true)).toEqual({
+      overhead: "101",
+      left_arm: "202",
+      right_arm: "203",
+    })
+    expect(recordingCameraCount(cameras, true)).toBe(3)
+    expect(
+      missingCameraSerials(
+        cameras,
+        [
+          { serial: 202, model: "ZED X One", kind: "mono" },
+          { serial: 203, model: "ZED X One", kind: "mono" },
+        ],
+        true
+      )
+    ).toEqual(["101"])
+  })
+
+  it("allows head-only Mantis recording and honors its disabled branches", () => {
+    const cameras: CameraSpec = {
+      serials: { overhead: "101", left_arm: "102", right_arm: "103" },
+      mantis_serials: { overhead: "201", left_arm: "", right_arm: "" },
+      stream: { overhead: false },
+    }
+    expect(recordingCameraCount(cameras, true)).toBe(1)
+    expect(participatingCameraSerials(cameras, true)).toEqual(["201"])
+    expect(recordingCameraCount({ ...cameras, record: { overhead: false } }, true)).toBe(0)
+    expect(participatingCameraSerials({ ...cameras, record_resolution: "off" }, true)).toEqual([])
+    expect(
+      cameraSerials(
+        { ...cameras, mantis_serials: { ...cameras.mantis_serials, overhead: "" } },
+        true
+      ).overhead
+    ).toBe("")
+    expect(cameraSerials(cameras, false).overhead).toBe("101")
+  })
+
+  it.each(["left_arm", "right_arm"] as const)(
+    "does not inherit the Axol head already assigned to the Mantis %s",
+    (wrist) => {
+      const cameras: CameraSpec = {
+        serials: { overhead: " 101 ", left_arm: "102", right_arm: "103" },
+        mantis_serials: { [wrist]: "101" },
+      }
+      expect(cameraSerials(cameras, true).overhead).toBe("")
+      expect(cameraSerials(cameras, true)[wrist]).toBe("101")
+      expect(recordingCameraCount(cameras, true)).toBe(2)
+      // Explicit choices remain authoritative, including clearing the head.
+      for (const overhead of ["101", "201", ""]) {
+        expect(
+          cameraSerials(
+            { ...cameras, mantis_serials: { ...cameras.mantis_serials, overhead } },
+            true
+          ).overhead
+        ).toBe(overhead)
+      }
+    }
+  )
+
+  it("fills missing slots in partial legacy camera maps before resolving Mantis", () => {
+    const headOnly = { serials: { overhead: "101" } } as CameraSpec
+    expect(cameraSerials(headOnly, true)).toEqual({
+      overhead: "101",
+      left_arm: "",
+      right_arm: "",
+    })
+    const wristOnly = { serials: { left_arm: "202" } } as CameraSpec
+    expect(cameraSerials(wristOnly, true)).toEqual({
+      overhead: "",
+      left_arm: "202",
+      right_arm: "",
+    })
+    expect(cameraSerials(wristOnly, false)).toEqual(cameraSerials(wristOnly, true))
   })
 
   it("flattens and filters nested schemas", () => {

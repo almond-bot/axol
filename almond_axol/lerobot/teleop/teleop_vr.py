@@ -128,6 +128,7 @@ class AxolVRTeleop(Teleoperator):
             self._broadcast_tracking,
             broadcast_mode=lambda key, value: self._live.on_changed(key, value),
             broadcast_json=self._broadcast_json,
+            record_raw_tcp=config.record_raw_tcp,
         )
         # Live session settings (box mode, re-engage, reach, speed…) from the
         # headset HUD / control panel. This teleoperator never holds the robot
@@ -374,6 +375,7 @@ class AxolVRTeleop(Teleoperator):
                     self.config.kinematics_config,
                     q_start_left,
                     q_start_right,
+                    self.config.record_raw_tcp,
                 ),
                 daemon=True,
             )
@@ -1192,13 +1194,14 @@ class AxolVRTeleop(Teleoperator):
         return action
 
     def pose_capture_ts(self) -> float | None:
-        """Host-clock capture time of the pose behind the latest action.
+        """Host-clock capture time of the latest recorded pose.
 
         ``time.perf_counter`` seconds, estimated by the VR server's pose
         interpolator (``VRFrame.t_host``). Mantis data collection stamps dataset
         rows with this so image exposure and pose share one capture timeline.
-        ``None`` before the first solve or when the client doesn't stamp
-        capture times.
+        Its raw TCP samples are independent of virtual IK completion. Other
+        modes report the pose behind the latest solved action. ``None`` before
+        a usable pose or when the client doesn't stamp capture times.
         """
         return self._core.last_pose_host_ts
 
@@ -1206,11 +1209,10 @@ class AxolVRTeleop(Teleoperator):
         """Latest base-frame TCP target per side (absolute/Mantis mode only).
 
         ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}`` in the robot
-        base frame — the tracked ground-truth pose the IK solver chased for
-        the latest action. Mantis data collection records this per dataset row
-        so training can use raw TCP trajectories (e.g. Mantis-style relative EE
-        actions) independent of the joint solutions. ``None`` before the
-        first solve or outside absolute mode.
+        base frame. Mantis collection uses the calibrated raw tracker sample
+        at receive cadence, independent of the virtual IK solution and its
+        pose filters. Other absolute-mode callers receive the latest IK
+        target. ``None`` before a usable engage or outside absolute mode.
         """
         snapshot = self._core.last_tcp_snapshot
         if snapshot is None:
@@ -1228,12 +1230,15 @@ class AxolVRTeleop(Teleoperator):
     def recording_pose_snapshot(self) -> TCPPoseSnapshot | None:
         """The pose sample Mantis data collection records this tick.
 
-        While a managed tracker drives an engaged session this is the newest
-        received tracker frame mapped through the engage calibration, stamped
-        with its original capture time (see
-        :meth:`VRTeleopCore.calibrated_pose_snapshot`), so recording never
-        waits on the IK solve. Otherwise it is :meth:`tcp_pose_snapshot`.
+        Mantis collection reads the newest receive-side calibrated tracker
+        sample, with its original capture time and engage epoch. An invalidated
+        anchor returns no sample; it never falls back to an older IK pose.
+        Other callers retain the pull-based calibrated snapshot behavior.
         """
+        if self.config.record_raw_tcp:
+            # Receive-side publication is epoch-fenced and retains capture time;
+            # never fall back to a potentially older IK sample after a fault.
+            return self._core.last_tcp_snapshot
         server = self._vr_server
         frame = server.get_frame() if server is not None else None
         snapshot = self._core.calibrated_pose_snapshot(frame)
@@ -1242,8 +1247,8 @@ class AxolVRTeleop(Teleoperator):
     def tcp_last_change_ts(self) -> float | None:
         """Monotonic time the tracked TCP pose last took a *new* value.
 
-        ``time.perf_counter`` seconds of the last IK reply whose TCP differed
-        from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
+        ``time.perf_counter`` seconds of the last published sample whose TCP
+        differed from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
         This is diagnostic only: a live operator may deliberately hold a
         perfectly still pose, so data-quality checks use the capture heartbeat
         from :meth:`pose_capture_ts` rather than treating unchanged TCP values
@@ -1254,6 +1259,10 @@ class AxolVRTeleop(Teleoperator):
     def tracking_sides(self) -> dict[str, bool]:
         """Whether each controller/tracker contributed a currently live pose."""
         return dict(self._core.last_tracking)
+
+    def tracking_quality(self) -> dict[str, Any] | None:
+        """Live source quality, including faults hidden by filtered/held poses."""
+        return self._core.tracking_quality()
 
     def trigger_sides(self) -> dict[str, bool]:
         """Whether each managed Mantis trigger has a fresh CAN heartbeat.
@@ -1323,6 +1332,8 @@ class AxolVRTeleop(Teleoperator):
 
         # Reset rising edge
         self._core.note_frame_reset(frame.reset)
+        self._core.note_tracking_quality(frame)
+        self._core.note_raw_tcp_frame(frame)
 
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets

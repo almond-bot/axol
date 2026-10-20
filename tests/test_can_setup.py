@@ -247,6 +247,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
     def test_axol_pin_is_not_preserved_when_serial_now_enumerates_single(self) -> None:
         with (
             patch.object(setup, "_detect_serials", return_value=[]),
+            patch.object(setup, "_configured_profile_usb_serials", return_value={}),
             patch.object(
                 setup, "_configured_serial", side_effect=self._configured_axol_only
             ),

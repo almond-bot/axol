@@ -200,6 +200,9 @@ def run_configured_bridge(
 
     triggers: dict[str, TriggerReader] = {}
     source = create_source(config)
+    select_trackers = getattr(source, "set_required_trackers", None)
+    if callable(select_trackers):
+        select_trackers({key for key in (left, right) if key is not None})
     try:
         # Enter the ownership guard before startup: source.start() can acquire
         # USB/HID state before raising or receiving Ctrl+C, and stop() is its
@@ -212,7 +215,8 @@ def run_configured_bridge(
             if not channel:
                 continue
             try:
-                triggers[side] = TriggerReader(channel)
+                full_scale = getattr(config, f"trigger_full_scale_{side}", 1.0)
+                triggers[side] = TriggerReader(channel, full_scale=full_scale)
             except Exception as exc:
                 if require_live_inputs:
                     raise RuntimeError(
@@ -229,7 +233,14 @@ def run_configured_bridge(
                     exc_info=True,
                 )
         if require_live_inputs:
-            _wait_for_live_inputs(source, left, right, triggers)
+            timeout_s = _INPUT_READY_TIMEOUT_S
+            if config.backend == "survive":
+                from ..tracker.lighthouse_validation import (
+                    LIGHTHOUSE_ACQUISITION_TIMEOUT_S,
+                )
+
+                timeout_s = LIGHTHOUSE_ACQUISITION_TIMEOUT_S
+            _wait_for_live_inputs(source, left, right, triggers, timeout_s=timeout_s)
         bridge = TrackerBridge(
             source,
             left=left,
@@ -282,7 +293,9 @@ def _wait_for_live_inputs(
 ) -> None:
     """Block until both tracker poses and every trigger are currently live."""
     bindings = {"left": left, "right": right}
-    deadline = time.perf_counter() + timeout_s
+    started = time.perf_counter()
+    deadline = started + timeout_s
+    next_progress = started
     missing: list[str] = []
     while True:
         poses = source.poses()
@@ -315,9 +328,29 @@ def _wait_for_live_inputs(
         for side, trigger in triggers.items():
             if trigger.grip() is None or trigger.is_stale():
                 missing.append(f"{side} trigger has no fresh CAN frames")
+        quality_getter = getattr(source, "tracking_quality", None)
+        if callable(quality_getter):
+            quality = quality_getter()
+            if quality.get("calibrationRequired"):
+                raise RuntimeError(
+                    "Lighthouse calibration is no longer valid: "
+                    + "; ".join(quality.get("reasons") or ["Station geometry changed"])
+                )
+            if quality.get("status") not in {"ready", "warning"}:
+                missing.extend(
+                    quality.get("reasons") or ["Tracking quality has not stabilized"]
+                )
         if not missing:
             _logger.info("both Mantis trackers and triggers are live")
             return
+        if now >= next_progress:
+            _logger.info(
+                "Waiting for Mantis inputs (%.0f/%.0f s): %s",
+                now - started,
+                timeout_s,
+                "; ".join(missing[:6]),
+            )
+            next_progress = now + 5.0
         if now >= deadline:
             raise RuntimeError(
                 "Mantis inputs were not ready within "

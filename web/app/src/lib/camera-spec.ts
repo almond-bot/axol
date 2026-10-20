@@ -1,4 +1,11 @@
-import type { BranchSel, CameraDevice, CameraSlot, CameraSpec, StereoEyes } from "./supervisor"
+import {
+  cameraSerials,
+  type BranchSel,
+  type CameraDevice,
+  type CameraSlot,
+  type CameraSpec,
+  type StereoEyes,
+} from "./supervisor"
 
 export const CAMERA_SLOT_KEYS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
 
@@ -41,13 +48,12 @@ export function materializeCameraSpec(
     !selEnabled(map[slot]) ? false : stereo ? selEyes(map[slot], slot) : true
   const outStream: BranchMap = { ...(spec.stream ?? {}) }
   const outRecord: BranchMap = { ...(spec.record ?? {}) }
+  const axolSerials = cameraSerials(spec, false)
+  const mantisSerials = cameraSerials(spec, true)
   for (const key of CAMERA_SLOT_KEYS) {
     const profile = profileBySlot[key]
     if (!profile) continue
-    const mappedSerial =
-      profile === "mantis" && key !== "overhead"
-        ? (spec.mantis_serials?.[key] ?? spec.serials[key])
-        : spec.serials[key]
+    const mappedSerial = cameraSerials(spec, profile === "mantis")[key]
     const kind = kindBySerial.get(mappedSerial.trim())
     if (!kind) continue // unknown kind / unassigned: leave backend defaults
     const stereo = kind === "stereo"
@@ -60,13 +66,14 @@ export function materializeCameraSpec(
   }
   return {
     serials: {
-      overhead: spec.serials.overhead.trim(),
-      left_arm: spec.serials.left_arm.trim(),
-      right_arm: spec.serials.right_arm.trim(),
+      overhead: axolSerials.overhead.trim(),
+      left_arm: axolSerials.left_arm.trim(),
+      right_arm: axolSerials.right_arm.trim(),
     },
     mantis_serials: {
-      left_arm: (spec.mantis_serials?.left_arm ?? spec.serials.left_arm).trim(),
-      right_arm: (spec.mantis_serials?.right_arm ?? spec.serials.right_arm).trim(),
+      overhead: mantisSerials.overhead.trim(),
+      left_arm: mantisSerials.left_arm.trim(),
+      right_arm: mantisSerials.right_arm.trim(),
     },
     stream_resolution: spec.stream_resolution || spec.resolution || "SVGA",
     record_resolution: spec.record_resolution || "SVGA",

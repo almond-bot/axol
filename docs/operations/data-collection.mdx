@@ -12,7 +12,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)) and the selected device connected: **Axol**, or **Mantis** with its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) set up (setup complete under **Mantis settings → Tracking**, and an approved factory or measured tracker→TCP transform for both sides).
-- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Left Mantis / Right Mantis layout.
+- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Head / Left Mantis / Right Mantis layout. Both can record the head stereo camera and both wrists together.
 - **A Meta Quest** with the VR TLS certificate authorized once — for Axol, and for Mantis with the Quest source. Lighthouse/Ultimate Mantis collects with no headset.
 
 <Tip>
@@ -70,7 +70,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
     <Steps>
       <Step title="Select Mantis and check its settings">
-        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, and at least one **Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**.
+        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, the [rig trigger endpoints](/mantis/hardware#testing-the-triggers-and-grippers) checked under **Triggers**, and at least one **Head / Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**. For stereo head recording, enable both **L** and **R** under **Record**.
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
@@ -104,10 +104,10 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
     ```bash
     axol collect-data --mantis true --mantis_source lighthouse \
       --repo_id myorg/mantis-pick --task "Pick the part" \
-      --robot_config.cameras "{left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+      --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
+    The `overhead` slot is the head camera and records both stereo eyes as `overhead_left` / `overhead_right`; omit any camera slots you do not use. Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
   </Tab>
 </Tabs>
 

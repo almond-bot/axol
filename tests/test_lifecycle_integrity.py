@@ -438,6 +438,7 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
             vr_server_config=object(),
             vr_teleop_config=SimpleNamespace(absolute_mode=False),
             kinematics_config=object(),
+            record_raw_tcp=False,
         )
         teleop._loop = None
         teleop._loop_thread = None

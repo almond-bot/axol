@@ -12,6 +12,7 @@ import {
 } from "lucide-react"
 import {
   HARDWARE_PROFILE_SETTING,
+  cameraSerials,
   flattenFields,
   setQuestProximityDisabled,
   settingShown,
@@ -41,6 +42,7 @@ import { Card } from "@/components/ui/card"
 import { FieldRow, FlatSchemaForm } from "@/components/config-form"
 import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-spec"
 import { buildSettingsFile, parseSettingsFile } from "@/lib/settings-file"
+import { applySavedSettingValues, diffSettingValues } from "@/lib/settings-patch"
 import {
   AXOL_CATEGORY_KEYS,
   JELLY_ADVANCED_SECTION,
@@ -61,13 +63,17 @@ import { cn } from "@/lib/utils"
 // render on the Mantis tabs instead.
 const MANTIS_SOURCE_KEYS = ["mantis.source", "mantis.quest_tracker_key"]
 const MANTIS_CHANNEL_KEYS = ["mantis.left_channel", "mantis.right_channel"]
+const MANTIS_TRIGGER_KEYS = ["mantis.left_trigger_full_scale", "mantis.right_trigger_full_scale"]
 // Keys the card never edits: the device selection has its own switch above.
 const EXTERNALLY_MANAGED_KEYS = new Set([HARDWARE_PROFILE_SETTING])
 
 interface Draft {
   /** Every staged value by canonical key — curated tabs and Advanced alike. */
   values: Record<string, SettingValue>
+  /** Values that were stored when this draft began. */
+  baseValues: Record<string, SettingValue>
   cameras: CameraSpec
+  baseCameras: CameraSpec
   /** Layout whose controls most recently changed each shared logical slot. */
   cameraProfiles: CameraProfileBySlot
 }
@@ -75,10 +81,7 @@ interface Draft {
 const CAMERA_SLOTS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
 
 function assignedSerial(spec: CameraSpec, profile: HardwareProfile, slot: CameraSlot): string {
-  if (profile === "mantis" && slot !== "overhead") {
-    return spec.mantis_serials?.[slot] ?? spec.serials[slot]
-  }
-  return spec.serials[slot]
+  return cameraSerials(spec, profile === "mantis")[slot]
 }
 
 /** Attribute only the logical slots an edit actually touched to its layout. */
@@ -90,14 +93,11 @@ function cameraProfilesAfterEdit(
 ): CameraProfileBySlot {
   const next = { ...current }
   for (const slot of CAMERA_SLOTS) {
-    // Mantis has no overhead assignment/control; an imported overhead change
-    // always belongs to the Axol layout even when imported from that tab.
-    const slotProfile = slot === "overhead" ? "axol" : profile
     const assignmentChanged =
-      assignedSerial(before, slotProfile, slot) !== assignedSerial(after, slotProfile, slot)
+      assignedSerial(before, profile, slot) !== assignedSerial(after, profile, slot)
     const streamChanged = before.stream?.[slot] !== after.stream?.[slot]
     const recordChanged = before.record?.[slot] !== after.record?.[slot]
-    if (assignmentChanged || streamChanged || recordChanged) next[slot] = slotProfile
+    if (assignmentChanged || streamChanged || recordChanged) next[slot] = profile
   }
   return next
 }
@@ -105,7 +105,7 @@ function cameraProfilesAfterEdit(
 /**
  * The shared settings, directly on the control panel page, split by device:
  * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
- * **Mantis** (tracking source and setup, wrist cameras, CAN), and
+ * **Mantis** (tracking source and setup, trigger calibration, head and wrist cameras, CAN), and
  * **General** (Quest, recording, inference, system, Advanced). Each
  * connection tile opens its own scope. Values persist on the serve host
  * (~/.almond/settings.json) and are folded into every operation start, so
@@ -161,8 +161,8 @@ export function SettingsSection({
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
-    () => (draft ? computePatch(snapshot, cameras, draft, devices) : null),
-    [draft, snapshot, cameras, devices]
+    () => (draft ? computePatch(cameras, draft, devices) : null),
+    [draft, cameras, devices]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
 
@@ -173,11 +173,10 @@ export function SettingsSection({
   // which makes `dirty` true and prevents the response from ever reaching the
   // form. On an old host, `supportError` resolves the request and enables the
   // camera-only fallback draft.
-  const seedDraft = (): Draft => ({
-    values: { ...(snapshot?.values ?? {}) },
-    cameras,
-    cameraProfiles: {},
-  })
+  const seedDraft = (): Draft => {
+    const values = { ...(snapshot?.values ?? {}) }
+    return { values, baseValues: { ...values }, cameras, baseCameras: cameras, cameraProfiles: {} }
+  }
   const settingsResolved = snapshot !== null || supportError !== null
   const nextSeedKey = settingsResolved ? JSON.stringify([snapshot?.values, cameras]) : null
   if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
@@ -188,10 +187,21 @@ export function SettingsSection({
   const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
 
   async function save() {
-    if (!patch) return
+    if (!patch || !draft) return
+    const submitted = patch
+    const submittedCameras = draft.cameras
     setSaving(true)
     try {
-      await onSave(patch)
+      await onSave(submitted)
+      setDraft((d) =>
+        d
+          ? {
+              ...d,
+              baseValues: applySavedSettingValues(d.baseValues, submitted.values ?? {}),
+              baseCameras: submitted.camerasSet ? submittedCameras : d.baseCameras,
+            }
+          : d
+      )
     } catch (e) {
       toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
@@ -226,6 +236,14 @@ export function SettingsSection({
     setValue(key, value)
     try {
       await onSave({ values: { [key]: value } })
+      setDraft((d) =>
+        d
+          ? {
+              ...d,
+              baseValues: applySavedSettingValues(d.baseValues, { [key]: value }),
+            }
+          : d
+      )
     } catch (e) {
       setValue(key, prior === undefined ? null : prior)
       toast.error(String(e).replace(/^Error:\s*/, ""))
@@ -263,6 +281,7 @@ export function SettingsSection({
           if (d.values[key] !== undefined) values[key] = d.values[key]
         }
         return {
+          ...d,
           values,
           cameras: importedCameras,
           cameraProfiles: cameraProfilesAfterEdit(
@@ -285,7 +304,7 @@ export function SettingsSection({
 
   // Tabs within the active scope. Axol: hardware first (cameras), then arm
   // behaviour categories with the pose editor after Teleop & VR. Mantis: the
-  // tracking flow, wrist cameras, CAN. Jelly: the wheels / lift switches and
+  // tracking flow, trigger calibration, cameras, CAN. Jelly: the wheels / lift switches and
   // the drive parameters. General: Quest, the remaining categories, and
   // Advanced.
   const tabs: { key: SettingsTab; label: string }[] = []
@@ -299,6 +318,7 @@ export function SettingsSection({
   } else if (scope === "mantis") {
     tabs.push(
       { key: "mantis-tracking", label: "Tracking" },
+      { key: "mantis-triggers", label: "Triggers" },
       { key: "mantis-cameras", label: "Cameras" },
       { key: "mantis-can", label: "CAN" }
     )
@@ -339,6 +359,8 @@ export function SettingsSection({
   )
   const mantisChannelFields =
     teleopCategory?.settings.filter((s) => MANTIS_CHANNEL_KEYS.includes(s.key)) ?? []
+  const mantisTriggerFields =
+    teleopCategory?.settings.filter((s) => MANTIS_TRIGGER_KEYS.includes(s.key)) ?? []
   const defaultMantisSource = String(mantisSourceField?.default ?? "lighthouse")
   const draftMantisSource = String(draft?.values["mantis.source"] ?? defaultMantisSource)
   const storedMantisSource = String(snapshot?.values["mantis.source"] ?? defaultMantisSource)
@@ -481,6 +503,35 @@ export function SettingsSection({
                   onHostSessionChange={onCommandSessionChange}
                 />
               </div>
+            ) : tab === "mantis-triggers" ? (
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-1.5">
+                  <Label>Full squeeze calibration</Label>
+                  <p className="max-w-prose text-xs leading-relaxed text-white/40">
+                    A fully pressed trigger should close its gripper. If its live reading peaks
+                    below 1.00, set that side to the measured peak. For example, a left trigger that
+                    peaks around 0.90 can use 0.90 here. These values apply to Mantis teleoperation
+                    and Lighthouse or Ultimate data collection.
+                  </p>
+                </div>
+                {mantisTriggerFields.length > 0 ? (
+                  <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+                    {mantisTriggerFields.map((field) => (
+                      <SettingRow
+                        key={field.key}
+                        field={field}
+                        value={draft.values[field.key]}
+                        onChange={setValue}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-white/40">
+                    This host does not expose Mantis trigger calibration; update it to edit the
+                    endpoints.
+                  </p>
+                )}
+              </div>
             ) : tab === "mantis-can" ? (
               <div className="flex flex-col gap-4">
                 <div className="flex flex-col gap-1.5">
@@ -554,7 +605,7 @@ export function SettingsSection({
                 onChange={setValue}
                 excludeKeys={
                   activeCategory.key === "teleop"
-                    ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS]
+                    ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS, ...MANTIS_TRIGGER_KEYS]
                     : [...EXTERNALLY_MANAGED_KEYS]
                 }
               />
@@ -608,7 +659,6 @@ export function SettingsSection({
 
 /** Diff the draft against what's stored, producing the minimal PUT payload. */
 function computePatch(
-  snapshot: SettingsSnapshot | null,
   storedCameras: CameraSpec,
   draft: Draft,
   devices: CameraDevice[] | null
@@ -617,23 +667,14 @@ function computePatch(
 
   // The device selection saves through its own switch, possibly while this
   // draft is dirty; it must never be written (or reset) from here.
-  const before = snapshot?.values ?? {}
-  const valuesPatch: Record<string, SettingValue | null> = {}
-  for (const [k, v] of Object.entries(draft.values)) {
-    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
-    if (JSON.stringify(before[k]) !== JSON.stringify(v)) valuesPatch[k] = v
-  }
-  for (const k of Object.keys(before)) {
-    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
-    if (!(k in draft.values)) valuesPatch[k] = null
-  }
+  const valuesPatch = diffSettingValues(draft.baseValues, draft.values, EXTERNALLY_MANAGED_KEYS)
   if (Object.keys(valuesPatch).length > 0) patch.values = valuesPatch
 
   // Only materialize after an actual camera edit, and use the layout whose
   // controls produced each slot edit. The operation selected elsewhere is
   // unrelated, and untouched explicit values may encode stereo eyes for the
   // other hardware profile, so they must never be normalized opportunistically.
-  if (JSON.stringify(draft.cameras) !== JSON.stringify(storedCameras)) {
+  if (JSON.stringify(draft.cameras) !== JSON.stringify(draft.baseCameras)) {
     const camerasOut = materializeCameraSpec(draft.cameras, devices, draft.cameraProfiles)
     if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
       patch.cameras = camerasOut

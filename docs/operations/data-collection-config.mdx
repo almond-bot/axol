@@ -51,7 +51,7 @@ Only used with `--mantis`.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mantis` | `false` | Record with the Mantis handheld rigs instead of the robot: tracked TCP poses plus wrist cameras. |
+| `--mantis` | `false` | Record with the Mantis handheld rigs instead of the robot: tracked TCP poses plus head and wrist cameras. |
 | `--mantis_source` | `lighthouse` | Pose source: `quest`, `lighthouse`, or `ultimate`. Defaults to the host's **Mantis settings → Tracking** choice. |
 | `--mantis_allow_uncalibrated` | `false` | Record without a tracker → TCP calibration. Bring-up only; don't train on the result. |
 | `--mantis_smooth_hz` | `10.0` | Low-pass cutoff (Hz) applied to the recorded pose track on save. `0` disables. |

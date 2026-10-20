@@ -896,7 +896,9 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
     def test_lighthouse_check_is_a_runnable_serve_command(self) -> None:
         self.assertIn("tracker.lighthouse.check", COMMANDS)
         schema = get_schema("tracker.lighthouse.check")
-        self.assertEqual(schema.nodes, [])
+        self.assertEqual(len(schema.nodes), 1)
+        self.assertEqual(schema.nodes[0]["key"], "expected_stations")
+        self.assertEqual(schema.nodes[0]["options"], [1, 2, 3, 4])
 
 
 if __name__ == "__main__":

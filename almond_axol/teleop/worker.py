@@ -2224,6 +2224,34 @@ class IKWorker:
         R_b = R_wb.T @ R_w
         return p_b.astype(np.float32), R_b.astype(np.float32)
 
+    def raw_tcp_mapping(self) -> dict[str, Any] | None:
+        """Export the current engage's rigid raw tracker→base TCP mapping.
+
+        Collection applies it on receipt, before virtual IK and its filters.
+        Ordinary robot teleoperation still consumes the usual solved reply.
+        """
+        if not self._abs_active or self._abs_base is None:
+            return None
+        rotation, position = self._abs_base
+        offsets = {}
+        for side in ("left", "right"):
+            mount_pos, mount_rot = self._tcp_transforms.get(
+                side, (np.zeros(3), np.eye(3))
+            )
+            engage_pos, engage_rot = self._abs_offset[side]
+            offsets[side] = (
+                mount_pos + mount_rot @ engage_pos,
+                mount_rot @ engage_rot,
+            )
+        message = self._encode_tcp_msg(offsets["left"], offsets["right"])
+        message["base"] = [*map(float, position), *_matrix_to_quat_xyzw(rotation)]
+        for side in ("left", "right"):
+            message[f"shoulder_{side}"] = list(
+                map(float, self._solver.shoulder_positions[side])
+            )
+        message["reach_limit"] = float(self._solver.config.reach_soft_start)
+        return message
+
     def _note_raw(self, raw_l: np.ndarray, raw_r: np.ndarray, t_eff: float) -> None:
         """Fold a good frame into the raw-tracking state (position + EMA velocity)."""
         if self._prev_raw and self._prev_raw_t is not None:
@@ -2544,6 +2572,7 @@ def run_ik_worker(
     kinematics_config: KinematicsConfig,
     q_current_left: np.ndarray | None = None,
     q_current_right: np.ndarray | None = None,
+    record_raw_tcp: bool = False,
 ) -> None:
     """IK subprocess entry point.
 
@@ -2568,6 +2597,10 @@ def run_ik_worker(
       after a policy has moved the arms, the worker's own last solution is
       stale, and engaging against it would drag the robot back toward it.
     - ``None``                         → exit
+
+    Absolute replies add the base transform and current TCP target. With
+    ``record_raw_tcp``, a fifth item exports the engage calibration so Mantis
+    collection can map each raw received sample without waiting for IK.
     """
     # Ctrl-C is owned by the parent, which first disables physical outputs and
     # then sends the pipe sentinel / terminate / kill sequence. Terminal and
@@ -2691,18 +2724,17 @@ def run_ik_worker(
                     # Absolute (Mantis) mode replies carry the engage-calibrated
                     # base transform (for the headset's URDF overlay) and the
                     # base-frame TCP targets (recorded per dataset row by Mantis
-                    # data collection) alongside the joint solution.
-                    # The base message also carries the engage calibration
-                    # (see absolute_reply_base_msg) so recording can map raw
-                    # tracker poses itself instead of waiting for this solve.
-                    conn.send(
-                        (
-                            "q",
-                            q.copy(),
-                            worker.absolute_reply_base_msg(),
-                            worker.last_tcp_msg,
-                        )
+                    # callers that consume solved targets) alongside joints.
+                    # Raw collection instead uses the rigid mapping below.
+                    reply = (
+                        "q",
+                        q.copy(),
+                        worker.absolute_reply_base_msg(),
+                        worker.last_tcp_msg,
                     )
+                    if record_raw_tcp:
+                        reply += (worker.raw_tcp_mapping(),)
+                    conn.send(reply)
                 else:
                     # Relative-mode replies pair the joint solution with the
                     # gripper-pair status (box-mode "aligned" cue), refreshed

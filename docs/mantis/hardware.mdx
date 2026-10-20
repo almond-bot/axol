@@ -18,9 +18,9 @@ A Mantis kit consists of:
 - **2× Mantis rigs**, left and right. Each carries the same gripper as Axol, the trigger, and the tracker mount.
 - **1× Mantis Hub**, the link between the rigs and the host. **L** and **R** are etched on the case to mark the left and right gripper connections, an XT30(2+2) lead feeds out from each to plug into its rig, and a USB cable connects the hub to the ZED Box.
 - **A pose source**, one of the three tracking systems described in [Mantis Tracking](/mantis/tracking): Quest controllers (no extra hardware), VIVE Tracker 3.0 with 1–2 SteamVR base stations, or VIVE Ultimate Trackers with their wireless dongle.
-- **(Optional) wrist cameras**: up to two ZED cameras assigned to the **Left Mantis / Right Mantis** slots, stored separately from the Axol camera layout.
+- **Cameras**: up to two wrist ZED cameras assigned to **Left Mantis / Right Mantis**, plus a head stereo camera assigned to **Head**, stored separately from the Axol camera layout. Data collection needs at least one camera recording.
 
-Mantis has no arms. The arm joints in a recording are virtual, filled in from the IK solution, while the gripper is real and read from motor feedback. The trigger is analog: fully released is `0.0` (open), fully squeezed is `1.0` (closed). It calibrates itself at power-on, so there is nothing to set up on the host.
+Mantis has no arms. The arm joints in a recording are virtual, filled in from the IK solution, while the gripper is real and read from motor feedback. The trigger is analog: fully released is `0.0` (open), fully squeezed is `1.0` (closed). Its node learns the **released** position at power-on. If the reported value does not reach `1.0` when the trigger is physically fully squeezed, set that side's **full squeeze endpoint** on the host as described [below](#testing-the-triggers-and-grippers).
 
 The grippers are driven by the same `axol-rt` realtime core as the robot's arms (see [Provision](/cli/provision)): for the duration of each take — and for a Mantis teleop run — the core owns the two gripper CAN interfaces and streams the POSITION_FORCE commands at 240 Hz, while Python only reads the triggers and trackers and hands it normalised targets. Between takes the grippers are torque-off and the core is stopped; the one-time open-stop calibration and the torque-off checks run from Python on the idle bus. The trigger reader's receive-only socket shares each interface with the core (the kernel duplicates frames to every open socket, and the core ignores the trigger node's ID).
 
@@ -63,7 +63,7 @@ Setting up a Mantis kit on a host with the Axol SDK [installed](/installation), 
 
 ### Using Mantis without a robot
 
-You don't need an Axol robot to collect data with Mantis: the rigs, hub, and a pose source are a complete data-collection setup on their own. Besides the kit, you need a **host machine**. Mantis uses the same one-command [install](/installation) as Axol, on Linux with systemd. The wrist cameras are ZED GMSL cameras and data collection needs at least one of them recording, so the host must be an NVIDIA Jetson with GMSL inputs (such as a ZED Box); the grippers, triggers, and tracking alone work on any Linux machine.
+You don't need an Axol robot to collect data with Mantis: the rigs, hub, and a pose source are a complete data-collection setup on their own. Besides the kit, you need a **host machine**. Mantis uses the same one-command [install](/installation) as Axol, on Linux with systemd. The cameras are ZED GMSL cameras and data collection needs at least one head or wrist camera recording, so the host must be an NVIDIA Jetson with GMSL inputs (such as a ZED Box); the grippers, triggers, and tracking alone work on any Linux machine.
 
 On a host where Mantis is the only hardware attached, the [control panel](/guides/control-panel) identifies and connects it automatically, and with **Mantis** selected on its tile the panel offers exactly the two operations Mantis supports: **Teleoperation** (the grippers-only [trigger check](#testing-the-triggers-and-grippers), no tracking) and **[Data collection](/operations/data-collection)**. The Axol-only operations stay hidden.
 
@@ -128,13 +128,13 @@ axol teleop --mantis
 
 Keep hands and objects clear: once both triggers read live and released, each gripper opens fully to find its hard stop, then squeezing a trigger closes its matching gripper proportionally. **Stop** / **Ctrl-C** disables both grippers, and a lost trigger stream stops the run rather than holding a stale command.
 
+If one gripper follows its trigger but leaves a gap at full squeeze, check the trigger endpoint before changing motor torque. Open **Mantis settings → Triggers**, lower **Left trigger full squeeze** or **Right trigger full squeeze** from its default of `1.0`, then save. The allowed range is `0.50`–`1.00`. If you have repeated full-squeeze readings, choose an endpoint just below the lowest repeatable reading; for example, set the left endpoint to `0.90` for readings around `0.91`–`0.94`, and leave the right at `1.0` if it already closes fully. Otherwise, lower the affected side in small steps until the jaws close at the end of the trigger's travel. The host maps that endpoint to a full close command and clamps values above it; the released position stays at open. This setting applies to the rig triggers used by Mantis teleop and Lighthouse/Ultimate collection, not to Quest controller triggers.
+
+Stop and restart **Teleoperation** after saving, then fully squeeze each trigger once and compare jaw closure. A setting that is too low makes the jaws reach full close before the trigger finishes moving; raise it if that happens. Once both sides close as expected, start **Collect data** from the panel and check one short take before recording the rest. If the left jaw still has a gap when its commanded grip reaches full close, inspect the gripper's jaws, linkage, and motor calibration rather than reducing the trigger endpoint further.
+
 ### Mounting the cameras
 
-Mantis records wrist views only. Mount up to two ZED cameras on the rigs (mounting is the same as on the Axol gripper) and connect each camera to the ZED Box with its GMSL2 cable. Note each camera's serial (QR code on the back) and which rig it is on, then assign them under **Mantis settings → Cameras** as **Left Mantis** / **Right Mantis**. The Mantis layout is stored separately from Axol's overhead / left arm / right arm layout, so changing one never overwrites the other. At least one Mantis camera must have **Record** enabled before data collection can start; see [Cameras](/guides/control-panel#cameras) for the stream/record controls.
-
-<Frame>
-  <img src="/assets/mantis_cameras.png" alt="Mantis settings Cameras tab with the Left Mantis and Right Mantis slots" style={{ margin: "0 auto" }} />
-</Frame>
+Mantis can record both wrist cameras and the head stereo camera together. Mount up to two ZED cameras on the rigs (mounting is the same as on the Axol gripper) and connect each camera, including the head camera, to the ZED Box with its GMSL2 cable. Note each camera's serial (QR code on the back), then assign them under **Mantis settings → Cameras** as **Head** / **Left Mantis** / **Right Mantis**. The Mantis layout is stored separately from Axol's overhead / left arm / right arm layout, so changing one never overwrites the other. The Head slot uses the dataset's `overhead` name; enable both **Record** eyes to capture `overhead_left` and `overhead_right` alongside the wrists. At least one head or wrist camera must have **Record** enabled before data collection can start; see [Cameras](/guides/control-panel#cameras) for the stream/record controls.
 
 ## Next steps
 

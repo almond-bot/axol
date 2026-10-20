@@ -776,7 +776,10 @@ class OperationRunner:
                 )
             if mantis_mode:
                 if op_id == "collect-data":
-                    from ..cli.collect_data import _prepare_mantis_collection
+                    from ..cli.collect_data import (
+                        _prepare_mantis_collection,
+                        _require_mantis_tracking_validation,
+                    )
                     from ..cli.mantis_bridge import (
                         require_mantis_tracker_readiness,
                         set_managed_pose_source_id,
@@ -785,6 +788,7 @@ class OperationRunner:
                     # Fail missing/ambiguous tracker→TCP calibration before
                     # releasing CAN or opening the managed tracker backend.
                     _prepare_mantis_collection(cfg)
+                    _require_mantis_tracking_validation(cfg)
                     # Quest is checked live by the WebXR handshake. External
                     # sources must pass the same supported-runtime/access gate
                     # as direct CLI commands before releasing CAN or opening
@@ -1198,9 +1202,11 @@ class OperationRunner:
     ) -> dict[str, Any] | None:
         """Select the saved camera assignment for the active hardware profile.
 
-        Axol uses the normal overhead/left-arm/right-arm map. Mantis has its
-        own two-camera map so changing gripper cameras does not overwrite the
-        Axol rig. Older saved specs fall back to the Axol left/right entries.
+        Both profiles support an overhead/head camera and two wrist cameras.
+        Mantis keeps its own assignments so changing them does not overwrite
+        the Axol rig. Missing slots in older saved specs fall back to Axol's
+        entries; an explicitly blank serial keeps that Mantis slot unassigned.
+        An inherited head camera must not already occupy a Mantis wrist slot.
         """
         if not cameras:
             return cameras
@@ -1220,14 +1226,16 @@ class OperationRunner:
         raw_mantis = cameras.get("mantis_serials")
         mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
         selected["serials"] = {
-            "overhead": "",
-            "left_arm": mantis_serials.get(
-                "left_arm", axol_serials.get("left_arm", "")
-            ),
-            "right_arm": mantis_serials.get(
-                "right_arm", axol_serials.get("right_arm", "")
-            ),
+            slot: mantis_serials.get(slot, axol_serials.get(slot, ""))
+            for slot in _CAMERA_SLOTS
         }
+        # The old wrist-only Mantis layout could assign Axol's head camera to
+        # a wrist. Preserve that valid mapping instead of opening it twice.
+        serials = selected["serials"]
+        if "overhead" not in mantis_serials and str(serials["overhead"]).strip() in {
+            str(serials[slot]).strip() for slot in ("left_arm", "right_arm")
+        }:
+            serials["overhead"] = ""
         return selected
 
     @staticmethod
@@ -1466,6 +1474,8 @@ class OperationRunner:
         """Start the selected tracker bridge and wait for initialization."""
         from ..tracker import load_tracker_config
         from ..tracker.config import select_tracker_backend
+        from ..tracker.lighthouse_validation import LIGHTHOUSE_ACQUISITION_TIMEOUT_S
+        from ..tracker.trigger import validate_trigger_full_scale
 
         config = load_tracker_config()
         source = str(getattr(cfg, "mantis_source", "lighthouse"))
@@ -1475,6 +1485,14 @@ class OperationRunner:
                 f"Mantis source {source!r} does not use a tracker bridge"
             )
         select_tracker_backend(config, backend)
+        # Lighthouse must receive fresh station identity broadcasts before it
+        # reports ready. Give the child its full acquisition window plus spawn
+        # overhead; Ultimate retains its existing startup budget.
+        ready_timeout = (
+            LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
+            if backend == "survive"
+            else _BRIDGE_READY_TIMEOUT_S
+        )
         server = getattr(cfg, "vr_server", None)
         if server is None:
             teleop = getattr(cfg, "teleop_config", None)
@@ -1490,6 +1508,12 @@ class OperationRunner:
         # could leave its controls attached to the old logical side after a hub
         # swap, so managed trigger readers always follow the run config.
         _bind_managed_mantis_trigger_channels(config, cfg)
+        config.trigger_full_scale_left = validate_trigger_full_scale(
+            getattr(cfg, "mantis_left_trigger_full_scale", 1.0)
+        )
+        config.trigger_full_scale_right = validate_trigger_full_scale(
+            getattr(cfg, "mantis_right_trigger_full_scale", 1.0)
+        )
         if (
             config.left is None or config.right is None
         ) and not config.allow_single_side:
@@ -1527,10 +1551,9 @@ class OperationRunner:
             process.start()
             child_conn.close()
             try:
-                if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
+                if not parent_conn.poll(ready_timeout):
                     raise RuntimeError(
-                        "tracker bridge did not initialize within "
-                        f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+                        f"tracker bridge did not initialize within {ready_timeout:.0f}s"
                     )
                 result = parent_conn.recv()
                 if not result.get("ok"):

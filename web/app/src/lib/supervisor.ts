@@ -789,6 +789,48 @@ export interface EpisodeBrief {
   grid?: EpisodeBriefGrid
 }
 
+export interface TrackingDiagnostics {
+  enabled: boolean
+  state:
+    | "disabled"
+    | "waiting_for_ready"
+    | "armed"
+    | "capturing"
+    | "saving"
+    | "saved"
+    | "error"
+    | "closed"
+  armed?: boolean
+  capture_count?: number
+  capture_limit?: number
+  pending_capture?: boolean
+  latest_path?: string | null
+  error?: string | null
+  counters?: Record<string, number>
+}
+
+export interface TrackingQuality {
+  /** Automatic fault capture is independent of tracking and episode validity. */
+  diagnostics?: TrackingDiagnostics
+  controlState?: "engaged" | "recovering" | "awaiting_engagement"
+  reengageRequired?: boolean
+  triggersLive?: { left: boolean; right: boolean }
+  pairSkewMs?: number
+  status: "checking" | "ready" | "warning" | "error"
+  reasons: string[]
+  faultCount: number
+  lastFault: string | null
+  /** Persistent setup faults require a new validation, not visibility recovery. */
+  calibrationRequired?: boolean
+  /** The tracking process exited or its reader failed. */
+  nativeFailure?: boolean
+  /** Remains set for the failed take, even after live tracking recovers. */
+  retakeRequired: boolean
+  /** Preserved after rejecting a take, until the next recording starts. */
+  lastEpisodeFault?: string | null
+  trackers?: Record<string, unknown>
+}
+
 export interface PolicyState {
   phase: PolicyPhase
   episodesRecorded: number
@@ -808,6 +850,8 @@ export interface PolicyState {
   /** Why the last episode was not saved (quality-gate rejection, capture or
    *  save failure). Persists until the next episode starts recording. */
   notice?: { level: "error"; message: string }
+  /** Live Mantis pose checks and the current take's latched failure state. */
+  trackingQuality?: TrackingQuality
 }
 
 export interface OpStatus {
@@ -1030,8 +1074,8 @@ export const RESOLUTION_OFF = "off"
  */
 export interface CameraSpec {
   serials: Record<CameraSlot, string>
-  /** Mantis wrist-camera assignment, kept separate from the Axol camera map. */
-  mantis_serials?: Pick<Record<CameraSlot, string>, "left_arm" | "right_arm">
+  /** Mantis camera assignments. Missing slots inherit the legacy Axol map. */
+  mantis_serials?: Partial<Record<CameraSlot, string>>
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
   /** Dataset downscale target (collect-data recording), or `"off"`. */
@@ -1159,13 +1203,29 @@ export interface LighthouseTrackerReadiness {
    * `null` until one has run on this host; absent on older serve hosts.
    */
   baseStations?: LighthouseBaseStationSurvey | null
+  expectedBaseStations?: number
+  /** Absent on hosts without stationary tracking validation. */
+  validation?: LighthouseValidation | null
+}
+
+export interface LighthouseValidation {
+  status: "passed" | "failed" | "stale" | "missing" | "needs_identification"
+  valid: boolean
+  checkedAt?: number | null
+  expiresAt?: number | null
+  expectedBaseStations?: number
+  baseStations?: unknown
+  trackers?: unknown
+  metrics?: Record<string, unknown>
+  problems: string[]
+  calibrated?: boolean
 }
 
 export interface LighthouseBaseStationSurvey {
   checkedAt: number
   /**
    * Serials of the base stations a tracker actually received during the check,
-   * keyed by the channel number shown on the station (1–16).
+   * keyed by the channel number reported by the runtime (1–16).
    */
   channels: Record<string, string[]>
   /** Stations libsurvive replayed from its saved calibration; not counted as seen. */
@@ -1432,19 +1492,27 @@ export function urdfUrl(): string {
   return apiUrl("/api/urdf/axol.urdf")
 }
 
-export function cameraSerials(
-  spec: CameraSpec,
-  mantis?: boolean
-): Partial<Record<CameraSlot, string>> {
-  if (mantis === true) {
-    return (
-      spec.mantis_serials ?? {
-        left_arm: spec.serials.left_arm,
-        right_arm: spec.serials.right_arm,
-      }
-    )
+export function cameraSerials(spec: CameraSpec, mantis?: boolean): Record<CameraSlot, string> {
+  const axol = {
+    overhead: spec.serials?.overhead ?? "",
+    left_arm: spec.serials?.left_arm ?? "",
+    right_arm: spec.serials?.right_arm ?? "",
   }
-  return spec.serials
+  if (mantis === true) {
+    const left = spec.mantis_serials?.left_arm ?? axol.left_arm
+    const right = spec.mantis_serials?.right_arm ?? axol.right_arm
+    // Older Mantis layouts could assign the Axol head camera to a wrist. Do
+    // not inherit that device into a second slot and open it twice.
+    const inheritedHead = [left, right].some((serial) => serial.trim() === axol.overhead.trim())
+      ? ""
+      : axol.overhead
+    return {
+      overhead: spec.mantis_serials?.overhead ?? inheritedHead,
+      left_arm: left,
+      right_arm: right,
+    }
+  }
+  return axol
 }
 
 export function cameraCount(spec: CameraSpec, mantis?: boolean): number {
