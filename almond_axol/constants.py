@@ -73,13 +73,18 @@ RT_TARGET_FIELDS = 10
 # Cap on the return-to-rest a flow plays while shutting down, before it torques
 # the arms off. It has to cover the IK plan plus a full return from a raised
 # pose: rest moves play at ``reset_speed`` (0.63 rad/s on the worst joint,
-# 1.5 s minimum), so a shoulder 2 rad up is ~3.2 s of motion alone. The serve
-# runner's 6 s stop grace (``_STOP_GRACE_S``) is not a hard limit on this: past
-# it the runner only kills the op's child processes (IK worker, video relay),
-# and by then the plan is made and playback runs in-process. A park that
-# overruns is abandoned and the arms are torqued off where they are — the
+# 1.5 s minimum), so a shoulder 2 rad up is ~3.2 s of motion alone. A park
+# that overruns is abandoned and the arms are torqued off where they are — the
 # pre-existing behaviour — so the cap can never make shutdown worse.
 PARK_TIMEOUT_S: float = 6.0
+
+# Cap on the second leg of that shutdown park — rest to the all-zero joint
+# pose (``VRTeleopConfig.park_to_zero``, see ``almond_axol.teleop.shutdown``).
+# From rest the shoulders and elbows have ~1.4 rad to travel at
+# ``reset_speed``, plus a second IK plan. The serve runner's stop grace for
+# the teleop and collect-data ops (``_PARK_STOP_GRACE_S``) covers both legs
+# so the IK worker survives until the second plan is made.
+PARK_ZERO_TIMEOUT_S: float = 10.0
 
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"

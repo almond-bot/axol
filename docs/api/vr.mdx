@@ -42,7 +42,7 @@ async with VRServer() as vr:
 | `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position + quaternion) |
 | `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions |
 | `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
-| `l_lock` / `r_lock` | `bool` | Grip button states. Both together (from rest) engage tracking; once engaged each **toggles its own arm** between tracking and frozen — or, with `hold_to_engage`, holds it while pressed |
+| `l_lock` / `r_lock` | `bool` | Grip button states. Both together (from rest) engage tracking; once engaged each **toggles its own arm** between tracking and frozen — or, with `hold_to_engage`, each holds its own arm while pressed (either alone, from rest too) |
 | `l_tracked` / `r_tracked` | `bool` | Whether each controller's position is optically tracked. `False` means the headset is dead-reckoning it (WebXR `emulatedPosition` — occluded / out of FOV / fast whip), so the pose smoother excludes those frames and holds the last clean pose. Defaults to `True`, so older web builds (which omit the field) keep the previous always-trusted behaviour |
 | `l_trigger_live` / `r_trigger_live` | `bool` | Whether each managed Mantis CAN trigger node is still publishing fresh input. A tracker bridge sets this false on heartbeat loss while holding the last safe command; collection quality checks reject the affected take. Quest/legacy clients default to `True`. |
 | `reset` | `bool` | Rising edge triggers a reset move |
@@ -99,7 +99,7 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | `box_flush_deg` | number, ° | how far the angled (`flush`) grasp turns each gripper inward from the parallel grasp, about the parcel plate's front edge (39°); read at the next engage or grasp switch |
 | `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
 | `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
-| `hold_to_engage` | boolean | grips as dead-man switches vs. toggles |
+| `hold_to_engage` | boolean | grips as per-arm dead-man switches vs. toggles |
 | `gripper_torque` | number, Nm | both grippers' `torque_limit` (read on every gripper command). Hardware only — hidden in sim |
 | `position_multiplier` | number, × | hand-motion scale (forwarded to the IK worker) |
 | `teleop_max_vel` | number, rev/s | joint velocity cap while tracking |

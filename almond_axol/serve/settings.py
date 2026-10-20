@@ -686,12 +686,24 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Hold grips to engage",
                 type="boolean",
                 help=(
-                    "Dead-man grip scheme: hold both grips to start driving, "
-                    "and each arm tracks only while its grip stays held — "
-                    "release one and that arm freezes where it is. Off "
-                    "(default) is the toggle scheme: click both grips to "
-                    "engage from rest, then a click on either grip toggles "
-                    "that arm between tracking and frozen."
+                    "Per-arm dead-man grips: each arm moves only while its "
+                    "own grip is held — either grip alone engages its arm, "
+                    "from rest too — and releasing a grip freezes that arm "
+                    "where it is. Off (default) is the toggle scheme: click "
+                    "both grips to engage from rest, then a click on either "
+                    "grip toggles that arm between tracking and frozen."
+                ),
+            ),
+            SettingDef(
+                key="teleop.park_to_zero",
+                label="Park to zero on stop",
+                type="boolean",
+                help=(
+                    "On Stop (or Ctrl+C) the arms return to rest and then "
+                    "continue to the all-zero joint pose — hanging straight "
+                    "down — holding their grasp, before the motors are "
+                    "released, so nothing drops when the torque comes off. "
+                    "Off: the park stops at the rest pose."
                 ),
             ),
             SettingDef(

@@ -61,6 +61,7 @@ from ...teleop.core import (
     wait_for_ik_ready,
 )
 from ...teleop.live import LiveSettings
+from ...teleop.shutdown import park_arms
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -983,6 +984,22 @@ class AxolVRTeleop(Teleoperator):
         """
         await self._core.guarded_return(**kwargs)
 
+    async def park_arms(self, **kwargs: Any) -> str:
+        """Play the shutdown park (rest, then zero) before torque-off.
+
+        Thin passthrough to :func:`almond_axol.teleop.shutdown.park_arms`,
+        the orchestrator shared with native ``axol teleop``. The caller
+        supplies the same flow-specific hooks as :meth:`guarded_return`;
+        await from a coroutine on the robot's event loop. Returns the park's
+        outcome (``"done"`` or why it stopped early).
+        """
+        return await park_arms(self._core, **kwargs)
+
+    @property
+    def is_parking(self) -> bool:
+        """True from the shutdown park's start until a fresh worker handshake."""
+        return self._core.is_parking
+
     async def contact_hold(self, **kwargs: Any) -> None:
         """Limp gravity-comp hold after a tracking-time contact trip.
 
@@ -1326,10 +1343,12 @@ class AxolVRTeleop(Teleoperator):
 
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
-            # force a stop so the base doesn't creep during return-to-rest.
-            # Box mode leaves Jelly its sticks (its grip width is on the
-            # right stick's forward/back, which Jelly doesn't read).
-            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            # force a stop so the base doesn't creep during return-to-rest (or
+            # park). Box mode leaves Jelly its sticks (its grip width is on
+            # the right stick's forward/back, which Jelly doesn't read).
+            self._jelly.apply_vr_frame(
+                frame, resetting=self._core.is_resetting or self._core.is_parking
+            )
 
         # Episode state transitions. Latch writes take _event_lock so they
         # can't land inside get_teleop_events' read-then-clear and vanish.

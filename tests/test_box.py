@@ -1467,7 +1467,6 @@ class BoxExitRampTest(unittest.TestCase):
         cfg.box_width_speed = 0.1
         cfg.box_elbow_out = 30.0
         cfg.box_elbow_weight = 0.0
-        cfg.box_elbow_speed = 30.0
         cfg.box_squeeze_lean = 0.0
         cfg.box_squeeze_trim = 0.0
         cfg.box_squeeze_force = 0.0

@@ -648,6 +648,8 @@ function legacyStatus(phase: string): string {
       return "Reset the scene, then start the episode."
     case "resetting":
       return "Returning to rest…"
+    case "parking":
+      return "Parking the arms (rest, then zero) before releasing the motors…"
     default:
       return "Preparing…"
   }
@@ -713,6 +715,11 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
     },
     resetting: {
       label: "Resetting",
+      cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
+      kind: "spin",
+    },
+    parking: {
+      label: "Parking",
       cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
       kind: "spin",
     },
