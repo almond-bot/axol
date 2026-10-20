@@ -666,8 +666,10 @@ class VRTeleopCore:
             self._park_grippers = (float(last[7]), float(last[15]))
         else:
             self._park_grippers = (float(self.l_grip), float(self.r_grip))
-        self.reset_interp.freeze_grippers(*self._park_grippers)
+        # Flag first, then freeze: the IK thread re-checks the flag after it
+        # adopts a plan, so whichever side runs second freezes the ramp.
         self._parking = True
+        self.reset_interp.freeze_grippers(*self._park_grippers)
 
     def request_zero(self) -> None:
         """Latch a collision-aware move of both arms to all-zero joints.
@@ -1968,7 +1970,6 @@ class VRTeleopCore:
                 self._reset_cancel = False
                 goal = self._reset_goal
                 self._reset_goal = "rest"
-                hold = self._park_grippers if self._parking else None
                 self.reset_error = None
                 if self.box_mode:
                     # Going home leaves box mode: the arms come back as two
@@ -2018,6 +2019,10 @@ class VRTeleopCore:
                             trajectory = self._check_park_plan(
                                 q_plan, q_goal, q_default, trajectory
                             )
+                        # Read at adoption, not dispatch: a park that began
+                        # during the (possibly seconds-long) planning round
+                        # trip must still hold its grasp through this move.
+                        hold = self._park_grippers if self._parking else None
                         if hold is not None:
                             # Shutdown park: the grippers stay at the grasp
                             # that was commanded when the park began.
@@ -2029,6 +2034,10 @@ class VRTeleopCore:
                                 self.r_grip,
                                 hold_grippers=hold is not None,
                             )
+                            if hold is None and self._parking:
+                                # begin_park() landed between the read above
+                                # and this adoption; it found nothing playing.
+                                self.reset_interp.freeze_grippers(*self._park_grippers)
                             self._disengage_all()
                             self._at_rest = True
                         self._hold_target(np.asarray(q_default, dtype=np.float32))

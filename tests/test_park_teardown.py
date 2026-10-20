@@ -153,6 +153,18 @@ class _FakeIKPipe:
         return bool(self._replies)
 
 
+class _GatedIKPipe(_FakeIKPipe):
+    """A planner whose first reply waits for ``release`` — a slow plan."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = threading.Event()
+
+    def recv(self) -> object:
+        self.release.wait(timeout=2.0)
+        return super().recv()
+
+
 def _teleop(
     robot: _FakeRobot,
     *,
@@ -375,6 +387,35 @@ class ParkTeardownTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_visited(robot, 0.0))
         grips = {round(float(cmd[7]), 6) for cmd in robot.commands}
         self.assertEqual(grips, {round(found, 6)}, "the grasp moved during the park")
+
+    async def test_a_stop_while_a_reset_plans_holds_the_grasp(self) -> None:
+        # The X reset is still in its planning round trip when the stop
+        # lands, so nothing is playing yet for the park to freeze: the plan
+        # must pick the park's grasp up when it is adopted, or the rest leg
+        # ramps the grippers open and the zero leg closes them again.
+        robot = _FakeRobot()
+        pipe = _GatedIKPipe()
+        session = self._session(robot, pipe=pipe)
+        core = session._core  # noqa: SLF001
+        core.set_initial_grips(0.3, 0.6)
+        core.seed_filters(robot.left.positions, robot.right.positions)
+        core.request_reset()
+        deadline = time.perf_counter() + 1.0
+        while not core._reset_dispatching:  # noqa: SLF001
+            self.assertLess(time.perf_counter(), deadline, "reset never dispatched")
+            await asyncio.sleep(0.001)
+
+        park = asyncio.create_task(session._park_arms())  # noqa: SLF001
+        while not core.is_parking:
+            self.assertLess(time.perf_counter(), deadline, "park never began")
+            await asyncio.sleep(0.001)
+        pipe.release.set()
+        await park
+
+        self.assertTrue(_visited(robot, _REST))
+        self.assertTrue(_visited(robot, 0.0))
+        grips = {round(float(cmd[7]), 6) for cmd in robot.commands}
+        self.assertEqual(grips, {0.3}, "the grasp moved during the park")
 
     async def test_contact_ends_the_park_without_a_limp_hold(self) -> None:
         # Nobody is left to hand-guide the arms and press reset, so holding
