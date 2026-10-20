@@ -138,7 +138,7 @@ sudo dpkg -i stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb
 sudo reboot
 ```
 
-Then install the ZED SDK release for JetPack 7 / L4T 39 from the [Stereolabs download page](https://www.stereolabs.com/developers/release).
+Then install the ZED SDK release for JetPack 7.2 (L4T 39.2) from the [Stereolabs download page](https://www.stereolabs.com/developers/release).
 
 <Note>
   Axol's [`zed.driver`](/cli/zed-driver) step manages only the ZED Box and ZED Link driver packages (`stereolabs-zed*`). It leaves the MIC-742 driver alone, so the installer and self-updater never replace it. Upgrade it by hand, and only to a release built for the L4T version Advantech's image runs.
