@@ -70,10 +70,12 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         label="Box mode",
         type="boolean",
         help=(
-            "One controller drives both arms as a level parallel-gripper pair "
-            "by position and heading (it stays level); the "
-            "thumbsticks set the grip width while a grip "
-            "leads and drive Jelly once it's frozen. Also toggled by clicking both "
+            "One controller drives both arms as a parallel-gripper pair, "
+            "following the hand's position and its full rotation (yaw, pitch "
+            "and roll, about the pair's centre). The right thumbstick's "
+            "forward/back sets the grip width while a grip leads; the rest "
+            "of the sticks drive Jelly's wheels and lift as usual, led or "
+            "not. Also toggled by clicking both "
             "thumbsticks together. Switching engages at once: into box mode "
             "led by the lead hand, out of it with both arms."
         ),
@@ -98,8 +100,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "box. flush: the parcel gripper rolled inward by the Angled yaw "
             "(39°) about its plate's front edge onto the chamfer facet and "
             "the fixed tip, the plate at its stop. Width is between the "
-            "contact faces in both. Also toggled by clicking "
-            "either thumbstick while a grip leads; the pair blends over to it."
+            "contact faces in both. Switching while a grip leads blends the "
+            "pair over to it."
         ),
     ),
     LiveSettingDef(
@@ -111,7 +113,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=0.5,
         unit="°",
         help=(
-            "Parcel gripper: how far the angled grasp (stick click) turns "
+            "Parcel gripper: how far the angled (flush) grasp turns "
             "each gripper inward from parallel, about its plate's front edge "
             "(the chamfer is 39.2°). The plate stays at its open stop."
         ),
@@ -163,8 +165,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         help=(
             "Box mode: how far out the elbows are held, in degrees from "
             "hanging straight down under the shoulder-wrist line (0) to out "
-            "level (90). Also jogged live by pushing either thumbstick "
-            "forward (further apart) or back (tucked in)."
+            "level (90)."
         ),
     ),
     LiveSettingDef(

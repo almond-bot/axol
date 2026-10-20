@@ -36,7 +36,6 @@ from .box import (
     choose_faces,
     contact_width,
     elbow_swivel_hint,
-    joint_force_limit,
     pair_aligned,
     parcel_tool,
     rodrigues,
@@ -47,7 +46,6 @@ from .box import (
     swivel_step,
     tip_inward_sign,
     toe_out_sides,
-    twist_about,
 )
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
@@ -131,19 +129,6 @@ _TRIM_STILL_SPEED = 0.03
 _TRIM_STILL_S = 0.3
 # While the grippers press, a line of clamp diagnostics this often (s).
 _CLAMP_LOG_PERIOD_S = 1.0
-# Share of a torque-capped joint's cap the even clamp may use (see
-# joint_force_limit): the rest is left for what else that joint carries —
-# the squeeze trim's extra yaw, a held box's weight, the pair's own moves.
-_JOINT_CAP_MARGIN = 0.8
-# The robot's up (FLU +z), for box-frame rotations.
-_UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
-# The room's up in the frame the controller rotations are held in. Those
-# come out of ``_vr_to_flu_np``, which permutes the VR world's axes so that
-# the clutch mapping (``_relative_target_np``) reads controller-local deltas
-# — it does *not* turn the world frame into FLU: the VR world's +y (up) stays
-# the second axis. Anything that looks at a controller's rotation in world
-# terms (box mode's turn about vertical) must use this axis, not ``_UP``.
-_CTRL_UP = np.array((0.0, 1.0, 0.0), dtype=np.float32)
 
 # Gripper-pair status (see IKWorker.pair_status): reported to the core every
 # this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
@@ -170,10 +155,6 @@ def _dz(v: float) -> float:
 # Clearance (m) kept between the two grippers' bodies when the width is
 # closed with nothing between them (see ToolGeometry.min_width).
 _BODY_CLEARANCE_M = 0.01
-# Range (degrees from straight down) the sticks jog ``box_elbow_out`` over:
-# elbows hanging under the shoulder-wrist line to held out level.
-_ELBOW_OUT_MIN = 0.0
-_ELBOW_OUT_MAX = 90.0
 # Longest step (m) along its swivel an elbow hint asks for (swivel_step): the
 # swivel is a curve, and a longer step's chord leaves it.
 _ELBOW_HINT_STEP_M = 0.03
@@ -183,19 +164,6 @@ _ELBOW_HINT_STEP_M = 0.03
 # manipulability cost and the elbow hint settle against a pose error that
 # size (0.3-0.5° tip-out in the angled grasp); these hold it under 0.05°.
 _BOX_POSE_WEIGHT_SCALE = (2.0, 4.0)
-
-
-def _dominant_axis(x: float, y: float) -> tuple[float, float]:
-    """Keep only the larger of a thumbstick's two axes (deadzoned).
-
-    ``x`` is the grip width and ``y`` the elbows; a thumb pushed mostly
-    forward with a little sideways in it should not creep the width (or the
-    other way round), so the smaller axis is zeroed. Ties go to ``x``.
-    """
-    x, y = _dz(x), _dz(y)
-    if abs(x) >= abs(y):
-        return x, 0.0
-    return 0.0, y
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -297,41 +265,36 @@ def _relative_target_np(
     return new_t.astype(np.float32), (rot_snap_fk @ R_delta).astype(np.float32)
 
 
+# Controller axes → box-frame axes for box mode's turn (see _box_turn). The
+# controller rotations out of ``_vr_to_flu_np`` hold the controller's own
+# axes as (back, up, left); the box frame is (forward, left, up).
+_CTRL_TO_BOX = np.array(
+    ((-1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), dtype=np.float32
+)
+
+
+def _box_turn(
+    rot_curr: np.ndarray, rot_snap_ctrl: np.ndarray, rotation_multiplier: float = 1.0
+) -> np.ndarray:
+    """The controller's turn since its snap, in the box frame's own axes.
+
+    The controller-local rotation delta (what :func:`_relative_target_np`
+    reads too), re-expressed as if the controller had been held like the
+    box frame at the snap — pointing forward, upright — so turning the hand
+    about its own vertical yaws the pair, about its left/right axis pitches
+    it and about its pointing axis rolls it, wherever the operator stands
+    and however the grippers were posed at the engage. Apply it on the
+    right of the box rotation (``box.rot @ turn``).
+    ``rotation_multiplier`` scales the angle.
+    """
+    local = np.asarray(rot_snap_ctrl, np.float32).T @ np.asarray(rot_curr, np.float32)
+    turn = _CTRL_TO_BOX @ local @ _CTRL_TO_BOX.T
+    return _scale_rotation_np(turn, rotation_multiplier).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # IKWorker
 # ---------------------------------------------------------------------------
-
-
-def box_joint_caps(
-    robot_config: object, config: VRTeleopConfig
-) -> dict[str, np.ndarray]:
-    """Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order, inf = none).
-
-    The configured ``JointConfig.torque_limit`` tightened by box mode's
-    session wrist cap (``config.box_wrist_torque`` on ``BOX_WRIST_JOINTS``,
-    what ``VRTeleopCore.spring_caps`` has the robot apply). The squeeze lean
-    holds the clamp under the force at which these saturate
-    (:func:`joint_force_limit`).
-    """
-    from ..constants import ARM_JOINTS
-    from .core import BOX_WRIST_JOINTS
-
-    wrist_cap = float(getattr(config, "box_wrist_torque", 0.0))
-    out: dict[str, np.ndarray] = {}
-    for side in ("left", "right"):
-        caps = np.array(
-            [
-                getattr(getattr(robot_config, side), j.value).torque_limit
-                for j in ARM_JOINTS
-            ],
-            dtype=np.float64,
-        )
-        if wrist_cap > 0.0:
-            for j in BOX_WRIST_JOINTS:
-                i = ARM_JOINTS.index(j)
-                caps[i] = min(caps[i], wrist_cap)
-        out[side] = caps
-    return out
 
 
 class IKWorker:
@@ -484,18 +447,10 @@ class IKWorker:
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
         self._lean_model = None
-        # Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order;
-        # inf for none): the configured torque_limit, tightened by the
-        # session's box_wrist_torque on the wrists (what the core caps them
-        # at in box mode). The clamp is held under the force at which they
-        # saturate.
-        self._joint_caps: dict[str, np.ndarray] | None = None
         try:
-            from ..robot.config import AxolConfig
             from ..robot.gravity import GravityCompensator
 
             self._lean_model = GravityCompensator()
-            self._joint_caps = box_joint_caps(AxolConfig(), config)
         except Exception:  # noqa: BLE001 - the lean is optional
             _logger.exception("arm model unavailable; box mode's squeeze lean is off")
 
@@ -1185,7 +1140,7 @@ class IKWorker:
             _logger.warning("Ignoring live update %s=%r (bad value)", key, value)
             return
         if key == "box_grasp" and coerced != current and self._box is not None:
-            # Switch grasps under a live pair the same way a stick click does:
+            # Switch grasps under a live pair:
             # re-snap, so the arms blend into the new configuration.
             self._box = None
         setattr(self._config, key, coerced)
@@ -1278,7 +1233,8 @@ class IKWorker:
         would come within ``_BODY_CLEARANCE_M`` of each other in the
         current grasp (:meth:`ToolGeometry.min_width`). The parcel
         gripper's contact faces are proud of everything else on it in both
-        grasps, so they may close to the operator's floor; the stock
+        grasps, so they may close to the operator's floor (``0`` by
+        default: the faces together); the stock
         gripper's face is modelled on the mount axis and its wrists meet
         first, at ~77 mm.
         """
@@ -1323,6 +1279,7 @@ class IKWorker:
         targets: dict[str, Pose],
         q_current: np.ndarray,
         now: float,
+        rot: np.ndarray | None = None,
     ) -> dict[str, Pose]:
         """Lean the gripper targets so the clamp presses evenly on the contacts.
 
@@ -1356,14 +1313,9 @@ class IKWorker:
         this replaces did exactly that and cost the pair its alignment).
         With ``config.box_squeeze_force`` > 0 the depth is capped at that
         force's, the targets pulled back out along the normals to hold it
-        — the same on both arms, so the pair stays a pair. The arms' own
-        torque caps set a second, automatic cap (:func:`joint_force_limit`,
-        ``_JOINT_CAP_MARGIN`` of it, the lower arm's for both): ``wrist_2``
-        holds the moment that keeps the tip pressed and saturates first,
-        at ~39 N of even clamp at box mode's 5 Nm wrist cap
-        (``box_wrist_torque``), and squeezing past that only
-        unloads the tip onto the facet — so the clamp stops there, both
-        contacts pressed, however far the width is jogged.
+        — the same on both arms, so the pair stays a pair. Otherwise (the
+        default) nothing holds the depth back: the clamp keeps tightening
+        as far as the operator jogs the width in.
 
         The model's lean is open loop, and the arm is not quite the model:
         gear backlash, the wrist's own compliance, and the gripper flexing
@@ -1392,7 +1344,9 @@ class IKWorker:
         Off (targets returned as they are) without a measurement (the
         sim, or none reported for ``_LEAN_RESET_S``) or a pair still
         blending into alignment; the model's lean also needs the arm model
-        and a nonzero lean scale or force cap.
+        and a nonzero lean scale or force cap. ``rot`` is the pair's box
+        frame this frame (the snap's ``box.rot`` turned by the leader);
+        omitted, the snap's.
         """
         cfg = self._config
         scale = float(getattr(cfg, "box_squeeze_lean", 0.0))
@@ -1415,9 +1369,10 @@ class IKWorker:
         if not np.all(np.isfinite(q_meas)):
             return targets
         measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
-        lateral = np.asarray(box.rot[:, 1], dtype=np.float64)
+        frame = np.asarray(box.rot if rot is None else rot, dtype=np.float64)
+        lateral = frame[:, 1]
         normals = {"left": -lateral, "right": lateral}
-        up = np.asarray(box.rot[:, 2], dtype=np.float64)
+        up = frame[:, 2]
         depths = {
             side: float(
                 (
@@ -1490,18 +1445,6 @@ class IKWorker:
                 self._lean_model = None
                 return self._apply_trim(targets, normals, up)
             models[side] = (rot_cmd, jac, np.asarray(tool.contacts(box.face[side])))
-        joint_limit = math.inf
-        caps = getattr(self, "_joint_caps", None)
-        if caps is not None:
-            for side, (rot_cmd, jac, pts) in models.items():
-                joint_limit = min(
-                    joint_limit,
-                    _JOINT_CAP_MARGIN
-                    * joint_force_limit(jac, rot_cmd, normals[side], pts, caps[side]),
-                )
-        force_cap = cap if cap > 0.0 else math.inf
-        limited = joint_limit < force_cap
-        force_cap = min(force_cap, joint_limit)
         for side in ("left", "right"):
             pos, rot = targets[side]
             rot_cmd, jac, pts = models[side]
@@ -1512,7 +1455,7 @@ class IKWorker:
                 normals[side],
                 pts,
                 depth,
-                force_cap if math.isfinite(force_cap) else 0.0,
+                cap if cap > 0.0 else 0.0,
             )
             forces.append(lean.force)
             per_side_force[side] = lean.force
@@ -1525,9 +1468,7 @@ class IKWorker:
                 new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
             out[side] = (new_pos, new_rot)
         self._lean_force = 0.5 * sum(forces)
-        self._log_clamp(
-            now, depths, per_side_force, toe, still, joint_limit if limited else None
-        )
+        self._log_clamp(now, depths, per_side_force, toe, still)
         return self._apply_trim(out, normals, up)
 
     def _pair_still(self, targets: dict[str, Pose], now: float) -> bool:
@@ -1560,7 +1501,6 @@ class IKWorker:
         forces: dict[str, float],
         toe: dict[str, float],
         still: bool,
-        joint_limit: float | None = None,
     ) -> None:
         """Rate-limited clamp diagnostics while the grippers press."""
         if now - self._clamp_log_t < _CLAMP_LOG_PERIOD_S:
@@ -1568,7 +1508,7 @@ class IKWorker:
         self._clamp_log_t = now
         _logger.info(
             "box clamp: depth L %.1f / R %.1f mm, force L %.1f / R %.1f N, "
-            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s%s",
+            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s",
             depths["left"] * 1e3,
             depths["right"] * 1e3,
             forces.get("left", 0.0),
@@ -1578,9 +1518,6 @@ class IKWorker:
             math.degrees(self._lean_trim["left"]),
             math.degrees(self._lean_trim["right"]),
             "" if still else " (pair moving: trims held)",
-            ""
-            if joint_limit is None
-            else f" (held at the wrists' even-clamp limit, {joint_limit:.0f} N)",
         )
 
     def _apply_trim(
@@ -1688,14 +1625,14 @@ class IKWorker:
         faces) over ``box_align_duration``. Afterwards the leader hand
         drives the pair through the usual per-arm clutch mapping
         (:func:`_relative_target_np`, so moving the hand feels exactly like
-        normal teleop) with two of its six degrees of freedom dropped: the
-        pair follows the hand's translation and its turn about the room's
-        vertical (:func:`twist_about`, applied about the pair's centre so a
-        wrist turn lines the pair up with a box on the table without moving
-        it), and stays level whatever the hand's pitch and roll. The thumbsticks set
-        the grip width (see :meth:`_integrate_sticks`), and
-        a single stick click switches between the flush and straight grasps
-        (:meth:`_stick_click_toggle`), re-running the blend.
+        normal teleop) in all six degrees of freedom: the pair follows the
+        hand's translation, and the hand's rotation since the snap — yaw,
+        pitch and roll, in the box frame's axes (:func:`_box_turn`) — turns
+        the whole pair about its centre, so a wrist turn lines the pair up
+        with (or tips) a box without moving it. The right thumbstick's forward/back sets the
+        grip width (see :meth:`_integrate_sticks`); the rest of the sticks
+        drive Jelly as outside box mode, and the grasp is switched from the
+        settings (``box_grasp``), re-running the blend.
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1730,21 +1667,9 @@ class IKWorker:
             self._clear_freeze()
             self._solver.set_posture_pose(q_current)
             self._last_solve_t = None
-            # A stick already held at the snap can't be the start of a grasp
-            # toggle (see _stick_click_toggle).
-            self._box.click_prev = (
-                bool(frame.l_stick_click),
-                bool(frame.r_stick_click),
-            )
             return q_current
 
         box = self._box
-        if self._stick_click_toggle(frame, box):
-            # Grasp switched: drop the pair state so the next frame re-snaps
-            # from FK and blends the arms into the new configuration (the
-            # leader re-anchors too, so nothing jumps). This frame holds.
-            self._box = None
-            return q_current
         ctrl_pos, ctrl_rot = ctrl[leader]
         assert self._box_snap is not None
         (snap_ctrl_pos, snap_ctrl_rot), snap_fk = self._box_snap
@@ -1756,28 +1681,21 @@ class IKWorker:
             *snap_fk,
             position_multiplier=cfg.position_multiplier,
         )
-        # Position and heading only: the box centre is carried along with
-        # the leader gripper's translation since the snap, and the pair is
-        # turned about that centre by how far the hand has turned about the
-        # room's up axis since the snap (taken from the controller's own
-        # world-frame rotation, not from the clutch-mapped gripper rotation,
-        # so it is a yaw whatever the gripper was doing at the snap). The
-        # controller frame's up is the VR world's +y (_CTRL_UP): the poses
-        # out of _vr_to_flu_np are not in FLU, and twisting about FLU +z
-        # there would read the hand's *pitch* as the turn. The turn is a
-        # right-handed angle about up in either frame, so it applies to the
-        # box frame about the robot's +z unchanged. The hand's pitch and roll
-        # never reach the grippers, so the pair stays level with the fingers
-        # straight out.
+        # The box centre is carried along with the leader gripper's
+        # translation since the snap, and the pair is turned about that
+        # centre by the hand's full rotation since the snap — yaw, pitch and
+        # roll — read in the box frame's own axes (_box_turn), not through
+        # the leader gripper's clutch mapping: that one is relative to the
+        # gripper's pose at the snap, before the align blend, so a gripper
+        # that engaged pointing down would turn a hand's yaw into a roll of
+        # the box.
         snap_pos = snap_fk[0]
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
-        yaw = (
-            twist_about(ctrl_rot @ snap_ctrl_rot.T, _CTRL_UP) * cfg.rotation_multiplier
-        )
-        rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
+        turn = _box_turn(ctrl_rot, snap_ctrl_rot, cfg.rotation_multiplier)
+        rot = (box.rot @ turn).astype(np.float32)
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)
-        targets = self._squeeze_lean(box, targets, q_current, now)
+        targets = self._squeeze_lean(box, targets, q_current, now, rot)
         elbows = self._box_elbow_hints(q_current, targets)
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
@@ -1875,61 +1793,19 @@ class IKWorker:
             )
         return hints
 
-    def _stick_click_toggle(self, frame: VRFrame, box: BoxState) -> bool:
-        """Flip ``config.box_grasp`` on a single stick click; True if it flipped.
-
-        A click *and release* of either thumbstick while a grip leads toggles
-        between the ``"flush"`` and ``"straight"`` grasps. It fires on the
-        release, not the press, so that the both-sticks gesture (which the
-        headset turns into a box-mode toggle) can't also switch the grasp on
-        its way through: a press is *armed* only if the other stick is up,
-        and disarmed the moment both are down. A stick already held when
-        the pair snapped isn't armed either (``click_prev`` is seeded at the
-        snap).
-        """
-        now_l, now_r = bool(frame.l_stick_click), bool(frame.r_stick_click)
-        prev_l, prev_r = box.click_prev
-        box.click_prev = (now_l, now_r)
-        if now_l and now_r:
-            box.click_armed = False
-            return False
-        if (now_l and not prev_l) or (now_r and not prev_r):
-            # Rising edge with the other stick up: candidate toggle.
-            box.click_armed = True
-            return False
-        released = (prev_l and not now_l) or (prev_r and not now_r)
-        if released and box.click_armed and not (now_l or now_r):
-            box.click_armed = False
-            new = "straight" if self._box_grasp() == "flush" else "flush"
-            self._config.box_grasp = new
-            _logger.info("Box grasp: %s (stick click)", new)
-            return True
-        return False
-
     def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
-        """Accumulate this frame's thumbstick input into ``box`` / the config.
+        """Accumulate this frame's thumbstick input into the grip width.
 
-        Box mode's sticks do two things, and both sticks do the same, so it
-        doesn't matter which hand leads: left/right sets the **width**
-        between the grippers (push right = wider, clamped to
-        ``box_width_min``..``box_width_max`` — the floor raised, if need
-        be, to where the grippers' bodies would meet in this grasp,
-        :meth:`_box_width_min`), and forward/back sets how far
-        out the **elbows** are held (push forward = further apart, back =
-        tucked in): it jogs ``config.box_elbow_out`` at ``box_elbow_speed``
-        within 0..90° from straight down, the angle the IK's elbow hint
-        (:meth:`_box_elbow_hints`) steers each arm's free swivel to. The
-        grippers' yaw is the grasp's (``straight`` 0°, ``flush`` the tool's
-        flush tilt) plus the fixed ``config.box_grip_tilt`` trim, not a
-        live control. Only a stick's dominant axis counts, so a thumb
-        pushing "left" with a little forward in it still changes only the
-        width (see :func:`_dominant_axis`); with both sticks deflected their
-        inputs add, capped at full deflection. Stick clicks are not
-        modifiers (a single click toggles the grasp,
-        :meth:`_stick_click_toggle`); the pair's position is the leader
-        hand's job, not the sticks'. The elbow angle lives in the config so
-        it outlasts the pair (the next engage keeps it) and reaches the
-        core / settings panel through :meth:`pair_status`.
+        Box mode takes one stick axis, the one Jelly leaves free: the
+        right stick's forward/back sets the **width** between the grippers
+        (push forward = wider, pull back = narrower, at
+        ``box_width_speed``), clamped to ``box_width_min``..``box_width_max``
+        — the floor raised, if need be, to where the grippers' bodies would
+        meet in this grasp (:meth:`_box_width_min`). Everything else on the
+        sticks — the left stick, the right stick's left/right, the stick
+        clicks — drives Jelly's wheels and lift exactly as outside box
+        mode, so the base moves while a grip leads the pair. The pair's
+        position and rotation are the leader hand's job, not the sticks'.
         """
         cfg = self._config
         dt = (
@@ -1940,30 +1816,15 @@ class IKWorker:
         box.stick_t = now
         if dt <= 0.0:
             return
-
-        lx, ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
-        rx, ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
-        if not (lx or rx or ly or ry):
-            return
-
-        x = float(np.clip(lx + rx, -1.0, 1.0))
-        width_rate = x * cfg.box_width_speed  # push right = wider
+        # The raw stick axis reads negative pushed forward (WebXR gamepad
+        # convention, as Jelly's drive reads it too): forward = wider.
+        width_rate = -_dz(frame.r_stick_y) * cfg.box_width_speed
         if width_rate:
             box.width = float(
                 np.clip(
                     box.width + dt * width_rate,
                     self._box_width_min(),
                     cfg.box_width_max,
-                )
-            )
-        # The raw stick axis reads negative pushed forward (WebXR gamepad
-        # convention, as Jelly's drive reads it too): forward = elbows out.
-        y = -float(np.clip(ly + ry, -1.0, 1.0))
-        elbow_rate = y * cfg.box_elbow_speed
-        if elbow_rate:
-            cfg.box_elbow_out = float(
-                np.clip(
-                    cfg.box_elbow_out + dt * elbow_rate, _ELBOW_OUT_MIN, _ELBOW_OUT_MAX
                 )
             )
 

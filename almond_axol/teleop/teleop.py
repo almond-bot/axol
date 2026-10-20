@@ -1156,12 +1156,10 @@ class VRTeleop:
         if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
-            # creep while the arms replay their return-to-rest trajectory;
-            # while a box-mode leader owns the sticks (grip width / tilt)
-            # Jelly is held stopped the same way (frozen pair: sticks drive).
-            self._jelly.apply_vr_frame(
-                frame, resetting=self._core.is_resetting or self._core.pair_owns_sticks
-            )
+            # creep while the arms replay their return-to-rest trajectory.
+            # Box mode leaves Jelly its sticks (its grip width is on the
+            # right stick's forward/back, which Jelly doesn't read).
+            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)

@@ -65,14 +65,13 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
-  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode elbows (either stick's y; Jelly ignores it). */
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode grip width (forward = wider; Jelly ignores it). */
   r_stick_y?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held (while a box-mode
-   * leader is engaged a single click of either stick toggles the grasp, flush
-   * / straight). Both sticks clicked together toggle box mode (the headset sends the `set` message
+   * Right thumbstick pressed in — lift up while held, in box mode too.
+   * Both sticks clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
