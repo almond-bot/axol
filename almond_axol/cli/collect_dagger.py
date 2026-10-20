@@ -1547,8 +1547,8 @@ def _run(
     control_thread: _DaggerControlLoop | None = None
     control_worker_stopped = True
     # Disabling raised arms drops them under gravity, so the cleanup below
-    # parks them (rest pose, then zero) first — once this session has moved
-    # them, or whenever they are somewhere other than rest.
+    # parks them (rest pose, then zero) first — once this session owns them
+    # (past the start check), or whenever they are somewhere other than rest.
     arms_at_rest = True
     arms_moved = False
 
@@ -1724,6 +1724,10 @@ def _run(
             # away. A current-pose session never homes on start, so it may
             # begin anywhere.
             check_start_pose(robot.positions)
+        # Past the start check the session owns the arms — homing, idle
+        # teleop, episodes — so the teardown parks them whatever the last
+        # move was. A refused start raises above and never parks.
+        arms_moved = True
 
         # Connect the VR teleop stack: the position source lets takeovers
         # sync the IK worker to the robot's measured pose, and the current
@@ -1781,7 +1785,6 @@ def _run(
 
         if cfg.home_on_start or not cfg.start_from_current_pose:
             _logger.info("Returning to rest pose (through zero).")
-            arms_moved = True
             if not _return_to_rest_guarded(_gate_retry, startup=True):
                 return
         else:

@@ -36,6 +36,7 @@ from typing import Any, Callable
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
 from ..mantis.smoothing import rotvec_to_quat_xyzw
@@ -172,6 +173,34 @@ class ReplayDatasetConfig:
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
     log_level: LogLevel = "INFO"
+
+
+def _park_before_torque_off(
+    reset_controller: Any, robot: Any, cfg: "ReplayDatasetConfig"
+) -> bool:
+    """Teardown park: rest, then (``cfg.park_to_zero``) zero, holding the grasp.
+
+    The run's stop flag is already set by now, so a deadline bounds the park
+    instead — the same caps as run-policy's and collect-dagger's parks
+    (:data:`PARK_TIMEOUT_S`, plus :data:`PARK_ZERO_TIMEOUT_S` for the zero
+    leg). Nobody is left to free the arms from a contact hold, so a contact
+    trip ends the park at once; the torque-off follows either way. Returns
+    whether the park finished.
+    """
+    park_to_zero = bool(cfg.park_to_zero)
+    deadline = time.perf_counter() + PARK_TIMEOUT_S
+    if park_to_zero:
+        deadline += PARK_ZERO_TIMEOUT_S
+    contact = threading.Event()
+    return reset_controller.return_to_rest(
+        robot,
+        torque_threshold=cfg.reset_torque_threshold,
+        gravity_comp_kd=cfg.reset_gravity_comp_kd,
+        stopped=lambda: contact.is_set() or time.perf_counter() >= deadline,
+        on_contact=contact.set,
+        path=("rest", "zero") if park_to_zero else None,
+        hold_grasp=True,
+    )
 
 
 def main(argv: list[str]) -> None:
@@ -424,35 +453,26 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # Guarded: a sustained torque residual (contact) drops the arms into
         # a limp gravity-comp hold. Replay has no interactive retry channel, so the
         # hold lasts until the run is stopped, and the teardown then leaves the
-        # limp arms where they are (``arms_limp``). The teardown's own
-        # return (``final=True``) must play even though the stop flag is
-        # already set, so it passes no stop hook; on contact it aborts
-        # immediately instead of holding (nothing could end that hold).
+        # limp arms where they are (``arms_limp``).
         #
         # ``startup`` plays the run's first home through zero (the arms'
-        # natural resting pose); ``final`` parks at rest and then zero, so the
-        # torque-off leaves the arms where they would settle anyway.
+        # natural resting pose). ``final`` is the teardown park
+        # (:func:`_park_before_torque_off`): bounded by its own deadline, since
+        # the stop flag is already set by then.
         _logger.info(message)
+        if final:
+            _park_before_torque_off(reset_controller, robot, cfg)
+            return
         reset_controller.return_to_rest(
             robot,
             torque_threshold=cfg.reset_torque_threshold,
             gravity_comp_kd=cfg.reset_gravity_comp_kd,
-            stopped=None if final else _stopped,
-            on_contact=None
-            if final
-            else lambda: _logger.info(
+            stopped=_stopped,
+            on_contact=lambda: _logger.info(
                 "Contact during return to rest — arms are limp. Free them, "
                 "then stop the run."
             ),
-            path=(
-                (("rest", "zero") if cfg.park_to_zero else None)
-                if final
-                else ("zero", "rest")
-                if startup
-                else None
-            ),
-            # The teardown park keeps the grasp until the torque comes off.
-            hold_grasp=final,
+            path=("zero", "rest") if startup else None,
         )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
