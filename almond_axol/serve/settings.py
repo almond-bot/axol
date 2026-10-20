@@ -705,6 +705,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "released, so nothing drops when the torque comes off. "
                     "Off: the park stops at the rest pose."
                 ),
+                # Also a top-level field of the ops without a teleop subtree.
+                targets={
+                    "teleop": ("teleop.park_to_zero",),
+                    "collect-data": (f"{_VRT}.park_to_zero",),
+                    "run-policy": ("park_to_zero",),
+                    "replay-dataset": ("park_to_zero",),
+                },
             ),
             SettingDef(
                 key="teleop.box_mode",

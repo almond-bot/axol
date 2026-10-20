@@ -212,6 +212,8 @@ class IKResetController:
         wait_retry: Callable[[], bool] | None = None,
         stopped: Callable[[], bool] | None = None,
         on_contact: Callable[[], None] | None = None,
+        path: tuple[str, ...] | None = None,
+        hold_grasp: bool = False,
     ) -> bool:
         """Plan and play a guarded collision-aware trajectory to the rest pose.
 
@@ -239,15 +241,27 @@ class IKResetController:
             wait_retry: Blocking operator gate; ``True`` = retry.
             stopped: Flow shutdown flag, polled during play and hold.
             on_contact: Announce hook, run once per trip before the hold.
+            path: Named goals to chain through instead of going straight to
+                rest, planned as one trajectory by the IK worker:
+                ``("zero", "rest")`` for a session's first home,
+                ``("rest", "zero")`` for the teardown park. A contact retry
+                replans the whole path from wherever the arms were left.
+            hold_grasp: Keep the grippers at their last commanded grasp for
+                the whole move instead of ramping them open — the teardown
+                park, where an arm may still be holding something.
 
         Returns:
-            ``True`` once the arms reached rest; ``False`` if aborted
-            (stopped, or the operator declined the retry).
+            ``True`` once the arms reached the path's last goal (rest by
+            default); ``False`` if aborted (stopped, or the operator
+            declined the retry).
         """
         if not self.wait_ready(stopped=stopped):
             return False
+        hold = robot.parking_gripper_hold() if hold_grasp else None
         while True:
-            outcome = self._play_to_rest(robot, torque_threshold, stopped)
+            outcome = self._play_to_rest(
+                robot, torque_threshold, stopped, path=path, hold_grippers=hold
+            )
             if outcome != "contact":
                 return outcome == "done"
             if on_contact is not None:
@@ -347,10 +361,12 @@ class IKResetController:
         q_target: Any | None = None,
         deadline: float | None = None,
         hold_grippers: tuple[float, float] | None = None,
+        path: tuple[str, ...] | None = None,
     ) -> str:
         """One play attempt from the current measured positions.
 
-        Plans from the robot's cached positions, then streams the waypoints
+        Plans from the robot's cached positions — to rest, to ``q_target``,
+        or through the named goals of ``path`` — then streams the waypoints
         watching the torque residuals. Returns ``"done"``, ``"contact"``, or
         ``"stopped"``.
         """
@@ -389,9 +405,12 @@ class IKResetController:
         for i, gi in enumerate(self._right_indices):
             q_current[gi] = float(pos_r[i])
 
-        request = ("reset", q_current)
-        if q_target is not None:
-            request += (q_target,)
+        if path is not None:
+            request: tuple[Any, ...] = ("reset_path", q_current, path)
+        else:
+            request = ("reset", q_current)
+            if q_target is not None:
+                request += (q_target,)
         self._conn.send(request)
         if parking:
             while not self._conn.poll(0.05):

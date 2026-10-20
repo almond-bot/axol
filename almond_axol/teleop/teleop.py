@@ -50,6 +50,7 @@ from ..robot.base import (
 )
 from ..robot.control import ContactWatchdog
 from ..robot.jelly import Jelly
+from ..robot.start_pose import check_start_pose
 from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -395,13 +396,16 @@ class VRTeleop:
         self._live.announce()
 
         await self._robot.enable()
+        pos_l, pos_r = await self._robot.get_positions()
+        # The startup trajectory plays from here to rest unsupervised; refuse
+        # it from far away. __aenter__'s teardown torques the arms back off.
+        check_start_pose((pos_l, pos_r))
         if self._jelly is not None:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
             await self._jelly.enable()
 
-        pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
             pos_l[7] if pos_l is not None else None,
             pos_r[7] if pos_r is not None else None,

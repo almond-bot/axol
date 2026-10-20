@@ -93,6 +93,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
@@ -1673,6 +1674,10 @@ def _run_session(
 
     try:
         robot.connect()
+        if not mantis_mode:
+            # The teleop's startup move to rest plays unsupervised; refuse it
+            # from far away (a Mantis rig has no arm joints to check).
+            check_start_pose(robot.positions)
         if mantis_mode:
             # Open both grippers all the way (this is also the one-time
             # hard-stop calibration), then drop torque again, so the jaws are

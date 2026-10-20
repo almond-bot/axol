@@ -111,6 +111,10 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
+  **Starting needs the arms near zero.** Teleop, data collection, DAgger, run-policy and replay all refuse to start while any arm joint is more than 25° from zero — the robot's natural resting pose, where the arms settle once torqued off — and name each offending joint. The check is against zero, not the configured rest pose. Move the arms back by hand (e.g. under `axol gravity-comp`) and start again. Not applied to `collect-dagger --start_from_current_pose`, which never homes on start. Once the check passes, the first move goes to zero and then out to the rest pose, so it follows the same path every session whatever rest pose is configured.
+</Note>
+
+<Note>
   **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and then, with **Park to zero on stop** (`--teleop.park_to_zero`, on by default), on to the all-zero joint pose, hanging straight down, holding whatever grasp was commanded; only then are the motors torqued off, so nothing drops under gravity on the way out. Both legs are the guarded return described above, capped at 6 s (rest) and 10 s (zero); if a leg runs out of time or hits something, the arms are torqued off where they are, and a second `Ctrl+C` aborts the park where it is. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when a contact hold has left the arms limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions. Turn **Park to zero on stop** off to stop at the rest pose.
 </Note>
 
