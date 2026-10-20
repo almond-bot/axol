@@ -1,76 +1,58 @@
 """
-Build the bundled Axol URDFs from their Onshape exports: Axol on Jelly, and
-Axol standalone, on the Ox cart and on the Owl mount.
+Build the bundled Axol URDFs from their Onshape exports: Axol on Jelly (with
+the parallel or the parcel gripper), and Axol standalone, on the Ox cart and
+on the Owl mount — one file per version.
 
-The Onshape export (``almond_urdf/urdf/almond_urdf.urdf`` + ``meshes/``) is a
-faithful CAD tree — ~140 links including every screw, a two-stage prismatic
-lift, prismatic gripper fingers, four wheel joints, and link frames wherever
-Onshape put them. None of that matches what the control stack expects, so
-this script distils it into three URDFs that share one set of meshes
-(``almond_axol/kinematics/urdf/meshes/jelly/``):
+An Onshape export (``almond_urdf/urdf/almond_urdf.urdf`` + ``meshes/``) is a
+faithful CAD tree — ~140 links including every screw, prismatic lift stages
+and fingers, wheel joints, and link frames wherever Onshape put them. None of
+that matches what the control stack expects, so this script distils each
+into one full model (``axol_jelly.urdf``, ``axol_jelly_parcel.urdf``,
+``axol_standalone.urdf``, ``axol_ox_cart.urdf``, ``axol_owl.urdf``) that IK,
+the viewers and physics simulators (Isaac Sim, MuJoCo) all load:
 
-- ``axol_jelly.urdf`` — **arm IK** (the default): only the 14 arm joints move;
-  base, lift, fingers and wheels are frozen (lift fully raised), rooted at
-  the classic torso-relative world frame.
-- ``axol_jelly_whole_body.urdf`` — **whole-body IK**: the same torso and arms
-  on the Jelly's planar base (``base_x`` / ``base_y`` / ``base_yaw`` about the
-  Jelly centre) and its lift (``lift``, the second stage mimicking it; 0 =
-  fully raised, positive lowers each stage). Its world frame is the arm
-  model's with every body joint at zero, so the two agree at startup.
-- ``axol_jelly_sim.urdf`` — **simulation** (e.g. Isaac Sim): a physical
-  robot rooted at the Jelly on the floor, with the lift, coupled gripper
-  fingers (``left_finger_1`` + mimic) and spinning wheels as joints, masses
-  and CoMs from :class:`~almond_axol.robot.config.AxolConfig`, contact
-  geometry per part, and relative mesh paths. See ``SIM_NOTE``.
-
-All three:
-
-- **Arms are the classic arms.** Every arm link, joint name, joint frame, axis
-  and inertial is copied verbatim from ``axol.urdf``; only the joint *limits*
-  come from the export. The script first proves the two arm chains are the
-  same mechanism (it fits the rigid transform between the exports' joint
-  axes, checks every arm link moves identically under random joint angles,
-  and reports the per-joint sign flips between the two naming schemes), so
-  FK, IK targets, recorded Cartesian frames and gravity compensation are
-  unchanged between the versions.
+- **Arms are the classic arms.** Every arm link, joint name, joint frame and
+  axis is copied verbatim from ``axol.urdf``; only the joint *limits* come
+  from the export. The script first proves the two arm chains are the same
+  mechanism (it fits the rigid transform between the exports' joint axes,
+  checks every arm link moves identically under random joint angles, and
+  reports the per-joint sign flips between the two naming schemes), so FK,
+  IK targets and recorded Cartesian frames are unchanged between versions.
+- **Every moving part is a joint:** the Jelly base in the plane (``base_x``
+  / ``base_y`` / ``base_yaw``) and its two-stage lift (``lift``, ``lift_2``
+  mimicking it), the Ox cart's lift, the fingers or parcel plate, and the
+  wheels. With every body joint at zero the torso root is the world
+  origin, so the world frame is the classic one.
+- **Two collision sets** (see ``MODEL_NOTE``): one convex hull per part in
+  ``<collision>``, for physics, and capsule-friendly pieces in the custom
+  ``<ik_collision>`` (pyroki fits one capsule per link): the shoulder bar,
+  the head-camera mount, the lift column's top plate and each section, the
+  Jelly deck and Owl foot plate as strips, and each gripper's jaws as one
+  body over their whole motion. IK (``almond_axol.kinematics.model``)
+  freezes the joints it does not solve and collides the second set.
+- **Masses and drives** from :class:`~almond_axol.robot.config.AxolConfig`
+  for the arms (wrist_3's lump split across the gripper parts), estimates
+  elsewhere (``Body.masses``); friction and impedance gains on the arm
+  joints.
 - **Meshes are the export's**, re-expressed in the bundled link frames: each
   rigid group of export links (a link plus its fastened children) is merged
-  per colour into one decimated visual STL, and convex hulls for collision.
-  Fasteners and connector bits under ``--min-part-mm`` are dropped.
+  per colour into one decimated visual STL. Fasteners and connector bits
+  under ``--min-part-mm`` are dropped. The body and arms are the same in
+  every export, so later exports reuse the first one's meshes
+  (``meshes/jelly/``) wherever the source parts match and keep only their
+  own under ``meshes/<version>/``. Mesh paths are relative.
 - **Camera optical frames** for both wrist cameras and both head-camera
   lenses (``*_optical``: +z along the optical axis, +x image right, +y image
   down), from the CAD lens geometry — see :func:`camera_frames`.
 
-The IK models split the body for capsule collision (pyroki fits one capsule
-per link): ``s1`` (shoulder bar), ``lift_plate`` (the bracket it bolts onto),
-``head`` (head-camera mount) and the lift column — one link (``base``) in the
-arm model, where the Jelly deck is visual only (``ARM_NOTE``), and one per
-stage (``base``, ``lift_stage``, ``jelly``) plus deck strips in the
-whole-body model. Their fingers collide as one cylinder spanning the full
-stroke.
-
-Each other mount (a :class:`Body`) gets an arm IK model only,
-``axol_<mount>.urdf`` (``axol_standalone``, ``axol_ox_cart``, ``axol_owl``):
-the same classic arms and the head and wrist cameras over its own body —
-nothing (standalone), the Ox cart's lift column with the lift fully raised,
-or the Owl mount's column and foot plate (as strips, like the Jelly deck).
-The script tells exports apart by their links.
-
-Each gripper (``AxolConfig.gripper``) has its own export and its own three
-URDFs (a :class:`Variant`): the parallel gripper's above, and the parcel
-gripper's ``axol_jelly_parcel{,_whole_body,_sim}.urdf`` — a fixed jaw and a
-plate hinged on it (a revolute joint in the sim model, its whole sweep one
-collision cylinder in the IK models), and no wrist cameras. The body and
-arms are the same in every export, so the parcel gripper's URDFs reuse the
-parallel gripper's meshes wherever the source parts match and keep only
-their own (gripper, wrist link) under ``meshes/jelly_parcel/``. The script
-tells the exports apart by their links.
+Each export is a body (a :class:`Body`: Jelly, standalone, Ox cart, Owl) and
+a gripper (a :class:`Variant`); the script tells them apart by their links.
 
 Run (``fast-simplification`` is only needed here, not at runtime) with
 every export at once, the Jelly parallel gripper's first, so the others
 reuse its meshes::
 
-    uv run --with fast-simplification python scripts/build_jelly_urdfs.py \\
+    uv run --with fast-simplification python scripts/build_urdfs.py \\
         jelly/almond_urdf parcel/almond_urdf axol/almond_urdf \\
         owl/almond_urdf ox_cart/almond_urdf
 """
@@ -94,11 +76,7 @@ import yourdfpy
 REPO = Path(__file__).resolve().parents[1]
 URDF_DIR = REPO / "almond_axol" / "kinematics" / "urdf"
 CLASSIC_URDF = URDF_DIR / "axol.urdf"
-OUT_ARM = URDF_DIR / "axol_jelly.urdf"
-OUT_WHOLE_BODY = URDF_DIR / "axol_jelly_whole_body.urdf"
-OUT_SIM = URDF_DIR / "axol_jelly_sim.urdf"
 MESH_SUBDIR = "meshes/jelly"
-PACKAGE = "package://assembly/"
 # Travel of each planar base joint in the whole-body model (m): far beyond
 # any single session, so the joint limits never shape the solve.
 BASE_TRAVEL = 10.0
@@ -180,32 +158,50 @@ DECK_STRIPS = 3
 
 @dataclass(frozen=True)
 class Body:
-    """What an export mounts the shoulder bar on, and how each model of it
-    collides. Collision pieces: each export mesh feeds the piece named after
-    its group, unless ``splits`` splits it by a mesh-local box ``(lo, hi)``
-    into the piece inside and the piece outside it."""
+    """What an export mounts the shoulder bar on, and how it collides.
+
+    Collision pieces: each export mesh feeds the piece named after its group,
+    unless ``splits`` splits it by a mesh-local box ``(lo, hi)`` into the
+    piece inside and the piece outside it. Each link gets two collision
+    sets: ``sim_hulls`` (one convex hull per part, for physics) and
+    ``ik_hulls`` + ``strips`` (capsule-friendly, for IK; see IK_NOTE).
+    """
 
     key: str  # AxolModel value
     marker: str | None  # an export link only this body has (None: no body)
     anchors: dict[str, str]  # its export links -> bundled links
     extra_links: dict[str, str]  # its fixed extra links (see HEAD_LINKS)
-    moving: dict[str, Moving]
+    moving: dict[str, Moving]  # its moving parts besides the lift (wheels)
     # Links world-aligned at the export root (the ground under the robot
-    # when it stands on it), in every model.
+    # when it stands on it).
     frame_links: tuple[str, ...]
     splits: dict[str, Split]
-    # The arm model's body hulls besides s1 and head: link -> pieces.
-    hulls: dict[str, tuple[str, ...]]
-    # Flat pieces as strips: piece -> (parent link, strip prefix, count).
+    # IK body hulls besides s1 and head: link -> pieces (one hull).
+    ik_hulls: dict[str, tuple[str, ...]]
+    # IK: flat pieces as strips: piece -> (parent link, strip prefix, count).
     strips: dict[str, tuple[str, str, int]]
+    # Physics: link -> its parts' hulls (each a tuple of pieces).
+    sim_hulls: dict[str, tuple[tuple[str, ...], ...]]
+    # The lift: its export joints (equal stages, 0 = fully raised, lowering
+    # along -z) and the bundled links it runs through, base to torso
+    # ("root"); one stage per pair of neighbours, the later ones mimicking
+    # the first. Empty: no lift.
+    lift_joints: tuple[str, ...]
+    lift_links: tuple[str, ...]
+    # Masses (kg) of its links and s1 / head: ESTIMATES, not measured.
+    masses: dict[str, float]
     # Whether the export root is the ground the robot stands on (a floor
     # link goes there); the Owl mount and standalone Axol stand on whatever
     # they are bolted to, above where the arms hang.
     floor: bool
-    title: str  # what the URDFs' header calls the robot
-    note: str  # the arm model's header note
-    whole_body: bool = False  # also the whole-body and sim models
+    title: str  # what the URDF's header calls the robot
+    note: str  # what IK keeps the arms clear of, for the header
+    # The Jelly base drives in the plane: base_x / base_y / base_yaw joints
+    # (whole-body IK solves them; a simulator can drive them).
+    planar: bool = False
 
+
+_TORSO_MASSES = {"s1": 3.0, "head": 0.3}
 
 JELLY = Body(
     key="mobile",
@@ -248,22 +244,43 @@ JELLY = Body(
         ),
         "Jelly_Stage_2.stl": (*_ALL, "column_mid", ""),
     },
-    hulls={
+    # Each lift-column section rides its own stage.
+    ik_hulls={
         "lift_plate": ("lift_plate",),
-        "base": ("column_top", "column_mid", "column_stub"),
+        "base": ("column_top",),
+        "lift_stage": ("column_mid",),
+        "jelly": ("column_stub",),
     },
-    strips={},
+    strips={"deck": ("jelly", "deck", DECK_STRIPS)},
+    sim_hulls={
+        "lift_plate": (("lift_plate",),),
+        "base": (("column_top",),),
+        "lift_stage": (("column_mid",),),
+        "jelly": (("column_stub",), ("deck",)),
+    },
+    lift_joints=("stage_1", "stage_2"),
+    lift_links=("jelly", "lift_stage", "root"),
+    masses={
+        **_TORSO_MASSES,
+        "jelly": 40.0,  # drive base + two 24 V 50 Ah LiFePO4 packs
+        "lift_stage": 3.0,
+        "base": 4.0,  # top lift stage
+        "lift_plate": 1.0,
+        "wheel_1_link": 1.0,
+        "wheel_2_link": 1.0,
+        "wheel_3_link": 1.0,
+        "wheel_4_link": 1.0,
+    },
     floor=True,
     title="Axol on the Jelly mobile base",
     note=(
-        "Arm IK model: the base, lift, fingers and wheels are frozen, the lift "
-        "fully raised (its CAD pose). At that height the Jelly deck sits below "
-        "anything the arms can reach, so it is visual only; the arms collide "
-        "with the shoulder bar (s1), the lift column (base), its top plate "
-        "(lift_plate) and the head-camera mount (head), exactly as the classic "
-        "arms collide with the classic base and s1."
+        "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
+        "mount (head), the lift column's top plate (lift_plate) and its three "
+        "sections (base, lift_stage, jelly), and, for whole-body IK, the deck "
+        "(deck_0..2). Arm IK freezes the base and lift at zero, the lift "
+        "fully raised, where the deck is below anything the arms can reach."
     ),
-    whole_body=True,
+    planar=True,
 )
 
 # Axol on its own: the shoulder bar and head, nothing below them.
@@ -275,14 +292,17 @@ STANDALONE = Body(
     moving={},
     frame_links=(),
     splits={},
-    hulls={},
+    ik_hulls={},
     strips={},
+    sim_hulls={},
+    lift_joints=(),
+    lift_links=(),
+    masses=dict(_TORSO_MASSES),
     floor=False,
     title="Axol standalone",
     note=(
-        "Arm IK model of Axol standalone: the shoulder bar and head camera, "
-        "nothing below them. The fingers are frozen; the arms collide with the "
-        "shoulder bar (s1) and the head-camera mount (head)."
+        "Nothing below the shoulder bar: IK keeps the arms clear of it (s1) "
+        "and the head-camera mount (head)."
     ),
 )
 
@@ -296,16 +316,20 @@ OWL = Body(
     frame_links=(),
     # The foot plate (255 x 275 mm, 22 mm thick) at the bottom of the column.
     splits={"Owl_Base.stl": ((-_INF, -_INF, -0.37), (_INF,) * 3, "base", "foot")},
-    hulls={"base": ("base",)},
+    ik_hulls={"base": ("base",)},
     # Six strips: the capsule round each is ~24 mm for the 22 mm plate (three
     # would be 44 mm, and swallow the upper arms at the rest pose).
     strips={"foot": ("base", "foot", 6)},
+    sim_hulls={"base": (("base",), ("foot",))},
+    lift_joints=(),
+    lift_links=(),
+    masses={**_TORSO_MASSES, "base": 3.0},
     floor=False,
     title="Axol on the Owl mount",
     note=(
-        "Arm IK model of Axol on the Owl mount: the fingers are frozen; the "
-        "arms collide with the shoulder bar (s1), the head-camera mount "
-        "(head), the mount's column (base) and its foot plate (foot_0..5)."
+        "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
+        "mount (head), the mount's column (base) and its foot plate "
+        "(foot_0..5)."
     ),
 )
 
@@ -327,17 +351,22 @@ OX_CART = Body(
             "cart_frame",
         )
     },
-    hulls={"base": ("base", "column_stub")},
+    # IK freezes the lift fully raised: one hull over the column and the
+    # stub it rides on (in the torso's frame, valid at that height).
+    ik_hulls={"base": ("base", "column_stub")},
     strips={},
+    sim_hulls={"base": (("base",),), "cart": (("column_stub",), ("cart_frame",))},
+    lift_joints=("ox_lift",),
+    lift_links=("cart", "root"),
+    masses={**_TORSO_MASSES, "base": 6.0, "cart": 30.0},
     floor=True,
     title="Axol on the Ox cart",
     note=(
-        "Arm IK model of Axol on the Ox cart: the lift and fingers are frozen, "
-        "the lift fully raised (its CAD pose). At that height the cart's "
-        "caster frame sits below anything the arms can reach, so it is visual "
-        "only; the arms collide with the shoulder bar (s1), the head-camera "
-        "mount (head) and the lift column (base). Lowering the lift brings "
-        "the frame up toward the hands, which this model does not see."
+        "IK freezes the lift fully raised (its CAD pose), where the cart's "
+        "caster frame sits below anything the arms can reach, and keeps the "
+        "arms clear of the shoulder bar (s1), the head-camera mount (head) "
+        "and the lift column (base). Lowering the lift brings the frame up "
+        "toward the hands, which IK does not see."
     ),
 )
 BODIES = (JELLY, OX_CART, OWL, STANDALONE)  # matched in order; standalone last
@@ -358,40 +387,52 @@ HEAD_PROJECTION_BEHIND_COVER = 0.007205
 
 _CYLINDER_RPY = {0: "0 1.5707963267948966 0", 1: "-1.5707963267948966 0 0", 2: "0 0 0"}
 
-# Frame at the ground under the robot (the export's root), in the IK models.
+# Frame at the ground under the robot (the export's root).
 FLOOR_LINK = "floor"
 
-WHOLE_BODY_NOTE = (
-    "Whole-body IK model: the Jelly base moves in the plane (base_x, base_y, "
-    "base_yaw about the Jelly centre) and the lift lowers the torso (lift, "
-    "0 = fully raised, per stage; the second stage mimics it). The world "
-    "frame is the arm model's with every body joint at zero. The arms "
-    "collide with the shoulder bar, top plate, head camera, each lift-column "
-    "section and the deck (deck_0..2)."
+# One model serves IK, the viewers and physics simulators.
+MODEL_NOTE = (
+    "One model for IK, the viewers and physics simulators. Moving: the 14 "
+    "arm joints, {body_joints}{gripper_joints}. "
+    "With every body joint at zero the torso root (link root) is the "
+    "world origin, so poses match the classic axol.urdf. IK "
+    "(almond_axol.kinematics.model) freezes every joint it does not solve "
+    "(arm IK: all but the arms; whole-body IK: the body joints too) and "
+    "collides capsule-friendly pieces, the custom ik_collision elements, "
+    "instead of each part's collision hull; importers ignore them. {ik} "
+    "Physics: arm joints carry AxolConfig's measured friction as <dynamics "
+    "friction> (Coulomb, N·m) and damping (viscous, N·m·s/rad), per arm, and "
+    "the motors' impedance gains as <drive stiffness> (kp, N·m/rad) and "
+    "damping (kd, N·m·s/rad): a custom element no importer reads, so set "
+    "them as each joint's position-drive gains after import. Arm masses and "
+    "CoMs are AxolConfig's tuned gravity-comp values (the wrist-3 body is "
+    "split so {wrist_parts} carry their share while the assembly's total "
+    "mass and CoM stay as tuned); every other mass is an ESTIMATE (Body."
+    "masses in the generator) - replace with measured values. Inertia "
+    "tensors assume uniform density over each part's convex hull. "
+    "Effort/velocity: arm joints keep axol.urdf's values; the rest are "
+    "estimates. {sim}Camera frames (*_optical) use the ROS optical "
+    "convention (+z forward, +x right, +y down); an Isaac Sim camera "
+    "attached with ROS camera axes needs no extra rotation. Mesh paths are "
+    "relative to this file."
 )
-SIM_NOTE = (
-    "Simulation model: rooted at the Jelly on the floor (link jelly, at the "
-    "Jelly centre). Moving: the 14 arm joints, the lift (lift, lift_2 "
-    "mimics), {gripper_joints} and the four wheels "
-    "(continuous). Arm joints carry AxolConfig's measured friction as "
-    "<dynamics friction> (Coulomb, N·m) and damping (viscous, N·m·s/rad), "
-    "per arm, and the motors' impedance gains as <drive stiffness> (kp, "
-    "N·m/rad) and damping (kd, N·m·s/rad): a custom element no importer "
-    "reads, so set them as each joint's position-drive gains after import. "
-    "The x-drive's "
-    "omni rollers are not modelled: plain wheels "
-    "cannot strafe, so drive the base kinematically or with a holonomic "
-    "controller. Arm masses and CoMs are AxolConfig's tuned gravity-comp "
-    "values (the wrist-3 body is split so {wrist_parts} carry their share "
-    "while the assembly's total mass and CoM stay "
-    "as tuned); every other mass is an ESTIMATE (SIM_MASSES in the "
-    "generator) - replace with measured values. Inertia tensors assume "
-    "uniform density over each part's convex hull. Effort/velocity: arm "
-    "joints keep axol.urdf's values; the rest are estimates. Camera frames "
-    "(*_optical) use the ROS optical convention (+z forward, +x right, +y "
-    "down); an Isaac Sim camera attached with ROS camera axes needs no extra "
-    "rotation. Mesh paths are relative to this file."
-)
+# Per body: its joints, and what a simulator should know about them.
+BODY_JOINTS_NOTE = {
+    "mobile": (
+        "the Jelly base in the plane (base_x, base_y, base_yaw about the "
+        "Jelly centre, in the world frame), the lift (lift, 0 = fully raised, "
+        "lowering each of the two stages; lift_2 mimics it), the four wheels "
+        "(continuous), "
+    ),
+    "ox_cart": "the cart's lift (lift, 0 = fully raised, positive lowers), ",
+}
+SIM_BODY_NOTE = {
+    "mobile": (
+        "The x-drive's omni rollers are not modelled: plain wheels cannot "
+        "strafe, so drive the base through base_x / base_y / base_yaw (or "
+        "kinematically). "
+    ),
+}
 
 HEAD_CAMERA_NOTE = (
     "Head camera frames (head_camera_*_optical, ZED X Mini Wide): each lens's "
@@ -406,21 +447,6 @@ WRIST_CAMERA_NOTE = (
     "gripper at the bottom of the image, as in real frames. " + HEAD_CAMERA_NOTE
 )
 
-# Masses (kg) of the non-arm links in the sim model: ESTIMATES, not measured.
-# The wrist-3 entries are carved out of AxolConfig's wrist_3 mass (which
-# lumps the whole gripper assembly), so they redistribute rather than add.
-SIM_MASSES: dict[str, float] = {
-    "jelly": 40.0,  # drive base + two 24 V 50 Ah LiFePO4 packs
-    "lift_stage": 3.0,
-    "base": 4.0,  # top lift stage
-    "lift_plate": 1.0,
-    "s1": 3.0,
-    "head": 0.3,
-    "wheel_1_link": 1.0,
-    "wheel_2_link": 1.0,
-    "wheel_3_link": 1.0,
-    "wheel_4_link": 1.0,
-}
 # Joint effort (N·m or N) / velocity (rad/s or m/s) in the sim model for the
 # joints axol.urdf does not define: ESTIMATES.
 SIM_LIMITS: dict[str, tuple[float, float]] = {
@@ -428,6 +454,8 @@ SIM_LIMITS: dict[str, tuple[float, float]] = {
     "finger": (50.0, 0.1),
     "plate": (5.0, 3.0),
     "wheel": (20.0, 30.0),
+    "base": (1000.0, 1.0),
+    "base_yaw": (1000.0, 1.0),
 }
 
 
@@ -448,15 +476,14 @@ class Variant:
     # Masses (kg, ESTIMATES) carved out of AxolConfig's wrist_3 mass, which
     # lumps the whole gripper assembly, so they redistribute rather than add.
     wrist_parts: dict[str, float]
-    # Per model ("arm", and for Jelly "whole_body" and "sim"): its file.
-    outputs: dict[str, Path]
+    output: Path
     mesh_subdir: str
     # Set to reference the meshes earlier exports in the run wrote from the
     # same parts instead of writing copies (the body and arms are the same in
     # every export): the first export's subdirectory, which they all share.
     share_subdir: str | None
     wrist_cameras: bool
-    gripper_joints: str  # SIM_NOTE's description of the gripper joints
+    gripper_joints: str  # MODEL_NOTE's description of the gripper joints
     wrist_parts_note: str  # ... and of wrist_parts
 
     @property
@@ -516,7 +543,7 @@ PARALLEL = Variant(
         "finger_2": 0.04,
         "wrist_camera": 0.08,
     },
-    outputs={"arm": OUT_ARM, "whole_body": OUT_WHOLE_BODY, "sim": OUT_SIM},
+    output=URDF_DIR / "axol_jelly.urdf",
     mesh_subdir=MESH_SUBDIR,
     share_subdir=None,
     wrist_cameras=True,
@@ -548,11 +575,7 @@ PARCEL = Variant(
     hulls=(),
     tight=("_gripper", "_plate"),
     wrist_parts={"gripper": 0.30, "plate": 0.08},
-    outputs={
-        "arm": URDF_DIR / "axol_jelly_parcel.urdf",
-        "whole_body": URDF_DIR / "axol_jelly_parcel_whole_body.urdf",
-        "sim": URDF_DIR / "axol_jelly_parcel_sim.urdf",
-    },
+    output=URDF_DIR / "axol_jelly_parcel.urdf",
     mesh_subdir="meshes/jelly_parcel",
     share_subdir=MESH_SUBDIR,
     wrist_cameras=False,
@@ -566,12 +589,12 @@ PARCEL = Variant(
 
 
 def _mount(body: Body) -> Variant:
-    """The parallel gripper on a non-Jelly body: its arm IK model only, with
-    its own body meshes and everything else shared with Jelly's."""
+    """The parallel gripper on a non-Jelly body: its own body meshes, and
+    everything else shared with Jelly's."""
     return replace(
         PARALLEL,
         body=body,
-        outputs={"arm": URDF_DIR / f"axol_{body.key}.urdf"},
+        output=URDF_DIR / f"axol_{body.key}.urdf",
         mesh_subdir=f"meshes/{body.key}",
         share_subdir=MESH_SUBDIR,
     )
@@ -714,9 +737,12 @@ def check_equivalent(
     _zero(export)
 
 
-def check_lift(export: yourdfpy.URDF) -> float:
-    """The export's two lift stages: same travel, both lowering along -z."""
-    stages = [export.joint_map[n] for n in ("stage_1", "stage_2")]
+def check_lift(export: yourdfpy.URDF, names: tuple[str, ...]) -> float:
+    """The export's lift stages: same travel, each lowering along -z from 0
+    (fully raised). Returns the travel per stage (0 without a lift)."""
+    if not names:
+        return 0.0
+    stages = [export.joint_map[n] for n in names]
     travel = {round(float(j.limit.upper), 6) for j in stages}
     if len(travel) != 1 or any(abs(float(j.limit.lower)) > 1e-6 for j in stages):
         raise SystemExit(f"lift stages differ: {travel}")
@@ -729,7 +755,7 @@ def check_lift(export: yourdfpy.URDF) -> float:
         )
         if not np.allclose(axis, [0, 0, -1], atol=1e-6):
             raise SystemExit(f"{j.name} does not lower along -z: {axis}")
-    print(f"lift: two stages of {travel.pop():.3f} m each, 0 = fully raised")
+    print(f"lift: {len(stages)} stage(s) of {travel.pop():.3f} m, 0 = fully raised")
     return float(stages[0].limit.upper)
 
 
@@ -1293,8 +1319,10 @@ class Collision:
         return out
 
 
-def collision_plan(model: str, col: Collision) -> dict[str, list[Spec]]:
-    """Each model's collision bodies (link -> specs)."""
+def collision_plan(kind: str, col: Collision) -> dict[str, list[Spec]]:
+    """The model's collision bodies (link -> specs): ``"ik"`` the
+    capsule-friendly set IK collides (<ik_collision>), ``"sim"`` one hull per
+    part for physics (<collision>)."""
     variant = col.frames.variant
     body = variant.body
     hulls = (
@@ -1312,28 +1340,22 @@ def collision_plan(model: str, col: Collision) -> dict[str, list[Spec]]:
         side: tuple(n for n in variant.moving if n.startswith(f"{side}_"))
         for side in ("left", "right")
     }
-    if model == "arm":
-        for link, pieces in body.hulls.items():
+    if kind == "ik":
+        for link, pieces in body.ik_hulls.items():
             plan[link] = [col.hull(link, pieces)]
         for piece, (parent, prefix, count) in body.strips.items():
             plan.update(col.deck_strips(parent, piece, prefix, count))
-    else:
-        # Jelly's whole-body and sim models: each lift stage its own link.
-        plan["lift_plate"] = [col.hull("lift_plate", ("lift_plate",))]
-        plan["base"] = [col.hull("base", ("column_top",))]
-        plan["lift_stage"] = [col.hull("lift_stage", ("column_mid",))]
-        plan["jelly"] = [col.hull("jelly", ("column_stub",))]
-    if model in ("arm", "whole_body"):
+        # IK freezes the jaws, so each gripper's collide as one body over
+        # their whole motion.
         for side, parts in jaws.items():
             plan[f"{side}_fingers"] = [
                 col.plate_sweep(f"{side}_gripper", *parts)
                 if variant.gripper == "parcel"
                 else col.finger_cylinder(f"{side}_gripper", parts)
             ]
-    if model == "whole_body":
-        plan.update(col.deck_strips())
-    if model == "sim":
-        plan["jelly"].append(col.hull("jelly", ("deck",)))
+    else:
+        for link, parts in body.sim_hulls.items():
+            plan[link] = [col.hull(link, pieces) for pieces in parts]
         for parts in jaws.values():
             for part in parts:
                 plan[part] = [col.hull(part, (part,))]
@@ -1408,7 +1430,7 @@ def sim_inertials(
         if rest <= 0:
             raise SystemExit(f"{w2}: wrist parts outweigh the tuned wrist_3 mass")
         out[w2] = (rest, (total * com_total - carved_moment) / rest, None)
-    for link, mass in SIM_MASSES.items():
+    for link, mass in col.frames.variant.body.masses.items():
         out[link] = (mass, hull_of(link).center_mass, None)
     return {
         link: (mass, com, inertia(link, mass, com))
@@ -1496,60 +1518,86 @@ def _translation(xyz: np.ndarray) -> np.ndarray:
     return pose
 
 
+def _collision(element: ET.Element, tag: str, spec: Spec) -> None:
+    col = ET.SubElement(element, tag)
+    if spec[0] == "mesh":
+        ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
+        geom = ET.SubElement(col, "geometry")
+        ET.SubElement(geom, "mesh", filename=spec[1], scale="1 1 1")
+    else:
+        _, radius, length, xyz, rpy = spec
+        ET.SubElement(col, "origin", xyz=_fmt(xyz), rpy=rpy)
+        geom = ET.SubElement(col, "geometry")
+        ET.SubElement(geom, "cylinder", radius=f"{radius:g}", length=f"{length:g}")
+
+
+def _inertial(element: ET.Element, mass: float, com: np.ndarray, tensor) -> None:
+    inertial = ET.Element("inertial")
+    ET.SubElement(inertial, "origin", xyz=_fmt(com), rpy="0 0 0")
+    ET.SubElement(inertial, "mass", value=f"{mass:.6g}")
+    ET.SubElement(
+        inertial,
+        "inertia",
+        ixx=f"{tensor[0, 0]:.6g}",
+        ixy=f"{tensor[0, 1]:.6g}",
+        ixz=f"{tensor[0, 2]:.6g}",
+        iyy=f"{tensor[1, 1]:.6g}",
+        iyz=f"{tensor[1, 2]:.6g}",
+        izz=f"{tensor[2, 2]:.6g}",
+    )
+    element.insert(0, inertial)
+
+
+# The planar base's two intermediate links carry no part; physics engines
+# want some mass on every moving link.
+_VIRTUAL_MASS = 0.01
+
+
 def write_urdf(
-    model: str,
     out_path: Path,
     visuals: dict[str, list[tuple[str, tuple[float, ...], np.ndarray]]],
-    plan: dict[str, list[Spec]],
+    ik_plan: dict[str, list[Spec]],
+    sim_plan: dict[str, list[Spec]],
     limits: dict[str, tuple[float, float]],
     frames: Frames,
     cameras: dict[str, tuple[str, np.ndarray]],
     export: yourdfpy.URDF,
     lift_travel: float,
-    inertials: dict[str, tuple[float, np.ndarray, np.ndarray]] | None = None,
-    dynamics: dict[str, dict[str, float]] | None = None,
+    inertials: dict[str, tuple[float, np.ndarray, np.ndarray]],
+    dynamics: dict[str, dict[str, float]],
 ) -> None:
+    """The variant's one model: every moving part a joint, both collision
+    sets, masses and drives (see MODEL_NOTE)."""
     tree = ET.parse(CLASSIC_URDF)
     robot = tree.getroot()
     robot.set("name", "assembly")
     links = {ln.get("name"): ln for ln in robot.findall("link")}
     centre = frames.jelly_center
-    # Mesh paths: package:// for the IK models (the control panel and headset
-    # map "assembly" onto this directory); relative for the sim model, whose
-    # importers resolve files next to the URDF.
-    prefix = "" if model == "sim" else PACKAGE
+    variant = frames.variant
+    body = variant.body
 
     def link(name: str) -> None:
         links[name] = ET.SubElement(robot, "link", name=name)
 
-    variant = frames.variant
     for name, parent in variant.all_extra_links.items():
-        if model == "sim" and name in FINGER_LINKS:
-            continue
         link(name)
         _joint(robot, f"{name}_0", "fixed", parent, name)
-    body_links = variant.body.frame_links
-    for name in (*body_links, *variant.all_moving, *cameras):
+    for name in (*body.frame_links, *variant.all_moving, *cameras):
         link(name)
     for name, (parent, pose) in cameras.items():
         _joint(robot, f"{name}_0", "fixed", parent, name, pose)
+    for strip, parent in frames.strip_parent.items():
+        link(strip)
+        _joint(robot, f"{strip}_0", "fixed", parent, strip)
 
-    lift = ("prismatic", np.array([0, 0, -1.0]), (0.0, lift_travel))
-    if model == "arm":
-        if frames.floor is not None:
+    # A body the torso rides on: world -> (planar base ->) the body's base
+    # link -> lift stages -> the torso root (the classic tree). At every
+    # body joint's zero, "root" is the world origin.
+    if body.lift_links:
+        base_link = body.lift_links[0]
+        link("world")
+        if body.floor:
             link(FLOOR_LINK)
-            _joint(robot, f"{FLOOR_LINK}_0", "fixed", "root", FLOOR_LINK, frames.floor)
-        for name in body_links:
-            _joint(robot, f"{name}_0", "fixed", "root", name, _translation(centre))
-        for strip, parent in frames.strip_parent.items():
-            link(strip)
-            _joint(robot, f"{strip}_0", "fixed", parent, strip)
-    else:
-        if model == "whole_body":
-            # world -> planar base -> jelly -> lift -> torso root (the classic
-            # tree). At every body joint's zero, "root" is the world origin.
-            for name in ("world", "base_x_link", "base_y_link", FLOOR_LINK):
-                link(name)
             _joint(
                 robot,
                 f"{FLOOR_LINK}_0",
@@ -1558,7 +1606,11 @@ def write_urdf(
                 FLOOR_LINK,
                 _translation(centre),
             )
+        if body.planar:
+            for name in ("base_x_link", "base_y_link"):
+                link(name)
             travel = (-BASE_TRAVEL, BASE_TRAVEL)
+            planar = SIM_LIMITS["base"]
             _joint(
                 robot,
                 "base_x",
@@ -1568,6 +1620,7 @@ def write_urdf(
                 _translation(centre),
                 np.array([1.0, 0, 0]),
                 travel,
+                effort_velocity=planar,
             )
             _joint(
                 robot,
@@ -1578,49 +1631,51 @@ def write_urdf(
                 None,
                 np.array([0, 1.0, 0]),
                 travel,
+                effort_velocity=planar,
             )
             _joint(
                 robot,
                 "base_yaw",
                 "revolute",
                 "base_y_link",
-                "jelly",
+                base_link,
                 None,
                 np.array([0, 0, 1.0]),
                 (-2 * np.pi, 2 * np.pi),
+                effort_velocity=SIM_LIMITS["base_yaw"],
             )
-            for i in range(DECK_STRIPS):
-                link(f"deck_{i}")
-                _joint(robot, f"deck_{i}_0", "fixed", "jelly", f"deck_{i}")
-        lift_limits = SIM_LIMITS["lift"] if model == "sim" else (1.0, 1.0)
+        else:
+            _joint(
+                robot,
+                f"{base_link}_0",
+                "fixed",
+                "world",
+                base_link,
+                _translation(centre),
+            )
+        stages = list(zip(body.lift_links, body.lift_links[1:]))
+        for k, (parent, child) in enumerate(stages):
+            _joint(
+                robot,
+                "lift" if k == 0 else f"lift_{k + 1}",
+                "prismatic",
+                parent,
+                child,
+                _translation(-centre) if child == "root" else None,
+                np.array([0, 0, -1.0]),
+                (0.0, lift_travel),
+                mimic="lift" if k else None,
+                effort_velocity=SIM_LIMITS["lift"],
+            )
+    elif body.floor:
+        link(FLOOR_LINK)
         _joint(
-            robot,
-            "lift",
-            *lift[:1],
-            "jelly",
-            "lift_stage",
-            None,
-            *lift[1:],
-            effort_velocity=lift_limits,
-        )
-        _joint(
-            robot,
-            "lift_2",
-            *lift[:1],
-            "lift_stage",
-            "root",
-            _translation(-centre),
-            *lift[1:],
-            mimic="lift",
-            effort_velocity=lift_limits,
+            robot, f"{FLOOR_LINK}_0", "fixed", "root", FLOOR_LINK, _translation(centre)
         )
 
     for name, moving in variant.all_moving.items():
         joint = export.joint_map[moving.export_joint]
         pose = frames.relative(moving.parent, name)
-        if model != "sim":
-            _joint(robot, f"{name}_0", "fixed", moving.parent, name, pose)
-            continue
         if name.startswith("wheel_"):
             _joint(
                 robot,
@@ -1646,6 +1701,7 @@ def write_urdf(
                 effort_velocity=SIM_LIMITS["plate"],
             )
         else:
+            # Fingers: 0 = the export's pose, along its axis over its range.
             _joint(
                 robot,
                 f"{name}_joint",
@@ -1654,62 +1710,40 @@ def write_urdf(
                 name,
                 pose,
                 joint.axis,
-                (0.0, float(joint.limit.upper)),
+                (float(joint.limit.lower), float(joint.limit.upper)),
                 mimic=f"{moving.mimic}_joint" if moving.mimic else None,
                 effort_velocity=SIM_LIMITS["finger"],
             )
 
+    virtual = {"base_x_link", "base_y_link"} & set(links)
     for name, element in links.items():
-        for tag in ("visual", "collision"):
+        for tag in ("visual", "collision", "inertial"):
             for el in element.findall(tag):
                 element.remove(el)
-        if inertials is not None:
-            for el in element.findall("inertial"):
-                element.remove(el)
-            if name in inertials:
-                mass, com, tensor = inertials[name]
-                inertial = ET.Element("inertial")
-                ET.SubElement(inertial, "origin", xyz=_fmt(com), rpy="0 0 0")
-                ET.SubElement(inertial, "mass", value=f"{mass:.6g}")
-                ET.SubElement(
-                    inertial,
-                    "inertia",
-                    ixx=f"{tensor[0, 0]:.6g}",
-                    ixy=f"{tensor[0, 1]:.6g}",
-                    ixz=f"{tensor[0, 2]:.6g}",
-                    iyy=f"{tensor[1, 1]:.6g}",
-                    iyz=f"{tensor[1, 2]:.6g}",
-                    izz=f"{tensor[2, 2]:.6g}",
-                )
-                element.insert(0, inertial)
+        if name in inertials:
+            _inertial(element, *inertials[name])
+        elif name in virtual:
+            _inertial(element, _VIRTUAL_MASS, np.zeros(3), np.eye(3) * 1e-6)
         for path, rgba, offset in visuals.get(name, []):
             vis = ET.SubElement(element, "visual")
             ET.SubElement(vis, "origin", xyz=_fmt(offset), rpy="0 0 0")
             geom = ET.SubElement(vis, "geometry")
-            ET.SubElement(geom, "mesh", filename=prefix + path, scale="1 1 1")
+            ET.SubElement(geom, "mesh", filename=path, scale="1 1 1")
             mat = ET.SubElement(
                 vis, "material", name="c_" + "_".join(f"{c:g}" for c in rgba)
             )
             ET.SubElement(mat, "color", rgba=" ".join(f"{c:g}" for c in rgba))
-        for spec in plan.get(name, []):
-            col = ET.SubElement(element, "collision")
-            if spec[0] == "mesh":
-                ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
-                geom = ET.SubElement(col, "geometry")
-                ET.SubElement(geom, "mesh", filename=prefix + spec[1], scale="1 1 1")
-            else:
-                _, radius, length, xyz, rpy = spec
-                ET.SubElement(col, "origin", xyz=_fmt(xyz), rpy=rpy)
-                geom = ET.SubElement(col, "geometry")
-                ET.SubElement(
-                    geom, "cylinder", radius=f"{radius:g}", length=f"{length:g}"
-                )
+        for spec in sim_plan.get(name, []):
+            _collision(element, "collision", spec)
+        # Not URDF: importers ignore it; IK collides these instead.
+        for spec in ik_plan.get(name, []):
+            _collision(element, "ik_collision", spec)
     for joint in robot.findall("joint"):
         lim = limits.get(joint.get("name", ""))
         if lim is not None:
             joint.find("limit").set("lower", f"{lim[0]:.4f}")
             joint.find("limit").set("upper", f"{lim[1]:.4f}")
-        dyn = (dynamics or {}).get(joint.get("name", ""))
+        dyn = dynamics.get(joint.get("name", ""))
         if dyn is not None:
             ET.SubElement(
                 joint,
@@ -1727,26 +1761,28 @@ def write_urdf(
             )
     ET.indent(tree, space="    ")
     xml = ET.tostring(robot, encoding="unicode")
-    sim_note = SIM_NOTE.format(
-        gripper_joints=variant.gripper_joints, wrist_parts=variant.wrist_parts_note
-    )
     gripper = (
         "With the parcel gripper (AxolConfig.gripper = parcel): a fixed jaw "
         "and a plate hinged on it, no wrist cameras. "
         if variant.gripper == "parcel"
         else ""
     )
+    model_note = MODEL_NOTE.format(
+        body_joints=BODY_JOINTS_NOTE.get(body.key, ""),
+        gripper_joints=variant.gripper_joints,
+        ik=body.note,
+        wrist_parts=variant.wrist_parts_note,
+        sim=SIM_BODY_NOTE.get(body.key, ""),
+    )
     note = (
-        f"{variant.body.title}. GENERATED by scripts/build_jelly_urdfs.py "
+        f"{body.title}. GENERATED by scripts/build_urdfs.py "
         "from the Onshape export; do not edit by hand. "
         + gripper
         + "Arm links, joints and "
         "joint frames are the classic axol.urdf's, so FK and gravity "
         "compensation match it exactly; joint limits and meshes are the "
         "export's. "
-        + {"arm": variant.body.note, "whole_body": WHOLE_BODY_NOTE, "sim": sim_note}[
-            model
-        ]
+        + model_note
         + " "
         + (WRIST_CAMERA_NOTE if variant.wrist_cameras else HEAD_CAMERA_NOTE)
     )
@@ -1770,7 +1806,7 @@ def build(args: argparse.Namespace, export_dir: Path) -> None:
     print(f"== {export_dir} ({body.title}, {variant.gripper} gripper)")
     tf, sg = align(classic, export)
     check_equivalent(classic, export, tf, sg, variant)
-    lift_travel = check_lift(export) if body.whole_body else 0.0
+    lift_travel = check_lift(export, body.lift_joints)
     limits = export_limits(export, sg)
     for name, (lo, hi) in limits.items():
         old = classic.joint_map[name].limit
@@ -1794,22 +1830,23 @@ def build(args: argparse.Namespace, export_dir: Path) -> None:
         frames.floor = _translation(frames.jelly_center)
     cameras = camera_frames(in_root, frames)
     col = Collision(frames, pieces, export)
-    for model, out_path in variant.outputs.items():
-        plan = collision_plan(model, col)
-        report(model, plan)
-        write_urdf(
-            model,
-            out_path,
-            visuals,
-            plan,
-            limits,
-            frames,
-            cameras,
-            export,
-            lift_travel,
-            sim_inertials(col, plan) if model == "sim" else None,
-            sim_dynamics() if model == "sim" else None,
-        )
+    ik_plan = collision_plan("ik", col)
+    sim_plan = collision_plan("sim", col)
+    report("ik", ik_plan)
+    report("sim", sim_plan)
+    write_urdf(
+        variant.output,
+        visuals,
+        ik_plan,
+        sim_plan,
+        limits,
+        frames,
+        cameras,
+        export,
+        lift_travel,
+        sim_inertials(col, sim_plan),
+        sim_dynamics(),
+    )
 
 
 def main() -> None:

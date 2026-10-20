@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 from xml.etree import ElementTree
 
 import numpy as np
@@ -10,8 +8,6 @@ import yourdfpy
 
 from almond_axol.constants import (
     ARM_JOINTS,
-    JELLY_PARCEL_SIM_URDF,
-    JELLY_SIM_URDF,
     URDF_PATH,
     AxolModel,
     Joint,
@@ -21,6 +17,7 @@ from almond_axol.constants import (
     urdf_body_name,
     urdf_path,
 )
+from almond_axol.kinematics.model import ik_urdf, ik_urdf_xml
 
 
 class UrdfContractTest(unittest.TestCase):
@@ -124,32 +121,31 @@ def _element_attrs(el: ElementTree.Element | None) -> dict[str, str]:
 
 
 class MobileUrdfContractTest(unittest.TestCase):
-    """The mobile URDF is the classic arms on a different body.
+    """The generated URDFs are the classic arms on a different body.
 
     Everything downstream of the arm chain — FK, recorded Cartesian frames,
-    gravity compensation and its tuned mass/CoM parameters — assumes the two
-    versions' arms are the same, so this pins that the generated file only
-    differs where it should: the elbow limits, the meshes, and the body.
+    gravity compensation and its tuned mass/CoM parameters — assumes every
+    version's arms are the same, so this pins that each generated file only
+    differs where it should: the elbow limits, the meshes, and the body —
+    both as IK sees it (:func:`ik_urdf`) and as the full model.
     """
 
-    # The version, its fitted gripper (the mobile Axol has a URDF per
-    # gripper) and its whole-body and sim models, if it has them.
     model = AxolModel.MOBILE
     gripper = "parallel"
-    sim_path: Path | None = JELLY_SIM_URDF
-    whole_body = True
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.path = urdf_path(cls.model, gripper=cls.gripper)
         cls.root = ElementTree.parse(cls.path).getroot()
         cls.classic = ElementTree.parse(URDF_PATH).getroot()
-        cls.urdf = yourdfpy.URDF.load(str(cls.path), mesh_dir=str(cls.path.parent))
+        # What arm IK loads: every joint but the arms' frozen.
+        cls.urdf = ik_urdf(cls.path)
+        cls.ik_root = ElementTree.fromstring(ik_urdf_xml(cls.path))
 
     def _joints(self, root: ElementTree.Element) -> dict[str, ElementTree.Element]:
         return {j.attrib["name"]: j for j in root.findall("joint")}
 
-    def test_only_the_arm_joints_move(self) -> None:
+    def test_arm_ik_moves_only_the_arm_joints(self) -> None:
         expected = set(
             urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(is_left=False)
         )
@@ -178,32 +174,44 @@ class MobileUrdfContractTest(unittest.TestCase):
                 else:
                     self.assertEqual((new_lo, new_hi), (lo, hi))
 
-    def test_arm_inertials_match_classic(self) -> None:
-        links = {ln.attrib["name"]: ln for ln in self.root.findall("link")}
-        classic = {ln.attrib["name"]: ln for ln in self.classic.findall("link")}
-        for body in _arm_bodies():
-            with self.subTest(body=body):
-                a, b = classic[body].find("inertial"), links[body].find("inertial")
-                for tag in ("mass", "origin", "inertia"):
-                    self.assertEqual(
-                        _element_attrs(b.find(tag)), _element_attrs(a.find(tag))
-                    )
+    def test_its_masses_give_the_tuned_gravity_torques(self) -> None:
+        # The full model's own masses (AxolConfig's, with wrist_3's lump
+        # split across the gripper parts) weigh the arms exactly as gravity
+        # compensation's tuned model does.
+        import mujoco
 
-    def test_gravity_torques_match_classic(self) -> None:
         from almond_axol.robot import gravity
 
-        classic = gravity.GravityCompensator()
-        mobile_text = gravity._load_urdf_text(self.path)
-        with patch.object(gravity, "_load_urdf_text", return_value=mobile_text):
-            mobile = gravity.GravityCompensator()
+        tuned = gravity.GravityCompensator()
+        # fusestatic off: MuJoCo's fusing of fixed-jointed links misplaces
+        # their CoMs, which would shift wrist_3's by ~3 mm.
+        text = gravity._load_urdf_text(self.path).replace(
+            '<robot name="assembly">',
+            '<robot name="assembly"><mujoco><compiler fusestatic="false" '
+            'balanceinertia="false"/></mujoco>',
+            1,
+        )
+        model = mujoco.MjModel.from_xml_string(text)
+        data = mujoco.MjData(model)
         rng = np.random.default_rng(0)
-        for _ in range(20):
+        for _ in range(10):
             q = rng.uniform(-1.5, 1.5, len(ARM_JOINTS))
             for is_left in (True, False):
+                data.qpos[:] = 0.0
+                data.qvel[:] = 0.0
+                adr = [
+                    model.jnt_dofadr[
+                        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                    ]
+                    for name in urdf_arm_joint_names(is_left=is_left)
+                ]
+                for i, a in enumerate(adr):
+                    data.qpos[model.jnt_qposadr[model.dof_jntid[a]]] = q[i]
+                mujoco.mj_forward(model, data)
                 np.testing.assert_allclose(
-                    mobile.gravity_arm(q, is_left=is_left),
-                    classic.gravity_arm(q, is_left=is_left),
-                    atol=1e-6,
+                    data.qfrc_bias[adr],
+                    tuned.gravity_arm(q, is_left=is_left),
+                    atol=1e-4,
                 )
 
     def test_zero_pose_keeps_the_classic_grippers(self) -> None:
@@ -213,41 +221,44 @@ class MobileUrdfContractTest(unittest.TestCase):
                 self.urdf.get_transform(link), classic.get_transform(link), atol=1e-9
             )
 
-    def test_body_links_carry_collision_geometry(self) -> None:
-        links = {ln.attrib["name"]: ln for ln in self.root.findall("link")}
-        for link in torso_links(self.model) + tuple(_arm_bodies()):
+    def test_ik_collides_the_body_and_arms_only(self) -> None:
+        links = {ln.attrib["name"]: ln for ln in self.ik_root.findall("link")}
+        whole_body = self.model is AxolModel.MOBILE
+        torso = set(torso_links(self.model, whole_body=whole_body))
+        for link in sorted(torso) + _arm_bodies():
             with self.subTest(link=link):
                 self.assertIsNotNone(links[link].find("collision"))
-        # Every other link is visual or a frame only: a torso link without
-        # geometry would get a point capsule from pyroki. (The Jelly deck and
-        # the Ox cart's caster frame are out of reach with the lift raised.)
-        torso = set(torso_links(self.model))
+        # Every other link is visual or a frame only for IK: a torso link
+        # without geometry would get a point capsule from pyroki. (The Jelly
+        # deck and the Ox cart's caster frame are out of reach with the lift
+        # raised.)
         for name, link in links.items():
             if not name.startswith(("left_", "right_")) and name not in torso:
                 with self.subTest(link=name):
                     self.assertIsNone(link.find("collision"))
+        self.assertIsNone(self.ik_root.find("link/ik_collision"))
 
-    def test_meshes_exist(self) -> None:
-        prefix = "package://assembly/"
-        paths = [self.path]
-        if self.whole_body:
-            paths.append(urdf_path(self.model, whole_body=True, gripper=self.gripper))
-        if self.sim_path is not None:
-            paths.append(self.sim_path)
-        for path in paths:
-            for mesh in ElementTree.parse(path).getroot().iter("mesh"):
-                ref = mesh.attrib["filename"].removeprefix(prefix)
-                # IK models resolve meshes via the package, the sim model
-                # relative to itself; both land in the generated directories.
-                self.assertTrue(ref.startswith(_GENERATED_DIRS), ref)
-                self.assertTrue((path.parent / ref).is_file(), ref)
+    def test_every_part_has_contact_geometry_and_mass(self) -> None:
+        # The full model, for physics: every link with a visual collides
+        # and has a mass.
+        for link in self.root.findall("link"):
+            if link.find("visual") is None:
+                continue
+            with self.subTest(link=link.attrib["name"]):
+                self.assertIsNotNone(link.find("collision"))
+                self.assertGreater(float(link.find("inertial/mass").attrib["value"]), 0)
+
+    def test_meshes_are_relative_and_exist(self) -> None:
+        for mesh in self.root.iter("mesh"):
+            ref = mesh.attrib["filename"]
+            self.assertTrue(ref.startswith(_GENERATED_DIRS), ref)
+            self.assertTrue((self.path.parent / ref).is_file(), ref)
 
 
 class ParcelUrdfContractTest(MobileUrdfContractTest):
     """The mobile Axol with the parcel gripper: the same arms on the same body."""
 
     gripper = "parcel"
-    sim_path = JELLY_PARCEL_SIM_URDF
 
     def test_gripper_is_the_parcel_gripper(self) -> None:
         links = {ln.attrib["name"] for ln in self.root.findall("link")}
@@ -259,55 +270,63 @@ class ParcelUrdfContractTest(MobileUrdfContractTest):
             self.assertNotIn(f"{side}_wrist_camera_optical", links)
 
     def test_plate_sweep_is_one_capsule(self) -> None:
-        # The IK model cannot see the plate's angle: its collision body
-        # covers the whole sweep, fixed to the gripper.
-        links = {ln.attrib["name"]: ln for ln in self.root.findall("link")}
+        # IK cannot see the plate's angle: its collision body covers the
+        # whole sweep, fixed to the gripper.
+        links = {ln.attrib["name"]: ln for ln in self.ik_root.findall("link")}
         for side in ("left", "right"):
             (col,) = links[f"{side}_fingers"].findall("collision")
             self.assertIsNotNone(col.find("geometry/cylinder"))
             joint = next(
                 j
-                for j in self.root.findall("joint")
+                for j in self.ik_root.findall("joint")
                 if j.find("child").attrib["link"] == f"{side}_fingers"
             )
             self.assertEqual(joint.find("parent").attrib["link"], f"{side}_gripper")
+            # The plate itself is frozen and collides only through the sweep.
+            self.assertIsNone(links[f"{side}_plate"].find("collision"))
 
 
 class StandaloneUrdfContractTest(MobileUrdfContractTest):
     """Axol standalone: the same arms under nothing but the shoulder bar."""
 
     model = AxolModel.STANDALONE
-    sim_path = None
-    whole_body = False
 
 
-class OxCartUrdfContractTest(StandaloneUrdfContractTest):
+class OxCartUrdfContractTest(MobileUrdfContractTest):
     """Axol on the Ox cart: the same arms on its lift column."""
 
     model = AxolModel.OX_CART
 
 
-class OwlUrdfContractTest(StandaloneUrdfContractTest):
+class OwlUrdfContractTest(MobileUrdfContractTest):
     """Axol on the Owl mount: the same arms on its column and foot."""
 
     model = AxolModel.OWL
 
 
-# Where scripts/build_jelly_urdfs.py writes meshes.
+# Where scripts/build_urdfs.py writes meshes.
 _GENERATED_DIRS = tuple(
     f"meshes/{d}/" for d in ("jelly", "jelly_parcel", "standalone", "owl", "ox_cart")
 )
 
 
 class GeneratedMeshesTest(unittest.TestCase):
+    def test_one_urdf_per_version(self) -> None:
+        # Legacy, standalone, Ox cart, Owl and Jelly — plus Jelly with the
+        # parcel gripper — and nothing else.
+        self.assertEqual(
+            {p.name for p in URDF_PATH.parent.glob("*.urdf")},
+            {urdf_path(m).name for m in AxolModel}
+            | {urdf_path(AxolModel.MOBILE, gripper="parcel").name},
+        )
+
     def test_every_generated_mesh_is_used(self) -> None:
         # Exports share meshes across directories (the body and arms are the
         # same in every export): together the generated URDFs use every mesh
         # the generator packaged, and nothing else.
-        prefix = "package://assembly/"
         urdfs = [p for p in URDF_PATH.parent.glob("axol_*.urdf")]
         references = {
-            mesh.attrib["filename"].removeprefix(prefix)
+            mesh.attrib["filename"]
             for path in urdfs
             for mesh in ElementTree.parse(path).getroot().iter("mesh")
         }

@@ -12,6 +12,7 @@ from ..constants import (
     ARM_JOINTS,
     BODY_JOINTS,
     AxolModel,
+    check_whole_body,
     urdf_arm_joint_names,
     urdf_path,
 )
@@ -241,9 +242,12 @@ class Sim(RobotBase):
                 jelly_enabled=True if self._whole_body else None,
                 mount=self._mount,
             )
+            if self._whole_body:
+                check_whole_body(model)
+            # The full model: joints the viewer is not driven on (fingers,
+            # wheels, and the body unless whole-body) stay at zero.
             path = urdf_path(
                 model,
-                whole_body=self._whole_body,
                 gripper=(
                     resolve_gripper(self._gripper)
                     if model is AxolModel.MOBILE

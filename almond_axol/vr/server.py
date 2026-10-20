@@ -1481,8 +1481,8 @@ class VRServer:
 
         # Robot model for the headset's URDF overlay (absolute/Mantis mode): the
         # web client fetches the URDF named by urdf_state's ``urdf`` (one per
-        # Axol version) and resolves its package://assembly/... mesh
-        # references against /urdf/.
+        # Axol version) and resolves its mesh references (package://assembly/...
+        # in the classic one, relative in the generated ones) against /urdf/.
         app.mount("/urdf", StaticFiles(directory=str(URDF_PATH.parent)), name="urdf")
 
         @app.get("/__accept")

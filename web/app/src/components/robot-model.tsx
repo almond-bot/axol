@@ -172,8 +172,9 @@ export function RobotModel({
       const loader = new URDFLoader(manager)
       loader.fetchOptions = { signal: activeUrdfRequest.signal }
       loader.parseCollision = false
-      // Every bundled URDF uses package://assembly/meshes/...; the server
-      // exposes the whole URDF directory at /urdf.
+      // The classic URDF uses package://assembly/meshes/..., the generated
+      // ones paths relative to themselves; the server exposes the whole URDF
+      // directory at /urdf, so both resolve.
       loader.packages = { assembly: `${origin}/urdf` }
       loader.load(
         `${origin}/urdf/${encodeURIComponent(urdfFile)}`,

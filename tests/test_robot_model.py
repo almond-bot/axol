@@ -135,20 +135,19 @@ class UrdfSelectionTest(unittest.TestCase):
         self.assertEqual(len(paths), len(AxolModel))
         self.assertTrue(all(p.is_file() for p in paths))
         # Whole-body IK is Jelly's alone.
+        from almond_axol.kinematics.model import shared_robot
+
         for model in MOUNTS:
             with self.assertRaises(ValueError):
-                urdf_path(model, whole_body=True)
+                shared_robot(model, whole_body=True)
 
     def test_the_mobile_axol_has_a_urdf_per_gripper(self) -> None:
-        for whole_body, name in (
-            (False, "axol_jelly_parcel.urdf"),
-            (True, "axol_jelly_parcel_whole_body.urdf"),
-        ):
-            path = urdf_path(AxolModel.MOBILE, whole_body=whole_body, gripper="parcel")
-            self.assertEqual(path.name, name)
-            self.assertTrue(path.is_file())
-        # The classic Axol has one URDF, whatever its gripper.
-        self.assertEqual(urdf_path(AxolModel.CLASSIC, gripper="parcel"), URDF_PATH)
+        path = urdf_path(AxolModel.MOBILE, gripper="parcel")
+        self.assertEqual(path.name, "axol_jelly_parcel.urdf")
+        self.assertTrue(path.is_file())
+        # The other versions have one URDF, whatever their gripper.
+        for model in MOUNTS:
+            self.assertEqual(urdf_path(model, gripper="parcel"), urdf_path(model))
 
     def test_collision_is_arm_against_body_on_both_versions(self) -> None:
         from almond_axol.kinematics.model import shared_robot_collision
@@ -287,10 +286,7 @@ class FloorFrameTest(unittest.TestCase):
         urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
         floor_z = urdf.get_transform("floor")[2, 3]
         lowest = min(
-            trimesh.load(
-                path.parent
-                / v.geometry.mesh.filename.removeprefix("package://assembly/")
-            )
+            trimesh.load(path.parent / v.geometry.mesh.filename)
             .apply_transform(urdf.get_transform(name) @ v.origin)
             .bounds[0, 2]
             for name, link in urdf.link_map.items()

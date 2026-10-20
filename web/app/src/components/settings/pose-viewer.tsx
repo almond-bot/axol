@@ -63,8 +63,9 @@ export default function PoseViewer({
     let cancelled = false
     const manager = new LoadingManager()
     const loader = new URDFLoader(manager)
-    // The URDF references its meshes as package://assembly/meshes/*.stl; the
-    // serve host exposes that directory at /api/urdf.
+    // The classic URDF references its meshes as package://assembly/meshes/*.stl,
+    // the generated ones relative to themselves; the serve host exposes that
+    // directory at /api/urdf, so both resolve.
     loader.packages = { assembly: apiUrl("/api/urdf") }
     let robot: URDFRobot | null = null
     loader.load(urdfUrl(robotModel, gripper), (r) => {

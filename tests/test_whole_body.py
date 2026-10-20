@@ -1,51 +1,48 @@
 """Whole-body IK: the Jelly base and lift as joints, behind a switch.
 
 Arm IK (the default) is covered by the rest of the suite; this pins the
-whole-body model and its switch: the URDF agrees with the arm model at every
-body joint's zero, the solver keeps the body still inside the arms' reach and
+whole-body view of axol_jelly.urdf and its switch: it agrees with arm IK at
+every body joint's zero, the solver keeps the body still inside the arms' reach and
 moves it outside, and every surface that cannot follow the body refuses.
 """
 
 from __future__ import annotations
 
 import unittest
-from xml.etree import ElementTree
 
 import numpy as np
-import yourdfpy
 
 from almond_axol.constants import (
     BODY_JOINTS,
     AxolModel,
+    check_whole_body,
     torso_links,
     urdf_arm_joint_names,
     urdf_path,
 )
+from almond_axol.kinematics.model import ik_urdf
 
 ARM_JOINT_NAMES = urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(
     is_left=False
 )
 
 
-def _load(path) -> yourdfpy.URDF:
-    return yourdfpy.URDF.load(
-        str(path), load_meshes=False, build_collision_scene_graph=False
-    )
-
-
 class WholeBodyUrdfTest(unittest.TestCase):
+    """Whole-body and arm IK load the same file (axol_jelly.urdf), with
+    different joints frozen (:func:`ik_urdf`)."""
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.path = urdf_path(AxolModel.MOBILE, whole_body=True)
-        cls.body = _load(cls.path)
-        cls.arm = _load(urdf_path(AxolModel.MOBILE))
+        cls.path = urdf_path(AxolModel.MOBILE)
+        cls.body = ik_urdf(cls.path, whole_body=True)
+        cls.arm = ik_urdf(cls.path)
 
-    def test_only_mobile_has_a_whole_body_model(self) -> None:
-        self.assertEqual(self.path.name, "axol_jelly_whole_body.urdf")
-        with self.assertRaises(ValueError):
-            urdf_path(AxolModel.CLASSIC, whole_body=True)
-        with self.assertRaises(ValueError):
-            torso_links(AxolModel.CLASSIC, whole_body=True)
+    def test_only_mobile_has_whole_body_joints(self) -> None:
+        for model in (AxolModel.CLASSIC, AxolModel.OX_CART, AxolModel.OWL):
+            with self.assertRaises(ValueError):
+                check_whole_body(model)
+            with self.assertRaises(ValueError):
+                torso_links(model, whole_body=True)
 
     def test_arm_and_body_joints_move(self) -> None:
         self.assertEqual(
@@ -59,39 +56,19 @@ class WholeBodyUrdfTest(unittest.TestCase):
         self.assertEqual(set(self.arm.actuated_joint_names), set(ARM_JOINT_NAMES))
 
     def test_zero_body_pose_is_the_arm_model(self) -> None:
-        # Same world frame at startup: every shared link where the arm model
-        # has it, for arbitrary arm angles.
+        # Same world frame at startup: every link where arm IK has it, for
+        # arbitrary arm angles.
         rng = np.random.default_rng(0)
-        shared = [n for n in self.arm.link_map if n in self.body.link_map]
         for _ in range(5):
             q = dict(zip(ARM_JOINT_NAMES, rng.uniform(-1.0, 1.0, 14)))
             self.arm.update_cfg(q)
             self.body.update_cfg({**q, **{n: 0.0 for n in BODY_JOINTS}})
-            for link in shared:
+            for link in self.arm.link_map:
                 np.testing.assert_allclose(
                     self.body.get_transform(link),
                     self.arm.get_transform(link),
                     atol=1e-6,
                     err_msg=link,
-                )
-
-    def test_arm_joints_match_the_arm_model(self) -> None:
-        arm = {
-            j.attrib["name"]: j
-            for j in ElementTree.parse(urdf_path(AxolModel.MOBILE))
-            .getroot()
-            .findall("joint")
-        }
-        body = {
-            j.attrib["name"]: j
-            for j in ElementTree.parse(self.path).getroot().findall("joint")
-        }
-        for name in ARM_JOINT_NAMES:
-            for tag in ("origin", "axis", "limit", "parent", "child"):
-                self.assertEqual(
-                    dict(body[name].find(tag).attrib),
-                    dict(arm[name].find(tag).attrib),
-                    (name, tag),
                 )
 
     def test_body_joints_move_the_robot_as_named(self) -> None:
@@ -105,15 +82,6 @@ class WholeBodyUrdfTest(unittest.TestCase):
         np.testing.assert_allclose(moved - s1, [0.5, -0.2, -0.2], atol=1e-9)
         # The ground stays put.
         np.testing.assert_allclose(self.body.get_transform("floor")[:3, 3], floor)
-
-    def test_mesh_references_exist(self) -> None:
-        refs = {
-            m.attrib["filename"].removeprefix("package://assembly/")
-            for m in ElementTree.parse(self.path).getroot().iter("mesh")
-        }
-        self.assertTrue(refs)
-        for ref in refs:
-            self.assertTrue((self.path.parent / ref).is_file(), ref)
 
 
 class WholeBodyCollisionTest(unittest.TestCase):

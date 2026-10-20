@@ -28,15 +28,25 @@ inferred — mobile when Jelly is enabled — by
 
 from __future__ import annotations
 
+import io
 import logging
 import threading
+from pathlib import Path
+from xml.etree import ElementTree
 
 import jax.numpy as jnp
 import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..constants import AxolModel, torso_links, urdf_path
+from ..constants import (
+    BODY_JOINTS,
+    AxolModel,
+    check_whole_body,
+    torso_links,
+    urdf_arm_joint_names,
+    urdf_path,
+)
 from ..settings import resolve_gripper, resolve_robot_model
 
 _logger = logging.getLogger(__name__)
@@ -98,11 +108,64 @@ def _key(model: AxolModel | str | None, whole_body: bool, gripper: str | None) -
     return resolved, whole_body, gripper
 
 
+def ik_urdf_xml(path: Path, *, whole_body: bool = False) -> str:
+    """The bundled URDF at ``path`` as IK sees it.
+
+    The generated models are full robots (see
+    :func:`~almond_axol.constants.urdf_path`). For IK every joint but the
+    ones it solves is frozen at zero — the arms, plus the Jelly body joints
+    (:data:`~almond_axol.constants.BODY_JOINTS`) for ``whole_body`` — since
+    pyroki treats every movable joint as a variable; and each link's
+    capsule-friendly ``<ik_collision>`` pieces replace its per-part
+    ``<collision>`` hulls. A URDF without ``<ik_collision>`` (the classic
+    one) keeps its collision geometry.
+    """
+    root = ElementTree.parse(path).getroot()
+    solved = set(
+        urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(is_left=False)
+    )
+    if whole_body:
+        solved |= set(BODY_JOINTS)
+    for joint in root.findall("joint"):
+        if joint.get("type") == "fixed":
+            continue
+        mimic = joint.find("mimic")
+        target = mimic.get("joint") if mimic is not None else joint.get("name")
+        if target in solved:
+            continue
+        joint.set("type", "fixed")
+        for tag in ("axis", "limit", "mimic", "dynamics", "drive"):
+            for el in joint.findall(tag):
+                joint.remove(el)
+    if root.find("link/ik_collision") is not None:
+        for link in root.findall("link"):
+            for el in link.findall("collision"):
+                link.remove(el)
+            for el in link.findall("ik_collision"):
+                el.tag = "collision"
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+def ik_urdf(path: Path, *, whole_body: bool = False) -> yourdfpy.URDF:
+    """The bundled URDF at ``path`` as IK sees it (:func:`ik_urdf_xml`), with
+    meshes resolved next to it."""
+    return yourdfpy.URDF.load(
+        io.StringIO(ik_urdf_xml(path, whole_body=whole_body)),
+        mesh_dir=str(path.parent),
+    )
+
+
 def _load_urdf(key: _Key) -> yourdfpy.URDF:
     if key not in _urdf:
-        path = urdf_path(key[0], whole_body=key[1], gripper=key[2])
-        _logger.info("Loading Axol URDF (%s)...", path.name)
-        _urdf[key] = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
+        if key[1]:
+            check_whole_body(key[0])
+        path = urdf_path(key[0], gripper=key[2])
+        _logger.info(
+            "Loading Axol URDF (%s, %s IK)...",
+            path.name,
+            "whole-body" if key[1] else "arm",
+        )
+        _urdf[key] = ik_urdf(path, whole_body=key[1])
     return _urdf[key]
 
 

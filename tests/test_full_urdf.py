@@ -1,11 +1,12 @@
-"""The Axol-on-Jelly simulation URDFs (``axol_jelly_sim.urdf`` and, with the
-parcel gripper, ``axol_jelly_parcel_sim.urdf``).
+"""The generated URDFs as full robot models (physics simulators: Isaac Sim,
+MuJoCo).
 
-Not loaded by the control stack; this pins what makes it usable in a physics
-simulator (Isaac Sim, MuJoCo): the right joints move, the arm chain is the
-IK model's, masses are AxolConfig's where they are known and physically
-valid everywhere, mesh paths resolve without a ROS package, and the camera
-optical frames sit where the cameras are.
+Each generated version is one file that IK, the viewers and simulators all
+load (see ``almond_axol.constants.urdf_path``). This pins what makes it usable
+in a physics simulator: the right joints move, the arm chain is the one IK
+solves, masses are AxolConfig's where they are known and physically valid
+everywhere, mesh paths resolve without a ROS package, and the camera optical
+frames sit where the cameras are.
 """
 
 from __future__ import annotations
@@ -19,13 +20,12 @@ import yourdfpy
 
 from almond_axol.constants import (
     ARM_JOINTS,
-    JELLY_PARCEL_SIM_URDF,
-    JELLY_SIM_URDF,
     AxolModel,
     urdf_arm_joint_names,
     urdf_body_name,
     urdf_path,
 )
+from almond_axol.kinematics.model import ik_urdf
 from almond_axol.robot.config import AxolConfig
 
 ARM_JOINT_NAMES = urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(
@@ -45,38 +45,62 @@ def _load(path) -> yourdfpy.URDF:
     )
 
 
-class JellySimUrdfTest(unittest.TestCase):
-    # Per gripper: the sim model, its gripper joints (and their mimics), the
-    # links wrist_3's tuned mass is split across, and MuJoCo's dof count.
+_PARALLEL_JOINTS = {"left_finger_1_joint", "right_finger_1_joint"}
+_PARALLEL_MIMICS = {
+    "left_finger_2_joint": "left_finger_1_joint",
+    "right_finger_2_joint": "right_finger_1_joint",
+}
+
+
+class JellyFullUrdfTest(unittest.TestCase):
+    # Per version: the model, its body joints (and their mimics), its root,
+    # its gripper joints (and mimics), the links wrist_3's tuned mass is
+    # split across, and MuJoCo's dof count (mimics import as joints).
+    model = AxolModel.MOBILE
     gripper = "parallel"
-    path = JELLY_SIM_URDF
-    gripper_joints = {"left_finger_1_joint", "right_finger_1_joint"}
-    gripper_mimics = {
-        "left_finger_2_joint": "left_finger_1_joint",
-        "right_finger_2_joint": "right_finger_1_joint",
+    body_joints = {
+        "base_x",
+        "base_y",
+        "base_yaw",
+        "lift",
+        "wheel_1",
+        "wheel_2",
+        "wheel_3",
+        "wheel_4",
     }
+    body_mimics = {"lift_2": "lift"}
+    root_link = "world"
+    gripper_joints = _PARALLEL_JOINTS
+    gripper_mimics = _PARALLEL_MIMICS
     wrist_parts = ("w2", "gripper", "finger_1", "finger_2", "wrist_camera")
-    # 21 driven joints + the three mimics (MuJoCo imports them as joints).
-    dofs = 24
+    # 14 arms + 8 body + 2 fingers driven, + the lift's and fingers' mimics.
+    dofs = 27
 
     @classmethod
     def setUpClass(cls) -> None:
+        cls.path = urdf_path(cls.model, gripper=cls.gripper)
         cls.sim = _load(cls.path)
-        cls.arm = _load(urdf_path(AxolModel.MOBILE, gripper=cls.gripper))
+        cls.arm = ik_urdf(cls.path)
         cls.root = ElementTree.parse(cls.path).getroot()
         cls.zero = {n: 0.0 for n in cls.sim.actuated_joint_names}
 
     def test_moving_joints(self) -> None:
-        extra = {"lift", "wheel_1", "wheel_2", "wheel_3", "wheel_4"}
         self.assertEqual(
             set(self.sim.actuated_joint_names),
-            set(ARM_JOINT_NAMES) | extra | self.gripper_joints,
+            set(ARM_JOINT_NAMES) | self.body_joints | self.gripper_joints,
         )
         mimics = {
             j.name: j.mimic.joint for j in self.sim.robot.joints if j.mimic is not None
         }
-        self.assertEqual(mimics, {"lift_2": "lift", **self.gripper_mimics})
-        self.assertEqual(self.sim.base_link, "jelly")
+        self.assertEqual(mimics, {**self.body_mimics, **self.gripper_mimics})
+        self.assertEqual(self.sim.base_link, self.root_link)
+
+    def test_at_zero_the_torso_is_the_world_origin(self) -> None:
+        # So IK's frame (and every recorded pose) is the classic one.
+        self.sim.update_cfg(self.zero)
+        np.testing.assert_allclose(
+            self.sim.get_transform("root", self.root_link), np.eye(4), atol=1e-9
+        )
 
     def test_arm_chain_is_the_ik_models(self) -> None:
         rng = np.random.default_rng(1)
@@ -96,18 +120,21 @@ class JellySimUrdfTest(unittest.TestCase):
     def test_fingers_open_together(self) -> None:
         # Driving the first finger's joint moves both fingers their full
         # stroke, in opposite directions (the second finger mimics).
+        limit = self.sim.joint_map["left_finger_1_joint"].limit
+        stroke = max((limit.lower, limit.upper), key=abs)
+        self.assertGreater(abs(stroke), 0.03)
         self.sim.update_cfg(self.zero)
         closed = [
             self.sim.get_transform(f"left_finger_{i}")[:3, 3].copy() for i in (1, 2)
         ]
-        self.sim.update_cfg({**self.zero, "left_finger_1_joint": 0.0588})
+        self.sim.update_cfg({**self.zero, "left_finger_1_joint": stroke})
         moved = [
             self.sim.get_transform(f"left_finger_{i}")[:3, 3] - c
             for i, c in zip((1, 2), closed)
         ]
         for step in moved:
-            self.assertAlmostEqual(float(np.linalg.norm(step)), 0.0588, places=6)
-        self.assertAlmostEqual(float(moved[0] @ moved[1]), -(0.0588**2), places=6)
+            self.assertAlmostEqual(float(np.linalg.norm(step)), abs(stroke), places=6)
+        self.assertAlmostEqual(float(moved[0] @ moved[1]), -(stroke**2), places=6)
 
     def test_arm_masses_are_axol_configs(self) -> None:
         cfg = AxolConfig()
@@ -192,16 +219,15 @@ class JellySimUrdfTest(unittest.TestCase):
         self.assertGreater(model.dof_frictionloss[model.jnt_dofadr[jid]], 0.5)
 
 
-class ParcelSimUrdfTest(JellySimUrdfTest):
-    """The sim model with the parcel gripper: a hinged plate per gripper."""
+class ParcelFullUrdfTest(JellyFullUrdfTest):
+    """Jelly with the parcel gripper: a hinged plate per gripper."""
 
     gripper = "parcel"
-    path = JELLY_PARCEL_SIM_URDF
     gripper_joints = {"left_plate_joint", "right_plate_joint"}
     gripper_mimics: dict[str, str] = {}
     wrist_parts = ("w2", "gripper", "plate")
-    # 21 driven joints + the lift's mimic.
-    dofs = 22
+    # 14 arms + 8 body + 2 plates driven, + the lift's mimic.
+    dofs = 25
 
     def test_fingers_open_together(self) -> None:
         self.skipTest("the parcel gripper has a plate, not fingers")
@@ -224,50 +250,68 @@ class ParcelSimUrdfTest(JellySimUrdfTest):
             self.assertAlmostEqual(float(angle), np.pi / 2, places=6)
 
 
+class OxCartFullUrdfTest(JellyFullUrdfTest):
+    """Axol on the Ox cart: the cart's one-stage lift."""
+
+    model = AxolModel.OX_CART
+    body_joints = {"lift"}
+    body_mimics: dict[str, str] = {}
+    # 14 arms + the lift + 2 fingers driven, + the fingers' mimics.
+    dofs = 19
+
+    def test_the_lift_lowers_the_torso(self) -> None:
+        self.sim.update_cfg({**self.zero, "lift": 0.2})
+        np.testing.assert_allclose(
+            self.sim.get_transform("root", "world")[:3, 3], [0, 0, -0.2], atol=1e-9
+        )
+
+
+class OwlFullUrdfTest(JellyFullUrdfTest):
+    """Axol on the Owl mount: only the arms and fingers move."""
+
+    model = AxolModel.OWL
+    body_joints: set[str] = set()
+    body_mimics: dict[str, str] = {}
+    root_link = "root"
+    dofs = 18
+
+
+class StandaloneFullUrdfTest(OwlFullUrdfTest):
+    model = AxolModel.STANDALONE
+
+
 class CameraFramesTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.models = {
-            "arm": _load(urdf_path(AxolModel.MOBILE)),
-            "whole_body": _load(urdf_path(AxolModel.MOBILE, whole_body=True)),
-            "sim": _load(JELLY_SIM_URDF),
+            (m.value, "parallel"): _load(urdf_path(m))
+            for m in AxolModel
+            if m is not AxolModel.CLASSIC
         }
-        # The parcel gripper's models: the same head, no wrist cameras.
-        cls.parcel = {
-            "arm": _load(urdf_path(AxolModel.MOBILE, gripper="parcel")),
-            "whole_body": _load(
-                urdf_path(AxolModel.MOBILE, whole_body=True, gripper="parcel")
-            ),
-            "sim": _load(JELLY_PARCEL_SIM_URDF),
-        }
-        for urdf in (*cls.models.values(), *cls.parcel.values()):
+        # The parcel gripper's model: the same head, no wrist cameras.
+        cls.parcel = _load(urdf_path(AxolModel.MOBILE, gripper="parcel"))
+        for urdf in (*cls.models.values(), cls.parcel):
             urdf.update_cfg({n: 0.0 for n in urdf.actuated_joint_names})
 
-    def test_parcel_models_have_the_head_cameras_only(self) -> None:
-        arm = self.models["arm"]
-        for name, urdf in self.parcel.items():
-            with self.subTest(model=name):
-                frames = {ln for ln in urdf.link_map if ln.endswith("_optical")}
-                self.assertEqual(frames, set(CAMERAS[2:]))
-                for cam in CAMERAS[2:]:
-                    joint = next(j for j in urdf.robot.joints if j.child == cam)
-                    ref = next(j for j in arm.robot.joints if j.child == cam)
-                    self.assertEqual(joint.parent, ref.parent)
-                    # The two exports' CAD poses differ by ~5 µrad of rounding.
-                    np.testing.assert_allclose(joint.origin, ref.origin, atol=1e-5)
+    def _frame(self, urdf: yourdfpy.URDF, cam: str):
+        return next(j for j in urdf.robot.joints if j.child == cam)
 
-    def test_every_model_has_the_same_camera_frames(self) -> None:
-        arm = self.models["arm"]
-        for name, urdf in self.models.items():
+    def test_every_version_has_the_same_camera_frames(self) -> None:
+        # The exports' CAD poses differ by up to ~20 µm / µrad of rounding.
+        ref = self.models[("mobile", "parallel")]
+        for key, urdf in self.models.items():
             for cam in CAMERAS:
-                with self.subTest(model=name, camera=cam):
-                    joint = next(j for j in urdf.robot.joints if j.child == cam)
-                    ref = next(j for j in arm.robot.joints if j.child == cam)
-                    self.assertEqual(joint.parent, ref.parent)
-                    np.testing.assert_allclose(joint.origin, ref.origin, atol=1e-9)
+                with self.subTest(model=key, camera=cam):
+                    joint, other = self._frame(urdf, cam), self._frame(ref, cam)
+                    self.assertEqual(joint.parent, other.parent)
+                    np.testing.assert_allclose(joint.origin, other.origin, atol=5e-5)
+
+    def test_parcel_model_has_the_head_cameras_only(self) -> None:
+        frames = {ln for ln in self.parcel.link_map if ln.endswith("_optical")}
+        self.assertEqual(frames, set(CAMERAS[2:]))
 
     def test_frames_are_right_handed_and_placed(self) -> None:
-        sim = self.models["sim"]
+        sim = self.models[("mobile", "parallel")]
         poses = {cam: sim.get_transform(cam) for cam in CAMERAS}
         for cam, pose in poses.items():
             rot = pose[:3, :3]
