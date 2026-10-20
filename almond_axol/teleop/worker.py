@@ -15,6 +15,7 @@ import multiprocessing.connection
 import os
 import signal
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -55,6 +56,15 @@ from .recorder import make as _recorder_make
 from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
+
+# Named goals a ``("reset_path", …)`` request chains through: the configured
+# rest pose, and joint zero — the arms' natural resting pose, where they
+# settle once torqued off.
+PATH_GOALS = ("rest", "zero")
+# A path leg whose start is already this close to its goal on every joint is
+# skipped: each planned leg plays for at least ``reset_min_duration``, which
+# would otherwise hold the arms still for that long.
+_PATH_LEG_SKIP_RAD = 1e-3
 
 # Up direction of the raw VR world frame (WebXR reference space: +y is up).
 _VR_UP = np.array([0.0, 1.0, 0.0])
@@ -1162,6 +1172,36 @@ class IKWorker:
             collision_weight=cfg.reset_collision_weight,
             max_iterations=cfg.reset_max_iterations,
         )
+
+    def path_goal(self, name: str) -> np.ndarray:
+        """Full (N,) joint vector for a named path goal (see :data:`PATH_GOALS`)."""
+        if name == "rest":
+            return self.get_rest_q()
+        if name == "zero":
+            return np.zeros(self._solver.num_joints, dtype=np.float32)
+        raise ValueError(f"unknown path goal {name!r} (expected one of {PATH_GOALS})")
+
+    def compute_path_trajectory(
+        self, q_current: np.ndarray, goals: Sequence[str]
+    ) -> list[np.ndarray]:
+        """Chain collision-aware legs through named goals, in order.
+
+        Every leg is planned before anything plays, so a caller that loses
+        this worker mid-move (a stop that kills the IK subprocess) still has
+        the whole path. Each leg starts where the previous one ends; a leg
+        already at its goal is skipped rather than played as a still hold.
+        """
+        traj: list[np.ndarray] = []
+        q = np.asarray(q_current, dtype=np.float32)
+        for name in goals:
+            goal = self.path_goal(name)
+            if float(np.max(np.abs(goal - q))) < _PATH_LEG_SKIP_RAD:
+                continue
+            leg = self.compute_reset_trajectory(q, goal)
+            traj.extend(leg)
+            if leg:
+                q = np.asarray(leg[-1], dtype=np.float32)
+        return traj
 
     def set_config(self, key: str, value: object) -> None:
         """Live-update one :class:`VRTeleopConfig` field (``("set", …)`` message).
@@ -2559,6 +2599,10 @@ def run_ik_worker(
     - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
     - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
       an explicit joint target for the second (zero) leg of a guarded park.
+    - ``("reset_path", q_current, goals)`` → ``("reset_traj", last, traj)`` —
+      one trajectory chained through named goals (``"rest"`` / ``"zero"``,
+      see :meth:`IKWorker.compute_path_trajectory`); ``last`` is the final
+      goal's joint vector.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -2625,7 +2669,10 @@ def run_ik_worker(
         for i, gi in enumerate(worker.right_indices):
             q_start[gi] = q_current_right[i]
 
-    startup_traj = worker.compute_reset_trajectory(q_start, q_rest)
+    # Start through zero — the arms' natural resting pose, which the session
+    # start check has already confirmed they are near — so the move out to the
+    # rest pose always follows the same planned path.
+    startup_traj = worker.compute_path_trajectory(q_start, ("zero", "rest"))
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(
@@ -2664,6 +2711,25 @@ def run_ik_worker(
                     )
                 traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
+            elif isinstance(msg, tuple) and msg[0] == "reset_path":
+                q_current = np.asarray(msg[1], dtype=np.float32)
+                goals = tuple(msg[2]) if len(msg) == 3 else ()
+                if (
+                    len(msg) != 3
+                    or not goals
+                    or any(g not in PATH_GOALS for g in goals)
+                    or q_current.shape != q_rest.shape
+                    or not np.isfinite(q_current).all()
+                ):
+                    raise ValueError(
+                        "reset_path requires a finite current joint vector and "
+                        f"named goals from {PATH_GOALS}"
+                    )
+                traj = worker.compute_path_trajectory(q_current, goals)
+                worker.reset()
+                q_target = worker.path_goal(goals[-1])
                 q = traj[-1].copy() if traj else q_target.copy()
                 conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, tuple) and msg[0] == "sync":

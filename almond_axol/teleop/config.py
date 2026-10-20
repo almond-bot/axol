@@ -83,11 +83,19 @@ class VRTeleopConfig:
             arms; while engaged, a click on either grip toggles *that* arm
             between tracking and frozen (a frozen arm holds its pose and
             gripper — e.g. it keeps a grasp steady while the other arm
-            works). ``True`` is the dead-man scheme: hold both grips to
-            engage from rest, and each arm tracks only while its grip
-            stays held — release a grip and that arm freezes where it is,
-            hold on and it keeps going; re-engaging from a full release
-            requires holding both again.
+            works). ``True`` is the per-arm dead-man scheme: each arm tracks
+            exactly while its own grip is held — either grip alone engages
+            its arm, including from rest — and releasing a grip freezes
+            that arm (pose and gripper) where it is. After a forced
+            disengage (reset, dropped link, contact stop) a grip that is
+            still held must be released once before it engages again.
+        park_to_zero: Shutdown park. ``True`` (default): when a hardware
+            session stops (**Stop** in the control panel, ``Ctrl+C``), the
+            arms return to rest and then continue to the all-zero joint
+            pose — hanging straight down — holding their grasp, before the
+            motors are released, so nothing drops when the torque comes
+            off. ``False`` stops the park at the rest pose. Both legs are
+            the guarded, collision-aware return described above.
         reengage: What happens to an arm's controller↔arm mapping when its
             grip re-engages (after a freeze, a disengage, or a pause in which
             the operator walked away or the arm was moved by hand).
@@ -556,6 +564,7 @@ class VRTeleopConfig:
     teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
+    park_to_zero: bool = True
     reengage: ReengageMode = "clutch"
     reengage_ramp_speed: float = 0.15
     reengage_ramp_min_s: float = 0.75
@@ -653,6 +662,7 @@ def apply_mantis_teleop_profile(
     """
     config.absolute_mode = True
     config.hold_to_engage = False
+    config.park_to_zero = False
     config.ik_alpha = 1.0
     config.teleop_max_vel = 1e6
     config.teleop_max_accel = 1e6

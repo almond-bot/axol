@@ -64,6 +64,7 @@ from ...teleop.core import (
     wait_for_ik_ready,
 )
 from ...teleop.live import LiveSettings
+from ...teleop.shutdown import park_arms
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
@@ -1007,6 +1008,22 @@ class AxolVRTeleop(Teleoperator):
         """
         await self._core.guarded_return(**kwargs)
 
+    async def park_arms(self, **kwargs: Any) -> str:
+        """Play the shutdown park (rest, then zero) before torque-off.
+
+        Thin passthrough to :func:`almond_axol.teleop.shutdown.park_arms`,
+        the orchestrator shared with native ``axol teleop``. The caller
+        supplies the same flow-specific hooks as :meth:`guarded_return`;
+        await from a coroutine on the robot's event loop. Returns the park's
+        outcome (``"done"`` or why it stopped early).
+        """
+        return await park_arms(self._core, **kwargs)
+
+    @property
+    def is_parking(self) -> bool:
+        """True from the shutdown park's start until a fresh worker handshake."""
+        return self._core.is_parking
+
     async def contact_hold(self, **kwargs: Any) -> None:
         """Limp gravity-comp hold after a tracking-time contact trip.
 
@@ -1354,7 +1371,10 @@ class AxolVRTeleop(Teleoperator):
             # while a box-mode leader owns the sticks (grip width / tilt)
             # Jelly is held stopped the same way (frozen pair: sticks drive).
             self._jelly.apply_vr_frame(
-                frame, resetting=self._core.is_resetting or self._core.pair_owns_sticks
+                frame,
+                resetting=self._core.is_resetting
+                or self._core.is_parking
+                or self._core.pair_owns_sticks,
             )
 
         # Episode state transitions. Latch writes take _event_lock so they

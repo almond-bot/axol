@@ -8,7 +8,8 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}ik_frequency</F> | `120` | How often VR poses are sent to the IK solver (Hz). The control loop interpolates between solutions. |
 | <F>--{prefix}position_multiplier</F> | `1.0` | Scales hand movement. `2` moves the arm twice as far as your hand. Ignored in `absolute_mode`. |
 | <F>--{prefix}rotation_multiplier</F> | `1.0` | Scales hand rotation the same way. Ignored in `absolute_mode`. |
-| <F>--{prefix}hold_to_engage</F> | `false` | `false`: click both grips to engage, then click a grip to freeze or unfreeze that arm. `true`: each arm tracks only while its grip is held. |
+| <F>--{prefix}hold_to_engage</F> | `false` | `false`: click both grips to engage, then click a grip to freeze or unfreeze that arm. `true`: per-arm dead-man grips — each arm tracks only while its own grip is held, either grip alone engages its arm (from rest too), release freezes that arm. |
+| <F>--{prefix}park_to_zero</F> | `true` | On Stop / `Ctrl+C` the arms return to rest and then continue to the all-zero joint pose (hanging straight down), holding their grasp, before the motors are released. `false` stops the park at the rest pose. |
 | <F>--{prefix}disengage_timeout</F> | `0.5` | Seconds without a VR frame before tracking disengages and the arms hold position. `0` disables. |
 | <F>--{prefix}record</F> | `null` | Record every stage of the teleop pipeline to `~/.almond/recordings/<name>_*.npz` for [`motion.build`](/cli/motion-build) and [`diag.offline`](/cli/diag-offline). A bare name like `rec1` goes in that folder; a path is used as-is. |
 | <F>--{prefix}reset_speed</F> | `0.628` | Speed (rad/s) of the return-to-rest move. |
