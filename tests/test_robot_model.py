@@ -134,6 +134,12 @@ class UrdfSelectionTest(unittest.TestCase):
         paths = {urdf_path(model) for model in AxolModel}
         self.assertEqual(len(paths), len(AxolModel))
         self.assertTrue(all(p.is_file() for p in paths))
+        # Whole-body IK is Jelly's alone.
+        from almond_axol.kinematics.model import shared_robot
+
+        for model in MOUNTS:
+            with self.assertRaises(ValueError):
+                shared_robot(model, whole_body=True)
 
     def test_the_mobile_axol_has_a_urdf_per_gripper(self) -> None:
         path = urdf_path(AxolModel.MOBILE, gripper="parcel")

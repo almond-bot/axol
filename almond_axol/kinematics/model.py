@@ -40,7 +40,9 @@ import pyroki as pk
 import yourdfpy
 
 from ..constants import (
+    BODY_JOINTS,
     AxolModel,
+    check_whole_body,
     torso_links,
     urdf_arm_joint_names,
     urdf_path,
@@ -85,30 +87,34 @@ _RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
-# Keyed by (version, gripper): the parcel gripper has its own URDF.
-_Key = tuple[AxolModel, str]
+# Keyed by (version, whole_body, gripper): whole-body IK and the parcel
+# gripper have their own URDFs.
+_Key = tuple[AxolModel, bool, str]
 _urdf: dict[_Key, yourdfpy.URDF] = {}
 _robot: dict[_Key, pk.Robot] = {}
 _robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
 
 
-def _key(model: AxolModel | str | None, gripper: str | None) -> _Key:
-    resolved = resolve_robot_model(model)
+def _key(model: AxolModel | str | None, whole_body: bool, gripper: str | None) -> _Key:
+    resolved = resolve_robot_model(
+        model, jelly_enabled=True if whole_body and model is None else None
+    )
     # Only the mobile Axol has a URDF per gripper: skip the settings lookup
-    # for the others.
+    # for the classic one.
     if resolved is AxolModel.MOBILE:
         gripper = resolve_gripper(gripper)
     else:
         gripper = "parallel"
-    return resolved, gripper
+    return resolved, whole_body, gripper
 
 
-def ik_urdf_xml(path: Path) -> str:
+def ik_urdf_xml(path: Path, *, whole_body: bool = False) -> str:
     """The bundled URDF at ``path`` as IK sees it.
 
     The generated models are full robots (see
     :func:`~almond_axol.constants.urdf_path`). For IK every joint but the
-    arms' is frozen at zero — the body, lift, fingers and wheels — since
+    ones it solves is frozen at zero — the arms, plus the Jelly body joints
+    (:data:`~almond_axol.constants.BODY_JOINTS`) for ``whole_body`` — since
     pyroki treats every movable joint as a variable; and each link's
     capsule-friendly ``<ik_collision>`` pieces replace its per-part
     ``<collision>`` hulls. A URDF without ``<ik_collision>`` (the classic
@@ -118,8 +124,14 @@ def ik_urdf_xml(path: Path) -> str:
     solved = set(
         urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(is_left=False)
     )
+    if whole_body:
+        solved |= set(BODY_JOINTS)
     for joint in root.findall("joint"):
-        if joint.get("type") == "fixed" or joint.get("name") in solved:
+        if joint.get("type") == "fixed":
+            continue
+        mimic = joint.find("mimic")
+        target = mimic.get("joint") if mimic is not None else joint.get("name")
+        if target in solved:
             continue
         joint.set("type", "fixed")
         for tag in ("axis", "limit", "mimic", "dynamics", "drive"):
@@ -134,53 +146,72 @@ def ik_urdf_xml(path: Path) -> str:
     return ElementTree.tostring(root, encoding="unicode")
 
 
-def ik_urdf(path: Path) -> yourdfpy.URDF:
+def ik_urdf(path: Path, *, whole_body: bool = False) -> yourdfpy.URDF:
     """The bundled URDF at ``path`` as IK sees it (:func:`ik_urdf_xml`), with
     meshes resolved next to it."""
-    return yourdfpy.URDF.load(io.StringIO(ik_urdf_xml(path)), mesh_dir=str(path.parent))
+    return yourdfpy.URDF.load(
+        io.StringIO(ik_urdf_xml(path, whole_body=whole_body)),
+        mesh_dir=str(path.parent),
+    )
 
 
 def _load_urdf(key: _Key) -> yourdfpy.URDF:
     if key not in _urdf:
-        path = urdf_path(key[0], gripper=key[1])
-        _logger.info("Loading Axol URDF (%s)...", path.name)
-        _urdf[key] = ik_urdf(path)
+        if key[1]:
+            check_whole_body(key[0])
+        path = urdf_path(key[0], gripper=key[2])
+        _logger.info(
+            "Loading Axol URDF (%s, %s IK)...",
+            path.name,
+            "whole-body" if key[1] else "arm",
+        )
+        _urdf[key] = ik_urdf(path, whole_body=key[1])
     return _urdf[key]
 
 
 def shared_urdf(
-    model: AxolModel | str | None = None, *, gripper: str | None = None
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
 ) -> yourdfpy.URDF:
-    """The parsed bundled URDF for ``model``, as IK sees it, loaded once per
-    process."""
+    """The parsed bundled URDF for ``model``, loaded once per process."""
     with _lock:
-        return _load_urdf(_key(model, gripper))
+        return _load_urdf(_key(model, whole_body, gripper))
 
 
 def shared_robot(
-    model: AxolModel | str | None = None, *, gripper: str | None = None
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
 ) -> pk.Robot:
     """The pyroki robot for ``model``'s bundled URDF, built once per process.
 
-    ``gripper`` is the fitted gripper (``AxolConfig.gripper``; ``None`` reads
-    it from the shared settings): the mobile Axol has a URDF per gripper.
+    ``whole_body`` selects the mobile model whose Jelly base and lift are
+    joints too (:data:`~almond_axol.constants.BODY_JOINTS`). ``gripper`` is
+    the fitted gripper (``AxolConfig.gripper``; ``None`` reads it from the
+    shared settings): the mobile Axol has a URDF per gripper.
     """
     with _lock:
-        key = _key(model, gripper)
+        key = _key(model, whole_body, gripper)
         if key not in _robot:
             _robot[key] = pk.Robot.from_urdf(_load_urdf(key))
         return _robot[key]
 
 
 def shared_robot_collision(
-    model: AxolModel | str | None = None, *, gripper: str | None = None
+    model: AxolModel | str | None = None,
+    *,
+    whole_body: bool = False,
+    gripper: str | None = None,
 ) -> pk.collision.RobotCollision:
     """``model``'s torso<->arm collision model, built once per process."""
     with _lock:
-        key = _key(model, gripper)
+        key = _key(model, whole_body, gripper)
         if key not in _robot_coll:
             _robot_coll[key] = _build_robot_collision(
-                _load_urdf(key), torso_links(key[0])
+                _load_urdf(key), torso_links(key[0], whole_body=whole_body)
             )
         return _robot_coll[key]
 

@@ -60,6 +60,8 @@ Hover a card to see that version turn on the stage. The Jelly card shows **Detec
 
 Every operation uses the chosen robot model. It sets the body the IK solver keeps the arms clear of (the lift column, the Owl mount, the head camera) and the joint limits (every version but Legacy has elbows that reach 24° further past straight). Gravity compensation, recorded end-effector poses and the tuned per-joint masses are identical on all of them. The **Rest pose** viewer shows whichever version the host is running. On the mobile Axol the robot model also follows the fitted gripper (**Gripper** in the Robot tab): with the parcel gripper, IK, the viewers and the headset overlay use the parcel gripper's model. To force one outright, Jelly or not, set `kinematics.robot_model` under **Advanced → Kinematics** (or pass `--kinematics.robot_model`).
 
+**Whole-body IK.** By default only the arms are IK joints (arm IK). The **Whole-body IK (sim only)** switch in the **Kinematics** tab (or `--kinematics.whole_body true`) adds the Jelly base (forward, sideways, rotation) and the lift: while both hands stay within comfortable reach the body holds still, and when a target goes beyond it the base drives toward it or the lift lowers for low targets. It works in relative (Quest) teleop with **sim** on; the sim viewer shows the base and lift moving. Driving the real wheels and lift from the IK, absolute (Mantis) mode, and data collection are not supported yet — those runs refuse to start with the switch on.
+
 A connected tile carries three buttons:
 
 - **Restart** reboots the robot host (`shutdown -r now`) behind a confirmation dialog. The panel loses its connection while the host reboots — reconnect once it's back up, typically under a minute.
