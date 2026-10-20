@@ -126,6 +126,24 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
   On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Nothing to enable: Jelly is inferred from the CAN devices attached, and the Robot tab's **Jelly wheels** / **Jelly lift** switches (or [`--jelly.wheels false` / `--jelly.lift false`](/cli/teleop)) opt attached hardware out. Drive just Jelly with the arms left untouched by switching **Axol arms** off (or [`axol teleop --arms false`](/cli/teleop)).
 </Note>
 
+## Camera stream recovery
+
+For GStreamer camera streams, teleop detects three seconds without encoded
+frames and reopens only the stalled camera's pipeline. Existing WebRTC tracks
+stay subscribed, so a recovered feed resumes without reconnecting the headset.
+The log identifies the camera and whether fresh frames returned.
+
+Each camera gets at most three reopen attempts per session, with five seconds
+between attempts. This applies only to streaming-only pipelines: recording and
+policy camera pipelines are excluded because reopening resets their sensor
+timestamp mapping. Recovery does not restart camera services or change arm
+control.
+
+If video stays unavailable, stop teleop with the arms clear before resetting
+camera services or checking connections. A native driver hang, crashed video
+process, or physical connection fault can still require that manual recovery.
+Do not continue moving an arm using a frozen camera view.
+
 ## Network tip
 
 If VR tracking feels jittery or arrives in bursts, configure the following on your router or access point:

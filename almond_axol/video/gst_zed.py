@@ -278,6 +278,7 @@ class _AUChannel:
         self._subscribers: list[queue.Queue[list[bytes]]] = []
         self._lock = threading.Lock()
         self.first_au = threading.Event()
+        self.last_au = time.perf_counter()
 
     @property
     def alive(self) -> bool:
@@ -298,6 +299,7 @@ class _AUChannel:
 
     def broadcast(self, au: list[bytes]) -> None:
         """Push one access unit to every subscriber (drop-oldest if full)."""
+        self.last_au = time.perf_counter()
         self.first_au.set()
         with self._lock:
             subscribers = list(self._subscribers)
@@ -842,6 +844,8 @@ class _GstPipelineBase:
         self._pts_perf_offset_s: float | None = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._recovery_thread: threading.Thread | None = None
         # Kept as a list for cancellation compatibility with an in-flight close.
         # Dataset encoders are all-intra now, so current closes are immediate and
         # never populate it.
@@ -1263,6 +1267,9 @@ class _GstPipelineBase:
 
     @property
     def alive(self) -> bool:
+        # Preserve subscribers while the streaming-only watchdog reopens a feed.
+        if self._recovery_thread is not None and self._recovery_thread.is_alive():
+            return not self._stop.is_set()
         if self._pipeline is None:
             return False
         _, state, _ = self._pipeline.get_state(0)
@@ -1504,14 +1511,83 @@ class _GstPipelineBase:
             return self.alive
         while time.perf_counter() < deadline:
             if all(ch.first_au.is_set() for ch in channels):
+                self._start_stream_recovery(channels)
                 return True
             if not self.alive:
                 break
             time.sleep(0.05)
-        return all(ch.first_au.is_set() for ch in channels)
+        ready = all(ch.first_au.is_set() for ch in channels)
+        if ready:
+            self._start_stream_recovery(channels)
+        return ready
+
+    def _start_stream_recovery(self, channels: tuple[_AUChannel, ...]) -> None:
+        # Reopening rebases sensor PTS: never do this for recording/policy feeds.
+        if self._want_raw or not channels or self._recovery_thread is not None:
+            return
+        self._recovery_thread = threading.Thread(
+            target=self._recover_stream,
+            args=(channels,),
+            name=f"zed-recover-{self.serial}",
+            daemon=True,
+        )
+        self._recovery_thread.start()
+
+    def _recover_stream(self, channels: tuple[_AUChannel, ...]) -> None:
+        attempts = 0
+        while not self._stop.wait(0.5):
+            if all(time.perf_counter() - ch.last_au < 3.0 for ch in channels):
+                continue
+            if attempts == 3:
+                _logger.error(
+                    "camera %s: recovery exhausted; stop teleop for camera service reset",
+                    self.serial,
+                )
+                return
+            attempts += 1
+            _logger.warning(
+                "camera %s: no encoded frames for 3s; reopening pipeline (attempt %d/3)",
+                self.serial,
+                attempts,
+            )
+            try:
+                # Serialize with disconnect; shutdown must never reopen a camera.
+                with self._lifecycle_lock:
+                    if self._stop.is_set():
+                        return
+                    pipeline = self._pipeline
+                    if pipeline is None:
+                        return
+                    pipeline.set_state(self._gst.State.NULL)
+                    if self._stop.is_set():
+                        return
+                    for channel in channels:
+                        channel.first_au.clear()
+                    result = pipeline.set_state(self._gst.State.PLAYING)
+                    if result == self._gst.StateChangeReturn.FAILURE:
+                        raise RuntimeError("pipeline rejected PLAYING")
+                deadline = time.perf_counter() + _READY_TIMEOUT_S
+                while not all(ch.first_au.is_set() for ch in channels):
+                    if self._stop.wait(0.1):
+                        return
+                    if time.perf_counter() >= deadline:
+                        raise TimeoutError("no fresh encoded frames after reopen")
+                _logger.info(
+                    "camera %s: video recovered on existing WebRTC tracks", self.serial
+                )
+            except Exception as exc:  # camera-only recovery must not kill signaling
+                _logger.error("camera %s: recovery failed: %s", self.serial, exc)
+            if self._stop.wait(5.0):
+                return
 
     def disconnect(self) -> None:
         self._stop.set()
+        with self._lifecycle_lock:
+            self._disconnect_pipeline()
+        if self._recovery_thread is not None:
+            self._recovery_thread.join(timeout=1.0)
+
+    def _disconnect_pipeline(self) -> None:
         self._cancel_dataset_enable()
         self._dataset_enabled = False
         self._cancel_dataset_disable()
