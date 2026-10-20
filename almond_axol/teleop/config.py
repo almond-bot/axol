@@ -138,9 +138,11 @@ class VRTeleopConfig:
             The thumbsticks keep driving Jelly's wheels and lift with their
             ordinary mapping throughout box mode, led or frozen; box mode
             takes only the one axis Jelly leaves free, the right stick's
-            forward/back, for the gripper separation (forward = wider). The
-            grasp (``box_grasp``) and the elbows (``box_elbow_out``) are
-            set from the settings. The mode is a live setting
+            forward/back, for the gripper separation (forward = wider), and
+            splits the stick clicks by how long they're held: a quick tap of
+            either stick switches the grasp (``box_grasp``) while a grip
+            leads, a hold past ~0.3 s runs the lift. The elbows
+            (``box_elbow_out``) are set from the settings. The mode is a live setting
             (``VRTeleopCore.set_box_mode``, the headset's **Box** button,
             both thumbstick clicks together, the control panel); this is the
             default it starts in. Switching engages at once, no grip
@@ -188,10 +190,10 @@ class VRTeleopConfig:
             mounts). ``"flush"``: for the parcel gripper, each gripper
             turned ``box_flush_deg`` (39°) inward about the plate's front
             edge, the plate still at its stop and the width still measured
-            between the contact faces. Toggled live while a grip is leading by clicking (and
-            releasing) either thumbstick — a click that turns into the
-            both-sticks box-mode gesture doesn't count — or from the
-            settings; the pair blends into the new grasp over
+            between the contact faces. Toggled live while a grip is
+            leading by a quick tap of either thumbstick (released within
+            ~0.3 s; a longer hold runs the lift, and the both-sticks
+            box-mode gesture never counts) or from the settings; the pair blends into the new grasp over
             ``box_align_duration``, each gripper turning about that edge so
             a box already held stays held. The tilt trim applies on top of
             either.

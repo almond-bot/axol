@@ -513,6 +513,26 @@ def pair_aligned(
     )
 
 
+def tipped_frame_holds(
+    left: Pose, right: Pose, rot: np.ndarray, tol_deg: float
+) -> bool:
+    """True when both grippers still sit in the (possibly tipped) box frame ``rot``.
+
+    In either grasp a box-mode gripper's ``Y`` axis — the parcel
+    gripper's hinge — is along the box's up (``±``, by face; the grasp's
+    yaw turns the gripper about that axis), so each gripper's ``Y`` must be
+    within ``tol_deg`` of ``±rot[:, 2]``. A pair the leader tipped and then
+    froze, handed over or switched grasp passes; one moved elsewhere since
+    (a reset, hand guiding) doesn't, and is squared up level again.
+    """
+    up = np.asarray(rot, dtype=np.float64)[:, 2]
+    cos_tol = math.cos(math.radians(tol_deg))
+    return all(
+        abs(float(np.asarray(pose[1], dtype=np.float64)[:, 1] @ up)) >= cos_tol
+        for pose in (left, right)
+    )
+
+
 def snap_box(
     left: Pose,
     right: Pose,
@@ -523,6 +543,7 @@ def snap_box(
     tilt: float = 0.0,
     tool: ToolGeometry = URDF_TOOL,
     faces: Faces | None = None,
+    rot: np.ndarray | None = None,
 ) -> BoxState:
     """Build the box state for an engage snap from the current gripper poses.
 
@@ -537,8 +558,14 @@ def snap_box(
     holding a box keeps its grip, and a switch between the parcel
     gripper's grasps rolls it from its face onto its facet about the edge
     between them instead of swinging the facet into the box.
+
+    ``rot`` keeps a given box rotation instead of the level one
+    :func:`box_frame` builds — a re-snap of a pair the leader has tipped
+    (:func:`tipped_frame_holds`), so it isn't levelled under the box.
     """
-    _mounts, rot, _width = box_frame(left[0], right[0])
+    if rot is None:
+        _mounts, rot, _width = box_frame(left[0], right[0])
+    rot = np.asarray(rot, dtype=np.float32)
     yaw = tilt + tool.flush_tilt
     face = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
     feet = {side: tool.foot(face[side]) for side in _SIDE_SIGN}

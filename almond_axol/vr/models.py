@@ -174,8 +174,12 @@ class VRFrame(BaseModel):
             by Jelly; in box mode, while a grip leads the pair, it sets the
             grip width (forward = wider).
         l_stick_click: Left thumbstick pressed in — lift down while held.
-        r_stick_click: Right thumbstick pressed in — lift up while held, in
-            box mode as everywhere else. Both sticks clicked
+        r_stick_click: Right thumbstick pressed in — lift up while held. In
+            box mode a click is split by how long it's held: a tap (either
+            stick, released within ~0.3 s) switches the grasp while a grip
+            leads, and only a hold past that runs the lift (see
+            :meth:`almond_axol.teleop.core.VRTeleopCore.box_stick_frame`).
+            Both sticks clicked
             *together* toggle **box mode** (handled on the headset, which
             sends the ``set`` message; see
             :meth:`almond_axol.vr.server.VRServer.set_on_setting`).

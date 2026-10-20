@@ -70,7 +70,8 @@ export type AxolPoseData = {
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held, in box mode too.
+   * Right thumbstick pressed in — lift up while held (in box mode a quick
+   * tap of either stick switches the grasp instead; only a hold runs the lift).
    * Both sticks clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */

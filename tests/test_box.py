@@ -32,6 +32,7 @@ from almond_axol.teleop.box import (
     snap_box,
     swivel_step,
     tip_inward_sign,
+    tipped_frame_holds,
     toe_out,
     twist_about,
 )
@@ -712,7 +713,7 @@ class SticksDriveJellyTest(unittest.TestCase):
         core.update_engage(_stick_frame(l_lock=False, r_lock=False))
         core.update_engage(_stick_frame(l_lock=False, r_lock=True))
         self.assertTrue(core.teleop_enabled)  # the right hand leads
-        frame = _stick_frame(l_stick_y=-1.0, r_stick_x=0.5, r_stick_click=True)
+        frame = _stick_frame(l_stick_y=-1.0, r_stick_x=0.5)
         teleop._on_vr_frame(frame)
         teleop._jelly.apply_vr_frame.assert_called_with(frame, resetting=False)
         # Frozen: the same.
@@ -721,6 +722,82 @@ class SticksDriveJellyTest(unittest.TestCase):
         self.assertFalse(core.teleop_enabled)
         teleop._on_vr_frame(frame)
         teleop._jelly.apply_vr_frame.assert_called_with(frame, resetting=False)
+
+
+class StickTapTest(unittest.TestCase):
+    """In box mode a quick stick click switches the grasp and a held one runs
+    the lift; outside box mode clicks reach Jelly untouched."""
+
+    def _core(self, **overrides) -> VRTeleopCore:
+        return VRTeleopCore(
+            VRTeleopConfig(gripper="parcel", **overrides),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+
+    def _led(self) -> VRTeleopCore:
+        core = self._core(box_mode=True)
+        core.update_engage(_stick_frame(l_lock=False, r_lock=False))
+        core.update_engage(_stick_frame(l_lock=False, r_lock=True))
+        self.assertIsNotNone(core._box_leader)
+        return core
+
+    def _feed(self, core: VRTeleopCore, t: float, **clicks: bool):
+        return core.box_stick_frame(_stick_frame(**clicks), now=t)
+
+    def test_outside_box_mode_the_frame_is_untouched(self) -> None:
+        core = self._core()
+        frame = _stick_frame(r_stick_click=True)
+        self.assertIs(core.box_stick_frame(frame, now=0.0), frame)
+
+    def test_a_tap_switches_the_grasp_and_never_lifts(self) -> None:
+        core = self._led()
+        self.assertEqual(core.config.box_grasp, "straight")
+        out = self._feed(core, 0.0, r_stick_click=True)
+        self.assertFalse(out.r_stick_click)
+        out = self._feed(core, 0.1, r_stick_click=True)
+        self.assertFalse(out.r_stick_click)
+        self._feed(core, 0.2)  # released inside the window: a tap
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "flush")
+        # And back, with the other stick.
+        self._feed(core, 1.0, l_stick_click=True)
+        self._feed(core, 1.1)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+
+    def test_a_hold_runs_the_lift_and_switches_nothing(self) -> None:
+        core = self._led()
+        self.assertFalse(self._feed(core, 0.0, l_stick_click=True).l_stick_click)
+        self.assertFalse(self._feed(core, 0.2, l_stick_click=True).l_stick_click)
+        self.assertTrue(self._feed(core, 0.35, l_stick_click=True).l_stick_click)
+        self.assertTrue(self._feed(core, 2.0, l_stick_click=True).l_stick_click)
+        self.assertFalse(self._feed(core, 2.1).l_stick_click)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+
+    def test_both_sticks_are_never_a_tap(self) -> None:
+        core = self._led()
+        self._feed(core, 0.0, l_stick_click=True)
+        self._feed(core, 0.05, l_stick_click=True, r_stick_click=True)
+        self._feed(core, 0.1, r_stick_click=True)
+        self._feed(core, 0.15)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+
+    def test_a_tap_with_nobody_leading_does_nothing(self) -> None:
+        core = self._core(box_mode=True)
+        self.assertFalse(self._feed(core, 0.0, r_stick_click=True).r_stick_click)
+        self._feed(core, 0.1)
+        core._apply_live_requests()
+        self.assertEqual(core.config.box_grasp, "straight")
+
+    def test_the_same_frame_again_gives_the_same_result(self) -> None:
+        core = self._led()
+        frame = _stick_frame(r_stick_click=True)
+        out = core.box_stick_frame(frame, now=0.0)
+        self.assertIs(core.box_stick_frame(frame, now=5.0), out)
+        self.assertFalse(out.r_stick_click)
 
 
 class BoxTriggersTest(unittest.TestCase):
@@ -1158,6 +1235,7 @@ def _box_worker(leader: str = "left") -> IKWorker:
     worker._box = None
     worker._box_leader = None
     worker._box_snap = None
+    worker._box_rot = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {}
@@ -1300,6 +1378,71 @@ class HandTrackingTest(unittest.TestCase):
         self.assertGreater(float(np.linalg.norm(shift)), 0.1)
         np.testing.assert_allclose(right[0] - base_right[0], shift, atol=1e-6)
         self._assert_straight_out(left, right, self._CENTER + shift)
+
+
+class TippedResnapTest(unittest.TestCase):
+    """A re-snap inside box mode (handover, freeze and lead again, grasp
+    switch) keeps a tipped pair's tilt instead of levelling it under the box;
+    only a fresh engage, or grippers moved out of the frame, square it up."""
+
+    def _step(self, worker: IKWorker, leader: str = "left", ctrl_rot=None) -> None:
+        frame = _stick_frame()
+        frame.box_leader = leader
+        rot = np.eye(3, dtype=np.float32) if ctrl_rot is None else ctrl_rot
+        zero = np.zeros(3, np.float32)
+        ctrl = {"left": (zero, np.asarray(rot, np.float32)), "right": (zero, rot)}
+        worker._step_box(frame, np.zeros(14, np.float32), ctrl, zero, zero)
+
+    def _tipped(self) -> tuple[IKWorker, dict]:
+        worker = _box_worker()
+        self._step(worker, ctrl_rot=_rot_z(0.4))  # pitch the pair 0.4 rad
+        call = worker._solver.calls[-1]
+        # The arms got there: FK now reports the tipped grippers.
+        worker._solver.left_pose = call["left_pose"]
+        worker._solver.right_pose = call["right_pose"]
+        return worker, call
+
+    def _assert_same_pair(self, worker: IKWorker, call: dict) -> None:
+        new = worker._solver.calls[-1]
+        for key in ("left_pose", "right_pose"):
+            np.testing.assert_allclose(new[key][0], call[key][0], atol=1e-5)
+            np.testing.assert_allclose(new[key][1], call[key][1], atol=1e-5)
+
+    def test_a_handover_keeps_the_tilt(self) -> None:
+        worker, call = self._tipped()
+        self._step(worker, leader="right")  # re-snap to the new leader
+        self._step(worker, leader="right")
+        self._assert_same_pair(worker, call)
+
+    def test_freeze_and_lead_again_keeps_the_tilt(self) -> None:
+        worker, call = self._tipped()
+        # What a lock-less (frozen) frame does to the pair state.
+        worker._box = worker._box_leader = worker._box_snap = None
+        self._step(worker)  # lead again: re-snap
+        self._step(worker)
+        self._assert_same_pair(worker, call)
+
+    def test_a_fresh_engage_squares_the_pair_level(self) -> None:
+        worker, _call = self._tipped()
+        worker.clear_engage()
+        self._step(worker)
+        self._step(worker)
+        for pose in (
+            worker._solver.calls[-1]["left_pose"],
+            worker._solver.calls[-1]["right_pose"],
+        ):
+            np.testing.assert_allclose(pose[1][:, 0] @ _UP, 0.0, atol=1e-5)
+            np.testing.assert_allclose(approach_axis(pose[1]) @ _UP, 0.0, atol=1e-5)
+
+    def test_grippers_moved_out_of_the_frame_are_squared_up(self) -> None:
+        tipped = rodrigues(_LAT, 0.8)  # ~46°, past the 25° tolerance
+        level = side_clamp_rotation(1.0, 1.0, 0.0)
+        pose = (np.zeros(3, np.float32), tipped @ level)
+        self.assertTrue(tipped_frame_holds(pose, pose, tipped, 25.0))
+        self.assertFalse(tipped_frame_holds(pose, pose, np.eye(3), 25.0))
+        self.assertTrue(
+            tipped_frame_holds((pose[0], level), (pose[0], level), np.eye(3), 25.0)
+        )
 
 
 class GraspSwitchTest(unittest.TestCase):

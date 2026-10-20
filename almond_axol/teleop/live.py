@@ -73,9 +73,10 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "One controller drives both arms as a parallel-gripper pair, "
             "following the hand's position and its full rotation (yaw, pitch "
             "and roll, about the pair's centre). The right thumbstick's "
-            "forward/back sets the grip width while a grip leads; the rest "
-            "of the sticks drive Jelly's wheels and lift as usual, led or "
-            "not. Also toggled by clicking both "
+            "forward/back sets the grip width while a grip leads and a "
+            "quick stick tap switches the grasp; the rest of the sticks "
+            "drive Jelly as usual, led or not (hold a click ~0.3 s for the "
+            "lift). Also toggled by clicking both "
             "thumbsticks together. Switching engages at once: into box mode "
             "led by the lead hand, out of it with both arms."
         ),
@@ -100,8 +101,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
             "box. flush: the parcel gripper rolled inward by the Angled yaw "
             "(39°) about its plate's front edge onto the chamfer facet and "
             "the fixed tip, the plate at its stop. Width is between the "
-            "contact faces in both. Switching while a grip leads blends the "
-            "pair over to it."
+            "contact faces in both. Also switched by a quick tap of either "
+            "thumbstick while a grip leads; the pair blends over to it."
         ),
     ),
     LiveSettingDef(

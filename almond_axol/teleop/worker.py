@@ -45,6 +45,7 @@ from .box import (
     squeeze_lean,
     swivel_step,
     tip_inward_sign,
+    tipped_frame_holds,
     toe_out_sides,
 )
 from .config import VRTeleopConfig
@@ -422,6 +423,12 @@ class IKWorker:
         self._box_snap: (
             tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None
         ) = None
+        # The pair's box rotation as last commanded (the snap's turned by the
+        # leader, so possibly tipped). Kept across a freeze, a handover and a
+        # grasp switch so their re-snap holds a tipped box at its tilt
+        # (snap_box's ``rot``) instead of levelling it; dropped once the
+        # session leaves box tracking or the arms are moved by something else.
+        self._box_rot: np.ndarray | None = None
         # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
         # and joint stiffness as last reported by the core (``("meas", ...)``,
         # hardware only — the sim reports none), the low-passed clamp depth
@@ -665,6 +672,7 @@ class IKWorker:
                 lp,
                 rp,
             )
+        self._box_rot = None
         if self._box is not None:
             # Box tracking ended without a lock-less frame in between (mode
             # switched while engaged): the per-arm path below re-engages each
@@ -1570,6 +1578,7 @@ class IKWorker:
         self._box = None
         self._box_leader = None
         self._box_snap = None
+        self._box_rot = None
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
@@ -1645,8 +1654,16 @@ class IKWorker:
         if self._box is None or not engaged or self._box_leader != leader:
             # Engage snap, or the leading hand changed: (re)anchor to the
             # live pose. A handover mid-align simply restarts the blend from
-            # wherever the grippers are, so nothing jumps.
+            # wherever the grippers are, so nothing jumps. A re-snap within
+            # box mode (handover, freeze and lead again, grasp switch) keeps
+            # the pair's last frame while the grippers still sit in it, so a
+            # tipped box stays tipped; a fresh engage squares the pair level.
             l_fk, r_fk = self._solver.fk(q_current)
+            keep = self._box_rot
+            if keep is not None and not tipped_frame_holds(
+                l_fk, r_fk, keep, _ALIGNED_TOL_DEG
+            ):
+                keep = None
             self._box = snap_box(
                 l_fk,
                 r_fk,
@@ -1657,6 +1674,7 @@ class IKWorker:
                 tilt=math.radians(cfg.box_grip_tilt),
                 tool=self._box_tool(),
                 faces=self._box_faces(),
+                rot=keep,
             )
             self._box_leader = leader
             self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
@@ -1693,6 +1711,7 @@ class IKWorker:
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
         turn = _box_turn(ctrl_rot, snap_ctrl_rot, cfg.rotation_multiplier)
         rot = (box.rot @ turn).astype(np.float32)
+        self._box_rot = rot
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)
         targets = self._squeeze_lean(box, targets, q_current, now, rot)

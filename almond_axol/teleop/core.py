@@ -112,6 +112,9 @@ JOINT_BROADCAST_HZ = 20.0
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
 # worker's re-blend to the straight grasp starts a frame after the request.
 _BOX_EXIT_MARGIN_S = 0.25
+# Box mode's stick clicks (see VRTeleopCore.box_stick_frame): a click
+# released sooner than this is a grasp tap; one held longer runs the lift.
+_BOX_TAP_S = 0.3
 # How long after a box-mode switch the next VR frame may arrive and still
 # engage the arms at once (see VRTeleopCore._maybe_auto_engage). Longer than
 # a frame gap under load; far shorter than the walk from the panel to the
@@ -422,6 +425,13 @@ class VRTeleopCore:
             )
         self.box_mode: bool = bool(config.box_mode) and self.box_available
         self._box_leader: str | None = None
+        # Box mode's stick-click split (VR thread, see box_stick_frame): when
+        # each stick went down (None while up), whether that press can still
+        # be a grasp tap, and the last frame in with the one handed on.
+        self._click_down: dict[str, float | None] = {"l": None, "r": None}
+        self._click_tap: dict[str, bool] = {"l": False, "r": False}
+        self._sticks_in: object | None = None
+        self._sticks_out: object | None = None
 
         # Re-engage behaviour ("clutch": the controller matches the arm,
         # "ramp": the arm ramps out to the controller — see
@@ -873,6 +883,66 @@ class VRTeleopCore:
         """True while at least one arm is engaged (tracking)."""
         return self.left_enabled or self.right_enabled
 
+    def box_stick_frame(self, frame: Any, now: float | None = None) -> Any:
+        """The frame to hand Jelly, box mode's stick clicks split into tap and hold.
+
+        Outside box mode the frame comes back as is. In box mode a stick
+        click does one of two things, told apart by how long it is held:
+        a **tap** — one stick pressed and released within ``_BOX_TAP_S``,
+        the other stick up throughout — switches the grasp
+        (``box_grasp``: straight / flush) while a grip leads the pair, and
+        never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
+        lift as outside box mode, from then until the release. Until a press
+        has lasted that long its click is cleared from the frame Jelly gets
+        (a copy; the sticks' axes are untouched). Both sticks pressed
+        together — the box-mode toggle gesture — are never a tap.
+
+        Call once per received frame (VR thread), before Jelly; the same
+        frame object handed over again returns the same result, so Jelly's
+        stale-frame check still holds. The grasp switch is queued
+        (:meth:`set_live`) and flipped against the session's value on the
+        IK thread.
+        """
+        if frame is self._sticks_in:
+            return self._sticks_out
+        now = time.perf_counter() if now is None else now
+        held: dict[str, bool] = {}
+        for side, other in (("l", "r"), ("r", "l")):
+            pressed = bool(getattr(frame, f"{side}_stick_click", False))
+            other_pressed = bool(getattr(frame, f"{other}_stick_click", False))
+            down = self._click_down[side]
+            if pressed:
+                if down is None:
+                    self._click_down[side] = down = now
+                    self._click_tap[side] = not other_pressed
+                elif other_pressed:
+                    self._click_tap[side] = False
+                held[side] = now - down >= _BOX_TAP_S
+                continue
+            if (
+                down is not None
+                and self._click_tap[side]
+                and now - down < _BOX_TAP_S
+                and self.box_mode
+                and self._box_leader is not None
+            ):
+                self._logger.info("Box grasp: switching (stick tap)")
+                self.set_live("box_grasp", "toggle")
+            self._click_down[side] = None
+            self._click_tap[side] = False
+            held[side] = False
+        out = frame
+        if self.box_mode:
+            masked = {
+                f"{side}_stick_click": False
+                for side in ("l", "r")
+                if getattr(frame, f"{side}_stick_click", False) and not held[side]
+            }
+            if masked:
+                out = frame.model_copy(update=masked)
+        self._sticks_in, self._sticks_out = frame, out
+        return out
+
     def spring_caps(self) -> dict[Joint, float] | None:
         """Per-joint spring-torque caps the arms should run under right now.
 
@@ -966,6 +1036,10 @@ class VRTeleopCore:
                     )
                 self._notify_mode("reengage", mode)
             else:
+                if key == "box_grasp" and value == "toggle":
+                    if self._box_exit_deadline is not None:
+                        continue  # leaving box mode: the exit owns the grasp
+                    value = "straight" if self.config.box_grasp == "flush" else "flush"
                 field_type = type(getattr(self.config, key))
                 coerced = (
                     field_type(value) if field_type in (bool, int, float) else value
