@@ -53,22 +53,88 @@ The Camera Kit's GMSL cables end in standard FAKRA connectors, and the MIC-742 f
 
 ## Flash the OS
 
-Advantech publishes a MIC-742 image for **JetPack 7.2 (L4T 39.2)** together with its flashing SOP:
+Axol targets Advantech's MIC-742 image for **JetPack 7.2 (L4T 39.2)**. Units can arrive with an earlier JetPack 7 release, so reflash unless the unit already reports L4T 39.2 (see [Verify](#verify)).
 
-- [MIC-742_Thor_7.2_V1.0.0_SDK](https://www.dropbox.com/scl/fo/dr6zcn9vfq8eokdh9uug0/AGLRTIHqmxA1kSuH-KaphEQ/MIC-742-AT/MIC-742-AT7A1/MIC-742_Thor_7.2_V1.0.0_SDK?dl=0&rlkey=css95k1m3b0698nn4wrvwisva&subfolder_nav_tracking=1) (Advantech download folder)
-
-Units can arrive with an earlier JetPack 7 release. Axol's camera stack targets L4T 39.2, so reflash with this image unless the unit already reports it (see [Verify](#verify)). Follow the flashing SOP in that folder.
+| File | Download | MD5 |
+|---|---|---|
+| OS image (BSP), 4.2 GB | [MIC-742_Thor_7.2_V1.0.0_SDK.tbz2](https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.tbz2) | `67807ecc0d316637fecbe7b282d56c4f` |
+| Advantech flashing SOP | [MIC-742_Jetpack_7_Flash_SOP.pdf](https://downloads.almond.bot/mic742/jp7.2/MIC-742_Jetpack_7_Flash_SOP.pdf) | |
 
 <Warning>
   Flashing erases the SSD. Copy off any datasets or calibration you want to keep first.
 </Warning>
 
+You need a separate **x86_64 host PC running Ubuntu 24.04**, a **USB-A to Micro-USB** cable, and an HDMI monitor for the MIC-742. Advantech's notes for the host:
+
+- Use a physical machine, not a virtual machine. USB passthrough to VMs drops the connection mid-flash.
+- Plug the cable straight into the host, with no USB hub in between.
+- Run the commands as a normal user with `sudo`, not logged in as `root`.
+- Keep the HDMI monitor attached to the MIC-742 until the flash finishes and it boots to the desktop.
+
+<Steps>
+  <Step title="Download and check the image">
+    On the host PC:
+
+    ```bash
+    cd ~/Desktop
+    curl -LO https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.tbz2
+    curl -LO https://downloads.almond.bot/mic742/jp7.2/MIC-742_Thor_7.2_V1.0.0_SDK.md5sum
+    md5sum -c MIC-742_Thor_7.2_V1.0.0_SDK.md5sum   # expect: OK
+    ```
+  </Step>
+  <Step title="Extract it">
+    ```bash
+    sudo tar xvpf MIC-742_Thor_7.2_V1.0.0_SDK.tbz2
+    ```
+
+    This creates `~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK`.
+  </Step>
+  <Step title="Install the flashing prerequisites">
+    The host needs internet access for this step.
+
+    ```bash
+    cd ~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK
+    sudo ./tools/l4t_flash_prerequisites.sh
+    ```
+  </Step>
+  <Step title="Put the MIC-742 in recovery mode">
+    1. Shut the MIC-742 down and unplug its power.
+    2. Connect the Micro-USB port next to the **REC** and **RST** buttons to the host PC.
+    3. Press and hold **REC**.
+    4. Plug in power and press **RST**, keeping **REC** held. Release **REC** 5–10 seconds after pressing **RST**.
+
+    Confirm it from the host:
+
+    ```bash
+    lsusb | grep 0955:7026   # expect: NVIDIA Corp. APX
+    ```
+
+    If nothing shows, repeat the button sequence.
+  </Step>
+  <Step title="Flash">
+    ```bash
+    cd ~/Desktop/MIC-742_Thor_7.2_V1.0.0_SDK
+    sudo bash advantech/only_flash.sh
+    ```
+  </Step>
+  <Step title="Reboot">
+    When the script reports success, press **RST**. The MIC-742 boots into the new image. Complete the Ubuntu first-boot setup on the HDMI monitor.
+  </Step>
+</Steps>
+
 ## Install the camera driver
 
-Once the image boots, install the **Stereolabs driver built for the MIC-742**: package `stereolabs-advantech-mic742`, release **1.4.3 for L4T 39.2.0**. This is the only driver that pairs with Advantech's image. Driver packages for the ZED Box, the ZED Link, or NVIDIA's devkit will not work on this carrier.
+Once the image boots, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that pairs with Advantech's image. Driver packages for the ZED Box, the ZED Link, or NVIDIA's devkit will not work on this carrier.
+
+| File | Download | MD5 |
+|---|---|---|
+| Camera driver | [stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb](https://downloads.almond.bot/mic742/jp7.2/stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb) | `e92cdd0b2e4bb2f81a4a43eb9bda1b4d` |
+
+On the MIC-742:
 
 ```bash
-sudo dpkg -i stereolabs-advantech-mic742_1.4.3*_arm64.deb
+curl -LO https://downloads.almond.bot/mic742/jp7.2/stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb
+sudo dpkg -i stereolabs-advantech-mic742_1.4.3-L4T39.2.0_arm64.deb
 sudo reboot
 ```
 
@@ -84,7 +150,7 @@ Check the L4T release and the driver before installing Axol:
 
 ```bash
 head -1 /etc/nv_tegra_release      # expect: # R39 (release), REVISION: 2.x
-dpkg -l | grep stereolabs           # expect: stereolabs-advantech-mic742  1.4.3-...L4T39.2.0
+dpkg -l | grep stereolabs           # expect: stereolabs-advantech-mic742  1.4.3-L4T39.2.0
 ```
 
 If the first line doesn't say `R39` with revision `2`, reflash with Advantech's image. If the system hangs at boot after the driver install, the unit is running a non-Advantech image: reflash it from [Flash the OS](#flash-the-os). The driver install alone can't fix it.
