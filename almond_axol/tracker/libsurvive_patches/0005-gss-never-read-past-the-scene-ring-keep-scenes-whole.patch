@@ -1,7 +1,7 @@
 From 5326d3bfe991cee49deb08a592ef2df9f7ff07b2 Mon Sep 17 00:00:00 2001
 From: Shawn Patel <shawn@almondbot.com>
 Date: Mon, 19 Oct 2026 21:19:31 +0000
-Subject: [PATCH 5/6] gss: never read past the scene ring; keep scenes whole
+Subject: [PATCH 5/7] gss: never read past the scene ring; keep scenes whole
  when compacting
 
 The global scene solver keeps up to GSS_NUM_STORED_SCENES (32) scenes.

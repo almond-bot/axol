@@ -35,11 +35,12 @@ _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
 # the global scene solver's out-of-bounds read once its 32-scene ring wrapped,
 # and mpfit's work arrays moved off the stack (a global-scene solve's Jacobian
 # overflowed the solver thread's stack) — the two mid-session SIGSEGVs seen
-# with four base stations.
+# with four base stations — plus a solver-flag data race, a mis-indexed
+# lighthouse-correction count, and a read past an empty config file's tokens.
 _PATCH_DIR = Path(__file__).resolve().parent.parent / "tracker" / "libsurvive_patches"
 # Bump this whenever build options or the patch set change so existing
 # installations are rebuilt.
-_BUILD_REVISION = "libusb-v3-axol-patches-5"
+_BUILD_REVISION = "libusb-v3-axol-patches-6"
 # Earlier revisions compiled to byte-identical artifacts (same CMake options,
 # same patches). A build cache stamped with any of these only needs a stale
 # machine manifest re-attested rather than a native rebuild. Builds before

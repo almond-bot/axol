@@ -1,7 +1,7 @@
 From a5c5a073b682200cd95e05437f5abadcb1edadf3 Mon Sep 17 00:00:00 2001
 From: Shawn Patel <shawn@almondbot.com>
 Date: Mon, 19 Oct 2026 19:10:15 +0000
-Subject: [PATCH 4/6] recording: line-buffer the stdout recording
+Subject: [PATCH 4/7] recording: line-buffer the stdout recording
 
 With --record-stdout writing into a pipe, glibc fully buffers stdout and
 the consumer receives the stream in 4 KB blocks. Two trackers' POSE and

@@ -1,7 +1,7 @@
 From e67f02ac2dab777b117cc42c49332005cec1ca44 Mon Sep 17 00:00:00 2001
 From: Shawn Patel <shawn@almondbot.com>
 Date: Mon, 19 Oct 2026 22:49:51 +0000
-Subject: [PATCH 6/6] mpfit: allocate the work arrays on the heap
+Subject: [PATCH 6/7] mpfit: allocate the work arrays on the heap
 
 mp_malloc used alloca for every work array, including the m * nfree
 Jacobian. A global-scene solve feeds mpfit every stored scene of every

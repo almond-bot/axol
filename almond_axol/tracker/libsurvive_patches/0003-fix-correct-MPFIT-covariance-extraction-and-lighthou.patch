@@ -1,7 +1,7 @@
 From 46c3ae1fe7afd1dcc24e9aa140146467bd4b1feb Mon Sep 17 00:00:00 2001
 From: shkwon <shkwon@tommoro.ai>
 Date: Thu, 10 Sep 2026 14:41:13 +0900
-Subject: [PATCH 3/6] fix: correct MPFIT covariance extraction and lighthouse
+Subject: [PATCH 3/7] fix: correct MPFIT covariance extraction and lighthouse
  indexing
 
 - Expand free-parameter covariance before extracting lighthouse and object pose blocks, preserving indices for fixed parameters.
