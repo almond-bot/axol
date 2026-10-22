@@ -228,9 +228,8 @@ class MobileUrdfContractTest(unittest.TestCase):
             with self.subTest(link=link):
                 self.assertIsNotNone(links[link].find("collision"))
         # Every other link is visual or a frame only for IK: a torso link
-        # without geometry would get a point capsule from pyroki. (The Jelly
-        # deck and the Ox cart's caster frame are out of reach with the lift
-        # raised.)
+        # without geometry would get a point capsule from pyroki. (The Ox
+        # cart's caster frame is out of reach with the lift raised.)
         for name, link in links.items():
             if not name.startswith(("left_", "right_")) and name not in torso:
                 with self.subTest(link=name):

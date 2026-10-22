@@ -161,7 +161,17 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.OX_CART: ("base", "s1", "lift_plate", "head"),
     # The mount's column (base) and its foot plate as six strips.
     AxolModel.OWL: ("base", "s1", "head", *(f"foot_{i}" for i in range(6))),
-    AxolModel.MOBILE: ("base", "s1", "lift_plate", "head", "lift_stage", "jelly"),
+    # The lift column's sections and top plate, and the deck as three strips
+    # (in reach with the lift lowered).
+    AxolModel.MOBILE: (
+        "base",
+        "s1",
+        "lift_plate",
+        "head",
+        "lift_stage",
+        "jelly",
+        *(f"deck_{i}" for i in range(3)),
+    ),
 }
 
 
@@ -191,15 +201,20 @@ def urdf_path(
 # its strip capsules overlap the upper arms' (fat) capsules at the arms'
 # ordinary poses even though the parts clear by ~5 cm, so it is kept off
 # the hard upper-arm guard (built for the upper arm swinging into the torso
-# cross-body); the soft collision cost still keeps the arms off it.
-_UPPER_ARM_GUARD_EXEMPT = frozenset(f"foot_{i}" for i in range(6))
+# cross-body); the soft collision cost still keeps the arms off it. The
+# Jelly deck's strips likewise: the deck rises toward the arms as the lift
+# lowers, and a hard stop there would pin an arm the lift brought down next
+# to it rather than let the soft cost ease it away.
+_UPPER_ARM_GUARD_EXEMPT = frozenset(
+    (*(f"foot_{i}" for i in range(6)), *(f"deck_{i}" for i in range(3)))
+)
 
 
 def upper_arm_guard_links(
     model: AxolModel | str = AxolModel.CLASSIC,
 ) -> tuple[str, ...]:
     """The body links the solver hard-stops the upper arms (e1) against: the
-    :func:`torso_links` but the Owl mount's foot."""
+    :func:`torso_links` but the Owl mount's foot and the Jelly deck."""
     return tuple(
         link for link in torso_links(model) if link not in _UPPER_ARM_GUARD_EXEMPT
     )

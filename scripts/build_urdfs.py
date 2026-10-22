@@ -27,9 +27,9 @@ the viewers and physics simulators (Isaac Sim, MuJoCo) all load:
   ``<collision>``, for physics, and capsule-friendly pieces in the custom
   ``<ik_collision>`` (pyroki fits one capsule per link): the shoulder bar,
   the head-camera mount, the lift column's top plate and each section, the
-  Owl foot plate as strips, and each gripper's jaws as one body over their
-  whole motion. IK (``almond_axol.kinematics.model``) freezes every joint
-  but the arms' and collides the second set.
+  Jelly deck and the Owl foot plate as strips, and each gripper's jaws as
+  one body over their whole motion. IK (``almond_axol.kinematics.model``)
+  freezes every joint but the arms' and collides the second set.
 - **Masses and drives** from :class:`~almond_axol.robot.config.AxolConfig`
   for the arms (wrist_3's lump split across the gripper parts), estimates
   elsewhere (``Body.masses``); friction and impedance gains on the arm
@@ -252,7 +252,10 @@ JELLY = Body(
         "lift_stage": ("column_mid",),
         "jelly": ("column_stub",),
     },
-    strips={},
+    # The deck stays on the ground while the lift carries the arms down, so
+    # it is in reach with the lift lowered (IK places it from the live lift
+    # height, see almond_axol.kinematics.model.lift_link_shift).
+    strips={"deck": ("jelly", "deck", DECK_STRIPS)},
     sim_hulls={
         "lift_plate": (("lift_plate",),),
         "base": (("column_top",),),
@@ -277,9 +280,10 @@ JELLY = Body(
     note=(
         "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
         "mount (head), the lift column's top plate (lift_plate) and its three "
-        "sections (base, lift_stage, jelly). IK freezes the base and lift at "
-        "zero, the lift fully raised, where the deck is below anything the "
-        "arms can reach."
+        "sections (base, lift_stage, jelly), and the deck as strips (deck_*). "
+        "IK freezes the base and lift at zero, the lift fully raised, and "
+        "moves the parts the lift leaves behind (the deck and the lower "
+        "column) up to the arms by the live lift height."
     ),
     planar=True,
 )

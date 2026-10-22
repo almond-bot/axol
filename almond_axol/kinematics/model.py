@@ -90,6 +90,11 @@ _Key = tuple[AxolModel, str]
 _urdf: dict[_Key, yourdfpy.URDF] = {}
 _robot: dict[_Key, pk.Robot] = {}
 _robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
+_lift_shift: dict[_Key, tuple[np.ndarray, float]] = {}
+
+# The lift's driving joint in the generated URDFs (0 = fully raised,
+# lowering the arms); any further stages mimic it.
+_LIFT_JOINT = "lift"
 
 
 def _key(model: AxolModel | str | None, gripper: str | None) -> _Key:
@@ -183,6 +188,61 @@ def shared_robot_collision(
                 _load_urdf(key), torso_links(key[0])
             )
         return _robot_coll[key]
+
+
+def lift_link_shift(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> tuple[np.ndarray, float]:
+    """How the lift moves each IK link relative to the arms, and its travel.
+
+    IK freezes the lift fully raised (:func:`ik_urdf_xml`) and solves in the
+    torso's frame, which the lift carries with the arms. Lowering it leaves
+    the parts below behind — the Jelly deck and the lower column sections —
+    so relative to the arms they rise. Returns ``(shift, travel)``:
+    ``shift`` is ``(num_links, 3)`` in the IK robot's link order, each link's
+    displacement in the torso frame per metre the lift is lowered (zero for
+    the links that ride with the arms), and ``travel`` the lift's full stroke
+    (m). A version without a lift has zero shift and travel.
+    """
+    with _lock:
+        key = _key(model, gripper)
+        if key not in _lift_shift:
+            names = list(shared_robot(key[0], gripper=key[1]).links.names)
+            _lift_shift[key] = _measure_lift_shift(
+                urdf_path(key[0], gripper=key[1]), names
+            )
+        return _lift_shift[key]
+
+
+def _measure_lift_shift(path: Path, names: list[str]) -> tuple[np.ndarray, float]:
+    shift = np.zeros((len(names), 3), dtype=np.float32)
+    full = yourdfpy.URDF.load(
+        str(path), build_collision_scene_graph=False, load_meshes=False
+    )
+    joint = full.joint_map.get(_LIFT_JOINT)
+    if joint is None or joint.limit is None:
+        return shift, 0.0
+    travel = float(joint.limit.upper)
+    root = full.base_link
+    # The torso root: the link the arms' first joints hang from (s1's
+    # ancestor chain ends there), whose frame IK solves in.
+    torso = "root" if "root" in full.link_map else "s1"
+
+    def relative(q: float) -> np.ndarray:
+        cfg = {n: 0.0 for n in full.actuated_joint_names}
+        cfg[_LIFT_JOINT] = q
+        full.update_cfg(cfg)
+        world_torso = full.get_transform(torso, root)
+        inv = np.linalg.inv(world_torso)
+        out = np.zeros((len(names), 3))
+        for k, name in enumerate(names):
+            if name in full.link_map:
+                out[k] = (inv @ full.get_transform(name, root))[:3, 3]
+        return out
+
+    shift[:] = (relative(travel) - relative(0.0)) / travel
+    full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
+    return shift, travel
 
 
 def _build_robot_collision(

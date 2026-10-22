@@ -508,6 +508,20 @@ class Jelly:
         return self._lift.status if self._lift is not None else None
 
     @property
+    def lift_raised(self) -> float | None:
+        """Lift height as a fraction of its travel (1 = fully raised), or None.
+
+        ``None`` until the lift is up, homed and answering (a status within
+        the last 2 s). IK places the deck by it (see
+        :meth:`almond_axol.kinematics.solver.KinematicsSolver.set_lift`).
+        """
+        lift = self._lift
+        if lift is None or not lift.status_is_fresh(2.0):
+            return None
+        percent = lift.height_percent
+        return None if percent is None else percent / 100.0
+
+    @property
     def battery(self) -> BatteryStatus | None:
         """Battery estimate from the lift board's rail voltage, or None.
 

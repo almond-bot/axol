@@ -1210,4 +1210,7 @@ class VRTeleop:
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
             get_measured=lambda: measured_arms(self._robot),
+            get_lift=(
+                (lambda: self._jelly.lift_raised) if self._jelly is not None else None
+            ),
         )

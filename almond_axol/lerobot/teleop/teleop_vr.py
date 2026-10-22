@@ -1438,4 +1438,7 @@ class AxolVRTeleop(Teleoperator):
             self._note_ik_sample,
             # Read live: collect-data hands the robot over after connect().
             get_measured=lambda: measured_arms(self.measured_robot),
+            get_lift=(
+                (lambda: self._jelly.lift_raised) if self._jelly is not None else None
+            ),
         )

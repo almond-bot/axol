@@ -1230,6 +1230,12 @@ class IKWorker:
             self._box = None
         setattr(self._config, key, coerced)
 
+    def set_lift(self, raised: float) -> None:
+        """The live lift height (``("lift", raised)`` message): where the
+        collision checks put the deck and lower column (see
+        :meth:`KinematicsSolver.set_lift`)."""
+        self._solver.set_lift(raised)
+
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
 
@@ -2702,6 +2708,8 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "set":
                 worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "lift":
+                worker.set_lift(float(msg[1]))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":

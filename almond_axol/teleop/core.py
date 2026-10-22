@@ -1936,6 +1936,7 @@ class VRTeleopCore:
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
         get_measured: Callable[[], MeasuredArms | None] | None = None,
+        get_lift: Callable[[], float | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1958,11 +1959,19 @@ class VRTeleopCore:
                 engaged and forwarded to the worker as ``("meas", left,
                 right, kp_left, kp_right)`` for the squeeze lean
                 (``IKWorker.note_measured``). Hardware flows only.
+            get_lift: Optional; returns the lift's height as a fraction of
+                its travel (``Jelly.lift_raised``), or ``None`` while it is
+                unknown. Forwarded as ``("lift", raised)`` whenever it moves,
+                so the solver's collision checks follow the deck up as the
+                lift lowers (``KinematicsSolver.set_lift``); until the first
+                reading the solver takes the lift as fully raised, and an
+                unknown height keeps the last one sent.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0
+        sent_lift: float | None = None
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -1972,6 +1981,22 @@ class VRTeleopCore:
                 continue
 
             t0 = time.perf_counter()
+
+            if get_lift is not None:
+                try:
+                    raised = get_lift()
+                except Exception:  # noqa: BLE001 - never stall the solve
+                    self._logger.exception("lift height readout failed")
+                    raised = None
+                # 1 permille steps: the lift reports permille of its travel.
+                if raised is not None and (
+                    sent_lift is None or abs(raised - sent_lift) >= 1e-3
+                ):
+                    try:
+                        conn.send(("lift", float(raised)))
+                        sent_lift = raised
+                    except OSError:
+                        pass  # the dead-process path below reports it
 
             # Reset (return-to-rest) takes priority over normal tracking. Leave
             # the latch set if we can't dispatch yet (no solution, or a
