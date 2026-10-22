@@ -934,8 +934,15 @@ export default function ControlPanel() {
   // No robot model picked yet: a host that offers the pick (kinematics.mount)
   // and has none saved, on Axol without Jelly (Jelly is detected, never
   // picked). The pick shows above the settings and gates Axol runs until saved.
+  //
+  // It waits for CAN discovery to settle: hardware still being identified
+  // may be the Jelly, which would make the pick moot. (Hosts that predate
+  // discovery report none: settled.)
+  const canDiscoverySettled =
+    canDiscovery == null || canDiscovery.status === "ready" || canDiscovery.status === "configured"
   const needsMount =
     conn.state === "ok" &&
+    canDiscoverySettled &&
     !settingsError &&
     hardwareProfile !== "mantis" &&
     settingsSnap?.robotModel !== "mobile" &&
@@ -944,6 +951,25 @@ export default function ControlPanel() {
     ) &&
     settingsSnap?.values["kinematics.mount"] == null
   const desiredHardwareProfile: HardwareProfile = hardwareProfile
+
+  // The host derives the robot model (robotModel) from whether Jelly's CAN
+  // interfaces are present — but the panel only fetches it with the
+  // settings. Follow the 2 s CAN inventory instead of a one-off answer:
+  // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
+  // that comes up a moment after the panel connects turns the robot into
+  // Axol × Jelly (and drops the "Which Axol is this?" pick) without a reload.
+  const jellyPresent = canDevices
+    ? Boolean(canDevices.wheels?.present || canDevices.lift?.present)
+    : null
+  const robotModelInputs = conn.state === "ok" ? `${jellyPresent}:${canDiscoverySettled}` : null
+  const robotModelInputsRef = useRef<string | null>(null)
+  useEffect(() => {
+    const prev = robotModelInputsRef.current
+    robotModelInputsRef.current = robotModelInputs
+    if (prev !== null && robotModelInputs !== null && prev !== robotModelInputs) {
+      void loadSettings()
+    }
+  }, [robotModelInputs, loadSettings])
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
