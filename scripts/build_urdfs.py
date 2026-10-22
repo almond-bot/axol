@@ -189,9 +189,11 @@ class Body:
     lift_links: tuple[str, ...]
     # Masses (kg) of its links and s1 / head: ESTIMATES, not measured.
     masses: dict[str, float]
-    # Whether the export root is the ground the robot stands on (a floor
-    # link goes there); the Owl mount and standalone Axol stand on whatever
-    # they are bolted to, above where the arms hang.
+    # Whether the body stands on the ground: a floor link goes under its
+    # lowest point (not the export root, which is not always there — the Ox
+    # cart's is its frame, 112 mm above the casters' bottoms). The Owl mount
+    # and standalone Axol stand on whatever they are bolted to, above where
+    # the arms hang.
     floor: bool
     title: str  # what the URDF's header calls the robot
     note: str  # what IK keeps the arms clear of, for the header
@@ -1594,16 +1596,9 @@ def write_urdf(
     if body.lift_links:
         base_link = body.lift_links[0]
         link("world")
-        if body.floor:
+        if frames.floor is not None:
             link(FLOOR_LINK)
-            _joint(
-                robot,
-                f"{FLOOR_LINK}_0",
-                "fixed",
-                "world",
-                FLOOR_LINK,
-                _translation(centre),
-            )
+            _joint(robot, f"{FLOOR_LINK}_0", "fixed", "world", FLOOR_LINK, frames.floor)
         if body.planar:
             for name in ("base_x_link", "base_y_link"):
                 link(name)
@@ -1665,11 +1660,9 @@ def write_urdf(
                 mimic="lift" if k else None,
                 effort_velocity=SIM_LIMITS["lift"],
             )
-    elif body.floor:
+    elif frames.floor is not None:
         link(FLOOR_LINK)
-        _joint(
-            robot, f"{FLOOR_LINK}_0", "fixed", "root", FLOOR_LINK, _translation(centre)
-        )
+        _joint(robot, f"{FLOOR_LINK}_0", "fixed", "root", FLOOR_LINK, frames.floor)
 
     for name, moving in variant.all_moving.items():
         joint = export.joint_map[moving.export_joint]
@@ -1825,7 +1818,14 @@ def build(args: argparse.Namespace, export_dir: Path) -> None:
         args.loose_tolerance_mm * 1e-3,
     )
     if body.floor:
+        # Under the export root, at the body's lowest point (the wheels' or
+        # casters' bottoms).
+        owner = groups(export, variant.all_anchors)
+        mine = [
+            pts for n, pts in in_root.items() if owner.get(n) in body.anchors.values()
+        ]
         frames.floor = _translation(frames.jelly_center)
+        frames.floor[2, 3] = float(np.vstack(mine)[:, 2].min())
     cameras = camera_frames(in_root, frames)
     col = Collision(frames, pieces, export)
     ik_plan = collision_plan("ik", col)

@@ -58,6 +58,7 @@ import {
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
 import { MountPicker } from "./mount-picker"
+import { rebaseValues } from "@/lib/settings-rebase"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
@@ -162,6 +163,9 @@ export function SettingsSection({
   const [draft, setDraft] = useState<Draft | null>(null)
   const [saving, setSaving] = useState(false)
   const [seedKey, setSeedKey] = useState("")
+  // The stored values the draft was seeded from: what "untouched" means when
+  // the host's values change under a staged draft.
+  const [seedValues, setSeedValues] = useState<Record<string, SettingValue>>({})
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
@@ -184,9 +188,22 @@ export function SettingsSection({
   })
   const settingsResolved = snapshot !== null || supportError !== null
   const nextSeedKey = settingsResolved ? JSON.stringify([snapshot?.values, cameras]) : null
-  if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
-    setSeedKey(nextSeedKey)
-    setDraft(seedDraft())
+  if (nextSeedKey !== null && nextSeedKey !== seedKey) {
+    if (draft == null || !dirty) {
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot?.values ?? {})
+      setDraft(seedDraft())
+    } else if (snapshot) {
+      // Saved elsewhere while edits are staged (the main page's robot-model
+      // pick, another client): keys the operator has not touched follow the
+      // host; staged edits stay.
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot.values)
+      setDraft({
+        ...draft,
+        values: rebaseValues(draft.values, seedValues, snapshot.values),
+      })
+    }
   }
 
   const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
@@ -206,6 +223,7 @@ export function SettingsSection({
   function discard() {
     if (nextSeedKey === null) return
     setSeedKey(nextSeedKey)
+    setSeedValues(snapshot?.values ?? {})
     setDraft(seedDraft())
   }
 

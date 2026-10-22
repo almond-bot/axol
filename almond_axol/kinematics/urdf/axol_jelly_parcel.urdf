@@ -1023,7 +1023,7 @@
     <link name="world" />
     <link name="floor" />
     <joint name="floor_0" type="fixed">
-        <origin xyz="-0.112228 5.36873e-06 -0.46944" rpy="0 0 0" />
+        <origin xyz="-0.112228 5.36873e-06 -0.469551" rpy="0 0 0" />
         <parent link="world" />
         <child link="floor" />
     </joint>

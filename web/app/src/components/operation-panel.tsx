@@ -82,6 +82,7 @@ export function OperationPanel({
   vrPort,
   startPhase,
   hostBlocker,
+  needsMount = false,
   connected,
   policy,
   onStart,
@@ -115,6 +116,9 @@ export function OperationPanel({
   startPhase: string | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
+  /** No robot model picked yet (`kinematics.mount`): an Axol run waits for
+   *  the "Which Axol is this?" pick above the settings. */
+  needsMount?: boolean
   /** False while disconnected or validating a replacement host. */
   connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
@@ -329,6 +333,9 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
+  if (!live && needsMount && !mantisMode) {
+    blockers.push("Choose your Axol: pick what it is mounted on, above Axol settings")
+  }
   if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
       robotOk && robot?.profile !== "mantis"

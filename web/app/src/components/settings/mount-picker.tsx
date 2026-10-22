@@ -89,12 +89,15 @@ export function MountPicker({
   mount,
   robotModel,
   onSelect,
+  showActive = true,
 }: {
-  /** The saved (or draft) `kinematics.mount`. */
-  mount: AxolMount
+  /** The saved (or draft) `kinematics.mount`; null before one is picked. */
+  mount: AxolMount | null
   /** What the host runs now: `mobile` while Jelly is enabled. */
   robotModel: AxolModel
   onSelect: (mount: AxolMount) => void
+  /** Badge the version the host runs ("In play"); off before a first pick. */
+  showActive?: boolean
 }) {
   const jelly = robotModel === "mobile"
   // The stage shows what the operator points at, else what the robot is.
@@ -114,7 +117,7 @@ export function MountPicker({
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-        <Stage character={staged} active={staged.model === robotModel} />
+        <Stage character={staged} active={showActive && staged.model === robotModel} />
         <div role="radiogroup" aria-label="Robot model" className="grid gap-2">
           {AXOL_MOUNTS.map((m) => (
             <RosterCard

@@ -93,6 +93,7 @@ import { DatasetPreview } from "@/components/dataset-preview"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
+import { MountRequired } from "@/components/settings/mount-required"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { SiteNav } from "@/components/site-nav"
@@ -927,6 +928,18 @@ export default function ControlPanel() {
   // The device selection is system-wide: a Mantis-capable operation runs on
   // Mantis whenever it is selected, and the idle link auto-connects to it.
   const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
+  // No robot model picked yet: a host that offers the pick (kinematics.mount)
+  // and has none saved, on Axol without Jelly (Jelly is detected, never
+  // picked). The pick shows above the settings and gates Axol runs until saved.
+  const needsMount =
+    conn.state === "ok" &&
+    !settingsError &&
+    hardwareProfile !== "mantis" &&
+    settingsSnap?.robotModel !== "mobile" &&
+    (settingsSnap?.schema ?? []).some((c) =>
+      c.settings.some((f) => f.key === "kinematics.mount")
+    ) &&
+    settingsSnap?.values["kinematics.mount"] == null
   const desiredHardwareProfile: HardwareProfile = hardwareProfile
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
@@ -1889,6 +1902,18 @@ export default function ControlPanel() {
           </div>
         )}
 
+        {needsMount && (
+          <MountRequired
+            onSave={async (mount) => {
+              await handleSettingsSave(
+                { values: { "kinematics.mount": mount } },
+                renderedConnectionGeneration
+              )
+              toast.success("Robot model saved. Change it any time in Settings → Robot.")
+            }}
+          />
+        )}
+
         {conn.state === "ok" && (
           <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
             <SettingsSection
@@ -1987,6 +2012,7 @@ export default function ControlPanel() {
                 ? `${runningOp ?? "Another operation"} is running`
                 : null
           }
+          needsMount={needsMount}
           connected={conn.state === "ok"}
           policy={selectedLive ? policy : null}
           onStart={handleStart}
