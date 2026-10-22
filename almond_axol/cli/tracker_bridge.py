@@ -329,8 +329,8 @@ def _wait_for_live_inputs(
             if trigger.grip() is None or trigger.is_stale():
                 missing.append(f"{side} trigger has no fresh CAN frames")
         quality_getter = getattr(source, "tracking_quality", None)
-        if callable(quality_getter):
-            quality = quality_getter()
+        quality = quality_getter() if callable(quality_getter) else None
+        if quality is not None:
             if quality.get("calibrationRequired"):
                 raise RuntimeError(
                     "Lighthouse calibration is no longer valid: "

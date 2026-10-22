@@ -64,12 +64,17 @@ def ready_source():
 
 
 def test_collection_enables_diagnostics_but_setup_does_not():
-    config = TrackerConfig(backend="survive")
+    config = TrackerConfig(backend="survive", lighthouse_quality="strict")
     assert create_source(config)._diagnostics_enabled
     assert not create_source(config, setup=True)._diagnostics_enabled
     assert not SurviveSource(
         force_calibrate=True, enable_diagnostics=True
     )._diagnostics_enabled
+
+
+def test_standard_policy_never_enables_diagnostics():
+    config = TrackerConfig(backend="survive")
+    assert not create_source(config)._diagnostics_enabled
 
 
 def test_pose_jump_triggers_before_next_bridge_poll_and_keeps_raw_evidence():

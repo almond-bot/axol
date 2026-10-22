@@ -437,6 +437,15 @@ class SurviveSource(TrackerSource):
     Requires the machine-wide artifact manifest created by
     ``axol tracker.install``. Raises ``RuntimeError`` from :meth:`start` when
     the pinned executable or any of its installed shared objects has drifted.
+
+    ``strict`` selects the fixed-installation policy (see
+    ``TrackerConfig.lighthouse_quality``): a frozen, validated room geometry,
+    optical-support monitoring from the angle stream, and poses withheld
+    (``tracking=False``) until tracking quality is ready. Without it the source
+    runs libsurvive on the saved calibration with background calibration
+    enabled, streams poses only, and reports no tracking quality. Explicit
+    calibration and validation runs construct this class directly and keep the
+    strict default.
     """
 
     def __init__(
@@ -447,6 +456,7 @@ class SurviveSource(TrackerSource):
         expected_stations: int | None = None,
         allow_frame_refinement: bool = False,
         enable_diagnostics: bool = False,
+        strict: bool = True,
     ) -> None:
         expected = 2 if expected_stations is None else expected_stations
         if (
@@ -456,8 +466,13 @@ class SurviveSource(TrackerSource):
         ):
             raise ValueError("expected_stations must be an integer between 1 and 16")
         self._expected_stations = expected
-        self._diagnostics_enabled = enable_diagnostics and not (
-            force_calibrate or allow_frame_refinement
+        # Explicit calibration and private candidate configs are setup
+        # transactions of the strict policy.
+        self._strict = strict or force_calibrate or config_path is not None
+        self._diagnostics_enabled = (
+            self._strict
+            and enable_diagnostics
+            and not (force_calibrate or allow_frame_refinement)
         )
         self._diagnostics: FaultDiagnosticRecorder | None = None
         self._diagnostic_error: str | None = None
@@ -673,6 +688,8 @@ class SurviveSource(TrackerSource):
         with self._lock:
             if self._failure is not None:
                 raise self._failure
+            if not self._strict:
+                return dict(self._poses)
             quality = self._quality_snapshot()
             ready = quality["status"] in ("ready", "warning")
             return {
@@ -693,8 +710,14 @@ class SurviveSource(TrackerSource):
         with self._lock:
             return set(self._serials.values())
 
-    def tracking_quality(self) -> dict[str, object]:
-        """Observed tracking health, with a retained count of post-baseline faults."""
+    def tracking_quality(self) -> dict[str, object] | None:
+        """Observed tracking health, with a retained count of post-baseline faults.
+
+        ``None`` outside strict mode: without the angle stream there is no
+        optical-support evidence to judge, and no gate consumes the report.
+        """
+        if not self._strict:
+            return None
         with self._lock:
             report = self._quality_snapshot()
             if self._failure is not None:
@@ -1178,6 +1201,9 @@ class SurviveSource(TrackerSource):
 
     def _invalidate_changed_frame(self) -> None:
         """Persist a rare geometry fault once, outside the hot tracking lock."""
+        if not self._strict:
+            # Background calibration may legitimately refine the geometry.
+            return
         with self._lock:
             if self._validation_invalidated or not self._quality.calibration_required:
                 return
@@ -1421,6 +1447,9 @@ class SurviveSource(TrackerSource):
 
     def _prepare_native_config(self, directory: Path) -> Path:
         """Keep native bookkeeping away from the validated, published baseline."""
+        if not self._strict:
+            # libsurvive owns and refines the saved calibration in place.
+            return prepare_survive_config()
         original_path = self._config_path or prepare_survive_config()
         try:
             contents = secure_read_text(original_path).encode("utf-8")
@@ -1524,46 +1553,49 @@ class SurviveSource(TrackerSource):
             str(executable),
             "--record-stdout",
             "1",
-            # Angles provide optical freshness/visibility independent of pose
-            # output. Consume them immediately into bounded per-sensor state;
-            # raw light and IMU remain disabled.
+            # Strict mode reads angles for optical freshness/visibility
+            # independent of pose output, consumed immediately into bounded
+            # per-sensor state. Otherwise only poses are consumed; muting the
+            # angle stream keeps the pipe (and this parser) from drowning in
+            # telemetry. Raw light and IMU always remain disabled.
             "--record-rawlight",
             "0",
             "--record-imu",
             "0",
             "--record-angle",
-            "1",
+            "1" if self._strict else "0",
             "--serialize-ootx",
             "1",
         ]
         config_path = self._prepare_native_config(directory)
         args.extend(["--configfile", str(config_path)])
         args.extend(["--force-calibrate", "1" if self._force_calibrate else "0"])
-        # Calibration is an explicit preparation operation. Validation and
-        # recording run the same solver configuration with GSS disabled, so
-        # ordinary stationary observations cannot keep refitting the room or
-        # moving its floor. The required patched native runtime also makes
-        # disable-calibrate prevent local station bootstrapping (older builds
-        # disabled only GSS). Pose/station guards still reject unexpected
-        # geometry mutations or identity changes.
-        args.extend(
-            [
-                "--disable-calibrate",
-                "0" if self._force_calibrate else "1",
-                "--globalscenesolver",
-                "1" if self._force_calibrate else "0",
-                "--gss-auto-floor-height",
-                "1" if self._force_calibrate else "0",
-                "--kalman-joint-model-lightcap",
-                "-1",
-                "--light-error-for-lh-confidence",
-                "0",
-                # The native residual filter needs an established pose prior.
-                # Calibration/discovery retain all of their optical support.
-                "--mpfit-filter-individual-outliers",
-                "0" if self._allow_frame_refinement else "1",
-            ]
-        )
+        if self._strict:
+            # Calibration is an explicit preparation operation. Validation and
+            # recording run the same solver configuration with GSS disabled, so
+            # ordinary stationary observations cannot keep refitting the room or
+            # moving its floor. The required patched native runtime also makes
+            # disable-calibrate prevent local station bootstrapping (older builds
+            # disabled only GSS). Pose/station guards still reject unexpected
+            # geometry mutations or identity changes.
+            args.extend(
+                [
+                    "--disable-calibrate",
+                    "0" if self._force_calibrate else "1",
+                    "--globalscenesolver",
+                    "1" if self._force_calibrate else "0",
+                    "--gss-auto-floor-height",
+                    "1" if self._force_calibrate else "0",
+                    "--kalman-joint-model-lightcap",
+                    "-1",
+                    "--light-error-for-lh-confidence",
+                    "0",
+                    # The native residual filter needs an established pose prior.
+                    # Calibration/discovery retain all of their optical support.
+                    "--mpfit-filter-individual-outliers",
+                    "0" if self._allow_frame_refinement else "1",
+                ]
+            )
         # Native SURVIVE_* environment variables override command-line flags.
         # Keep this stream's protocol and explicit calibration destination
         # authoritative, particularly for a temporary calibration config.

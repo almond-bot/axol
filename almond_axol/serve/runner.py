@@ -1225,17 +1225,16 @@ class OperationRunner:
         axol_serials = cameras.get("serials") or {}
         raw_mantis = cameras.get("mantis_serials")
         mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
+        # Wrist slots fall back to the Axol layout as before. The Head slot is
+        # new to Mantis: a layout saved before it existed recorded wrists
+        # only, so never inherit Axol's overhead camera into it (that would
+        # silently add a third camera, or block Start when it is not attached).
         selected["serials"] = {
-            slot: mantis_serials.get(slot, axol_serials.get(slot, ""))
+            slot: mantis_serials.get(
+                slot, "" if slot == "overhead" else axol_serials.get(slot, "")
+            )
             for slot in _CAMERA_SLOTS
         }
-        # The old wrist-only Mantis layout could assign Axol's head camera to
-        # a wrist. Preserve that valid mapping instead of opening it twice.
-        serials = selected["serials"]
-        if "overhead" not in mantis_serials and str(serials["overhead"]).strip() in {
-            str(serials[slot]).strip() for slot in ("left_arm", "right_arm")
-        }:
-            serials["overhead"] = ""
         return selected
 
     @staticmethod

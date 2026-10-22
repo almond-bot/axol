@@ -18,7 +18,7 @@ const devices: CameraDevice[] = [
 ]
 const cameras: CameraSpec = {
   serials: { overhead: "101", left_arm: "102", right_arm: "103" },
-  mantis_serials: { left_arm: "202", right_arm: "203" },
+  mantis_serials: { overhead: "101", left_arm: "202", right_arm: "203" },
 }
 
 let root: Root
@@ -76,7 +76,14 @@ function headEyes(branch: string): HTMLInputElement[] {
 }
 
 describe("Mantis cameras", () => {
-  it("shows the legacy head alongside both wrists and records both stereo eyes by default", () => {
+  it("leaves the head unassigned for a legacy wrist-only Mantis layout", () => {
+    renderPanel({ ...cameras, mantis_serials: { left_arm: "202", right_arm: "203" } })
+    expect(cameraSelect("Head").value).toBe("")
+    expect(cameraSelect("Left Mantis").value).toBe("202")
+    expect(cameraSelect("Right Mantis").value).toBe("203")
+  })
+
+  it("shows the head alongside both wrists and records both stereo eyes by default", () => {
     renderPanel()
     expect(cameraSelect("Head").value).toBe("101")
     expect(cameraSelect("Left Mantis").value).toBe("202")

@@ -38,7 +38,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
 | `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
-| `--qa_gate` | `true` | Refuse to save Mantis episodes the quality check marks corrupt. `false` saves anyway. |
+| `--qa_gate` | `true` | Refuse to save Mantis episodes the quality check marks corrupt. `false` saves anyway, except a take with a tracking fault under the [strict Lighthouse policy](/cli/tracker#lighthouse-tracking-policy). |
 | `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |

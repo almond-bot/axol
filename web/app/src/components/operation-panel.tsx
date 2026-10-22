@@ -379,10 +379,15 @@ export function OperationPanel({
       if (!status.udevReady) trackerIssues.push("Install the Lighthouse Vive USB permissions rule")
       if (!status.binding.complete) trackerIssues.push("Identify left + right Lighthouse trackers")
       const validation = status.validation
+      // Mirrors collect-data: only the strict policy requires a passed,
+      // unexpired validation, and a bring-up capture is exempt.
       if (
-        !validation?.valid ||
-        validation.status !== "passed" ||
-        (validation.expiresAt != null && validation.expiresAt <= trackerCheckedAt)
+        status.qualityMode === "strict" &&
+        meta.id === "collect-data" &&
+        !settings.mantis_allow_uncalibrated &&
+        (!validation?.valid ||
+          validation.status !== "passed" ||
+          (validation.expiresAt != null && validation.expiresAt <= trackerCheckedAt))
       ) {
         trackerIssues.push("Validate Lighthouse tracking in Mantis settings before collecting")
       }

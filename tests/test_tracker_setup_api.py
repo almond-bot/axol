@@ -14,7 +14,11 @@ from almond_axol.mantis.calibration import ULTIMATE_POSE_CONVENTION_FIELD
 from almond_axol.serve import app as app_module
 from almond_axol.serve import tracker_setup
 from almond_axol.serve.commands import COMMANDS, get_schema
-from almond_axol.tracker.config import TrackerConfig, save_tracker_config
+from almond_axol.tracker.config import (
+    TrackerConfig,
+    load_tracker_config,
+    save_tracker_config,
+)
 from almond_axol.tracker.ultimate import ultimate_wifi_config_error
 
 _IDENTITY = {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
@@ -838,6 +842,40 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 400)
         self.assertNotIn(secret, response.text)
+
+    async def test_lighthouse_quality_api_saves_valid_modes_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            save_tracker_config(TrackerConfig(left="LHR-L", right="LHR-R"), path)
+
+            def load(*_args: Any) -> TrackerConfig:
+                return load_tracker_config(path)
+
+            def save(config: TrackerConfig, *_args: Any) -> None:
+                save_tracker_config(config, path)
+
+            app = _test_app(_Settings())
+            transport = httpx.ASGITransport(app=app)
+            with (
+                patch("almond_axol.tracker.config.load_tracker_config", load),
+                patch("almond_axol.tracker.config.save_tracker_config", save),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    rejected = await client.put(
+                        "/api/tracker/lighthouse/quality", json={"mode": "lax"}
+                    )
+                    saved = await client.put(
+                        "/api/tracker/lighthouse/quality", json={"mode": "strict"}
+                    )
+            self.assertEqual(rejected.status_code, 400)
+            self.assertEqual(saved.status_code, 200)
+            self.assertEqual(saved.json(), {"mode": "strict"})
+            data = json.loads(path.read_text())
+            self.assertEqual(data["lighthouse_quality"], "strict")
+            # The rest of the tracker setup is untouched.
+            self.assertEqual((data["left"], data["right"]), ("LHR-L", "LHR-R"))
 
     async def test_calibration_api_supports_partial_quest_update(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

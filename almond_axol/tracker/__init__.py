@@ -47,10 +47,12 @@ def create_source(config: TrackerConfig, *, setup: bool = False) -> TrackerSourc
     if config.backend == "survive":
         from .survive import SurviveSource
 
+        strict = getattr(config, "lighthouse_quality", "standard") == "strict"
         return SurviveSource(
             expected_stations=getattr(config, "expected_base_stations", 2),
             allow_frame_refinement=setup,
-            enable_diagnostics=not setup,
+            enable_diagnostics=strict and not setup,
+            strict=strict,
         )
     if config.backend == "ultimate":
         from .ultimate import UltimateSource

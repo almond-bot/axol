@@ -22,7 +22,8 @@ At save time each episode passes a data-quality gate (see
 :func:`evaluate_episode_qa`): episodes with a mid-recording re-engage, too
 many frozen-TCP/disengaged/untracked frames, or a stale Mantis trigger
 heartbeat are discarded and re-recorded instead of silently saved
-(``--qa_gate false`` disables the refusal; the QA summary is always logged).
+(``--qa_gate false`` disables the refusal, except for a tracking fault under the
+strict Lighthouse policy; the QA summary is always logged).
 
 After an episode ends the arms return to rest automatically, but *guarded*:
 a torque-residual watchdog compares measured torque against the gravity
@@ -810,7 +811,8 @@ class CollectDataConfig:
     # escape hatch (debugging the gate, or deliberately recording unusual
     # sessions) — the per-episode QA summary is still logged, the bad episode
     # is just saved anyway. Only Mantis episodes can fail the gate; on-robot
-    # episodes read poses from joint encoders and always pass.
+    # episodes read poses from joint encoders and always pass. A tracking
+    # fault under the strict Lighthouse policy is refused regardless.
     qa_gate: bool = True
     rerun_ip: str | None = None
     rerun_port: int = 9876
@@ -1288,9 +1290,30 @@ def _preserve_interrupted_tracking_attempt(
         _logger.exception("Could not preserve interrupted tracking-attempt diagnostics")
 
 
+def _resolve_lighthouse_quality(cfg: CollectDataConfig) -> str:
+    """The host's Lighthouse policy, resolved once for the whole session."""
+    from ..tracker.config import load_tracker_config
+
+    cfg._lighthouse_quality = load_tracker_config().lighthouse_quality
+    return cfg._lighthouse_quality
+
+
+def _strict_lighthouse(cfg: CollectDataConfig) -> bool:
+    """Whether this run records under the strict Lighthouse policy."""
+    return (
+        cfg.mantis
+        and cfg.mantis_source == "lighthouse"
+        and getattr(cfg, "_lighthouse_quality", "standard") == "strict"
+    )
+
+
 def _require_mantis_tracking_validation(cfg: CollectDataConfig) -> None:
-    """Check persisted setup evidence before any managed tracker is opened."""
-    if not cfg.mantis or cfg.mantis_source != "lighthouse":
+    """Check persisted setup evidence before any managed tracker is opened.
+
+    Only the strict Lighthouse policy requires a passed validation; standard
+    hosts may still run one, and its result is reported in the panel.
+    """
+    if not _strict_lighthouse(cfg):
         return
     if cfg.mantis_allow_uncalibrated:
         return
@@ -1333,6 +1356,7 @@ def main(argv: list[str]) -> None:
         # a dongle, starting libsurvive, or waiting for live tracker inputs.
         _prepare_mantis_collection(cfg)
         _prepare_recording_cameras(cfg)
+        lighthouse_quality = _resolve_lighthouse_quality(cfg)
         _require_mantis_tracking_validation(cfg)
         from .mantis_bridge import managed_mantis_bridge, set_managed_pose_source_id
 
@@ -1348,6 +1372,7 @@ def main(argv: list[str]) -> None:
             right_trigger_full_scale=cfg.mantis_right_trigger_full_scale,
             port=cfg.teleop_config.vr_server_config.port,
             pose_source_id=pose_source_id,
+            lighthouse_quality=lighthouse_quality,
         ):
             _run(cfg)
     else:
@@ -2149,7 +2174,9 @@ def _run_session(
         # pollutes the verdict.
         stats = EpisodeQAStats()
         quality_monitor = EpisodeTrackingQuality(
-            required=mantis_mode and cfg.mantis_source == "lighthouse"
+            required=mantis_mode
+            and cfg.mantis_source == "lighthouse"
+            and getattr(cfg, "_lighthouse_quality", "standard") == "strict"
         )
         tracking_attempt[:] = [quality_monitor]
 

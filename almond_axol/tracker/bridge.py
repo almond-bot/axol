@@ -682,8 +682,10 @@ class TrackerBridge:
             if pair_skew_s > TRACKER_PAIR_MAX_SKEW_S:
                 skewed_side = "left" if left.t < right.t else "right"
         source_quality = getattr(self._source, "tracking_quality", None)
-        if callable(source_quality):
-            quality = dict(source_quality())
+        # A source reports None when it does not police tracking quality.
+        source_report = source_quality() if callable(source_quality) else None
+        if source_report is not None:
+            quality = dict(source_report)
             native_fault_count = int(quality.get("faultCount", 0))
             if native_fault_count != self._quality_native_fault_count:
                 self._quality_last_fault = quality.get("lastFault")

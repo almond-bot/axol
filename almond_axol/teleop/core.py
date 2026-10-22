@@ -649,11 +649,18 @@ class VRTeleopCore:
         if not self._record_raw_tcp:
             return
         with self._raw_tcp_lock:
+            # Latch a loss only when there is an engagement to end. Invalid
+            # frames keep arriving while rigs are set down or tracking is
+            # still being checked; re-latching then would disengage (and
+            # broadcast tracking=false) on every IK iteration.
+            engaged = self._raw_tcp_mapping is not None or (
+                self.left_enabled or self.right_enabled
+            )
             self._raw_tcp_epoch += 1
             self._raw_tcp_mapping = None
             self.last_tcp_snapshot = None
             self.last_pose_host_ts = None
-            self._raw_tcp_tracking_lost |= tracking_lost
+            self._raw_tcp_tracking_lost |= tracking_lost and engaged
 
     def note_raw_tcp_frame(self, frame: object) -> None:
         """Publish a calibrated raw Mantis sample without waiting for IK.

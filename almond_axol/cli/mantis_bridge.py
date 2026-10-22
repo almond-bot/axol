@@ -116,8 +116,14 @@ def managed_mantis_bridge(
     port: int,
     auto_engage: bool = True,
     pose_source_id: str | None = None,
+    lighthouse_quality: str | None = None,
 ) -> Iterator[None]:
-    """Run the selected tracker bridge beside a direct CLI operation."""
+    """Run the selected tracker bridge beside a direct CLI operation.
+
+    ``lighthouse_quality`` pins the Lighthouse policy the operation resolved
+    (``TrackerConfig.lighthouse_quality``) so the bridge and the operation's
+    own gates cannot disagree if the saved setting changes meanwhile.
+    """
     left, right = require_mantis_channels(
         (
             _rig_channel(left_channel, CAN_LEFT, CAN_MANTIS_LEFT),
@@ -145,7 +151,7 @@ def managed_mantis_bridge(
 
     from ..tracker import load_tracker_config
     from ..tracker.bridge import ManagedStdinControls
-    from ..tracker.config import select_tracker_backend
+    from ..tracker.config import select_tracker_backend, validate_lighthouse_quality
     from ..tracker.trigger import validate_trigger_full_scale
     from .tracker_bridge import run_configured_bridge
 
@@ -167,6 +173,8 @@ def managed_mantis_bridge(
     config.trigger_can_right = right
     config.trigger_full_scale_left = left_trigger_full_scale
     config.trigger_full_scale_right = right_trigger_full_scale
+    if lighthouse_quality is not None:
+        config.lighthouse_quality = validate_lighthouse_quality(lighthouse_quality)
 
     stop = threading.Event()
     ready = threading.Event()

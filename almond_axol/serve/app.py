@@ -2440,6 +2440,44 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
         return JSONResponse(result)
 
+    @app.put("/api/tracker/lighthouse/quality", response_model=None)
+    async def put_lighthouse_quality(request: Request) -> JSONResponse:
+        """Choose the standard or strict Lighthouse tracking policy."""
+        from ..tracker.config import (
+            load_tracker_config,
+            save_tracker_config,
+            validate_lighthouse_quality,
+        )
+
+        body, error = await redacted_json_body(request)
+        if error is not None:
+            return error
+        try:
+            mode = validate_lighthouse_quality(body.get("mode"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if runner.is_running() or _diagnostic_session_active():
+            # A running bridge resolved its policy at startup; changing it
+            # underneath would make the panel describe a policy not in force.
+            return JSONResponse(
+                {"error": "stop the running operation before changing this"},
+                status_code=409,
+            )
+
+        def save() -> None:
+            config = load_tracker_config()
+            config.lighthouse_quality = mode
+            save_tracker_config(config)
+
+        try:
+            await asyncio.to_thread(save)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not write the tracker configuration"},
+                status_code=400,
+            )
+        return JSONResponse({"mode": mode})
+
     @app.get("/api/tracker/calibration/{source}", response_model=None)
     async def get_tracker_calibration(source: str) -> JSONResponse:
         """Measured TCP calibration for the exact active tracker identities."""
@@ -2695,6 +2733,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 # sole view of it. None until a survey has run on this host.
                 "baseStations": lighthouse_survey,
                 "expectedBaseStations": config.expected_base_stations,
+                "qualityMode": config.lighthouse_quality,
                 "validation": validation_snapshot(config),
             }
             ultimate = ultimate_runtime_readiness()

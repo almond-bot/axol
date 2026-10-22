@@ -13,7 +13,7 @@ from almond_axol.serve.runner import OperationRunner
 def camera_spec():
     return {
         "serials": {"overhead": "101", "left_arm": "102", "right_arm": "103"},
-        "mantis_serials": {"left_arm": "202", "right_arm": "203"},
+        "mantis_serials": {"overhead": "101", "left_arm": "202", "right_arm": "203"},
     }
 
 
@@ -33,12 +33,15 @@ def collection_config(spec):
     return cfg
 
 
-def test_legacy_mantis_mapping_inherits_head_without_mutating_axol():
+def test_legacy_mantis_mapping_leaves_head_unassigned_without_mutating_axol():
+    # A wrist-only layout saved before the Head slot existed must not pick up
+    # Axol's overhead camera: that would add a camera to existing datasets.
     spec = camera_spec()
+    del spec["mantis_serials"]["overhead"]
     before = deepcopy(spec)
     selected = OperationRunner._camera_spec_for_profile(spec, mantis=True)
     assert selected["serials"] == {
-        "overhead": "101",
+        "overhead": "",
         "left_arm": "202",
         "right_arm": "203",
     }
@@ -57,13 +60,15 @@ def test_explicit_mantis_head_overrides_legacy_assignment(head):
     assert selected["serials"]["overhead"] == head
 
 
-@pytest.mark.parametrize("wrist", ["left_arm", "right_arm"])
-def test_inherited_head_does_not_reopen_an_existing_mantis_wrist(wrist):
+def test_legacy_mantis_wrists_still_inherit_axol_wrists():
     spec = camera_spec()
-    spec["mantis_serials"][wrist] = " 101 "
+    spec["mantis_serials"] = {}
     selected = OperationRunner._camera_spec_for_profile(spec, mantis=True)
-    assert selected["serials"]["overhead"] == ""
-    assert selected["serials"][wrist] == " 101 "
+    assert selected["serials"] == {
+        "overhead": "",
+        "left_arm": "102",
+        "right_arm": "103",
+    }
 
 
 def test_head_and_wrists_reach_dataset_and_video_relay():

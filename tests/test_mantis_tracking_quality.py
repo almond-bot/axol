@@ -14,6 +14,7 @@ from almond_axol.cli.collect_data import (
     EpisodeQAStats,
     _QueueCollectControl,
     _require_mantis_tracking_validation,
+    _resolve_lighthouse_quality,
     evaluate_episode_qa,
 )
 from almond_axol.mantis.quality import EpisodeTrackingQuality, quality_ready
@@ -21,6 +22,7 @@ from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 from almond_axol.tracker.base import TrackerPose
 from almond_axol.tracker.bridge import StopEventControls, TrackerBridge
+from almond_axol.tracker.config import TrackerConfig
 from almond_axol.vr.interp import PoseInterpolator
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
@@ -219,6 +221,7 @@ def test_production_validation_gate_cannot_be_bypassed_by_ui_or_cli():
         mantis=True,
         mantis_source="lighthouse",
     )
+    cfg._lighthouse_quality = "strict"
     with patch(
         "almond_axol.tracker.lighthouse_validation.require_lighthouse_validation",
         side_effect=RuntimeError("session check expired"),
@@ -229,3 +232,25 @@ def test_production_validation_gate_cannot_be_bypassed_by_ui_or_cli():
         cfg.mantis_allow_uncalibrated = True
         _require_mantis_tracking_validation(cfg)
         gate.assert_called_once()
+
+
+def test_standard_policy_does_not_require_validation():
+    cfg = CollectDataConfig(
+        repo_id="test/quality",
+        task="quality test",
+        mantis=True,
+        mantis_source="lighthouse",
+    )
+    with (
+        patch(
+            "almond_axol.tracker.config.load_tracker_config",
+            return_value=TrackerConfig(),
+        ),
+        patch(
+            "almond_axol.tracker.lighthouse_validation.require_lighthouse_validation",
+            side_effect=RuntimeError("session check expired"),
+        ) as gate,
+    ):
+        assert _resolve_lighthouse_quality(cfg) == "standard"
+        _require_mantis_tracking_validation(cfg)
+    gate.assert_not_called()

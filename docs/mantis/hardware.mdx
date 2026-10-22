@@ -17,7 +17,7 @@ A Mantis kit consists of:
 
 - **2× Mantis rigs**, left and right. Each carries the same gripper as Axol, the trigger, and the tracker mount.
 - **1× Mantis Hub**, the link between the rigs and the host. **L** and **R** are etched on the case to mark the left and right gripper connections, an XT30(2+2) lead feeds out from each to plug into its rig, and a USB cable connects the hub to the ZED Box.
-- **A pose source**, one of the three tracking systems described in [Mantis Tracking](/mantis/tracking): Quest controllers (no extra hardware), VIVE Tracker 3.0 with 1–2 SteamVR base stations, or VIVE Ultimate Trackers with their wireless dongle.
+- **A pose source**, one of the three tracking systems described in [Mantis Tracking](/mantis/tracking): Quest controllers (no extra hardware), VIVE Tracker 3.0 with 1–4 SteamVR base stations, or VIVE Ultimate Trackers with their wireless dongle.
 - **Cameras**: up to two wrist ZED cameras assigned to **Left Mantis / Right Mantis**, plus a head stereo camera assigned to **Head**, stored separately from the Axol camera layout. Data collection needs at least one camera recording.
 
 Mantis has no arms. The arm joints in a recording are virtual, filled in from the IK solution, while the gripper is real and read from motor feedback. The trigger is analog: fully released is `0.0` (open), fully squeezed is `1.0` (closed). Its node learns the **released** position at power-on. If the reported value does not reach `1.0` when the trigger is physically fully squeezed, set that side's **full squeeze endpoint** on the host as described [below](#testing-the-triggers-and-grippers).

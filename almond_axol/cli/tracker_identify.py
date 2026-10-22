@@ -127,8 +127,9 @@ def _report_backend_warnings(source) -> None:  # type: ignore[no-untyped-def]
         for message in warnings():
             print(f"  backend warning: {message}", flush=True)
     quality = getattr(source, "tracking_quality", None)
-    if quality is not None:
-        for message in quality().get("reasons", []):
+    report = quality() if quality is not None else None
+    if report is not None:
+        for message in report.get("reasons", []):
             print(f"  tracking check: {message}", flush=True)
 
 

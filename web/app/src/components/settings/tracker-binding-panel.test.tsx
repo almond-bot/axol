@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   start: vi.fn(),
   input: vi.fn(),
   stop: vi.fn(),
+  saveQuality: vi.fn(),
   logs: { lines: [] as string[], status: null as SessionInfo | null },
   toast: { success: vi.fn(), error: vi.fn() },
 }))
@@ -19,6 +20,7 @@ vi.mock("@/lib/supervisor", async (original) => ({
   useSessionLogs: () => mocks.logs,
   sendSessionInput: mocks.input,
   stopSession: mocks.stop,
+  saveLighthouseQualityMode: mocks.saveQuality,
 }))
 vi.mock("@/lib/telemetry", () => ({ startDiagnosticsRun: mocks.start }))
 vi.mock("@/components/ui/toast", () => ({ useToast: () => mocks.toast }))
@@ -245,6 +247,29 @@ describe("Lighthouse validation", () => {
     expect(mocks.input).toHaveBeenCalledTimes(2)
     expect(container.textContent).toContain(sweep)
     expect(container.textContent).not.toContain("Keep both rigs still.")
+  })
+
+  it("saves the tracking policy and explains what it changes", async () => {
+    snapshot.sources!.lighthouse.qualityMode = "standard"
+    mocks.saveQuality.mockResolvedValue({ mode: "strict" })
+    await render()
+    const policy = container.querySelector<HTMLSelectElement>(
+      'select[aria-label="Tracking policy"]'
+    )!
+    expect(policy.value).toBe("standard")
+    expect(container.textContent).toContain("validation is optional")
+    await act(async () => {
+      policy.value = "strict"
+      policy.dispatchEvent(new Event("change", { bubbles: true }))
+    })
+    expect(mocks.saveQuality).toHaveBeenCalledWith("strict")
+    expect(policy.value).toBe("strict")
+    expect(container.textContent).toContain("requires a passed validation before collecting")
+  })
+
+  it("hides the tracking policy on hosts that do not report it", async () => {
+    await render()
+    expect(container.querySelector('select[aria-label="Tracking policy"]')).toBeNull()
   })
 
   it("disables setup commands while an operation owns the host", async () => {

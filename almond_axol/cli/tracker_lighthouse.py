@@ -167,8 +167,9 @@ def _source_details(source, survey: LighthouseSurvey) -> list[str]:  # type: ign
     if callable(warnings):
         details.extend(f"Backend warning: {reason}" for reason in warnings()[-6:])
     quality = getattr(source, "tracking_quality", None)
-    if callable(quality):
-        details.extend(f"Tracking check: {reason}" for reason in quality()["reasons"])
+    report = quality() if callable(quality) else None
+    if report is not None:
+        details.extend(f"Tracking check: {reason}" for reason in report["reasons"])
     return details
 
 
@@ -189,8 +190,13 @@ def run_check(_args: object = None) -> None:
     if expected_stations is not None:
         config.expected_base_stations = expected_stations
         save_tracker_config(config)
+    # Standard mode lets libsurvive calibrate a new or re-channelled room
+    # during the check (as Identify and collection do); strict mode keeps the
+    # saved geometry fixed until an explicit Recalibrate.
     source = SurviveSource(
-        expected_stations=config.expected_base_stations, allow_frame_refinement=True
+        expected_stations=config.expected_base_stations,
+        allow_frame_refinement=True,
+        strict=config.lighthouse_quality == "strict",
     )
     try:
         source.start()

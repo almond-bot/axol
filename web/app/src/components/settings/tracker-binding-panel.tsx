@@ -15,9 +15,11 @@ import {
 } from "lucide-react"
 import {
   fetchTrackerBindings,
+  saveLighthouseQualityMode,
   sendSessionInput,
   stopSession,
   useSessionLogs,
+  type LighthouseQualityMode,
   type SessionInfo,
   type TrackerBackend,
   type TrackerBinding,
@@ -166,6 +168,7 @@ export function TrackerBindingPanel({
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [busy, setBusy] = useState(false)
   const [expectedStationChoice, setExpectedStationChoice] = useState<number | null>(null)
+  const [qualityModeChoice, setQualityModeChoice] = useState<LighthouseQualityMode | null>(null)
   const [dismissed, setDismissed] = useState<{ id: string; promptIndex: number } | null>(null)
   // Keep ownership of an in-flight setup session even if the operator edits
   // the source selector. Otherwise its progress/prompt/Stop controls vanish
@@ -374,6 +377,19 @@ export function TrackerBindingPanel({
   const canAct = !actionsLocked && (sessionBackend === null || sessionBackend === backend)
   const expectedStationCount =
     expectedStationChoice ?? readiness?.lighthouse.expectedBaseStations ?? 2
+  const qualityMode = qualityModeChoice ?? readiness?.lighthouse.qualityMode
+
+  async function chooseQualityMode(mode: LighthouseQualityMode) {
+    setBusy(true)
+    try {
+      const saved = await saveLighthouseQualityMode(mode)
+      setQualityModeChoice(saved.mode)
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   if (!bindingsLoaded) {
     return (
@@ -1060,9 +1076,29 @@ export function TrackerBindingPanel({
                     ))}
                   </select>
                 </label>
+                {qualityMode !== undefined && (
+                  <label className="flex items-center gap-3 text-sm">
+                    Tracking policy
+                    <select
+                      aria-label="Tracking policy"
+                      className="rounded-md border border-white/20 bg-[#141414] px-3 py-1.5 text-white"
+                      value={qualityMode}
+                      onChange={(event) =>
+                        void chooseQualityMode(event.target.value as LighthouseQualityMode)
+                      }
+                      disabled={!canAct}
+                    >
+                      <option value="standard">Standard</option>
+                      <option value="strict">Strict (fixed installation)</option>
+                    </select>
+                  </label>
+                )}
                 <p className="text-xs text-white/45">
                   Select the number installed, including all three stations in a three-station
-                  setup. Validate before the first session each day; reports expire after 12 hours.
+                  setup.{" "}
+                  {qualityMode === "strict"
+                    ? "Strict keeps the station geometry fixed between recalibrations, requires a passed validation before collecting (reports expire after 12 hours), and marks any take with a tracking fault for retake."
+                    : "Standard lets libsurvive keep refining the calibration in the background; validation is optional and recording is judged by the episode quality gate."}{" "}
                   The check measures tracking consistency, not absolute accuracy. Recalibrate after
                   a station or tripod moves; the existing calibration is replaced only if the new
                   check passes.

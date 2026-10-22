@@ -85,8 +85,9 @@ describe("supervisor pure helpers", () => {
     expect(missingCameraSerials(cameras, [{ serial: 2, model: "one", kind: "mono" }])).toEqual([
       "1",
     ])
-    // Mantis reuses the Axol head and wrist serials unless it has its own.
-    expect(cameraCount(cameras, true)).toBe(2)
+    // Mantis reuses the Axol wrist serials unless it has its own; its Head
+    // slot never inherits the Axol overhead camera.
+    expect(cameraCount(cameras, true)).toBe(1)
     // A camera disabled on the stream branch still participates via recording.
     expect(participatingCameraSerials({ ...cameras, stream: { left_arm: false } })).toEqual([
       "1",
@@ -101,17 +102,19 @@ describe("supervisor pure helpers", () => {
     ).toEqual(["1"])
   })
 
-  it("includes the inherited head alongside separately mapped Mantis wrists", () => {
+  it("does not inherit the Axol overhead into a legacy Mantis layout", () => {
+    // A wrist-only layout saved before the Head slot existed must not start
+    // recording (or requiring) a third camera after an upgrade.
     const cameras: CameraSpec = {
       serials: { overhead: "101", left_arm: "102", right_arm: "103" },
       mantis_serials: { left_arm: "202", right_arm: "203" },
     }
     expect(cameraSerials(cameras, true)).toEqual({
-      overhead: "101",
+      overhead: "",
       left_arm: "202",
       right_arm: "203",
     })
-    expect(recordingCameraCount(cameras, true)).toBe(3)
+    expect(recordingCameraCount(cameras, true)).toBe(2)
     expect(
       missingCameraSerials(
         cameras,
@@ -121,7 +124,7 @@ describe("supervisor pure helpers", () => {
         ],
         true
       )
-    ).toEqual(["101"])
+    ).toEqual([])
   })
 
   it("allows head-only Mantis recording and honors its disabled branches", () => {
@@ -168,7 +171,7 @@ describe("supervisor pure helpers", () => {
   it("fills missing slots in partial legacy camera maps before resolving Mantis", () => {
     const headOnly = { serials: { overhead: "101" } } as CameraSpec
     expect(cameraSerials(headOnly, true)).toEqual({
-      overhead: "101",
+      overhead: "",
       left_arm: "",
       right_arm: "",
     })

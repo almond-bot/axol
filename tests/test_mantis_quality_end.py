@@ -125,7 +125,9 @@ def _run_take(
         "quat_xyzw_to_rotvec": quat_xyzw_to_rotvec,
         "_LEFT_EE_KEYS": _LEFT_EE_KEYS,
         "_RIGHT_EE_KEYS": _RIGHT_EE_KEYS,
-        "cfg": SimpleNamespace(mantis_source="lighthouse"),
+        "cfg": SimpleNamespace(
+            mantis_source="lighthouse", _lighthouse_quality="strict"
+        ),
         "mantis_mode": True,
         "teleop": teleop,
         "robot": robot,

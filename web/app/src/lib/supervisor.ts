@@ -1204,8 +1204,28 @@ export interface LighthouseTrackerReadiness {
    */
   baseStations?: LighthouseBaseStationSurvey | null
   expectedBaseStations?: number
+  /**
+   * Host-wide tracking policy. Only "strict" requires a passed validation
+   * before collection and marks faulty takes for retake. Absent on older
+   * serve hosts, which never enforced it.
+   */
+  qualityMode?: LighthouseQualityMode
   /** Absent on hosts without stationary tracking validation. */
   validation?: LighthouseValidation | null
+}
+
+export type LighthouseQualityMode = "standard" | "strict"
+
+export async function saveLighthouseQualityMode(
+  mode: LighthouseQualityMode
+): Promise<{ mode: LighthouseQualityMode }> {
+  return json(
+    await fetch(apiUrl("/api/tracker/lighthouse/quality"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    })
+  )
 }
 
 export interface LighthouseValidation {
@@ -1499,17 +1519,12 @@ export function cameraSerials(spec: CameraSpec, mantis?: boolean): Record<Camera
     right_arm: spec.serials?.right_arm ?? "",
   }
   if (mantis === true) {
-    const left = spec.mantis_serials?.left_arm ?? axol.left_arm
-    const right = spec.mantis_serials?.right_arm ?? axol.right_arm
-    // Older Mantis layouts could assign the Axol head camera to a wrist. Do
-    // not inherit that device into a second slot and open it twice.
-    const inheritedHead = [left, right].some((serial) => serial.trim() === axol.overhead.trim())
-      ? ""
-      : axol.overhead
+    // Wrists fall back to the Axol layout. The Head slot is new to Mantis:
+    // older wrist-only layouts must not inherit Axol's overhead camera.
     return {
-      overhead: spec.mantis_serials?.overhead ?? inheritedHead,
-      left_arm: left,
-      right_arm: right,
+      overhead: spec.mantis_serials?.overhead ?? "",
+      left_arm: spec.mantis_serials?.left_arm ?? axol.left_arm,
+      right_arm: spec.mantis_serials?.right_arm ?? axol.right_arm,
     }
   }
   return axol

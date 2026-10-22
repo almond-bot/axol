@@ -43,7 +43,7 @@ describe("camera specification", () => {
       })
     ).toEqual({
       serials: { overhead: "101", left_arm: "202", right_arm: "" },
-      mantis_serials: { overhead: "101", left_arm: "202", right_arm: "" },
+      mantis_serials: { overhead: "", left_arm: "202", right_arm: "" },
       stream_resolution: "HD1200",
       record_resolution: "SVGA",
       stream: { overhead: "both", left_arm: false },
@@ -66,7 +66,7 @@ describe("camera specification", () => {
       devices,
       { left_arm: "mantis" }
     )
-    expect(out.mantis_serials).toEqual({ overhead: "101", left_arm: "303", right_arm: "" })
+    expect(out.mantis_serials).toEqual({ overhead: "", left_arm: "303", right_arm: "" })
     expect(out.stream).toEqual({ left_arm: false })
     expect(out.record).toEqual({ overhead: "right", left_arm: "left" })
   })
@@ -113,14 +113,14 @@ describe("camera specification", () => {
     expect(out.record).toEqual({ left_arm: "left" })
   })
 
-  it("can save a partial legacy head-only camera map", () => {
+  it("can save a partial legacy head-only camera map without inheriting it into Mantis", () => {
     const out = materializeCameraSpec(
       { serials: { overhead: "101" } } as CameraSpec,
       [{ serial: 101, model: "ZED X Mini", kind: "stereo" }],
       { overhead: "mantis" }
     )
     expect(out.serials).toEqual({ overhead: "101", left_arm: "", right_arm: "" })
-    expect(out.mantis_serials).toEqual(out.serials)
-    expect(out.record).toEqual({ overhead: "both" })
+    expect(out.mantis_serials).toEqual({ overhead: "", left_arm: "", right_arm: "" })
+    expect(out.record).toEqual({})
   })
 })

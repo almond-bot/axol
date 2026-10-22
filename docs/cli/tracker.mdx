@@ -79,9 +79,13 @@ Saves `~/.almond/tracker/config.json`:
     "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
   },
   "ultimate_quat_order": "wxyz",
-  "ultimate_up_axis": "z"
+  "ultimate_up_axis": "z",
+  "expected_base_stations": 2,
+  "lighthouse_quality": "standard"
 }
 ```
+
+`expected_base_stations` is set by **Check base stations** (`--expected_stations`); `lighthouse_quality` is the [Lighthouse tracking policy](#lighthouse-tracking-policy).
 
 Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so releases before 0.2.25, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
 
@@ -102,7 +106,7 @@ Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit
 - **Smaller fixes.** A data race on the scene solver's "solve needed" flag, a mis-indexed measurement count in the optional per-station correction setup (off by default), and a read past the end of an empty config file's parse.
 - **Poses delivered as they are produced.** `survive-cli --record-stdout` never flushed its output, so through a pipe the poses arrived in 4 KB blocks: about 50 ms late at the median and up to about 110 ms with two trackers. The stream is now line-buffered.
 - **Base-station identity through every tracker.** Each base station's OOTX broadcast (its identity and calibration) was decoded only through the first tracker that saw it; if that tracker received it poorly, the other tracker's clean copy was ignored and calibration could stall. Every tracker now decodes it, and the first valid packet wins.
-- **Fixed collection geometry, optical outliers and diagnostics.** Normal collection freezes station calibration, filters isolated bad optical measurements after tracking is established, and captures bounded native evidence around tracking faults. Recalibration uses a separate candidate and commits it only after validation passes.
+- **Fixed collection geometry, optical outliers and diagnostics.** Flag-gated support for the [strict tracking policy](#lighthouse-tracking-policy): freezing station calibration, filtering isolated bad optical measurements after tracking is established, and capturing bounded native evidence around tracking faults. Under the standard policy these are off and libsurvive behaves as before. Recalibration uses a separate candidate and commits it only after validation passes.
 
 A build from before these fixes is rebuilt, not re-attested. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
 
@@ -110,19 +114,31 @@ A build from before these fixes is rebuilt, not re-attested. `axol provision` ru
 axol tracker.install
 ```
 
-After updating Axol for the fixed-geometry tracking workflow, stop collection, install the updated runtime, and restart the web server:
+After updating Axol, stop collection, install the updated runtime, and restart the service so the hosted collector uses the updated code:
 
 ```bash
-.venv/bin/axol tracker.install
-# Stop the existing axol serve process, then start it again:
-.venv/bin/axol serve
+axol tracker.install
+sudo systemctl restart axol
 ```
 
-The control panel's **Install Lighthouse support** action runs the same installer. Then run **Recalibrate Lighthouse** and complete its validation before collecting. Previous validation reports from the refining runtime are not accepted for the new mode. An unpatched manual build or separately installed Python bindings are not supported substitutes for the attested runtime.
+The control panel's **Install Lighthouse support** action runs the same installer. On a host using the [strict tracking policy](#lighthouse-tracking-policy), then run **Recalibrate Lighthouse** and complete its validation before collecting; validation reports from earlier releases are not accepted. An unpatched manual build or separately installed Python bindings are not supported substitutes for the attested runtime.
 
 <Note>
   On ARM, avoid linking libsurvive against OpenBLAS (known instability/CPU blowups); `-DUSE_EIGEN=ON` sidesteps it. Close SteamVR if one is somehow present — it competes for the devices.
 </Note>
+
+## Lighthouse tracking policy
+
+`lighthouse_quality` in [`~/.almond/tracker/config.json`](#axol-trackeridentify) (control panel: **Mantis settings → Tracking → Tracking policy**) chooses how strictly Lighthouse tracking is policed. It is host-wide and applies to collection, the tracker bridge, **Check base stations** and **Identify**.
+
+| | `standard` (default) | `strict` |
+| --- | --- | --- |
+| Station calibration | libsurvive keeps refining it in the background and saves it, so **Check base stations** and **Identify** can calibrate a new or moved setup. | Frozen outside an explicit **Recalibrate Lighthouse**; tracking and survey runs use private copies of the saved calibration. |
+| Before collecting | **Validate tracking** is optional. | A passed validation is required; reports expire after 12 hours. |
+| While collecting | Poses stream as libsurvive reports them; takes are judged by the episode QA gate (`--qa_gate`). | Optical support, pose discontinuities and station identity are monitored live. Poses are withheld until tracking is stable, and any tracking fault marks the take for retake, even with `--qa_gate false`. |
+| Native solver | Upstream defaults. | Optical outlier rejection after tracking is established; bounded fault diagnostics. |
+
+Choose `strict` for a fixed installation whose base stations never move between sessions and where a rejected take is preferable to a slightly degraded one. `standard` suits portable setups, two-station rooms and bring-up. Change the policy only while no operation is running.
 
 ## `axol tracker.lighthouse.check`
 
@@ -132,7 +148,9 @@ axol tracker.lighthouse.check --expected_stations 3
 
 Listens to libsurvive for about 20 seconds with both trackers powered and in view. When base stations are live but the trackers are not reporting yet, station identity acquisition or localization is still pending: usable poses require station identities and positions, which can take a minute or more on a new host or after stations are added or re-channelled. The check then keeps listening, up to 150 seconds in total, until both trackers report; keep them still and in view meanwhile. It then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than the configured number of base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
 
-Axol resolves the published calibration baseline from libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before 0.2.25 let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept. Tracking and survey processes use private working copies. Explicit recalibration validates a separate candidate before replacing the published baseline.
+Under the strict policy the check never calibrates: on a new host, or after stations are added or re-channelled, run **Recalibrate Lighthouse** first.
+
+Axol resolves the published calibration baseline from libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before 0.2.25 let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept. Under the standard policy libsurvive updates this file as it refines the calibration; under the strict policy tracking and survey processes use private working copies. Explicit recalibration validates a separate candidate before replacing the published baseline.
 
 ## `axol tracker.lighthouse.validate`
 
@@ -147,9 +165,9 @@ Before the measurements, acquisition can take **up to two minutes**. Progress di
 | Flag | Description |
 |---|---|
 | `--expected_stations INT` | Number of installed stations, 1–4; saved for future checks. Set 3 for a three-station setup. When omitted, uses the saved setting. |
-| `--web_prompts true` | Use the control panel's interactive session prompt. The panel passes this automatically. |
+| `--web-prompts` | Use the control panel's interactive session prompt. The panel passes this automatically. |
 
-Validate before the first session each day. Collection requires a current passing report; reports expire after **12 hours** and become invalid when the setup fingerprint changes. Failures remain visible with their reasons; address the visibility, station, or identity issue and run validation again. If the report requires recalibration after a persistent calibration fault, run **Recalibrate Lighthouse** instead: standalone validation cannot clear that fault. This command preserves the existing calibration.
+Under the [strict policy](#lighthouse-tracking-policy), validate before the first session each day: collection requires a current passing report. Reports expire after **12 hours** and become invalid when the setup fingerprint changes. Failures remain visible with their reasons; address the visibility, station, or identity issue and run validation again. If the report requires recalibration after a persistent calibration fault, run **Recalibrate Lighthouse** instead: standalone validation cannot clear that fault. This command preserves the existing calibration.
 
 ## `axol tracker.lighthouse.calibrate`
 

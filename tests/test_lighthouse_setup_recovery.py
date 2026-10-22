@@ -487,6 +487,8 @@ def test_survey_uses_and_saves_three_station_choice() -> None:
     assert exc.value.code == 1
     assert config.expected_base_stations == 3
     save_config.assert_called_once_with(config)
-    factory.assert_called_once_with(expected_stations=3, allow_frame_refinement=True)
+    factory.assert_called_once_with(
+        expected_stations=3, allow_frame_refinement=True, strict=False
+    )
     assert "2 of 3 seen" in out.getvalue()
     source.stop.assert_called_once()
