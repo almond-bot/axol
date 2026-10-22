@@ -1,9 +1,20 @@
 //! Shared SocketCAN transmit-stall protection.
 //!
-//! A powered-off Axol bus cannot ACK frames. Linux then fills the interface
-//! TX queue and returns `ENOBUFS`; frames already accepted by that queue can
-//! replay when power returns. Every Rust CAN owner uses this module so both
-//! realtime control and maintenance traffic stop and purge identically.
+//! A powered-off Axol bus cannot ACK frames. How that surfaces depends on the
+//! arm hub's firmware:
+//!
+//! - **Hub firmware 2.01+** drops a frame nothing ACKs within 50 ms and
+//!   reports it as a `CAN_ERR_ACK` error frame. The TX queue never backs up;
+//!   a socket that asked for the reports ([`CanSock::watch_ack_errors`])
+//!   sees [`SendOutcome::Unacked`]. Nothing is left queued anywhere, so
+//!   there is nothing to purge.
+//! - **Older hubs** (and other adapters) back up instead: Linux fills the
+//!   interface TX queue and returns `ENOBUFS`, and frames already accepted
+//!   can replay when power returns — [`SendOutcome::Stalled`], after which
+//!   the caller purges ([`purge_tx_queue`]).
+//!
+//! Every Rust CAN owner uses this module so both realtime control and
+//! maintenance traffic stop identically.
 
 use crate::can::CanSock;
 use std::io;
@@ -12,6 +23,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub const STALL_DETECT: Duration = Duration::from_secs(1);
+
+/// The report for [`SendOutcome::Unacked`], after the interface name. Python
+/// recognises a dead bus by this text (`almond_axol.motor.bus.is_stall_report`)
+/// as it does `TX queue stalled`.
+pub const NO_ACK_REPORT: &str =
+    "bus dead — the hub reports no node ACKing frames (e-stop / motors unpowered?)";
 const PURGE_DEDUPE: Duration = Duration::from_secs(3);
 static LAST_PURGE: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -24,6 +41,29 @@ const BRINGUP_SCRIPT: &str = "/etc/almond-axol/can/startup.sh";
 /// `/etc`. Still honoured so a purge works on a robot that has not been
 /// re-provisioned yet; `axol provision` deletes the root references to it.
 const LEGACY_BRINGUP_SCRIPT: &str = ".almond/can/startup.sh";
+/// The arm hub's USB reset — `almond_axol.constants.CAN_RESET_SCRIPT`. The
+/// hub firmware keeps the frames it already accepted (up to the driver's 10
+/// in flight per channel) through a link down/up and transmits them on the
+/// next open, so on the arm buses a flap only defers the replay; this script
+/// resets the device, then runs the bring-up script. Same grant as above.
+const RESET_SCRIPT: &str = "/etc/almond-axol/can/reset_adapter.sh";
+/// The two channels of the arm hub (`CAN_LEFT` / `CAN_RIGHT` in
+/// `almond_axol.constants`), the only interfaces the reset script covers.
+const ARM_HUB_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
+
+/// The Mantis rig's channels (`CAN_MANTIS_LEFT` / `CAN_MANTIS_RIGHT`): the
+/// same dual-channel hub as the arms, so the same no-ACK reports.
+const MANTIS_HUB_IFACES: [&str; 2] = ["can_mantis_l", "can_mantis_r"];
+
+/// Whether `iface` is a dual-channel hub channel (arm or Mantis), whose
+/// no-ACK reports mean the motors lost power ([`CanSock::watch_ack_errors`]).
+/// The Jelly wheel and chest buses run on CANable (candleLight) adapters,
+/// which report every unACKed attempt, including one the controller then
+/// retransmits fine: on the wheel bus the lift shares, one such report killed
+/// the lift's proxy mid-teleop while the wheels kept driving.
+pub fn reports_no_ack(iface: &str) -> bool {
+    ARM_HUB_IFACES.contains(&iface) || MANTIS_HUB_IFACES.contains(&iface)
+}
 
 fn is_tx_full(err: &io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EAGAIN))
@@ -34,8 +74,13 @@ pub enum SendOutcome {
     Sent,
     /// Transient congestion: this frame was dropped.
     Dropped,
-    /// Nothing has ACKed frames for `STALL_DETECT`.
+    /// Nothing has ACKed frames for `STALL_DETECT`: the TX queue is full of
+    /// frames that would replay on re-power, so the caller purges it.
     Stalled,
+    /// The adapter reported a transmission nothing ACKed (hub firmware
+    /// 2.01+, see [`CanSock::watch_ack_errors`]): the bus is dead, but the hub
+    /// dropped the frame instead of holding it, so nothing needs purging.
+    Unacked,
 }
 
 pub fn guarded_send(
@@ -44,6 +89,12 @@ pub fn guarded_send(
     data: &[u8],
     enobufs_since: &mut Option<Instant>,
 ) -> io::Result<SendOutcome> {
+    // Latched by any receive on this socket. Checked before sending: a frame
+    // sent now would go out the moment power returns, which is what a dead
+    // bus must not do.
+    if sock.saw_ack_error() {
+        return Ok(SendOutcome::Unacked);
+    }
     match sock.send(id, data) {
         Ok(()) => {
             *enobufs_since = None;
@@ -99,10 +150,14 @@ fn bringup_script() -> Option<PathBuf> {
     bringup_script_in(Path::new(BRINGUP_SCRIPT), home.as_deref())
 }
 
-/// Drop frames queued behind a dead bus by flapping the CAN interface.
+/// Drop frames queued behind a dead bus.
 ///
-/// Prefer the installed bring-up script because the dual-channel adapter is
-/// most reliable when both channels are flapped together. A purge performed
+/// On an arm-hub channel, USB-reset the hub first (`RESET_SCRIPT`): a flap
+/// clears the kernel's queue but not the frames the hub firmware already
+/// holds, which it transmits on the next open. Otherwise, or when the reset
+/// cannot run, flap the interface — preferring the installed bring-up script
+/// because the dual-channel adapter is most reliable when both channels are
+/// flapped together. A purge performed
 /// for the other arm within the last three seconds counts for this arm too.
 ///
 /// Returns false when the flap could not be run at all — most often because
@@ -113,9 +168,18 @@ fn bringup_script() -> Option<PathBuf> {
 /// (`almond_axol.cli.can.setup.purge_stale_tx`).
 pub fn purge_tx_queue(iface: &str) -> bool {
     let mut last = LAST_PURGE.lock().unwrap();
+    let reset = reset_script_for(iface, Path::new(RESET_SCRIPT));
     let script = bringup_script();
-    if script.is_some() && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE) {
+    if (reset.is_some() || script.is_some()) && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE) {
         return true;
+    }
+    if let Some(path) = &reset {
+        // Falls through to the flap when the reset cannot run — most often a
+        // robot whose sudo grant predates the script (`axol provision`).
+        if run_root(&["bash", &path.to_string_lossy()]).is_ok_and(|st| st.success()) {
+            *last = Some(Instant::now());
+            return true;
+        }
     }
     let result = match &script {
         Some(path) => run_root(&["bash", &path.to_string_lossy()]),
@@ -134,6 +198,12 @@ pub fn purge_tx_queue(iface: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The reset script to purge `iface` with: only for an arm-hub channel, and
+/// only once `axol can.setup` has installed it. Split out for the tests.
+fn reset_script_for(iface: &str, provisioned: &Path) -> Option<PathBuf> {
+    (ARM_HUB_IFACES.contains(&iface) && provisioned.is_file()).then(|| provisioned.to_path_buf())
 }
 
 #[cfg(test)]
@@ -184,5 +254,41 @@ mod tests {
         let dir = scratch("none");
         assert_eq!(bringup_script_in(&dir.join("absent.sh"), Some(&dir)), None);
         assert_eq!(bringup_script_in(&dir.join("absent.sh"), None), None);
+    }
+
+    #[test]
+    fn arm_hub_channels_purge_with_the_usb_reset() {
+        let dir = scratch("reset");
+        let reset = dir.join("reset_adapter.sh");
+        std::fs::write(&reset, "#!/bin/bash\n").unwrap();
+        for iface in ARM_HUB_IFACES {
+            assert_eq!(reset_script_for(iface, &reset), Some(reset.clone()));
+        }
+    }
+
+    #[test]
+    fn only_hub_channels_trust_no_ack_reports() {
+        for iface in ARM_HUB_IFACES.into_iter().chain(MANTIS_HUB_IFACES) {
+            assert!(reports_no_ack(iface));
+        }
+        // CANable adapters: the Jelly wheel bus (shared with the lift) and
+        // the chest bus.
+        assert!(!reports_no_ack("can_alm_axol_b"));
+        assert!(!reports_no_ack("can_alm_axol_c"));
+    }
+
+    #[test]
+    fn other_buses_and_unset_up_hosts_keep_the_flap() {
+        // The wheel/chest adapters are single-channel and not the hub; a
+        // reset of the hub for their stall would drop a healthy arm session.
+        let dir = scratch("noreset");
+        let reset = dir.join("reset_adapter.sh");
+        std::fs::write(&reset, "#!/bin/bash\n").unwrap();
+        assert_eq!(reset_script_for("can_alm_axol_b", &reset), None);
+        assert_eq!(reset_script_for("can0", &reset), None);
+        assert_eq!(
+            reset_script_for("can_alm_axol_l", &dir.join("absent.sh")),
+            None
+        );
     }
 }

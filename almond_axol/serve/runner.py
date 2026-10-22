@@ -42,6 +42,7 @@ import threading
 import time
 from typing import Any
 
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
 from ..utils.logquiet import quiet_noisy_loggers
@@ -69,6 +70,11 @@ _logger = logging.getLogger(__name__)
 # only reliable way to stop fast in all those cases is to kill the children out
 # from under it, which makes the blocked join/recv return.
 _STOP_GRACE_S = 6.0
+# The teleop and collect-data ops park the arms on Stop — rest, then zero
+# (``almond_axol.teleop.shutdown``) — before the torque comes off, and the
+# second leg needs the IK worker alive for its plan. Give those ops the two
+# park caps plus the hardware disconnect before any child is killed.
+_PARK_STOP_GRACE_S = PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 4.0
 _FORCE_GRACE_S = 5.0
 
 # The dataset recorder subprocess (``record_proc``'s "dataset-recorder") is
@@ -1068,10 +1074,15 @@ class OperationRunner:
         """
         if thread is None:
             return
-        thread.join(timeout=_STOP_GRACE_S)
+        grace = (
+            _PARK_STOP_GRACE_S
+            if session.command_id in ("teleop", "collect-data")
+            else _STOP_GRACE_S
+        )
+        thread.join(timeout=grace)
         if thread.is_alive():
             session.emit(
-                f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
+                f"[serve] still stopping after {grace:.0f}s — "
                 "force-killing the operation's child processes (sparing the "
                 "dataset recorder)"
             )

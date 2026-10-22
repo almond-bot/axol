@@ -15,13 +15,24 @@ values that are basically zero). The mass and centre-of-mass of each link is
 therefore overridden at load time from each :class:`JointConfig`'s ``mass``
 and ``com`` fields on an :class:`AxolConfig`. Tune those values to match the
 hardware as closely as possible.
+
+A *payload* — whatever the gripper is holding right now — is layered on top
+at runtime with :meth:`GravityCompensator.set_payload`: it is lumped into the
+``wrist_3`` body (which already carries the gripper) as a point mass, so every
+joint's gravity feedforward accounts for it without touching the calibrated
+link inertials underneath.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import numbers
 import re
+import xml.etree.ElementTree as ET
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal
 
 import mujoco
 import numpy as np
@@ -29,6 +40,7 @@ import numpy as np
 from ..constants import (
     ARM_JOINTS,
     URDF_PATH,
+    Joint,
     urdf_arm_joint_names,
     urdf_body_name,
 )
@@ -36,8 +48,28 @@ from .config import AxolConfig
 
 _logger = logging.getLogger(__name__)
 
+_GRIPPER = Joint.GRIPPER
+_WRIST_3 = Joint.WRIST_3
 
-__all__ = ["GravityCompensator"]
+
+__all__ = [
+    "MAX_PAYLOAD_KG",
+    "GravityCompensator",
+    "PayloadSide",
+    "payload_sides",
+    "validate_payload",
+]
+
+PayloadSide = Literal["left", "right", "both"]
+
+# Upper bound accepted by ``set_payload``. A guard against unit slips — a
+# payload given in grams would otherwise become a feedforward large enough to
+# throw the arm upward — not a rated payload.
+MAX_PAYLOAD_KG = 5.0
+
+# Largest accepted distance (m) from the gripper mount to a payload's CoM —
+# roughly 3x the fingertip distance, again only a typo guard.
+_MAX_PAYLOAD_REACH = 0.5
 
 
 def _load_urdf_text(urdf_path: Path = URDF_PATH) -> str:
@@ -50,6 +82,76 @@ def _load_urdf_text(urdf_path: Path = URDF_PATH) -> str:
     text = re.sub(r"<visual>[\s\S]*?</visual>", "", text)
     text = re.sub(r"<collision>[\s\S]*?</collision>", "", text)
     return text
+
+
+def _rpy_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """URDF fixed-axis roll-pitch-yaw as a rotation matrix (``Rz · Ry · Rx``)."""
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    return rz @ ry @ rx
+
+
+def _gripper_mount(urdf_text: str, *, is_left: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Pose ``(R, p)`` of the gripper link in its parent (``wrist_3``) body frame.
+
+    The gripper hangs off ``wrist_3``'s body on a fixed joint, which MuJoCo's
+    URDF importer fuses away, so the transform is read from the URDF itself.
+    """
+    parent = urdf_body_name(Joint.WRIST_3, is_left=is_left)
+    child = urdf_body_name(Joint.GRIPPER, is_left=is_left)
+    for joint in ET.fromstring(urdf_text).iter("joint"):
+        p_el, c_el = joint.find("parent"), joint.find("child")
+        if (
+            p_el is None
+            or c_el is None
+            or p_el.get("link") != parent
+            or c_el.get("link") != child
+        ):
+            continue
+        origin = joint.find("origin")
+        attrs = origin.attrib if origin is not None else {}
+        xyz = [float(v) for v in attrs.get("xyz", "0 0 0").split()]
+        rpy = [float(v) for v in attrs.get("rpy", "0 0 0").split()]
+        return _rpy_matrix(*rpy), np.array(xyz)
+    raise RuntimeError(f"No joint {parent!r} -> {child!r} in the URDF")
+
+
+def validate_payload(mass: float, com: Sequence[float]) -> tuple[float, np.ndarray]:
+    """Check a payload's mass (kg) and CoM (m), returning them normalised.
+
+    Raises:
+        ValueError: ``mass`` is negative, non-finite or above
+            :data:`MAX_PAYLOAD_KG`, or ``com`` is not three finite numbers
+            within reach of the gripper.
+    """
+    if isinstance(mass, bool) or not isinstance(mass, numbers.Real):
+        raise ValueError(f"payload mass must be a number of kg, got {mass!r}")
+    mass = float(mass)
+    if not (math.isfinite(mass) and 0.0 <= mass <= MAX_PAYLOAD_KG):
+        raise ValueError(
+            f"payload mass must be between 0 and {MAX_PAYLOAD_KG:g} kg, got {mass!r}"
+        )
+    com_arr = np.asarray(com, dtype=np.float64)
+    if com_arr.shape != (3,) or not np.all(np.isfinite(com_arr)):
+        raise ValueError(f"payload com must be three finite numbers (m), got {com!r}")
+    if float(np.linalg.norm(com_arr)) > _MAX_PAYLOAD_REACH:
+        raise ValueError(
+            f"payload com {com_arr.tolist()} is more than {_MAX_PAYLOAD_REACH:g} m "
+            "from the gripper mount; it is in metres in the gripper link frame"
+        )
+    return mass, com_arr
+
+
+def payload_sides(side: str) -> tuple[bool, ...]:
+    """The ``is_left`` flags a ``set_payload`` ``side`` argument names."""
+    sides = {"left": (True,), "right": (False,), "both": (True, False)}
+    if side not in sides:
+        raise ValueError(f"side must be 'left', 'right' or 'both', got {side!r}")
+    return sides[side]
 
 
 def _body_inertials_from_config(
@@ -66,6 +168,44 @@ def _body_inertials_from_config(
         for joint in ARM_JOINTS:
             jc = getattr(arm, joint.value)
             out[urdf_body_name(joint, is_left=is_left)] = (jc.mass, jc.com)
+    return out
+
+
+def _rpy_to_matrix(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """URDF ``rpy`` (fixed-axis XYZ: R = Rz(yaw) Ry(pitch) Rx(roll)) to a matrix."""
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+def _gripper_mount_offsets(
+    urdf_text: str,
+) -> dict[bool, tuple[np.ndarray, np.ndarray]]:
+    """The fixed gripper-link transform on each wrist, ``{is_left: (xyz, R)}``.
+
+    The gripper is a fixed URDF joint on ``*_w2`` — the frame the IK solver
+    targets and the tool geometry (contact points) is expressed in. MuJoCo
+    fuses a fixed-jointed body into its parent at load time, so the frame
+    is reconstructed here from the URDF's ``<joint name="left_gripper_0">``
+    origin (``xyz`` in metres, ``rpy`` in radians) rather than looked up as
+    a body.
+    """
+    out: dict[bool, tuple[np.ndarray, np.ndarray]] = {}
+    for is_left in (True, False):
+        name = urdf_body_name(_GRIPPER, is_left=is_left) + "_0"
+        m = re.search(
+            rf'<joint name="{re.escape(name)}"[^>]*>\s*<origin xyz="([^"]+)" rpy="([^"]+)"',
+            urdf_text,
+        )
+        if m is None:
+            raise RuntimeError(f"Fixed joint {name!r} not found in URDF")
+        xyz = np.array([float(v) for v in m.group(1).split()], dtype=np.float64)
+        rpy = [float(v) for v in m.group(2).split()]
+        out[is_left] = (xyz, _rpy_to_matrix(*rpy))
     return out
 
 
@@ -112,6 +252,27 @@ class GravityCompensator:
     def __init__(self, config: AxolConfig | None = None) -> None:
         self._model = _build_model(config if config is not None else AxolConfig())
         self._data = mujoco.MjData(self._model)
+        # Payload bookkeeping, per arm (keyed by is_left): the wrist_3 body
+        # the payload is lumped into, that body's configured inertial (what
+        # a zero payload restores), the gripper mount pose the payload CoM is
+        # given relative to, and the payload currently applied.
+        urdf_text = _load_urdf_text()
+        self._wrist_bid: dict[bool, int] = {}
+        self._wrist_base: dict[bool, tuple[float, np.ndarray]] = {}
+        self._mount: dict[bool, tuple[np.ndarray, np.ndarray]] = {}
+        self._payload: dict[bool, tuple[float, np.ndarray]] = {}
+        for is_left in (True, False):
+            name = urdf_body_name(Joint.WRIST_3, is_left=is_left)
+            bid = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if bid < 0:
+                raise RuntimeError(f"Body {name!r} not found in URDF")
+            self._wrist_bid[is_left] = bid
+            self._wrist_base[is_left] = (
+                float(self._model.body_mass[bid]),
+                np.array(self._model.body_ipos[bid], dtype=np.float64),
+            )
+            self._mount[is_left] = _gripper_mount(urdf_text, is_left=is_left)
+            self._payload[is_left] = (0.0, np.zeros(3))
         self._left_qpos_idx, self._left_dof_idx = self._joint_indices(
             urdf_arm_joint_names(is_left=True)
         )
@@ -126,6 +287,105 @@ class GravityCompensator:
         self._full_mass_uses_data = tuple(
             int(part) for part in mujoco.__version__.split(".")[:2]
         ) >= (3, 10)
+        # Gripper mount frame (see mount_jacobian): the wrist body it is
+        # fused into, its fixed offset, and Jacobian scratch buffers.
+        self._mount_offset = _gripper_mount_offsets(_load_urdf_text())
+        self._wrist_body = {
+            is_left: mujoco.mj_name2id(
+                self._model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                urdf_body_name(_WRIST_3, is_left=is_left),
+            )
+            for is_left in (True, False)
+        }
+        self._jacp = np.zeros((3, self._model.nv))
+        self._jacr = np.zeros((3, self._model.nv))
+
+    def mount_jacobian(
+        self, arm_q: np.ndarray, *, is_left: bool
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Gripper mount pose and geometric Jacobian for one arm.
+
+        Returns ``(position, rotation, J)``: the mount frame's origin (m) and
+        rotation matrix in the robot base frame at ``arm_q`` (``(7,)``, joint
+        frame, :data:`ARM_JOINTS` order), and the ``(6, 7)`` Jacobian mapping
+        arm joint rates to the mount origin's linear velocity (rows 0–2)
+        and angular velocity (rows 3–5), both in the base frame. The mount
+        frame is the URDF gripper link — the frame the IK solver targets and
+        the tool's contact points are given in.
+
+        ``J.T @ wrench`` is the joint torque a wrench (force, moment about
+        the mount origin) applied at the mount costs each joint; box mode's
+        squeeze lean (:func:`almond_axol.teleop.box.squeeze_lean`) uses it
+        to place the arm's contact force where the tool actually touches the
+        box.
+        Pure kinematics (``mj_kinematics``), so only this arm's joints are
+        touched and the call is cheap enough for the control loop.
+        """
+        if len(arm_q) != len(ARM_JOINTS):
+            raise ValueError(
+                f"arm_q must have {len(ARM_JOINTS)} elements, got {len(arm_q)}"
+            )
+        qpos_idx = self._left_qpos_idx if is_left else self._right_qpos_idx
+        dof_idx = self._left_dof_idx if is_left else self._right_dof_idx
+        for i, qi in enumerate(qpos_idx):
+            self._data.qpos[qi] = float(arm_q[i])
+        mujoco.mj_kinematics(self._model, self._data)
+        mujoco.mj_comPos(self._model, self._data)
+        body = self._wrist_body[is_left]
+        offset, r_off = self._mount_offset[is_left]
+        r_wrist = self._data.xmat[body].reshape(3, 3)
+        position = self._data.xpos[body] + r_wrist @ offset
+        rotation = r_wrist @ r_off
+        mujoco.mj_jac(self._model, self._data, self._jacp, self._jacr, position, body)
+        jac = np.vstack((self._jacp[:, dof_idx], self._jacr[:, dof_idx]))
+        return position.copy(), rotation, jac
+
+    def set_payload(
+        self, mass: float, com: Sequence[float] = (0.0, 0.0, 0.0), *, is_left: bool
+    ) -> None:
+        """Model a payload held by one arm's gripper.
+
+        The payload is a point mass lumped into the ``wrist_3`` body (which
+        already carries the gripper), so every joint's gravity torque — and
+        the reflected inertia used for damping scheduling — includes it from
+        the next evaluation on. Replaces any payload set before; ``mass=0``
+        removes it, restoring the configured link inertial exactly.
+
+        Args:
+            mass: Payload mass (kg), ``0`` to :data:`MAX_PAYLOAD_KG`.
+            com: Payload centre of mass (m) in the gripper link frame — the
+                end-effector frame forward kinematics reports. The
+                fingertips are :data:`~almond_axol.constants.GRIPPER_TIP_OFFSET`.
+            is_left: ``True`` for the left arm, ``False`` for the right.
+
+        Raises:
+            ValueError: see :func:`validate_payload`.
+        """
+        mass, com_grip = validate_payload(mass, com)
+        rot, pos = self._mount[is_left]
+        com_body = rot @ com_grip + pos
+        base_mass, base_com = self._wrist_base[is_left]
+        total = base_mass + mass
+        bid = self._wrist_bid[is_left]
+        self._model.body_mass[bid] = total
+        self._model.body_ipos[bid] = (
+            (base_mass * base_com + mass * com_body) / total
+            if total > 0.0
+            else base_com
+        )
+        self._payload[is_left] = (mass, com_grip)
+        _logger.info(
+            "%s payload: %.3f kg at %s m (gripper frame)",
+            "left" if is_left else "right",
+            mass,
+            np.round(com_grip, 4).tolist(),
+        )
+
+    def payload(self, *, is_left: bool) -> tuple[float, np.ndarray]:
+        """The payload set on one arm: ``(mass_kg, com_m)`` in the gripper frame."""
+        mass, com = self._payload[is_left]
+        return mass, com.copy()
 
     def _joint_indices(self, names: list[str]) -> tuple[list[int], list[int]]:
         qpos_idx: list[int] = []

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react"
-import { ArrowRight, Hand, Loader2, Play, Square, X } from "lucide-react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { ArrowRight, Hand, Loader2, Play, Square, Upload, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { CuratedForm } from "@/components/config-form"
@@ -8,8 +8,10 @@ import {
   computeArgs,
   flattenFields,
   missingRequired,
+  uploadLiftFirmware,
   type CommandSpec,
   type FormValue,
+  type LiftFirmwareUpload,
 } from "@/lib/supervisor"
 import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetry"
 
@@ -349,10 +351,17 @@ export function ActionDialog({
     () => allFields.find((f) => f.key === "joints" && !hidden.has("joints")),
     [allFields, hidden]
   )
-  const fields = useMemo(
-    () => allFields.filter((f) => !hidden.has(f.key) && f.key !== "joints"),
+  // `--firmware` (lift.update) is a file the operator picks on this machine:
+  // it is uploaded to the host first and the stored path becomes the arg.
+  const firmwareField = useMemo(
+    () => allFields.find((f) => f.key === "firmware" && !hidden.has("firmware")),
     [allFields, hidden]
   )
+  const fields = useMemo(
+    () => allFields.filter((f) => !hidden.has(f.key) && f.key !== "joints" && f.key !== "firmware"),
+    [allFields, hidden]
+  )
+  const [uploading, setUploading] = useState(false)
   const hasWebPrompts = allFields.some((f) => f.key === "web_prompts")
 
   function setOverride(key: string, value: FormValue | null) {
@@ -365,7 +374,11 @@ export function ActionDialog({
   }
 
   function handleRun() {
-    const formFields = jointsField ? [...fields, jointsField] : fields
+    const formFields = [
+      ...fields,
+      ...(jointsField ? [jointsField] : []),
+      ...(firmwareField ? [firmwareField] : []),
+    ]
     const miss = missingRequired(formFields, overrides)
     setMissing(miss)
     if (miss.length > 0) return
@@ -450,6 +463,15 @@ export function ActionDialog({
           />
         )}
 
+        {firmwareField && (
+          <FirmwareUploadField
+            help={firmwareField.help}
+            disabled={running || busy}
+            onUploading={setUploading}
+            onChange={(path) => setOverride("firmware", path)}
+          />
+        )}
+
         {fields.length > 0 && (
           <CuratedForm
             fields={fields}
@@ -480,13 +502,104 @@ export function ActionDialog({
             <Button
               size="sm"
               onClick={handleRun}
-              disabled={busy || disabled || blocked || !spec.available}
+              disabled={busy || uploading || disabled || blocked || !spec.available}
             >
               {busy ? <Loader2 className="animate-spin" /> : <Play />} Run
             </Button>
           )}
         </div>
       </Card>
+    </div>
+  )
+}
+
+/**
+ * File picker for a command's `--firmware` argument: uploads the chosen file
+ * to the serve host, which validates it (a jelly_legs firmware.bin) and
+ * stores it; the stored path is what the run receives. Clearing or a failed
+ * upload leaves the argument unset (the command then only reports).
+ */
+export function FirmwareUploadField({
+  help,
+  disabled,
+  onUploading,
+  onChange,
+}: {
+  help?: string | null
+  disabled: boolean
+  onUploading: (uploading: boolean) => void
+  onChange: (path: string | null) => void
+}) {
+  const input = useRef<HTMLInputElement>(null)
+  const [uploaded, setUploaded] = useState<LiftFirmwareUpload | null>(null)
+  const [fileName, setFileName] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [uploading, setUploading] = useState(false)
+
+  async function handleFile(file: File | undefined) {
+    if (!file) return
+    setFileName(file.name)
+    setUploaded(null)
+    setError(null)
+    onChange(null)
+    setUploading(true)
+    onUploading(true)
+    try {
+      const result = await uploadLiftFirmware(file)
+      setUploaded(result)
+      onChange(result.path)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setUploading(false)
+      onUploading(false)
+      if (input.current) input.current.value = ""
+    }
+  }
+
+  function clear() {
+    setUploaded(null)
+    setFileName(null)
+    setError(null)
+    onChange(null)
+  }
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-white/[0.02] p-3">
+      <span className="text-xs font-medium text-white/70">Firmware file</span>
+      {help && <span className="text-xs leading-relaxed text-white/40">{help}</span>}
+      <div className="flex items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={disabled || uploading}
+          onClick={() => input.current?.click()}
+        >
+          {uploading ? <Loader2 className="animate-spin" /> : <Upload />}
+          {fileName ? "Choose another" : "Choose firmware.bin"}
+        </Button>
+        {(uploaded || error) && !uploading && (
+          <Button variant="ghost" size="sm" disabled={disabled} onClick={clear}>
+            Clear
+          </Button>
+        )}
+        <input
+          ref={input}
+          type="file"
+          accept=".bin,application/octet-stream"
+          className="hidden"
+          aria-label="Firmware file"
+          onChange={(e) => void handleFile(e.target.files?.[0])}
+        />
+      </div>
+      {uploading && <p className="text-xs text-white/45">Uploading {fileName}…</p>}
+      {uploaded && (
+        <p className="text-xs text-emerald-300/80">
+          {fileName}: firmware {uploaded.version}, built {uploaded.built} (build {uploaded.buildId},{" "}
+          {Math.round(uploaded.size / 1024)} KB)
+        </p>
+      )}
+      {error && <p className="text-xs text-red-300">{error}</p>}
     </div>
   )
 }

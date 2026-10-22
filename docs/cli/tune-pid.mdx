@@ -7,7 +7,7 @@ Tests one or more `Kp`/`Kd` candidates for a single joint at ~100 Hz — pass se
 
 The feedforward path defaults to exactly what the production control loop applies — gravity + friction + inertia (`j_eff`) + host-side damping (`kd_host`) — so gains found here transfer 1:1 to teleop. Use `--ff` to tune against a reduced feedforward instead (e.g. `--ff none` for bare PD, or `--ff friction` to see how the joint behaves without gravity compensation), and `--host-kd` to override the host-side damping (the shoulders need it — their motor firmware's velocity estimate is too filtered to damp the ~2 Hz closed-loop resonance, so firmware `kd` alone leaves them ringing).
 
-During every probe the other joints are held at rest by the motor firmware's own position servo (the stiffest hold available), and the tool round-robins one position read per cycle across them to prove they actually stayed put: each candidate's report ends with a `Holder peak` line listing how far every holder moved from its pre-step baseline. Past ~0.5° the structure was flexing under the reaction torque, and part of the measured ring belongs to a compliant neighbour rather than the joint under test.
+During every probe the other joints are held at rest on impedance at the calibration gains, with gravity fed forward (`--a4-holders` holds them on the motors' own position loops instead — stiffer, but with the arm held that way the MyActuator 0xA4 loop has set a shoulder oscillating), and the tool round-robins one position read per cycle across them to prove they actually stayed put: each candidate's report ends with a `Holder peak` line listing how far every holder moved from its pre-step baseline. Past ~0.5° the structure was flexing under the reaction torque, and part of the measured ring belongs to a compliant neighbour rather than the joint under test.
 
 | Flag | Description |
 |---|---|
@@ -29,6 +29,7 @@ During every probe the other joints are held at rest by the motor firmware's own
 | `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) — also the length of the unscored settle at the center before the step, so arrival/gain-change ringing dies out before anything is measured |
 | `--rate FLOAT` | Command rate in Hz (default: 240.0 — the production control rate, so gains see the same host-damping transport delay teleop gives them). The loop runs open-throttle when CAN round trips exceed the cycle budget, so the report prints the rate actually achieved and warns when it saturates below the request |
 | `--save` | Save the best candidate's Kp/Kd to `~/.almond/calibration.json` |
+| `--no-imu` | Skip the wrist IMU (recorded by default: each candidate gets an `imu` shake score — 1–15 Hz displacement p2p in mm at the gripper, see [`tune.motion`](/cli/tune-motion)) |
 | `--save-run` | Persist each candidate's full time series and metrics as a tuning-run artifact (`~/.almond/diagnostics/tuning/`) for charting and A/B comparison in the diagnostics UI |
 | `--dump-csv [PATH]` | Write per-sample `(kp, kd, t, target, actual, error)` rows to a CSV for offline plotting. Pass without a value to auto-name as `logs/pid_<side>_<joint>_<timestamp>.csv` |
 

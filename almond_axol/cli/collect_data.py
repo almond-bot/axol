@@ -74,7 +74,7 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..constants import PARK_TIMEOUT_S
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
@@ -93,8 +93,11 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
+from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
+from ..teleop.shutdown import OUTCOME_MESSAGES, abort_on_sigint
 from ..teleop_activity import TeleopActivityMarker
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_control_ticks
@@ -261,11 +264,13 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
 
     def quest_error() -> ValueError:
         return ValueError(
-            "Mantis Quest production collection requires measured left and "
-            "right transforms under one profile-scoped "
+            "Mantis Quest production collection requires factory or measured "
+            "left and right transforms under one profile-scoped "
             "`quest:<WebXR-profile>:grip` key. Bare `quest`, target-ray, "
             "missing, or conflicting datum metadata is unsafe because the "
-            "controller-local frame differs. Add the constants to "
+            "controller-local frame differs. Quest 3 Touch Plus controllers "
+            "(`quest:meta-quest-touch-plus:grip`) ship a factory transform; "
+            "for other controllers add the constants to "
             f"{MANTIS_TCP_TRANSFORM_FILE}; the live WebXR profile is "
             "reported by the updated Quest client. Use "
             "--mantis_allow_uncalibrated true only for a bring-up capture "
@@ -399,11 +404,12 @@ def _require_mantis_resume_transform(
     row-level data carries nothing that could tell them apart afterwards.
     Datasets predating the ``mantis_tcp_transform`` marker field were recorded
     with the Rx(+90°) Vive rotation; ``axol migrate-dataset
-    --mantis-tcp-rotation`` repairs them (and stamps the field), after which
-    they can be resumed.
+    --mantis-tcp-rotation`` repairs the rotation (and stamps the field).
+    Factory Vive datasets from axol 0.2.5–0.2.16 carry the retired
+    92 mm-forward translation and stay refused under the current constants.
     """
     from ..mantis.calibration import (
-        DESIGN_TCP_TRANSFORM_ID,
+        LEGACY_DESIGN_TCP_TRANSFORM_ID,
         MEASURED_TCP_TRANSFORM_ID,
         UNCALIBRATED_TCP_TRANSFORM_ID,
         same_tcp_transform,
@@ -420,8 +426,8 @@ def _require_mantis_resume_transform(
     recorded = marker.get(MANTIS_TCP_TRANSFORM_KEY)
     current = _mantis_tcp_transform_provenance(cfg)
     if recorded is None and cfg.mantis_source == "quest":
-        # Quest never had a factory constant, so the old rows used a per-unit
-        # measurement this run cannot check against.
+        # Quest had no factory constant before the marker existed, so the old
+        # rows used a per-unit measurement this run cannot check against.
         _logger.warning(
             "Resuming a Mantis Quest dataset (%s) recorded before axol stamped "
             "its tracker→gripper transforms into meta/axol.json; make sure the "
@@ -449,7 +455,8 @@ def _require_mantis_resume_transform(
     if UNCALIBRATED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Bring-up captures are explicitly not training data; nothing to protect.
         return
-    if recorded_id == current_id == DESIGN_TCP_TRANSFORM_ID:
+    if recorded_id == current_id != MEASURED_TCP_TRANSFORM_ID:
+        # Factory ids are versioned per constant: equal ids, equal transforms.
         return
     if MEASURED_TCP_TRANSFORM_ID in (recorded_id, current_id):
         # Compare as rigid transforms (q and -q are the same rotation), the
@@ -460,6 +467,15 @@ def _require_mantis_resume_transform(
             for side in ("left", "right")
         ):
             return
+    if recorded_id == LEGACY_DESIGN_TCP_TRANSFORM_ID:
+        raise ValueError(
+            f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
+            "with the axol 0.2.5–0.2.16 factory Vive tracker→gripper transform, "
+            "whose translation put the tracker 92 mm in front of the gripper "
+            "instead of 47 mm behind it. This run resolved "
+            f"{current['id']!r}, and appending would mix two pose conventions "
+            "in one dataset. Record to a new repo_id."
+        )
     raise ValueError(
         f"Cannot resume the Mantis dataset at {dataset_root}: it was recorded "
         f"with tracker→gripper transforms {recorded_id!r} but this run resolved "
@@ -888,6 +904,43 @@ class EpisodeQAStats:
         )
 
 
+def _newer_pose(
+    snapshot: TCPPoseSnapshot | None, previous: TCPPoseSnapshot | None
+) -> bool:
+    """Whether ``snapshot`` should replace ``previous`` as the recorded pose.
+
+    Falling back from the calibrated tracker pose to the IK snapshot (on a
+    disengage) hands back an older capture; recording it would step the row
+    timestamps backwards, which the recorder's snapshot ring cannot bracket.
+    Keep the newer sample until the IK path catches up.
+    """
+    if snapshot is None:
+        return False
+    if previous is None or previous.pose_host_ts is None:
+        return True
+    if snapshot.pose_host_ts is None:
+        return False
+    return snapshot.pose_host_ts >= previous.pose_host_ts
+
+
+def _row_observation(
+    robot: Any, live: dict[str, Any], pose_ts: float | None
+) -> dict[str, Any]:
+    """The measured state to record in a row stamped with ``pose_ts``.
+
+    The live reading is taken at the control tick, up to one pose lag (tens of
+    ms) after the pose capture the row is stamped with; the gripper position
+    in it would lead the recorded pose by that much. Use the core's
+    telemetry nearest the capture instead, and the live reading only when no
+    such sample is retained.
+    """
+    if pose_ts is None:
+        return live
+    at = getattr(robot, "joint_observation_at", None)
+    measured = at(pose_ts) if at is not None else None
+    return measured if measured is not None else live
+
+
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     """Quality verdict for a recorded episode: ``(ok, reasons)``.
 
@@ -1007,6 +1060,12 @@ class _NullCollectControl:
     def note_returning(self) -> None:
         pass
 
+    def note_parking(self) -> None:
+        pass
+
+    def note_rejected(self, reason: str) -> None:
+        pass
+
     def note_dataset(self, repo_id: str, root: Path) -> None:
         pass
 
@@ -1040,6 +1099,10 @@ class _QueueCollectControl:
         # The dataset this session records into (note_dataset), so the
         # panel's dataset preview can follow it.
         self._dataset: dict[str, str] | None = None
+        # Why the last take was not saved (note_rejected). Unlike the phase
+        # message it survives the return to "ready", so a refused take can't
+        # read as a quiet success; the next take's recording start clears it.
+        self._rejection: str | None = None
 
     # -- serve API surface --------------------------------------------------
 
@@ -1064,6 +1127,8 @@ class _QueueCollectControl:
                 snap["episode"] = self._episode
             if self._dataset is not None:
                 snap["dataset"] = dict(self._dataset)
+            if self._rejection is not None:
+                snap["notice"] = {"level": "error", "message": self._rejection}
             return snap
 
     def note_dataset(self, repo_id: str, root: Path) -> None:
@@ -1112,6 +1177,8 @@ class _QueueCollectControl:
             self._countdown_deadline = deadline
 
     def note_recording(self) -> None:
+        with self._lock:
+            self._rejection = None
         self._set("recording", "Recording — save or discard the episode to end it.")
 
     def note_saving(self) -> None:
@@ -1131,6 +1198,17 @@ class _QueueCollectControl:
 
     def note_returning(self) -> None:
         self._set("resetting", "Returning to rest…")
+
+    def note_parking(self) -> None:
+        self._set(
+            "parking",
+            "Parking the arms (rest, then zero) before releasing the motors…",
+        )
+
+    def note_rejected(self, reason: str) -> None:
+        """The take just ended was discarded or failed to save, and why."""
+        with self._lock:
+            self._rejection = reason
 
 
 Control = _NullCollectControl | _QueueCollectControl
@@ -1372,6 +1450,9 @@ def _run_session(
         and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+        adopt_robot_gripper(
+            cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
+        )
 
         # Keep the optional teleop flight recorder coherent across Python and
         # Rust. An explicit name enables every stage; the documented ``None``
@@ -1593,6 +1674,10 @@ def _run_session(
 
     try:
         robot.connect()
+        if not mantis_mode:
+            # The teleop's startup move to rest plays unsupervised; refuse it
+            # from far away (a Mantis rig has no arm joints to check).
+            check_start_pose(robot.positions)
         if mantis_mode:
             # Open both grippers all the way (this is also the one-time
             # hard-stop calibration), then drop torque again, so the jaws are
@@ -1641,6 +1726,10 @@ def _run_session(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        # The headset's live settings act on the hardware too (grip force):
+        # hand the teleoperator the arms now that the robot is up.
+        teleop.live_settings.set_robot(robot.axol)
+        teleop.measured_robot = robot.axol
         try:
             activity.start()
         except OSError as exc:
@@ -1835,6 +1924,32 @@ def _run_session(
     def _stopped() -> bool:
         return (stop_event is not None and stop_event.is_set()) or loop_stop.is_set()
 
+    # Box mode's squeeze torque cap (VRTeleopConfig.box_squeeze_torque): the
+    # teleop core says which joints run under a per-command spring-torque
+    # cap right now, and the robot is told on change only — same as native
+    # teleop. The Mantis rig has no arms and no setter, so this is a no-op
+    # there.
+    caps_applied: dict[Joint, float] | None = None
+
+    def _sync_spring_caps() -> None:
+        nonlocal caps_applied
+        axol = getattr(robot, "axol", None)
+        set_caps = getattr(axol, "set_spring_caps", None)
+        if set_caps is not None:
+            caps = teleop.spring_caps()
+            if caps != caps_applied:
+                set_caps(caps)
+                caps_applied = caps
+
+    def _clear_spring_caps() -> None:
+        # Session end: leave no squeeze cap on the robot object (as native
+        # teleop does), whatever state the last tick left.
+        nonlocal caps_applied
+        set_caps = getattr(getattr(robot, "axol", None), "set_spring_caps", None)
+        if set_caps is not None and caps_applied:
+            set_caps(None)
+        caps_applied = None
+
     # Worst single-iteration stall and scheduler slip within each window. `gap`
     # is the longest time between consecutive loop iterations (a starved control
     # thread shows up as gaps >> the 1/teleop_hz period); `slip` is how late the
@@ -2002,6 +2117,7 @@ def _run_session(
             robot_act = robot_action_proc((act_processed, joint_obs))
             dataset_act = robot.action_to_dataset(act_processed)
             t_proc = time.perf_counter()
+            _sync_spring_caps()
             await robot.send_action_async(robot_act)
             t_send = time.perf_counter()
             sect["obs"] += t_obs - t0
@@ -2025,9 +2141,11 @@ def _run_session(
             if mantis_mode:
                 # Pose and host capture time are one immutable sample. Reading
                 # them through separate accessors could straddle an IK publish
-                # and stamp pose N+1 with pose N's timestamp.
-                tcp_snapshot = teleop.tcp_pose_snapshot()
-                if tcp_snapshot is not None:
+                # and stamp pose N+1 with pose N's timestamp. While engaged on
+                # a managed tracker this is the calibrated tracker pose at its
+                # own capture time, not the IK path's older processed pose.
+                tcp_snapshot = teleop.recording_pose_snapshot()
+                if _newer_pose(tcp_snapshot, last_tcp):
                     last_tcp = tcp_snapshot
                 pose_ts = last_tcp.pose_host_ts if last_tcp is not None else None
                 if pose_ts is not None:
@@ -2043,6 +2161,9 @@ def _run_session(
                 # where the gripper physically is, and training must not
                 # inherit filter/solver artifacts. Grippers stay as-is —
                 # measured feedback in the state, commanded in the action.
+                # Measured values (the grippers) as of the pose capture, not
+                # the later control tick.
+                joint_obs = _row_observation(robot, joint_obs, pose_ts)
                 if last_tcp is not None:
                     joint_obs = dict(joint_obs)
                     dataset_act = dict(dataset_act)
@@ -2120,6 +2241,7 @@ def _run_session(
             robot.set_control_trace_active(True)
             joint_obs = robot.get_joint_observation()
             teleop.send_feedback(joint_obs)
+            _sync_spring_caps()
             await robot.send_action_async(last_robot_act)
             # Capture is already being stopped on the worker thread. Publishing
             # keeps the nearest-state history fresh for any final in-flight AU.
@@ -2470,6 +2592,7 @@ def _run_session(
     async def _guard_send_step() -> None:
         joint_obs = robot.get_joint_observation()
         act = teleop.get_action()
+        _sync_spring_caps()  # lifts the squeeze cap: the core caps nothing mid-reset
         await robot.send_action_async(robot_action_proc((act, joint_obs)))
 
     async def _guard_gravity_step() -> None:
@@ -2527,46 +2650,27 @@ def _run_session(
         finally:
             robot.set_control_trace_active(False)
 
-    async def _park_before_disconnect() -> None:
-        """Teardown return: the post-episode move, bounded and unattended.
+    async def _park_before_disconnect(abort: threading.Event) -> str:
+        """Teardown park: rest, then zero, bounded and unattended.
 
-        The session has already stopped by the time this runs, so a deadline
-        bounds the move and none of the operator hooks are offered: there is
+        The session has already stopped by the time this runs, so each leg
+        is bounded and none of the operator hooks are offered: there is
         nobody left at the headset or the panel to answer a contact hold, so
         a contact trip ends the park at once instead of holding limp until
-        the deadline — the torque-off follows either way.
+        the deadline — the torque-off follows either way. The sequencing is
+        the orchestrator shared with native ``axol teleop``
+        (:mod:`almond_axol.teleop.shutdown`).
         """
-        deadline = time.perf_counter() + PARK_TIMEOUT_S
-        contact = False
-
-        def _on_contact() -> None:
-            nonlocal contact
-            contact = True
-
-        # A both-grips squeeze mid-park would steer the arms off the path.
-        teleop.block_engage()
-        try:
-            if not teleop.is_resetting:
-                teleop.request_reset()
-            await teleop.guarded_return(
-                send_step=_guard_send_step,
-                gravity_step=_guard_gravity_step,
-                torque_residuals=robot.torque_residuals,
-                reset_command_state=robot.reset_command_state,
-                get_positions=lambda: robot.positions,
-                stopped=lambda: contact or time.perf_counter() >= deadline,
-                # The hold's "press reset" prompt has no one to read it here.
-                announce=lambda msg: None if contact else _logger.info(msg),
-                on_contact=_on_contact,
-                move_timeout_s=PARK_TIMEOUT_S,
-            )
-            if contact:
-                _logger.warning(
-                    "return to rest before disconnect stopped on contact; "
-                    "disabling the arms where they are"
-                )
-        finally:
-            teleop.unblock_engage()
+        return await teleop.park_arms(
+            park_to_zero=bool(vrt_cfg.park_to_zero),
+            send_step=_guard_send_step,
+            gravity_step=_guard_gravity_step,
+            torque_residuals=robot.torque_residuals,
+            reset_command_state=robot.reset_command_state,
+            get_positions=lambda: robot.positions,
+            announce=_logger.info,
+            abort=abort.is_set,
+        )
 
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
@@ -2643,6 +2747,15 @@ def _run_session(
         except RuntimeError as exc:
             _logger.error("episode discard failed; continuing: %s", exc)
 
+    def _reject_take(reason: str) -> None:
+        """Log a discarded or refused take and keep it on the panel.
+
+        The headset and the panel otherwise return to their ready state, so
+        without this a rejected take looked exactly like a saved one.
+        """
+        _logger.warning(reason)
+        control.note_rejected(reason)
+
     def _wrap_up_episode(
         recording: bool,
         rerecord: bool,
@@ -2652,8 +2765,9 @@ def _run_session(
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if capture_failure is not None:
-            _logger.info(
-                f"Episode discarded because camera capture failed: {capture_failure}"
+            _reject_take(
+                f"Episode {episode_idx + 1} was not saved: camera capture "
+                f"failed ({capture_failure})."
             )
             # finish_episode already joined capture and cleared the rejected
             # buffer. cancel_episode is an idempotent lifecycle reset and also
@@ -2685,7 +2799,7 @@ def _run_session(
                 # up like collect-dagger does instead of tearing everything
                 # down over one lost episode. Durability failures are a
                 # different type (EpisodeDurabilityError) and still unwind.
-                _logger.info(f"Episode NOT saved: {exc}")
+                _reject_take(f"Episode {episode_idx + 1} was NOT saved: {exc}")
                 return
             # The serve unit records as root into the operator's home; hand the
             # tree back after every save so a crash never leaves a root-owned
@@ -2768,16 +2882,17 @@ def _run_session(
             # the same episode again instead of tearing down robot control.
             if recording and not rerecord and capture_failure is None:
                 if captured_rows == 0 and qa.end_t_host is not None:
-                    _logger.info(
-                        "Episode has no dataset rows before the end gesture "
-                        "began — it was ended as soon as it started. Discarding "
-                        "and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it has no "
+                        "dataset rows before the end gesture began (it was "
+                        "ended as soon as it started). Record it again."
                     )
                     rerecord = True
                 elif captured_rows == 0:
-                    _logger.info(
-                        "Episode captured no dataset rows — it ended before the "
-                        "first camera frame arrived. Discarding and re-recording."
+                    _reject_take(
+                        f"Episode {episode_idx + 1} was not saved: it captured "
+                        "no dataset rows (it ended before the first camera "
+                        "frame arrived). Record it again."
                     )
                     rerecord = True
 
@@ -2824,9 +2939,11 @@ def _run_session(
                     )
                 if not qa_ok and not rerecord and capture_failure is None:
                     if cfg.qa_gate:
-                        _logger.info(
-                            "Episode REJECTED by the quality gate — "
-                            "discarding and re-recording. " + " ".join(qa_reasons)
+                        _reject_take(
+                            f"Episode {episode_idx + 1} was REJECTED by the "
+                            "quality gate and discarded: "
+                            + "; ".join(qa_reasons)
+                            + ". Record it again."
                         )
                         rerecord = True
                     else:
@@ -2931,42 +3048,59 @@ def _run_session(
         _cleanup("teleop activity marker", activity.stop)
         _cleanup("control trace", lambda: robot.set_control_trace_active(False))
         # Park before the torque comes off: ``disconnect()`` disables the
-        # motors, and arms left raised drop under gravity.
+        # motors, and arms left raised drop under gravity. The park is the
+        # guarded return to rest and then, with ``park_to_zero``, the move
+        # on to all-zero joints with the grasp held (see
+        # almond_axol.teleop.shutdown).
         #
         # Skipped on Mantis (handheld grippers, no arms to park), when the
-        # arms are already at rest, when a limp contact hold left them in the
-        # operator's hands, when the IK worker that plans the move is gone, or
-        # when the bus no longer reports a pose to plan from. A stop that
-        # lands mid-reset finishes that move. The rest states come off the
-        # teleop core here, rather than off an ``IKResetController`` as in
-        # run-policy and collect-dagger, because this flow's rest moves are
-        # planned by the teleop IK worker.
+        # arms are already at rest and the zero leg is off, when a limp
+        # contact hold left them in the operator's hands, when the IK worker
+        # that plans the moves is gone, or when the bus no longer reports a
+        # pose to plan from. A stop that lands mid-reset finishes that move.
+        # The rest states come off the teleop core here, rather than off an
+        # ``IKResetController`` as in run-policy and collect-dagger, because
+        # this flow's rest moves are planned by the teleop IK worker.
         #
-        # Bounded twice: by the deadline the coroutine installs, and by the
-        # hard wait below. Every failure is swallowed, so the disconnect that
-        # follows happens either way and a lost park costs only what was lost
-        # before it existed.
+        # Bounded twice: by the per-leg deadlines the orchestrator installs,
+        # and by the hard wait below. A second Ctrl+C aborts the park (the
+        # handler is main-thread only; under ``axol serve`` the panel has no
+        # Ctrl+C). Every failure is swallowed, so the disconnect that follows
+        # happens either way and a lost park costs only what was lost before
+        # it existed.
         try:
             if (
                 not mantis_mode
-                and (not teleop.at_rest or teleop.is_resetting)
+                and (
+                    bool(vrt_cfg.park_to_zero)
+                    or not teleop.at_rest
+                    or teleop.is_resetting
+                )
                 and not teleop.ik_paused
                 and teleop.ik_worker_alive
                 and arms_reporting(robot)
             ):
-                _logger.info("Returning to rest before disabling the arms.")
+                _logger.info("Parking the arms before disabling them.")
+                control.note_parking()
+                park_abort = threading.Event()
                 park = asyncio.run_coroutine_threadsafe(
-                    _park_before_disconnect(), robot.event_loop
+                    _park_before_disconnect(park_abort), robot.event_loop
                 )
                 try:
-                    park.result(timeout=PARK_TIMEOUT_S + 1.0)
+                    with abort_on_sigint(park_abort):
+                        outcome = park.result(
+                            timeout=PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 1.0
+                        )
+                    if outcome != "done":
+                        _logger.warning("%s", OUTCOME_MESSAGES.get(outcome, outcome))
                 finally:
-                    # A park that overran its own deadline must stop
+                    # A park that overran its own deadlines must stop
                     # commanding before the disconnect below disables the
                     # motors underneath it. A no-op once it has finished.
                     park.cancel()
         except BaseException:
-            _logger.exception("return to rest before disconnect failed")
+            _logger.exception("the park before disconnect failed")
+        _cleanup("spring caps", _clear_spring_caps)
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)
         # Close the relay's dataset branch BEFORE the recorder detaches its

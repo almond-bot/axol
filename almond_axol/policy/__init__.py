@@ -25,7 +25,7 @@ from .plan_protocol import (
     PlanSpec,
 )
 from .protocol import CameraSpec, PolicyProtocolError, PolicyRemoteError
-from .server import Observation, Policy, PolicyServer, PolicySpec, serve
+from .server import Observation, Policy, PolicyServer, PolicySpec, Prediction, serve
 
 __all__ = [
     "PLAN_PROTOCOL_VERSION",
@@ -43,6 +43,7 @@ __all__ = [
     "PolicyRemoteError",
     "PolicyServer",
     "PolicySpec",
+    "Prediction",
     "check_policy",
     "default_spec",
     "policy_url",

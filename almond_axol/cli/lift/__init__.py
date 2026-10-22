@@ -1,6 +1,6 @@
 """Shared plumbing for the ``axol lift.*`` commands.
 
-Both commands (``lift.home``, ``lift.goto``) talk to the jelly_legs lift
+The motion commands (``lift.home``, ``lift.goto``) talk to the jelly_legs lift
 controller — on its chest CAN bus or the wheel bus it shares with the
 motors, whichever ``axol can.setup`` pinned — through the
 :class:`~almond_axol.robot.lift.Lift` driver, watch its status to
@@ -52,7 +52,10 @@ def fmt_status(st: LiftStatus) -> str:
             ("at_lower", st.at_lower),
             ("at_upper", st.at_upper),
             ("homing", st.homing),
+            ("independent", bool(st.independent_homing)),
             ("jog", st.jog),
+            ("FW_TRIAL", bool(st.fw_trial)),
+            ("FW_UPDATE", bool(st.fw_updating)),
         )
         if on
     ]
@@ -159,6 +162,17 @@ def require_motion_preflight(
     if not st.drivers_enabled:
         raise SystemExit(
             f"ERROR: cannot start {operation}: the lift motor drivers are disabled."
+        )
+    if st.fw_updating:
+        raise SystemExit(
+            f"ERROR: cannot start {operation}: a lift firmware update is in "
+            "progress (motion is locked until it finishes)."
+        )
+    if st.fw_trial:
+        raise SystemExit(
+            f"ERROR: cannot start {operation}: new lift firmware is on trial "
+            "and not yet confirmed (motion is locked); finish the update with "
+            "legs_update.py, or power-cycle the board to revert."
         )
     if st.save_pending:
         raise SystemExit(

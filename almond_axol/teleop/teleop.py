@@ -41,7 +41,7 @@ import time
 
 import numpy as np
 
-from ..constants import PARK_TIMEOUT_S
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
     HardwareCleanupError,
@@ -50,14 +50,17 @@ from ..robot.base import (
 )
 from ..robot.control import ContactWatchdog
 from ..robot.jelly import Jelly
+from ..robot.start_pose import check_start_pose
 from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from .config import VRTeleopConfig
-from .core import VRTeleopCore, wait_for_ik_ready
+from .config import VRTeleopConfig, adopt_robot_gripper
+from .core import VRTeleopCore, measured_arms, wait_for_ik_ready
+from .live import LiveSettings
 from .recorder import make as _recorder_make
+from .shutdown import OUTCOME_MESSAGES, abort_on_sigint, park_arms
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -191,6 +194,12 @@ class VRTeleop:
                 vr_server_config = shared_config(
                     VRServerConfig, "teleop", "vr_server", store=store
                 )
+        # The robot's fitted gripper (AxolConfig.gripper) decides box mode;
+        # a robot without one (Sim) leaves the config's value.
+        arm = getattr(robot, "left", None) or getattr(robot, "right", None)
+        robot_gripper = getattr(arm, "gripper_type", None)
+        if isinstance(robot_gripper, str):
+            adopt_robot_gripper(config, robot_gripper)
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -208,8 +217,16 @@ class VRTeleop:
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config, _logger, self._broadcast_tracking, self._broadcast_json
+            config,
+            _logger,
+            self._broadcast_tracking,
+            broadcast_mode=lambda key, value: self._live.on_changed(key, value),
+            broadcast_json=self._broadcast_json,
         )
+        # Live session settings (box mode, re-engage, grip force, …): applied
+        # from `set` messages off any client, published back as `settings`.
+        self._live = LiveSettings(self._core, robot, self._publish_settings)
+        self._vr_server.set_on_setting(self._live.apply)
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -317,6 +334,8 @@ class VRTeleop:
 
         The VR app uses it to allow screen repositioning (trigger grabs) only
         while the robot isn't being controlled. Safe to call from any thread.
+        Goes through :meth:`VRServer.broadcast_tracking`, which also stores the
+        state for headsets that connect later (even with nobody connected now).
         """
         if self._vr_loop is None:
             return
@@ -327,17 +346,20 @@ class VRTeleop:
         except RuntimeError:
             pass  # VR loop already shut down
 
-    def _broadcast_json(self, obj: dict) -> None:
-        """Push an arbitrary JSON message to the headset (fire-and-forget).
+    def _publish_settings(self, snapshot: dict) -> None:
+        """Push the live-settings snapshot to every client and store it for
+        late joiners (see :class:`LiveSettings`)."""
+        self._vr_server.set_announce("settings", snapshot)
+        self._broadcast_json({"type": "settings", "value": snapshot})
 
-        Used by the shared core for the URDF overlay state in absolute (Mantis)
-        mode. Safe to call from any thread.
-        """
-        if self._vr_loop is None:
+    def _broadcast_json(self, payload: dict) -> None:
+        """Fire-and-forget a JSON message to every headset. Safe from any thread."""
+        if self._vr_loop is None or not self._vr_server.connected:
             return
+        text = json.dumps(payload)
         try:
             asyncio.run_coroutine_threadsafe(
-                self._vr_server.broadcast_text(json.dumps(obj)), self._vr_loop
+                self._vr_server.broadcast_text(text), self._vr_loop
             )
         except RuntimeError:
             pass  # VR loop already shut down
@@ -369,15 +391,21 @@ class VRTeleop:
         await loop.run_in_executor(None, self._vr_ready.wait)
         if self._vr_start_error is not None:
             raise self._vr_start_error
+        # Seed the connect-time announce so a headset / panel adopts the live
+        # session settings (their controls mirror the server; see set_announce).
+        self._live.announce()
 
         await self._robot.enable()
+        pos_l, pos_r = await self._robot.get_positions()
+        # The startup trajectory plays from here to rest unsupervised; refuse
+        # it from far away. __aenter__'s teardown torques the arms back off.
+        check_start_pose((pos_l, pos_r))
         if self._jelly is not None:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
             await self._jelly.enable()
 
-        pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
             pos_l[7] if pos_l is not None else None,
             pos_r[7] if pos_r is not None else None,
@@ -749,78 +777,68 @@ class VRTeleop:
         )
 
     async def _park_arms(self) -> None:
-        """Return the arms to rest before the torque comes off.
+        """Park the arms — rest, then zero — before the torque comes off.
 
         Raised arms drop under gravity the moment they are disabled, so
-        teardown parks them first. The move is skipped when there is nothing
-        to park or no safe way to park it: a target with no guarded engine
-        (Sim), arms already limp for hand-guiding (a contact hold — pulling
-        them would fight the operator), no IK worker or dispatch thread
-        (nothing can plan the path), arms already at rest, or a bus that no
-        longer reports positions. A stop that lands mid-reset (an X press,
-        the startup move) finishes that move instead of starting a new one.
+        teardown parks them first: the guarded return to rest, then (with
+        ``config.park_to_zero``) on to the all-zero joint pose with the grasp
+        held, see :mod:`almond_axol.teleop.shutdown`. The park is skipped when
+        there is nothing to park or no safe way to park it: a target with no
+        guarded engine (Sim), arms already limp for hand-guiding (a contact
+        hold — pulling them would fight the operator), no IK worker or
+        dispatch thread (nothing can plan the path), arms already at rest
+        with the zero leg off, or a bus that no longer reports positions. A
+        stop that lands mid-reset (an X press, the startup move) finishes
+        that move instead of starting a new one.
 
-        The whole move is capped at :data:`PARK_TIMEOUT_S` and every failure is
-        swallowed, so the torque-off that follows is never skipped. A contact
-        trip ends the park at once: nobody is left to hand-guide the arms and
-        press reset, so waiting out the cap in a limp hold would only delay
-        the same torque-off. Losing the park costs only what was already lost
-        before it existed.
+        Each leg is capped (:data:`PARK_TIMEOUT_S`, :data:`PARK_ZERO_TIMEOUT_S`)
+        and every failure is swallowed, so the torque-off that follows is never
+        skipped. A contact trip, a second Ctrl+C or a refused plan ends the
+        park at once: nobody is left to hand-guide the arms and press reset,
+        so waiting out the cap in a limp hold would only delay the same
+        torque-off. Losing the park costs only what was already lost before it
+        existed.
         """
         if not self._guard_supported():
             return
         if self._core.ik_paused:
             return
-        if self._core.at_rest and not self._core.is_resetting:
+        park_to_zero = bool(self._config.park_to_zero)
+        if self._core.at_rest and not self._core.is_resetting and not park_to_zero:
             return
         if self._ik_process is None or not self._ik_process.is_alive():
             return
         if self._ik_thread is None or not self._ik_thread.is_alive():
             return
-        contact = False
-
-        def _on_contact() -> None:
-            nonlocal contact
-            contact = True
-
-        # Nobody should re-engage tracking mid-park: the VR server is still
-        # up, and a both-grips squeeze would steer the arms off the path.
-        self._core.block_engage()
+        abort = threading.Event()
         try:
             left, right = await asyncio.wait_for(
                 self._robot.get_positions(), timeout=_BUS_PROBE_TIMEOUT_S
             )
             if left is None and right is None:
                 return
-            _logger.info("Returning the arms to rest before torque-off.")
-            deadline = time.perf_counter() + PARK_TIMEOUT_S
-            if not self._core.is_resetting:
-                self._core.request_reset()
-            await self._core.guarded_return(
-                send_step=self._guard_send_step,
-                gravity_step=self._guard_gravity_step,
-                torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
-                reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
-                get_positions=self._guard_positions,
-                stopped=lambda: contact or time.perf_counter() >= deadline,
-                # The hold's "press reset" prompt has no one to read it here.
-                announce=lambda msg: None if contact else _logger.info(msg),
-                on_contact=_on_contact,
-                move_timeout_s=PARK_TIMEOUT_S,
-            )
-            if contact:
-                _logger.warning(
-                    "return to rest before torque-off stopped on contact; "
-                    "disabling the arms where they are"
+            with abort_on_sigint(abort):
+                outcome = await park_arms(
+                    self._core,
+                    park_to_zero=park_to_zero,
+                    send_step=self._guard_send_step,
+                    gravity_step=self._guard_gravity_step,
+                    torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
+                    reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                    get_positions=self._guard_positions,
+                    announce=_logger.info,
+                    abort=abort.is_set,
+                    rest_timeout_s=PARK_TIMEOUT_S,
+                    zero_timeout_s=PARK_ZERO_TIMEOUT_S,
                 )
+            if outcome != "done":
+                _logger.warning("%s", OUTCOME_MESSAGES.get(outcome, outcome))
         except BaseException:
             _logger.warning(
-                "return to rest before torque-off did not finish; disabling "
-                "the arms where they are",
+                "the park before torque-off did not finish; disabling the arms "
+                "where they are",
                 exc_info=True,
             )
-        finally:
-            self._core.unblock_engage()
 
     # ------------------------------------------------------------------
     # Main loop
@@ -857,6 +875,23 @@ class VRTeleop:
         tegra.start()
 
         guard = self._guard_supported()
+
+        # Box mode's squeeze torque cap (VRTeleopConfig.box_squeeze_torque):
+        # the core says which joints to cap and by how much for the current
+        # state (box mode on, not resetting); the robot carries the caps to
+        # the realtime core on every command. Written only on change, and
+        # cleared when the loop ends so a robot object outliving this
+        # session is not left capped. Sim / classic targets have no caps.
+        set_caps = getattr(self._robot, "set_spring_caps", None)
+        caps_applied: dict | None = None
+
+        def _sync_squeeze() -> None:
+            nonlocal caps_applied
+            if set_caps is not None:
+                want = self._core.spring_caps()
+                if want != caps_applied:
+                    set_caps(want)
+                    caps_applied = want
 
         # Tracking-phase contact watchdog (hardware only, opt-in — the
         # threshold defaults to 0 = off): the same sustained-torque trip the
@@ -902,6 +937,9 @@ class VRTeleop:
                         self._robot_recorder(False)
                     if self._rec is not None:
                         self._rec.set_engaged(False)
+                    # A return wants the shoulders' full authority (the core
+                    # reports no caps while resetting).
+                    _sync_squeeze()
                     await self._core.guarded_return(
                         send_step=self._guard_send_step,
                         gravity_step=self._guard_gravity_step,
@@ -922,6 +960,7 @@ class VRTeleop:
                 t_step = time.perf_counter()
                 if self._robot_recorder is not None:
                     self._robot_recorder(self._core.teleop_enabled)
+                _sync_squeeze()
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
@@ -1039,6 +1078,8 @@ class VRTeleop:
         finally:
             if self._robot_recorder is not None:
                 self._robot_recorder(False)
+            if set_caps is not None and caps_applied:
+                set_caps(None)
             activity.stop()
             diag.stop()
             tegra.stop()
@@ -1063,6 +1104,7 @@ class VRTeleop:
         out = self._core.compute_output()
         if out is None:
             return None, None
+        self._core.maybe_broadcast_joints(out, self._robot)
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:
@@ -1109,8 +1151,15 @@ class VRTeleop:
         if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
-            # creep while the arms replay their return-to-rest trajectory.
-            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            # creep while the arms replay their return-to-rest trajectory;
+            # while a box-mode leader owns the sticks (grip width / tilt)
+            # Jelly is held stopped the same way (frozen pair: sticks drive).
+            self._jelly.apply_vr_frame(
+                frame,
+                resetting=self._core.is_resetting
+                or self._core.is_parking
+                or self._core.pair_owns_sticks,
+            )
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)
@@ -1140,4 +1189,5 @@ class VRTeleop:
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
+            get_measured=lambda: measured_arms(self._robot),
         )

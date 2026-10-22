@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor};
+use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor, WireMode};
 use crate::can::CanSock;
 use crate::proto;
-use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 
 /// Parameter sanity limits — a params file outside these is rejected whole.
 const KP_LIMIT: f64 = 250.0;
@@ -73,6 +73,23 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     k: 0.0,
                     fv: 0.0,
                     fo: 0.0,
+                    stiction_gain: 0.0,
+                    stiction_err: 0.0,
+                    stiction_load_gain: 0.0,
+                    dither_nm: 0.0,
+                    dither_hz: 0.0,
+                    wire: WireMode::Mit,
+                    stribeck_gain: 0.0,
+                    stribeck_dfs: 0.0,
+                    stribeck_load_gain: 0.0,
+                    stribeck_vs: 0.0,
+                    fl: 0.0,
+                    stribeck_pole: 0.0,
+                    cap_track: 0.0,
+                    lead_s: 0.0,
+                    tf_nm_per_pct: 0.0,
+                    mit_hz: 0.0,
+                    tau_cap: f64::INFINITY,
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })
@@ -221,6 +238,9 @@ fn bus_hold(
     if !yes {
         return Ok(());
     }
+    // The motors just answered bring-up; from here a no-ACK report from the
+    // hub means motor power died (see `SendOutcome::Unacked`).
+    sock.watch_ack_errors()?;
 
     let readies: Vec<ReadyMotor> = motors.iter().map(|m| m.ready.clone()).collect();
     bringup::enable(&sock, iface, &readies)?;
@@ -283,6 +303,11 @@ fn stream(
             };
             match guarded_send(sock, command_id, &frame, &mut enobufs_since)? {
                 SendOutcome::Sent | SendOutcome::Dropped => {}
+                SendOutcome::Unacked => {
+                    return Err(io::Error::other(format!(
+                        "{iface}: hold stopped: {NO_ACK_REPORT}"
+                    )));
+                }
                 SendOutcome::Stalled => {
                     let purged = purge_tx_queue(iface);
                     return Err(io::Error::other(format!(

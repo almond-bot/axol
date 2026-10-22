@@ -87,6 +87,12 @@ def _load_urdf() -> yourdfpy.URDF:
     return _urdf
 
 
+def shared_urdf() -> yourdfpy.URDF:
+    """The parsed bundled Axol URDF, loaded once per process."""
+    with _lock:
+        return _load_urdf()
+
+
 def shared_robot() -> pk.Robot:
     """The pyroki robot for the bundled Axol URDF, built once per process."""
     global _robot

@@ -6,6 +6,7 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// `CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG` — the kernel ORs these into
@@ -14,6 +15,20 @@ use std::time::{Duration, Instant};
 const CAN_FRAME_TYPE_FLAGS: u32 = 0xE000_0000;
 /// Standard-frame-format identifier mask (`CAN_SFF_MASK`).
 const CAN_SFF_MASK: u32 = 0x7FF;
+/// `CAN_ERR_FLAG`: the frame is an error report, not bus traffic.
+const CAN_ERR_FLAG: u32 = 0x2000_0000;
+/// `CAN_ERR_ACK`: a transmission received no ACK — no node on the wire is
+/// powered to acknowledge it.
+const CAN_ERR_ACK: u32 = 0x0000_0020;
+/// `SOL_CAN_RAW` / `CAN_RAW_ERR_FILTER` (linux/can/raw.h).
+const SOL_CAN_RAW: libc::c_int = libc::SOL_CAN_BASE + libc::CAN_RAW;
+const CAN_RAW_ERR_FILTER: libc::c_int = 2;
+
+/// Whether a received `can_id` is the adapter reporting a transmission
+/// nothing ACKed.
+fn is_ack_error(can_id: u32) -> bool {
+    can_id & CAN_ERR_FLAG != 0 && can_id & CAN_ERR_ACK != 0
+}
 
 /// Classic CAN frame as the kernel defines it (`struct can_frame`).
 #[repr(C)]
@@ -46,6 +61,14 @@ pub struct Frame {
 
 pub struct CanSock {
     fd: RawFd,
+    /// Whether this bus's no-ACK reports are trusted
+    /// ([`crate::safety::reports_no_ack`]). Decided at open so that no caller
+    /// of [`Self::watch_ack_errors`] can subscribe on another adapter.
+    hub_channel: bool,
+    /// Latched once the adapter reports a transmission nothing ACKed (see
+    /// [`Self::watch_ack_errors`]). Never cleared: the session that saw its
+    /// bus die ends, and the next one opens a fresh socket.
+    ack_error: AtomicBool,
 }
 
 impl CanSock {
@@ -80,7 +103,56 @@ impl CanSock {
             unsafe { libc::close(fd) };
             return Err(err);
         }
-        Ok(Self { fd })
+        Ok(Self::with_fd(fd, iface))
+    }
+
+    fn with_fd(fd: RawFd, iface: &str) -> Self {
+        Self {
+            fd,
+            hub_channel: crate::safety::reports_no_ack(iface),
+            ack_error: AtomicBool::new(false),
+        }
+    }
+
+    /// Ask the kernel for the adapter's no-ACK error frames on this socket.
+    ///
+    /// The Axol hub (firmware 2.01+) reports `CAN_ERR_ACK` whenever a frame
+    /// gets no ACK for 50 ms — nothing on the wire is powered (the e-stop) —
+    /// and then drops it rather than holding it for when power returns, so
+    /// the TX queue never backs up and the `ENOBUFS` stall below never
+    /// fires. Any receive on this socket latches the report into
+    /// [`Self::saw_ack_error`], which [`crate::safety::guarded_send`] turns
+    /// into [`crate::safety::SendOutcome::Unacked`].
+    ///
+    /// Hub channels only (arm and Mantis, see
+    /// [`crate::safety::reports_no_ack`]): on any other bus this is a no-op
+    /// returning `Ok(false)`, and the socket behaves exactly as before. Other
+    /// adapters report transient ACK errors too, which would end a healthy
+    /// session (#385). `Ok(true)` once subscribed.
+    pub fn watch_ack_errors(&self) -> io::Result<bool> {
+        if !self.hub_channel {
+            return Ok(false);
+        }
+        let mask: u32 = CAN_ERR_ACK;
+        let rc = unsafe {
+            libc::setsockopt(
+                self.fd,
+                SOL_CAN_RAW,
+                CAN_RAW_ERR_FILTER,
+                &mask as *const u32 as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(true)
+    }
+
+    /// Whether the adapter has reported a transmission nothing ACKed since
+    /// this socket opened (requires [`Self::watch_ack_errors`]).
+    pub fn saw_ack_error(&self) -> bool {
+        self.ack_error.load(Ordering::Acquire)
     }
 
     /// Set the blocking-receive timeout (`SO_RCVTIMEO`) for coarse,
@@ -223,8 +295,12 @@ impl CanSock {
             // extended, remote-request, or error frame whose low bits happen
             // to match a motor ID must not be mistaken for feedback (or, via
             // the proxy, for a `can.setup` identity reply), so drop it and
-            // keep reading instead of masking the flags away.
+            // keep reading instead of masking the flags away — after noting a
+            // no-ACK report (only delivered to sockets that asked for it).
             if frame.can_id & CAN_FRAME_TYPE_FLAGS != 0 {
+                if is_ack_error(frame.can_id) {
+                    self.ack_error.store(true, Ordering::Release);
+                }
                 continue;
             }
             return Ok(Some(Frame {
@@ -316,6 +392,38 @@ mod tests {
             median < timeout + Duration::from_millis(1),
             "wait overran its deadline: {median:?} for {timeout:?}"
         );
+    }
+
+    #[test]
+    fn only_hub_channels_subscribe_to_no_ack_reports() {
+        // #385: the proxy on the Jelly wheel bus (a CANable, shared with the
+        // lift) subscribed, and one transient no-ACK report killed the lift
+        // mid-teleop. The socket refuses on such buses whoever asks. fd -1
+        // makes any setsockopt fail with EBADF, so `Ok(false)` proves no
+        // subscription was attempted and an error proves one was.
+        for iface in ["can_alm_axol_b", "can_alm_axol_c", "vcan0"] {
+            let sock = CanSock::with_fd(-1, iface);
+            assert_eq!(sock.watch_ack_errors().ok(), Some(false), "{iface}");
+        }
+        for iface in [
+            "can_alm_axol_l",
+            "can_alm_axol_r",
+            "can_mantis_l",
+            "can_mantis_r",
+        ] {
+            let sock = CanSock::with_fd(-1, iface);
+            let err = sock.watch_ack_errors().expect_err(iface);
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF), "{iface}");
+        }
+    }
+
+    #[test]
+    fn only_no_ack_error_frames_count_as_a_dead_bus() {
+        assert!(is_ack_error(CAN_ERR_FLAG | CAN_ERR_ACK));
+        assert!(is_ack_error(CAN_ERR_FLAG | CAN_ERR_ACK | 0x04)); // with CAN_ERR_CRTL
+        assert!(!is_ack_error(CAN_ERR_FLAG | 0x04)); // controller state only
+        assert!(!is_ack_error(0x020)); // a data frame with ID 0x020
+        assert!(!is_ack_error(0x141));
     }
 
     #[test]

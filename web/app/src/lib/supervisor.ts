@@ -14,6 +14,10 @@ export interface SchemaField {
   required: boolean
   /** Optional one-line help (argparse commands carry their flag help). */
   help?: string | null
+  /** Widget hint for a per-run field (CommandSpec.fieldUi), e.g. a slider. */
+  ui?: SettingsFieldUI
+  /** Advanced-tree fields shown only while another setting holds a value. */
+  showWhen?: ShowWhen
 }
 
 /** A nested config section (a dataclass / dict in the config tree). */
@@ -49,6 +53,8 @@ export interface CommandSpec {
   requiresCameras?: boolean
   /** Config keys the panel asks for per run; the rest come from Settings. */
   perRunFields?: string[]
+  /** Widget hints for per-run fields (CommandDef ``field_ui``), by field key. */
+  fieldUi?: Record<string, SettingsFieldUI>
   /** Per-run fields with a server-side pick list (/api/commands/{id}/suggestions/{field}). */
   suggestedFields?: string[]
   /** Suggested fields whose value must be one of the suggestions (rendered as a select). */
@@ -578,6 +584,27 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
+/** A lift firmware image the serve host validated and stored for `lift.update`. */
+export interface LiftFirmwareUpload {
+  /** Host-side path, passed as the run's `--firmware` argument. */
+  path: string
+  version: string
+  built: string
+  buildId: string
+  size: number
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+  return json(
+    await fetch(apiUrl("/api/lift/firmware"), {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: file,
+    })
+  )
+}
+
 /** Healthy = reachable on CAN and reporting no error status. */
 export function wheelMotorHealthy(m: WheelMotorHealth): boolean {
   return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
@@ -778,6 +805,9 @@ export interface PolicyState {
   dataset?: { repoId: string; root: string }
   /** What to set up / do for this episode, as a card above the status line. */
   brief?: EpisodeBrief
+  /** Why the last episode was not saved (quality-gate rejection, capture or
+   *  save failure). Persists until the next episode starts recording. */
+  notice?: { level: "error"; message: string }
 }
 
 export interface OpStatus {
@@ -1321,6 +1351,16 @@ export interface SettingsFieldUI {
   step?: number
   /** toggle-number: value filled in when the switch turns on. */
   onValue?: number
+  /** Shown only while another setting holds a value. */
+  showWhen?: ShowWhen
+}
+
+/** Show a setting only while the setting `key` (its staged value, else its
+ * default) equals `equals` — box mode's settings only with the parcel
+ * gripper, say. */
+export interface ShowWhen {
+  key: string
+  equals: SettingValue
 }
 
 export interface SettingsField {
@@ -1499,6 +1539,42 @@ export function filterSchema(nodes: SchemaNode[], exclude: Set<string>): SchemaN
     }
   }
   return out
+}
+
+/** Whether a setting gated by `showWhen` is visible: the controlling
+ * setting's staged value (else its schema default) equals the wanted one. */
+export function settingShown(
+  showWhen: ShowWhen | undefined,
+  values: Record<string, SettingValue>,
+  schema: SettingsCategory[]
+): boolean {
+  if (!showWhen) return true
+  // A staged null is a reset to default, the same as nothing staged.
+  const staged = values[showWhen.key] as SettingValue | null | undefined
+  const value =
+    staged != null
+      ? staged
+      : schema.flatMap((c) => c.settings).find((s) => s.key === showWhen.key)?.default
+  return value === showWhen.equals
+}
+
+/** Drop the Advanced-tree fields whose `showWhen` doesn't hold (and any
+ * groups left empty). */
+export function visibleAdvancedSections(
+  sections: AdvancedSection[],
+  values: Record<string, SettingValue>,
+  schema: SettingsCategory[]
+): AdvancedSection[] {
+  const hidden = new Set(
+    sections
+      .flatMap((s) => flattenFields(s.nodes))
+      .filter((f) => !settingShown(f.showWhen, values, schema))
+      .map((f) => f.key)
+  )
+  if (hidden.size === 0) return sections
+  return sections
+    .map((s) => ({ ...s, nodes: filterSchema(s.nodes, hidden) }))
+    .filter((s) => s.nodes.length > 0)
 }
 
 export function defaultString(field: SchemaField): string {
@@ -1795,6 +1871,7 @@ export function perRunFields(
   }
   return [...byKey.values()]
     .filter((f) => runFieldVisible(f.key, profile))
+    .map((f) => (spec.fieldUi?.[f.key] ? { ...f, ui: spec.fieldUi[f.key] } : f))
     .sort((a, b) => Number(b.required) - Number(a.required))
 }
 

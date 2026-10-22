@@ -28,7 +28,8 @@
               "hardware-setup/owl-mount",
               "hardware-setup/ox-cart",
               "hardware-setup/jelly",
-              "hardware-setup/cameras"
+              "hardware-setup/cameras",
+              "hardware-setup/thor"
             ]
           },
           "installation"
@@ -108,6 +109,7 @@
             ]
           },
           "guides/diagnostics-dashboard",
+          "guides/robot-calibration",
           "guides/vr-interface",
           "guides/quest-over-usb",
           "guides/quest-headless"
@@ -150,7 +152,9 @@
                 "pages": [
                   "cli/can-setup",
                   "cli/can-enable",
-                  "cli/can-driver"
+                  "cli/can-driver",
+                  "cli/hub-info",
+                  "cli/hub-flash"
                 ]
               },
               {
@@ -170,7 +174,8 @@
                 "group": "Lift",
                 "pages": [
                   "cli/lift-home",
-                  "cli/lift-goto"
+                  "cli/lift-goto",
+                  "cli/lift-update"
                 ]
               },
               {
@@ -204,9 +209,12 @@
                 "pages": [
                   "cli/tune-pid",
                   "cli/tune-friction",
+                  "cli/tune-breakaway",
+                  "cli/tune-a4",
                   "cli/tune-gravity",
                   "cli/tune-factory",
                   "cli/tune-motion",
+                  "cli/tune-tf",
                   "cli/tune-filter",
                   "cli/motion-build",
                   "cli/tune-repeatability"

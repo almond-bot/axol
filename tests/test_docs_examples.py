@@ -926,6 +926,20 @@ def _load_json_example(block: Block, scratch: Path) -> None:
         for op in ("teleop", "gravity-comp"):
             shared_overlay(op, store=store)
         return
+    if isinstance(data, dict) and data.get("version") == 1 and "hub_serial" in data:
+        # ~/.almond/calibration.json / the cloud factory-calibration document
+        from almond_axol.robot.calibration import load_calibration
+
+        loaded = load_calibration(path, expected_hub_serial=data["hub_serial"])
+        for side in ("left", "right"):
+            for joint, entry in data.get(side, {}).items():
+                kept = loaded[side].get(joint, {})
+                dropped = sorted(set(entry) - set(kept) - {"updated_at"})
+                if dropped:
+                    raise AssertionError(
+                        f"calibration {side}.{joint} fields {dropped} were rejected"
+                    )
+        return
     if isinstance(data, dict) and "waypoints" in data:
         from almond_axol.waypoints import WaypointSet
 

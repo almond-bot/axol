@@ -102,9 +102,13 @@ Do not run it on a pre-0.2.5 dataset recorded with a per-unit override in
 the retired factory rotation. A dataset mixing Mantis and robot episodes is
 also out of scope (every row is transformed).
 
-After migration the marker records `mantis_tcp_transform.id` as the current
-factory constant, so `collect-data --mantis` can append new episodes to the
-dataset; it refuses to append to an unrepaired one.
+After migration the marker records `mantis_tcp_transform.id` as
+`vive-flat-back-ry180-v0.2.5` — the axol 0.2.5–0.2.16 factory constant, whose
+rotation the migration matches — so the migration refuses to run twice. That
+constant's translation has since been corrected (see
+[Vive factory values](/cli/tracker#vive-factory-values)), so `collect-data
+--mantis` refuses to append new episodes to a migrated dataset, just as it
+does to an unrepaired one: record new episodes to a new `repo_id`.
 
 ## Options
 

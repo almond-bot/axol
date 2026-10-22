@@ -17,8 +17,9 @@ from almond_axol.cli.collect_data import (
     _require_mantis_resume_transform,
 )
 from almond_axol.mantis.calibration import (
-    DESIGN_TCP_TRANSFORM_ID,
+    DESIGN_TCP_TRANSFORM_IDS,
     DESIGN_TCP_TRANSFORMS,
+    LEGACY_DESIGN_TCP_TRANSFORM_ID,
     LEGACY_VIVE_TCP_ROTATION_QUAT,
     MEASURED_TCP_TRANSFORM_ID,
     UNCALIBRATED_TCP_TRANSFORM_ID,
@@ -236,16 +237,38 @@ class ProvenanceTest(unittest.TestCase):
         survive = DESIGN_TCP_TRANSFORMS["survive"]
         ultimate = DESIGN_TCP_TRANSFORMS["ultimate"]
         design = tcp_transform_provenance(
-            survive["left"], ultimate["right"], source="lighthouse"
+            survive["left"], survive["right"], source="lighthouse"
         )
-        self.assertEqual(design["id"], DESIGN_TCP_TRANSFORM_ID)
+        self.assertEqual(design["id"], DESIGN_TCP_TRANSFORM_IDS["survive"])
         self.assertEqual(design["source"], "lighthouse")
         self.assertEqual(design["left"], survive["left"])
+        # Each family has its own id, so a Vive dataset can never resume as a
+        # Quest one (or across a constant change).
+        self.assertEqual(len(set(DESIGN_TCP_TRANSFORM_IDS.values())), 3)
+        self.assertEqual(set(DESIGN_TCP_TRANSFORM_IDS), set(DESIGN_TCP_TRANSFORMS))
+        self.assertNotIn(
+            LEGACY_DESIGN_TCP_TRANSFORM_ID, DESIGN_TCP_TRANSFORM_IDS.values()
+        )
+        mixed = tcp_transform_provenance(
+            survive["left"], ultimate["right"], source="lighthouse"
+        )
+        self.assertEqual(
+            mixed["id"],
+            f"{DESIGN_TCP_TRANSFORM_IDS['survive']}+"
+            f"{DESIGN_TCP_TRANSFORM_IDS['ultimate']}",
+        )
+        quest = DESIGN_TCP_TRANSFORMS["quest:meta-quest-touch-plus:grip"]
+        self.assertEqual(
+            tcp_transform_provenance(quest["left"], quest["right"], source="quest")[
+                "id"
+            ],
+            DESIGN_TCP_TRANSFORM_IDS["quest:meta-quest-touch-plus:grip"],
+        )
         # q and -q are the same rotation.
         negated = [*survive["left"][:3], *(-v for v in survive["left"][3:])]
         self.assertEqual(
             tcp_transform_provenance(negated, survive["right"], source=None)["id"],
-            DESIGN_TCP_TRANSFORM_ID,
+            DESIGN_TCP_TRANSFORM_IDS["survive"],
         )
         measured = [0.01, 0.0355, -0.092, *VIVE_TCP_ROTATION_QUAT]
         self.assertEqual(
@@ -328,12 +351,9 @@ class ResumeGateTest(unittest.TestCase):
         root = self._dataset(
             {
                 "cartesian_pose_frame": "flu-urdf-root-v0.1.32",
-                MANTIS_TCP_TRANSFORM_KEY: {
-                    "id": DESIGN_TCP_TRANSFORM_ID,
-                    "left": None,
-                    "right": None,
-                    "migrated": True,
-                },
+                MANTIS_TCP_TRANSFORM_KEY: tcp_transform_provenance(
+                    design["left"], design["right"], source="lighthouse"
+                ),
             }
         )
         _require_mantis_resume_transform(root, collection)
@@ -353,6 +373,39 @@ class ResumeGateTest(unittest.TestCase):
             _require_mantis_resume_transform(
                 root, _collection(other, measured, "quest")
             )
+
+    def test_retired_vive_translation_dataset_is_refused(self) -> None:
+        """0.2.5–0.2.16 Vive datasets used the 92 mm-forward translation."""
+        design = DESIGN_TCP_TRANSFORMS["survive"]
+        collection = _collection(design["left"], design["right"], "lighthouse")
+        retired = [0.0, 0.0355, -0.092, *VIVE_TCP_ROTATION_QUAT]
+        for recorded in (
+            {
+                "id": LEGACY_DESIGN_TCP_TRANSFORM_ID,
+                "left": None,
+                "right": None,
+                "migrated": True,
+            },
+            {
+                "id": LEGACY_DESIGN_TCP_TRANSFORM_ID,
+                "source": "lighthouse",
+                "left": retired,
+                "right": retired,
+            },
+        ):
+            root = self._dataset(
+                {
+                    "cartesian_pose_frame": "flu-urdf-root-v0.1.32",
+                    MANTIS_TCP_TRANSFORM_KEY: recorded,
+                }
+            )
+            with self.assertRaisesRegex(ValueError, "92 mm in front"):
+                _require_mantis_resume_transform(root, collection)
+        # Pinning the old values as a per-unit override still resumes a
+        # dataset that recorded them.
+        _require_mantis_resume_transform(
+            root, _collection(retired, retired, "lighthouse")
+        )
 
     def test_measured_transform_matches_across_quaternion_sign(self) -> None:
         """q and -q are one rotation: a re-saved override must still resume."""

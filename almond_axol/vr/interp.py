@@ -68,9 +68,9 @@ arms hold through the stall and then follow the current pose.
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
 jittery relay adds just enough to stay ahead of the bursts. Control-state fields
-(locks / reset / session state) are taken from the *latest* received frame, not
-the delayed playout, so engage/disengage/reset stay responsive while only the
-motion is smoothed.
+(locks / reset / session state, and a managed tracker's grips) are taken from
+the *latest* received frame, not the delayed playout, so engage/disengage/reset
+and the Mantis grippers stay responsive while only the motion is smoothed.
 
 Transports that don't stamp ``t`` (the USB link, or an older web build) degrade
 gracefully to the original latest-wins behaviour — capture time falls back to
@@ -982,7 +982,16 @@ def _build_frame(
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields
     are numerics we computed ourselves, so validation is pure overhead.
+
+    Grips from a managed tracker bridge are control state too: they are the
+    rig triggers' latest CAN reads, sampled independently of the tracker
+    pose, and Mantis recording pairs them with the newest tracker pose rather
+    than the delayed playout. Delaying and smoothing them like motion made the
+    grippers lag the triggers by the full playout delay, and left the recorded
+    grip command that far behind the recorded pose.
     """
+    if latest.pose_source_kind == "tracker":
+        l_grip, r_grip = latest.l_grip, latest.r_grip
     frame = VRFrame.model_construct(
         l_ee=VRPose.model_construct(
             position=VRPosition.model_construct(
@@ -1037,10 +1046,12 @@ def _build_frame(
         r_trigger_live=latest.r_trigger_live,
         # Cart input is control state, not delayed motion. Preserve the newest
         # thumbstick/click values exactly so interpolation cannot neutralize a
-        # drive command or keep a stale lift command alive.
+        # drive command or keep a stale lift command alive (the IK worker also
+        # reads them from this rendered frame for box-mode width / tilt).
         l_stick_x=latest.l_stick_x,
         l_stick_y=latest.l_stick_y,
         r_stick_x=latest.r_stick_x,
+        r_stick_y=latest.r_stick_y,
         l_stick_click=latest.l_stick_click,
         r_stick_click=latest.r_stick_click,
     )
@@ -1076,7 +1087,21 @@ def _same_motion(a: np.ndarray, b: np.ndarray, eps: float) -> bool:
     return float(np.max(np.abs(a[20:22] - b[20:22]))) < eps
 
 
+# Thumbstick deflection below this is idle for the identity-stable check.
+_STICK_IDLE = 0.05
+
+
 def _same_control(a: VRFrame, b: VRFrame) -> bool:
+    # A deflected stick is never "unchanged": box mode integrates the stick
+    # (grip width / tilt) over time in the IK worker, which only runs on a fresh frame, so a
+    # held stick with a still hand must keep producing new frames.
+    if (
+        abs(b.l_stick_x) > _STICK_IDLE
+        or abs(b.l_stick_y) > _STICK_IDLE
+        or abs(b.r_stick_x) > _STICK_IDLE
+        or abs(b.r_stick_y) > _STICK_IDLE
+    ):
+        return False
     return (
         a.l_lock == b.l_lock
         and a.r_lock == b.r_lock
@@ -1098,6 +1123,7 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.l_stick_x == b.l_stick_x
         and a.l_stick_y == b.l_stick_y
         and a.r_stick_x == b.r_stick_x
+        and a.r_stick_y == b.r_stick_y
         and a.l_stick_click == b.l_stick_click
         and a.r_stick_click == b.r_stick_click
     )

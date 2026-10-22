@@ -1,0 +1,27 @@
+---
+title: "hub.flash"
+description: "Flash the bundled firmware onto the Axol arm hub."
+---
+
+Flashes the firmware image that ships with this package (`almond_axol/hub/axol_hub.uf2`) onto the Axol arm hub. The hub reboots into its RP2350 bootloader, the image is copied onto the bootloader's USB disk, and the command waits for the hub to come back as a CAN adapter and report the new version. Both arm buses go quiet for a few seconds while it reboots. Needs root.
+
+| Flag | Description |
+|---|---|
+| `--port PORT` | USB port path of the hub to flash (e.g. `1-3`, as printed by [`hub.info`](/cli/hub-info)). Also flashes a hub that is sitting in its bootloader, which has no CAN interfaces to find it by. Default: every outdated hub behind the configured arm channels |
+| `--force` | Flash even when the hub already runs the bundled version |
+
+```bash
+sudo axol hub.flash
+sudo axol hub.flash --port 1-3
+sudo axol hub.flash --force
+```
+
+<Note>
+  You normally never need this: every arm bring-up (teleop, data collection, policy runs and control-panel operations — whatever connects the arms through `Axol`) checks the hub's firmware version and reflashes an outdated hub automatically before any bus is opened. The hosted `axol serve` is root and flashes directly; a manual session asks for `sudo`. If it cannot escalate, the session keeps running on the old firmware and logs an error naming `sudo axol hub.flash`. Set `AXOL_HUB_FLASH=0` to skip the automatic update.
+</Note>
+
+<Warning>
+  A hub whose firmware predates 2026-08-17 cannot be rebooted into its bootloader from the host, so it needs **one manual flash**: unplug it, hold its BOOTSEL button while plugging it back in, then run `sudo axol hub.flash --port <port>`. After that, updates are automatic. A hub left in its bootloader by an interrupted flash fails the bring-up; re-running `hub.flash --port` recovers it.
+</Warning>
+
+The hub's firmware decides what happens to motor commands when the bus dies. Since firmware 2.00, a USB reset ends the hub's CAN session and discards anything it had queued, and a frame that cannot be sent within 50 ms is dropped, so a command parked behind an emergency stop can no longer reach the motors when power returns. Firmware 2.01 also reports when nothing on a bus acknowledges frames, which is how the realtime core now detects a cut motor supply (see [`can.setup`](/cli/can-setup)).

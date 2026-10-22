@@ -26,6 +26,7 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
@@ -38,6 +39,7 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
+from ..robot import lift_firmware
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -67,6 +69,10 @@ from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
 _logger = logging.getLogger(__name__)
+
+# Grace between acknowledging a host shutdown/restart and running it, so the
+# response reaches the panel before the server goes down with the host.
+_HOST_POWER_DELAY_S = 0.5
 
 
 class RunRequest(BaseModel):
@@ -1354,6 +1360,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- host power ----------------------------------------------------------
 
+    def _host_power_refusal() -> JSONResponse | None:
+        """Why the host can't be powered off right now, or None when it can."""
+        if not _is_idle():
+            return JSONResponse(
+                {"error": "an operation or session is running — stop it first"},
+                status_code=409,
+            )
+        if updater.installing:
+            # Cutting power mid-install can leave dpkg half-configured,
+            # failing every later install until `dpkg --configure -a`.
+            return JSONResponse(
+                {
+                    "error": "the robot is installing an update or system "
+                    "packages — wait for it to finish"
+                },
+                status_code=409,
+            )
+        return None
+
     async def _host_power(flag: str, verb: str) -> JSONResponse:
         """Run ``shutdown <flag> now`` on the serve host.
 
@@ -1362,43 +1387,54 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         escalates via ``sudo -n`` so a headless context fails fast instead of
         blocking on a password prompt.
 
+        The command runs only after the acknowledgement is sent (a response
+        background task, ``_HOST_POWER_DELAY_S`` later): run inline, it takes
+        this server down before the response leaves and the panel reports an
+        API error for a shutdown that worked. Every refusal (busy, installing,
+        no root) is still decided up front, and the launch reservation stays
+        held until the command has run so no session can start in the gap.
+
         A hardware-cleanup lockout does not refuse it (see :func:`_is_idle`):
         restarting the host is one of the two documented ways out of it (the
         other is ``/api/op/clear-lockout``).
         """
-        async with session_launch_reservation:
-            if not _is_idle():
-                return JSONResponse(
-                    {"error": "an operation or session is running — stop it first"},
-                    status_code=409,
-                )
-            if updater.installing:
-                # Cutting power mid-install can leave dpkg half-configured,
-                # failing every later install until `dpkg --configure -a`.
-                return JSONResponse(
-                    {
-                        "error": "the robot is installing an update or system "
-                        "packages — wait for it to finish"
-                    },
-                    status_code=409,
-                )
-
-            def _run() -> tuple[bool, str]:
-                cmd = ["shutdown", flag, "now"]
-                if os.geteuid() != 0:
-                    if not prime_sudo():
-                        return False, "root required (no passwordless sudo)"
+        await session_launch_reservation.acquire()
+        try:
+            refusal = _host_power_refusal()
+            cmd = ["shutdown", flag, "now"]
+            if refusal is None and os.geteuid() != 0:
+                if await asyncio.to_thread(prime_sudo):
                     cmd = ["sudo", "-n", *cmd]
-                proc = subprocess.run(cmd, capture_output=True, text=True)
-                return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
+                else:
+                    refusal = JSONResponse(
+                        {
+                            "error": f"{verb} failed: root required (no passwordless sudo)"
+                        },
+                        status_code=500,
+                    )
+        except BaseException:
+            session_launch_reservation.release()
+            raise
+        if refusal is not None:
+            session_launch_reservation.release()
+            return refusal
 
-            ok, detail = await asyncio.to_thread(_run)
-        if not ok:
-            return JSONResponse(
-                {"error": f"{verb} failed: {detail or 'unknown error'}"},
-                status_code=500,
-            )
-        return JSONResponse({"ok": True})
+        async def _run_after_ack() -> None:
+            try:
+                await asyncio.sleep(_HOST_POWER_DELAY_S)
+                proc = await asyncio.to_thread(
+                    subprocess.run, cmd, capture_output=True, text=True
+                )
+                if proc.returncode != 0:
+                    _logger.error(
+                        "host %s failed: %s",
+                        verb,
+                        (proc.stderr or proc.stdout).strip() or "unknown error",
+                    )
+            finally:
+                session_launch_reservation.release()
+
+        return JSONResponse({"ok": True}, background=BackgroundTask(_run_after_ack))
 
     @app.post("/api/host/shutdown")
     async def host_shutdown() -> JSONResponse:
@@ -2026,6 +2062,46 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Delete the whole run history (the dashboard's Clear button)."""
         return {"removed": await asyncio.to_thread(runs.clear)}
 
+    # -- lift firmware upload ------------------------------------------------
+    #
+    # The dashboard's "Update lift firmware" dialog uploads the raw
+    # firmware.bin here first; the validated image is stored on the host and
+    # its path filled into the lift.update run's --firmware argument.
+
+    @app.post("/api/lift/firmware", response_model=None)
+    async def upload_lift_firmware(request: Request) -> JSONResponse:
+        data = bytearray()
+        async for part in request.stream():
+            data += part
+            if len(data) > lift_firmware.MAX_IMAGE_BYTES:
+                return JSONResponse(
+                    {
+                        "error": "the file is larger than a lift firmware "
+                        f"partition ({lift_firmware.MAX_IMAGE_BYTES} bytes)"
+                    },
+                    status_code=413,
+                )
+        try:
+            image = lift_firmware.FirmwareImage.parse(bytes(data))
+        except lift_firmware.FirmwareUpdateError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
+            path = await asyncio.to_thread(lift_firmware.store_upload, image)
+        except OSError as exc:
+            return JSONResponse(
+                {"error": f"could not store the firmware on the host: {exc}"},
+                status_code=500,
+            )
+        return JSONResponse(
+            {
+                "path": str(path),
+                "version": image.version,
+                "built": image.built,
+                "buildId": f"0x{image.build_id:08x}",
+                "size": len(image.data),
+            }
+        )
+
     @app.get("/api/diagnostics/runs/{run_id}")
     async def diagnostics_run_data(run_id: str) -> JSONResponse:
         data = await asyncio.to_thread(runs.load, run_id)
@@ -2048,7 +2124,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         file overlaid — exactly what a tuning run uses when a gain field is
         left empty. The workbench shows these as the slider baselines.
         ``kd_host_hz`` is resolved to the shared default where a joint
-        doesn't set its own band centre.
+        doesn't set its own band centre. ``wire_modes`` carries each joint's
+        configured controller (``mit`` impedance or ``a4`` firmware position
+        loop): the Recorded-motion tab's per-joint controller picker seeds
+        from it, since a run adds ``--a4`` joints on top of the config.
         """
         import math
 
@@ -2059,11 +2138,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         def _load() -> dict[str, Any]:
             cfg = AxolConfig()
             out: dict[str, Any] = {}
+            wire: dict[str, Any] = {}
             for side in ("left", "right"):
                 arm_cfg = getattr(cfg, side)
                 joints: dict[str, Any] = {}
+                modes: dict[str, str] = {}
                 for j in ARM_JOINTS:
                     jc = getattr(arm_cfg, j.value)
+                    modes[j.value] = str(jc.wire_mode).lower()
                     joints[j.value] = {
                         "kp": jc.kp,
                         "kd": jc.kd,
@@ -2077,11 +2159,30 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                             jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
                         ),
                         "j_eff": jc.j_eff,
+                        "stiction_gain": jc.stiction_gain,
+                        "stiction_load_gain": jc.stiction_load_gain,
+                        "dither_nm": jc.dither_nm,
+                        "stribeck_gain": jc.stribeck_gain,
+                        # Firmware position-loop set (tune.motion's
+                        # ``firmware.*`` overrides): the grid's baselines.
+                        **{
+                            f"firmware.{name}": getattr(jc.firmware, name)
+                            for name in (
+                                "position_kp",
+                                "speed_kp",
+                                "speed_ki",
+                                "planner_accel",
+                                "cap_track",
+                                "planner_lead_ms",
+                                "tf_rated_current_a",
+                            )
+                        },
                     }
                 out[side] = joints
-            return out
+                wire[side] = modes
+            return {"gains": out, "wire_modes": wire}
 
-        return {"gains": await asyncio.to_thread(_load)}
+        return await asyncio.to_thread(_load)
 
     @app.get("/api/tuning/runs")
     async def tuning_runs() -> dict[str, Any]:
@@ -2145,7 +2246,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/tuning/motions")
     async def tuning_motions() -> dict[str, Any]:
-        """The committed reference motions available for tune.motion replays."""
+        """The reference motions in ~/.almond/motions for tune.motion replays."""
         from ..tuning.motion import list_motions
 
         def _list() -> list[dict[str, Any]]:
@@ -2529,6 +2630,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     "measured"
                     if quest_key is not None
                     and quest_key in saved_transforms.get(side, {})
+                    else "missing"
+                    if quest_key is not None
+                    and has_conflicting_transform_override(
+                        side,
+                        quest_key,
+                        saved_transforms,
+                        transform_entry_statuses,
+                    )
                     else "factory"
                     if quest_key is not None
                     and design_transform_for(side, quest_key) is not None

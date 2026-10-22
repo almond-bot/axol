@@ -1,9 +1,9 @@
 ---
 title: "motion.build / motion.list"
-description: "Build committed reference motions from recorded sessions — teleoperated or hand-guided."
+description: "Build reference motions from recorded sessions — teleoperated or hand-guided."
 ---
 
-Reference motions are uniform-rate, both-arm joint trajectories committed to the repository (`almond_axol/tuning/motions/`), so the exact same motion can be replayed on any robot — today or on future units — and the tracking metrics compared 1:1 with [`tune.motion`](/cli/tune-motion).
+Reference motions are uniform-rate, both-arm joint trajectories stored on the robot in `~/.almond/motions/`, so the same motion can be replayed on that robot again and again and the tracking metrics compared 1:1 with [`tune.motion`](/cli/tune-motion). Build one from a recording here, or generate one ([`motion.chirp`](/cli/tune-tf), `scripts/creep_motions.py`). A few are built in — generated in code, the same on every robot, no file needed: `slow_osc` (the slow-motion acceptance test), `fast_swing` (large fast swings), each with a `_left` mirror, and `hold` (40 s still). A file of the same name in `~/.almond/motions/` overrides a built-in.
 
 `motion.build` postprocesses a flight-recorder capture into one, from either recorder:
 
@@ -15,8 +15,8 @@ Either way, the stream is resampled onto a uniform grid, zero-phase low-pass smo
 | Flag | Description |
 |---|---|
 | `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip) or `axol gravity-comp --record PREFIX` (reads `<prefix>_gc.npz`). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare recording names are written. **Optional**: omitted, the newest recording in that directory is used |
-| `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz`. **Optional**: defaults to the recording's name |
-| `--out PATH` | Write to an explicit path instead of the committed directory |
+| `--name NAME` | Motion name; written to `~/.almond/motions/<name>.npz`. **Optional**: defaults to the recording's name |
+| `--out PATH` | Write to an explicit path instead of `~/.almond/motions/` |
 | `--rate HZ` | Uniform playback rate (default: 240 — the production control rate; `tune.motion` replays at the motion's stored rate) |
 | `--cutoff HZ` | Zero-phase low-pass cutoff (default: 6.0 — keeps deliberate motion, drops hand tremor and network jitter) |
 | `--time-scale X` | Stretch playback time (2.0 = half speed; default: 1.0) |
@@ -28,9 +28,7 @@ axol teleop --teleop.record rec1          # record via teleop, or ...
 axol gravity-comp --record rec1           # ... by hand-guiding the arms
 axol motion.build                                # newest recording, named after it
 axol motion.build rec1 --name reach-slow --time-scale 2.0
-axol motion.list                                 # what's committed
+axol motion.list                                 # the built-ins and ~/.almond/motions
 ```
-
-Commit the generated `.npz` so every robot can replay the identical motion.
 
 Every build also saves a **before/after tuning-run artifact** (`kind=build`, `~/.almond/diagnostics/tuning/`): the clipped raw command recording and the built motion side by side per joint, with per-joint change RMS/max and peak velocities. The diagnostics dashboard charts it like any other tuning run (zoom / fullscreen), so the effect of the smoothing pass and the collision projection is directly visible before the motion is ever replayed.

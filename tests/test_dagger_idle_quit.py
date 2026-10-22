@@ -231,3 +231,40 @@ def test_remote_collector_quit_lifecycle(tmp_path, mode, should_park):
         assert not control.quit_requested
     policy.close.assert_called_once_with()
     assert control._gate_active is False
+
+
+def test_idle_teleop_carries_box_spring_caps_and_lifts_them_on_return():
+    from almond_axol.constants import Joint
+
+    caps = {Joint.SHOULDER_2: 4.0}
+    teleop = Mock()
+    teleop.get_teleop_events.return_value = {}
+    teleop.consume_idle_reset.return_value = False
+    teleop.teleop_engaged = True
+    teleop.spring_caps.return_value = caps
+    teleop.get_action.return_value = {"left_joint.pos": 0.2}
+    robot, home = Mock(), Mock()
+    control = Mock()
+    control.poll_gate.side_effect = [None, "quit"]
+
+    with patch.object(collect_dagger.time, "sleep"):
+        collect_dagger._idle_teleop_until_record(
+            teleop, robot, home, 120, control, threading.Event()
+        )
+
+    assert robot.axol.set_spring_caps.call_args_list == [((caps,),), ((None,),)]
+
+
+def test_spring_caps_apply_only_on_change():
+    teleop = Mock()
+    teleop.spring_caps.return_value = None
+    robot = Mock()
+    caps = collect_dagger._SpringCaps(robot, teleop)
+    caps.sync()
+    caps.clear()
+    robot.axol.set_spring_caps.assert_not_called()
+    teleop.spring_caps.return_value = {"x": 1.0}
+    caps.sync()
+    caps.sync()
+    caps.clear()
+    assert robot.axol.set_spring_caps.call_args_list == [(({"x": 1.0},),), ((None,),)]

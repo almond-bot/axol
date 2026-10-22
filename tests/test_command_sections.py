@@ -14,6 +14,7 @@ _SECTIONS = {"test", "helper", "tuning"}
 # dashboard renders no other grid for them. Keep this list honest.
 _CLI_ONLY_TUNING = {"tune.filter"}
 _WORKBENCH_TABS = {
+    "tune.a4",
     "tune.pid",
     "tune.friction",
     "tune.gravity",
@@ -57,7 +58,8 @@ class DiagnosticsSectionsTest(unittest.TestCase):
             {"diag.rom-enable", "diag.lift-cycle", "diag.zed-cable"},
         )
         self.assertEqual(
-            by_section["helper"], {"diag.rom-disable", "lift.home", "lift.goto"}
+            by_section["helper"],
+            {"diag.rom-disable", "lift.home", "lift.goto", "lift.update"},
         )
 
 

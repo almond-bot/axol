@@ -64,6 +64,15 @@ class ZedGstreamerBuildDependenciesTest(unittest.TestCase):
         self.assertIn("libblas-dev", build_zed._APT_BUILD_DEPS)  # noqa: SLF001
         self.assertIn("libusb-1.0-0-dev", build_zed._APT_BUILD_DEPS)  # noqa: SLF001
 
+    def test_declares_jetson_multimedia_api_headers(self) -> None:
+        # gstzedsrc.cpp / gstzedxonesrc.cpp include nvbufsurface.h from
+        # /usr/src/jetson_multimedia_api/include on L4T; a minimal flash
+        # (AGX Thor, L4T 38.2) ships the runtime library but not the headers.
+        self.assertIn(
+            "nvidia-l4t-jetson-multimedia-api",
+            build_zed._APT_BUILD_DEPS,  # noqa: SLF001
+        )
+
     def test_apt_install_uses_all_declared_dependencies(self) -> None:
         succeeded = subprocess.CompletedProcess([], 0, "", "")
         run_package_manager = Mock(return_value=succeeded)

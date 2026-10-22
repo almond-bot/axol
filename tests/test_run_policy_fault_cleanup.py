@@ -31,6 +31,7 @@ def run_session(
     episode_time_s=120,
     episode_choices=None,
     policy_type="custom",
+    park_to_zero=True,
 ):
     events = []
     stopped = Event()
@@ -51,7 +52,7 @@ def run_session(
         return True
 
     reset.park.side_effect = park
-    client = mock.Mock(fatal_error=fault, contact_tripped=None)
+    client = mock.Mock(fatal_error=fault, contact_tripped=None, start_rejected=None)
     client.start.return_value = True
     if soft_park:
         client.stop.side_effect = lambda: events.append("client stopped")
@@ -106,6 +107,7 @@ def run_session(
         robot_config=object(),
         actions_per_chunk=30,
         soft_park_on_quit=soft_park,
+        park_to_zero=park_to_zero,
         rest_pose_left=[-0.8708, 0, 0, 1.395, 0, 0, 0.3442],
         rest_pose_right=[0.8784, 0, 0, -1.403, 0, 0, -0.3408],
     )
@@ -133,6 +135,7 @@ def run_session(
         )
         stack.enter_context(mock.patch.object(run_policy.time, "sleep"))
         stack.enter_context(mock.patch.object(run_policy, "_check_training_fps"))
+        stack.enter_context(mock.patch.object(run_policy, "check_start_pose"))
         stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
         if episode_choice is None and fault is None:
             from itertools import count
@@ -258,6 +261,21 @@ def test_lerobot_fault_off_rest_returns_to_rest_before_disabling():
     assert result.events == ["workers stopped", "disable"]
     assert result.reset.return_to_rest.call_count == 2  # setup + teardown park
     assert result.reset.return_to_rest.call_args.kwargs["on_contact"] is not None
+    # The first home goes out through zero; the teardown parks back to zero.
+    setup, teardown = result.reset.return_to_rest.call_args_list
+    assert setup.kwargs["path"] == ("zero", "rest")
+    assert teardown.kwargs["path"] == ("rest", "zero")
+    assert teardown.kwargs["hold_grasp"] is True
+
+
+def test_park_to_zero_off_stops_the_teardown_park_at_rest():
+    with mock.patch.object(run_policy, "arms_reporting", return_value=True):
+        result = run_session(
+            fault=RuntimeError("CAN bus error"), policy_type="act", park_to_zero=False
+        )
+    _setup, teardown = result.reset.return_to_rest.call_args_list
+    assert teardown.kwargs["path"] is None
+    assert teardown.kwargs["hold_grasp"] is True
 
 
 def test_custom_fault_holds_without_a_teardown_rest_move():

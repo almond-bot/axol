@@ -347,8 +347,14 @@ class AxolRobot(Robot):
         ``<name>_right`` so the rest of the pipeline treats the two eyes as
         ordinary cameras.
         """
+        # Logged because the two paths deliver visibly different frames: a
+        # policy run through a different path than its dataset was recorded
+        # through sees images it was never trained on.
+        backend = getattr(self.config, "video_backend", "auto")
         if self._use_gst_cameras():
+            _logger.info("Cameras: gst pipeline (video_backend=%s).", backend)
             return self._build_gst_cameras()
+        _logger.info("Cameras: ZED SDK (video_backend=%s).", backend)
         return self._build_sdk_cameras()
 
     def _use_gst_cameras(self) -> bool:
@@ -757,6 +763,15 @@ class AxolRobot(Robot):
         pass
 
     @property
+    def axol(self) -> Axol | Mantis | None:
+        """The underlying realtime-core robot while connected, else ``None``.
+
+        For flows that need the arms themselves (the teleoperator's live
+        settings adjust the gripper torque limit on them).
+        """
+        return self._axol
+
+    @property
     def positions(self) -> tuple[np.ndarray, np.ndarray]:
         """Cached arm positions from telemetry. Call after connect().
 
@@ -943,6 +958,34 @@ class AxolRobot(Robot):
                 obs[key] = float(right_trq[i])
 
         return obs
+
+    def joint_observation_at(
+        self, ts: float, max_skew_s: float = 0.010
+    ) -> RobotObservation | None:
+        """Joint state from the core's telemetry history nearest ``ts``.
+
+        For rows stamped with an earlier instant than the control tick (Mantis
+        rows carry the tracker pose's capture time), so the measured values in
+        the row describe the same moment as the pose. Never waits: returns
+        ``None`` when the core keeps no history (it does only while armed), the
+        instant is outside it, or the nearest sample is more than
+        ``max_skew_s`` away; callers then keep the live reading.
+        """
+        state_nearest = getattr(self._axol, "state_nearest", None)
+        if state_nearest is None:
+            return None
+        state = state_nearest(ts, timeout=0.0)
+        if state is None:
+            return None
+        left_pos, right_pos, left_trq, right_trq, state_ts = state
+        if abs(state_ts - ts) > max_skew_s:
+            return None
+        return self._joint_state_from_arrays(
+            left_pos,
+            right_pos,
+            left_trq if self.config.observe_torques else None,
+            right_trq if self.config.observe_torques else None,
+        )
 
     @check_if_not_connected
     def get_joint_observation(self) -> RobotObservation:

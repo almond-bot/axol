@@ -1,4 +1,4 @@
-"""Motor control utilities: friction model, differentiator, contact watchdog.
+"""Motor control utilities: friction/stiction models, differentiator, contact watchdog.
 
 Gravity compensation is handled separately — see
 :class:`almond_axol.robot.gravity.GravityCompensator` — because the simple
@@ -139,6 +139,16 @@ class ContactWatchdog:
 FRICTION_FF_K_MAX = 100.0
 
 
+def coulomb_unit(velocity: float, k: float) -> float:
+    """Saturation of the Coulomb feedforward in ``[-1, 1]``: ``tanh(0.1·k·v)``.
+
+    The factor :func:`compute_friction` multiplies ``Fc`` by, with the same
+    :data:`FRICTION_FF_K_MAX` cap. Exposed so :func:`stiction_compensation`
+    can fade itself out exactly as the velocity term takes over.
+    """
+    return math.tanh(0.1 * min(k, FRICTION_FF_K_MAX) * velocity)
+
+
 def compute_friction(
     velocity: float, Fc: float, k: float, Fv: float, Fo: float
 ) -> float:
@@ -147,9 +157,156 @@ def compute_friction(
     ``k`` is capped at :data:`FRICTION_FF_K_MAX` (see above) so the Coulomb
     term ramps smoothly through zero crossings instead of stepping.
     """
-    return (
-        Fc * math.tanh(0.1 * min(k, FRICTION_FF_K_MAX) * velocity) + Fv * velocity + Fo
-    )
+    return Fc * coulomb_unit(velocity, k) + Fv * velocity + Fo
+
+
+def stiction_amplitude(
+    Fc: float, gain: float, load_gain: float, gravity: float
+) -> float:
+    """Peak stiction push (Nm): ``gain·Fc + load_gain·|gravity|``.
+
+    Gear friction is not a constant: the breakaway measured on right
+    shoulder_1 (X8-P20, 1:20) was 0.66 Nm at the rest pose but 2-3.3 Nm with
+    the arm extended under 10-15 Nm of gravity load — the transmitted torque
+    loads the gear meshes and their static friction scales with it. A push
+    sized for the loaded pose would hunt at rest, one sized for rest does
+    nothing under load, so the amplitude follows the gravity feedforward
+    the joint is carrying this cycle (``load_gain`` in Nm per Nm).
+    """
+    return gain * Fc + load_gain * abs(gravity)
+
+
+# Measured joint speed (rad/s) over which the stiction push fades out —
+# ``1 − tanh(|v_meas| / STICTION_FADE_VEL)``. About 1.4 LSB of the motor's
+# reported velocity (0.022 rad/s): a joint reading one LSB of motion keeps
+# ~40 % of the push, two LSBs ~10 %. The fade used to follow the *commanded*
+# velocity, which kept the push on through the whole slip phase of a slow
+# move (the command is slow, so the velocity feedforward never saturates),
+# so the joint was driven past the target, the push flipped sign and it
+# re-stuck — a 2 Hz limit cycle in place of the stairs. Measured velocity
+# hands over to the sliding feedforward the moment the joint actually moves.
+STICTION_FADE_VEL = 0.03
+
+# Per-channel phase offset of the torque dither (rad): the golden angle,
+# π(3 − √5), so seven joints never push the structure in unison.
+DITHER_PHASE_STAGGER = math.pi * (3.0 - math.sqrt(5.0))
+
+
+def stiction_compensation(
+    err: float, v_meas: float, amp: float, err_scale: float
+) -> float:
+    """Error-sign Coulomb compensation:
+    ``amp·tanh(err/err_scale)·(1 − tanh(|v_meas|/STICTION_FADE_VEL))``.
+
+    The velocity feedforward above is driven by the *commanded* velocity, so
+    at the creeping speeds where a geared joint stick-slips (the X8-P20
+    shoulders below ~0.1 rad/s) it delivers well under half of ``Fc`` and
+    nothing at all while the joint sits stuck with the target walking away
+    from it. Breakaway there costs ``(F_static − F_ff)/kp`` of tracking
+    error — the 0.5°, 2 Hz stairs measured on right shoulder_1 — and a pure
+    velocity feedforward cannot shrink them: whatever level it holds, the
+    joint still jumps by ``(F_static − F_kinetic)/kp`` when it lets go.
+
+    This term acts on the *measured* error instead (``err = q_des − q_meas``):
+    it pushes up to ``amp`` (see :func:`stiction_amplitude`) toward the
+    target while the joint is stuck, saturating within ``err_scale`` so the
+    effective stiffness near zero error is far above ``kp`` and breakaway
+    happens after a fraction of the stair. It fades on the *measured*
+    velocity (:data:`STICTION_FADE_VEL`), so it is gone as soon as the joint
+    slides and the velocity feedforward takes over — it never drives the
+    slip phase.
+
+    Keep ``amp`` below the breakaway torque ``axol tune.breakaway`` measures
+    at the corresponding load (compensation that exceeds the real static
+    friction hunts around the target at rest). ``amp == 0`` (the default on
+    every joint) disables the term exactly.
+    """
+    if amp == 0.0:
+        return 0.0
+    fade = 1.0 - math.tanh(abs(v_meas) / STICTION_FADE_VEL)
+    return amp * math.tanh(err / max(err_scale, 1e-9)) * fade
+
+
+# Speed (rad/s) over which the Stribeck term passes through zero — a hair above
+# the measured-velocity noise, so the sign change is smooth and a joint at rest
+# gets no push from it (breakaway is the stiction term's job).
+STRIBECK_V0 = 0.02
+
+
+def stribeck_amplitude(
+    gain: float, dfs: float, load_gain: float, gravity: float
+) -> float:
+    """Excess of low-speed over sliding friction (Nm) this cycle:
+    ``gain·(dfs + load_gain·|gravity|)``, load-scaled like the stiction push."""
+    return gain * (dfs + load_gain * abs(gravity))
+
+
+def stribeck_excess(
+    v_meas: float, amp: float, v_s: float, v0: float = STRIBECK_V0
+) -> float:
+    """Friction cancellation keyed on *measured* velocity:
+    ``amp·exp(−(v/v_s)²)·tanh(v/v0)``.
+
+    The X8-P20 shoulders' friction falls as they speed up — 2.1 Nm sliding
+    at 0.05 rad/s, 1.4 at 0.1, 0.7 at 0.2 rad/s under load — and that
+    negative slope is negative damping: a joint that speeds up sees less
+    resistance and speeds up more, until the impedance spring catches it and
+    it slows back into the friction rise and sticks. That is the 2 Hz
+    stick-slip cycle no command-driven feedforward can stabilise, because a
+    term computed from the *commanded* velocity does not change when the
+    real velocity does.
+
+    This term follows the measured velocity with the measured curve's
+    shape, so when the joint speeds up the feedforward drops by what the real
+    friction drops and the net slope is flattened; at ``v_s`` (where the
+    excess has fallen to 1/e) it hands over to the ordinary Coulomb term.
+    ``gain`` below 1 under-cancels and leaves some cycle; above the true curve
+    it over-cancels and the net damping goes negative, which shows as the
+    arm's 3 Hz mode growing. Zero at rest, so it cannot hunt.
+    """
+    if amp == 0.0 or v_s <= 0.0:
+        return 0.0
+    return amp * math.exp(-((v_meas / v_s) ** 2)) * math.tanh(v_meas / max(v0, 1e-9))
+
+
+def dither_step(phase: float, nm: float, hz: float, dt: float) -> tuple[float, float]:
+    """Advance a torque-dither oscillator one step: ``(new_phase, torque)``.
+
+    A small sinusoidal torque on the feedforward keeps a geared joint's
+    meshes in the sliding regime instead of letting them re-stick between
+    control cycles. The X8-P20 shoulders' friction is velocity-weakening
+    (2.1 Nm sliding at 0.05 rad/s, 0.7 Nm at 0.2 rad/s, 2.4-3.3 Nm static
+    under load), which is what turns a slow move into a 2 Hz stick-slip
+    cycle no feedforward can stabilise; dither flattens that curve at the
+    contact. ``hz`` has to clear the arm's structural modes (up to ~35 Hz)
+    and stay under the Nyquist of the loop emitting it (120 Hz in the core),
+    so 50-80 Hz. ``nm == 0`` (the default on every joint) is exactly zero and
+    leaves the phase alone.
+    """
+    if nm == 0.0 or hz <= 0.0:
+        return phase, 0.0
+    phase = math.fmod(phase + 2.0 * math.pi * hz * dt, 2.0 * math.pi)
+    return phase, nm * math.sin(phase)
+
+
+class TorqueDither:
+    """N-channel torque dither (see :func:`dither_step`), each channel a golden
+    angle further round the cycle. Sample spacing comes from the wall clock,
+    like :class:`BandPass`."""
+
+    def __init__(self, n: int) -> None:
+        self._phase = [i * DITHER_PHASE_STAGGER for i in range(n)]
+        self._last: float | None = None
+
+    def update(self, nm: Sequence[float], hz: Sequence[float]) -> list[float]:
+        now = time.perf_counter()
+        dt = 0.0 if self._last is None else now - self._last
+        self._last = now
+        out: list[float] = []
+        for i in range(len(self._phase)):
+            self._phase[i], torque = dither_step(self._phase[i], nm[i], hz[i], dt)
+            out.append(torque)
+        return out
 
 
 class BandPass:

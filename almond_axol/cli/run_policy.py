@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
-from ..constants import PARK_TIMEOUT_S
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
@@ -52,6 +52,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from ..utils.logquiet import quiet_noisy_loggers
@@ -87,10 +88,14 @@ def _default_robot_config() -> AxolRobotConfig:
     are overridable too, e.g. ``--robot_config.axol_config.left_stiffness 0.8``
     (match the stiffness used at data-collection time).
 
-    Inference captures through the ZED Python SDK (``video_backend="sdk"``):
-    run-policy streams no headset video, so the GPU-resident gst pipeline's
-    encoded branch would be pure waste here. Teleop and collect-data default
-    to the gst path; pass ``--robot_config.video_backend gst`` to opt in.
+    The camera backend keeps collect-data's default (``auto``: the gst
+    pipeline when its stack is installed, else the ZED SDK). The two paths
+    deliver visibly different frames, and a policy fed frames from a path
+    other than the one its demonstrations were recorded through sees images
+    it was never trained on, and can start far enough from the arm to trip
+    ``max_step_rad``. Override with
+    ``--robot_config.video_backend`` only to match a dataset recorded
+    through the other path.
     """
     return AxolRobotConfig(
         cameras={
@@ -98,7 +103,6 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(serial=0),
             "right_arm": ZedCameraConfig(serial=0),
         },
-        video_backend="sdk",
     )
 
 
@@ -203,6 +207,14 @@ class RunPolicyConfig:
     # freeze-then-lurch. Set either to 0 to disable the filter.
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel
+    # Start check for joint-space policies: the first action of each episode
+    # must keep every arm joint within this many radians of the measured pose,
+    # or the episode is discarded before anything moves. Demonstrations start
+    # from rest, so a policy that is in distribution begins where the arm is;
+    # a large first offset means its inputs are not (a different scene, or a
+    # state channel that never varied in training blowing up the normalizer).
+    # Grippers are exempt. 0 disables.
+    max_first_action_offset_rad: float = 0.15
     # Contact watchdog for the between-episode return-to-rest: a joint torque
     # residual (measured minus modeled gravity, Nm) sustained above this
     # drops the arms into a limp gravity-comp hold instead of pulling
@@ -211,6 +223,11 @@ class RunPolicyConfig:
     reset_torque_threshold: float = 6.0
     # Hard modeled clearance for the Mink reset planner (metres).
     mink_reset_collision_margin: float = 0.01
+    # Shutdown park: on stop the arms return to rest and then continue to the
+    # all-zero joint pose — hanging straight down — holding their grasp,
+    # before the motors are released. False stops the park at rest. The
+    # control panel's "Park to zero on stop" (``teleop.park_to_zero``).
+    park_to_zero: bool = True
     # Optional deployment rest goals, in radians (seven arm joints per side).
     # Omitted sides retain the generic teleoperation rest configuration.
     rest_pose_left: list[float] | None = None
@@ -860,6 +877,34 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
     serve(PolicyServerConfig(**server_cfg_dict))
 
 
+def _measured_joint_action(
+    action_names: "tuple[str, ...]", left: np.ndarray, right: np.ndarray
+) -> np.ndarray:
+    """Measured arm positions laid out in the joint action schema's order.
+
+    The joint schema is the left arm's keys then the right arm's, each in
+    Joint order with the gripper key dropped on the gripperless SKU, while
+    ``AxolRobot.positions`` always reports (8,) per arm — so the first
+    ``len(action_names) // 2`` entries of each side line up with the schema.
+    """
+    per_arm = len(action_names) // 2
+    return np.concatenate(
+        [np.asarray(left)[:per_arm], np.asarray(right)[:per_arm]]
+    ).astype(np.float32)
+
+
+def _first_action_offset(
+    target: np.ndarray,
+    measured: np.ndarray,
+    arm_indices: "list[int]",
+    action_names: "tuple[str, ...]",
+) -> tuple[str, float]:
+    """The arm joint whose first target lies furthest from the measured pose."""
+    deltas = np.abs(np.asarray(target)[arm_indices] - np.asarray(measured)[arm_indices])
+    worst = int(np.argmax(deltas))
+    return action_names[arm_indices[worst]], float(deltas[worst])
+
+
 def _snap_to_newest_indices(
     action_features: "list[str] | dict[str, Any]",
 ) -> tuple[int, ...]:
@@ -1305,6 +1350,7 @@ def _build_axol_robot_client(
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
     policy_torque_threshold: float = 0.0,
+    max_first_action_offset_rad: float = 0.0,
     custom_policy_url: str | None = None,
     plan_config: PlanRuntimeConfig | None = None,
 ) -> Any:
@@ -1331,6 +1377,12 @@ def _build_axol_robot_client(
             ``contact_tripped`` and shuts the episode down. ``<= 0``
             disables (the default; see
             ``RunPolicyConfig.policy_torque_threshold``).
+        max_first_action_offset_rad: Start check for joint-space actions
+            (rad): the episode's first action must keep every arm joint
+            within this of the measured pose, or ``start_rejected`` is set
+            and the episode shuts down before anything is sent. ``<= 0``
+            disables (the default here; ``run-policy`` passes
+            ``RunPolicyConfig.max_first_action_offset_rad``).
         custom_policy_url: When set, use the continuation-capable custom
             policy endpoint at this ``ws://`` URL instead of a LeRobot
             ``PolicyServer``. Local action shaping and the configured contact
@@ -1422,6 +1474,7 @@ def _build_axol_robot_client(
             exec_max_vel,
             exec_max_accel,
             policy_torque_threshold,
+            max_first_action_offset_rad=0.0,
         ):
             # We override the private RobotClient._aggregate_action_queues to
             # inject temporal_ensemble (no public hook can express it — see the
@@ -1481,21 +1534,25 @@ def _build_axol_robot_client(
                 for i in range(len(robot.action_features))
                 if i not in self._gripper_indices
             ]
+            self._joint_actions = not getattr(
+                robot,
+                "cartesian_actions",
+                getattr(robot.config, "observe_cartesian", False),
+            )
             self._exec_filter = None
-            if (
-                exec_max_vel > 0.0
-                and exec_max_accel > 0.0
-                and not getattr(
-                    robot,
-                    "cartesian_actions",
-                    getattr(robot.config, "observe_cartesian", False),
-                )
-            ):
+            if exec_max_vel > 0.0 and exec_max_accel > 0.0 and self._joint_actions:
                 self._exec_filter = TrapezoidalFilter(
                     float(exec_max_vel),
                     float(exec_max_accel),
                     config.environment_dt,
                 )
+            # Start check (joint actions only): the measured pose captured at
+            # episode reset, consumed by the first send. ``start_rejected``
+            # records ``(joint, offset_rad)`` when the first action was too
+            # far from it; the episode supervisor discards the attempt.
+            self._max_first_action_offset = float(max_first_action_offset_rad)
+            self._start_pose: np.ndarray | None = None
+            self.start_rejected: "tuple[str, float] | None" = None
             # Full unfiltered target of the last popped action (numpy), kept
             # so starvation ticks can keep converging toward it.
             self._exec_last_target: Any | None = None
@@ -1798,11 +1855,21 @@ def _build_axol_robot_client(
                 self._chunk_buffer = []
             with self.latest_action_lock:
                 self.latest_action = -1
-            # Unseeded reset: the filter passes its first target through
-            # unchanged, which is safe because the first chunk is anchored on
-            # the arm's actual observed (resting) state.
-            if self._exec_filter is not None:
-                self._exec_filter.reset()
+            # Seed the filter at the arm's measured pose. Unseeded, it passes
+            # its first target through and takes it as the arm's position: a
+            # policy whose first target is far from the arm then went out as
+            # one step (dropped by max_step_rad), and the filter went on
+            # tracking a trajectory the arm never followed until a later
+            # target slipped under the limit as a single jump.
+            self._start_pose = None
+            self.start_rejected = None
+            if self._joint_actions:
+                left, right = self.robot.positions
+                self._start_pose = _measured_joint_action(
+                    self._expected_action_schema, left, right
+                )
+                if self._exec_filter is not None:
+                    self._exec_filter.reset(seed=self._start_pose[self._arm_indices])
             self._exec_last_target = None
             self.action_chunk_size = -1
             self.must_go.set()
@@ -2008,8 +2075,14 @@ def _build_axol_robot_client(
             Args:
                 target_vec: Full action vector (numpy, robot action order).
 
+            The episode's first joint-space send is also the start check: if
+            it puts any arm joint more than ``max_first_action_offset_rad``
+            from the pose measured at reset, nothing is sent, now or for the
+            rest of the episode, and ``start_rejected`` is set.
+
             Returns:
-                The dict returned by ``robot.send_action``.
+                The dict returned by ``robot.send_action``, or ``None`` when
+                the start check rejected the episode.
             """
             if not self._action_schema_confirmed:
                 raise ActionSchemaError(
@@ -2022,6 +2095,33 @@ def _build_axol_robot_client(
                     f"({len(self._expected_action_schema)},) for the confirmed "
                     "ordered action schema."
                 )
+            if self.start_rejected is not None:
+                return None
+            if self._start_pose is not None:
+                start_pose, self._start_pose = self._start_pose, None
+                if self._max_first_action_offset > 0.0:
+                    joint, offset = _first_action_offset(
+                        target_vec,
+                        start_pose,
+                        self._arm_indices,
+                        self._expected_action_schema,
+                    )
+                    if offset > self._max_first_action_offset:
+                        _logger.warning(
+                            "Policy's first action puts %s %.3f rad from the "
+                            "measured pose (limit %.3f rad); nothing was sent "
+                            "and the episode is discarded. A policy that starts "
+                            "away from the arm is usually seeing inputs it was "
+                            "not trained on: check the scene matches the "
+                            "demonstrations, and the checkpoint's state "
+                            "normalization for channels that never varied.",
+                            joint,
+                            offset,
+                            self._max_first_action_offset,
+                        )
+                        self.start_rejected = (joint, offset)
+                        self.shutdown_event.set()
+                        return None
             out = target_vec
             if self._exec_filter is not None:
                 shaped = self._exec_filter.update(target_vec[self._arm_indices])
@@ -2672,6 +2772,7 @@ def _build_axol_robot_client(
         exec_max_vel,
         exec_max_accel,
         policy_torque_threshold,
+        max_first_action_offset_rad,
     )
 
 
@@ -2924,8 +3025,10 @@ def _run(
     normal_quit = False
     abort_requested = False
     # Disabling raised arms drops them under gravity, so the cleanup below
-    # returns them to rest first — but only when they are somewhere else.
+    # parks them (rest pose, then zero) first — once this session has moved
+    # them, or whenever they are somewhere other than rest.
     arms_at_rest = True
+    arms_moved = False
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -2992,18 +3095,27 @@ def _run(
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded(*, final: bool = False) -> bool:
+        def _return_to_rest_guarded(
+            *, final: bool = False, startup: bool = False
+        ) -> bool:
             """Guarded return to rest; ``False`` when the operator aborted.
 
-            ``final=True`` is the teardown park played on the way out. The
-            stop flag is already set by then, so a deadline bounds the move
-            instead — well inside the caller's stop grace — and there is no
-            operator left to answer a contact retry.
+            ``startup=True`` is the session's first home, played through zero
+            (the arms' natural resting pose) on the way out to rest.
+
+            ``final=True`` is the teardown park played on the way out: rest,
+            then zero, so the torque-off leaves the arms where they would
+            settle anyway. The stop flag is already set by then, so a deadline
+            bounds the move instead and there is no operator left to answer a
+            contact retry.
             """
             nonlocal arms_at_rest
             assert reset_controller is not None
             if final:
+                park_to_zero = bool(getattr(cfg, "park_to_zero", True))
                 deadline = time.perf_counter() + PARK_TIMEOUT_S
+                if park_to_zero:
+                    deadline += PARK_ZERO_TIMEOUT_S
                 contact = threading.Event()
                 arms_at_rest = reset_controller.return_to_rest(
                     robot,
@@ -3015,6 +3127,10 @@ def _run(
                         contact.is_set() or time.perf_counter() >= deadline
                     ),
                     on_contact=contact.set,
+                    path=("rest", "zero") if park_to_zero else None,
+                    # An arm may still be holding something: keep the grasp
+                    # until the torque comes off.
+                    hold_grasp=True,
                 )
                 return arms_at_rest
             arms_at_rest = reset_controller.return_to_rest(
@@ -3023,6 +3139,7 @@ def _run(
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
                 stopped=stop_event.is_set,
                 wait_retry=control.await_contact_clear,
+                path=("zero", "rest") if startup else None,
             )
             return arms_at_rest
 
@@ -3071,6 +3188,7 @@ def _run(
             exec_max_vel=cfg.exec_max_vel,
             exec_max_accel=cfg.exec_max_accel,
             policy_torque_threshold=cfg.policy_torque_threshold,
+            max_first_action_offset_rad=cfg.max_first_action_offset_rad,
             custom_policy_url=custom_policy_url,
             plan_config=plan_config,
         )
@@ -3094,6 +3212,8 @@ def _run(
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
+        # The first return to rest plays unsupervised; refuse it from far away.
+        check_start_pose(robot.positions)
 
         # A Cartesian-action policy resolves each action to joints via IK in
         # send_action. Build that solver now, before the control loop, so its
@@ -3110,8 +3230,9 @@ def _run(
             _logger.info("Preparing Cartesian action solver (IK)...")
             robot.prepare_cartesian_actions()
 
-        _logger.info("Returning to rest pose.")
-        if not _return_to_rest_guarded():
+        _logger.info("Returning to rest pose (through zero).")
+        arms_moved = True
+        if not _return_to_rest_guarded(startup=True):
             return
         if not control.await_continue("Reset the scene, then start the first episode."):
             return
@@ -3250,6 +3371,10 @@ def _run(
                             # Tracking contact — the client already signalled
                             # shutdown; the limp hold runs after teardown.
                             break
+                        if client.start_rejected is not None:
+                            # Start check — the client already signalled
+                            # shutdown before sending anything.
+                            break
                         time.sleep(0.1)
                 except KeyboardInterrupt:
                     interrupted = True
@@ -3350,6 +3475,26 @@ def _run(
                     break
                 if not control.await_continue(
                     "Reset the scene, then start the next episode."
+                ):
+                    break
+                continue
+
+            if client.start_rejected is not None:
+                # The start check refused the policy's first action, so the
+                # arms never left the pose they held at reset. Nothing is saved.
+                joint, offset = client.start_rejected
+                _logger.info(
+                    f"Episode discarded: the policy's first {joint} target was "
+                    f"{offset:.2f} rad from the arm."
+                )
+                if dataset is not None:
+                    _clear_episode_buffer_after_workers(
+                        dataset, workers_stopped=episode_workers_stopped
+                    )
+                if not control.await_continue(
+                    f"Episode discarded: the policy's first {joint} target was "
+                    f"{offset:.2f} rad from the arm. Check the scene matches the "
+                    "demonstrations, then start the next episode."
                 ):
                     break
                 continue
@@ -3549,13 +3694,15 @@ def _run(
             except BaseException as exc:
                 _logger.exception("policy client cleanup failed")
                 cleanup_failures.append(("policy client", exc))
-        # Park before the torque comes off: ``disconnect()`` disables the
-        # motors, and arms left raised drop under gravity.
+        # Park — rest pose, then zero — before the torque comes off:
+        # ``disconnect()`` disables the motors, and arms left raised drop under
+        # gravity; ending at zero leaves them where they would settle anyway.
         #
         # Skipped when the motors are being left energized instead (a custom
         # policy fault, or a failed soft park: preserve_position), after a
         # completed soft park (the arms are parked at zero on purpose), when
-        # the arms are already at rest, when a limp hold left
+        # this session never moved the arms and they are at rest, when a limp
+        # hold left
         # them in the operator's hands, when the bus no longer reports a pose
         # to plan from, or when a live episode worker may still be inside the
         # robot. (``collect-data`` reads the same three states off its teleop
@@ -3571,12 +3718,14 @@ def _run(
                 episode_workers_stopped
                 and not preserve_position
                 and not soft_parked
-                and not arms_at_rest
+                and (arms_moved or not arms_at_rest)
                 and reset_controller is not None
                 and not reset_controller.arms_limp
                 and arms_reporting(robot)
             ):
-                _logger.info("Returning to rest before disabling the arms.")
+                _logger.info(
+                    "Parking the arms (rest pose, then zero) before disabling them."
+                )
                 _return_to_rest_guarded(final=True)
         except BaseException:
             _logger.exception("return to rest before disconnect failed")

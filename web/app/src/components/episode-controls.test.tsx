@@ -115,3 +115,21 @@ describe("episode input controls", () => {
     expect(sent).toEqual(["task a note"])
   })
 })
+
+describe("episode rejection notice", () => {
+  it("keeps a rejected take's reason on screen after returning to ready", () => {
+    const reason = "Episode 3 was REJECTED by the quality gate and discarded: 9.0% stale pose."
+    render({ ...policy({}), notice: { level: "error", message: reason } }, vi.fn())
+
+    const alert = container.querySelector('[role="alert"]')
+    expect(alert?.textContent).toBe(reason)
+    expect(alert?.className).toContain("text-red-200")
+    // The ordinary ready status still shows alongside it.
+    expect(container.textContent).toContain("Ready.")
+  })
+
+  it("shows no alert without a notice", () => {
+    render(policy({}), vi.fn())
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+  })
+})

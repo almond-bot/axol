@@ -160,6 +160,33 @@ class PoseInterpolatorSafetyTest(unittest.TestCase):
         self.assertFalse(released.l_stick_click)
         self.assertFalse(released.r_stick_click)
 
+    def test_tracker_grip_is_live_while_the_pose_plays_out_delayed(self) -> None:
+        def squeeze_at_render(kind: str) -> tuple[float, float]:
+            interp = PoseInterpolator(
+                min_delay_s=0.05, max_delay_s=0.15, smooth_window_s=0.12
+            )
+            # 100 Hz stream moving left; the trigger closes on the last frame.
+            for seq in range(40):
+                grip = 0.0 if seq == 39 else 1.0
+                interp.push(
+                    _frame(seq, x=0.01 * seq, grip=grip, source_kind=kind),
+                    now=1.0 + 0.01 * seq,
+                )
+            rendered = interp.sample(now=1.0 + 0.01 * 39)
+            assert rendered is not None
+            return rendered.l_grip, rendered.l_ee.position.x
+
+        tracker_grip, tracker_x = squeeze_at_render("tracker")
+        quest_grip, quest_x = squeeze_at_render("webxr")
+
+        # The tracker bridge's trigger read reaches the gripper at once...
+        self.assertEqual(tracker_grip, 0.0)
+        # ...while the pose itself still plays out behind the newest sample.
+        self.assertLess(tracker_x, 0.39)
+        self.assertAlmostEqual(tracker_x, quest_x)
+        # Quest grips stay smoothed together with the controller pose.
+        self.assertGreater(quest_grip, 0.9)
+
     def test_fixed_position_rotation_and_grip_are_not_deduplicated(self) -> None:
         interp = PoseInterpolator(
             min_delay_s=0.0,
