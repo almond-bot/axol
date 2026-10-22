@@ -928,6 +928,9 @@ export default function ControlPanel() {
   // The device selection is system-wide: a Mantis-capable operation runs on
   // Mantis whenever it is selected, and the idle link auto-connects to it.
   const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
+  // An Axol is connected: its robot model can be picked (until then the
+  // picker previews only, like the Jelly card until Jelly is attached).
+  const axolConnected = robot?.state === "connected" && (robot?.profile ?? "axol") === "axol"
   // No robot model picked yet: a host that offers the pick (kinematics.mount)
   // and has none saved, on Axol without Jelly (Jelly is detected, never
   // picked). The pick shows above the settings and gates Axol runs until saved.
@@ -1904,6 +1907,7 @@ export default function ControlPanel() {
 
         {needsMount && (
           <MountRequired
+            locked={!axolConnected}
             onSave={async (mount) => {
               await handleSettingsSave(
                 { values: { "kinematics.mount": mount } },
@@ -1939,6 +1943,7 @@ export default function ControlPanel() {
                     : null
               }
               activeCommandSession={activeCommandSession}
+              axolConnected={axolConnected}
               onCommandSessionChange={(next) => {
                 if (connectionGenerationRef.current === renderedConnectionGeneration) {
                   setActiveCommandSession(next)

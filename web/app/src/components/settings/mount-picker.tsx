@@ -90,6 +90,7 @@ export function MountPicker({
   robotModel,
   onSelect,
   showActive = true,
+  locked = false,
 }: {
   /** The saved (or draft) `kinematics.mount`; null before one is picked. */
   mount: AxolMount | null
@@ -98,6 +99,9 @@ export function MountPicker({
   onSelect: (mount: AxolMount) => void
   /** Badge the version the host runs ("In play"); off before a first pick. */
   showActive?: boolean
+  /** No Axol connected: the mounts can be previewed but not picked, like
+   *  Jelly until it is attached. */
+  locked?: boolean
 }) {
   const jelly = robotModel === "mobile"
   // The stage shows what the operator points at, else what the robot is.
@@ -110,10 +114,16 @@ export function MountPicker({
         <span className="font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
           Choose your Axol
         </span>
-        {jelly && (
+        {jelly ? (
           <span className="text-xs text-white/45">
             Jelly is attached, so this robot is Axol × Jelly. Your pick applies when it is off.
           </span>
+        ) : (
+          locked && (
+            <span className="text-xs text-white/45">
+              Connect the Axol to choose what it is mounted on.
+            </span>
+          )
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
@@ -125,6 +135,7 @@ export function MountPicker({
               character={ROSTER[m]}
               selected={m === mount}
               dimmed={jelly}
+              locked={locked}
               onSelect={() => onSelect(m)}
               onHover={setHovered}
               silhouette={<Silhouette model={m} />}
@@ -193,6 +204,7 @@ function RosterCard({
   character,
   selected,
   dimmed,
+  locked,
   onSelect,
   onHover,
   silhouette,
@@ -200,6 +212,7 @@ function RosterCard({
   character: Character
   selected: boolean
   dimmed: boolean
+  locked: boolean
   onSelect: () => void
   onHover: (model: AxolModel | null) => void
   silhouette: ReactNode
@@ -209,19 +222,22 @@ function RosterCard({
       type="button"
       role="radio"
       aria-checked={selected}
-      onClick={onSelect}
+      aria-disabled={locked}
+      onClick={locked ? undefined : onSelect}
       onMouseEnter={() => onHover(character.model)}
       onMouseLeave={() => onHover(null)}
       onFocus={() => onHover(character.model)}
       onBlur={() => onHover(null)}
       className={cn(
         "group flex items-center gap-3 rounded-lg border px-3 py-2 text-left transition-all duration-150",
-        "hover:-translate-y-px hover:border-white/30 hover:bg-white/[0.06]",
+        locked
+          ? "cursor-default border-dashed"
+          : "hover:-translate-y-px hover:border-white/30 hover:bg-white/[0.06]",
         "focus-visible:ring-2 focus-visible:ring-[#eff483]/60 focus-visible:outline-none",
         selected
           ? "border-[#eff483]/70 bg-[#eff483]/[0.08] shadow-[0_0_18px_-6px_rgba(239,244,131,0.6)]"
           : "border-white/10 bg-white/[0.02]",
-        dimmed && !selected && "opacity-60"
+        (dimmed || locked) && !selected && "opacity-60"
       )}
     >
       <div
@@ -235,10 +251,14 @@ function RosterCard({
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-sm font-medium text-white">{character.name}</span>
         <span className="truncate font-mono text-[0.6rem] tracking-widest text-white/40 uppercase">
-          {character.kind}
+          {locked ? "Connect Axol to choose" : character.kind}
         </span>
       </div>
-      {selected && <Check className="size-4 shrink-0 text-[#eff483]" aria-hidden />}
+      {locked ? (
+        <Lock className="size-4 shrink-0 text-white/30" aria-label="Locked" />
+      ) : (
+        selected && <Check className="size-4 shrink-0 text-[#eff483]" aria-hidden />
+      )}
     </button>
   )
 }

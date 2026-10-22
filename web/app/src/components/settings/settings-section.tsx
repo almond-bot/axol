@@ -135,6 +135,7 @@ export function SettingsSection({
   actionBlocker,
   activeCommandSession,
   onCommandSessionChange,
+  axolConnected = false,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -158,6 +159,8 @@ export function SettingsSection({
   /** Active generic setup/diagnostic session, if any. */
   activeCommandSession: SessionInfo | null
   onCommandSessionChange: (session: SessionInfo | null) => void
+  /** An Axol is connected: its robot model can be picked. */
+  axolConnected?: boolean
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -581,6 +584,7 @@ export function SettingsSection({
                 values={draft.values}
                 onChange={setValue}
                 robotModel={snapshot?.robotModel ?? "classic"}
+                axolConnected={axolConnected}
                 excludeKeys={
                   activeCategory.key === "teleop"
                     ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS]
@@ -825,6 +829,7 @@ function CategoryPanel({
   onChange,
   excludeKeys = [],
   robotModel = "classic",
+  axolConnected = false,
 }: {
   category: SettingsCategory
   /** Every category, to resolve the defaults `showWhen` gates read. */
@@ -834,6 +839,8 @@ function CategoryPanel({
   excludeKeys?: string[]
   /** What the host runs now, for the robot-model picker. */
   robotModel?: AxolModel
+  /** An Axol is connected: the robot-model picker is unlocked. */
+  axolConnected?: boolean
 }) {
   const shown = category.settings.filter(
     (s) =>
@@ -852,6 +859,7 @@ function CategoryPanel({
           key={f.key}
           mount={parseAxolMount(values[f.key] ?? f.default)}
           robotModel={robotModel}
+          locked={!axolConnected}
           onSelect={(mount) => onChange(f.key, mount)}
         />
       ))}
