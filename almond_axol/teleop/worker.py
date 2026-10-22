@@ -2578,6 +2578,34 @@ class IKWorker:
 # ---------------------------------------------------------------------------
 
 
+def configure_ik_process() -> None:
+    """Set up this process's XLA backend the way the IK runs it.
+
+    Confine the JAX solve to a single core's worth of compute. The per-arm IK
+    is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
+    core for each solve; combined with the worker's nice(-10) boost, that
+    burst preempts the control loop's CAN round-trip and the video relay on
+    every step — exactly the engaged-only send/act latency spikes and grainy
+    frames seen in `collect-data`, which (unlike teleop) has no spare core
+    headroom once the relay's raw-frame branch is running. Single-threaded XLA
+    is no slower for a problem this small and leaves the real-time loop alone.
+
+    Must run before the first JAX op (backend init reads XLA_FLAGS lazily).
+    The flags are part of the compilation cache's key, so anything that
+    precompiles for the worker (:mod:`.warm`) calls this too.
+    """
+    xla = os.environ.get("XLA_FLAGS", "")
+    if "xla_cpu_multi_thread_eigen" not in xla:
+        os.environ["XLA_FLAGS"] = f"{xla} --xla_cpu_multi_thread_eigen=false".strip()
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+
 def run_ik_worker(
     conn: multiprocessing.connection.Connection,
     config: VRTeleopConfig,
@@ -2620,25 +2648,7 @@ def run_ik_worker(
     # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    # Confine the JAX solve to a single core's worth of compute. The per-arm IK
-    # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
-    # core for each solve; combined with this process's nice(-10) boost, that
-    # burst preempts the control loop's CAN round-trip and the video relay on
-    # every step — exactly the engaged-only send/act latency spikes and grainy
-    # frames seen in `collect-data`, which (unlike teleop) has no spare core
-    # headroom once the relay's raw-frame branch is running. Single-threaded XLA
-    # is no slower for a problem this small and leaves the real-time loop alone.
-    # Must be set before the first JAX op (backend init reads XLA_FLAGS lazily).
-    _xla = os.environ.get("XLA_FLAGS", "")
-    if "xla_cpu_multi_thread_eigen" not in _xla:
-        os.environ["XLA_FLAGS"] = f"{_xla} --xla_cpu_multi_thread_eigen=false".strip()
-    for _var in (
-        "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    ):
-        os.environ.setdefault(_var, "1")
+    configure_ik_process()
 
     try:
         os.nice(-10)

@@ -23,6 +23,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
 - [`rt.install`](/cli/rt-install) — the required **`axol-rt` realtime core** hardware-control binary (Rust toolchain via rustup if needed; sources fetched at the installed package's exact ref on tool installs). Self-gates on network/toolchain availability.
+- [`ik.warm`](/cli/ik-warm) — the **IK solver's first compile** for this robot's model, so the first session after an install or update starts without the ~1 min compile. Optional: a failure only warns.
 
 ```bash
 axol provision
