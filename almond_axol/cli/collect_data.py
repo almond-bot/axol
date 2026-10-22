@@ -80,7 +80,7 @@ from ..lerobot.camera.configuration_zed import (
     ZedCameraConfig,
     resolution_for_dims,
 )
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
@@ -1440,6 +1440,15 @@ def _run_session(
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     mantis_mode = isinstance(cfg.robot_config, MantisRobotConfig)
+
+    # Axol and Mantis alike: the robot and the teleop IK worker must name the
+    # same backend (MantisRobotConfig is an AxolRobotConfig).
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
 
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.

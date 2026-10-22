@@ -6,6 +6,10 @@ import math
 from dataclasses import dataclass
 
 
+# IK backends: "jax" (Pyroki, the default) and "mink" (MuJoCo velocity QP).
+KINEMATICS_BACKENDS = ("jax", "mink")
+
+
 @dataclass
 class KinematicsConfig:
     """Cost weights and solver parameters for :class:`KinematicsSolver`.
@@ -14,6 +18,12 @@ class KinematicsConfig:
     functions. Higher values make the solver prioritise that term more strongly.
 
     Attributes:
+        backend: IK backend. ``"jax"`` (default) is the Pyroki/JAX solver.
+            ``"mink"`` uses the Cartesian-policy Mink profile for teleop
+            tracking and Cartesian reset paths; its fixed QP costs replace
+            every JAX weight below (elbow hints and the Mantis profile are
+            ignored). Set once for every operation with the control panel's
+            ``kinematics.backend`` setting.
         pos_weight: Weight on end-effector position error.
         ori_weight: Weight on end-effector orientation error.
         elbow_weight: Weight on elbow position hints (position only, no
@@ -189,6 +199,16 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+    backend: str = "jax"
+
+    def __post_init__(self) -> None:
+        # Validate here, not in the IK subprocess, so a typo fails the CLI
+        # parse instead of a worker startup.
+        if self.backend not in KINEMATICS_BACKENDS:
+            raise ValueError(
+                f"kinematics backend must be one of {KINEMATICS_BACKENDS}, "
+                f"got {self.backend!r}"
+            )
 
 
 # Solver values the Mantis profile forces (see
@@ -236,6 +256,11 @@ def apply_mantis_kinematics_profile(config: KinematicsConfig) -> None:
     override is applied only when the field still holds its dataclass
     default, so explicit ``--kinematics.<field>`` flags win over the profile.
     """
+    if config.backend == "mink":
+        # These are JAX solver weights. Mink keeps its policy-compatible
+        # profile; in particular, raising max_joint_delta would move Mink's
+        # QP step bound away from the one policies run with.
+        return
     defaults = KinematicsConfig()
     for name, value in MANTIS_KINEMATICS_OVERRIDES.items():
         if getattr(config, name) == getattr(defaults, name):

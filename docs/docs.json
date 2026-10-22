@@ -72,7 +72,8 @@
             "root": "operations/run-policy",
             "pages": [
               "operations/run-policy-config",
-              "operations/custom-policy"
+              "operations/custom-policy",
+              "operations/mink"
             ]
           },
           {

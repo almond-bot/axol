@@ -208,7 +208,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor, WireMode};
 use crate::can::CanSock;
-use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, Trapezoid};
+use crate::filter::{self, BandPass, Cadence, Holdover, LpDiff, TrackingProfile, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
@@ -286,7 +286,11 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   hub to 2.01, which drops unACKed frames instead of backing up, so a
 ///   proto-17 core would never see the e-stop as a TX stall and would keep
 ///   streaming into the dead bus; it must refuse to arm instead.
-const CONFIG_PROTO: u32 = 18;
+/// - 19: an optional `tracking_profile mink` line (literal targets, measured
+///   tick spacing, see `filter::TrackingProfile`). A proto-18 core rejects
+///   the line as an unknown directive; the bump makes that the proto
+///   mismatch's "rebuild with `axol rt.install`" instead.
+const CONFIG_PROTO: u32 = 19;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -1362,6 +1366,7 @@ struct Config {
     impedance_hz: f64,
     watchdog_ms: f64,
     max_step_rad: f64,
+    tracking_profile: TrackingProfile,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
 }
@@ -1371,6 +1376,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut impedance_hz = IMPEDANCE_HZ;
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
+    let mut tracking_profile = TrackingProfile::Default;
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
     let mut proto: Option<u32> = None;
 
@@ -1428,6 +1434,14 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     .get(1)
                     .and_then(|v| v.parse().ok())
                     .ok_or_else(|| bad(line))?
+            }
+            "tracking_profile" => {
+                // Optional and strict: a pre-profile core rejects this line
+                // rather than silently running different control physics.
+                tracking_profile = match f.as_slice() {
+                    ["tracking_profile", "mink"] => TrackingProfile::Mink,
+                    _ => return Err(bad(line)),
+                };
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
@@ -1600,6 +1614,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
         impedance_hz,
         watchdog_ms,
         max_step_rad,
+        tracking_profile,
         buses,
     })
 }
@@ -2204,10 +2219,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 18\ngripper 0 canL 8\n".to_string()
+                "proto 19\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2444,7 +2459,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 18\n\
+            "proto 19\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2496,39 +2511,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 18\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 19\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2539,7 +2554,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 18\n\
+            "proto 19\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2553,15 +2568,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 18\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 19\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 19\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 18\n\
+            "proto 19\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2592,7 +2607,7 @@ mod tests {
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 18\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 19\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2601,7 +2616,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
-            "proto 18\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 19\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
@@ -2616,27 +2631,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 18\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 19\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 18\n{mit}"))
+            parse_config(&format!("proto 19\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 18\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 19\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 18\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 19\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 18\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 19\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2652,7 +2667,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 18\nloop_hz 480\n{}{}{}{}",
+            "proto 19\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -2733,6 +2748,32 @@ mod tests {
         let slow = Thinning::plan(&motors, MIXED_LOOP_HZ, IMPEDANCE_HZ);
         assert_eq!(slow.read_div, 1);
         assert_eq!(slow.mit_lane.len(), 6);
+    }
+
+    #[test]
+    fn tracking_profile_is_explicit_and_strict() {
+        let base = format!("proto {CONFIG_PROTO}\ngripper 0 canL 8\n");
+        let base = base.as_str();
+        assert_eq!(
+            parse_config(base).unwrap().tracking_profile,
+            TrackingProfile::Default
+        );
+        assert_eq!(
+            parse_config(&format!("{base}tracking_profile mink\n"))
+                .unwrap()
+                .tracking_profile,
+            TrackingProfile::Mink,
+        );
+        for line in [
+            "tracking_profile",
+            "tracking_profile mink extra",
+            "tracking_profile future",
+            // Existing binaries fail the same strict unknown-directive gate
+            // on `tracking_profile`; unknown semantics must never be ignored.
+            "future_tracking_profile mink",
+        ] {
+            assert!(parse_config(&format!("{base}{line}\n")).is_err(), "{line}");
+        }
     }
 }
 
@@ -3702,21 +3743,22 @@ fn bus_loop(
             // Tick spacing for the damping chain (measured, not nominal —
             // a late tick then damps over the interval it actually covers).
             // An overrun is the exception: the motors held the previous
-            // command for the whole gap, so the tracker advances one nominal
-            // period rather than rendering a max-velocity catch-up step over
-            // the wall-clock it lost, and the command derivatives are
-            // re-seeded (below) instead of differentiated across it.
+            // command for the whole gap, so the default profile advances the
+            // tracker one nominal period rather than rendering a max-velocity
+            // catch-up step over the wall-clock it lost, and re-seeds the
+            // command derivatives (below) instead of differentiating across
+            // it. Mink keeps the measured gap and its derivatives, but caps
+            // the tracker step (filter::MINK_MAX_OVERRUN_PERIODS).
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
             prev_tick = Some(began);
-            let cmd_dt = if overrun {
-                period.as_secs_f64()
-            } else {
-                tick_dt
-            };
+            let cmd_dt = cfg
+                .tracking_profile
+                .command_dt(tick_dt, period.as_secs_f64(), overrun);
             // Age of the latest accepted target this tick, for the holdover.
             let target_age =
                 last_accepted.map_or(0.0, |a| began.saturating_duration_since(a).as_secs_f64());
-            carrying = have_target
+            carrying = cfg.tracking_profile == TrackingProfile::Default
+                && have_target
                 && !watchdog_frozen
                 && cadence
                     .get()
@@ -3836,7 +3878,12 @@ fn bus_loop(
                     // that target is late (identity while the stream is on
                     // time — see filter::Holdover and the adoption above).
                     let p_tgt = if tracked {
-                        hold[m.slot].target(c.p_des, target_age, cadence.get())
+                        cfg.tracking_profile.target(
+                            &hold[m.slot],
+                            c.p_des,
+                            target_age,
+                            cadence.get(),
+                        )
                     } else {
                         c.p_des
                     };
@@ -3883,7 +3930,7 @@ fn bus_loop(
                         stiction_ff,
                         dither_ff,
                         stribeck_ff,
-                    ) = if tracked && overrun {
+                    ) = if tracked && cfg.tracking_profile.reset_derivatives(overrun) {
                         // The gap since the last command is not a trajectory
                         // segment the motor followed — it held. Re-prime the
                         // derivative chains at rest here so the first tick

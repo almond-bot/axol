@@ -1,0 +1,12 @@
+Xiaomi-Robotics-1 numerical helper attribution
+
+Copyright 2026 Xiaomi Corporation
+Licensed under the Apache License, Version 2.0.
+See LICENSE-Xiaomi-Robotics-1.txt in this directory.
+
+vendor_io.py contains the aa2rotm Rodrigues conversion extracted from
+Xiaomi-Robotics-1, commit 7c20088b5328.
+The surrounding module was reduced to that function; its float32 coercion,
+expression order, and numerical implementation are retained unchanged.
+
+Upstream: https://github.com/XiaomiRobotics/Xiaomi-Robotics-1
