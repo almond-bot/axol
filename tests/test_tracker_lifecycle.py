@@ -513,7 +513,7 @@ class SurviveLifecycleTest(unittest.TestCase):
             ),
             patch(
                 "almond_axol.tracker.survive.time.perf_counter",
-                side_effect=(10.0, 10.0, 11.1, 12.03, 13.2),
+                side_effect=self._reader_clock([10.0, 10.0, 11.1, 12.03, 13.2]),
             ),
         ):
             source._run_cli()
@@ -522,6 +522,25 @@ class SurviveLifecycleTest(unittest.TestCase):
         self.assertAlmostEqual(poses["LHR-LEFT"].t, 13.03)
         self.assertAlmostEqual(poses["LHR-RIGHT"].t, 12.03)
         self.assertFalse(poses["LHR-LEFT"].timestamp_is_capture)
+
+    @staticmethod
+    def _reader_clock(values: list[float]):  # type: ignore[no-untyped-def]
+        """A perf_counter that scripts ``values`` for the calling thread only.
+
+        The patch replaces time.perf_counter process-wide; a background thread
+        left by another test must read the real clock instead of consuming a
+        scripted receipt and exhausting the sequence.
+        """
+        real_perf_counter = time.perf_counter
+        scripted = iter(values)
+        reader = threading.get_ident()
+
+        def perf_counter() -> float:
+            if threading.get_ident() == reader:
+                return next(scripted)
+            return real_perf_counter()
+
+        return perf_counter
 
     @staticmethod
     def _survive_cli_stream(
@@ -640,18 +659,8 @@ class SurviveLifecycleTest(unittest.TestCase):
             source._stop.set()
 
         process = SimpleNamespace(stdout=lines(), poll=lambda: 0)
-        # The patch replaces time.perf_counter process-wide; hand the scripted
-        # receipts to this thread's _run_cli only, so a background thread left
-        # by another test can't consume one and exhaust the sequence.
-        real_perf_counter = time.perf_counter
-        scripted = iter(receipts)
-        reader = threading.get_ident()
-
-        def perf_counter() -> float:
-            if threading.get_ident() == reader:
-                return next(scripted)
-            return real_perf_counter()
-
+        # The source reads the clock twice at startup before the first line.
+        perf_counter = self._reader_clock([10.0, 10.0, *receipts])
         with (
             patch(
                 "almond_axol.tracker.survive.subprocess.Popen",
@@ -659,7 +668,7 @@ class SurviveLifecycleTest(unittest.TestCase):
             ),
             patch(
                 "almond_axol.tracker.survive.time.perf_counter",
-                side_effect=[10.0, 10.0, *receipts],
+                side_effect=perf_counter,
             ),
             patch.object(source, "_publish", wraps=source._publish) as publish,
         ):
