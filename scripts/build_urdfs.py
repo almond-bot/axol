@@ -339,34 +339,53 @@ OX_CART = Body(
     key="ox_cart",
     marker="ox_cart_base",
     anchors={"ox_cart_lift": "base", "ox_cart_base": "cart"},
-    extra_links={},
+    extra_links={"lift_plate": "base"},
     moving={},
     frame_links=("cart",),
     # The cart's fixed column section, which the lift column rides on, apart
     # from the caster frame below it.
+    # - The lift's top 38 mm is the plate the shoulder bar bolts onto,
+    #   reaching 130 mm behind the 148 x 75 mm column: in the column's hull
+    #   it tilts the fitted capsule off the vertical and widens it to 127 mm,
+    #   so it is its own piece (and link), as on Jelly.
+    # - The cart's fixed column section, which the lift column rides on,
+    #   apart from the caster frame below it.
     splits={
+        "Ox_Cart_Lift.stl": (
+            (-_INF, -_INF, 1.075),
+            (_INF,) * 3,
+            "lift_plate",
+            "column_top",
+        ),
         "Ox_Cart_Base.stl": (
             (-0.09, -0.08, 0.23),
             (0.09, 0.11, _INF),
             "column_stub",
             "cart_frame",
-        )
+        ),
     },
     # IK freezes the lift fully raised: one hull over the column and the
     # stub it rides on (in the torso's frame, valid at that height).
-    ik_hulls={"base": ("base", "column_stub")},
+    ik_hulls={
+        "lift_plate": ("lift_plate",),
+        "base": ("column_top", "column_stub"),
+    },
     strips={},
-    sim_hulls={"base": (("base",),), "cart": (("column_stub",), ("cart_frame",))},
+    sim_hulls={
+        "lift_plate": (("lift_plate",),),
+        "base": (("column_top",),),
+        "cart": (("column_stub",), ("cart_frame",)),
+    },
     lift_joints=("ox_lift",),
     lift_links=("cart", "root"),
-    masses={**_TORSO_MASSES, "base": 6.0, "cart": 30.0},
+    masses={**_TORSO_MASSES, "base": 5.0, "lift_plate": 1.0, "cart": 30.0},
     floor=True,
     title="Axol on the Ox cart",
     note=(
         "IK freezes the lift fully raised (its CAD pose), where the cart's "
         "caster frame sits below anything the arms can reach, and keeps the "
-        "arms clear of the shoulder bar (s1), the head-camera mount (head) "
-        "and the lift column (base). Lowering the lift brings the frame up "
+        "arms clear of the shoulder bar (s1), the head-camera mount (head), "
+        "the lift column (base) and its top plate (lift_plate). Lowering the lift brings the frame up "
         "toward the hands, which IK does not see."
     ),
 )

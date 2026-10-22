@@ -156,8 +156,9 @@ _PARCEL_URDF = "axol_jelly_parcel.urdf"
 _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.CLASSIC: ("base", "s1"),
     AxolModel.STANDALONE: ("s1", "head"),
-    # The lift column (base); the caster frame is out of reach, lift raised.
-    AxolModel.OX_CART: ("base", "s1", "head"),
+    # The lift column (base) and its top plate; the caster frame is out of
+    # reach with the lift raised.
+    AxolModel.OX_CART: ("base", "s1", "lift_plate", "head"),
     # The mount's column (base) and its foot plate as six strips.
     AxolModel.OWL: ("base", "s1", "head", *(f"foot_{i}" for i in range(6))),
     AxolModel.MOBILE: ("base", "s1", "lift_plate", "head", "lift_stage", "jelly"),

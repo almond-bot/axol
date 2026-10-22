@@ -12,38 +12,38 @@
      instead of each part's collision hull; importers ignore them. IK
      freezes the lift fully raised (its CAD pose), where the cart's caster
      frame sits below anything the arms can reach, and keeps the arms clear
-     of the shoulder bar (s1), the head-camera mount (head) and the lift
-     column (base). Lowering the lift brings the frame up toward the hands,
-     which IK does not see. Physics: arm joints carry AxolConfig's measured
-     friction as <dynamics friction> (Coulomb, N·m) and damping (viscous,
-     N·m·s/rad), per arm, and the motors' impedance gains as <drive
-     stiffness> (kp, N·m/rad) and damping (kd, N·m·s/rad): a custom element
-     no importer reads, so set them as each joint's position-drive gains
-     after import. Arm masses and CoMs are AxolConfig's tuned gravity-comp
-     values (the wrist-3 body is split so the gripper, fingers and wrist
-     camera carry their share while the assembly's total mass and CoM stay
-     as tuned); every other mass is an ESTIMATE (Body.masses in the
-     generator) - replace with measured values. Inertia tensors assume
-     uniform density over each part's convex hull. Effort/velocity: arm
-     joints keep axol.urdf's values; the rest are estimates. Camera frames
-     (*_optical) use the ROS optical convention (+z forward, +x right, +y
-     down); an Isaac Sim camera attached with ROS camera axes needs no extra
-     rotation. Mesh paths are relative to this file. Wrist camera frames
-     (*_wrist_camera_optical, ZED X One S fisheye): the origin is the
-     projection centre from Stereolabs' model of the camera (its FOV solid's
-     rays meet on the lens axis 2.2 mm behind the front glass); fitting real
-     wrist images through each camera's factory calibration agrees within
-     the fit's ~3 mm resolution. Roll puts the gripper at the bottom of the
-     image, as in real frames. Head camera frames (head_camera_*_optical,
-     ZED X Mini Wide): each lens's projection centre from Stereolabs' model,
-     7.2 mm behind its front cover.
+     of the shoulder bar (s1), the head-camera mount (head), the lift column
+     (base) and its top plate (lift_plate). Lowering the lift brings the
+     frame up toward the hands, which IK does not see. Physics: arm joints
+     carry AxolConfig's measured friction as <dynamics friction> (Coulomb,
+     N·m) and damping (viscous, N·m·s/rad), per arm, and the motors'
+     impedance gains as <drive stiffness> (kp, N·m/rad) and damping (kd,
+     N·m·s/rad): a custom element no importer reads, so set them as each
+     joint's position-drive gains after import. Arm masses and CoMs are
+     AxolConfig's tuned gravity-comp values (the wrist-3 body is split so
+     the gripper, fingers and wrist camera carry their share while the
+     assembly's total mass and CoM stay as tuned); every other mass is an
+     ESTIMATE (Body.masses in the generator) - replace with measured values.
+     Inertia tensors assume uniform density over each part's convex hull.
+     Effort/velocity: arm joints keep axol.urdf's values; the rest are
+     estimates. Camera frames (*_optical) use the ROS optical convention (+z
+     forward, +x right, +y down); an Isaac Sim camera attached with ROS
+     camera axes needs no extra rotation. Mesh paths are relative to this
+     file. Wrist camera frames (*_wrist_camera_optical, ZED X One S
+     fisheye): the origin is the projection centre from Stereolabs' model of
+     the camera (its FOV solid's rays meet on the lens axis 2.2 mm behind
+     the front glass); fitting real wrist images through each camera's
+     factory calibration agrees within the fit's ~3 mm resolution. Roll puts
+     the gripper at the bottom of the image, as in real frames. Head camera
+     frames (head_camera_*_optical, ZED X Mini Wide): each lens's projection
+     centre from Stereolabs' model, 7.2 mm behind its front cover.
 -->
 <robot name="assembly">
     <link name="base">
         <inertial>
-            <origin xyz="0 0.089569 -0.27083" rpy="0 0 0" />
-            <mass value="6" />
-            <inertia ixx="0.135424" ixy="-9.65948e-19" ixz="1.32818e-18" iyy="0.133825" iyz="0.0108394" izz="0.0249366" />
+            <origin xyz="0 0.135219 -0.374042" rpy="0 0 0" />
+            <mass value="5" />
+            <inertia ixx="0.0877334" ixy="3.04898e-18" ixz="-5.49658e-18" iyy="0.0946876" iyz="-0.00874057" izz="0.0112991" />
         </inertial>
         <visual>
             <origin xyz="0 0 0" rpy="0 0 0" />
@@ -57,13 +57,13 @@
         <collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="meshes/ox_cart/base_collision.stl" scale="1 1 1" />
+                <mesh filename="meshes/ox_cart/base__column_top_collision.stl" scale="1 1 1" />
             </geometry>
         </collision>
         <ik_collision>
             <origin xyz="0 0 0" rpy="0 0 0" />
             <geometry>
-                <mesh filename="meshes/ox_cart/base__base_column_stub_collision.stl" scale="1 1 1" />
+                <mesh filename="meshes/ox_cart/base__column_top_column_stub_collision.stl" scale="1 1 1" />
             </geometry>
         </ik_collision>
     </link>
@@ -762,6 +762,30 @@
         <origin xyz="0 0 0" rpy="0 0 0" />
         <parent link="s1" />
         <child link="head" />
+    </joint>
+    <link name="lift_plate">
+        <inertial>
+            <origin xyz="0 0.0751838 -0.0716316" rpy="0 0 0" />
+            <mass value="1" />
+            <inertia ixx="0.00272682" ixy="5.40906e-20" ixz="7.61933e-20" iyy="0.00213012" iyz="0.000157157" izz="0.00462414" />
+        </inertial>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="meshes/ox_cart/lift_plate_collision.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+        <ik_collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="meshes/ox_cart/lift_plate_collision.stl" scale="1 1 1" />
+            </geometry>
+        </ik_collision>
+    </link>
+    <joint name="lift_plate_0" type="fixed">
+        <origin xyz="0 0 0" rpy="0 0 0" />
+        <parent link="base" />
+        <child link="lift_plate" />
     </joint>
     <link name="left_wrist_camera">
         <inertial>
