@@ -538,6 +538,11 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         await _run_jelly_only(cfg, jelly_cfg)
         return
 
+    if cfg.kinematics.whole_body and not cfg.sim:
+        raise ValueError(
+            "--kinematics.whole_body is sim-only for now: add --sim (driving "
+            "the real Jelly wheels and lift from the IK is not implemented yet)"
+        )
     if not cfg.sim and cfg.kinematics.robot_model is None:
         # Enabling Jelly means this is the mobile Axol: its URDF (the body the
         # arms are kept clear of, and its joint limits) follows this session's
@@ -550,6 +555,7 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
     if cfg.sim:
         robot = Sim(
             robot_model=cfg.kinematics.robot_model,
+            whole_body=cfg.kinematics.whole_body,
             mount=cfg.kinematics.mount,
             gripper=cfg.axol.gripper,
         )

@@ -147,12 +147,22 @@ _URDF_FILES: dict[AxolModel, str] = {
 # of the parallel gripper and its wrist camera.
 _PARCEL_URDF = "axol_jelly_parcel.urdf"
 
+BODY_JOINTS: tuple[str, ...] = ("base_x", "base_y", "base_yaw", "lift")
+"""The Jelly joints whole-body IK solves for, after the 14 arm joints.
+
+``base_x`` / ``base_y`` (m) and ``base_yaw`` (rad) move the base in the
+plane about the Jelly centre, in the world frame of the session's start;
+``lift`` (m) lowers each of the two lift stages from fully raised (0), so the
+torso drops twice that. Wheel spin is not a pose: wheel speeds follow from
+the base motion through the drive's kinematics.
+"""
+
 # Static body links the arms must not collide into, per version. pyroki fits
 # one capsule per link, so the body is split into capsule-friendly pieces
 # (the IK collision set, <ik_collision>): the shoulder bar, the head-camera
-# mount, the lift column's top plate and each of its sections. (IK keeps the
-# lifts fully raised, where the Jelly deck and the Ox cart's caster frame
-# are out of reach — see the URDFs' headers.)
+# mount, the lift column's top plate and each of its sections. (The Jelly
+# deck is out of reach with the lift raised: only whole-body IK collides it
+# — see axol_jelly.urdf's header.)
 _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.CLASSIC: ("base", "s1"),
     AxolModel.STANDALONE: ("s1", "head"),
@@ -162,6 +172,21 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.OWL: ("base", "s1", "head", *(f"foot_{i}" for i in range(6))),
     AxolModel.MOBILE: ("base", "s1", "lift_plate", "head", "lift_stage", "jelly"),
 }
+# With the base and lift moving, the deck comes within reach.
+_WHOLE_BODY_TORSO_LINKS: tuple[str, ...] = (
+    *_TORSO_LINKS[AxolModel.MOBILE],
+    "deck_0",
+    "deck_1",
+    "deck_2",
+)
+
+
+def _check_whole_body(model: AxolModel | str) -> None:
+    if AxolModel(model) is not AxolModel.MOBILE:
+        raise ValueError(
+            "whole-body IK needs the mobile Axol (its Jelly base and lift are "
+            "the extra joints); the other versions have none"
+        )
 
 
 def urdf_path(
@@ -186,6 +211,11 @@ def urdf_path(
     return URDF_DIR / _URDF_FILES[AxolModel(model)]
 
 
+def check_whole_body(model: AxolModel | str) -> None:
+    """Raise unless ``model`` has the joints whole-body IK solves (Jelly's)."""
+    _check_whole_body(model)
+
+
 # The Owl mount's foot plate sits under the upper arms' path, behind them:
 # its strip capsules overlap the upper arms' (fat) capsules at the arms'
 # ordinary poses even though the parts clear by ~5 cm, so it is kept off
@@ -195,17 +225,24 @@ _UPPER_ARM_GUARD_EXEMPT = frozenset(f"foot_{i}" for i in range(6))
 
 
 def upper_arm_guard_links(
-    model: AxolModel | str = AxolModel.CLASSIC,
+    model: AxolModel | str = AxolModel.CLASSIC, *, whole_body: bool = False
 ) -> tuple[str, ...]:
     """The body links the solver hard-stops the upper arms (e1) against: the
     :func:`torso_links` but the Owl mount's foot."""
     return tuple(
-        link for link in torso_links(model) if link not in _UPPER_ARM_GUARD_EXEMPT
+        link
+        for link in torso_links(model, whole_body=whole_body)
+        if link not in _UPPER_ARM_GUARD_EXEMPT
     )
 
 
-def torso_links(model: AxolModel | str = AxolModel.CLASSIC) -> tuple[str, ...]:
+def torso_links(
+    model: AxolModel | str = AxolModel.CLASSIC, *, whole_body: bool = False
+) -> tuple[str, ...]:
     """URDF links of ``model``'s body that arm links collide against."""
+    if whole_body:
+        _check_whole_body(model)
+        return _WHOLE_BODY_TORSO_LINKS
     return _TORSO_LINKS[AxolModel(model)]
 
 
