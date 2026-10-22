@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import logging
 import math
 
@@ -35,12 +36,15 @@ from ..constants import (
     urdf_arm_joint_names,
     urdf_body_name,
     urdf_joint_name,
+    urdf_path,
 )
 from ..settings import resolve_gripper, resolve_robot_model
+from .aot import ExportedJit
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
     collision_cost_params,
+    ik_urdf_xml,
     shared_robot,
     upper_arm_guard_floor,
     shared_robot_collision,
@@ -759,6 +763,14 @@ def _quat_to_matrix(wxyz: np.ndarray) -> np.ndarray:
     )
 
 
+# The jitted solve and safe step, exported once per graph shape so a new
+# process deserializes them instead of re-tracing (see .aot).
+_SOLVE_IK = ExportedJit(
+    _solve_ik, "solve_ik", static_argnames=("max_iterations", "use_self_collision")
+)
+_SAFE_STEP = ExportedJit(_base_collision_safe_step, "safe_step")
+
+
 # ---------------------------------------------------------------------------
 # KinematicsSolver
 # ---------------------------------------------------------------------------
@@ -826,6 +838,11 @@ class KinematicsSolver:
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
         self.robot = shared_robot(self.robot_model, gripper=self.gripper)
+        # What the exported programs were traced for (see .aot): the model
+        # IK loads, beyond what its arrays' shapes say.
+        self._export_fingerprint = hashlib.sha256(
+            ik_urdf_xml(urdf_path(self.robot_model, gripper=self.gripper)).encode()
+        ).hexdigest()
         # Base collision detection is opt-in (config.self_collision): when
         # off, no collision model is built at all — the soft cost is left out
         # of the solve graph and the hard base guard below is skipped, so the
@@ -1261,7 +1278,7 @@ class KinematicsSolver:
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
 
-        q_result, cost_history = _solve_ik(
+        q_result, cost_history = _SOLVE_IK(
             self.robot,
             self.robot_coll,
             target_L,
@@ -1298,6 +1315,7 @@ class KinematicsSolver:
             cfg.lambda_initial,
             cfg.lambda_factor,
             self.robot_coll is not None,
+            _fingerprint=self._export_fingerprint,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
 
@@ -1336,13 +1354,14 @@ class KinematicsSolver:
             # the joint-limit clamp it also provided still applies.
             q_out = _clamp_to_limits_np(self.robot, q_current, q_out)
             return self.from_pyroki_order(q_out)
-        q_out, guard_active_jax = _base_collision_safe_step(
+        q_out, guard_active_jax = _SAFE_STEP(
             self.robot,
             self.robot_coll,
             jnp.asarray(q_current, dtype=jnp.float32),
             jnp.asarray(q_out, dtype=jnp.float32),
             self._base_clearance_floor,
             jnp.asarray(delta_budget, dtype=jnp.float32),
+            _fingerprint=self._export_fingerprint,
         )
         guard_active = bool(guard_active_jax)
         if guard_active and not self._base_collision_guard_active:
