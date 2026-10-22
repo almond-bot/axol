@@ -111,7 +111,7 @@ The bindings below are for Axol. (Mantis teleop uses no headset — the rig trig
 </Note>
 
 <Note>
-  **Starting needs the arms near zero.** Teleop, data collection, DAgger, run-policy and replay all refuse to start while any arm joint is more than 25° from zero — the robot's natural resting pose, where the arms settle once torqued off — and name each offending joint. The check is against zero, not the configured rest pose. Move the arms back by hand (e.g. under `axol gravity-comp`) and start again. Not applied to `collect-dagger --start_from_current_pose`, which never homes on start. Once the check passes, the first move goes to zero and then out to the rest pose, so it follows the same path every session whatever rest pose is configured.
+  **Starting needs the arms near zero.** Teleop, data collection, DAgger, run-policy and replay all refuse to start while any arm joint is more than 25° from zero — the robot's natural resting pose, where the arms settle once torqued off — and name each offending joint. The check is against zero, not the configured rest pose. Move the arms back by hand (e.g. under `axol gravity-comp`) and start again. Not applied to `collect-dagger --start_from_current_pose` (unless `--home_on_start` is also set), which never homes on start. Once the check passes, the first move goes to zero and then out to the rest pose, so it follows the same path every session whatever rest pose is configured.
 </Note>
 
 <Note>

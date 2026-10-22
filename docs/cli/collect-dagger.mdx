@@ -121,11 +121,21 @@ so a row cannot pair the previous source's action with the new source's label.
 home after idle teleop. Add `--home_on_start true` to restore the startup home
 while keeping episode starts at the operator's current pose. The guarded
 startup move must finish before the first VR Record gate opens.
+Whenever the session homes on start (the default, or with `--home_on_start true`)
+it first refuses to start while any arm joint is more than 25° from zero, naming
+each offending joint, and that first home goes through zero on its way to rest
+(see [Starting needs the arms near zero](/operations/teleop)). A current-pose
+session without `--home_on_start` may begin anywhere.
 Cartesian IK, when selected, is warmed before motors are enabled so its first
 solve cannot stall policy dispatch.
 `--episode_time_s 0` removes the episode time cap.
 Instruction selection is managed by the desktop; remote-mode `--subtasks`
 is rejected.
+
+With a local policy, ending the session parks the arms the same way: rest,
+then, with `--teleop_config.vr_teleop_config.park_to_zero` (on by default; the
+control panel's **Park to zero on stop**), zero, holding the grasp, capped at
+6 s plus 10 s, before the motors are released.
 
 For remote policies, press terminal `q` once to park through rest and zero
 before disabling motors, either at the idle VR Record gate or during an

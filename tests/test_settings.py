@@ -342,6 +342,24 @@ class DiagnosticSettingsTest(unittest.TestCase):
         self.assertEqual(args, {"cycles": 3})
         self.assertEqual(build_argv("diag.lift-cycle", args), ["--cycles", "3"])
 
+    def test_park_to_zero_reaches_every_parking_operation(self) -> None:
+        # The panel's "Park to zero on stop" is one setting with a different
+        # field path per op (a top-level field where there's no teleop tree).
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            store.update(values={"teleop.park_to_zero": False})
+
+            expected = {
+                "teleop": "teleop.park_to_zero",
+                "collect-data": "teleop_config.vr_teleop_config.park_to_zero",
+                "collect-dagger": "teleop_config.vr_teleop_config.park_to_zero",
+                "run-policy": "park_to_zero",
+                "replay-dataset": "park_to_zero",
+            }
+            for op, key in expected.items():
+                with self.subTest(op=op):
+                    self.assertEqual(store.merged_args(op, {}), {key: False})
+
     def test_lift_cycle_inherits_axol_channels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = SettingsStore(Path(directory) / "settings.json")
