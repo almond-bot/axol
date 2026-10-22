@@ -83,8 +83,9 @@ from ..utils import reboot
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
-# The common hosted extras and Python match web/app/public/install. Preserve
-# whichever kinematics backends are installed when rebuilding the environment.
+# The version-pinned reinstall must reproduce the hosted installer's
+# requirement (web/app/public/install): same extras, same Python. Keep the two
+# in sync.
 _EXTRAS = "lerobot,sim"
 _PYTHON_VERSION = "3.13"
 # Where release tags live. Index (PyPI) installs carry no repository metadata,
@@ -123,19 +124,6 @@ _LOG_TAIL_LINES = 20
 # the run still succeeded (almond_axol.cli.provision.OPTIONAL_FAILURE_PREFIX;
 # not imported, which would pull every provisioning module into serve).
 _OPTIONAL_FAILURE_PREFIX = "Optional provisioning steps failed: "
-
-
-def _installed_extras() -> str:
-    backends = []
-    for backend in ("jax", "mink"):
-        try:
-            distribution(backend)
-        except PackageNotFoundError:
-            continue
-        backends.append(backend)
-    # Older installations always included JAX; preserve the default even if
-    # repairing an incomplete environment with neither backend installed.
-    return ",".join([_EXTRAS, *(backends or ["jax"])])
 
 
 def parse_version(text: str) -> tuple[int, ...] | None:
@@ -598,10 +586,7 @@ class SelfUpdater:
             # upgrade` cannot be used here: it re-resolves the originally
             # requested version, so it would never move to a new release. The
             # requirement mirrors the hosted installer's.
-            requirement = (
-                f"{_PACKAGE}[{_installed_extras()}]=="
-                f"{target_version or tag.lstrip('v')}"
-            )
+            requirement = f"{_PACKAGE}[{_EXTRAS}]=={target_version or tag.lstrip('v')}"
             self._phase = "upgrading"
             async with self._env_lock:
                 try:

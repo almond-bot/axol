@@ -236,15 +236,20 @@ the limp contact hold, and the replanned reset all run against the core.
 `Axol(tracking_profile="mink")` emits the strict optional config line
 `tracking_profile mink`. The last received joint target goes directly to the
 Rust trapezoid, each step uses measured tick spacing, and command
-velocity/acceleration derivatives continue across overruns. Target holdover
-and the default profile's overrun derivative re-seeding are disabled. Mink
+velocity/acceleration derivatives continue across overruns. On an overrun the
+tracker step is capped at two control periods
+(`filter::MINK_MAX_OVERRUN_PERIODS`): the trapezoid is only well-behaved for
+small steps, and an uncapped 60 ms gap let it snap to the target and overshoot
+it. The default profile instead advances one nominal period on an overrun.
+Target holdover and the default profile's overrun derivative re-seeding are
+disabled. Mink
 supplies joint targets without a Python trapezoid ahead of this core.
 
 Both profiles use the same target validation, watchdog, timing/feedback health
 gates, and fault handling. Selecting Mink does not change configured joint
-gains. Omitting the directive retains the default profile. A binary that does
-not support the directive rejects it during configuration, before CAN
-preparation; rebuild the core together with the Python package.
+gains. Omitting the directive retains the default profile. The directive arrived
+with config protocol 19, so an older binary refuses the configuration with the
+protocol mismatch (rebuild with `axol rt.install`) before CAN preparation.
 
 `cargo test mink_matches_reference_trace` checks all samples of an independent
 reference trace, including 30 Hz joint targets, 240 Hz reset targets, cadence

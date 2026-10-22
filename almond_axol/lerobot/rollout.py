@@ -241,8 +241,10 @@ class IKResetController:
         :class:`~almond_axol.robot.control.ContactWatchdog`) means it hit
         something — a gripper still hooked on the scene, an operator
         grabbing an arm — so the move stops where it is and the arms drop
-        into a limp gravity-comp hold instead of pulling through. What ends
-        the hold depends on the caller:
+        into a limp gravity-comp hold instead of pulling through. A path the
+        planner refuses (Mink rejects paths it cannot validate) takes the
+        same hold, so the operator can guide the arms clear. What ends the
+        hold depends on the caller:
 
         - ``wait_retry`` set (run-policy): it runs in a helper thread while
           the hold streams; return ``True`` to replan from wherever the
@@ -280,8 +282,10 @@ class IKResetController:
             outcome = self._play_to_rest(
                 robot, torque_threshold, stopped, path=path, hold_grippers=hold
             )
-            if outcome != "contact":
+            if outcome not in ("contact", "blocked"):
                 return outcome == "done"
+            # "blocked": the planner refused the path (Mink validates it whole)
+            # — the same limp hold lets the operator guide the arms clear.
             if on_contact is not None:
                 on_contact()
             if not self._hold_limp(robot, gravity_comp_kd, wait_retry, stopped):
@@ -385,8 +389,9 @@ class IKResetController:
 
         Plans from the robot's cached positions — to rest, to ``q_target``,
         or through the named goals of ``path`` — then streams the waypoints
-        watching the torque residuals. Returns ``"done"``, ``"contact"``, or
-        ``"stopped"``.
+        watching the torque residuals. Returns ``"done"``, ``"contact"``,
+        ``"blocked"`` (the planner refused the path; nothing moved — a park
+        raises instead), or ``"stopped"``.
         """
         import numpy as np
 
@@ -437,7 +442,15 @@ class IKResetController:
             check_park()
         result = self._conn.recv()
         if isinstance(result, tuple) and result[0] == "reset_error":
-            raise RuntimeError(f"Reset trajectory refused: {result[1]}")
+            if parking:
+                # park() preserves torque on any failure.
+                raise RuntimeError(f"Reset trajectory refused: {result[1]}")
+            # Nothing moved. Like a contact, hand the arms to the operator
+            # (limp hold) to guide them somewhere the planner accepts.
+            _logger.warning(
+                "Return-to-rest path rejected: %s — holding the arms limp", result[1]
+            )
+            return "blocked"
         if not (isinstance(result, tuple) and result[0] == "reset_traj"):
             raise RuntimeError(f"Unexpected IK worker response: {result!r}")
         _, q_goal, traj = result

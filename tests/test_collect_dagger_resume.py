@@ -347,6 +347,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         performed = {"left.pos": 0.9}
         live_joints = {"left.pos": 0.85}
         control_loop.robot = SimpleNamespace(
+            action_features={"left.pos": float},
             send_action=mock.Mock(return_value=performed),
             get_joint_observation=mock.Mock(return_value=live_joints),
             get_observation_with_capture_timestamp=mock.Mock(
@@ -366,6 +367,35 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         control_loop.recorder.publish.assert_called_once_with(
             live_joints, performed, 42.0
         )
+
+    def test_mink_policy_tick_records_fk_of_the_dispatched_joints(self) -> None:
+        # Mink's send_action returns the joint command it dispatched; a
+        # Cartesian dataset must record that command's FK pose (as
+        # run-policy does), not joint keys it has no column for.
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        dispatched = {"left_shoulder_1.pos": 0.3}
+        fk_pose = {"left_ee.x": 0.41}
+        control_loop.robot = SimpleNamespace(
+            action_features={"left_ee.x": float},
+            send_action=mock.Mock(return_value=dispatched),
+            action_to_dataset=mock.Mock(return_value=fk_pose),
+            get_joint_observation=mock.Mock(return_value={}),
+            get_observation_with_capture_timestamp=mock.Mock(
+                return_value=({"left_ee.x": 0.4}, 1.0)
+            ),
+        )
+        control_loop.policy = SimpleNamespace(
+            act=mock.Mock(return_value={"left_ee.x": 0.42})
+        )
+        control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
+        control_loop.recorder = SimpleNamespace(publish=mock.Mock())
+
+        control_loop._policy_tick(2.0)  # noqa: SLF001
+
+        control_loop.robot.action_to_dataset.assert_called_once_with(dispatched)
+        control_loop.recorder.publish.assert_called_once_with({}, fk_pose, 2.0)
 
     def test_cartesian_dagger_intervention_records_converted_joint_action(self) -> None:
         control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001

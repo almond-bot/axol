@@ -96,7 +96,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import (
     IKResetController,
     PolicyActionLimiter,
@@ -659,6 +659,11 @@ class _DaggerControlLoop(threading.Thread):
         performed = self.robot.send_action(action_dict)
         if self.shutdown_event.is_set():
             return None
+        recorded = performed if performed is not None else action_dict
+        if any(key not in recorded for key in self.robot.action_features):
+            # Mink returns the joint commands actually dispatched; a Cartesian
+            # dataset records their FK poses (as run-policy does).
+            recorded = self.robot.action_to_dataset(recorded)
         # Snapshot the live joint state at this tick, dated at the tick, like
         # the teleop and frozen states (and collect-data) do: the recorder
         # pairs every 60 Hz exposure with the nearest snapshot, and those must
@@ -666,11 +671,7 @@ class _DaggerControlLoop(threading.Thread):
         # observation is not that snapshot any more — its ring runs below
         # --fps and the frame set (with the joints selected at its exposure)
         # is re-served between ring frames, so its timestamp repeats.
-        self.recorder.publish(
-            self.robot.get_joint_observation(),
-            performed if performed is not None else action_dict,
-            t0,
-        )
+        self.recorder.publish(self.robot.get_joint_observation(), recorded, t0)
         return action_dict
 
     def run(self) -> None:
@@ -1253,13 +1254,6 @@ def _run(
             raise ValueError("handover_duration_s must be finite and nonnegative")
         if not isinstance(cfg.teleop_config, AxolVRTeleopConfig):
             raise ValueError("Remote DAgger requires Axol VR teleop")
-        if (
-            isinstance(cfg.robot_config, AxolRobotConfig)
-            and cfg.robot_config.cartesian_actions
-            and cfg.teleop_config.kinematics_config.backend
-            != cfg.robot_config.cartesian_controller
-        ):
-            raise ValueError("Policy and teleop must use the same IK backend")
     else:
         if not cfg.policy_path.strip():
             raise ValueError("Local DAgger requires policy_path")
@@ -1270,6 +1264,14 @@ def _run(
         _check_training_fps(cfg)
     if episode_time_s < 0 or fps <= 0 or teleop_hz <= 0:
         raise ValueError("Invalid episode duration or control rate")
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        # Local and remote alike: the teleop IK worker also plans the
+        # policy-side resets, so one backend must drive both.
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
 
     # Resolve and validate the destination before camera enumeration, workers,
     # the relay, or the robot can start. LeRobotDataset.resume keeps the existing
@@ -1743,7 +1745,9 @@ def _run(
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
-        if remote_policy and isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+        if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+            # Local policies run Mink Cartesian actions too: pin the same
+            # rest attractor rather than Mink's all-zero default.
             vr_cfg = cfg.teleop_config.vr_teleop_config
             robot.set_cartesian_posture(vr_cfg.rest_pose_left, vr_cfg.rest_pose_right)
         if cfg.home_on_start or not cfg.start_from_current_pose:

@@ -6,7 +6,6 @@ import sys
 from unittest import mock
 
 import numpy as np
-import pytest
 
 from almond_axol.kinematics.config import KinematicsConfig
 from almond_axol.lerobot import rollout
@@ -53,8 +52,9 @@ def test_real_worker_returns_repeats_and_parks_without_hardware():
         assert controller.wait_ready(timeout=30)
         with mock.patch.object(rollout, "time", Clock()):
             plant.q[3] = 10.0
-            with pytest.raises(RuntimeError, match="Reset trajectory refused"):
-                controller.return_to_rest(plant)
+            # A refused plan moves nothing and keeps the worker; with no
+            # operator channel (no wait_retry/stopped) the arms hold in place.
+            assert not controller.return_to_rest(plant)
             assert not plant.actions
             assert controller._proc.is_alive()
             plant.q[:] = 0.0
@@ -84,10 +84,11 @@ def test_real_worker_returns_repeats_and_parks_without_hardware():
 
 def test_invalid_backend_is_rejected_before_starting_worker():
     # Backend validation must occur before a child or hardware owner starts.
-    config = KinematicsConfig(backend="missing")
     with mock.patch("multiprocessing.get_context") as spawn:
         try:
-            rollout.IKResetController(kinematics_config=config)
+            rollout.IKResetController(
+                kinematics_config=KinematicsConfig(backend="missing")
+            )
         except ValueError:
             pass
         else:

@@ -187,13 +187,19 @@ version = "0.2.26"
 source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
+    { name = "almond-pyroki" },
+    { name = "daqp" },
     { name = "draccus" },
     { name = "fastapi" },
+    { name = "jax" },
+    { name = "jaxlie" },
+    { name = "mink" },
     { name = "mujoco" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
     { name = "pydantic" },
     { name = "python-can" },
+    { name = "qpsolvers" },
     { name = "scipy" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
@@ -204,11 +210,6 @@ dependencies = [
 gamepad = [
     { name = "pygame" },
 ]
-jax = [
-    { name = "almond-pyroki" },
-    { name = "jax" },
-    { name = "jaxlie" },
-]
 lerobot = [
     { name = "datasets" },
     { name = "jsonlines" },
@@ -218,12 +219,6 @@ lerobot = [
     { name = "torch" },
     { name = "torchvision" },
     { name = "wandb" },
-]
-mink = [
-    { name = "daqp" },
-    { name = "mink" },
-    { name = "mujoco" },
-    { name = "qpsolvers" },
 ]
 sim = [
     { name = "viser" },
@@ -242,19 +237,18 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiortc", specifier = ">=1.14.0,<1.15" },
-    { name = "almond-pyroki", marker = "extra == 'jax'", specifier = ">=0.1.0,<0.2" },
-    { name = "daqp", marker = "extra == 'mink'", specifier = "==0.8.7" },
+    { name = "almond-pyroki", specifier = ">=0.1.0,<0.2" },
+    { name = "daqp", specifier = "==0.8.7" },
     { name = "datasets", marker = "extra == 'lerobot'", specifier = ">=4.8,<5" },
     { name = "draccus", specifier = ">=0.11.6,<0.12" },
     { name = "fastapi", specifier = ">=0.135.2,<0.136" },
     { name = "hid", marker = "extra == 'tracker'", specifier = ">=1.0.5,<2" },
-    { name = "jax", marker = "extra == 'jax'", specifier = ">=0.9.2,<0.10" },
-    { name = "jaxlie", marker = "extra == 'jax'", specifier = ">=1.5.0,<2" },
+    { name = "jax", specifier = ">=0.9.2,<0.10" },
+    { name = "jaxlie", specifier = ">=1.5.0,<2" },
     { name = "jsonlines", marker = "extra == 'lerobot'", specifier = ">=4,<5" },
     { name = "lerobot", extras = ["viz", "async", "diffusion", "av-dep", "accelerate-dep"], marker = "extra == 'lerobot'", specifier = "==0.6.1" },
-    { name = "mink", marker = "extra == 'mink'", specifier = "==1.2.0" },
-    { name = "mujoco", specifier = ">=3.8.0,<3.12" },
-    { name = "mujoco", marker = "extra == 'mink'", specifier = "==3.11.0" },
+    { name = "mink", specifier = "==1.2.0" },
+    { name = "mujoco", specifier = "==3.11.0" },
     { name = "numpy", specifier = ">=2.2.6,<2.3" },
     { name = "opencv-python-headless", specifier = ">=4.13.0.92,<4.14" },
     { name = "pandas", marker = "extra == 'lerobot'", specifier = ">=2,<3" },
@@ -262,7 +256,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5,<3" },
     { name = "pygame", marker = "extra == 'gamepad'", specifier = ">=2.6,<3" },
     { name = "python-can", specifier = ">=4.6.1,<5" },
-    { name = "qpsolvers", marker = "extra == 'mink'", specifier = "==4.13.0" },
+    { name = "qpsolvers", specifier = "==4.13.0" },
     { name = "scipy", specifier = ">=1.17.1,<2" },
     { name = "torch", marker = "extra == 'lerobot'", specifier = "==2.10.0" },
     { name = "torchvision", marker = "extra == 'lerobot'", specifier = "==0.25.0" },
@@ -273,7 +267,7 @@ requires-dist = [
     { name = "websockets", marker = "extra == 'tracker'", specifier = ">=12,<16" },
     { name = "yourdfpy", specifier = ">=0.0.60,<0.1" },
 ]
-provides-extras = ["jax", "mink", "gamepad", "lerobot", "sim", "tracker"]
+provides-extras = ["gamepad", "lerobot", "sim", "tracker"]
 
 [package.metadata.requires-dev]
 dev = [

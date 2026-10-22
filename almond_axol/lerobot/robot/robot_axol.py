@@ -58,6 +58,10 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+# Mink seeds each solve from its previous command while that stays within
+# this distance (any joint) of the measured arm; past it, from measured.
+_MINK_RESYNC_RAD = 0.35
+
 
 def default_tracking_ik_config() -> "KinematicsConfig":
     """Tracking-grade IK solver config for executing Cartesian policy actions.
@@ -1365,8 +1369,12 @@ class AxolRobot(Robot):
         self._ensure_ik()
 
     def set_cartesian_posture(self, left: np.ndarray, right: np.ndarray) -> None:
-        """Pin Mink's null-space attractor to the session's rest target."""
-        if not self._uses_mink:
+        """Pin Mink's null-space attractor to the session's rest target.
+
+        A no-op unless this robot resolves Cartesian actions with Mink, so a
+        joint-action session never builds (or warms) an unused solver.
+        """
+        if not self._uses_mink or not self.cartesian_actions:
             return
         q = np.concatenate((np.asarray(left)[:7], np.asarray(right)[:7])).astype(
             np.float32
@@ -1380,7 +1388,8 @@ class AxolRobot(Robot):
         """Re-anchor Mink at the last completed joint send at an episode seam.
 
         Reset/park joint waypoints count too. Measured joints are only the
-        fallback before a send, or when tracking differs by >= 0.35 rad.
+        fallback before a send, or when tracking differs by >=
+        ``_MINK_RESYNC_RAD``.
         """
         if not self._uses_mink:
             self._cartesian_shapers = None
@@ -1422,12 +1431,29 @@ class AxolRobot(Robot):
                     "Mink requires finite measured joints and action values"
                 )
             previous = self._last_ik_q
-            seed = (
-                previous
-                if previous is not None
-                and float(np.max(np.abs(previous - measured))) < 0.35
-                else measured
-            )
+            if previous is None:
+                seed = measured
+            else:
+                gap = previous - measured
+                if float(np.max(np.abs(gap))) >= _MINK_RESYNC_RAD:
+                    # The arm moved away from our last command (operator
+                    # takeover, hand-guiding): re-anchor at measured.
+                    seed = measured
+                else:
+                    # A target the arm cannot reach (pushing into a table)
+                    # winds the command up one step per tick. Saturate that
+                    # windup just inside the resync threshold, so a held
+                    # contact settles at a steady offset instead of growing
+                    # to the threshold and snapping back — a ~3 Hz command
+                    # sawtooth into the contact. Gaps below the cap (normal
+                    # tracking lag) seed from the previous command as before.
+                    budget = float(self._ik_config.mink_max_joint_delta)
+                    cap = max(_MINK_RESYNC_RAD - budget, 0.0)
+                    seed = (
+                        previous
+                        if float(np.max(np.abs(gap))) <= cap
+                        else (measured + np.clip(gap, -cap, cap)).astype(np.float32)
+                    )
             result = np.asarray(
                 solver.solve(
                     seed,

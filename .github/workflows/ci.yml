@@ -31,7 +31,7 @@ jobs:
       - name: Install Python 3.13 and locked dependencies
         run: |
           uv python install 3.13
-          uv sync --locked --extra sim --extra lerobot --extra jax --extra mink --dev
+          uv sync --locked --extra sim --extra lerobot --dev
       - name: Lint and format check
         run: |
           uvx --from ruff==0.9.7 ruff check .
@@ -78,29 +78,6 @@ jobs:
           name: mink-reference-native-reference
           path: ${{ runner.temp }}/mink-reference-native
           if-no-files-found: ignore
-
-  mink-without-jax:
-    name: Mink without JAX
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-          cache-dependency-glob: uv.lock
-      - name: Install Mink, collection, and simulation dependencies
-        run: uv sync --locked --extra sim --extra lerobot --extra mink --dev
-      - name: Exercise Mink without any JAX packages installed
-        env:
-          AXOL_EXPECT_NO_JAX: "1"
-        run: >-
-          uv run --no-sync pytest --no-cov
-          tests/test_mink_no_jax.py
-          tests/test_mink_trajectory.py
-          tests/test_mink_lifecycle.py
-          tests/test_mink_robot_controller.py
-          tests/test_mink_policy_cadence.py
 
   rust:
     name: Rust realtime core

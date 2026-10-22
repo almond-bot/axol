@@ -105,7 +105,7 @@ def test_measured_zero_limit_noise_recovers_without_snapping(solver):
     assert np.all(np.diff(np.minimum(path[:, 3], 0)) >= -1e-6)
     assert np.all(np.diff(np.maximum(path[:, 10], 0)) <= 1e-6)
     start[3] = -0.011
-    with pytest.raises(MinkPlanningError, match="recovery exceeds"):
+    with pytest.raises(MinkPlanningError, match="past its limit"):
         plan(solver, start, np.zeros(14))
     with pytest.raises(MinkPlanningError, match="joint limit"):
         plan(solver, np.zeros(14), start)
@@ -181,8 +181,8 @@ def test_planning_failure_keeps_worker_alive_for_retry():
     worker = Mock(left_indices=list(range(7)), right_indices=list(range(7, 14)))
     zero = np.zeros(14, dtype=np.float32)
     worker.get_rest_q.return_value = zero
+    worker.compute_path_trajectory.return_value = [zero]
     worker.compute_reset_trajectory.side_effect = [
-        [zero],
         MinkPlanningError("blocked"),
         [zero],
     ]
@@ -210,6 +210,25 @@ def test_planning_failure_keeps_worker_alive_for_retry():
         "reset_traj",
     ]
     worker.reset.assert_called_once()
+
+
+def test_rejected_startup_move_reports_why_without_dying_silently():
+    worker = Mock(left_indices=list(range(7)), right_indices=list(range(7, 14)))
+    worker.get_rest_q.return_value = np.zeros(14, dtype=np.float32)
+    worker.compute_path_trajectory.side_effect = MinkPlanningError("blocked")
+    conn = Mock()
+    with (
+        patch.object(worker_module, "IKWorker", return_value=worker),
+        patch.object(worker_module.signal, "signal"),
+        patch.object(worker_module.os, "nice"),
+        patch("almond_axol.utils.affinity.pin_ik_startup"),
+        patch("almond_axol.utils.affinity.pin_ik"),
+    ):
+        worker_module.run_ik_worker(
+            conn, VRTeleopConfig(), KinematicsConfig(backend="mink")
+        )
+    conn.send.assert_called_once_with(("startup_error", "blocked"))
+    conn.recv.assert_not_called()
 
 
 def test_real_spawned_worker_startup_reset_and_park_leg_need_no_jax(tmp_path):
@@ -291,6 +310,8 @@ def test_teleop_rejected_plan_holds_command_and_does_not_claim_rest():
     assert not core.is_resetting
     assert not core.left_enabled and not core.right_enabled
     assert core._reset_error == "straight path is blocked"
+    # The shutdown park reads the public field after each leg.
+    assert core.reset_error == "straight path is blocked"
 
 
 def test_teleop_guarded_return_enters_retry_hold_after_rejected_plan():
@@ -319,4 +340,57 @@ def test_teleop_guarded_return_enters_retry_hold_after_rejected_plan():
             )
         )
     hold.assert_awaited_once()
+    assert hold.await_args.kwargs["reason"] == "blocked"
     assert "blocked" in announce.call_args.args[0]
+
+
+def test_park_rejected_plan_returns_to_the_park_instead_of_holding():
+    import asyncio
+    import logging
+    from unittest.mock import AsyncMock
+    from almond_axol.teleop.core import VRTeleopCore
+
+    core = VRTeleopCore(
+        VRTeleopConfig(), logging.getLogger("test"), broadcast_tracking=lambda _: None
+    )
+    core._reset_error = "blocked"
+    core._parking = True
+    with patch.object(core, "_contact_hold_until_reset", new=AsyncMock()) as hold:
+        asyncio.run(
+            core.guarded_return(
+                send_step=AsyncMock(),
+                gravity_step=AsyncMock(),
+                torque_residuals=lambda: (np.zeros(7), np.zeros(7)),
+                reset_command_state=lambda: None,
+                get_positions=lambda: (np.zeros(8), np.zeros(8)),
+                stopped=lambda: False,
+                announce=Mock(),
+            )
+        )
+    # Nobody is left to press reset during a shutdown park.
+    hold.assert_not_awaited()
+
+
+def test_blocked_hold_prompts_for_a_retry_not_a_contact():
+    import asyncio
+    import logging
+    from unittest.mock import AsyncMock
+    from almond_axol.teleop.core import VRTeleopCore
+
+    core = VRTeleopCore(
+        VRTeleopConfig(), logging.getLogger("test"), broadcast_tracking=lambda _: None
+    )
+    announce = Mock()
+    asyncio.run(
+        core._contact_hold_until_reset(
+            gravity_step=AsyncMock(),
+            reset_command_state=lambda: None,
+            get_positions=lambda: (np.zeros(8), np.zeros(8)),
+            stopped=lambda: True,
+            announce=announce,
+            on_contact=None,
+            hold_tick=None,
+            reason="blocked",
+        )
+    )
+    assert "Return path rejected" in announce.call_args.args[0]

@@ -80,7 +80,7 @@ from ..lerobot.camera.configuration_zed import (
     ZedCameraConfig,
     resolution_for_dims,
 )
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
@@ -1452,6 +1452,9 @@ def _run_session(
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
         adopt_robot_gripper(
             cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
+        )
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
         )
 
         # Keep the optional teleop flight recorder coherent across Python and

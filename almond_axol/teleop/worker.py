@@ -382,7 +382,10 @@ class IKWorker:
         # Elbow hints are optional (kinematics.elbow_weight == 0 disables, the
         # default): skip the whole elbow pipeline — filters, engage snapshots,
         # target math — so the solve graph never carries the cost.
-        self._use_elbow = kinematics_config.elbow_weight > 0.0
+        # Mink has no elbow task, so it never consumes them.
+        self._use_elbow = (
+            kinematics_config.elbow_weight > 0.0 and not self._mink_backend
+        )
 
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
         self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
@@ -1944,7 +1947,9 @@ class IKWorker:
         from the first touch.
         """
         cfg = self._config
-        if cfg.box_elbow_weight <= 0.0:
+        if cfg.box_elbow_weight <= 0.0 or getattr(self, "_mink_backend", False):
+            # Mink has no elbow task (nor elbow_swivel); its rest posture
+            # attractor steers the swivel instead.
             return None
         angle = math.radians(cfg.box_elbow_out)
         swivel = self._solver.elbow_swivel(q_current)
@@ -2633,6 +2638,10 @@ def run_ik_worker(
 ) -> None:
     """IK subprocess entry point.
 
+    Startup sends ``("ready", q, left_indices, right_indices, startup_traj)``,
+    or ``("startup_error", reason)`` and exits when the planner rejects the
+    startup move (nothing has moved).
+
     Message protocol (after the ``("ready", …)`` handshake):
 
     - ``VRFrame``                      → ``(q, status)`` (one solve step;
@@ -2641,15 +2650,17 @@ def run_ik_worker(
     - ``("set", key, value)``          → *(no reply)* — live update of one
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
-    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
-      (an infeasible request replies ``("reset_error", reason)`` without motion)
     - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
+    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
     - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
       an explicit joint target for the second (zero) leg of a guarded park.
     - ``("reset_path", q_current, goals)`` → ``("reset_traj", last, traj)`` —
       one trajectory chained through named goals (``"rest"`` / ``"zero"``,
       see :meth:`IKWorker.compute_path_trajectory`); ``last`` is the final
       goal's joint vector.
+    - A ``reset`` / ``reset_path`` the planner rejects (Mink: limits,
+      self-collision, unreached endpoint) replies ``("reset_error", reason)``
+      without motion; the worker stays up for a retry.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -2676,7 +2687,7 @@ def run_ik_worker(
     # headroom once the relay's raw-frame branch is running. Single-threaded XLA
     # is no slower for a problem this small and leaves the real-time loop alone.
     # Must be set before the first JAX op (backend init reads XLA_FLAGS lazily).
-    if kinematics_config.backend == "jax":
+    if getattr(kinematics_config, "backend", "jax") == "jax":
         _xla = os.environ.get("XLA_FLAGS", "")
         if "xla_cpu_multi_thread_eigen" not in _xla:
             os.environ["XLA_FLAGS"] = (
@@ -2722,7 +2733,15 @@ def run_ik_worker(
     # Start through zero — the arms' natural resting pose, which the session
     # start check has already confirmed they are near — so the move out to the
     # rest pose always follows the same planned path.
-    startup_traj = worker.compute_path_trajectory(q_start, ("zero", "rest"))
+    try:
+        startup_traj = worker.compute_path_trajectory(q_start, ("zero", "rest"))
+    except (RuntimeError, ValueError) as exc:
+        # Mink refuses paths it cannot validate (limits, self-collision, an
+        # unreached endpoint). Nothing has moved: tell the parent why instead
+        # of dying with a bare exit code.
+        _logger.error("Startup move rejected: %s", exc)
+        conn.send(("startup_error", str(exc)))
+        return
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(
@@ -2789,7 +2808,12 @@ def run_ik_worker(
                         "reset_path requires a finite current joint vector and "
                         f"named goals from {PATH_GOALS}"
                     )
-                traj = worker.compute_path_trajectory(q_current, goals)
+                try:
+                    traj = worker.compute_path_trajectory(q_current, goals)
+                except (RuntimeError, ValueError) as exc:
+                    # Same contract as "reset": a rejected plan moves nothing.
+                    conn.send(("reset_error", str(exc)))
+                    continue
                 worker.reset()
                 q_target = worker.path_goal(goals[-1])
                 q = traj[-1].copy() if traj else q_target.copy()

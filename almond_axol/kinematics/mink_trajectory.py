@@ -144,11 +144,16 @@ class _ResetProblem:
         """
         if q.shape != (14,) or not np.isfinite(q).all():
             raise MinkPlanningError("reset start: expected 14 finite arm joint angles")
-        if np.any(q < self.ranges[:, 0] - _START_JOINT_TOLERANCE) or np.any(
-            q > self.ranges[:, 1] + _START_JOINT_TOLERANCE
+        # The limit's gain=1 makes the first step undo the whole overshoot,
+        # so recovery is only feasible within one tick's velocity budget
+        # (0.0098 rad at the defaults); past it the QP has no solution.
+        tolerance = min(_START_JOINT_TOLERANCE, 0.9 * self.max_velocity * self.dt)
+        if np.any(q < self.ranges[:, 0] - tolerance) or np.any(
+            q > self.ranges[:, 1] + tolerance
         ):
             raise MinkPlanningError(
-                "reset start: joint limit recovery exceeds 0.01 rad"
+                f"reset start: a joint is more than {tolerance:.4f} rad past its "
+                "limit (guide it back inside and retry)"
             )
         self.validation_ranges[:, 0] = np.minimum(self.ranges[:, 0], q)
         self.validation_ranges[:, 1] = np.maximum(self.ranges[:, 1], q)

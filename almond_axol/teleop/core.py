@@ -250,6 +250,11 @@ def wait_for_ik_ready(
                 "(solver build, rest-pose settle, and startup trajectory)."
             )
     msg = conn.recv()
+    if isinstance(msg, tuple) and msg and msg[0] == "startup_error":
+        raise RuntimeError(
+            f"IK worker could not plan the startup move: {msg[1]}. Nothing "
+            "moved; guide the arms toward zero (or rest) and start again."
+        )
     if not (isinstance(msg, tuple) and msg and msg[0] == "ready"):
         raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
     return msg
@@ -491,6 +496,10 @@ class VRTeleopCore:
         # trajectory is adopted, so ``is_resetting`` has no false window
         # while the IK worker plans (planning can take seconds).
         self._reset_dispatching: bool = False
+        # Why the IK worker refused the last reset plan (Mink validates the
+        # whole path and rejects it rather than playing it); cleared when the
+        # next reset is dispatched. guarded_return reads it to tell a refused
+        # plan from a finished move.
         self._reset_error: str | None = None
         # Set by cancel_reset() while a dispatch is in flight: the planning
         # round trip can't be interrupted, so the dispatch drops its result
@@ -1803,13 +1812,17 @@ class VRTeleopCore:
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
             if self._reset_error is not None:
                 announce(f"Reset path rejected: {self._reset_error}")
-                return "blocked"
+                # A shutdown park reads reset_error itself and stops; it
+                # must not wait in a hold for a reset press nobody will make.
+                return "done" if self._parking else "blocked"
             return "stopped" if stopped() else "done"
 
         while not stopped():
             outcome = await _play()
             if outcome not in ("contact", "blocked"):
                 return
+            # A refused plan goes limp like a contact so the operator can
+            # hand-guide the arms somewhere the planner accepts, then retry.
             hold = await self._contact_hold_until_reset(
                 gravity_step=gravity_step,
                 reset_command_state=reset_command_state,
@@ -1818,6 +1831,7 @@ class VRTeleopCore:
                 announce=announce,
                 on_contact=on_contact,
                 hold_tick=hold_tick,
+                reason=outcome,
             )
             if hold != "reset":
                 return
@@ -1873,8 +1887,13 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None,
         hold_tick: Callable[[], None] | None,
+        reason: str = "contact",
     ) -> str:
         """Shared limp-hold engine: ``reset`` | ``stopped``.
+
+        ``reason`` is ``"contact"`` or ``"blocked"`` (the planner refused the
+        return path); it only changes the operator prompt. ``on_contact``
+        runs either way: it is the flows' "arms went limp" hook.
 
         Freezes the IK pipeline, holds the arms limp until a reset press
         (or the flow stops), then hands position control back re-synced to
@@ -1892,7 +1911,12 @@ class VRTeleopCore:
         self.cancel_reset()
         if on_contact is not None:
             on_contact()
-        announce("Contact. Arms are free — press reset to continue.")
+        announce(
+            "Return path rejected. Arms are free — guide them clear and "
+            "press reset to retry."
+            if reason == "blocked"
+            else "Contact. Arms are free — press reset to continue."
+        )
         deadline = time.perf_counter()
         while not stopped() and not self.reset_pending:
             deadline += interval
@@ -1970,6 +1994,10 @@ class VRTeleopCore:
                 and self.q is not None
                 and not self.reset_interp.is_active()
             ):
+                # Clear a refused plan's reason before the latch drops, so a
+                # guarded_return polling is_resetting never pairs this new
+                # dispatch with the previous rejection.
+                self._reset_error = None
                 self._reset_latched = False
                 self._reset_cancel = False
                 goal = self._reset_goal
@@ -1984,7 +2012,6 @@ class VRTeleopCore:
                 # planning round trip so callers waiting on it don't observe a
                 # false gap between the latch and the trajectory playback.
                 self._reset_dispatching = True
-                self._reset_error = None
                 try:
                     # Plan from the last *commanded* joints, not the raw IK
                     # solution: the smoothed command lags raw q by the EMA +
@@ -2020,6 +2047,8 @@ class VRTeleopCore:
                         pass
                     elif isinstance(result, tuple) and result[0] == "reset_error":
                         self._reset_error = str(result[1])
+                        # A park reads the public field after each leg.
+                        self.reset_error = self._reset_error
                         self._disengage_all("Teleop disabled (reset path rejected)")
                         self._at_rest = False
                         self._logger.error("Reset path rejected: %s", self._reset_error)

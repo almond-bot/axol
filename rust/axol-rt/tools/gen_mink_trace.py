@@ -26,14 +26,17 @@ fn main() {
     println!("# tick,dt,target,adopt,overrun,position,velocity,acceleration,fast_velocity,friction,inertia,damping");
     for tick in 0..176 {
         // 30 Hz policy, 240 Hz rest trajectory, then 30 Hz again. Two missing
-        // policy updates and two core overruns exercise both changed paths.
+        // policy updates and three core overruns exercise both changed paths;
+        // the 60 ms one is long enough to overshoot without the step cap.
         let adopt = ((32..64).contains(&tick) || tick % 8 == 0) && tick != 96 && tick != 104;
         if adopt { target = 0.2 * (tick as f64 * 0.07).sin(); }
-        let overrun = tick == 112 || tick == 136;
-        let dt = match tick { 0 => 0.0, 112 => 0.025, 136 => 0.015, _ => 1.0 / 240.0 };
-        // Literal target, measured dt, uninterrupted low-pass derivatives,
-        // and timing-gated band-pass damping define the reference profile.
-        let (position, _, _) = tracker.update(target, dt);
+        let overrun = tick == 112 || tick == 136 || tick == 152;
+        let dt: f64 = match tick { 0 => 0.0, 112 => 0.025, 136 => 0.015, 152 => 0.060, _ => 1.0 / 240.0 };
+        // Literal target, measured dt (the tracker step capped at two periods
+        // on an overrun), uninterrupted low-pass derivatives, and
+        // timing-gated band-pass damping define the reference profile.
+        let step_dt = if overrun { dt.min(2.0 / 240.0) } else { dt };
+        let (position, _, _) = tracker.update(target, step_dt);
         let velocity = vel.update(position, dt);
         let acceleration = acc.update(velocity, dt);
         let fast_velocity = fast.update(position, dt);

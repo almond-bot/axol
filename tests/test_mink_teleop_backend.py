@@ -152,11 +152,28 @@ def test_invalid_inputs_and_no_active_arm(solver, saved):
         solve.assert_not_called()
 
 
-def test_unsupported_elbow_configuration_fails_before_building_model():
-    with patch("almond_axol.kinematics.mink_backend.MinkIK") as create:
-        with pytest.raises(ValueError, match="elbow_weight=0"):
-            MinkKinematicsSolver(KinematicsConfig(backend="mink", elbow_weight=1))
-        create.assert_not_called()
+def test_jax_elbow_weight_is_ignored_not_fatal(caplog):
+    # One backend switch: a JAX elbow weight in shared settings must not stop
+    # a Mink session; Mink has no elbow task, so the weight is just unused.
+    with caplog.at_level("WARNING"):
+        solver = MinkKinematicsSolver(KinematicsConfig(backend="mink", elbow_weight=1))
+    assert "ignoring elbow_weight" in caplog.text
+    q = np.zeros(14, dtype=np.float32)
+    assert solver.ik(q, *solver.fk(q)).shape == (14,)
+
+
+def test_box_mode_cost_knobs_are_accepted(solver, saved):
+    q = saved["rest14"]
+    left, right = solver.fk(q)
+    np.testing.assert_array_equal(
+        solver.ik(q, left, right, elbow_weight=10.0, pose_weight_scale=(2.0, 2.0)),
+        solver.ik(q, left, right),
+    )
+
+
+def test_unknown_backend_fails_at_config_parse():
+    with pytest.raises(ValueError, match="kinematics backend"):
+        KinematicsConfig(backend="pink")
 
 
 def test_default_worker_keeps_jax_and_unknown_backend_is_rejected():
@@ -219,3 +236,24 @@ def test_mink_worker_engage_keeps_policy_rest_and_passes_active_sides():
     with patch.object(worker._solver, "ik", return_value=q.copy()) as solve:
         worker.step(_frame(left_forward=0, t_ms=1010, r_lock=False), q)
         assert solve.call_args.kwargs["active_sides"] == ("left",)
+
+
+def test_robot_and_teleop_backends_must_match():
+    from almond_axol.lerobot.robot.config_axol import (
+        AxolRobotConfig,
+        require_matching_ik_backend,
+    )
+
+    require_matching_ik_backend(AxolRobotConfig(cartesian_controller="mink"), "mink")
+    with pytest.raises(ValueError, match="IK backend mismatch"):
+        require_matching_ik_backend(AxolRobotConfig(), "mink")
+
+
+def test_mantis_profile_leaves_the_mink_step_bound_alone():
+    from almond_axol.kinematics.config import apply_mantis_kinematics_profile
+
+    jax, mink_cfg = KinematicsConfig(), KinematicsConfig(backend="mink")
+    apply_mantis_kinematics_profile(jax)
+    apply_mantis_kinematics_profile(mink_cfg)
+    assert jax.max_joint_delta == 0.05
+    assert mink_cfg == KinematicsConfig(backend="mink")

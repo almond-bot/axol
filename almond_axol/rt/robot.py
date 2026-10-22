@@ -392,9 +392,11 @@ class Axol(RobotBase):
             f"max_step_rad {max_step}",
         ]
         # Omit the default so existing clients retain identical wire config.
-        # Older cores reject this optional directive before opening CAN.
-        if self._tracking_profile != "default":
-            lines.append(f"tracking_profile {self._tracking_profile}")
+        # A pre-proto-19 core refuses the config (proto mismatch) before
+        # opening CAN.
+        profile = getattr(self, "_tracking_profile", "default")
+        if profile != "default":
+            lines.append(f"tracking_profile {profile}")
         trk_vel = self._TRACKER_HEADROOM * self._max_vel
         trk_acc = self._TRACKER_HEADROOM * self._max_accel
         for side, arm in self._arms():

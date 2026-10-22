@@ -143,21 +143,42 @@ class MinkRobotControllerTest(unittest.TestCase):
         self.assertEqual(len(self.dispatches), 1)
 
     def test_seed_uses_previous_command_only_below_strict_resync_threshold(self):
-        for distance, use_previous in (
-            (0.349, True),
-            (0.35, False),
-            (0.351, False),
+        cap = 0.35 - self.robot._ik_config.mink_max_joint_delta
+        for distance, expected in (
+            (0.2, 0.2),
+            # Inside the threshold but past the windup cap: saturated.
+            (0.349, cap),
+            (-0.349, -cap),
+            (0.35, 0.0),
+            (0.351, 0.0),
         ):
             with self.subTest(distance=distance):
                 previous = np.zeros(14, dtype=np.float64)
                 previous[0] = distance
+                previous[8] = 0.05
                 self.robot._last_ik_q = previous.copy()
                 self.solver.solve.reset_mock()
                 self.robot.send_action(self.action)
                 seed = self.solver.solve.call_args.args[0]
-                np.testing.assert_array_equal(
-                    seed, previous if use_previous else np.zeros(14)
-                )
+                want = np.zeros(14)
+                if expected:
+                    want[0] = expected
+                    want[8] = 0.05
+                np.testing.assert_allclose(seed, want, atol=1e-6)
+
+    def test_unreachable_target_windup_saturates_without_snapping_back(self):
+        # The arm is held (contact) while every solve steps one budget
+        # further: the seed must settle, never fall back to measured.
+        step = self.robot._ik_config.mink_max_joint_delta
+        self.solver.solve.side_effect = lambda seed, *_: (
+            np.asarray(seed, dtype=np.float32) + np.float32(step)
+        )
+        seeds = []
+        for _ in range(30):
+            self.robot.send_action(self.action)
+            seeds.append(float(self.solver.solve.call_args.args[0][0]))
+        self.assertTrue(all(b >= a - 1e-6 for a, b in zip(seeds, seeds[1:])))
+        self.assertAlmostEqual(seeds[-1], 0.35 - step, places=5)
 
     def test_current_frame_hold_reaches_solver_in_model_frame(self):
         from scipy.spatial.transform import Rotation

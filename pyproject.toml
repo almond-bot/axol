@@ -20,10 +20,26 @@ dependencies = [
     "aiortc>=1.14.0,<1.15", # WebRTC transport for headset camera video (pulls av)
     "draccus>=0.11.6,<0.12",
     "fastapi>=0.135.2,<0.136",
-    # gravity.py supports the 3.8/3.9 and 3.10/3.11 mass-matrix APIs.
-    "mujoco>=3.8.0,<3.12",
+    # Default IK backend (KinematicsConfig.backend = "jax").
+    "jax>=0.9.2,<0.10",
+    "jaxlie>=1.5.0,<2",
+    # Mink IK backend (KinematicsConfig.backend = "mink"). Pinned: the solver's
+    # numerical reference (tests/test_mink_ik_parity.py) is exact, and MuJoCo
+    # changes collision rows between releases even with identical solver code.
+    "mink==1.2.0",
+    "qpsolvers==4.13.0",
+    "daqp==0.8.7",
+    # Pinned for Mink parity (above). robot/gravity.py supports both the
+    # 3.8/3.9 and 3.10/3.11 mass-matrix APIs; tests/test_gravity.py guards it.
+    "mujoco==3.11.0",
     "numpy>=2.2.6,<2.3",
     "pydantic>=2.12.5,<3",
+    # Our PyPI-published fork of pyroki (github.com/almond-bot-research/pyroki,
+    # `almond` branch), which installs the `pyroki` import name. Upstream has no
+    # PyPI release and pins jaxls from git, which PyPI rejects in dependency
+    # metadata — the fork (and its almond-jaxls companion) is what makes
+    # almond-axol itself installable from PyPI.
+    "almond-pyroki>=0.1.0,<0.2",
     "python-can>=4.6.1,<5",
     "scipy>=1.17.1,<2",
     "uvicorn[standard]>=0.42.0,<0.43",
@@ -34,12 +50,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The standard backend remains available explicitly; Mink-only installs do
-# not install JAX, jaxlie, pyroki, or their JAXLS dependency.
-jax = ["jax>=0.9.2,<0.10", "jaxlie>=1.5.0,<2", "almond-pyroki>=0.1.0,<0.2"]
-# Pinned numerical stack of the Mink controller. MuJoCo changes
-# collision rows between releases even with identical solver code.
-mink = ["mink==1.2.0", "mujoco==3.11.0", "qpsolvers==4.13.0", "daqp==0.8.7"]
 gamepad = ["pygame>=2.6,<3"]
 # training backs `axol mantis.train` (LeRobot's trainer: accelerate + wandb);
 # diffusion adds the diffusers dependency for --policy.type diffusion.

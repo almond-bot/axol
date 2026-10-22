@@ -1,13 +1,11 @@
 """Exercise public Mink imports in a process that cannot load the JAX stack.
 
-CI also runs this file in an installation without any JAX distributions. The
-import blocker makes the same checks meaningful in a developer's full env.
+Both backends are installed, but a Mink session must not pay JAX's import and
+compile cost: the import blocker fails any Mink path that reaches for it.
 """
 
 from __future__ import annotations
 
-import importlib.metadata
-import os
 import subprocess
 import sys
 import textwrap
@@ -42,14 +40,6 @@ def _run_without_jax(source: str) -> None:
         timeout=90,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-
-
-def test_mink_ci_environment_has_no_jax_distributions() -> None:
-    if os.environ.get("AXOL_EXPECT_NO_JAX") != "1":
-        pytest.skip("dedicated Mink-only installation check")
-    for package in ("jax", "jaxlib", "jaxlie", "almond-jaxls", "almond-pyroki"):
-        with pytest.raises(importlib.metadata.PackageNotFoundError):
-            importlib.metadata.distribution(package)
 
 
 @pytest.mark.parametrize(

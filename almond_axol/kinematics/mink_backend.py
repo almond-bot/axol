@@ -8,6 +8,7 @@ left followed by right, without grippers.
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Collection
 
@@ -19,6 +20,8 @@ from ..constants import Joint, urdf_body_name
 from ..policy.mink_ik import MinkIK, MinkIKConfig
 from ..policy.mink_ik.frames import _ROOT_ORIGIN, _WORLD_TO_MODEL_R
 from .config import KinematicsConfig
+
+_logger = logging.getLogger(__name__)
 
 Pose = tuple[np.ndarray, np.ndarray]
 
@@ -52,8 +55,8 @@ class MinkKinematicsSolver:
     Mink uses its serving cost/collision profile, not JAX's soft-cost weights.
     ``max_joint_delta`` sets the same per-call QP bound used by policies;
     ``solve_hz`` supplies the actual cadence to the posture speed gate.
-    Elbow hints are unsupported by the policy-compatible profile and must be
-    disabled. Reset trajectories use a separate collision-constrained Mink
+    Elbow hints are unsupported by the policy-compatible profile and are
+    ignored (``elbow_weight`` is a JAX weight, like the others). Reset trajectories use a separate collision-constrained Mink
     planner so reset queries cannot mutate this tracker's state.
     Mutable model/tracker state belongs to one worker thread.
     """
@@ -62,7 +65,12 @@ class MinkKinematicsSolver:
 
     def __init__(self, config: KinematicsConfig, *, solve_hz: float = 30.0) -> None:
         if config.elbow_weight != 0:
-            raise ValueError("Mink teleop requires elbow_weight=0")
+            # The backend is a one-switch toggle: a JAX elbow weight saved in
+            # shared settings must not stop a Mink session from starting.
+            _logger.warning(
+                "Mink IK has no elbow task; ignoring elbow_weight=%s",
+                config.elbow_weight,
+            )
         if not math.isfinite(solve_hz) or solve_hz <= 0:
             raise ValueError("Mink solve_hz must be finite and positive")
         if not math.isfinite(config.max_joint_delta) or config.max_joint_delta <= 0:
@@ -167,6 +175,8 @@ class MinkKinematicsSolver:
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
         delta_scale: float = 1.0,
+        elbow_weight: float | None = None,
+        pose_weight_scale: tuple[float, float] = (1.0, 1.0),
         *,
         active_sides: Collection[str] | None = None,
     ) -> np.ndarray:
@@ -175,8 +185,11 @@ class MinkKinematicsSolver:
         The QP retains its fixed per-call safety budget when ``delta_scale``
         exceeds one; a delayed VR frame cannot enlarge the policy-compatible
         step bound. A smaller positive scale tightens the returned step.
+        ``elbow_weight`` and ``pose_weight_scale`` (box mode's JAX cost knobs)
+        are accepted for interface compatibility and ignored, like the elbow
+        hints: the serving profile has no elbow task and fixed QP costs.
         """
-        del left_elbow_pos, right_elbow_pos  # profile has no elbow task
+        del left_elbow_pos, right_elbow_pos, elbow_weight, pose_weight_scale
         q = self._q(q_current)
         if not math.isfinite(delta_scale) or delta_scale <= 0:
             raise ValueError("delta_scale must be finite and positive")
