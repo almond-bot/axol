@@ -46,6 +46,7 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
+import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -83,6 +84,8 @@ export function OperationPanel({
   startPhase,
   hostBlocker,
   needsMount = false,
+  simRobot,
+  onSimRobotChange,
   connected,
   policy,
   onStart,
@@ -120,6 +123,9 @@ export function OperationPanel({
    *  Axol arms waits for the "Which Axol is this?" pick above the settings
    *  (sim and arms-off runs keep the legacy default). */
   needsMount?: boolean
+  /** The robot a sim run simulates (sent as its kinematics.robot_model). */
+  simRobot?: SimRobot
+  onSimRobotChange?: (next: SimRobot) => void
   /** False while disconnected or validating a replacement host. */
   connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
@@ -565,6 +571,10 @@ export function OperationPanel({
                     />
                   )}
                 </>
+              )}
+
+              {isSim && simRobot && onSimRobotChange && (
+                <SimRobotPicker value={simRobot} onChange={onSimRobotChange} disabled={live} />
               )}
 
               <button
