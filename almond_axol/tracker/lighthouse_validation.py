@@ -93,19 +93,37 @@ def binding_problems(config: TrackerConfig) -> list[str]:
     return []
 
 
-def validation_fingerprint(config: TrackerConfig, native_path: Path) -> str:
-    """Bind a check to the actual native state and physical rig assignment."""
-    native = secure_read_text(native_path).encode("utf-8")
-    material = {
+def _setup_material(config: TrackerConfig, native_path: Path) -> dict[str, Any]:
+    return {
         "nativePath": str(native_path.absolute()),
         "runtimeMode": VALIDATION_RUNTIME_MODE,
-        "nativeSha256": hashlib.sha256(native).hexdigest(),
         "bindings": lighthouse_bindings(config),
         "expectedBaseStations": validate_expected_stations(
             config.expected_base_stations
         ),
     }
+
+
+def _digest(material: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+
+def validation_fingerprint(config: TrackerConfig, native_path: Path) -> str:
+    """Bind a check to the actual native state and physical rig assignment."""
+    native = secure_read_text(native_path).encode("utf-8")
+    material = _setup_material(config, native_path)
+    material["nativeSha256"] = hashlib.sha256(native).hexdigest()
+    return _digest(material)
+
+
+def setup_fingerprint(config: TrackerConfig, native_path: Path) -> str:
+    """The fingerprint without the native calibration contents.
+
+    Under the standard tracking policy libsurvive keeps refining the saved
+    calibration, so a check that matches this but not
+    :func:`validation_fingerprint` was invalidated only by that refinement.
+    """
+    return _digest(_setup_material(config, native_path))
 
 
 def validation_report_path() -> Path:
@@ -160,6 +178,10 @@ def validation_snapshot(
         "baseStations": {},
         "problems": binding_problems(config)
         + ["Run the Lighthouse session check before recording."],
+        # Why a passed check is stale: "expired", "refined" (the native
+        # calibration changed but nothing else did), "setup" (bindings, station
+        # count, runtime or calibration file changed) or "unverifiable".
+        "staleCauses": [],
     }
     try:
         report = json.loads(secure_read_text(report_path or validation_report_path()))
@@ -180,24 +202,35 @@ def validation_snapshot(
             report.get("problems") or ["The last Lighthouse check did not pass."]
         )
         return result
+    causes: list[str] = ["setup"] if problems else []
     try:
         checked_at = float(report["checkedAt"])
         expires_at = float(report["expiresAt"])
         if not checked_at <= now < min(expires_at, checked_at + VALIDATION_MAX_AGE_S):
             problems.append("The Lighthouse session check has expired; run it again.")
+            causes.append("expired")
         if config_path is None:
             from .survive import default_survive_config_path
 
             config_path = default_survive_config_path()
         current = validation_fingerprint(config, config_path)
         if current != report.get("fingerprint"):
-            problems.append(
-                "Tracker bindings, station count, tracking runtime or native calibration changed; run the session check again."
-            )
+            if report.get("setupFingerprint") == setup_fingerprint(config, config_path):
+                problems.append(
+                    "The native calibration has been refined since this check; run it again."
+                )
+                causes.append("refined")
+            else:
+                problems.append(
+                    "Tracker bindings, station count, tracking runtime or native calibration changed; run the session check again."
+                )
+                causes.append("setup")
     except (KeyError, TypeError, ValueError, OSError, RuntimeError):
         problems.append(
             "The current native calibration cannot be verified; run the session check again."
         )
+        causes.append("unverifiable")
+    result["staleCauses"] = list(dict.fromkeys(causes))
     result["status"] = "stale" if problems else "passed"
     result["valid"] = not problems
     result["problems"] = problems

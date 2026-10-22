@@ -1021,6 +1021,19 @@ export function TrackerBindingPanel({
               !countChanged
             const stale = validation?.status === "stale" || expired || countChanged
             const supported = lighthouse.validation !== undefined
+            // Standard hosts keep refining the calibration and never require
+            // a check, so a pass that aged out or predates a refinement is
+            // history, not a problem. Setup changes still read as stale.
+            const causes = validation?.staleCauses ?? []
+            const lastCheckOnly =
+              qualityMode === "standard" &&
+              !bindingsError &&
+              !countChanged &&
+              validation?.checkedAt != null &&
+              ((validation.status === "passed" && expired) ||
+                (validation.status === "stale" &&
+                  causes.length > 0 &&
+                  causes.every((cause) => cause === "expired" || cause === "refined")))
             return (
               <StepBody>
                 <p>
@@ -1033,28 +1046,41 @@ export function TrackerBindingPanel({
                 </p>
                 <div role="status" aria-live="polite" className="flex flex-col gap-2">
                   <ReadinessBadge
-                    tone={passed ? "ready" : validation?.status === "failed" ? "error" : "warning"}
+                    tone={
+                      passed
+                        ? "ready"
+                        : lastCheckOnly
+                          ? "neutral"
+                          : validation?.status === "failed"
+                            ? "error"
+                            : "warning"
+                    }
                   >
                     {bindingsError
                       ? "Validation status unavailable — reconnect to the host"
-                      : passed
-                        ? "Tracking check passed"
-                        : validation?.status === "needs_identification"
-                          ? "Calibration saved — identify sides, then validate tracking"
-                          : validation?.status === "failed"
-                            ? "Tracking check failed"
-                            : stale
-                              ? "Validation expired or setup changed — check again"
-                              : "Tracking quality not checked"}
+                      : lastCheckOnly
+                        ? `Last check passed ${ago(validation!.checkedAt!)}${
+                            causes.includes("refined") ? " — calibration refined since" : ""
+                          }`
+                        : passed
+                          ? "Tracking check passed"
+                          : validation?.status === "needs_identification"
+                            ? "Calibration saved — identify sides, then validate tracking"
+                            : validation?.status === "failed"
+                              ? "Tracking check failed"
+                              : stale
+                                ? "Validation expired or setup changed — check again"
+                                : "Tracking quality not checked"}
                   </ReadinessBadge>
-                  {validation?.checkedAt != null && (
+                  {validation?.checkedAt != null && !lastCheckOnly && (
                     <p className="text-xs text-white/45">Checked {ago(validation.checkedAt)}</p>
                   )}
-                  {validation?.problems.map((problem, index) => (
-                    <p key={`${index}:${problem}`} className="text-xs text-amber-200/85">
-                      {problem}
-                    </p>
-                  ))}
+                  {!lastCheckOnly &&
+                    validation?.problems.map((problem, index) => (
+                      <p key={`${index}:${problem}`} className="text-xs text-amber-200/85">
+                        {problem}
+                      </p>
+                    ))}
                 </div>
                 <label className="flex items-center gap-3 text-sm">
                   Expected base stations

@@ -27,6 +27,7 @@ from almond_axol.tracker.lighthouse_validation import (
     require_lighthouse_validation,
     save_validation_report,
     stationary_metrics,
+    setup_fingerprint,
     validation_fingerprint,
     validation_snapshot,
 )
@@ -507,6 +508,37 @@ class ValidationProvenanceTest(unittest.TestCase):
             config.left = "LHR-left"
             native.write_text('{"lighthouse": "moved"}')
             self.assertFalse(validation_snapshot(config, **kwargs)["valid"])
+
+    def test_stale_causes_separate_calibration_refinement_from_setup_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            native = Path(temporary) / "config.json"
+            native.write_text('{"lighthouse": "original"}')
+            path = Path(temporary) / "report.json"
+            config = _config()
+            report = new_validation_report(config, calibrated=False)
+            report.update(
+                status="passed",
+                checkedAt=1000.0,
+                expiresAt=1500.0,
+                problems=[],
+                fingerprint=validation_fingerprint(config, native),
+                setupFingerprint=setup_fingerprint(config, native),
+            )
+            save_validation_report(report, path)
+            kwargs = {"config_path": native, "report_path": path}
+            self.assertEqual(
+                validation_snapshot(config, **kwargs, now=1100.0)["staleCauses"], []
+            )
+            # libsurvive refined the saved calibration (standard policy).
+            native.write_text('{"lighthouse": "refined"}')
+            refined = validation_snapshot(config, **kwargs, now=1600.0)
+            self.assertEqual(refined["status"], "stale")
+            self.assertEqual(refined["staleCauses"], ["expired", "refined"])
+            config.expected_base_stations = 2
+            changed = validation_snapshot(config, **kwargs, now=1100.0)
+            self.assertEqual(changed["staleCauses"], ["setup"])
 
     def test_unfinished_check_overrides_previous_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

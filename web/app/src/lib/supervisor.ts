@@ -1239,6 +1239,11 @@ export interface LighthouseValidation {
   metrics?: Record<string, unknown>
   problems: string[]
   calibrated?: boolean
+  /**
+   * Why a passed check went stale: "expired", "refined" (only the native
+   * calibration changed), "setup" or "unverifiable". Absent on older hosts.
+   */
+  staleCauses?: Array<"expired" | "refined" | "setup" | "unverifiable">
 }
 
 export interface LighthouseBaseStationSurvey {

@@ -267,6 +267,46 @@ describe("Lighthouse validation", () => {
     expect(container.textContent).toContain("requires a passed validation before collecting")
   })
 
+  it("shows a refined calibration as history on a standard host but stale on a strict one", async () => {
+    const checkedAt = Date.now() / 1000 - 600
+    snapshot.sources!.lighthouse.qualityMode = "standard"
+    snapshot.sources!.lighthouse.validation = {
+      status: "stale",
+      valid: false,
+      checkedAt,
+      expiresAt: checkedAt + 12 * 3600,
+      expectedBaseStations: 3,
+      problems: ["The native calibration has been refined since this check; run it again."],
+      staleCauses: ["refined"],
+    }
+    await render()
+    expect(container.textContent).toContain(
+      "Last check passed 10 min ago — calibration refined since"
+    )
+    expect(container.textContent).not.toContain("run it again")
+    act(() => root.unmount())
+    root = createRoot(container)
+    snapshot.sources!.lighthouse.qualityMode = "strict"
+    await render()
+    expect(container.textContent).toContain("Validation expired or setup changed — check again")
+    expect(container.textContent).toContain("run it again")
+  })
+
+  it("keeps a setup change stale on a standard host", async () => {
+    snapshot.sources!.lighthouse.qualityMode = "standard"
+    snapshot.sources!.lighthouse.validation = {
+      status: "stale",
+      valid: false,
+      checkedAt: Date.now() / 1000 - 600,
+      expiresAt: Date.now() / 1000 + 3600,
+      expectedBaseStations: 3,
+      problems: ["Tracker bindings changed"],
+      staleCauses: ["setup"],
+    }
+    await render()
+    expect(container.textContent).toContain("Validation expired or setup changed — check again")
+  })
+
   it("hides the tracking policy on hosts that do not report it", async () => {
     await render()
     expect(container.querySelector('select[aria-label="Tracking policy"]')).toBeNull()

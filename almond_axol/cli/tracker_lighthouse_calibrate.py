@@ -27,6 +27,7 @@ from ..tracker.lighthouse_validation import (
     new_validation_report,
     release_lighthouse_runtime_lock,
     save_validation_report,
+    setup_fingerprint,
     validation_fingerprint,
     validation_snapshot,
 )
@@ -612,6 +613,7 @@ def run(args: argparse.Namespace) -> None:
                     secure_atomic_write_bytes(native_path, updated)
                     committed = True
                     report["fingerprint"] = validation_fingerprint(config, native_path)
+                    report["setupFingerprint"] = setup_fingerprint(config, native_path)
                     report.update(
                         status="needs_identification"
                         if needs_identification

@@ -134,7 +134,7 @@ The control panel's **Install Lighthouse support** action runs the same installe
 | | `standard` (default) | `strict` |
 | --- | --- | --- |
 | Station calibration | libsurvive keeps refining it in the background and saves it, so **Check base stations** and **Identify** can calibrate a new or moved setup. | Frozen outside an explicit **Recalibrate Lighthouse**; tracking and survey runs use private copies of the saved calibration. |
-| Before collecting | **Validate tracking** is optional. | A passed validation is required; reports expire after 12 hours. |
+| Before collecting | **Validate tracking** is optional. Because libsurvive keeps refining the calibration, the panel shows an earlier pass as **Last check passed … — calibration refined since** rather than as stale. | A passed validation is required; reports expire after 12 hours. |
 | While collecting | Poses stream as libsurvive reports them; takes are judged by the episode QA gate (`--qa_gate`). | Optical support, pose discontinuities and station identity are monitored live. Poses are withheld until tracking is stable, and any tracking fault marks the take for retake, even with `--qa_gate false`. |
 | Native solver | Upstream defaults. | Optical outlier rejection after tracking is established; bounded fault diagnostics. |
 
