@@ -779,6 +779,7 @@ class OperationRunner:
                     from ..cli.collect_data import (
                         _prepare_mantis_collection,
                         _require_mantis_tracking_validation,
+                        _resolve_lighthouse_quality,
                     )
                     from ..cli.mantis_bridge import (
                         require_mantis_tracker_readiness,
@@ -788,6 +789,10 @@ class OperationRunner:
                     # Fail missing/ambiguous tracker→TCP calibration before
                     # releasing CAN or opening the managed tracker backend.
                     _prepare_mantis_collection(cfg)
+                    # Resolve the Lighthouse policy once: the validation gate,
+                    # the episode's live checks and the managed bridge started
+                    # below all follow this value.
+                    _resolve_lighthouse_quality(cfg)
                     _require_mantis_tracking_validation(cfg)
                     # Quest is checked live by the WebXR handshake. External
                     # sources must pass the same supported-runtime/access gate
@@ -1472,7 +1477,7 @@ class OperationRunner:
     def _start_tracker_bridge(self, session: Session, cfg: Any, op_id: str) -> None:
         """Start the selected tracker bridge and wait for initialization."""
         from ..tracker import load_tracker_config
-        from ..tracker.config import select_tracker_backend
+        from ..tracker.config import select_tracker_backend, validate_lighthouse_quality
         from ..tracker.lighthouse_validation import LIGHTHOUSE_ACQUISITION_TIMEOUT_S
         from ..tracker.trigger import validate_trigger_full_scale
 
@@ -1513,6 +1518,11 @@ class OperationRunner:
         config.trigger_full_scale_right = validate_trigger_full_scale(
             getattr(cfg, "mantis_right_trigger_full_scale", 1.0)
         )
+        # Pin the policy collect-data resolved so its gates and the bridge
+        # cannot disagree if the saved setting changes meanwhile.
+        quality = getattr(cfg, "_lighthouse_quality", None)
+        if quality is not None:
+            config.lighthouse_quality = validate_lighthouse_quality(quality)
         if (
             config.left is None or config.right is None
         ) and not config.allow_single_side:

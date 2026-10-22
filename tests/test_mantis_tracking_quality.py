@@ -254,3 +254,30 @@ def test_standard_policy_does_not_require_validation():
         assert _resolve_lighthouse_quality(cfg) == "standard"
         _require_mantis_tracking_validation(cfg)
     gate.assert_not_called()
+
+
+def test_panel_runs_resolve_the_saved_strict_policy_without_the_cli_entry():
+    # The control panel builds the config and calls the gates directly,
+    # without main(); the strict policy must still apply.
+    cfg = CollectDataConfig(
+        repo_id="test/quality",
+        task="quality test",
+        mantis=True,
+        mantis_source="lighthouse",
+    )
+    with (
+        patch(
+            "almond_axol.tracker.config.load_tracker_config",
+            return_value=TrackerConfig(lighthouse_quality="strict"),
+        ) as load,
+        patch(
+            "almond_axol.tracker.lighthouse_validation.require_lighthouse_validation",
+            side_effect=RuntimeError("session check expired"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="expired"):
+            _require_mantis_tracking_validation(cfg)
+        assert cfg._lighthouse_quality == "strict"
+        # Resolved once; later checks in the session reuse it.
+        assert _resolve_lighthouse_quality(cfg) == "strict"
+    load.assert_called_once()

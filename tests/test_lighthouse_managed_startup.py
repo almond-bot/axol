@@ -65,6 +65,36 @@ class ManagedAcquisitionBudgetTest(unittest.TestCase):
                 parent_conn.poll.assert_called_once_with(budget)
                 parent_conn.close.assert_called_once_with()
 
+    def test_panel_bridge_follows_the_policy_collect_data_resolved(self) -> None:
+        # The saved setting may change between the run's gates and bridge
+        # startup; the bridge must police what the gates assumed.
+        runner = OperationRunner()
+        parent_conn = Mock()
+        parent_conn.poll.return_value = True
+        parent_conn.recv.return_value = {"ok": True}
+        context = Mock()
+        context.Pipe.return_value = (parent_conn, Mock())
+        config = TrackerConfig(left="LHR-LEFT", right="LHR-RIGHT")
+        cfg = SimpleNamespace(
+            mantis_source="lighthouse",
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+            vr_server=SimpleNamespace(port=8000, expected_pose_source_id="token"),
+            _lighthouse_quality="strict",
+        )
+        with (
+            patch("almond_axol.tracker.load_tracker_config", return_value=config),
+            patch(
+                "almond_axol.serve.runner.multiprocessing.get_context",
+                return_value=context,
+            ),
+            patch("almond_axol.serve.runner.threading.Thread"),
+        ):
+            runner._start_tracker_bridge(
+                Session("collect-data", {}), cfg, "collect-data"
+            )
+        self.assertEqual(config.lighthouse_quality, "strict")
+
 
 if __name__ == "__main__":
     unittest.main()

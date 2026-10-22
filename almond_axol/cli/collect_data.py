@@ -1291,19 +1291,28 @@ def _preserve_interrupted_tracking_attempt(
 
 
 def _resolve_lighthouse_quality(cfg: CollectDataConfig) -> str:
-    """The host's Lighthouse policy, resolved once for the whole session."""
-    from ..tracker.config import load_tracker_config
+    """The host's Lighthouse policy, resolved once for the whole session.
 
-    cfg._lighthouse_quality = load_tracker_config().lighthouse_quality
-    return cfg._lighthouse_quality
+    Every entry point (this CLI and the control panel's runner) shares the
+    first resolution, and its managed bridge is pinned to the same value.
+    """
+    quality = getattr(cfg, "_lighthouse_quality", None)
+    if quality is None:
+        from ..tracker.config import load_tracker_config
+
+        quality = load_tracker_config().lighthouse_quality
+        cfg._lighthouse_quality = quality
+    return quality
 
 
-def _strict_lighthouse(cfg: CollectDataConfig) -> bool:
+def _strict_lighthouse(cfg: CollectDataConfig, *, mantis: bool | None = None) -> bool:
     """Whether this run records under the strict Lighthouse policy."""
+    if mantis is None:
+        mantis = cfg.mantis
     return (
-        cfg.mantis
+        mantis
         and cfg.mantis_source == "lighthouse"
-        and getattr(cfg, "_lighthouse_quality", "standard") == "strict"
+        and _resolve_lighthouse_quality(cfg) == "strict"
     )
 
 
@@ -2174,9 +2183,7 @@ def _run_session(
         # pollutes the verdict.
         stats = EpisodeQAStats()
         quality_monitor = EpisodeTrackingQuality(
-            required=mantis_mode
-            and cfg.mantis_source == "lighthouse"
-            and getattr(cfg, "_lighthouse_quality", "standard") == "strict"
+            required=_strict_lighthouse(cfg, mantis=mantis_mode)
         )
         tracking_attempt[:] = [quality_monitor]
 
