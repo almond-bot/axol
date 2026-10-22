@@ -39,6 +39,11 @@ describe("MountRequired", () => {
     expect(onSave).not.toHaveBeenCalled()
     expect(card("Axol × Owl").getAttribute("aria-checked")).toBe("true")
     expect(container.textContent).toContain("Axol × Owl selected")
+    // The stage shows the pick, not the legacy fallback, once the pointer leaves.
+    await act(async () => {
+      card("Axol × Owl").dispatchEvent(new MouseEvent("mouseout", { bubbles: true }))
+    })
+    expect(container.querySelector(".text-lg")?.textContent).toBe("Axol × Owl")
 
     await act(async () => saveButton().click())
     expect(onSave).toHaveBeenCalledWith("owl")

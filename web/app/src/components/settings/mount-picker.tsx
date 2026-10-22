@@ -104,9 +104,10 @@ export function MountPicker({
   locked?: boolean
 }) {
   const jelly = robotModel === "mobile"
-  // The stage shows what the operator points at, else what the robot is.
+  // The stage shows what the operator points at, else the selection (the
+  // robot is Axol × Jelly while Jelly is attached), else what the robot is.
   const [hovered, setHovered] = useState<AxolModel | null>(null)
-  const staged = ROSTER[hovered ?? robotModel]
+  const staged = ROSTER[hovered ?? (jelly ? "mobile" : (mount ?? robotModel))]
 
   return (
     <div className="flex flex-col gap-3">
