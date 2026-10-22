@@ -76,14 +76,38 @@ export default function PoseViewer({
     }
     // Meshes stream in through the manager after the URDF callback; only when
     // everything is in can we size the camera to the real bounding box.
-    manager.onLoad = () => {
-      if (cancelled || !robot) return
+    // onLoad fires whenever this manager's queue drains — which is not when
+    // the robot is complete: three's FileLoader shares a request already in
+    // flight for the same URL (another viewer on the page loading the same
+    // meshes) without telling this manager, so the queue can drain with the
+    // URDF alone. Framing an empty robot puts the camera inside the model
+    // once its meshes arrive (the Canvas only reads its camera on mount).
+    // So frame once every visual holds its mesh, polling for the shared
+    // ones; after a timeout, frame whatever arrived.
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = Date.now() + 10_000
+    let framed = false
+    const frame = () => {
+      if (cancelled || framed || !robot) return
+      const visuals: { children: unknown[] }[] = []
+      robot.traverse((o) => {
+        if ((o as { isURDFVisual?: boolean }).isURDFVisual) visuals.push(o)
+      })
+      const complete = visuals.every((v) => v.children.length > 0)
+      if (!complete && Date.now() < deadline) {
+        timer = setTimeout(frame, 100)
+        return
+      }
       const scene = new Group()
       scene.rotation.x = -Math.PI / 2 // URDF is Z-up; three.js is Y-up.
       // urdf-loader resolves a second @types/three; structurally identical.
       scene.add(robot as unknown as Parameters<Group["add"]>[0])
       scene.updateWorldMatrix(true, true)
       const box = new Box3().setFromObject(scene)
+      if (box.isEmpty()) {
+        setError("the robot model has no meshes")
+        return
+      }
       const center = box.getCenter(new Vector3())
       const size = Math.max(box.getSize(new Vector3()).length(), 0.1)
       const floor = new Vector3()
@@ -93,11 +117,17 @@ export default function PoseViewer({
         if (joint.jointType === "fixed") continue
         limits[name] = { lower: Number(joint.limit.lower), upper: Number(joint.limit.upper) }
       }
+      framed = true
       setModel({ scene, robot, center, size, floor })
       onLoadedRef.current?.(limits)
     }
+    manager.onLoad = () => {
+      clearTimeout(timer)
+      frame()
+    }
     return () => {
       cancelled = true
+      clearTimeout(timer)
     }
   }, [robotModel, gripper])
 
@@ -130,7 +160,11 @@ export default function PoseViewer({
     center.z + size * 0.9 * distance,
   ]
   return (
-    <Canvas camera={{ position: camPos, fov: 40, near: size / 100, far: size * 20 }}>
+    // Keyed by the framing: a later re-frame remounts with the new camera.
+    <Canvas
+      key={`${size.toFixed(4)}:${center.toArray().map((v) => v.toFixed(4))}`}
+      camera={{ position: camPos, fov: 40, near: size / 100, far: size * 20 }}
+    >
       <ambientLight intensity={0.7} />
       <directionalLight position={[2, 4, 3]} intensity={1.6} />
       <directionalLight position={[-3, 2, -2]} intensity={0.5} />
