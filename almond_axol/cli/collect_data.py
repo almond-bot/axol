@@ -1441,6 +1441,15 @@ def _run_session(
 
     mantis_mode = isinstance(cfg.robot_config, MantisRobotConfig)
 
+    # Axol and Mantis alike: the robot and the teleop IK worker must name the
+    # same backend (MantisRobotConfig is an AxolRobotConfig).
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
+
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
     # The Mantis always has grippers, so only the real robot propagates.
@@ -1452,9 +1461,6 @@ def _run_session(
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
         adopt_robot_gripper(
             cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
-        )
-        require_matching_ik_backend(
-            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
         )
 
         # Keep the optional teleop flight recorder coherent across Python and

@@ -143,7 +143,7 @@ class MinkRobotControllerTest(unittest.TestCase):
         self.assertEqual(len(self.dispatches), 1)
 
     def test_seed_uses_previous_command_only_below_strict_resync_threshold(self):
-        cap = 0.35 - self.robot._ik_config.mink_max_joint_delta
+        cap = 0.35 - 2 * self.robot._ik_config.mink_max_joint_delta
         for distance, expected in (
             (0.2, 0.2),
             # Inside the threshold but past the windup cap: saturated.
@@ -177,8 +177,11 @@ class MinkRobotControllerTest(unittest.TestCase):
         for _ in range(30):
             self.robot.send_action(self.action)
             seeds.append(float(self.solver.solve.call_args.args[0][0]))
+            # The stored command (the next tick's gap) stays a full step
+            # clear of the resync threshold, so it never snaps back.
+            self.assertLessEqual(float(self.robot._last_ik_q[0]), 0.35 - step + 1e-6)
         self.assertTrue(all(b >= a - 1e-6 for a, b in zip(seeds, seeds[1:])))
-        self.assertAlmostEqual(seeds[-1], 0.35 - step, places=5)
+        self.assertAlmostEqual(seeds[-1], 0.35 - 2 * step, places=5)
 
     def test_current_frame_hold_reaches_solver_in_model_frame(self):
         from scipy.spatial.transform import Rotation

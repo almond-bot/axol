@@ -1442,13 +1442,16 @@ class AxolRobot(Robot):
                 else:
                     # A target the arm cannot reach (pushing into a table)
                     # winds the command up one step per tick. Saturate that
-                    # windup just inside the resync threshold, so a held
-                    # contact settles at a steady offset instead of growing
-                    # to the threshold and snapping back — a ~3 Hz command
-                    # sawtooth into the contact. Gaps below the cap (normal
-                    # tracking lag) seed from the previous command as before.
+                    # windup inside the resync threshold, so a held contact
+                    # settles at a steady offset instead of growing to the
+                    # threshold and snapping back — a ~3 Hz command sawtooth
+                    # into the contact. The solve may add one more step to
+                    # the seed, and that result is the next tick's gap, so
+                    # the cap leaves a full step of margin below resync. Gaps
+                    # below the cap (normal tracking lag) seed from the
+                    # previous command as before.
                     budget = float(self._ik_config.mink_max_joint_delta)
-                    cap = max(_MINK_RESYNC_RAD - budget, 0.0)
+                    cap = max(_MINK_RESYNC_RAD - 2.0 * budget, 0.0)
                     seed = (
                         previous
                         if float(np.max(np.abs(gap))) <= cap

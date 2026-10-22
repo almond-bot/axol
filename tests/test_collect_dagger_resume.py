@@ -407,6 +407,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             get_joint_observation=mock.Mock(return_value=joint_observation),
             send_action=mock.Mock(return_value=human_joint_action),
             action_to_dataset=mock.Mock(return_value=cartesian_action),
+            reset_cartesian_seed=mock.Mock(),
         )
         recorder = SimpleNamespace(
             publish=mock.Mock(), poll_capture_error=mock.Mock(return_value=None)
@@ -461,6 +462,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             get_joint_observation=mock.Mock(return_value=joint_observation),
             send_action=mock.Mock(return_value=human_joint_action),
             action_to_dataset=mock.Mock(return_value=cartesian_action),
+            reset_cartesian_seed=mock.Mock(),
         )
         recorder = SimpleNamespace(
             publish=mock.Mock(),
@@ -511,6 +513,9 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         self.assertNotIn(
             "left_shoulder_pitch.pos", recorder.publish.call_args_list[1].args[1]
         )
+        # Mink's seed is re-anchored when the loop starts and again at the
+        # handback, so the policy resumes from the operator's correction.
+        self.assertEqual(robot.reset_cartesian_seed.call_count, 2)
 
 
 if __name__ == "__main__":

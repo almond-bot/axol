@@ -699,6 +699,10 @@ class _DaggerControlLoop(threading.Thread):
             # the fault boundary so startup failures reach the supervisor.
             if self.limiter is not None:
                 self.limiter.seed(*self.robot.positions)
+            # Mink seeds each solve from its previous command: anchor it at
+            # the last joint send (the return-to-rest that opened the
+            # episode), not the previous episode's final policy command.
+            self.robot.reset_cartesian_seed()
 
             while not self.shutdown_event.is_set():
                 t0 = time.perf_counter()
@@ -759,6 +763,10 @@ class _DaggerControlLoop(threading.Thread):
                         # jump away from where the operator left the arms.
                         if self.limiter is not None:
                             self.limiter.seed(*self.robot.positions)
+                        # Likewise re-anchor Mink's seed at the operator's
+                        # last joint command, or a correction smaller than its
+                        # resync threshold would be walked back.
+                        self.robot.reset_cartesian_seed()
                         _logger.info("Intervention over — policy resumes.")
                     elif self.state == _STATE_POLICY and frozen_press:
                         self.state = _STATE_FROZEN
