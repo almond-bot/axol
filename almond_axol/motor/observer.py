@@ -322,12 +322,20 @@ class BusObserver:
             if self._bus.is_open:
                 return
             await self.close()
-        bus = CanBus(self._channel)
+        # Never transmits, so it can't stall — and reopening it mid-task must
+        # not clear a stall the channel's commanding bus reported.
+        bus = CanBus(self._channel, publishes_stall=False)
         bus._add_listener(self._on_message)
         # Only a started proxy becomes the observer's bus, so a failed start
-        # leaves the observer cleanly dead and the next start() retries.
-        await bus.start()
-        bus.enable_observer_mode()
+        # leaves the observer cleanly dead and the next start() retries. A
+        # start that fails or is cancelled part-way may already have spawned
+        # the proxy, and nothing else holds a reference to reap it.
+        try:
+            await bus.start()
+            bus.enable_observer_mode()
+        except BaseException:
+            await bus.close()
+            raise
         self._bus = bus
         # The new proxy's timing reducer starts empty; let the next
         # timing_snapshot() re-anchor it rather than assume a reset happened.

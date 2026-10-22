@@ -15,7 +15,9 @@ import unittest
 from unittest.mock import patch
 
 from almond_axol.constants import Joint
+from almond_axol.motor import bus as bus_mod
 from almond_axol.motor import observer as observer_mod
+from almond_axol.motor.bus import CanBus, stalled_channels
 from almond_axol.motor.observer import BusObserver
 from almond_axol.serve import robot_link
 from almond_axol.serve.robot_link import RobotLink
@@ -25,10 +27,12 @@ class _FakeBus:
     """Stands in for the Rust proxy: open until ``die()``."""
 
     instances: list[_FakeBus] = []
-    fail_start = False
+    fail_start: BaseException | None = None
+    fail_observer_mode = False
 
-    def __init__(self, channel: str) -> None:
+    def __init__(self, channel: str, *, publishes_stall: bool = True) -> None:
         self.channel = channel
+        self.publishes_stall = publishes_stall
         self.is_open = False
         self.started = False
         self.closed = False
@@ -38,13 +42,15 @@ class _FakeBus:
         pass
 
     async def start(self) -> None:
-        if _FakeBus.fail_start:
-            raise OSError("Network is down")
+        # Like the real proxy, the process exists before start() can fail.
         self.started = True
+        if _FakeBus.fail_start is not None:
+            raise _FakeBus.fail_start
         self.is_open = True
 
     def enable_observer_mode(self) -> None:
-        pass
+        if _FakeBus.fail_observer_mode:
+            raise ConnectionResetError("proxy went away")
 
     def die(self) -> None:
         self.is_open = False
@@ -57,7 +63,8 @@ class _FakeBus:
 class BusObserverReopenTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         _FakeBus.instances = []
-        _FakeBus.fail_start = False
+        _FakeBus.fail_start = None
+        _FakeBus.fail_observer_mode = False
         patcher = patch.object(observer_mod, "CanBus", _FakeBus)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -92,15 +99,55 @@ class BusObserverReopenTest(unittest.IsolatedAsyncioTestCase):
         await obs.start()
         _FakeBus.instances[0].die()
 
-        _FakeBus.fail_start = True
+        _FakeBus.fail_start = OSError("Network is down")
         with self.assertRaises(OSError):
             await obs.start()
         self.assertFalse(obs.running)
         self.assertFalse(obs.alive)
 
-        _FakeBus.fail_start = False
+        _FakeBus.fail_start = None
         await obs.start()
         self.assertTrue(obs.alive)
+
+    async def test_cancelled_or_failed_start_reaps_the_spawned_proxy(self) -> None:
+        for failure in ("cancelled", "observer_mode"):
+            with self.subTest(failure=failure):
+                _FakeBus.instances = []
+                _FakeBus.fail_start = (
+                    asyncio.CancelledError() if failure == "cancelled" else None
+                )
+                _FakeBus.fail_observer_mode = failure == "observer_mode"
+                obs = BusObserver("can_test", [Joint.SHOULDER_1])
+                with self.assertRaises((asyncio.CancelledError, ConnectionError)):
+                    await obs.start()
+                (bus,) = _FakeBus.instances
+                self.assertTrue(bus.closed, "a half-started proxy is reaped")
+                self.assertFalse(obs.running)
+        _FakeBus.fail_start = None
+        _FakeBus.fail_observer_mode = False
+
+    async def test_observer_bus_stays_out_of_the_stall_record(self) -> None:
+        obs = BusObserver("can_test", [Joint.SHOULDER_1])
+        await obs.start()
+        self.assertFalse(_FakeBus.instances[0].publishes_stall)
+
+
+class ObserverBusStallRecordTest(unittest.IsolatedAsyncioTestCase):
+    """A non-publishing CanBus can't clear a stall the channel's owner reported."""
+
+    def tearDown(self) -> None:
+        bus_mod.set_channel_stalled("can_stall_test", False)
+
+    async def test_open_and_close_leave_the_owners_stall_flagged(self) -> None:
+        bus_mod.set_channel_stalled("can_stall_test", True)
+        passive = CanBus("can_stall_test", publishes_stall=False)
+        await passive.close()
+        self.assertIn("can_stall_test", stalled_channels())
+
+    async def test_a_publishing_bus_still_clears_it(self) -> None:
+        bus_mod.set_channel_stalled("can_stall_test", True)
+        CanBus("can_stall_test")
+        self.assertNotIn("can_stall_test", stalled_channels())
 
 
 class _FakeObserver:

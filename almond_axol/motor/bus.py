@@ -114,16 +114,24 @@ class CanBus:
     is unusable (every send raises) and :attr:`stalled` stays set until
     :meth:`start` spawns a fresh proxy; the channel is also published
     process-wide through :func:`stalled_channels` until :meth:`close`.
+
+    ``publishes_stall=False`` keeps a bus that never commands the channel (a
+    passive :class:`~almond_axol.motor.BusObserver`) out of that process-wide
+    record: it cannot stall, and opening or closing it must not clear a stall
+    the channel's actual owner reported.
     """
 
-    def __init__(self, channel: str) -> None:
+    _publishes_stall = True
+
+    def __init__(self, channel: str, *, publishes_stall: bool = True) -> None:
         self._channel = channel
+        self._publishes_stall = publishes_stall
         # A fresh bus has observed no stall. Without this reset a bus that was
         # abandoned open on a dead event loop (a failed teardown that kept the
         # lockout's buses) leaves its channel flagged for the rest of the
         # process, and every later stall on the channel is invisible to
         # ``stalled_channels`` readers because the set add is idempotent.
-        set_channel_stalled(channel, False)
+        self._publish_stall(False)
         self._stalled = False
         self._socket_path = f"/tmp/axol-can-{os.getpid()}-{id(self):x}.sock"
         self._proc: subprocess.Popen[bytes] | None = None
@@ -171,12 +179,16 @@ class CanBus:
         """
         return self._stalled
 
+    def _publish_stall(self, stalled: bool) -> None:
+        if self._publishes_stall:
+            set_channel_stalled(self._channel, stalled)
+
     def _mark_stalled(self, report: str) -> None:
         """Latch the proxy's stall report and publish the channel as stalled."""
         if self._stalled:
             return
         self._stalled = True
-        set_channel_stalled(self._channel, True)
+        self._publish_stall(True)
         _logger.warning(
             "CAN %s: %s — the motors are most likely unpowered (e-stop?); "
             "commands stay off until the bus is reopened",
@@ -209,7 +221,7 @@ class CanBus:
         # A new proxy opens the interface afresh: whatever stall the previous
         # one died on is over as far as this bus can tell.
         self._stalled = False
-        set_channel_stalled(self._channel, False)
+        self._publish_stall(False)
         self._state = "starting"
         try:
             binary = find_binary()
@@ -313,7 +325,7 @@ class CanBus:
         """Close the proxy connection and reap its Rust process."""
         # A closed bus reports nothing: its stall belongs to the owner that is
         # going away, not to whoever opens this channel next.
-        set_channel_stalled(self._channel, False)
+        self._publish_stall(False)
         was_open = self._state not in ("unopened", "closed")
         # A reason recorded before close() (proxy died under us) is worth
         # keeping for the next send's error; the reader hitting EOF during
