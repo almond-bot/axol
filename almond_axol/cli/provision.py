@@ -27,6 +27,10 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       via rustup if needed; sources fetched at the installed
                       package's ref for tool installs), required by hardware
                       control (see :mod:`almond_axol.rt`).
+* shared install    — re-opens the hosted ``/opt/axol`` uv tool env to every
+                      user after the root service's ``027`` umask rebuilt it
+                      root-only, so ``axol`` keeps working from the operator's
+                      own login (see :mod:`almond_axol.utils.shared_install`).
 * CAN purge grant   — a ``sudoers.d`` drop-in letting a manual ``axol serve``
                       flap the CAN interfaces without a password when motor
                       power dies, so the e-stop's queued position commands
@@ -97,7 +101,7 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..rt import install as rt_install
-from ..utils import adb, affinity, can_purge, jetson, reboot, rtprio
+from ..utils import adb, affinity, can_purge, jetson, reboot, rtprio, shared_install
 from ..utils.host_update_lock import (
     HOLDER_READY,
     HostUpdateLockError,
@@ -467,6 +471,10 @@ def _run_locked() -> None:
     # step it is reported rather than aborting the run, and any failure makes
     # the command exit non-zero below.
     step(_RT_STEP, rt_install.run)
+    # After every step that writes into the tool env (pyzed, PyGObject) and
+    # after the reinstall a self-update just ran under serve's 027 umask:
+    # without it the operator's own `axol` fails with "command not found".
+    step("shared install permissions", shared_install.share)
     # Last, so the Argus daemon and CAN interfaces the earlier steps may have
     # (re)installed exist, and so this run leaves the host tuned now rather
     # than at its next boot. The same step is the unit's per-boot hook.
