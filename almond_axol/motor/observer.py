@@ -311,13 +311,27 @@ class BusObserver:
         self._timing_since: float | None = None
 
     async def start(self) -> None:
-        """Open the socket and start decoding. Idempotent."""
+        """Open the socket and start decoding. Idempotent while the proxy lives.
+
+        A proxy that died under the observer — its interface went away, as
+        when ``can.setup`` USB-resets the arm hub or the hub drops off USB —
+        is reaped and replaced by a fresh one. Decoded state and synced decode
+        ranges carry over: the motors on the other end did not change.
+        """
         if self._bus is not None:
-            return
-        self._bus = CanBus(self._channel)
-        self._bus._add_listener(self._on_message)
-        await self._bus.start()
-        self._bus.enable_observer_mode()
+            if self._bus.is_open:
+                return
+            await self.close()
+        bus = CanBus(self._channel)
+        bus._add_listener(self._on_message)
+        # Only a started proxy becomes the observer's bus, so a failed start
+        # leaves the observer cleanly dead and the next start() retries.
+        await bus.start()
+        bus.enable_observer_mode()
+        self._bus = bus
+        # The new proxy's timing reducer starts empty; let the next
+        # timing_snapshot() re-anchor it rather than assume a reset happened.
+        self._timing_since = None
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -327,6 +341,11 @@ class BusObserver:
     @property
     def running(self) -> bool:
         return self._bus is not None
+
+    @property
+    def alive(self) -> bool:
+        """Whether the proxy is up and forwarding frames (not just started once)."""
+        return self._bus is not None and self._bus.is_open
 
     def _on_message(self, msg: can.Message) -> None:
         handler = self._handlers.get(msg.arbitration_id)
