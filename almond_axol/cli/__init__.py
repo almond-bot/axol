@@ -15,6 +15,7 @@ from . import (
     tracker_identify,
     tracker_install,
     tracker_lighthouse,
+    tracker_lighthouse_calibrate,
     tracker_pair,
     tracker_ultimate,
 )
@@ -154,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     tracker_identify.add_parser(subparsers)
     tracker_install.add_parser(subparsers)
     tracker_lighthouse.add_parser(subparsers)
+    tracker_lighthouse_calibrate.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
     tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)

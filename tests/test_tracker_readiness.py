@@ -7,11 +7,13 @@ from unittest.mock import patch
 
 import numpy as np
 
+from almond_axol.cli import tracker_bridge
 from almond_axol.cli.tracker_bridge import _wait_for_live_inputs
 from almond_axol.tracker.base import (
     TRACKER_PAIR_MAX_SKEW_S,
     TRACKER_POSE_MAX_AGE_S,
 )
+from almond_axol.tracker.lighthouse_validation import LIGHTHOUSE_ACQUISITION_TIMEOUT_S
 
 
 class _OffsetPoseSource:
@@ -38,6 +40,50 @@ class _OffsetPoseSource:
 
 
 class ManagedTrackerReadinessTest(unittest.TestCase):
+    def test_late_lighthouse_identities_can_acquire_with_progress(self) -> None:
+        now = [0.0]
+        source = _OffsetPoseSource([{"left": (0.0, True), "right": (0.0, True)}])
+        source.tracking_quality = lambda: {
+            "status": "ready" if now[0] >= 50.0 else "checking",
+            "reasons": []
+            if now[0] >= 50.0
+            else ["Waiting for fresh station identities"],
+        }
+
+        def advance(delay: float) -> None:
+            now[0] += delay
+
+        with (
+            patch.object(
+                tracker_bridge.time, "perf_counter", side_effect=lambda: now[0]
+            ),
+            patch.object(tracker_bridge.time, "sleep", side_effect=advance),
+            patch.object(tracker_bridge._logger, "info") as progress,
+        ):
+            _wait_for_live_inputs(
+                source, "left", "right", {}, timeout_s=LIGHTHOUSE_ACQUISITION_TIMEOUT_S
+            )
+        self.assertGreaterEqual(now[0], 50.0)
+        self.assertLess(now[0], 50.1)
+        self.assertGreater(progress.call_count, 9)
+        self.assertIn(
+            "Waiting for fresh station identities", progress.call_args_list[0].args[-1]
+        )
+
+    def test_invalidated_calibration_fails_promptly_instead_of_waiting_two_minutes(
+        self,
+    ) -> None:
+        source = _OffsetPoseSource([{"left": (0.0, True), "right": (0.0, True)}])
+        source.tracking_quality = lambda: {
+            "status": "error",
+            "calibrationRequired": True,
+            "reasons": ["Lighthouse calibration invalidated"],
+        }
+        with patch.object(tracker_bridge.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "calibration is no longer valid"):
+                _wait_for_live_inputs(source, "left", "right", {}, timeout_s=120)
+        sleep.assert_not_called()
+
     def test_requires_both_tracker_bindings(self) -> None:
         source = _OffsetPoseSource([{"right": (0.0, True)}])
 

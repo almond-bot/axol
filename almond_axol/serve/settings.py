@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..tracker.trigger import validate_trigger_full_scale
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
@@ -666,6 +667,37 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
                 targets={},
                 effective_default="can_mantis_r",
+            ),
+            SettingDef(
+                key="mantis.left_trigger_full_scale",
+                label="Left trigger full squeeze",
+                type="number",
+                help=(
+                    "Normalized trigger reading at a firm full squeeze. "
+                    "Set this to the measured left endpoint if it stops "
+                    "below 1.00; 1.00 leaves the input unchanged. A lower "
+                    "value makes the left gripper reach fully closed sooner."
+                ),
+                targets={
+                    "teleop": ("mantis_left_trigger_full_scale",),
+                    "collect-data": ("mantis_left_trigger_full_scale",),
+                },
+                ui={"widget": "slider", "min": 0.5, "max": 1.0, "step": 0.01},
+            ),
+            SettingDef(
+                key="mantis.right_trigger_full_scale",
+                label="Right trigger full squeeze",
+                type="number",
+                help=(
+                    "Normalized trigger reading at a firm full squeeze. "
+                    "Leave at 1.00 when the right gripper already closes fully. "
+                    "A lower value makes it reach fully closed sooner."
+                ),
+                targets={
+                    "teleop": ("mantis_right_trigger_full_scale",),
+                    "collect-data": ("mantis_right_trigger_full_scale",),
+                },
+                ui={"widget": "slider", "min": 0.5, "max": 1.0, "step": 0.01},
             ),
             SettingDef(
                 key="teleop.frequency",
@@ -1728,6 +1760,18 @@ class SettingsStore:
                     and value is not None
                 ):
                     incoming[key] = parse_boolean(value, key=key)
+                if (
+                    key
+                    in {
+                        "mantis.left_trigger_full_scale",
+                        "mantis.right_trigger_full_scale",
+                    }
+                    and value is not None
+                ):
+                    try:
+                        incoming[key] = validate_trigger_full_scale(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{key}: {exc}") from exc
             values = incoming
         with self._lock:
             if (

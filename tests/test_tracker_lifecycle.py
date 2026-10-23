@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import numpy as np
 
@@ -230,13 +230,35 @@ def _device_configs():  # type: ignore[no-untyped-def]
 
 
 class SurviveLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Runtime config validation/isolation is covered separately. Lifecycle
+        # fixtures exercise fake native ownership without any host calibration.
+        native_config = patch.object(
+            SurviveSource,
+            "_prepare_native_config",
+            return_value=Path("/private/config.json"),
+        )
+        native_config.start()
+        self.addCleanup(native_config.stop)
+        # These tests deliberately retain mock native owners on failed teardown;
+        # use a mock reservation so one such fixture cannot lock out the suite.
+        acquire = patch(
+            "almond_axol.tracker.lighthouse_validation.acquire_lighthouse_runtime_lock"
+        )
+        release = patch(
+            "almond_axol.tracker.lighthouse_validation.release_lighthouse_runtime_lock"
+        )
+        self.acquire_runtime = acquire.start()
+        self.release_runtime = release.start()
+        self.addCleanup(acquire.stop)
+        self.addCleanup(release.stop)
+
     def test_pysurvive_uses_native_pose_epoch_on_host_monotonic_clock(self) -> None:
         source = SurviveSource()
         native_epoch = 1_700_000_000.0
 
         class Updated:
-            def Name(self) -> bytes:
-                return b"T20"
+            ptr = object()
 
             def Pose(self) -> tuple[SimpleNamespace, float]:
                 source._stop.set()
@@ -263,6 +285,7 @@ class SurviveLifecycleTest(unittest.TestCase):
         pysurvive = ModuleType("pysurvive")
         pysurvive.SimpleContext = FakeContext  # type: ignore[attr-defined]
         pysurvive.simple_close = Mock()  # type: ignore[attr-defined]
+        pysurvive.survive_simple_serial_number = Mock(return_value=b"LHR-LEFT")  # type: ignore[attr-defined]
         with (
             patch.dict(sys.modules, {"pysurvive": pysurvive}),
             patch(
@@ -274,7 +297,7 @@ class SurviveLifecycleTest(unittest.TestCase):
             source._run_pysurvive()
             source.stop()
 
-        sample = source.poses()["T20"]
+        sample = source.poses()["LHR-LEFT"]
         self.assertAlmostEqual(sample.t, 41.975, places=5)
         self.assertTrue(sample.timestamp_is_capture)
 
@@ -435,20 +458,48 @@ class SurviveLifecycleTest(unittest.TestCase):
         process = SimpleNamespace(stdout=[], poll=lambda: 17)
         with patch(
             "almond_axol.tracker.survive.subprocess.Popen", return_value=process
-        ):
+        ) as launch:
             source._run_worker(source._run_cli)
+        self.assertEqual(launch.call_args.kwargs["stderr"], subprocess.PIPE)
 
         with self.assertRaisesRegex(
             TrackerSourceError, "survive-cli exited unexpectedly.*17"
         ):
             source.poses()
 
+    def test_survive_cli_crash_retains_bounded_native_diagnostics(self) -> None:
+        source = SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+        lines = [f"Info: calibration update {i}\n" for i in range(256)]
+        lines.extend(
+            (
+                "12.0 WM0 POSE 0 0 0 1 0 0 0\n",
+                "Warning: IMU packets dropped\n",
+                "Error 5: USB read failed\n",
+            )
+        )
+        process = SimpleNamespace(stdout=lines, poll=lambda: -11)
+        with patch(
+            "almond_axol.tracker.survive.subprocess.Popen", return_value=process
+        ):
+            source._run_worker(source._run_cli)
+
+        with self.assertRaises(TrackerSourceError) as failure:
+            source.poses()
+        message = str(failure.exception)
+        self.assertIn("-11", message)
+        self.assertIn("Warning: IMU packets dropped", message)
+        self.assertIn("Error 5: USB read failed", message)
+        self.assertNotIn("calibration update 0", message)
+        self.assertNotIn("POSE", message)
+
     def test_survive_cli_maps_output_clock_but_labels_it_as_receipt(self) -> None:
         source = SurviveSource()
         source._cli_executable = Path("/attested/survive-cli")
 
         def lines():  # type: ignore[no-untyped-def]
-            yield from _device_configs()
+            yield '0 T20 CONFIG {"device_serial_number":"LHR-LEFT"}\n'
+            yield '0 T21 CONFIG {"device_serial_number":"LHR-RIGHT"}\n'
             yield "1.000 T20 POSE 0 0 0 1 0 0 0\n"
             yield "2.000 T21 POSE 0 0 0 1 0 0 0\n"
             yield "3.000 T20 POSE 0 0 0 1 0 0 0\n"
@@ -462,15 +513,34 @@ class SurviveLifecycleTest(unittest.TestCase):
             ),
             patch(
                 "almond_axol.tracker.survive.time.perf_counter",
-                side_effect=(11.1, 12.03, 13.2),
+                side_effect=self._reader_clock([10.0, 10.0, 11.1, 12.03, 13.2]),
             ),
         ):
             source._run_cli()
 
         poses = source.poses()
-        self.assertAlmostEqual(poses["LHR-00000020"].t, 13.03)
-        self.assertAlmostEqual(poses["LHR-00000021"].t, 12.03)
-        self.assertFalse(poses["LHR-00000020"].timestamp_is_capture)
+        self.assertAlmostEqual(poses["LHR-LEFT"].t, 13.03)
+        self.assertAlmostEqual(poses["LHR-RIGHT"].t, 12.03)
+        self.assertFalse(poses["LHR-LEFT"].timestamp_is_capture)
+
+    @staticmethod
+    def _reader_clock(values: list[float]):  # type: ignore[no-untyped-def]
+        """A perf_counter that scripts ``values`` for the calling thread only.
+
+        The patch replaces time.perf_counter process-wide; a background thread
+        left by another test must read the real clock instead of consuming a
+        scripted receipt and exhausting the sequence.
+        """
+        real_perf_counter = time.perf_counter
+        scripted = iter(values)
+        reader = threading.get_ident()
+
+        def perf_counter() -> float:
+            if threading.get_ident() == reader:
+                return next(scripted)
+            return real_perf_counter()
+
+        return perf_counter
 
     @staticmethod
     def _survive_cli_stream(
@@ -582,24 +652,15 @@ class SurviveLifecycleTest(unittest.TestCase):
         )
 
         def lines():  # type: ignore[no-untyped-def]
-            yield from _device_configs()
+            yield '0 T20 CONFIG {"device_serial_number":"LHR-LEFT"}\n'
+            yield '0 T21 CONFIG {"device_serial_number":"LHR-RIGHT"}\n'
             for k, output_time in enumerate(output_times):
                 yield f"{output_time:.3f} T2{k % 2} POSE 0 0 0 1 0 0 0\n"
             source._stop.set()
 
         process = SimpleNamespace(stdout=lines(), poll=lambda: 0)
-        # The patch replaces time.perf_counter process-wide; hand the scripted
-        # receipts to this thread's _run_cli only, so a background thread left
-        # by another test can't consume one and exhaust the sequence.
-        real_perf_counter = time.perf_counter
-        scripted = iter(receipts)
-        reader = threading.get_ident()
-
-        def perf_counter() -> float:
-            if threading.get_ident() == reader:
-                return next(scripted)
-            return real_perf_counter()
-
+        # The source reads the clock twice at startup before the first line.
+        perf_counter = self._reader_clock([10.0, 10.0, *receipts])
         with (
             patch(
                 "almond_axol.tracker.survive.subprocess.Popen",
@@ -627,13 +688,11 @@ class SurviveLifecycleTest(unittest.TestCase):
         self.assertLessEqual(len(stale), 52)
         self.assertTrue(all(age <= 0.015 + 1e-9 for age in published[stale[-1] + 1 :]))
         poses = source.poses()
+        self.assertLessEqual(receipts[-1] - poses["LHR-LEFT"].t, TRACKER_POSE_MAX_AGE_S)
         self.assertLessEqual(
-            receipts[-1] - poses["LHR-00000020"].t, TRACKER_POSE_MAX_AGE_S
+            receipts[-1] - poses["LHR-RIGHT"].t, TRACKER_POSE_MAX_AGE_S
         )
-        self.assertLessEqual(
-            receipts[-1] - poses["LHR-00000021"].t, TRACKER_POSE_MAX_AGE_S
-        )
-        self.assertFalse(poses["LHR-00000020"].timestamp_is_capture)
+        self.assertFalse(poses["LHR-LEFT"].timestamp_is_capture)
 
     def test_start_selects_only_manifest_attested_cli(self) -> None:
         source = SurviveSource()
@@ -675,6 +734,7 @@ class SurviveLifecycleTest(unittest.TestCase):
         self.assertTrue(source._stop.is_set())
         reader.join.assert_called_once_with(timeout=3.0)
         self.assertIsNone(source._thread)
+        self.release_runtime.assert_called_once_with(self.acquire_runtime.return_value)
 
     def test_start_retains_reader_when_interrupt_cleanup_is_uncertain(self) -> None:
         source = SurviveSource()
@@ -695,6 +755,8 @@ class SurviveLifecycleTest(unittest.TestCase):
             source.start()
 
         self.assertIs(source._thread, reader)
+        self.release_runtime.assert_not_called()
+        self.assertIs(source._runtime_lock, self.acquire_runtime.return_value)
         with self.assertRaisesRegex(TrackerSourceError, "cleanup is incomplete"):
             source.start()
 
@@ -1478,6 +1540,7 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         )
         source._note_lighthouse(0, None)  # noqa: SLF001
         source._note_lighthouse(0, "7dff627a")  # noqa: SLF001
+        source._note_info("Got OOTX packet 0 7dff627a")  # noqa: SLF001
         source._note_info("Got OOTX packet 0 406494d9")  # noqa: SLF001
         source._note_warning(  # noqa: SLF001
             "Two or more lighthouses are on channel 0; tracking is most likely going to fail."
@@ -1487,7 +1550,7 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         self.assertEqual(survey.conflicts, {0})
         self.assertEqual(survey.clashing_channels(), [0])
         self.assertEqual(survey.base_station_count, 2)
-        # Operators read the number shown on the station, not libsurvive's index,
+        # Operators use the software's channel number, not libsurvive's index,
         # and every problem ends with the fix.
         [problem] = survey.clash_problems()
         self.assertTrue(
@@ -1496,7 +1559,7 @@ class LighthouseChannelCheckTest(unittest.TestCase):
             ),
             problem,
         )
-        self.assertIn("press the channel button on the back of one station", problem)
+        self.assertIn("assign each station a distinct channel", problem)
         published = survey.to_dict()
         self.assertEqual(published["channels"], {"1": ["406494D9", "7DFF627A"]})
         self.assertEqual(published["clashingChannels"], [1])
@@ -1547,10 +1610,10 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         )
         self.assertIn(
             "the station now on channel 1 (406494D9) is not the one saved there "
-            "last time (7DFF627A), which means both are set to channel 1",
+            "last time (7DFF627A); the station may have been replaced, re-channelled, or share a channel",
             problem,
         )
-        self.assertIn("press the channel button", problem)
+        self.assertIn("assign each station a distinct channel", problem)
         published = survey.to_dict()
         self.assertEqual(published["channels"], {"1": ["406494D9"]})
         self.assertEqual(published["savedChannels"], {"1": ["7DFF627A"]})
@@ -1579,14 +1642,13 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         [none_seen] = LighthouseSurvey().problems()
         self.assertTrue(none_seen.startswith("no base station was seen"), none_seen)
 
-        # One station, no saved calibration to compare against: still point at
-        # the channel, since that is almost always the cause with two stations.
+        # A missing station is not sufficient evidence of a channel clash.
         lonely = LighthouseSurvey()
         lonely.note_channel(0)
         [problem] = lonely.problems()
         self.assertIn("only 1 of 2 base stations was seen (channel 1)", problem)
-        self.assertIn("set to the same channel as the one that was seen", problem)
-        self.assertIn("press the channel button", problem)
+        self.assertIn("check power, visibility and distinct channels", problem)
+        self.assertNotIn("almost certainly", problem)
 
         # A saved station on a channel nobody received tonight is not counted.
         stale = LighthouseSurvey()
@@ -1651,7 +1713,7 @@ class LighthouseChannelCheckTest(unittest.TestCase):
         self.assertEqual(failures, 2)
         self.assertIn("FAIL Channel 1", out.getvalue())
         self.assertIn("FAIL Trackers           1 of 2 reporting (T20)", out.getvalue())
-        self.assertIn("press the channel button", out.getvalue())
+        self.assertIn("assign each station a distinct channel", out.getvalue())
 
         lonely = LighthouseSurvey()
         lonely.note_channel(0, "406494d9")
@@ -1699,6 +1761,39 @@ class LighthouseChannelCheckTest(unittest.TestCase):
 
 
 class BridgeCleanupTest(unittest.TestCase):
+    def test_trigger_full_scales_follow_logical_sides(self) -> None:
+        source = SimpleNamespace(start=Mock(), stop=Mock())
+        reader = SimpleNamespace(close=Mock())
+        bridge = SimpleNamespace(run=AsyncMock())
+        config = SimpleNamespace(
+            backend="survive",
+            left="left",
+            right="right",
+            allow_single_side=False,
+            trigger_can_left="right-can",
+            trigger_can_right="left-can",
+            trigger_full_scale_left=0.90,
+            trigger_full_scale_right=1.0,
+        )
+        with (
+            patch("almond_axol.tracker.create_source", return_value=source),
+            patch(
+                "almond_axol.tracker.trigger.TriggerReader",
+                return_value=reader,
+            ) as reader_factory,
+            patch("almond_axol.tracker.bridge.TrackerBridge", return_value=bridge),
+        ):
+            run_configured_bridge(config)
+
+        self.assertEqual(
+            reader_factory.call_args_list,
+            [
+                call("right-can", full_scale=0.90),
+                call("left-can", full_scale=1.0),
+            ],
+        )
+        source.stop.assert_called_once_with()
+
     def test_identify_start_interrupt_still_stops_partial_backend(self) -> None:
         source = SimpleNamespace(
             start=Mock(side_effect=KeyboardInterrupt),

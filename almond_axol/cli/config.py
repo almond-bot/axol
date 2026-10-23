@@ -654,6 +654,11 @@ class TeleopCmdConfig:
     # data collection's job (`axol collect-data --mantis`). Mutually exclusive
     # with --sim.
     mantis: bool = False
+    # Normalized trigger position observed at a full physical squeeze. A
+    # value below 1.0 stretches that side's input range so a fully squeezed
+    # trigger still commands a fully closed Mantis gripper.
+    mantis_left_trigger_full_scale: float = 1.0
+    mantis_right_trigger_full_scale: float = 1.0
     arms: bool = True
     """Drive the Axol arms. Off leaves the arms and their CAN channels
     untouched (no Axol hub needed) and drives only Jelly from the headset

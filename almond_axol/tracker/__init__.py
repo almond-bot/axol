@@ -41,13 +41,19 @@ HARDWARE_FREE_BINDINGS: dict[str, tuple[str, str]] = {
 }
 
 
-def create_source(config: TrackerConfig) -> TrackerSource:
+def create_source(config: TrackerConfig, *, setup: bool = False) -> TrackerSource:
     """Instantiate the configured backend (imported lazily — the survive and
     ultimate backends require optional system/pip dependencies)."""
     if config.backend == "survive":
         from .survive import SurviveSource
 
-        return SurviveSource()
+        strict = getattr(config, "lighthouse_quality", "standard") == "strict"
+        return SurviveSource(
+            expected_stations=getattr(config, "expected_base_stations", 2),
+            allow_frame_refinement=setup,
+            enable_diagnostics=strict and not setup,
+            strict=strict,
+        )
     if config.backend == "ultimate":
         from .ultimate import UltimateSource
 

@@ -1,0 +1,123 @@
+diff --git a/include/libsurvive/survive_optimizer.h b/include/libsurvive/survive_optimizer.h
+index 4fcbc11..fb3073f 100644
+--- a/include/libsurvive/survive_optimizer.h
++++ b/include/libsurvive/survive_optimizer.h
+@@ -136,6 +136,8 @@ typedef struct survive_optimizer {
+ 	int cameraLength;
+ 	int ptsLength;
+ 	bool nofilter;
++	// Only enable with an established pose seed; calibration must retain its full support.
++	bool filter_individual_outliers;
+ 
+ 	mp_config *cfg;
+ 
+@@ -145,6 +147,7 @@ typedef struct survive_optimizer {
+ 		uint32_t total_meas_cnt;
+ 		uint32_t total_lh_cnt;
+ 		uint32_t dropped_meas_cnt;
++		uint32_t dropped_meas_lighthouse_mask;
+ 		uint32_t dropped_lh_cnt;
+ 
+ 		FLT object_up_error; int object_up_error_cnt;
+diff --git a/src/poser_mpfit.c b/src/poser_mpfit.c
+index 7ad3d3c..78921b4 100644
+--- a/src/poser_mpfit.c
++++ b/src/poser_mpfit.c
+@@ -16,6 +16,7 @@
+ #include "string.h"
+ #include "survive_async_optimizer.h"
+ #include "survive_config.h"
++#include "survive_diagnostics.h"
+ #include "survive_kalman_tracker.h"
+ #include "survive_recording.h"
+ #include "survive_reproject.h"
+@@ -94,6 +95,10 @@ typedef struct MPFITData {
+   FLT obj_up_variance, lh_up_variance, calibration_stationary_obj_up_variance, stationary_obj_up_variance;
+   FLT sensor_variance_cal;
+   bool model_velocity;
++  bool filter_individual_outliers;
++  uint64_t diagnostic_rejected_measurements, diagnostic_reported_rejections;
++  uint32_t diagnostic_rejected_channels;
++  double diagnostic_filter_report_t;
+   bool globalDataAvailable;
+   struct survive_async_optimizer *async_optimizer;
+ 
+@@ -101,6 +106,9 @@ typedef struct MPFITData {
+ } MPFITData;
+ 
+ STRUCT_CONFIG_SECTION(MPFITData)
++STRUCT_CONFIG_ITEM("mpfit-filter-individual-outliers",
++                   "Reject isolated optical residual outliers after tracking is established",
++                   false, t->filter_individual_outliers)
+ STRUCT_CONFIG_ITEM("mpfit-cal-sensor-variance", "Light sensor variance for calibration", 1e-4, t->sensor_variance_cal)
+ STRUCT_CONFIG_ITEM("mpfit-model-velocity", "Model velocity in non mpfit process", true, t->model_velocity)
+ STRUCT_CONFIG_ITEM("mpfit-record-reprojection-error", "", 0, t->record_reprojection_error)
+@@ -695,6 +703,33 @@ static void handle_results(MPFITData *d, PoserDataLight *lightData, FLT error, S
+ 	}
+ }
+ 
++/* Counts repeated uses in optimizer windows, not unique incoming light strikes.
++ * Diagnostic-only: coalesce to <=10 Hz/device without changing optical gates. */
++static void diagnostic_optical_filter(MPFITData *d, const survive_optimizer *opt, const PoserDataLight *pdl) {
++	if (!opt->filter_individual_outliers || !survive_diagnostic_enabled()) return;
++	SurviveObject *so = d->opt.so;
++	d->diagnostic_rejected_measurements += opt->stats.dropped_meas_cnt;
++	for (int lh = 0; lh < NUM_GEN2_LIGHTHOUSES; lh++) {
++		if (opt->stats.dropped_meas_lighthouse_mask & (1u << lh)) {
++			int channel = so->ctx->bsd[lh].mode;
++			if (channel >= 0 && channel < NUM_GEN2_LIGHTHOUSES)
++				d->diagnostic_rejected_channels |= 1u << channel;
++		}
++	}
++	double t = pdl->hdr.timecode / (double)so->timebase_hz;
++	if (d->diagnostic_rejected_measurements == d->diagnostic_reported_rejections ||
++		(d->diagnostic_filter_report_t > 0 && t >= d->diagnostic_filter_report_t &&
++		 t - d->diagnostic_filter_report_t < .1)) return;
++	survive_diagnostic_emit("optical_filter", so->codename,
++		",\"device_tick64\":%llu,\"rejected_measurement_uses_total\":%llu,\"rejected_measurement_uses_since_last\":%llu,\"rejected_channel_mask\":%u",
++		(unsigned long long)pdl->hdr.timecode, (unsigned long long)d->diagnostic_rejected_measurements,
++		(unsigned long long)(d->diagnostic_rejected_measurements - d->diagnostic_reported_rejections),
++		d->diagnostic_rejected_channels);
++	d->diagnostic_reported_rejections = d->diagnostic_rejected_measurements;
++	d->diagnostic_rejected_channels = 0;
++	d->diagnostic_filter_report_t = t;
++}
++
+ typedef void (*handle_results_fn)(MPFITData *d, PoserDataLight *lightData, FLT error, SurvivePose *estimate);
+ 
+ static FLT run_mpfit_find_3d_structure(MPFITData *d, PoserDataLight *pdl, SurviveSensorActivations *scene,
+@@ -712,6 +747,10 @@ static FLT run_mpfit_find_3d_structure(MPFITData *d, PoserDataLight *pdl, Surviv
+ 								  .objectUpVectorVariance =
+ 									  objectStationary ? d->stationary_obj_up_variance : d->obj_up_variance,
+ 								  .disableVelocity = d->model_velocity == false || objectStationary,
++                                  // Initial acquisition and global calibration do not have a trustworthy pose prior.
++                                  // Once established, sparse reflected/reacquired sweeps must not dominate a solve.
++                                  .filter_individual_outliers = d->filter_individual_outliers &&
++                                      so->tracker && so->tracker->stats.obs_count >= 16,
+ 								  .user = d};
+ 	// stationary_obj_up_variance;
+ 	SURVIVE_OPTIMIZER_SETUP_STACK_BUFFERS(mpfitctx, so);
+@@ -730,6 +769,7 @@ static FLT run_mpfit_find_3d_structure(MPFITData *d, PoserDataLight *pdl, Surviv
+ 	survive_release_ctx_lock(ctx);
+ 	int res = survive_optimizer_run(&mpfitctx, &result, R ? &free_R : 0);
+ 	survive_get_ctx_lock(ctx);
++	diagnostic_optical_filter(d, &mpfitctx, pdl);
+ 
+ 	FLT error = handle_optimizer_results(&mpfitctx, res, &result, &user_data, R ? &free_R : 0, out);
+ 	if (R && error > 0) {
+diff --git a/src/survive_optimizer.c b/src/survive_optimizer.c
+index 95c2da7..11df09a 100644
+--- a/src/survive_optimizer.c
++++ b/src/survive_optimizer.c
+@@ -679,9 +679,10 @@ static void filter_measurements(survive_optimizer *optimizer, FLT *deviates) {
+ 
+ 			FLT chauvenet_criterion =
+ 				linmath_chauvenet_criterion(deviates[i] * meas->variance, 0, avg_dev, optimizer->measurementsCnt);
+-			if (chauvenet_criterion < .5 && false) {
++			if (optimizer->filter_individual_outliers && chauvenet_criterion < .5) {
+ 				meas->invalid = true;
+ 				optimizer->stats.dropped_meas_cnt++;
++				optimizer->stats.dropped_meas_lighthouse_mask |= 1u << meas->light.lh;
+ 
+ 				SV_VERBOSE(105,
+ 						   "Ignoring noisy data at lh %d sensor %d axis %2d val %f (err: %7.7f/dev: %7.7f/cnt: %d) "

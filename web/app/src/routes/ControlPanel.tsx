@@ -10,6 +10,7 @@ import {
   JELLY_DEVICE_LABELS,
   OPERATIONS,
   cameraCount,
+  cameraSerials,
   canDiscoveryRequestCanRetry,
   clearOperationLockout,
   detectCameras,
@@ -107,7 +108,7 @@ type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
-  mantis_serials: { left_arm: "", right_arm: "" },
+  mantis_serials: { overhead: "", left_arm: "", right_arm: "" },
   stream_resolution: "SVGA",
   record_resolution: "SVGA",
   stream: {},
@@ -119,17 +120,12 @@ function loadCameras(): CameraSpec {
     const raw = localStorage.getItem("axolCameraSpec")
     if (raw) {
       const parsed = JSON.parse(raw)
+      const serials = { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) }
       return {
         ...DEFAULT_CAMERAS,
         ...parsed,
-        serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
-        mantis_serials: {
-          ...DEFAULT_CAMERAS.mantis_serials,
-          ...(parsed.mantis_serials ?? {
-            left_arm: parsed.serials?.left_arm ?? "",
-            right_arm: parsed.serials?.right_arm ?? "",
-          }),
-        },
+        serials,
+        mantis_serials: cameraSerials({ serials, mantis_serials: parsed.mantis_serials }, true),
         // Migrate the legacy single `resolution` to the streaming resolution.
         stream_resolution:
           parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,

@@ -33,6 +33,7 @@ import {
   type RobotStatus,
   type SessionInfo,
   type TrackerSourceReadiness,
+  type TrackingQuality,
 } from "@/lib/supervisor"
 import { CuratedForm } from "@/components/config-form"
 import type { FieldSuggestion } from "@/components/suggest-input"
@@ -174,6 +175,7 @@ export function OperationPanel({
   const wantsDatasets = runFields.some((f) => f.key === "repo_id")
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   const [trackerReadiness, setTrackerReadiness] = useState<TrackerSourceReadiness | null>(null)
+  const [trackerCheckedAt, setTrackerCheckedAt] = useState(() => Date.now() / 1000)
   const [trackerReadinessState, setTrackerReadinessState] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle")
@@ -194,9 +196,11 @@ export function OperationPanel({
     if (!connected || !mantisMode || !trackerSource || live) return
     let cancelled = false
     const refresh = () => {
+      setTrackerCheckedAt(Date.now() / 1000)
       fetchTrackerBindings()
         .then((snapshot) => {
           if (cancelled) return
+          setTrackerCheckedAt(Date.now() / 1000)
           setTrackerReadinessSource(mantisSource)
           if (snapshot.sources) {
             setTrackerReadiness(snapshot.sources)
@@ -388,6 +392,19 @@ export function OperationPanel({
       else if (!status.installed) trackerIssues.push("Repair Lighthouse support in Mantis settings")
       if (!status.udevReady) trackerIssues.push("Install the Lighthouse Vive USB permissions rule")
       if (!status.binding.complete) trackerIssues.push("Identify left + right Lighthouse trackers")
+      const validation = status.validation
+      // Mirrors collect-data: only the strict policy requires a passed,
+      // unexpired validation, and a bring-up capture is exempt.
+      if (
+        status.qualityMode === "strict" &&
+        meta.id === "collect-data" &&
+        !settings.mantis_allow_uncalibrated &&
+        (!validation?.valid ||
+          validation.status !== "passed" ||
+          (validation.expiresAt != null && validation.expiresAt <= trackerCheckedAt))
+      ) {
+        trackerIssues.push("Validate Lighthouse tracking in Mantis settings before collecting")
+      }
     } else if (trackerSource === "ultimate") {
       const status = currentTrackerReadiness.ultimate
       if (!status.nativeDependencies)
@@ -605,7 +622,7 @@ export function OperationPanel({
                   operator view (the headset-off replacement for the HUD). */}
               {/* Sim has the browser viewer, an arms-off run has no video relay, and
                   Mantis teleop is grippers-only (no cameras). Mantis collection
-                  still relays its configured wrist-camera feeds even when
+                  still relays its configured camera feeds even when
                   Lighthouse/Ultimate make the headset unnecessary. */}
               {live && (meta.episodeControl || showFeeds || showSettings) && (
                 <OperatorDeck
@@ -925,6 +942,13 @@ export function EpisodeControls({
   // the built-in run-policy set otherwise.
   const controls = policy?.controls ?? legacyControls(phase)
   const status = policy?.message ?? legacyStatus(phase)
+  const quality = policy?.trackingQuality
+  const controlBlocked = (command: string) =>
+    ((command === "s" || command === "save") && Boolean(quality?.retakeRequired)) ||
+    (command === "start" &&
+      phase !== "countdown" &&
+      quality !== undefined &&
+      (quality.status === "checking" || quality.status === "error"))
   // Which confirm-gated command is armed and awaiting its second click — the
   // panel's stand-in for the headset's double-press save/discard confirmation.
   const [armed, setArmed] = useState<string | null>(null)
@@ -968,6 +992,7 @@ export function EpisodeControls({
   const flushes = useRef(new Map<string, () => void>())
 
   function click(control: EpisodeControlSpec) {
+    if (controlBlocked(control.command)) return
     for (const flush of flushes.current.values()) flush()
     if (control.confirm && armed !== control.command) {
       setArmed(control.command)
@@ -1004,6 +1029,7 @@ export function EpisodeControls({
           {policy.notice.message}
         </div>
       )}
+      {quality && <TrackingQualityStatus quality={quality} recording={phase === "recording"} />}
       <span className="text-sm text-white/60">{displayStatus}</span>
       {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
@@ -1013,6 +1039,7 @@ export function EpisodeControls({
               variant={armed === c.command ? "destructive" : i === 0 ? "default" : "outline"}
               size="sm"
               onClick={() => click(c)}
+              disabled={controlBlocked(c.command)}
             >
               {armed === c.command ? `Confirm: ${c.label}?` : c.label}
             </Button>
@@ -1029,6 +1056,142 @@ export function EpisodeControls({
           flushes={flushes}
         />
       ))}
+    </div>
+  )
+}
+
+function TrackingQualityStatus({
+  quality,
+  recording,
+}: {
+  quality: TrackingQuality
+  recording: boolean
+}) {
+  const failed = quality.retakeRequired || quality.status === "error"
+  const ready = quality.status === "ready" && !failed
+  const controlPaused = quality.controlState === "recovering" || quality.reengageRequired
+  const reasons = quality.reasons.length
+    ? quality.reasons
+    : quality.retakeRequired && quality.lastFault
+      ? [quality.lastFault]
+      : []
+  const nativeFailure =
+    quality.nativeFailure ||
+    reasons.some((reason) =>
+      /survive-cli exited|libsurvive reader (?:failed|stopped)|pysurvive stopped/.test(reason)
+    )
+  return (
+    <div
+      role={failed ? "alert" : "status"}
+      aria-live={failed ? "assertive" : "polite"}
+      className={cn(
+        "flex flex-col gap-1 rounded-md border p-3 text-sm",
+        failed
+          ? "border-red-400/40 bg-red-400/10 text-red-200"
+          : ready && !controlPaused
+            ? "border-emerald-400/25 bg-emerald-400/5 text-emerald-200"
+            : "border-amber-400/25 bg-amber-400/5 text-amber-200"
+      )}
+    >
+      <p className="font-medium">
+        {quality.retakeRequired
+          ? "Tracking fault — retake required"
+          : failed
+            ? "Tracking quality failed"
+            : ready
+              ? controlPaused
+                ? "Gripper control paused"
+                : "Live tracking checks passed"
+              : quality.status === "checking"
+                ? "Checking tracking quality…"
+                : "Tracking quality warning"}
+      </p>
+      {reasons.map((reason, index) => (
+        <p key={`${index}:${reason}`}>{reason}</p>
+      ))}
+      {quality.retakeRequired && <p>This take cannot be saved. Discard and retake.</p>}
+      {quality.controlState === "recovering" ? (
+        <p>Gripper control is paused while tracker poses or trigger inputs recover.</p>
+      ) : quality.reengageRequired ? (
+        <p>
+          Tracking has recovered, but gripper control remains disengaged.{" "}
+          {recording || quality.retakeRequired ? "Discard this take. When Mantis is ready, " : ""}
+          Squeeze both triggers together, then release both, to start a new take.
+        </p>
+      ) : null}
+      {quality.triggersLive && !quality.triggersLive.left && (
+        <p>Left trigger heartbeat is missing. Check its power and CAN connection.</p>
+      )}
+      {quality.triggersLive && !quality.triggersLive.right && (
+        <p>Right trigger heartbeat is missing. Check its power and CAN connection.</p>
+      )}
+      {nativeFailure ? (
+        <p>
+          The tracking process stopped. Stop this collection session and restart tracking. If the
+          process keeps stopping, repair Lighthouse support and keep the session log for diagnosis.
+        </p>
+      ) : quality.calibrationRequired ? (
+        <p>
+          This tracking session requires recalibration. Stop collection and open Mantis settings →
+          Tracking → Recalibrate Lighthouse. This includes the tracking validation needed before
+          recording. Waiting for visibility alone cannot clear this fault.
+        </p>
+      ) : quality.status === "warning" ? (
+        <p>
+          Recording remains available. Review the warning and restore tracker coverage where
+          possible.
+        </p>
+      ) : quality.status === "checking" ? (
+        <p>Keep both trackers visible while the live tracking checks acquire the setup.</p>
+      ) : !ready ? (
+        <p>Restore both trackers to view and wait for the live checks to pass before recording.</p>
+      ) : (
+        <p className="text-xs">
+          Checks monitor tracking consistency; they do not certify absolute accuracy.
+        </p>
+      )}
+      {quality.faultCount > 0 && (
+        <p className="text-xs">
+          {quality.faultCount} tracking fault events since tracking started (includes setup and idle
+          time).
+        </p>
+      )}
+      {!quality.retakeRequired && quality.lastEpisodeFault && (
+        <p className="text-amber-200">Previous take needs a retake: {quality.lastEpisodeFault}</p>
+      )}
+      {quality.diagnostics && <TrackingDiagnosticStatus diagnostics={quality.diagnostics} />}
+    </div>
+  )
+}
+
+function TrackingDiagnosticStatus({
+  diagnostics,
+}: {
+  diagnostics: NonNullable<TrackingQuality["diagnostics"]>
+}) {
+  const { state, latest_path: path, error } = diagnostics
+  const message =
+    error || state === "error"
+      ? "Diagnostic capture unavailable."
+      : state === "capturing"
+        ? "Capturing tracking diagnostics. Keep this session open for 3 seconds."
+        : state === "saving"
+          ? "Saving tracking diagnostics. Keep this session open."
+          : path
+            ? "Tracking diagnostics saved. Stop this collection session and share the capture path."
+            : state === "armed"
+              ? "Automatic fault capture is ready. Collect normally until a tracking fault occurs."
+              : state === "waiting_for_ready"
+                ? "Automatic fault capture is waiting for live tracking."
+                : null
+  if (!message) return null
+  return (
+    <div className="mt-1 border-t border-current/15 pt-2 text-xs">
+      <p>{message}</p>
+      {error && <p className="break-words">{error}</p>}
+      {path && state !== "capturing" && state !== "saving" && (
+        <p className="mt-1 break-all font-mono">{path}</p>
+      )}
     </div>
   )
 }

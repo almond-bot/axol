@@ -527,7 +527,12 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
 
         left, right = require_mantis_channels(mantis_rig_channels(cfg))
         print(f"Mantis grippers only (no tracking): left={left} right={right}")
-        await run_grippers_only(left, right)
+        await run_grippers_only(
+            left,
+            right,
+            left_trigger_full_scale=cfg.mantis_left_trigger_full_scale,
+            right_trigger_full_scale=cfg.mantis_right_trigger_full_scale,
+        )
         return
 
     # What this session drives follows the CAN interfaces attached (and the
