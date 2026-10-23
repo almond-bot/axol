@@ -967,10 +967,36 @@ SETTINGS: tuple[SettingCategory, ...] = (
         key="kinematics",
         label="Kinematics",
         description=(
-            "IK solver cost weights for teleop and data collection — how the "
-            "arms trade off tracking the hands against posture and limits."
+            "Which IK solver every operation uses, and the JAX solver's cost "
+            "weights for teleop and data collection — how the arms trade off "
+            "tracking the hands against posture and limits."
         ),
         settings=(
+            SettingDef(
+                key="kinematics.backend",
+                label="IK solver",
+                type="select",
+                options=("jax", "mink"),
+                help=(
+                    "jax (default): the Pyroki/JAX solver. mink: the MuJoCo "
+                    "velocity-QP solver used by Cartesian policies — teleop "
+                    "tracking, Cartesian policy actions, and straight-line "
+                    "Cartesian return-to-rest / park paths all switch to it, "
+                    "and LeRobot sessions also run the realtime core's mink "
+                    "tracking profile. The weights below tune JAX only."
+                ),
+                # One switch for both config fields that name the backend.
+                # collect-dagger inherits collect-data's (settings_like).
+                targets={
+                    "teleop": ("kinematics.backend",),
+                    "collect-data": (
+                        f"{_KIN}.backend",
+                        f"{_ROBOT}.cartesian_controller",
+                    ),
+                    "run-policy": (f"{_ROBOT}.cartesian_controller",),
+                    "replay-dataset": (f"{_ROBOT}.cartesian_controller",),
+                },
+            ),
             SettingDef(
                 key="kinematics.pos_weight",
                 label="Position weight",

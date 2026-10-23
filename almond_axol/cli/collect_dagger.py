@@ -96,7 +96,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import (
     IKResetController,
     PolicyActionLimiter,
@@ -659,6 +659,11 @@ class _DaggerControlLoop(threading.Thread):
         performed = self.robot.send_action(action_dict)
         if self.shutdown_event.is_set():
             return None
+        recorded = performed if performed is not None else action_dict
+        if any(key not in recorded for key in self.robot.action_features):
+            # Mink returns the joint commands actually dispatched; a Cartesian
+            # dataset records their FK poses (as run-policy does).
+            recorded = self.robot.action_to_dataset(recorded)
         # Snapshot the live joint state at this tick, dated at the tick, like
         # the teleop and frozen states (and collect-data) do: the recorder
         # pairs every 60 Hz exposure with the nearest snapshot, and those must
@@ -666,11 +671,7 @@ class _DaggerControlLoop(threading.Thread):
         # observation is not that snapshot any more — its ring runs below
         # --fps and the frame set (with the joints selected at its exposure)
         # is re-served between ring frames, so its timestamp repeats.
-        self.recorder.publish(
-            self.robot.get_joint_observation(),
-            performed if performed is not None else action_dict,
-            t0,
-        )
+        self.recorder.publish(self.robot.get_joint_observation(), recorded, t0)
         return action_dict
 
     def run(self) -> None:
@@ -698,6 +699,10 @@ class _DaggerControlLoop(threading.Thread):
             # the fault boundary so startup failures reach the supervisor.
             if self.limiter is not None:
                 self.limiter.seed(*self.robot.positions)
+            # Mink seeds each solve from its previous command: anchor it at
+            # the last joint send (the return-to-rest that opened the
+            # episode), not the previous episode's final policy command.
+            self.robot.reset_cartesian_seed()
 
             while not self.shutdown_event.is_set():
                 t0 = time.perf_counter()
@@ -758,6 +763,10 @@ class _DaggerControlLoop(threading.Thread):
                         # jump away from where the operator left the arms.
                         if self.limiter is not None:
                             self.limiter.seed(*self.robot.positions)
+                        # Likewise re-anchor Mink's seed at the operator's
+                        # last joint command, or a correction smaller than its
+                        # resync threshold would be walked back.
+                        self.robot.reset_cartesian_seed()
                         _logger.info("Intervention over — policy resumes.")
                     elif self.state == _STATE_POLICY and frozen_press:
                         self.state = _STATE_FROZEN
@@ -1263,6 +1272,14 @@ def _run(
         _check_training_fps(cfg)
     if episode_time_s < 0 or fps <= 0 or teleop_hz <= 0:
         raise ValueError("Invalid episode duration or control rate")
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        # Local and remote alike: the teleop IK worker also plans the
+        # policy-side resets, so one backend must drive both.
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
 
     # Resolve and validate the destination before camera enumeration, workers,
     # the relay, or the robot can start. LeRobotDataset.resume keeps the existing
@@ -1379,7 +1396,12 @@ def _run(
             cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
         )
 
-    robot = AxolRobot(cfg.robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(cfg.robot_config, **robot_options)
     teleop = DaggerVRTeleop(cfg.teleop_config)
     teleop.set_hold_to_intervene(cfg.hold_to_intervene)
     from ..recording.datasets import (
@@ -1449,17 +1471,29 @@ def _run(
         if rerun_ip:
             init_rerun(session_name="axol_dagger", ip=rerun_ip, port=rerun_port)
 
-        # Start the IK reset worker once the policy schema has been proven. Its
-        # JAX JIT overlaps with robot connect and the teleop's own IK worker
-        # JIT. It owns collision-aware homing between episodes.
+        # Start the selected reset worker once the policy schema has been
+        # proven, overlapping preparation with robot and teleop startup.
         if remote_policy:
             vr_cfg = cfg.teleop_config.vr_teleop_config
             reset_controller = IKResetController(
                 rest_pose_left=vr_cfg.rest_pose_left,
                 rest_pose_right=vr_cfg.rest_pose_right,
+                kinematics_config=cfg.teleop_config.kinematics_config,
+                vr_teleop_config=vr_cfg,
             )
         else:
-            reset_controller = IKResetController()
+            reset_controller = IKResetController(
+                kinematics_config=(
+                    cfg.teleop_config.kinematics_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+                vr_teleop_config=(
+                    cfg.teleop_config.vr_teleop_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+            )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
@@ -1719,6 +1753,11 @@ def _run(
         _logger.info("Connecting robot...")
         robot.connect()
         robot_connected = True
+        if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+            # Local policies run Mink Cartesian actions too: pin the same
+            # rest attractor rather than Mink's all-zero default.
+            vr_cfg = cfg.teleop_config.vr_teleop_config
+            robot.set_cartesian_posture(vr_cfg.rest_pose_left, vr_cfg.rest_pose_right)
         if cfg.home_on_start or not cfg.start_from_current_pose:
             # The start-of-session home plays unsupervised; refuse it from far
             # away. A current-pose session never homes on start, so it may

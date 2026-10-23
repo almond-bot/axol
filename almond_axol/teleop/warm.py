@@ -54,6 +54,9 @@ def warm_ik(store: object | None = None) -> str:
         store = load_store()
     config = shared_config(VRTeleopConfig, "teleop", "teleop", store=store)
     kinematics = shared_config(KinematicsConfig, "teleop", "kinematics", store=store)
+    if kinematics.backend != "jax":
+        # Mink solves a QP per call: there is nothing to compile ahead.
+        return f"IK backend {kinematics.backend}: nothing to precompile"
     adopt_robot_gripper(config, shared_axol_config(store).gripper)
     # The model a session on this robot resolves (VRTeleop): Jelly when it is
     # attached and on, else the saved mount, unless one is forced.

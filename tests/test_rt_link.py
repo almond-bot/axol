@@ -125,7 +125,7 @@ class RtLinkConfigureTest(unittest.IsolatedAsyncioTestCase):
         # 10-field target slot (per-command cap); 18: no layout change — the
         # core must stop on the hub's no-ACK report (hub firmware 2.01).
         # Bump both sides together (rust/axol-rt/src/serve.rs CONFIG_PROTO).
-        self.assertEqual(link.CONFIG_PROTO, 18)
+        self.assertEqual(link.CONFIG_PROTO, 19)
 
     async def test_configure_names_a_stale_binary_when_the_core_exits(self) -> None:
         rt = self._link(_ExitedProc())

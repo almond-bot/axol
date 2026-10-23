@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from almond_axol.constants import CAN_LEFT, CAN_RIGHT
 from almond_axol.serve.commands import COMMANDS, build_argv, normalize_boolean_args
-from almond_axol.serve.settings import SettingsStore
+from almond_axol.serve.settings import SettingsStore, settings_schema
 from almond_axol.utils import certs, state_files
 
 
@@ -359,6 +359,43 @@ class DiagnosticSettingsTest(unittest.TestCase):
             for op, key in expected.items():
                 with self.subTest(op=op):
                     self.assertEqual(store.merged_args(op, {}), {key: False})
+
+    def test_ik_backend_is_one_switch_for_every_operation(self) -> None:
+        # The panel's "IK solver" sets every config field that names the
+        # backend, so robot and teleop can never disagree.
+        with tempfile.TemporaryDirectory() as directory:
+            store = SettingsStore(Path(directory) / "settings.json")
+            store.update(values={"kinematics.backend": "mink"})
+
+            both = {
+                "teleop_config.kinematics_config.backend": "mink",
+                "robot_config.cartesian_controller": "mink",
+            }
+            expected = {
+                "teleop": {"kinematics.backend": "mink"},
+                "collect-data": both,
+                "collect-dagger": both,
+                "run-policy": {"robot_config.cartesian_controller": "mink"},
+                "replay-dataset": {"robot_config.cartesian_controller": "mink"},
+            }
+            for op, want in expected.items():
+                with self.subTest(op=op):
+                    args = store.merged_args(op, {})
+                    self.assertEqual(
+                        {k: v for k, v in args.items() if v == "mink"}, want
+                    )
+                    argv = build_argv(op, args)
+                    for key in want:
+                        self.assertIn(f"--{key}", argv)
+
+        (entry,) = [
+            setting
+            for category in settings_schema()
+            for setting in category["settings"]
+            if setting["key"] == "kinematics.backend"
+        ]
+        self.assertEqual(entry["options"], ["jax", "mink"])
+        self.assertEqual(entry["default"], "jax")
 
     def test_lift_cycle_inherits_axol_channels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -228,6 +228,7 @@ class ProvisionSafetyTest(unittest.TestCase):
                 (provision.gst_install, "run", stub("gst")),
                 (provision.gst_build_zed, "run", stub("gst-build")),
                 (provision.rt_install, "run", stub("rt")),
+                (provision.shared_install, "share", stub("share")),
                 (provision, "tune_host", stub("tuning")),
             ):
                 stack.enter_context(patch.object(target, name, value))
@@ -255,6 +256,7 @@ class ProvisionSafetyTest(unittest.TestCase):
                 "gst",
                 "gst-build",
                 "rt",
+                "share",
                 "tuning",
             ],
         )
