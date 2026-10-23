@@ -38,7 +38,6 @@ import os
 import signal
 import threading
 import time
-
 from dataclasses import replace
 
 import numpy as np

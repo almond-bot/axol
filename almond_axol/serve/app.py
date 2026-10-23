@@ -39,8 +39,8 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
-from ..settings import resolve_robot_model
 from ..robot import lift_firmware
+from ..settings import resolve_robot_model
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML

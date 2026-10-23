@@ -5,6 +5,7 @@ import importlib
 import sys
 
 from ..rt import install as rt_install
+from ..teleop import warm as ik_warm
 from ..utils.dotenv import load_local_env
 from . import calibration as calibration_cmd
 from . import hub as hub_cmd
@@ -48,7 +49,6 @@ from .tune import motion as tune_motion
 from .tune import tf as tune_tf
 from .zed import driver as zed_driver
 from .zed import install as zed_install
-from ..teleop import warm as ik_warm
 
 # Commands that parse their config with draccus instead of argparse. Their
 # dotted ``--section.field`` overrides aren't compatible with argparse

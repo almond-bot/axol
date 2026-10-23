@@ -13,9 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
 import tempfile
+from pathlib import Path
 
 
 def main() -> None:

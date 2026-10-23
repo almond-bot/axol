@@ -41,7 +41,6 @@ start gesture.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
 import errno
 import json
 import logging
@@ -52,6 +51,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Protocol
 
 import numpy as np

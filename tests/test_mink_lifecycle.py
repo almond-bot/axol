@@ -10,8 +10,7 @@ import numpy as np
 from almond_axol.kinematics.config import KinematicsConfig
 from almond_axol.lerobot import rollout
 from almond_axol.teleop.config import VRTeleopConfig
-
-from .test_rollout_park import Clock, Plant
+from tests.test_rollout_park import Clock, Plant
 
 
 class LifecyclePlant(Plant):
