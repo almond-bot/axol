@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-
 # IK backends: "jax" (Pyroki, the default) and "mink" (MuJoCo velocity QP).
 KINEMATICS_BACKENDS = ("jax", "mink")
 

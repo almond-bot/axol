@@ -26,12 +26,11 @@ from almond_axol.tracker.lighthouse_validation import (
     release_lighthouse_runtime_lock,
     require_lighthouse_validation,
     save_validation_report,
-    stationary_metrics,
     setup_fingerprint,
+    stationary_metrics,
     validation_fingerprint,
     validation_snapshot,
 )
-
 
 _NATIVE_CONFIG = (
     Path(__file__).parent / "fixtures" / "libsurvive-config.native"

@@ -1,9 +1,9 @@
 """Real-model reset geometry, failure behavior, and JAX-free worker startup."""
 
-from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -19,8 +19,8 @@ from almond_axol.kinematics.mink_trajectory import (
     _ResetProblem,
     plan_mink_trajectory,
 )
-from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop import worker as worker_module
+from almond_axol.teleop.config import VRTeleopConfig
 
 
 @pytest.fixture(scope="module")
@@ -287,6 +287,7 @@ def test_real_spawned_worker_startup_reset_and_park_leg_need_no_jax(tmp_path):
 def test_teleop_rejected_plan_holds_command_and_does_not_claim_rest():
     import logging
     import threading
+
     from almond_axol.teleop.core import VRTeleopCore
 
     core = VRTeleopCore(
@@ -318,6 +319,7 @@ def test_teleop_guarded_return_enters_retry_hold_after_rejected_plan():
     import asyncio
     import logging
     from unittest.mock import AsyncMock
+
     from almond_axol.teleop.core import VRTeleopCore
 
     core = VRTeleopCore(
@@ -348,6 +350,7 @@ def test_park_rejected_plan_returns_to_the_park_instead_of_holding():
     import asyncio
     import logging
     from unittest.mock import AsyncMock
+
     from almond_axol.teleop.core import VRTeleopCore
 
     core = VRTeleopCore(
@@ -375,6 +378,7 @@ def test_blocked_hold_prompts_for_a_retry_not_a_contact():
     import asyncio
     import logging
     from unittest.mock import AsyncMock
+
     from almond_axol.teleop.core import VRTeleopCore
 
     core = VRTeleopCore(

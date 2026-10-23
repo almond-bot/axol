@@ -85,6 +85,7 @@ from ..lerobot.camera.configuration_zed import (
 from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from ..mantis.quality import EpisodeTrackingQuality, quality_ready
 from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
@@ -101,7 +102,6 @@ from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
 from ..teleop.shutdown import OUTCOME_MESSAGES, abort_on_sigint
 from ..teleop_activity import TeleopActivityMarker
-from ..mantis.quality import EpisodeTrackingQuality, quality_ready
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_control_ticks
 from ..utils.jetson_diag import TegraStatsDiag

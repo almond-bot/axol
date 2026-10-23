@@ -7,7 +7,6 @@ import pytest
 
 from almond_axol.tracker.survive_config import native_seed, parse_survive_config
 
-
 # config_save() writes the global members without outer braces, then appends
 # lighthouse objects without commas between those top-level groups. Values
 # written by json_write_float/json_write_uint32 are strings, not JSON numbers.

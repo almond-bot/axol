@@ -47,9 +47,9 @@ from .model import (
     ik_urdf_xml,
     lift_link_shift,
     shared_robot,
-    upper_arm_guard_floor,
     shared_robot_collision,
     shared_urdf,
+    upper_arm_guard_floor,
 )
 
 _logger = logging.getLogger(__name__)

@@ -43,9 +43,9 @@ if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.lerobot_types import RobotAction
 
-    from .robot.robot_axol import AxolRobot
     from ..kinematics.config import KinematicsConfig
     from ..teleop.config import VRTeleopConfig
+    from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
 

@@ -17,6 +17,6 @@ It then runs the worker's startup: both solve variants and the move to the rest 
 axol ik.warm
 ```
 
-It runs automatically as the last step of [`provision`](/cli/provision), which every install and update runs, so a robot comes back from an update ready to go. Run it by hand after pulling a development checkout, or after changing the robot model, to take the compile out of the next session's start. A model picked only for a sim run still compiles on its first use.
+It runs automatically as one of the last steps of [`provision`](/cli/provision), which every install and update runs, so a robot comes back from an update ready to go. Run it by hand after pulling a development checkout, or after changing the robot model, to take the compile out of the next session's start. A model picked only for a sim run still compiles on its first use.
 
 Set `ALMOND_IK_EXPORTS=0` to make the IK trace its solve on every start instead of reusing exports.

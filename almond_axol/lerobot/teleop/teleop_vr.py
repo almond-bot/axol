@@ -43,9 +43,8 @@ import multiprocessing.connection
 import multiprocessing.context
 import threading
 import time
-from typing import Any
-
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 from lerobot.lerobot_types import RobotAction

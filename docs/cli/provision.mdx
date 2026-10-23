@@ -24,6 +24,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
 - [`rt.install`](/cli/rt-install) — the required **`axol-rt` realtime core** hardware-control binary (Rust toolchain via rustup if needed; sources fetched at the installed package's exact ref on tool installs). Self-gates on network/toolchain availability.
 - [`ik.warm`](/cli/ik-warm) — the **IK solver's first compile** for this robot's model, so the first session after an install or update starts without the ~1 min compile. Optional: a failure only warns.
+- **shared install permissions** — on a hosted install (`/opt/axol`), re-applies the installer's `chmod -R a+rX` to the uv tool and Python trees holding the running `axol`, so the operator's own login can still run it after a control-panel self-update (which reinstalls under `axol serve`'s `027` umask and would otherwise leave `axol: command not found`). Root only, and only on the trees that actually hold this install; runs after every step that writes into the tool env.
 
 ```bash
 axol provision
