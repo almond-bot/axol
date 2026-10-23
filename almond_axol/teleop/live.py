@@ -79,13 +79,29 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="rigid_mode",
+        label="Rigid mode",
+        type="boolean",
+        help=(
+            "Locks the two grippers together as they are — position, "
+            "orientation and stroke — and one controller moves the pair as "
+            "one rigid body, position and full orientation, turning it about "
+            "its centre. Set each hand where you want it first. The "
+            "thumbsticks jog the elbows out while a grip leads and drive "
+            "Jelly once it's frozen. Also toggled by clicking both thumbsticks "
+            "together. Switching engages at once: into rigid mode led by the "
+            "lead hand, out of it with both arms (each trigger takes its "
+            "gripper back once squeezed to the held stroke)."
+        ),
+    ),
+    LiveSettingDef(
         key="box_lead_hand",
-        label="Box lead hand",
+        label="Lead hand",
         type="select",
         options=("right", "left"),
         help=(
-            "Which controller leads the pair when box mode is switched on. "
-            "The other grip can still take the lead over."
+            "Which controller leads the pair when box / rigid mode is "
+            "switched on. The other grip can still take the lead over."
         ),
     ),
     LiveSettingDef(
@@ -161,7 +177,7 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=5.0,
         unit="°",
         help=(
-            "Box mode: how far out the elbows are held, in degrees from "
+            "Box / rigid mode: how far out the elbows are held, in degrees from "
             "hanging straight down under the shoulder-wrist line (0) to out "
             "level (90). Also jogged live by pushing either thumbstick "
             "forward (further apart) or back (tucked in)."
@@ -282,6 +298,10 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
 
 _DEFS = {d.key: d for d in LIVE_SETTINGS}
 
+# The ``box_*`` settings rigid mode shares with box mode (published with
+# either gripper); every other ``box_*`` key is box mode's alone.
+_PAIR_KEYS = frozenset({"box_lead_hand", "box_elbow_out"})
+
 # Joint velocities are configured in rad/s but shown in rev/s (the unit the
 # rest of the docs use for teleop_max_vel).
 _RAD_PER_REV = 6.283185307179586
@@ -343,7 +363,14 @@ class LiveSettings:
         return callable(getattr(self._robot, "set_spring_caps", None))
 
     def _hidden(self, d: LiveSettingDef) -> bool:
-        if d.key.startswith("box_") and not self._core.box_available:
+        if d.key == "rigid_mode":
+            # The stock gripper's pair mode; the parcel gripper has box mode.
+            return not self._core.rigid_available
+        if (
+            d.key.startswith("box_")
+            and d.key not in _PAIR_KEYS
+            and not self._core.box_available
+        ):
             # Box mode exists only with the parcel gripper.
             return True
         if d.key == "gripper_torque":

@@ -1174,6 +1174,7 @@ class StickControlTest(unittest.TestCase):
 
 class _FakeCore:
     box_available = True
+    rigid_available = False
 
     def __init__(self) -> None:
         self.values = {
@@ -1249,6 +1250,7 @@ def _box_worker(leader: str = "left") -> IKWorker:
     worker._hold_elbow_fk = {}
     worker._ramp = {}
     worker._box = None
+    worker._rigid = None
     worker._box_leader = None
     worker._box_snap = None
     worker._freeze_since = {}

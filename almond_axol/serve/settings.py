@@ -352,6 +352,18 @@ def _lerobot_dataset_root() -> str:
         return "~/.cache/huggingface/lerobot"
 
 
+# Box-mode settings rigid mode (the stock gripper's pair mode) uses too:
+# shown whichever gripper is fitted.
+_PAIR_SETTINGS = frozenset(
+    {
+        "teleop.box_lead_hand",
+        "teleop.box_elbow_out",
+        "teleop.box_elbow_weight",
+        "teleop.box_elbow_speed",
+    }
+)
+
+
 def _parcel_only() -> dict[str, Any]:
     """``ui`` hint for box mode's settings: shown only while the parcel
     gripper is selected (the only gripper with box mode)."""
@@ -717,12 +729,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_lead_hand",
-                ui=_parcel_only(),
-                label="Box-mode lead hand",
+                label="Box / rigid lead hand",
                 type="select",
                 options=("right", "left"),
                 help=(
-                    "Which controller leads the pair when box mode is "
+                    "Which controller leads the pair when box mode (parcel "
+                    "gripper) or rigid mode (stock gripper) is "
                     "switched on (the pair engages straight away, led by "
                     "this hand). The other grip can still take the lead "
                     "over. Also switchable live from the headset menu."
@@ -755,11 +767,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_elbow_out",
-                ui=_parcel_only(),
-                label="Box-mode elbows out (°)",
+                label="Box / rigid elbows out (°)",
                 type="number",
                 help=(
-                    "How far out box mode holds the elbows, in degrees from "
+                    "How far out box and rigid mode hold the elbows, in degrees from "
                     "hanging straight down under the shoulder-wrist line (0) "
                     "to out level (90). The startup value; in the headset "
                     "either thumbstick forward/back jogs it live (forward = "
@@ -773,11 +784,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.box_elbow_weight",
-                ui=_parcel_only(),
-                label="Box-mode elbow hint weight",
+                label="Box / rigid elbow hint weight",
                 type="number",
                 help=(
-                    "IK weight steering box mode's elbows to the angle above "
+                    "IK weight steering box and rigid mode's elbows to the angle above "
                     "(box mode holds the grippers at 100 for position and "
                     "40 for orientation; 10 is the default). 0 "
                     "turns the hint off: the elbows are left where they fall "
@@ -1372,7 +1382,7 @@ def _rekey_nodes(
             if new_key in managed:
                 continue
             out.append({**node, "key": new_key})
-            if new_key.startswith("teleop.box_"):
+            if new_key.startswith("teleop.box_") and new_key not in _PAIR_SETTINGS:
                 out[-1].update(_parcel_only())
         else:
             children = _rekey_nodes(

@@ -1,7 +1,9 @@
 """Box-mode (bimanual carry) target geometry.
 
 Pure-NumPy helpers for the IK worker's box-mode tracking (the pose blending
-ones double for the per-arm re-engage ramp). Everything is expressed in the
+ones double for the per-arm re-engage ramp), and for rigid mode — the stock
+gripper's pair mode, which locks the two grippers together as they are
+instead of aligning them on a box (:class:`RigidState`). Everything is expressed in the
 robot's world frame (FLU:
 +x forward, +y left, +z up) using the ``(pos (3,), rot (3, 3))`` pose format
 :class:`~almond_axol.kinematics.solver.KinematicsSolver` speaks.
@@ -619,6 +621,70 @@ def box_targets(
         goal = ((goal_pos + goal_rot @ foot).astype(np.float32), goal_rot)
         f_pos, r = blend_pose(start, goal, alpha)
         out[side] = ((f_pos - r @ foot).astype(np.float32), r)
+    return out
+
+
+@dataclass
+class RigidState:
+    """Rigid-mode tracking state, established at the engage snap.
+
+    Rigid mode is the stock parallel gripper's pair mode: the operator puts
+    each gripper where they want it — position, orientation and stroke,
+    one arm at a time in ordinary teleop — and switching it on locks the
+    two together as one rigid body that a single controller moves in all
+    six degrees of freedom. Unlike :class:`BoxState` nothing is aligned at
+    the snap: the targets start exactly at the grippers' poses, so the
+    switch moves nothing.
+
+    ``center`` is the midpoint of the two mounts at the snap and ``poses``
+    each gripper's pose then. Every frame the leader's clutch-mapped motion
+    since the snap is applied to the whole pair (:func:`rigid_targets`):
+    its gripper's translation moves ``center``, and its rotation turns the
+    pair about it — the way two hands turn a tray they hold between them.
+    ``targets`` is the last frame's pair, which a lead hand-over re-snaps
+    from so the geometry carries over exactly (no FK drift baked in).
+    """
+
+    center: np.ndarray
+    poses: dict[str, Pose]
+    targets: dict[str, Pose] | None = None
+    # Wall time of the previous stick integration step (None before the first).
+    stick_t: float | None = None
+
+
+def snap_rigid(left: Pose, right: Pose) -> RigidState:
+    """Rigid-mode state for an engage snap with the grippers at these poses."""
+    poses = {
+        side: (
+            np.asarray(pose[0], dtype=np.float32).copy(),
+            np.asarray(pose[1], dtype=np.float32).copy(),
+        )
+        for side, pose in (("left", left), ("right", right))
+    }
+    center = (0.5 * (poses["left"][0] + poses["right"][0])).astype(np.float32)
+    return RigidState(center=center, poses=poses)
+
+
+def rigid_targets(
+    state: RigidState, translation: np.ndarray, rotation: np.ndarray
+) -> dict[str, Pose]:
+    """Both grippers' targets after moving the snapped pair as one rigid body.
+
+    ``translation`` (m, world) moves the pair's centre and ``rotation``
+    (world-frame ``(3, 3)``) turns the pair about that centre, so each
+    gripper keeps its pose relative to the other. Identity / zero returns
+    the snap poses.
+    """
+    rot = np.asarray(rotation, dtype=np.float32)
+    center = (state.center + np.asarray(translation, dtype=np.float32)).astype(
+        np.float32
+    )
+    out: dict[str, Pose] = {}
+    for side, (pos, r) in state.poses.items():
+        out[side] = (
+            (center + rot @ (pos - state.center)).astype(np.float32),
+            (rot @ r).astype(np.float32),
+        )
     return out
 
 

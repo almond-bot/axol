@@ -27,6 +27,7 @@ from .box import (
     BoxState,
     Faces,
     Pose,
+    RigidState,
     ToolGeometry,
     blend_pose,
     box_frame,
@@ -37,10 +38,12 @@ from .box import (
     joint_force_limit,
     pair_aligned,
     parcel_tool,
+    rigid_targets,
     rodrigues,
     rotation_angle,
     smoothstep,
     snap_box,
+    snap_rigid,
     squeeze_lean,
     swivel_step,
     tip_inward_sign,
@@ -484,6 +487,9 @@ class IKWorker:
         # Box mode (bimanual carry, see .box): the pair's state from the engage
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
+        # Rigid mode (the stock gripper's pair mode, see .box.RigidState):
+        # the same frames, leader and anchor as box mode, a different pair.
+        self._rigid: RigidState | None = None
         self._box_leader: str | None = None
         # The leader's anchor for the pair — its controller pose and its
         # gripper's FK at the box engage — kept apart from the per-arm snaps
@@ -732,25 +738,28 @@ class IKWorker:
             self._ramp = {}
             self._clear_freeze()
             self._box = None
+            self._rigid = None
             self._box_leader = None
             self._box_snap = None
             return q_current
 
         if frame.box_leader is not None:
-            return self._step_box(
+            step_pair = self._step_box if self._is_parcel() else self._step_rigid
+            return step_pair(
                 frame,
                 q_current,
                 {"left": (left_pos, left_rot), "right": (right_pos, right_rot)},
                 lp,
                 rp,
             )
-        if self._box is not None:
+        if self._box is not None or self._rigid is not None:
             # Box tracking ended without a lock-less frame in between (mode
             # switched while engaged): the per-arm path below re-engages each
             # arm — in "ramp" mode against the session snaps box mode left
             # untouched, so both arms blend back out to the mapping the
             # operator had before the box; otherwise with a fresh snap.
             self._box = None
+            self._rigid = None
             self._box_leader = None
             self._box_snap = None
             self._active = {"left": False, "right": False}
@@ -1245,6 +1254,19 @@ class IKWorker:
         arms' own (``[left, right]``).
         """
         left, right = self._solver.fk(q)
+        if not self._is_parcel():
+            # Rigid mode locks the pair as it is: there is no grasp to align
+            # into, so no "aligned" cue; the width is the mounts' separation.
+            _c, _rot, sep = box_frame(left[0], right[0])
+            return {
+                "aligned": False,
+                "width": round(sep, 3),
+                "grasp": self._box_grasp(),
+                "elbow": round(float(self._config.box_elbow_out), 1),
+                "squeeze": 0.0,
+                "trim": 0.0,
+                "trims": [0.0, 0.0],
+            }
         tool = self._box_tool()
         faces = self._box_faces()
         tilt = math.radians(self._config.box_grip_tilt)
@@ -1298,11 +1320,20 @@ class IKWorker:
         mounts themselves, the same in both grasps).
         """
         cfg = self._config
-        if getattr(cfg, "gripper", "parallel") == "parcel":
+        if self._is_parcel():
             return parcel_tool(
                 float(getattr(cfg, "box_flush_deg", 39.0)), self._box_grasp()
             )
         return URDF_TOOL
+
+    def _is_parcel(self) -> bool:
+        """True with the parcel gripper fitted: the pair mode is box mode.
+
+        Any other gripper (the stock parallel one) gets rigid mode instead
+        (:meth:`_step_rigid`); the core decides which one a session has the
+        same way (``VRTeleopCore.box_available``).
+        """
+        return getattr(self._config, "gripper", None) == "parcel"
 
     def _box_width_min(self) -> float:
         """The smallest grip width the sticks (and an engage snap) allow now.
@@ -1665,6 +1696,7 @@ class IKWorker:
         self._ramp = {}
         self._clear_freeze()
         self._box = None
+        self._rigid = None
         self._box_leader = None
         self._box_snap = None
         self._snap_ctrl = {}
@@ -1812,8 +1844,106 @@ class IKWorker:
         self._integrate_sticks(frame, box, now)
         targets = box_targets(box, center, rot, now)
         targets = self._squeeze_lean(box, targets, q_current, now)
+        return self._solve_pair(frame, q_current, targets, lp, rp, now)
+
+    def _step_rigid(
+        self,
+        frame: VRFrame,
+        q_current: np.ndarray,
+        ctrl: dict[str, tuple[np.ndarray, np.ndarray]],
+        lp: np.ndarray,
+        rp: np.ndarray,
+    ) -> np.ndarray:
+        """Rigid-mode solve: one controller moves both grippers as one rigid body.
+
+        The stock gripper's pair mode (box mode is the parcel gripper's).
+        On engage the pair is snapped exactly where it is (:func:`snap_rigid`
+        — each gripper's position and orientation as the operator left them,
+        no alignment blend, so the switch moves nothing) and the leader
+        controller's pose is anchored against its gripper. Afterwards the
+        leader drives the pair through the usual per-arm clutch mapping
+        (:func:`_relative_target_np`) with all six degrees of freedom: the
+        pair's centre follows the leader gripper's translation and the pair
+        turns about that centre by the leader's full rotation
+        (:func:`rigid_targets`), so the grippers keep their pose relative to
+        each other. The grippers' strokes are held by the core while the
+        pair is engaged. The thumbsticks only jog the elbows out
+        (:meth:`_integrate_sticks`); there is no width or grasp control. A
+        lead hand-over re-anchors the new leader against the pair's last
+        targets, so the geometry carries over unchanged.
+        """
+        leader = frame.box_leader
+        assert leader in ("left", "right")
+        cfg = self._config
+        now = time.perf_counter()
+        if self._rec is not None:
+            self._rec.set_engaged(True)
+
+        engaged = self._active["left"] and self._active["right"]
+        state = self._rigid
+        if state is None or not engaged or self._box_leader != leader:
+            # Engage snap, or the leading hand changed. A hand-over keeps
+            # the pair the leader left (its last targets); a fresh engage
+            # snaps from FK, where the arms are being held.
+            if state is not None and engaged and state.targets is not None:
+                base = state.targets
+                left_pose, right_pose = base["left"], base["right"]
+            else:
+                left_pose, right_pose = self._solver.fk(q_current)
+            self._rigid = snap_rigid(left_pose, right_pose)
+            self._box_leader = leader
+            lead_pose = self._rigid.poses[leader]
+            self._box_snap = (ctrl[leader], lead_pose)
+            self._ramp = {}
+            self._active = {"left": True, "right": True}
+            self._hold_fk = {}
+            self._hold_elbow_fk = {}
+            self._clear_freeze()
+            self._solver.set_posture_pose(q_current)
+            self._last_solve_t = None
+            return q_current
+
+        ctrl_pos, ctrl_rot = ctrl[leader]
+        assert self._box_snap is not None
+        (snap_ctrl_pos, snap_ctrl_rot), snap_fk = self._box_snap
+        lead_pos, lead_rot = _relative_target_np(
+            ctrl_pos,
+            ctrl_rot,
+            snap_ctrl_pos,
+            snap_ctrl_rot,
+            *snap_fk,
+            position_multiplier=cfg.position_multiplier,
+            rotation_multiplier=cfg.rotation_multiplier,
+        )
+        # The leader gripper's motion since the snap as a world-frame
+        # translation and rotation, applied to the whole pair about its
+        # centre.
+        turn = (lead_rot @ np.asarray(snap_fk[1], dtype=np.float32).T).astype(
+            np.float32
+        )
+        targets = rigid_targets(state, lead_pos - snap_fk[0], turn)
+        state.targets = targets
+        self._integrate_sticks(frame, state, now)
+        return self._solve_pair(frame, q_current, targets, lp, rp, now)
+
+    def _solve_pair(
+        self,
+        frame: VRFrame,
+        q_current: np.ndarray,
+        targets: dict[str, Pose],
+        lp: np.ndarray,
+        rp: np.ndarray,
+        now: float,
+    ) -> np.ndarray:
+        """Solve both arms onto a pair's gripper targets (box and rigid mode).
+
+        Adds the elbows-out hints (:meth:`_box_elbow_hints`), lets the
+        posture attractor follow ``q`` and solves at the pair's raised pose
+        weights (``_BOX_POSE_WEIGHT_SCALE``), recording the frame.
+        """
+        cfg = self._config
         elbows = self._box_elbow_hints(q_current, targets)
-        # The posture attractor follows q for the whole of box mode. Pinned at
+        # The posture attractor follows q for the whole of a pair mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
         # cost well short of the target — posture_weight 5 against pos_weight
         # 50 left the grippers 20-45 mm apart from their slots and the pair
@@ -1940,8 +2070,13 @@ class IKWorker:
             return True
         return False
 
-    def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
+    def _integrate_sticks(
+        self, frame: VRFrame, box: BoxState | RigidState, now: float
+    ) -> None:
         """Accumulate this frame's thumbstick input into ``box`` / the config.
+
+        In rigid mode (a :class:`RigidState`) only the elbows half below
+        applies: the pair is locked as it is, so left/right does nothing.
 
         Box mode's sticks do two things, and both sticks do the same, so it
         doesn't matter which hand leads: left/right sets the **width**
@@ -1982,7 +2117,7 @@ class IKWorker:
 
         x = float(np.clip(lx + rx, -1.0, 1.0))
         width_rate = x * cfg.box_width_speed  # push right = wider
-        if width_rate:
+        if width_rate and isinstance(box, BoxState):
             box.width = float(
                 np.clip(
                     box.width + dt * width_rate,

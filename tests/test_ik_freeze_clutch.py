@@ -104,6 +104,7 @@ def _step_worker() -> IKWorker:
     worker._hold_elbow_fk = {}
     worker._ramp = {}
     worker._box = None
+    worker._rigid = None
     worker._box_leader = None
     worker._box_snap = None
     worker._freeze_since = {}
