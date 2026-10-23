@@ -3,9 +3,9 @@
 SteamVR Base Station 2.0 units each broadcast on one of 16 channels and every
 station in view must use a different one; otherwise their sweeps collide and
 tracking silently degrades or drops. libsurvive detects that clash but only
-reports it in its log, so this module collects the channel/serial facts from
-the recording stream and persists the most recent survey for the control
-panel's readiness badges.
+reports it in its log, so this module collects channel/serial facts from
+the recording stream and freshly decoded OOTX packets, then persists the
+most recent survey for the control panel's readiness badges.
 
 A station only counts as *seen* when a tracker actually received its sweeps
 during the run. libsurvive also replays the stations from its saved
@@ -13,8 +13,10 @@ calibration at startup; those are kept apart in :attr:`LighthouseSurvey.saved`
 so a station that was re-channelled, unplugged or swapped since the last
 session is not mistaken for a live one, and so a different station showing up
 on a saved channel can be pointed out.
+Station-pose records alone do not prove that a serial was freshly decoded:
+the native solver can refine geometry while still using a cached identity.
 
-libsurvive numbers channels 0–15 while the base station itself displays 1–16;
+libsurvive numbers channels 0–15 while operator-facing tools use 1–16;
 :func:`display_channel` converts for operator-facing text.
 """
 
@@ -35,14 +37,22 @@ LIGHTHOUSE_SURVEY_FILE = almond_path("tracker", "lighthouse_survey.json")
 # first. Every station the operator powered must therefore be accounted for.
 EXPECTED_BASE_STATIONS = 2
 
+
+def validate_expected_stations(value: object) -> int:
+    """Validate the physical station count independently of observed coverage."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 4:
+        raise ValueError("expected base stations must be an integer from 1 to 4")
+    return value
+
+
 _CHANNEL_FIX = (
-    "press the channel button on the back of one station until its display "
-    "shows a number no other station uses, wait for it to settle, then check again"
+    "assign each station a distinct channel using SteamVR Base Station Settings "
+    "(Configure Base Station Channels), wait for it to settle, then check again"
 )
 
 
 def display_channel(channel: int) -> int:
-    """The channel number printed on / shown by the base station."""
+    """The channel number shown by operator-facing tracking tools."""
     return channel + 1
 
 
@@ -105,17 +115,34 @@ class LighthouseSurvey:
                 replaced.append(channel)
         return replaced
 
-    def problems(self) -> list[str]:
+    def problems(self, *, require_serials: bool = False) -> list[str]:
         """Operator-facing setup problems with their fix; empty when healthy."""
         problems = self.clash_problems()
         if not self.channels:
             problems.append(
                 "no base station was seen: check that every station shows a "
-                "steady green light and a channel number, and that the trackers "
+                "steady green light, and that the trackers "
                 "have a clear view of them"
             )
         elif not problems and self.base_station_count < self.expected:
             problems.append(self._missing_station_problem())
+        if require_serials:
+            identified = {
+                serial for values in self.channels.values() for serial in values
+            }
+            if len(identified) < self.expected:
+                problems.append(
+                    f"only {len(identified)} of {self.expected} distinct base-station "
+                    "serials decoded; keep the trackers visible to every station"
+                )
+            serial_channels: dict[str, list[int]] = {}
+            for channel, serials in self.channels.items():
+                for serial in serials:
+                    serial_channels.setdefault(serial, []).append(channel)
+            if any(len(channels) > 1 for channels in serial_channels.values()):
+                problems.append(
+                    "a base-station serial appeared on multiple channels; check the setup again"
+                )
         return problems
 
     def clash_problems(self) -> list[str]:
@@ -154,17 +181,14 @@ class LighthouseSurvey:
             message += (
                 f"; the station now on channel {display_channel(channel)} "
                 f"({_names(self.channels[channel])}) is not the one saved there "
-                f"last time ({_names(self.saved[channel])}), which means both "
-                f"are set to channel {display_channel(channel)}"
+                f"last time ({_names(self.saved[channel])}); the station may "
+                "have been replaced, re-channelled, or share a channel"
             )
-        else:
-            message += (
-                f". If the other {'station is' if missing == 1 else 'stations are'} "
-                "powered (steady green) it is almost certainly set to the same "
-                "channel as the one that was seen — libsurvive can only receive "
-                "one station per channel"
-            )
-        return f"{message}; {_CHANNEL_FIX}"
+            return f"{message}; {_CHANNEL_FIX}"
+        return (
+            f"{message}; check power, visibility and distinct channels on the "
+            f"missing {'station' if missing == 1 else 'stations'}"
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {

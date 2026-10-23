@@ -2,6 +2,7 @@ import { useState } from "react"
 import { CameraOff, Loader2, RotateCw } from "lucide-react"
 import {
   apiUrl,
+  cameraSerials,
   restartCameraDaemon,
   RESOLUTION_OFF,
   type BranchSel,
@@ -25,6 +26,7 @@ const AXOL_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
 ]
 
 const MANTIS_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
+  { key: "overhead", label: "Head" },
   { key: "left_arm", label: "Left Mantis" },
   { key: "right_arm", label: "Right Mantis" },
 ]
@@ -56,7 +58,7 @@ export function CamerasPanel({
   onRefresh,
 }: {
   spec: CameraSpec
-  /** Show the two-camera Mantis assignment instead of the Axol layout. */
+  /** Show the Mantis head and wrist assignments instead of the Axol layout. */
   mantisMode: boolean
   onChange: (spec: CameraSpec) => void
   /** Detected ZED devices (shared with the badge; null until first detection). */
@@ -78,12 +80,7 @@ export function CamerasPanel({
   }
 
   const cameraSlots = mantisMode ? MANTIS_CAMERA_SLOTS : AXOL_CAMERA_SLOTS
-  const serials: Partial<Record<CameraSlot, string>> = mantisMode
-    ? (spec.mantis_serials ?? {
-        left_arm: spec.serials.left_arm,
-        right_arm: spec.serials.right_arm,
-      })
-    : spec.serials
+  const serials = cameraSerials(spec, mantisMode)
   const streamResolution = spec.stream_resolution || spec.resolution || "SVGA"
   const recordResolution = spec.record_resolution || "SVGA"
   const stream = spec.stream ?? {}
@@ -149,6 +146,7 @@ export function CamerasPanel({
       onChange({
         ...spec,
         mantis_serials: {
+          overhead: next.overhead ?? "",
           left_arm: next.left_arm ?? "",
           right_arm: next.right_arm ?? "",
         },
@@ -169,7 +167,7 @@ export function CamerasPanel({
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
         {mantisMode
-          ? "Assign the two ZED cameras connected to this machine to the left and right Mantis. This mapping is stored separately from the Axol camera layout."
+          ? "Assign the ZED cameras connected to this machine to the head and the left and right Mantis. This mapping is stored separately from the Axol camera layout."
           : "Assign the ZED cameras connected to this machine to their Axol slots."}{" "}
         Then choose what each one is used for. Collect data and run policy need at least one camera
         recording; teleop streams whichever are set to the headset.

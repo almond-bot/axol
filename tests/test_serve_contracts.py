@@ -108,7 +108,9 @@ def test_fastapi_read_only_routes_without_hardware(tmp_path: Path) -> None:
         command_response = client.get("/api/commands")
         assert command_response.status_code == 200
         assert any(item["id"] == "teleop" for item in command_response.json())
-        assert client.get("/api/settings").status_code == 200
+        settings_response = client.get("/api/settings")
+        assert settings_response.status_code == 200
+        assert settings_response.json()["robotModel"] in ("classic", "mobile")
         assert client.post("/api/op/start", json={"op": "missing"}).status_code == 400
         assert client.post("/api/run", json={"command": "missing"}).status_code == 400
         assert client.get("/api/sessions/missing/log").status_code == 404

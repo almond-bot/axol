@@ -1,9 +1,8 @@
 """
 IK subprocess worker for VR teleoperation.
 
-Runs in a separate process to keep JAX off the main asyncio event loop.
-All intermediate computations stay in NumPy; the single JAX boundary is the
-``solver.ik`` call itself (matching the arm-repo pattern).
+Runs in a separate process to keep IK off the main asyncio event loop.
+Tracking and reset planning use the selected backend; Mink requires no JAX packages.
 """
 
 from __future__ import annotations
@@ -15,13 +14,15 @@ import multiprocessing.connection
 import os
 import signal
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
 
 from ..kinematics.config import KinematicsConfig
-from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
+from .absolute_pose import AbsoluteCalibration
+from .absolute_pose import matrix_to_quat_xyzw as _matrix_to_quat_xyzw
 from .box import (
     URDF_TOOL,
     BoxState,
@@ -53,9 +54,25 @@ from .box import (
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
 from .recorder import make as _recorder_make
-from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
+
+
+def _make_jax_solver(config: KinematicsConfig) -> Any:
+    # Keep this import behind backend selection, including worker startup.
+    from ..kinematics.solver import KinematicsSolver
+
+    return KinematicsSolver(config)
+
+
+# Named goals a ``("reset_path", …)`` request chains through: the configured
+# rest pose, and joint zero — the arms' natural resting pose, where they
+# settle once torqued off.
+PATH_GOALS = ("rest", "zero")
+# A path leg whose start is already this close to its goal on every joint is
+# skipped: each planned leg plays for at least ``reset_min_duration``, which
+# would otherwise hold the arms still for that long.
+_PATH_LEG_SKIP_RAD = 1e-3
 
 # Up direction of the raw VR world frame (WebXR reference space: +y is up).
 _VR_UP = np.array([0.0, 1.0, 0.0])
@@ -199,42 +216,6 @@ def _dominant_axis(x: float, y: float) -> tuple[float, float]:
     return 0.0, y
 
 
-def _matrix_to_quat_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
-    """Convert a 3x3 rotation matrix to an ``(x, y, z, w)`` quaternion."""
-    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
-    if tr > 0.0:
-        s = math.sqrt(tr + 1.0) * 2.0
-        return (
-            float(R[2, 1] - R[1, 2]) / s,
-            float(R[0, 2] - R[2, 0]) / s,
-            float(R[1, 0] - R[0, 1]) / s,
-            0.25 * s,
-        )
-    if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-        return (
-            0.25 * s,
-            float(R[0, 1] + R[1, 0]) / s,
-            float(R[0, 2] + R[2, 0]) / s,
-            float(R[2, 1] - R[1, 2]) / s,
-        )
-    if R[1, 1] > R[2, 2]:
-        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-        return (
-            float(R[0, 1] + R[1, 0]) / s,
-            0.25 * s,
-            float(R[1, 2] + R[2, 1]) / s,
-            float(R[0, 2] - R[2, 0]) / s,
-        )
-    s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-    return (
-        float(R[0, 2] + R[2, 0]) / s,
-        float(R[1, 2] + R[2, 1]) / s,
-        0.25 * s,
-        float(R[1, 0] - R[0, 1]) / s,
-    )
-
-
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     """Convert an ``(x, y, z, w)`` quaternion to a 3x3 rotation matrix (float32)."""
     x, y, z, w = float(qx), float(qy), float(qz), float(qw)
@@ -374,8 +355,8 @@ def box_joint_caps(
 class IKWorker:
     """Self-contained IK controller for the subprocess.
 
-    Snap state is numpy-only. The single JAX boundary is the ``solver.ik``
-    call inside :meth:`step`.
+    Snap state is numpy-only. The selected solver runs through ``solver.ik``
+    inside :meth:`step`.
     """
 
     def __init__(
@@ -383,19 +364,31 @@ class IKWorker:
     ) -> None:
         """Construct the IK worker.
 
-        Instantiates the :class:`KinematicsSolver` (which triggers JAX JIT
-        compilation) and initialises One Euro Filters for all VR pose streams.
+        Instantiates the selected solver and initialises pose filters for VR streams.
 
         Args:
             config:            Teleop session parameters (rest poses, frequency, filter settings).
             kinematics_config: IK solver cost weights forwarded to :class:`KinematicsSolver`.
         """
         self._config = config
-        self._solver = KinematicsSolver(kinematics_config)
+        self._mink_backend = kinematics_config.backend == "mink"
+        if self._mink_backend:
+            from ..kinematics.mink_backend import MinkKinematicsSolver
+
+            self._solver = MinkKinematicsSolver(
+                kinematics_config, solve_hz=config.ik_frequency
+            )
+        elif kinematics_config.backend == "jax":
+            self._solver = _make_jax_solver(kinematics_config)
+        else:
+            raise ValueError("kinematics backend must be 'jax' or 'mink'")
         # Elbow hints are optional (kinematics.elbow_weight == 0 disables, the
         # default): skip the whole elbow pipeline — filters, engage snapshots,
         # target math — so the solve graph never carries the cost.
-        self._use_elbow = kinematics_config.elbow_weight > 0.0
+        # Mink has no elbow task, so it never consumes them.
+        self._use_elbow = (
+            kinematics_config.elbow_weight > 0.0 and not self._mink_backend
+        )
 
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
         self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
@@ -557,7 +550,11 @@ class IKWorker:
         # toward higher manipulability over the next ~10-30 frames. Baking the
         # settling in at startup means the trajectory ends at the fixed point
         # and the first engage produces no motion.
-        q_settled = self._settle_rest_pose()
+        # Mink has no manipulability objective; keep the configured policy
+        # rest posture unchanged across policy/operator handovers.
+        q_settled = (
+            self.get_rest_q() if self._mink_backend else self._settle_rest_pose()
+        )
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
@@ -861,7 +858,8 @@ class IKWorker:
             posture = self._solver.posture_pose
             for indices in snapped:
                 posture[indices] = q_current[indices]
-            self._solver.set_posture_pose(posture)
+            if not getattr(self, "_mink_backend", False):
+                self._solver.set_posture_pose(posture)
             # An engage snap re-anchors that arm to q_current: return the
             # seed unchanged so the snap frame itself produces no motion
             # (matching the previous whole-session engage behaviour). A ramp
@@ -928,6 +926,15 @@ class IKWorker:
         self._last_solve_t = now
 
         solve_t0 = time.perf_counter()
+        solve_options = (
+            {
+                "active_sides": tuple(
+                    side for side, active in self._active.items() if active
+                )
+            }
+            if getattr(self, "_mink_backend", False)
+            else {}
+        )
         q_new = self._solver.ik(
             q_current,
             left_pose=(tl_pos, tl_rot),
@@ -935,6 +942,7 @@ class IKWorker:
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
             delta_scale=delta_scale,
+            **solve_options,
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         # A frozen arm must not move at all: the hold-pose target keeps the
@@ -1026,7 +1034,8 @@ class IKWorker:
                     _elbow(side) if self._use_elbow else None,
                 )
                 posture[indices] = q_current[indices]
-            self._solver.set_posture_pose(posture)
+            if not getattr(self, "_mink_backend", False):
+                self._solver.set_posture_pose(posture)
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -1192,6 +1201,20 @@ class IKWorker:
     ) -> list[np.ndarray]:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
+        if getattr(self, "_mink_backend", False):
+            from ..kinematics.mink_trajectory import plan_mink_trajectory
+
+            return plan_mink_trajectory(
+                self._solver,
+                q_current,
+                q_target,
+                speed=cfg.reset_speed,
+                rate=cfg.frequency,
+                min_duration=cfg.reset_min_duration,
+                collision_margin=cfg.mink_reset_collision_margin,
+            )
+        from .trajectory import plan_collision_aware_trajectory
+
         return plan_collision_aware_trajectory(
             self._solver,
             q_current,
@@ -1205,6 +1228,36 @@ class IKWorker:
             collision_weight=cfg.reset_collision_weight,
             max_iterations=cfg.reset_max_iterations,
         )
+
+    def path_goal(self, name: str) -> np.ndarray:
+        """Full (N,) joint vector for a named path goal (see :data:`PATH_GOALS`)."""
+        if name == "rest":
+            return self.get_rest_q()
+        if name == "zero":
+            return np.zeros(self._solver.num_joints, dtype=np.float32)
+        raise ValueError(f"unknown path goal {name!r} (expected one of {PATH_GOALS})")
+
+    def compute_path_trajectory(
+        self, q_current: np.ndarray, goals: Sequence[str]
+    ) -> list[np.ndarray]:
+        """Chain collision-aware legs through named goals, in order.
+
+        Every leg is planned before anything plays, so a caller that loses
+        this worker mid-move (a stop that kills the IK subprocess) still has
+        the whole path. Each leg starts where the previous one ends; a leg
+        already at its goal is skipped rather than played as a still hold.
+        """
+        traj: list[np.ndarray] = []
+        q = np.asarray(q_current, dtype=np.float32)
+        for name in goals:
+            goal = self.path_goal(name)
+            if float(np.max(np.abs(goal - q))) < _PATH_LEG_SKIP_RAD:
+                continue
+            leg = self.compute_reset_trajectory(q, goal)
+            traj.extend(leg)
+            if leg:
+                q = np.asarray(leg[-1], dtype=np.float32)
+        return traj
 
     def set_config(self, key: str, value: object) -> None:
         """Live-update one :class:`VRTeleopConfig` field (``("set", …)`` message).
@@ -1232,6 +1285,12 @@ class IKWorker:
             # re-snap, so the arms blend into the new configuration.
             self._box = None
         setattr(self._config, key, coerced)
+
+    def set_lift(self, raised: float) -> None:
+        """The live lift height (``("lift", raised)`` message): where the
+        collision checks put the deck and lower column (see
+        :meth:`KinematicsSolver.set_lift`)."""
+        self._solver.set_lift(raised)
 
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
@@ -1731,9 +1790,11 @@ class IKWorker:
         self._suspect = None
         self._last_solve_t = None
         self._reset_pose_filters()
-        # step() pins posture to q_current on each engage; an explicit reset
-        # restores the default rest-pose attractor.
+        # JAX pins posture on engage; Mink keeps its rest attractor throughout
+        # a policy/teleop cycle. Both clear history at the reset boundary.
         self._solver.set_posture_pose(self.get_rest_q())
+        if getattr(self, "_mink_backend", False):
+            self._solver.reset_tracking_state()
 
     # -- Internal -----------------------------------------------------------
 
@@ -2022,7 +2083,9 @@ class IKWorker:
         from the first touch.
         """
         cfg = self._config
-        if cfg.box_elbow_weight <= 0.0:
+        if cfg.box_elbow_weight <= 0.0 or getattr(self, "_mink_backend", False):
+            # Mink has no elbow task (nor elbow_swivel); its rest posture
+            # attractor steers the swivel instead.
             return None
         angle = math.radians(cfg.box_elbow_out)
         swivel = self._solver.elbow_swivel(q_current)
@@ -2327,6 +2390,36 @@ class IKWorker:
         self._last_mapped_quat[side] = out_quat
         return out_pos, out_quat
 
+    def absolute_reply_base_msg(self) -> dict[str, Any] | None:
+        """:attr:`abs_base_msg` plus the live calibration while engaged.
+
+        The ``"calibration"`` entry (:meth:`AbsoluteCalibration.to_message`)
+        is present only while an engage fit is active, so a reply to any
+        disengaged frame withdraws it: the core must never map later tracker
+        poses through a fit the next engage is about to replace.
+        """
+        msg = self.abs_base_msg
+        if not (
+            self._abs_active
+            and self._abs_base is not None
+            and isinstance(msg, dict)
+            and "rejected" not in msg
+        ):
+            return msg
+        R_wb, t_wb = self._abs_base
+        calibration = AbsoluteCalibration(
+            base=(np.asarray(t_wb, dtype=np.float64), np.asarray(R_wb, np.float64)),
+            tcp={side: self._tcp_transforms.get(side) for side in ("left", "right")},
+            offset={
+                side: (
+                    np.asarray(self._abs_offset[side][0], dtype=np.float64),
+                    np.asarray(self._abs_offset[side][1], dtype=np.float64),
+                )
+                for side in ("left", "right")
+            },
+        )
+        return {**msg, "calibration": calibration.to_message()}
+
     @staticmethod
     def _encode_tcp_msg(
         left: tuple[np.ndarray, np.ndarray],
@@ -2362,6 +2455,34 @@ class IKWorker:
         p_b = R_wb.T @ (p_w - t_wb)
         R_b = R_wb.T @ R_w
         return p_b.astype(np.float32), R_b.astype(np.float32)
+
+    def raw_tcp_mapping(self) -> dict[str, Any] | None:
+        """Export the current engage's rigid raw tracker→base TCP mapping.
+
+        Collection applies it on receipt, before virtual IK and its filters.
+        Ordinary robot teleoperation still consumes the usual solved reply.
+        """
+        if not self._abs_active or self._abs_base is None:
+            return None
+        rotation, position = self._abs_base
+        offsets = {}
+        for side in ("left", "right"):
+            mount_pos, mount_rot = self._tcp_transforms.get(
+                side, (np.zeros(3), np.eye(3))
+            )
+            engage_pos, engage_rot = self._abs_offset[side]
+            offsets[side] = (
+                mount_pos + mount_rot @ engage_pos,
+                mount_rot @ engage_rot,
+            )
+        message = self._encode_tcp_msg(offsets["left"], offsets["right"])
+        message["base"] = [*map(float, position), *_matrix_to_quat_xyzw(rotation)]
+        for side in ("left", "right"):
+            message[f"shoulder_{side}"] = list(
+                map(float, self._solver.shoulder_positions[side])
+            )
+        message["reach_limit"] = float(self._solver.config.reach_soft_start)
+        return message
 
     def _note_raw(self, raw_l: np.ndarray, raw_r: np.ndarray, t_eff: float) -> None:
         """Fold a good frame into the raw-tracking state (position + EMA velocity)."""
@@ -2677,14 +2798,48 @@ class IKWorker:
 # ---------------------------------------------------------------------------
 
 
+def configure_ik_process(backend: str = "jax") -> None:
+    """Set up this process the way the IK runs it (``backend``: the
+    kinematics backend; the XLA flag only matters to JAX).
+
+    Confine the JAX solve to a single core's worth of compute. The per-arm IK
+    is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
+    core for each solve; combined with the worker's nice(-10) boost, that
+    burst preempts the control loop's CAN round-trip and the video relay on
+    every step — exactly the engaged-only send/act latency spikes and grainy
+    frames seen in `collect-data`, which (unlike teleop) has no spare core
+    headroom once the relay's raw-frame branch is running. Single-threaded XLA
+    is no slower for a problem this small and leaves the real-time loop alone.
+
+    Must run before the first JAX op (backend init reads XLA_FLAGS lazily).
+    The flags are part of the compilation cache's key, so anything that
+    precompiles for the worker (:mod:`.warm`) calls this too.
+    """
+    xla = os.environ.get("XLA_FLAGS", "")
+    if backend == "jax" and "xla_cpu_multi_thread_eigen" not in xla:
+        os.environ["XLA_FLAGS"] = f"{xla} --xla_cpu_multi_thread_eigen=false".strip()
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+
 def run_ik_worker(
     conn: multiprocessing.connection.Connection,
     config: VRTeleopConfig,
     kinematics_config: KinematicsConfig,
     q_current_left: np.ndarray | None = None,
     q_current_right: np.ndarray | None = None,
+    record_raw_tcp: bool = False,
 ) -> None:
     """IK subprocess entry point.
+
+    Startup sends ``("ready", q, left_indices, right_indices, startup_traj)``,
+    or ``("startup_error", reason)`` and exits when the planner rejects the
+    startup move (nothing has moved).
 
     Message protocol (after the ``("ready", …)`` handshake):
 
@@ -2694,10 +2849,17 @@ def run_ik_worker(
     - ``("set", key, value)``          → *(no reply)* — live update of one
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
-    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
     - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
+    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
     - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
       an explicit joint target for the second (zero) leg of a guarded park.
+    - ``("reset_path", q_current, goals)`` → ``("reset_traj", last, traj)`` —
+      one trajectory chained through named goals (``"rest"`` / ``"zero"``,
+      see :meth:`IKWorker.compute_path_trajectory`); ``last`` is the final
+      goal's joint vector.
+    - A ``reset`` / ``reset_path`` the planner rejects (Mink: limits,
+      self-collision, unreached endpoint) replies ``("reset_error", reason)``
+      without motion; the worker stays up for a retry.
     - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
       joint vector at the robot's measured arm positions (7 arm joints per
       side; any gripper element past index 6 is ignored) and clear the engage
@@ -2707,6 +2869,10 @@ def run_ik_worker(
       after a policy has moved the arms, the worker's own last solution is
       stale, and engaging against it would drag the robot back toward it.
     - ``None``                         → exit
+
+    Absolute replies add the base transform and current TCP target. With
+    ``record_raw_tcp``, a fifth item exports the engage calibration so Mantis
+    collection can map each raw received sample without waiting for IK.
     """
     # Ctrl-C is owned by the parent, which first disables physical outputs and
     # then sends the pipe sentinel / terminate / kill sequence. Terminal and
@@ -2715,25 +2881,7 @@ def run_ik_worker(
     # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    # Confine the JAX solve to a single core's worth of compute. The per-arm IK
-    # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
-    # core for each solve; combined with this process's nice(-10) boost, that
-    # burst preempts the control loop's CAN round-trip and the video relay on
-    # every step — exactly the engaged-only send/act latency spikes and grainy
-    # frames seen in `collect-data`, which (unlike teleop) has no spare core
-    # headroom once the relay's raw-frame branch is running. Single-threaded XLA
-    # is no slower for a problem this small and leaves the real-time loop alone.
-    # Must be set before the first JAX op (backend init reads XLA_FLAGS lazily).
-    _xla = os.environ.get("XLA_FLAGS", "")
-    if "xla_cpu_multi_thread_eigen" not in _xla:
-        os.environ["XLA_FLAGS"] = f"{_xla} --xla_cpu_multi_thread_eigen=false".strip()
-    for _var in (
-        "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    ):
-        os.environ.setdefault(_var, "1")
+    configure_ik_process(getattr(kinematics_config, "backend", "jax"))
 
     try:
         os.nice(-10)
@@ -2764,7 +2912,18 @@ def run_ik_worker(
         for i, gi in enumerate(worker.right_indices):
             q_start[gi] = q_current_right[i]
 
-    startup_traj = worker.compute_reset_trajectory(q_start, q_rest)
+    # Start through zero — the arms' natural resting pose, which the session
+    # start check has already confirmed they are near — so the move out to the
+    # rest pose always follows the same planned path.
+    try:
+        startup_traj = worker.compute_path_trajectory(q_start, ("zero", "rest"))
+    except (RuntimeError, ValueError) as exc:
+        # Mink refuses paths it cannot validate (limits, self-collision, an
+        # unreached endpoint). Nothing has moved: tell the parent why instead
+        # of dying with a bare exit code.
+        _logger.error("Startup move rejected: %s", exc)
+        conn.send(("startup_error", str(exc)))
+        return
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(
@@ -2784,25 +2943,63 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "set":
                 worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "lift":
+                worker.set_lift(float(msg[1]))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":
+                try:
+                    if len(msg) not in (2, 3):
+                        raise ValueError(
+                            "reset requires current joints and an optional goal"
+                        )
+                    q_current = np.asarray(msg[1], dtype=np.float32)
+                    q_target = (
+                        np.asarray(msg[2], dtype=np.float32)
+                        if len(msg) == 3
+                        else q_rest
+                    )
+                    if (
+                        q_current.shape != q_rest.shape
+                        or q_target.shape != q_rest.shape
+                        or not np.isfinite(q_current).all()
+                        or not np.isfinite(q_target).all()
+                    ):
+                        raise ValueError(
+                            "reset requires finite current/target joint vectors"
+                        )
+                    traj = worker.compute_reset_trajectory(q_current, q_target)
+                except (RuntimeError, ValueError) as exc:
+                    # Reject the entire plan while retaining the worker and its
+                    # last command. The parent keeps torque and can retry from
+                    # a hand-guided measured pose.
+                    conn.send(("reset_error", str(exc)))
+                    continue
+                worker.reset()
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
+            elif isinstance(msg, tuple) and msg[0] == "reset_path":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                q_target = (
-                    np.asarray(msg[2], dtype=np.float32) if len(msg) == 3 else q_rest
-                )
+                goals = tuple(msg[2]) if len(msg) == 3 else ()
                 if (
-                    len(msg) not in (2, 3)
+                    len(msg) != 3
+                    or not goals
+                    or any(g not in PATH_GOALS for g in goals)
                     or q_current.shape != q_rest.shape
-                    or q_target.shape != q_rest.shape
                     or not np.isfinite(q_current).all()
-                    or not np.isfinite(q_target).all()
                 ):
                     raise ValueError(
-                        "reset requires finite current/target joint vectors"
+                        "reset_path requires a finite current joint vector and "
+                        f"named goals from {PATH_GOALS}"
                     )
-                traj = worker.compute_reset_trajectory(q_current, q_target)
+                try:
+                    traj = worker.compute_path_trajectory(q_current, goals)
+                except (RuntimeError, ValueError) as exc:
+                    # Same contract as "reset": a rejected plan moves nothing.
+                    conn.send(("reset_error", str(exc)))
+                    continue
                 worker.reset()
+                q_target = worker.path_goal(goals[-1])
                 q = traj[-1].copy() if traj else q_target.copy()
                 conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, tuple) and msg[0] == "sync":
@@ -2830,8 +3027,17 @@ def run_ik_worker(
                     # Absolute (Mantis) mode replies carry the engage-calibrated
                     # base transform (for the headset's URDF overlay) and the
                     # base-frame TCP targets (recorded per dataset row by Mantis
-                    # data collection) alongside the joint solution.
-                    conn.send(("q", q.copy(), worker.abs_base_msg, worker.last_tcp_msg))
+                    # callers that consume solved targets) alongside joints.
+                    # Raw collection instead uses the rigid mapping below.
+                    reply = (
+                        "q",
+                        q.copy(),
+                        worker.absolute_reply_base_msg(),
+                        worker.last_tcp_msg,
+                    )
+                    if record_raw_tcp:
+                        reply += (worker.raw_tcp_mapping(),)
+                    conn.send(reply)
                 else:
                     # Relative-mode replies pair the joint solution with the
                     # gripper-pair status (box-mode "aligned" cue), refreshed

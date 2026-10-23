@@ -48,6 +48,37 @@ left_arm, right_arm = q[:7], q[7:]  # ARM_JOINTS order, ready for motion_control
 q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 ```
 
+## Robot models
+
+The bundled URDFs live in `almond_axol/kinematics/urdf/`, one per version. All but `axol.urdf` are generated from the Onshape exports by `scripts/build_urdfs.py`. They share the body and arm meshes in `meshes/jelly/` and keep only their own parts in `meshes/<version>/`:
+
+| File | Version | Joints besides the 14 arm joints |
+|---|---|---|
+| `axol.urdf` | Axol Legacy, the original model (the default) | none |
+| `axol_standalone.urdf` | Axol standalone: the shoulder bar and head camera, nothing below | fingers |
+| `axol_ox_cart.urdf` | Axol on the Ox cart | the cart's lift (`lift`), fingers |
+| `axol_owl.urdf` | Axol on the Owl mount: a column on a foot plate | fingers |
+| `axol_jelly.urdf` | Axol on Jelly, picked automatically when Jelly is enabled | `base_x`, `base_y`, `base_yaw` (the base in the plane, for simulators), the two-stage lift (`lift`, `lift_2`), wheels, fingers |
+| `axol_jelly_parcel.urdf` | the same with the parcel gripper, when `axol.gripper` is `parcel` | as above, with a hinged plate per gripper |
+
+**One model for everything.** Each generated file is the full robot: IK, the sim viewer, the headset overlay, the control panel's viewer and physics simulators all load it. With every body joint at zero the torso root (`root`) is the world origin, so poses match the classic `axol.urdf`. IK loads it through `almond_axol.kinematics.model.ik_urdf`, which:
+
+- **freezes every joint but the arms':** the base, lift, fingers and wheels stay at zero, so the lifts are fully raised.
+- **collides capsule-friendly pieces instead of each part's hull:** the custom `<ik_collision>` elements, which importers ignore. These are the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck and the Owl foot plate as strips, and each gripper's jaws as one body over their whole motion.
+
+**Picking the version.** With Jelly enabled the robot is Axol on Jelly. Otherwise it is the mount picked in the control panel's Robot tab (**Choose your Axol**), saved as `kinematics.mount`: `classic` (legacy, the default), `standalone`, `ox_cart` or `owl`. Each picks the body IK keeps the arms clear of: the Ox cart's lift column, and the Owl mount's column and its foot plate (six thin strips, kept off the hard upper-arm guard since they sit under the arms' path). On Jelly, IK also collides the deck (three strips, kept off the hard upper-arm guard like the Owl foot). It follows the lift: the lift carries the arms down while the deck stays on the ground, so teleop forwards the height the lift reports and IK moves the deck and the lower column up toward the arms by it. Until the lift first reports a homed height, IK takes it as fully raised; if the readings stop, it keeps the last height. IK keeps the Ox cart's lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and IK does not see it. `kinematics.robot_model` still forces a version outright.
+
+**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere the URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`, a revolute `*_plate_joint` over a half turn, 0 = alongside the jaw). The parcel gripper has no wrist cameras, so its model carries only the head camera frames. It is on Jelly only: the other versions keep the parallel gripper whichever gripper is fitted.
+
+All of them share the same arm chain, so forward kinematics match. Every generated model carries camera optical frames — `left_wrist_camera_optical`, `right_wrist_camera_optical` (parallel gripper only), `head_camera_left_optical`, `head_camera_right_optical` — in the ROS optical convention (+z along the optical axis, +x image right, +y image down).
+
+**In a physics simulator.** Mesh paths are relative, so the files import without a ROS package:
+
+- **Joints:** every moving part. The Jelly base drives through `base_x`, `base_y` and `base_yaw` (the x-drive's omni rollers are not modelled, so plain wheels cannot strafe). Each finger pair is one joint (`left_finger_1_joint`, `right_finger_1_joint`) with the second finger mimicking it. Importers that ignore `<mimic>` see the mimicked joints as independent: command them with the same value.
+- **Joint friction and drives:** each arm joint carries `AxolConfig`'s measured friction as `<dynamics friction>` (Coulomb) and `damping` (viscous), per arm. The motors' impedance gains are on the same joint as `<drive stiffness damping>` (`kp` in N·m/rad, `kd` in N·m·s/rad). URDF has no drive-gain element, so this is a custom one that importers ignore: read it and set each joint's position-drive stiffness and damping after import. The controller-only terms `j_eff` and `kd_host` are left out.
+- **Masses:** arm masses and centres of mass are `AxolConfig`'s tuned values: the arms weigh exactly what gravity compensation models. Wrist 3's lump is split across the gripper parts, keeping its total and CoM. The body, head, wheel and gripper-part masses are estimates, listed in each `Body`'s `masses` and each gripper's `wrist_parts` in the generator; replace them with measured values. In MuJoCo, compile with `fusestatic="false"`: fusing fixed-jointed links misplaces their centres of mass.
+- **Cameras:** attach Isaac Sim cameras to the `*_optical` links with ROS camera axes. The wrist cameras (ZED X One S fisheye) sit at the projection centre from Stereolabs' camera model, rolled so the gripper is at the bottom of the image as in real frames; render them with the factory fisheye (Kannala-Brandt) calibration, not a pinhole model. The head camera (ZED X Mini Wide) frames are likewise each lens's projection centre from Stereolabs' model, 7.2 mm behind its front cover, 50 mm apart.
+
 ## `KinematicsSolver` interface
 
 | Member | Description |

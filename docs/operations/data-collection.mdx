@@ -12,7 +12,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)) and the selected device connected: **Axol**, or **Mantis** with its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) set up (setup complete under **Mantis settings → Tracking**, and an approved factory or measured tracker→TCP transform for both sides).
-- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Left Mantis / Right Mantis layout.
+- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Head / Left Mantis / Right Mantis layout. Both can record the head stereo camera and both wrists together.
 - **A Meta Quest** with the VR TLS certificate authorized once — for Axol, and for Mantis with the Quest source. Lighthouse/Ultimate Mantis collects with no headset.
 
 <Tip>
@@ -70,7 +70,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
 
     <Steps>
       <Step title="Select Mantis and check its settings">
-        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, and at least one **Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**.
+        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, the [rig trigger endpoints](/mantis/hardware#testing-the-triggers-and-grippers) checked under **Triggers**, and at least one **Head / Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**. For stereo head recording, enable both **L** and **R** under **Record**.
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
@@ -95,7 +95,7 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
       </Step>
 
       <Step title="Treat any tracking or input break as a failed take">
-        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check. Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
+        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check; the panel then shows why the take was not saved (see [Driving from the panel](#driving-from-the-panel)). Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
       </Step>
     </Steps>
 
@@ -104,10 +104,10 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
     ```bash
     axol collect-data --mantis true --mantis_source lighthouse \
       --repo_id myorg/mantis-pick --task "Pick the part" \
-      --robot_config.cameras "{left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+      --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
+    The `overhead` slot is the head camera and records both stereo eyes as `overhead_left` / `overhead_right`; omit any camera slots you do not use. Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
   </Tab>
 </Tabs>
 
@@ -119,7 +119,7 @@ For Axol and Quest-source Mantis, episodes can be driven from the Quest controll
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **engage** tracking from rest; once engaged, each grip **toggles its own arm** between tracking and frozen (a frozen arm holds its pose and grasp) |
+| 1 | Left grip | Press both grips (1 + 2) together to **engage** tracking from rest; once engaged, each grip **toggles its own arm** between tracking and frozen (a frozen arm holds its pose and grasp). With **Hold grips to engage** on, hold a grip to move that arm — either grip alone, from rest too — and release to freeze it |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
@@ -183,6 +183,8 @@ Collection resumes from an existing dataset at `--root`; an aborted session that
 The Axol flow above assumes the headset is on your face; managed Lighthouse/Ultimate does not require one. When you launch from the [control panel](/guides/control-panel), it doubles as an operator display and can take the same episode decisions for either profile.
 
 The panel mirrors the **camera feeds** the headset receives (with a fullscreen toggle for a proper operator display) and an **Episode control** box carrying the phase, the episode number, the saved count, and the buttons that make sense right now: **Start recording** (a 3-second countdown mirroring the in-headset one, so you can pick the controllers back up; click again to cancel), **Save episode**, and **Discard episode** — the last two click-to-confirm, standing in for the controller's double-press. During a contact hold a **Return to rest** button appears, which does what **X** does: replan the return from wherever you left the arms.
+
+A take that ends without being saved — refused by the Mantis quality gate, emptied by a camera-capture failure, ended before its first dataset row, or refused by the recorder at save — leaves a red explanation in the Episode control box. It stays through the return to **Ready** until the next take starts recording, so a lost take never reads as a saved one; the same reason is in the log.
 
 The controller stays live the whole time — the panel is a parallel input, and whichever arrives first ends the take. Anything you arm on the controller (the confirmation popup, the record countdown) is mirrored into the panel too, so the dashboard follows a controller-driven session as well as a panel-driven one. See [Episode controls](/guides/control-panel#episode-controls).
 

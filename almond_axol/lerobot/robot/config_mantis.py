@@ -19,8 +19,9 @@ class MantisRobotConfig(AxolRobotConfig):
     observation options, so recorded datasets keep the robot schema — but the
     hardware behind it is :class:`~almond_axol.robot.Mantis`: one Damiao
     gripper per CAN bus and virtual arm joints that echo the commanded IK
-    targets. Cameras are the wrist slots only (``left_arm`` / ``right_arm``,
-    mounted on the handheld grippers); there is no overhead camera.
+    targets. Cameras use the same ``overhead`` head/scene slot and
+    ``left_arm`` / ``right_arm`` wrist slots as Axol, including both eyes of
+    a stereo head camera.
     """
 
     left_channel: str = CAN_MANTIS_LEFT

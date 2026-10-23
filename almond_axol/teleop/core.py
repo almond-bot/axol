@@ -21,6 +21,9 @@ Threading contract (identical for both adapters):
   - The control-loop thread calls :meth:`compute_output` once per step — the
     *only* place the smoothing filters are advanced, so it must run at the
     steady control rate, not the slower/jittery IK rate.
+  - Mantis Cartesian collection also maps incoming raw TCP samples on the VR
+    receive thread. Its immutable engage calibration and capture snapshot are
+    fenced against late worker replies with a lock and an epoch.
 The few cross-thread float writes (``max_vel`` / ``engage_time`` set on the IK
 thread and read on the control loop; ``reset_interp`` touched by both; the
 pose heartbeat ``_last_frame_time`` set on the VR thread and read on the IK
@@ -41,8 +44,10 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, Joint
+from ..constants import ARM_JOINTS, AxolModel, Joint, urdf_path
 from ..robot.control import ContactWatchdog
+from ..settings import resolve_gripper, resolve_robot_model
+from .absolute_pose import AbsoluteCalibration
 from .config import VRTeleopConfig
 from .filter import (
     AlphaSmoothFilter,
@@ -51,8 +56,10 @@ from .filter import (
     TrapezoidalFilter,
 )
 from .recorder import make as _recorder_make
+from .tcp import AbsoluteTCPMapping
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
+_RAW_TCP_MAX_AGE_S = 0.15  # same capture-age contract as managed tracker input
 
 # The arm joints box mode's squeeze cap (``VRTeleopConfig.box_squeeze_torque``)
 # applies to. In the side-clamp poses — arms hanging or reaching forward,
@@ -123,6 +130,10 @@ _AUTO_ENGAGE_WINDOW_S = 1.0
 # back only once it comes within this much (normalized stroke) of the held
 # value or crosses it, so a relaxed trigger can't drop what the pair held.
 _GRIP_CATCH_TOL = 0.05
+# Largest gap (rad, any arm joint) a shutdown park accepts between the planned
+# zero-leg trajectory's ends and the pose it was planned from / its goal. A
+# plan outside it is refused rather than played (``_check_park_plan``).
+_PARK_PLAN_TOLERANCE_RAD = 0.05
 
 
 def _sticks_neutral(frame: object) -> bool:
@@ -160,17 +171,33 @@ class TCPPoseSnapshot:
         )
 
 
+def _split_calibration(
+    base_msg: object,
+) -> tuple[object, AbsoluteCalibration | None]:
+    """Separate the worker's engage calibration from an absolute base message.
+
+    The rest of the base message is broadcast to the headset's URDF overlay
+    as is, so the calibration (see ``IKWorker.absolute_reply_base_msg``) is
+    removed from a copy rather than passed along.
+    """
+    if not isinstance(base_msg, dict) or "calibration" not in base_msg:
+        return base_msg, None
+    rest = dict(base_msg)
+    return rest, AbsoluteCalibration.from_message(rest.pop("calibration"))
+
+
 def _is_absolute_reply(result: object) -> bool:
     """Whether an IK-worker reply is the absolute (Mantis) mode tuple.
 
-    Absolute mode answers ``("q", q, base_msg, tcp_msg)``; relative mode
-    answers ``(q, status)`` (see :meth:`VRTeleopCore._unpack_solution`), whose
+    Absolute mode answers ``("q", q, base_msg, tcp_msg)`` with an optional
+    fifth raw-mapping item; relative mode answers ``(q, status)`` (see
+    :meth:`VRTeleopCore._unpack_solution`), whose
     first element is an array — so the tag must be type-checked before it is
     compared, or numpy would turn the comparison into an elementwise one.
     """
     return (
         isinstance(result, tuple)
-        and len(result) == 4
+        and len(result) in (4, 5)
         and isinstance(result[0], str)
         and result[0] == "q"
     )
@@ -234,6 +261,11 @@ def wait_for_ik_ready(
                 "(solver build, rest-pose settle, and startup trajectory)."
             )
     msg = conn.recv()
+    if isinstance(msg, tuple) and msg and msg[0] == "startup_error":
+        raise RuntimeError(
+            f"IK worker could not plan the startup move: {msg[1]}. Nothing "
+            "moved; guide the arms toward zero (or rest) and start again."
+        )
     if not (isinstance(msg, tuple) and msg and msg[0] == "ready"):
         raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
     return msg
@@ -249,6 +281,9 @@ class VRTeleopCore:
         broadcast_tracking: Callback ``(enabled: bool) -> None`` that pushes the
             engage state to the headset. Safe to call before the VR server
             exists (the adapter's implementation guards that).
+        robot_model: Axol version the IK solver runs (``KinematicsConfig.
+            robot_model``); names the URDF the headset overlay loads. ``None``
+            infers it from whether Jelly is enabled.
         broadcast_mode: Optional callback ``(key: str, value) -> None`` fired
             on the IK thread whenever a live setting changes (see
             :meth:`set_live`), so the adapter can push the new state to the
@@ -266,8 +301,21 @@ class VRTeleopCore:
         broadcast_tracking: Callable[[bool], None],
         broadcast_mode: Callable[[str, object], None] | None = None,
         broadcast_json: Callable[[dict], None] | None = None,
+        robot_model: str | None = None,
+        *,
+        record_raw_tcp: bool = False,
     ) -> None:
         self.config = config
+        # Resolved here, not per broadcast: it may read the settings file.
+        model = resolve_robot_model(robot_model)
+        self._urdf_file = urdf_path(
+            model,
+            gripper=(
+                resolve_gripper(config.gripper)
+                if model is AxolModel.MOBILE
+                else "parallel"
+            ),
+        ).name
         self._logger = logger
         self._broadcast = broadcast_tracking
         self._broadcast_mode = broadcast_mode
@@ -275,6 +323,16 @@ class VRTeleopCore:
         # absolute (Mantis) mode to stream the calibrated base + joint solution
         # for the headset's URDF overlay.
         self._broadcast_json = broadcast_json
+        if record_raw_tcp and not config.absolute_mode:
+            raise ValueError("Raw TCP recording requires absolute Mantis mapping")
+        self._record_raw_tcp = record_raw_tcp
+        # Only Mantis Cartesian collection uses the receive-thread mapping.
+        # Epoch + lock fence late IK replies against reset, faults and a new
+        # engage; the normal robot control/solver path remains unchanged.
+        self._raw_tcp_lock = threading.Lock()
+        self._raw_tcp_epoch = 0
+        self._raw_tcp_mapping: AbsoluteTCPMapping | None = None
+        self._raw_tcp_tracking_lost = False
 
         dt = 1.0 / config.frequency
         # ik_alpha is specified as a per-tick blend at the historical 120 Hz
@@ -300,16 +358,16 @@ class VRTeleopCore:
 
         # Raw IK solution (full URDF vector) + per-arm joint indices into it.
         self.q: np.ndarray | None = None
-        # Host-clock capture time of the VR pose behind the latest IK target
-        # (``VRFrame.t_host``). Mantis recording stamps dataset rows with this so
-        # they align to when the hand was actually at the pose, not to the
-        # control-loop tick that consumed it. ``None`` until the first solve
-        # (or when the transport doesn't provide capture times).
+        # Host-clock capture time (VRFrame.t_host), paired with raw TCP in
+        # Mantis collection or the latest IK target in normal teleoperation.
+        # Recording preserves when the hand was actually at the pose instead
+        # of stamping the control-loop tick that consumed it.
         self.last_pose_host_ts: float | None = None
         # Per-side validity carried by WebXR/managed tracker frames. Dataset
         # collection uses it to refuse a take when one hand is being held from
         # stale tracking while the other still moves.
         self.last_tracking: dict[str, bool] = {"left": False, "right": False}
+        self._tracking_quality_sample: tuple[dict[str, Any], float] | None = None
         # Per-side Mantis trigger-node liveness. Quest/legacy VRFrame senders
         # inherit True defaults; a managed tracker bridge explicitly marks a
         # side False once its 100 Hz CAN heartbeat becomes stale.
@@ -322,6 +380,11 @@ class VRTeleopCore:
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
+        # Absolute (Mantis) mode: the calibration behind the active engage fit,
+        # as the IK worker applies it. Present only while the worker reports an
+        # active fit; Mantis recording maps raw tracker poses through it (see
+        # calibrated_pose_snapshot).
+        self.abs_calibration: AbsoluteCalibration | None = None
         # Last engage rejection reason the IK worker reported (logged once per
         # distinct reason; see _handle_engage_rejection).
         self._last_engage_rejection: str | None = None
@@ -330,7 +393,7 @@ class VRTeleopCore:
         # Keeping the lists received over IPC out of shared state also prevents
         # either thread from mutating a sample another thread is consuming.
         self.last_tcp_snapshot: TCPPoseSnapshot | None = None
-        # Monotonic (``time.perf_counter``) time of the last IK reply whose
+        # Monotonic (``time.perf_counter``) time of the last published sample whose
         # ``tcp_msg`` *differed* from the previous one — i.e. when the
         # published TCP last took a new value. A frozen tracker / stalled IK
         # keeps replying with an identical TCP, so consumers (Mantis data
@@ -387,6 +450,12 @@ class VRTeleopCore:
         # always deliberate; cleared once engaged, so an operator who froze
         # both arms mid-task can resume either with a single click.
         self._require_both_engage: bool = True
+        # Dead-man scheme (``config.hold_to_engage``): a grip that was held
+        # when a forced disengage landed (reset, stale stream, contact) must
+        # be released once before it can engage its arm again, so an arm
+        # never resumes on its own the moment the disengage lifts.
+        self._l_inhibit: bool = False
+        self._r_inhibit: bool = False
         # Absolute tracker poses can snap when optical tracking returns. A
         # lost side therefore freezes both arms and blocks re-engagement until
         # the core itself has consumed a fully released frame followed by a
@@ -471,10 +540,28 @@ class VRTeleopCore:
         # trajectory is adopted, so ``is_resetting`` has no false window
         # while the IK worker plans (planning can take seconds).
         self._reset_dispatching: bool = False
+        # Why the IK worker refused the last reset plan (Mink validates the
+        # whole path and rejects it rather than playing it); cleared when the
+        # next reset is dispatched. guarded_return reads it to tell a refused
+        # plan from a finished move.
+        self._reset_error: str | None = None
         # Set by cancel_reset() while a dispatch is in flight: the planning
         # round trip can't be interrupted, so the dispatch drops its result
         # instead of adopting a trajectory the caller no longer wants.
         self._reset_cancel: bool = False
+        # Shutdown park (see :meth:`begin_park`). While set, the owner's park
+        # owns the arms: headset reset presses and grips are ignored, every
+        # reset leg plays with the grippers held at the grasp that was
+        # commanded when the park began (``_park_grippers``), and
+        # ``_reset_goal`` selects whether the next latched reset plans to the
+        # rest pose or to all-zero joints (:meth:`request_zero`).
+        self._parking: bool = False
+        self._park_grippers: tuple[float, float] | None = None
+        self._reset_goal: str = "rest"
+        # Why the last reset dispatch failed to adopt a plan (``None`` while
+        # none has): a park reads it after each leg, since the guarded
+        # return cannot tell a refused plan from a finished move.
+        self.reset_error: str | None = None
 
         # IK pipeline pause (set while the arms are moved out-of-band, e.g.
         # hand-guided under gravity compensation). While paused the IK loop
@@ -491,6 +578,11 @@ class VRTeleopCore:
         # the block can't engage the instant it lifts.
         self._engage_blocked: bool = False
         self._engage_release_required: bool = False
+        # A managed tracker bridge holds its lock request high until the core
+        # acknowledges engagement. If that request arrives during a blocked
+        # return, tell the bridge to withdraw it; otherwise the core waits for
+        # a low frame while the bridge waits forever for tracking=True.
+        self._last_engage_rejection_t: float | None = None
 
         # Arrival time of the most recent raw VR frame (written on the VR
         # server thread in note_frame_reset, read on the IK thread). Drives
@@ -522,6 +614,13 @@ class VRTeleopCore:
         self, q_init: np.ndarray, left_indices: list[int], right_indices: list[int]
     ) -> None:
         """Adopt the IK worker's initial solution + per-arm joint index maps."""
+        if self._parking:
+            # A fresh worker handshake (a disconnected session enabled again)
+            # is the only exit from shutdown-park mode.
+            self._parking = False
+            self._park_grippers = None
+            self._reset_goal = "rest"
+            self.reset_error = None
         self._hold_target(np.asarray(q_init, dtype=np.float32))
         self.left_indices = left_indices
         self.right_indices = right_indices
@@ -597,13 +696,164 @@ class VRTeleopCore:
         :meth:`_maybe_disengage_stale`).
         """
         self._last_frame_time = time.perf_counter()
-        if reset and not self._prev_reset:
+        if reset and not self._prev_reset and not self._parking:
             self._reset_latched = True
         self._prev_reset = reset
 
     def request_reset(self) -> None:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
+        self._reset_goal = "rest"
         self._reset_latched = True
+        self._invalidate_raw_tcp()
+
+    def note_tracking_quality(self, frame: object) -> None:
+        """Retain raw-frame diagnostics even while the IK worker is busy."""
+        quality = getattr(frame, "tracking_quality", None)
+        if isinstance(quality, dict):
+            self._tracking_quality_sample = (dict(quality), time.perf_counter())
+
+    def _invalidate_raw_tcp(self, *, tracking_lost: bool = False) -> None:
+        if not self._record_raw_tcp:
+            return
+        with self._raw_tcp_lock:
+            # Latch a loss only when there is an engagement to end. Invalid
+            # frames keep arriving while rigs are set down or tracking is
+            # still being checked; re-latching then would disengage (and
+            # broadcast tracking=false) on every IK iteration.
+            engaged = self._raw_tcp_mapping is not None or (
+                self.left_enabled or self.right_enabled
+            )
+            self._raw_tcp_epoch += 1
+            self._raw_tcp_mapping = None
+            self.last_tcp_snapshot = None
+            self.last_pose_host_ts = None
+            self._raw_tcp_tracking_lost |= tracking_lost and engaged
+
+    def note_raw_tcp_frame(self, frame: object) -> None:
+        """Publish a calibrated raw Mantis sample without waiting for IK.
+
+        Called on receipt, after host-clock conversion. Missing/late captures
+        are never restamped, and any invalid tracking frame invalidates the
+        engage anchor even if it recovers while the solver is busy.
+        """
+        if not self._record_raw_tcp:
+            return
+        flags = self._validated_tracking_flags(frame)
+        quality = getattr(frame, "tracking_quality", None)
+        quality_failed = isinstance(quality, dict) and quality.get("status") == "error"
+        if not all(flags.values()) or quality_failed:
+            self._invalidate_raw_tcp(tracking_lost=True)
+            return
+        if getattr(frame, "reset", False):
+            self._invalidate_raw_tcp()
+            return
+        try:
+            with self._raw_tcp_lock:
+                self._publish_raw_tcp_locked(frame)
+        except ValueError as exc:
+            self._invalidate_raw_tcp(tracking_lost=True)
+            self._logger.warning("Raw tracker TCP rejected: %s", exc)
+
+    def _publish_raw_tcp_locked(self, frame: object) -> None:
+        mapping = self._raw_tcp_mapping
+        if (
+            mapping is None
+            or not (self.left_enabled and self.right_enabled)
+            or self._engage_blocked
+            or self.is_resetting
+            or self._ik_paused
+        ):
+            return
+        stamp = getattr(frame, "t_host", None)
+        now = time.perf_counter()
+        if stamp is None or not 0.0 <= now - stamp <= _RAW_TCP_MAX_AGE_S:
+            return
+        previous = self.last_tcp_snapshot
+        if (
+            previous is not None
+            and previous.pose_host_ts is not None
+            and stamp <= previous.pose_host_ts
+        ):
+            return
+        self._publish_tcp_pose(mapping.map_frame(frame), stamp)
+        self.last_pose_host_ts = stamp
+
+    def _adopt_raw_tcp_mapping(
+        self, message: dict[str, Any] | None, epoch: int, frame: object
+    ) -> None:
+        if not self._record_raw_tcp or message is None:
+            return
+        with self._raw_tcp_lock:
+            if epoch != self._raw_tcp_epoch or self._raw_tcp_tracking_lost:
+                return
+            if (
+                not (self.left_enabled and self.right_enabled)
+                or self._engage_blocked
+                or self.is_resetting
+                or self._ik_paused
+            ):
+                return
+            if self._raw_tcp_mapping is None:
+                self._raw_tcp_mapping = AbsoluteTCPMapping.from_message(message)
+                # The engage reply is normally immediate (no solve). Use its
+                # actual sample only if still fresh; the next incoming sample
+                # will take over without waiting for any subsequent reply.
+                self._publish_raw_tcp_locked(frame)
+
+    def tracking_quality(self) -> dict[str, Any] | None:
+        sample = self._tracking_quality_sample
+        if sample is None:
+            return None
+        quality, received_at = sample
+        result = dict(quality)
+        if time.perf_counter() - received_at > 0.5:
+            result["status"] = "error"
+            result["reasons"] = [
+                "Tracking diagnostics stopped arriving. Restore the tracker connection."
+            ]
+        return result
+
+    def begin_park(self) -> None:
+        """Enter shutdown-park mode (the owner, before its teardown park).
+
+        From here until a fresh worker handshake (:meth:`set_solution`) the
+        park owns the arms: tracking is disengaged, the grips and the
+        headset's reset button are ignored, and every reset leg the owner
+        latches (:meth:`request_reset`, then :meth:`request_zero`) plays
+        with the grippers held at their last *commanded* value instead of
+        ramping open — a parked arm may still be holding something, and the
+        grasp force lives in the commanded-vs-measured gap, so the snapshot
+        is taken once, here, from the command stream. A reset already playing
+        (an X press, the startup move) has its gripper ramp frozen at the
+        same snapshot, so it can't keep opening the grippers only for the
+        zero leg to close them again. Safe from any thread.
+        """
+        last = self._last_cmd
+        if last is not None:
+            self._park_grippers = (float(last[7]), float(last[15]))
+        else:
+            self._park_grippers = (float(self.l_grip), float(self.r_grip))
+        # Flag first, then freeze: the IK thread re-checks the flag after it
+        # adopts a plan, so whichever side runs second freezes the ramp.
+        self._parking = True
+        self.reset_interp.freeze_grippers(*self._park_grippers)
+
+    def request_zero(self) -> None:
+        """Latch a collision-aware move of both arms to all-zero joints.
+
+        The second leg of the shutdown park, once :meth:`request_reset` has
+        brought the arms home. Only valid in shutdown-park mode: zero is a
+        torque-off pose, not a teleop one. Safe from any thread.
+        """
+        if not self._parking:
+            raise RuntimeError("request_zero() needs begin_park() first")
+        self._reset_goal = "zero"
+        self._reset_latched = True
+
+    @property
+    def is_parking(self) -> bool:
+        """True from :meth:`begin_park` until a fresh worker handshake."""
+        return self._parking
 
     @property
     def box_available(self) -> bool:
@@ -750,6 +1000,7 @@ class VRTeleopCore:
         so no new dispatch can start, then this. Safe from any thread.
         """
         self._reset_latched = False
+        self._reset_goal = "rest"
         self._reset_cancel = True
         self.reset_interp.clear()
 
@@ -798,6 +1049,7 @@ class VRTeleopCore:
         :meth:`resume_ik`. Safe to call from any thread.
         """
         self._ik_paused = True
+        self._invalidate_raw_tcp()
 
     def resume_ik(self) -> None:
         """Resume the IK loop after :meth:`pause_ik`.
@@ -833,6 +1085,7 @@ class VRTeleopCore:
         """
         self._engage_release_required = True
         self._engage_blocked = True
+        self._invalidate_raw_tcp()
 
     def unblock_engage(self) -> None:
         """Lift :meth:`block_engage`.
@@ -841,6 +1094,23 @@ class VRTeleopCore:
         both-grips squeeze. Safe to call from any thread.
         """
         self._engage_blocked = False
+
+    def _reject_engage_request(self, frame: object) -> None:
+        """Tell a managed bridge to lower a lock request refused by a gate."""
+        if not (bool(frame.l_lock) and bool(frame.r_lock)):
+            self._last_engage_rejection_t = None
+            return
+        if self._broadcast_json is None:
+            return
+        now = time.perf_counter()
+        # Retry on a persistent high request in case the bridge was
+        # reconnecting when the first rejection was broadcast.
+        if (
+            self._last_engage_rejection_t is None
+            or now - self._last_engage_rejection_t >= 1.0
+        ):
+            self._broadcast_json({"type": "engage_rejected", "reason": "blocked"})
+            self._last_engage_rejection_t = now
 
     # ------------------------------------------------------------------
     # Engage toggle + IK target (IK thread)
@@ -902,12 +1172,15 @@ class VRTeleopCore:
         afterwards always requires a deliberate both-grips engage.
         """
         was_enabled = self.teleop_enabled
+        self._invalidate_raw_tcp()
         self.left_enabled = False
         self.right_enabled = False
         self._prev_both = False
         self._prev_l_lock = False
         self._prev_r_lock = False
         self._require_both_engage = True
+        self._l_inhibit = True
+        self._r_inhibit = True
         self._engage_time = None
         if self._box_leader is not None:
             self._box_sticks_held = True
@@ -1132,17 +1405,20 @@ class VRTeleopCore:
     def update_engage(self, frame: object) -> None:
         """Advance the per-arm engage state and grip tracking for one VR frame.
 
-        From rest — and after any forced disengage (reset, stale stream,
-        contact) — both grips together are required to engage, and both arms
-        start tracking. Once engaged, grips act per-arm:
+        Toggle scheme (default): from rest — and after any forced disengage
+        (reset, stale stream, contact) — both grips together are required to
+        engage, and both arms start tracking. Once engaged, a rising edge on
+        a grip toggles *that* arm between tracking and frozen. A frozen arm
+        holds its pose and gripper while the other keeps tracking; a click
+        re-engages it.
 
-          - Toggle scheme (default): a rising edge on a grip toggles *that*
-            arm between tracking and frozen. A frozen arm holds its pose and
-            gripper while the other keeps tracking; a click re-engages it.
-          - Dead-man scheme (``config.hold_to_engage``): each arm tracks only
-            while its grip is held; releasing a grip freezes that arm, and
-            releasing both disengages the session (both grips must be held
-            again to resume).
+        Dead-man scheme (``config.hold_to_engage``): the grips are
+        independent per arm, including from rest. Each arm tracks exactly
+        while its own grip is held — either grip alone engages its arm —
+        and releasing a grip freezes that arm (pose and gripper) where it
+        is. A grip still held when a forced disengage lands is inhibited
+        until it is released once, so an arm never resumes on its own the
+        moment the disengage lifts.
 
         In **box mode** (:attr:`box_mode`) the arms only ever move as a pair
         and a single grip drives them — see :meth:`_update_engage_box`.
@@ -1155,6 +1431,11 @@ class VRTeleopCore:
         still-engaged session is disengaged); afterwards a fully released
         frame must arrive before the both-grips engage is accepted again.
         """
+        if self._parking:
+            # The shutdown park owns the arms: no live changes, no engage.
+            if self.teleop_enabled:
+                self._disengage_all("Teleop disabled (parking)")
+            return
         self._apply_live_requests()
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
@@ -1167,6 +1448,7 @@ class VRTeleopCore:
             self._auto_engage_until = None
             self._finish_box_exit()
             self._auto_engage_until = None
+            self._reject_engage_request(frame)
             if not self._engage_blocked and not l_lock and not r_lock:
                 self._engage_release_required = False
             # Track the raw edges so the toggle scheme sees no rising edge
@@ -1176,6 +1458,7 @@ class VRTeleopCore:
             self._prev_r_lock = r_lock
             self._ack_lock_release(frame, l_lock, r_lock)
             return
+        self._last_engage_rejection_t = None
 
         self._maybe_auto_engage(frame)
         if self.box_mode:
@@ -1188,23 +1471,26 @@ class VRTeleopCore:
         was_right = self.right_enabled
         was_enabled = was_left or was_right
 
-        if not was_enabled and (
-            self._require_both_engage or self.config.hold_to_engage
-        ):
-            # Engage gate: both grips together. Rising-edge in toggle mode so
-            # a held-over press can't re-engage; level-triggered in hold mode
-            # (the operator is *holding*, there is no release to edge on).
-            engage = (
-                both if self.config.hold_to_engage else (both and not self._prev_both)
-            )
-            if engage:
+        if self.config.hold_to_engage:
+            # Dead-man, per arm: each arm tracks exactly while its own grip
+            # is held, and either grip alone engages its arm (from rest
+            # too). A grip held through a forced disengage stays inhibited
+            # until it is released once (see _disengage_all).
+            if not l_lock:
+                self._l_inhibit = False
+            if not r_lock:
+                self._r_inhibit = False
+            self.left_enabled = l_lock and not self._l_inhibit
+            self.right_enabled = r_lock and not self._r_inhibit
+            if self.left_enabled or self.right_enabled:
+                self._require_both_engage = False
+        elif not was_enabled and self._require_both_engage:
+            # Engage gate (toggle scheme): both grips together, rising-edge
+            # so a held-over press can't re-engage.
+            if both and not self._prev_both:
                 self.left_enabled = True
                 self.right_enabled = True
                 self._require_both_engage = False
-        elif self.config.hold_to_engage:
-            # Dead-man: each arm tracks exactly while its grip is held.
-            self.left_enabled = l_lock
-            self.right_enabled = r_lock
         else:
             # Toggle: a rising edge on a grip flips that arm. Also reached
             # fully-disengaged when the operator froze both arms themselves
@@ -1215,6 +1501,8 @@ class VRTeleopCore:
                 self.right_enabled = not self.right_enabled
 
         now_enabled = self.left_enabled or self.right_enabled
+        if (was_left and was_right) and not (self.left_enabled and self.right_enabled):
+            self._invalidate_raw_tcp()
         if now_enabled and not was_enabled:
             self._logger.info("Teleop enabled")
             self._broadcast(True)
@@ -1436,6 +1724,7 @@ class VRTeleopCore:
             if not self._tracking_reengage_blocked:
                 self._disengage_all("Teleop disabled (tracker visibility lost)")
             self._tracking_release_seen = False
+            self._reject_engage_request(frame)
             return False
 
         if not self._tracking_reengage_blocked:
@@ -1445,6 +1734,7 @@ class VRTeleopCore:
         r_lock = bool(frame.r_lock)
         if not self._tracking_release_seen:
             if l_lock or r_lock:
+                self._reject_engage_request(frame)
                 return False
             self._tracking_release_seen = True
             return True
@@ -1539,6 +1829,36 @@ class VRTeleopCore:
         if u <= 0.0:
             return start.copy()
         return (start + u * (end - start)).astype(np.float32)
+
+    def _check_park_plan(
+        self,
+        q_plan: np.ndarray,
+        q_goal: np.ndarray,
+        q_default: object,
+        trajectory: object,
+    ) -> list[np.ndarray]:
+        """Validate a zero-leg plan before it is played (IK thread).
+
+        The zero pose is a torque-off pose, so a plan that does not honour
+        it, or that does not start where the arms are and end at the goal,
+        is refused (``ValueError``) rather than played — the owner's park
+        then stops at rest and reports :attr:`reset_error`.
+        """
+        idx = list(self.left_indices) + list(self.right_indices)
+        goal = np.asarray(q_default, dtype=np.float32)
+        if goal.shape != q_goal.shape or not np.allclose(goal, q_goal, atol=1e-6):
+            raise ValueError("park planner did not honour the zero goal")
+        waypoints = [np.asarray(q, dtype=np.float32) for q in trajectory] or [goal]
+        if any(q.shape != q_plan.shape or not np.isfinite(q).all() for q in waypoints):
+            raise ValueError("park planner returned an invalid trajectory")
+        start_gap = float(np.max(np.abs(waypoints[0][idx] - q_plan[idx])))
+        end_gap = float(np.max(np.abs(waypoints[-1][idx] - goal[idx])))
+        if max(start_gap, end_gap) > _PARK_PLAN_TOLERANCE_RAD:
+            raise ValueError(
+                "park plan is incomplete "
+                f"(start gap {start_gap:.3f} rad, end gap {end_gap:.3f} rad)"
+            )
+        return waypoints
 
     def _hold_target(self, q: np.ndarray) -> None:
         """Adopt ``q`` as a stationary target (reset/startup adoption paths)."""
@@ -1760,12 +2080,19 @@ class VRTeleopCore:
                     )
                     return "contact"
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+            if self._reset_error is not None:
+                announce(f"Reset path rejected: {self._reset_error}")
+                # A shutdown park reads reset_error itself and stops; it
+                # must not wait in a hold for a reset press nobody will make.
+                return "done" if self._parking else "blocked"
             return "stopped" if stopped() else "done"
 
         while not stopped():
             outcome = await _play()
-            if outcome != "contact":
+            if outcome not in ("contact", "blocked"):
                 return
+            # A refused plan goes limp like a contact so the operator can
+            # hand-guide the arms somewhere the planner accepts, then retry.
             hold = await self._contact_hold_until_reset(
                 gravity_step=gravity_step,
                 reset_command_state=reset_command_state,
@@ -1774,6 +2101,7 @@ class VRTeleopCore:
                 announce=announce,
                 on_contact=on_contact,
                 hold_tick=hold_tick,
+                reason=outcome,
             )
             if hold != "reset":
                 return
@@ -1829,8 +2157,13 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None,
         hold_tick: Callable[[], None] | None,
+        reason: str = "contact",
     ) -> str:
         """Shared limp-hold engine: ``reset`` | ``stopped``.
+
+        ``reason`` is ``"contact"`` or ``"blocked"`` (the planner refused the
+        return path); it only changes the operator prompt. ``on_contact``
+        runs either way: it is the flows' "arms went limp" hook.
 
         Freezes the IK pipeline, holds the arms limp until a reset press
         (or the flow stops), then hands position control back re-synced to
@@ -1848,7 +2181,12 @@ class VRTeleopCore:
         self.cancel_reset()
         if on_contact is not None:
             on_contact()
-        announce("Contact. Arms are free — press reset to continue.")
+        announce(
+            "Return path rejected. Arms are free — guide them clear and "
+            "press reset to retry."
+            if reason == "blocked"
+            else "Contact. Arms are free — press reset to continue."
+        )
         deadline = time.perf_counter()
         while not stopped() and not self.reset_pending:
             deadline += interval
@@ -1881,6 +2219,7 @@ class VRTeleopCore:
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
         get_measured: Callable[[], MeasuredArms | None] | None = None,
+        get_lift: Callable[[], float | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1903,11 +2242,19 @@ class VRTeleopCore:
                 engaged and forwarded to the worker as ``("meas", left,
                 right, kp_left, kp_right)`` for the squeeze lean
                 (``IKWorker.note_measured``). Hardware flows only.
+            get_lift: Optional; returns the lift's height as a fraction of
+                its travel (``Jelly.lift_raised``), or ``None`` while it is
+                unknown. Forwarded as ``("lift", raised)`` whenever it moves,
+                so the solver's collision checks follow the deck up as the
+                lift lowers (``KinematicsSolver.set_lift``); until the first
+                reading the solver takes the lift as fully raised, and an
+                unknown height keeps the last one sent.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0
+        sent_lift: float | None = None
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -1918,6 +2265,32 @@ class VRTeleopCore:
 
             t0 = time.perf_counter()
 
+            if get_lift is not None:
+                try:
+                    raised = get_lift()
+                except Exception:  # noqa: BLE001 - never stall the solve
+                    self._logger.exception("lift height readout failed")
+                    raised = None
+                # 1 permille steps: the lift reports permille of its travel.
+                if raised is not None and (
+                    sent_lift is None or abs(raised - sent_lift) >= 1e-3
+                ):
+                    try:
+                        conn.send(("lift", float(raised)))
+                        sent_lift = raised
+                    except OSError:
+                        pass  # the dead-process path below reports it
+
+            if self._record_raw_tcp:
+                with self._raw_tcp_lock:
+                    tracking_lost = self._raw_tcp_tracking_lost
+                    self._raw_tcp_tracking_lost = False
+                if tracking_lost:
+                    self._disengage_all("Teleop disabled (tracker sample invalid)")
+                    # Even an identical recovered pose must reach the worker
+                    # with locks low before a fresh engage can re-anchor it.
+                    last_frame = None
+
             # Reset (return-to-rest) takes priority over normal tracking. Leave
             # the latch set if we can't dispatch yet (no solution, or a
             # trajectory already playing) so a press is never dropped.
@@ -1926,8 +2299,15 @@ class VRTeleopCore:
                 and self.q is not None
                 and not self.reset_interp.is_active()
             ):
+                # Clear a refused plan's reason before the latch drops, so a
+                # guarded_return polling is_resetting never pairs this new
+                # dispatch with the previous rejection.
+                self._reset_error = None
                 self._reset_latched = False
                 self._reset_cancel = False
+                goal = self._reset_goal
+                self._reset_goal = "rest"
+                self.reset_error = None
                 if self.box_mode:
                     # Going home leaves box mode: the arms come back as two
                     # arms, and the next engage is a deliberate one.
@@ -1954,23 +2334,61 @@ class VRTeleopCore:
                     if pos_r is not None and self.right_indices:
                         q_plan[self.right_indices] = pos_r
                     self._hold_target(q_plan)
-                    conn.send(("reset", q_plan.copy()))
+                    q_goal: np.ndarray | None = None
+                    if goal == "zero":
+                        # Shutdown park's second leg: an explicit all-zero
+                        # goal for the same collision-aware planner.
+                        q_goal = q_plan.copy()
+                        q_goal[self.left_indices] = 0.0
+                        q_goal[self.right_indices] = 0.0
+                        conn.send(("reset", q_plan.copy(), q_goal.copy()))
+                    else:
+                        conn.send(("reset", q_plan.copy()))
                     result = conn.recv()
                     if self._reset_cancel:
                         # cancel_reset() fired mid-planning: drop the plan —
                         # the owner took the arms out-of-band and re-syncs q
                         # before any next dispatch.
                         pass
+                    elif isinstance(result, tuple) and result[0] == "reset_error":
+                        self._reset_error = str(result[1])
+                        # A park reads the public field after each leg.
+                        self.reset_error = self._reset_error
+                        self._disengage_all("Teleop disabled (reset path rejected)")
+                        self._at_rest = False
+                        self._logger.error("Reset path rejected: %s", self._reset_error)
                     elif isinstance(result, tuple) and result[0] == "reset_traj":
                         _, q_default, trajectory = result
+                        if q_goal is not None:
+                            trajectory = self._check_park_plan(
+                                q_plan, q_goal, q_default, trajectory
+                            )
+                        # Read at adoption, not dispatch: a park that began
+                        # during the (possibly seconds-long) planning round
+                        # trip must still hold its grasp through this move.
+                        hold = self._park_grippers if self._parking else None
+                        if hold is not None:
+                            # Shutdown park: the grippers stay at the grasp
+                            # that was commanded when the park began.
+                            self.l_grip, self.r_grip = hold
                         if trajectory:
                             self.reset_interp.set_trajectory(
-                                trajectory, self.l_grip, self.r_grip
+                                trajectory,
+                                self.l_grip,
+                                self.r_grip,
+                                hold_grippers=hold is not None,
                             )
+                            if hold is None and self._parking:
+                                # begin_park() landed between the read above
+                                # and this adoption; it found nothing playing.
+                                self.reset_interp.freeze_grippers(*self._park_grippers)
                             self._disengage_all()
                             self._at_rest = True
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
+                    elif q_goal is not None:
+                        raise ValueError(f"unexpected park planner reply: {result!r}")
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
+                    self.reset_error = str(e)
                     self._logger.error("Reset error: %s", e)
                 finally:
                     self._reset_dispatching = False
@@ -2005,7 +2423,7 @@ class VRTeleopCore:
                     # carry that live capture heartbeat into Mantis dataset
                     # timestamps/QA.
                     pose_ts = getattr(frame, "t_host", None)
-                    if pose_ts is not None:
+                    if pose_ts is not None and not self._record_raw_tcp:
                         self.last_pose_host_ts = pose_ts
                         snapshot = self.last_tcp_snapshot
                         if snapshot is not None:
@@ -2092,6 +2510,8 @@ class VRTeleopCore:
                         measured = None
                     if measured is not None:
                         conn.send(("meas", *measured))
+                with self._raw_tcp_lock:
+                    tcp_epoch = self._raw_tcp_epoch
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:
@@ -2099,19 +2519,30 @@ class VRTeleopCore:
                     # tcp_msg); relative mode replies are (q, status) — see
                     # _unpack_solution.
                     if _is_absolute_reply(result):
-                        _, q_arr, base_msg, tcp_msg = result
+                        _, q_arr, base_msg, tcp_msg = result[:4]
                         self.set_target(q_arr)
+                        base_msg, calibration = _split_calibration(base_msg)
                         if self._handle_engage_rejection(base_msg):
                             # The worker refused the base fit; no anchor exists,
                             # so the arms hold and the operator must re-engage.
                             base_msg = None
+                            calibration = None
                         self.abs_base = base_msg
+                        self.abs_calibration = calibration
                         pose_host_ts = getattr(frame, "t_host", None)
-                        self._publish_tcp_pose(tcp_msg, pose_host_ts)
+                        if self._record_raw_tcp:
+                            self._adopt_raw_tcp_mapping(
+                                result[4] if len(result) > 4 else None,
+                                tcp_epoch,
+                                frame,
+                            )
+                        else:
+                            self._publish_tcp_pose(tcp_msg, pose_host_ts)
                         self._maybe_broadcast_urdf_state()
                     else:
                         self.set_target(self._unpack_solution(result))
-                    self.last_pose_host_ts = getattr(frame, "t_host", None)
+                    if not self._record_raw_tcp:
+                        self.last_pose_host_ts = getattr(frame, "t_host", None)
                     recv_timeout_count = 0
                     on_ik_sample(time.perf_counter())
                 else:
@@ -2148,7 +2579,7 @@ class VRTeleopCore:
     def _publish_tcp_pose(
         self, tcp_msg: dict[str, Any] | None, pose_host_ts: float | None
     ) -> None:
-        """Publish an IK TCP result and its source timestamp as one sample."""
+        """Publish a TCP pose and its source timestamp as one sample."""
         previous = self.last_tcp_snapshot
         snapshot = (
             TCPPoseSnapshot.from_message(tcp_msg, pose_host_ts)
@@ -2166,6 +2597,52 @@ class VRTeleopCore:
             self.last_tcp_change_ts = time.perf_counter()
         # This single reference write is the synchronization point for readers.
         self.last_tcp_snapshot = snapshot
+
+    def calibrated_pose_snapshot(self, frame: object) -> TCPPoseSnapshot | None:
+        """Map a raw managed-tracker frame into the base frame at its capture time.
+
+        Mantis recording reads this instead of :attr:`last_tcp_snapshot`: the
+        IK path publishes a pose only after its solve returns, and stamps it
+        with the interpolator's playout instant, so a fresh tracker pose could
+        already be on hand while the recorded one was still the older,
+        processed sample (and stale-pose QA rejected the take). The tracker
+        bridge stamps each frame with its poses' host capture time, which is
+        kept as is.
+
+        ``None`` unless both arms are engaged under a calibration the worker
+        still reports as active, the frame comes from a managed tracker, and
+        both sides are tracked; callers then fall back to the IK snapshot.
+        """
+        calibration = self.abs_calibration
+        if (
+            calibration is None
+            or frame is None
+            or not (self.left_enabled and self.right_enabled)
+            or getattr(frame, "pose_source_kind", None) != "tracker"
+            or getattr(frame, "t", None) is None
+            or not (frame.l_tracked and frame.r_tracked)
+            or not all(self.last_tracking.values())
+        ):
+            return None
+        poses = []
+        for ee, side in ((frame.l_ee, "left"), (frame.r_ee, "right")):
+            pos = np.array([ee.position.x, ee.position.y, ee.position.z])
+            quat = np.array(
+                [ee.quaternion.x, ee.quaternion.y, ee.quaternion.z, ee.quaternion.w]
+            )
+            if not (np.all(np.isfinite(pos)) and np.all(np.isfinite(quat))):
+                return None
+            if np.linalg.norm(quat) < 1e-6:
+                return None
+            poses.append(calibration.base_pose(side, pos, quat))
+        previous = self.last_tcp_snapshot
+        return TCPPoseSnapshot(
+            pose_host_ts=float(frame.t) / 1000.0,
+            left=poses[0],
+            right=poses[1],
+            # Reach is judged on the IK target; carry the latest verdict.
+            out_of_reach=previous.out_of_reach if previous is not None else (),
+        )
 
     def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
         """Push the joint state and pair status to the headset, throttled.
@@ -2253,6 +2730,8 @@ class VRTeleopCore:
         self._broadcast_json(
             {
                 "type": "urdf_state",
+                # File under the server's /urdf mount for this Axol version.
+                "urdf": self._urdf_file,
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,

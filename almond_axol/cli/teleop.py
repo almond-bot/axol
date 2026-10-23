@@ -527,7 +527,12 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
 
         left, right = require_mantis_channels(mantis_rig_channels(cfg))
         print(f"Mantis grippers only (no tracking): left={left} right={right}")
-        await run_grippers_only(left, right)
+        await run_grippers_only(
+            left,
+            right,
+            left_trigger_full_scale=cfg.mantis_left_trigger_full_scale,
+            right_trigger_full_scale=cfg.mantis_right_trigger_full_scale,
+        )
         return
 
     # What this session drives follows the CAN interfaces attached (and the
@@ -538,8 +543,21 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         await _run_jelly_only(cfg, jelly_cfg)
         return
 
+    if not cfg.sim and cfg.kinematics.robot_model is None:
+        # Enabling Jelly means this is the mobile Axol: its URDF (the body the
+        # arms are kept clear of, and its joint limits) follows this session's
+        # own Jelly decision, per-run --jelly.* switches included.
+        from ..settings import resolve_robot_model
+
+        cfg.kinematics.robot_model = resolve_robot_model(
+            jelly_enabled=jelly_cfg is not None, mount=cfg.kinematics.mount
+        ).value
     if cfg.sim:
-        robot = Sim()
+        robot = Sim(
+            robot_model=cfg.kinematics.robot_model,
+            mount=cfg.kinematics.mount,
+            gripper=cfg.axol.gripper,
+        )
     else:
         # The Rust realtime core is the sole hardware control backend. Python
         # owns VR/IK/model math and streams targets; Rust owns both CAN buses.

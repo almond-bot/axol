@@ -26,8 +26,8 @@ test("Axol tabs are the arm hardware and behaviour categories", () => {
   }
 })
 
-test("Mantis tabs cover tracking, CAN mapping, and wrist cameras", () => {
-  for (const tab of ["mantis-tracking", "mantis-can", "mantis-cameras"]) {
+test("Mantis tabs cover tracking, triggers, CAN mapping, and wrist cameras", () => {
+  for (const tab of ["mantis-tracking", "mantis-triggers", "mantis-can", "mantis-cameras"]) {
     assert.equal(settingsScopeForTab(tab), "mantis", tab)
   }
 })

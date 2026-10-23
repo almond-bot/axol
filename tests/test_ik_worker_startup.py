@@ -21,7 +21,7 @@ class IKWorkerStartupTests(unittest.TestCase):
             tcp_transform_left=[0.1, 0.2, 0.3, 0.0, 0.0, half, half]
         )
         with (
-            patch.object(worker_module, "KinematicsSolver", return_value=solver),
+            patch.object(worker_module, "_make_jax_solver", return_value=solver),
             patch.object(worker_module.IKWorker, "_settle_rest_pose", return_value=q),
         ):
             worker = worker_module.IKWorker(config, KinematicsConfig())
@@ -56,7 +56,7 @@ class IKWorkerStartupTests(unittest.TestCase):
                 ]
                 with (
                     patch.object(
-                        worker_module, "KinematicsSolver", return_value=solver
+                        worker_module, "_make_jax_solver", return_value=solver
                     ),
                     patch.object(
                         worker_module.IKWorker, "_settle_rest_pose", return_value=q

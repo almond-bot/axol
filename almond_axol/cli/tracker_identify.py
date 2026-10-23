@@ -3,8 +3,8 @@ axol tracker.identify
 
 Bind discovered Vive trackers to the left/right Mantis rig sides.
 
-Trackers report under backend-native keys (a libsurvive codename like
-``T20``, an Ultimate tracker MAC) that say nothing about which rig they
+Trackers report under backend-native keys (a Lighthouse tracker serial like
+``LHR-E0FCD01B``, an Ultimate tracker MAC) that say nothing about which rig they
 are bolted to. This command discovers the powered-on trackers, then asks
 the operator to shake each rig in turn; the device with the most motion
 during the capture window is bound to that side. The binding (plus the
@@ -60,7 +60,9 @@ def _confirm(instruction: str, web_prompts: bool) -> None:
         input(f"{instruction} Press Enter to begin ... ")
 
 
-def _motion(source, window_s: float) -> tuple[dict[str, float], set[str]]:
+def _motion(
+    source, window_s: float, rejected: dict[str, str] | None = None
+) -> tuple[dict[str, float], set[str]]:
     """Fresh, fully-tracked position path length per device over a window.
 
     Also returns the keys that reported at all, so a device whose poses went
@@ -73,11 +75,18 @@ def _motion(source, window_s: float) -> tuple[dict[str, float], set[str]]:
     while time.perf_counter() < deadline:
         for key, sample in source.poses().items():
             seen.add(key)
-            if (
-                not valid_tracker_pose(sample)
-                or not sample.tracking
-                or time.perf_counter() - sample.t > _FRESH_S
-            ):
+            reason = (
+                "invalid poses"
+                if not valid_tracker_pose(sample)
+                else "stale poses"
+                if time.perf_counter() - sample.t > _FRESH_S
+                else "poses received but tracking checks did not pass"
+                if not sample.tracking
+                else None
+            )
+            if reason is not None:
+                if rejected is not None:
+                    rejected[key] = reason
                 last.pop(key, None)
                 continue
             prev = last.get(key)
@@ -91,7 +100,10 @@ def _motion(source, window_s: float) -> tuple[dict[str, float], set[str]]:
 
 
 def _motion_summary(
-    travelled: dict[str, float], seen: set[str], assigned: dict[str, str]
+    travelled: dict[str, float],
+    seen: set[str],
+    assigned: dict[str, str],
+    rejected: dict[str, str] | None = None,
 ) -> str:
     """One line per device: how far it moved, or that it was stale/bound."""
     bound = {key: side for side, key in assigned.items()}
@@ -104,17 +116,21 @@ def _motion_summary(
         elif key in travelled:
             parts.append(f"{key} {travelled[key]:.2f} m")
         else:
-            parts.append(f"{key} no fresh poses")
+            parts.append(f"{key} {(rejected or {}).get(key, 'no fresh poses')}")
     return ", ".join(parts) if parts else "no devices reported"
 
 
 def _report_backend_warnings(source) -> None:  # type: ignore[no-untyped-def]
     """Surface backend setup warnings (libsurvive logs them, poses still flow)."""
     warnings = getattr(source, "warnings", None)
-    if warnings is None:
-        return
-    for message in warnings():
-        print(f"  backend warning: {message}")
+    if warnings is not None:
+        for message in warnings():
+            print(f"  backend warning: {message}", flush=True)
+    quality = getattr(source, "tracking_quality", None)
+    report = quality() if quality is not None else None
+    if report is not None:
+        for message in report.get("reasons", []):
+            print(f"  tracking check: {message}", flush=True)
 
 
 def _check_lighthouse_channels(source, live: list[str]) -> None:  # type: ignore[no-untyped-def]
@@ -165,7 +181,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
         except RuntimeError as exc:
             raise SystemExit(str(exc)) from None
 
-    source = create_source(config)
+    source = create_source(config, setup=True)
     print(f"Starting the {config.backend} backend...")
     try:
         # Enter cleanup ownership before start(): a backend can acquire its USB
@@ -186,6 +202,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 and now - sample.t <= _FRESH_S
             )
             if time.perf_counter() >= deadline:
+                _report_backend_warnings(source)
                 source_hint = (
                     "check power, pairing, and base-station visibility"
                     if config.backend == "survive"
@@ -215,8 +232,9 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                     f"Mantis for {_CAPTURE_S:.0f} seconds.",
                     args.web_prompts,
                 )
-                travelled, seen = _motion(source, _CAPTURE_S)
-                summary = _motion_summary(travelled, seen, assigned)
+                rejected: dict[str, str] = {}
+                travelled, seen = _motion(source, _CAPTURE_S, rejected)
+                summary = _motion_summary(travelled, seen, assigned, rejected)
                 candidates = {
                     k: v
                     for k, v in travelled.items()

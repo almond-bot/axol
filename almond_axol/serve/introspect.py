@@ -75,6 +75,7 @@ _PRODUCT_LABELS = {
     "mantis": "Mantis",
     "mantis_source": "Mantis tracking",
     "mantis_smooth_hz": "Mantis smoothing Hz",
+    "payload_kg": "Payload kg per gripper",
 }
 
 

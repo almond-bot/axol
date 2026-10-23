@@ -152,7 +152,9 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
     // motors lost power: that hub drops unACKed frames instead of backing up,
     // so the ENOBUFS stall never fires. Python's `CanBus.stalled` — what
     // `Axol.disable()` needs to accept an all-silent arm as unpowered — rests
-    // on one or the other.
+    // on one or the other. A no-op off the hub channels (arm and Mantis):
+    // other adapters report transient ACK errors too, which would end a
+    // healthy session.
     socket.watch_ack_errors()?;
     socket.set_send_timeout(Duration::from_millis(20))?;
 

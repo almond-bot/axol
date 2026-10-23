@@ -28,7 +28,8 @@
               "hardware-setup/owl-mount",
               "hardware-setup/ox-cart",
               "hardware-setup/jelly",
-              "hardware-setup/cameras"
+              "hardware-setup/cameras",
+              "hardware-setup/thor"
             ]
           },
           "installation"
@@ -71,7 +72,8 @@
             "root": "operations/run-policy",
             "pages": [
               "operations/run-policy-config",
-              "operations/custom-policy"
+              "operations/custom-policy",
+              "operations/mink"
             ]
           },
           {
@@ -142,6 +144,7 @@
                   "cli/serve",
                   "cli/provision",
                   "cli/rt-install",
+                  "cli/ik-warm",
                   "cli/jetson-setup"
                 ]
               },

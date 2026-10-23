@@ -68,9 +68,9 @@ arms hold through the stall and then follow the current pose.
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
 jittery relay adds just enough to stay ahead of the bursts. Control-state fields
-(locks / reset / session state) are taken from the *latest* received frame, not
-the delayed playout, so engage/disengage/reset stay responsive while only the
-motion is smoothed.
+(locks / reset / session state, and a managed tracker's grips) are taken from
+the *latest* received frame, not the delayed playout, so engage/disengage/reset
+and the Mantis grippers stay responsive while only the motion is smoothed.
 
 Transports that don't stamp ``t`` (the USB link, or an older web build) degrade
 gracefully to the original latest-wins behaviour — capture time falls back to
@@ -325,10 +325,11 @@ class PoseInterpolator:
             kind, value, worst, count = late_event
             if kind == "late":
                 _logger.warning(
-                    "VR pose stream arriving %.1fs late (network stall between "
-                    "the headset and this host); holding the arms instead of "
-                    "replaying the delayed motion",
+                    "VR pose stream arriving %.1fs late (source=%s; capture "
+                    "or delivery delay); pose timestamps remain unchanged "
+                    "for freshness checks",
                     value,
+                    frame.pose_source_kind or "unspecified",
                 )
             else:
                 _logger.warning(
@@ -604,11 +605,12 @@ class PoseInterpolator:
                     return None
                 # Preserve identity for the IK skip while advancing the
                 # capture heartbeat to this equal-valued rendered sample.
-                # Only timestamp/seq metadata changes; pose/control equality
-                # was proven above.
+                # Diagnostics advance independently of motion; the raw frame
+                # callback also delivers them without waiting for an IK solve.
                 last_out.t = rendered.t
                 last_out.t_host = rendered.t_host
                 last_out.seq = rendered.seq
+                last_out.tracking_quality = rendered.tracking_quality
                 self._tracking_loss_delivered["left"] = max(
                     self._tracking_loss_delivered["left"], loss_seq_l
                 )
@@ -982,7 +984,16 @@ def _build_frame(
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields
     are numerics we computed ourselves, so validation is pure overhead.
+
+    Grips from a managed tracker bridge are control state too: they are the
+    rig triggers' latest CAN reads, sampled independently of the tracker
+    pose, and Mantis recording pairs them with the newest tracker pose rather
+    than the delayed playout. Delaying and smoothing them like motion made the
+    grippers lag the triggers by the full playout delay, and left the recorded
+    grip command that far behind the recorded pose.
     """
+    if latest.pose_source_kind == "tracker":
+        l_grip, r_grip = latest.l_grip, latest.r_grip
     frame = VRFrame.model_construct(
         l_ee=VRPose.model_construct(
             position=VRPosition.model_construct(
@@ -1035,6 +1046,7 @@ def _build_frame(
         r_tracked=r_tracked,
         l_trigger_live=latest.l_trigger_live,
         r_trigger_live=latest.r_trigger_live,
+        tracking_quality=latest.tracking_quality,
         # Cart input is control state, not delayed motion. Preserve the newest
         # thumbstick/click values exactly so interpolation cannot neutralize a
         # drive command or keep a stale lift command alive (the IK worker also

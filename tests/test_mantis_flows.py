@@ -276,6 +276,7 @@ class MantisFlowTest(unittest.TestCase):
 
         with (
             mock.patch.object(collect_data, "_prepare_recording_cameras"),
+            mock.patch.object(collect_data, "check_start_pose"),
             mock.patch.object(collect_data.affinity, "pin_realtime"),
             mock.patch.object(
                 collect_data.os,
@@ -405,6 +406,79 @@ class MantisFlowTest(unittest.TestCase):
         recording = bridge.compose_frame()
         self.assertEqual(recording["state"], VRState.RECORDING.value)
         self.assertFalse(recording["reset"])
+
+    def test_rejected_engage_releases_lock_and_requires_fresh_start(self) -> None:
+        bridge, left, right = self._collection_bridge()
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        early = bridge.compose_frame()
+        self.assertTrue(early["l_lock"] and early["r_lock"])
+        self.assertEqual(early["state"], VRState.DATA_COLLECTION.value)
+
+        # The core rejects a request made during the post-episode engage
+        # block. The bridge must lower both lock bits, even though no
+        # tracking=true ACK ever arrived for that request.
+        bridge._handle_engage_rejected()
+        withdrawn = bridge.compose_frame()
+        self.assertFalse(withdrawn["l_lock"] or withdrawn["r_lock"])
+        release_id = withdrawn["lock_release_id"]
+        self.assertIsNotNone(release_id)
+        self.assertEqual(withdrawn["state"], VRState.DATA_COLLECTION.value)
+
+        # Keep the low level asserted until the core confirms consuming it;
+        # the old gesture must not start recording or retry engagement.
+        still_low = bridge.compose_frame()
+        self.assertEqual(still_low["lock_release_id"], release_id)
+        self.assertFalse(still_low["l_lock"] or still_low["r_lock"])
+        bridge._handle_lock_release(release_id)
+        idle = bridge.compose_frame()
+        self.assertFalse(idle["l_lock"] or idle["r_lock"])
+        self.assertEqual(idle["state"], VRState.DATA_COLLECTION.value)
+
+        left.value = right.value = 0.0
+        bridge.compose_frame()
+        left.value = right.value = 1.0
+        retry = bridge.compose_frame()
+        self.assertTrue(retry["l_lock"] and retry["r_lock"])
+        self.assertEqual(retry["state"], VRState.DATA_COLLECTION.value)
+        bridge._handle_tracking_state(True)
+        self.assertEqual(bridge.compose_frame()["state"], VRState.RECORDING.value)
+
+    def test_saving_window_squeeze_cannot_start_next_take(self) -> None:
+        for release_during_saving in (True, False):
+            with self.subTest(release_during_saving=release_during_saving):
+                bridge, left, right = self._collection_bridge()
+                bridge._state = VRState.SAVING
+
+                left.value = right.value = 0.0
+                squeezed = bridge.compose_frame()
+                self.assertFalse(squeezed["l_lock"] or squeezed["r_lock"])
+
+                if release_during_saving:
+                    left.value = right.value = 1.0
+                    released = bridge.compose_frame()
+                    self.assertFalse(released["l_lock"] or released["r_lock"])
+                    bridge._state = VRState.DATA_COLLECTION
+                    self.assertFalse(bridge.compose_frame()["l_lock"])
+                else:
+                    # The bridge learns that the next take is ready while the
+                    # triggers are still held. Their release is only the tail
+                    # of the gesture begun during SAVING.
+                    bridge._state = VRState.DATA_COLLECTION
+                    held = bridge.compose_frame()
+                    self.assertFalse(held["l_lock"] or held["r_lock"])
+                    left.value = right.value = 1.0
+                    released = bridge.compose_frame()
+                    self.assertFalse(released["l_lock"] or released["r_lock"])
+
+                left.value = right.value = 0.0
+                bridge.compose_frame()
+                left.value = right.value = 1.0
+                fresh = bridge.compose_frame()
+                self.assertTrue(fresh["l_lock"] and fresh["r_lock"])
+                self.assertEqual(fresh["state"], VRState.DATA_COLLECTION.value)
 
     def test_start_gesture_while_engaged_opens_take_immediately(self) -> None:
         bridge, left, right = self._collection_bridge()

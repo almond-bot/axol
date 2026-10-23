@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import unittest
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
+from almond_axol.cli import teleop as teleop_cli
 from almond_axol.robot.base import HardwareCleanupError
 from almond_axol.teleop import mantis_grippers
 
@@ -101,11 +104,58 @@ class _FakeRobot:
 
 
 class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_teleop_session_passes_saved_trigger_endpoints(self) -> None:
+        cfg = SimpleNamespace(
+            mantis=True,
+            sim=False,
+            left_channel="can_mantis_l",
+            right_channel="can_mantis_r",
+            mantis_left_trigger_full_scale=0.90,
+            mantis_right_trigger_full_scale=1.0,
+        )
+        with patch(
+            "almond_axol.teleop.mantis_grippers.run_grippers_only",
+            new_callable=AsyncMock,
+        ) as run_grippers:
+            await teleop_cli._run_session(cfg)
+
+        run_grippers.assert_awaited_once_with(
+            "can_mantis_l",
+            "can_mantis_r",
+            left_trigger_full_scale=0.90,
+            right_trigger_full_scale=1.0,
+        )
+
+    async def test_calibration_follows_logical_side_even_with_swapped_channels(
+        self,
+    ) -> None:
+        readings: list[tuple[str, float]] = []
+        readers: dict[str, _FakeReader] = {}
+
+        def reader_factory(channel: str, *, full_scale: float) -> _FakeReader:
+            readings.append((channel, full_scale))
+            reader = _FakeReader(channel)
+            readers[channel] = reader
+            return reader
+
+        await mantis_grippers.run_grippers_only(
+            "right-can",
+            "left-can",
+            left_trigger_full_scale=0.90,
+            right_trigger_full_scale=1.0,
+            reader_factory=reader_factory,
+            robot_factory=lambda **_kwargs: _FakeRobot(readers),
+            duration=0.0,
+        )
+
+        self.assertEqual(readings, [("right-can", 0.90), ("left-can", 1.0)])
+        self.assertTrue(all(reader.closed for reader in readers.values()))
+
     async def test_maps_fresh_trigger_grips_without_trackers_or_cameras(self) -> None:
         readers: dict[str, _FakeReader] = {}
         robot: _FakeRobot | None = None
 
-        def reader_factory(channel: str) -> _FakeReader:
+        def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
             # Exercise the exact release threshold on one side.
             value = 0.8 if channel == "left-can" else 1.0
             reader = _FakeReader(channel, value)
@@ -156,7 +206,7 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
         readers: dict[str, _FakeReader] = {}
         robot: _FakeRobot | None = None
 
-        def reader_factory(channel: str) -> _FakeReader:
+        def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
             # A live but half-squeezed trigger is not a safe arming state.
             reader = _FakeReader(channel, 0.5)
             readers[channel] = reader
@@ -188,7 +238,7 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
         readers: dict[str, _FakeReader] = {}
         robot: _FakeRobot | None = None
 
-        def reader_factory(channel: str) -> _FakeReader:
+        def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
             reader = _FakeReader(channel, None)
             readers[channel] = reader
             return reader
@@ -222,7 +272,7 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
             readers: dict[str, _FakeReader] = {}
             robot: _FakeRobot | None = None
 
-            def reader_factory(channel: str) -> _FakeReader:
+            def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
                 reader = _FakeReader(channel)
                 readers[channel] = reader
                 return reader
@@ -251,7 +301,9 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
             first = _FakeReader("left-can")
             calls = 0
 
-            def broken_reader_factory(_channel: str) -> _FakeReader:
+            def broken_reader_factory(
+                _channel: str, *, full_scale: float = 1.0
+            ) -> _FakeReader:
                 nonlocal calls
                 calls += 1
                 if calls == 1:
@@ -281,7 +333,9 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
                 readers: dict[str, _FakeReader] = {}
                 robot: _FakeRobot | None = None
 
-                def reader_factory(channel: str) -> _FakeReader:
+                def reader_factory(
+                    channel: str, *, full_scale: float = 1.0
+                ) -> _FakeReader:
                     reader = _FakeReader(channel)
                     readers[channel] = reader
                     return reader
@@ -314,7 +368,7 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
     async def test_disable_failure_still_closes_both_trigger_readers(self) -> None:
         readers: dict[str, _FakeReader] = {}
 
-        def reader_factory(channel: str) -> _FakeReader:
+        def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
             reader = _FakeReader(channel)
             readers[channel] = reader
             return reader
@@ -343,7 +397,7 @@ class MantisGrippersOnlyTest(unittest.IsolatedAsyncioTestCase):
         readers: dict[str, _FakeReader] = {}
         robot: _FakeRobot | None = None
 
-        def reader_factory(channel: str) -> _FakeReader:
+        def reader_factory(channel: str, *, full_scale: float = 1.0) -> _FakeReader:
             reader = _FakeReader(
                 channel,
                 close_error=(

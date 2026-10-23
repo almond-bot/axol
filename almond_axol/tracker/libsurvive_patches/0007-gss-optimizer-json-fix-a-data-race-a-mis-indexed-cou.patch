@@ -1,0 +1,174 @@
+From e232d51271a7b6691a6213a58ea5276c71853ac0 Mon Sep 17 00:00:00 2001
+From: Shawn Patel <shawn@almondbot.com>
+Date: Tue, 20 Oct 2026 01:33:42 +0000
+Subject: [PATCH 7/7] gss, optimizer, json: fix a data race, a mis-indexed
+ count and an empty-file read
+
+- gss: needsSolve was set and read by the USB thread without
+  data_available_lock, and cleared by the solver thread just after it
+  released the lock (ThreadSanitizer report on the AGX Orin). Set, test
+  and clear it under the lock; a request made during a solve is no
+  longer lost.
+- survive_optimizer: the per-lighthouse correction setup tested
+  meas_for_lhs_axis[lh * 3 + i] (pose index, wrong stride) where the
+  array is filled as [lh * 2 + axis], so it freed corrections by another
+  lighthouse's or axis's measurement count (and read past the array from
+  the 11th lighthouse). Use the axis count; skip a correction with no
+  parameter. Only active with mpfit-lh-*-correction > 0 (off by default).
+- json_helpers: an empty document parsed to zero tokens, but token 0 was
+  still read (heap-buffer-overflow under ASan on an empty config file).
+  Return early, freeing the token pool. test-json_empty covers it.
+---
+ redist/json_helpers.c            |  4 +++-
+ src/driver_global_scene_solver.c | 23 ++++++++++++++---------
+ src/survive_optimizer.c          | 11 +++++++++--
+ src/test_cases/CMakeLists.txt    |  3 ++-
+ src/test_cases/json_empty.c      | 23 +++++++++++++++++++++++
+ 5 files changed, 51 insertions(+), 13 deletions(-)
+ create mode 100644 src/test_cases/json_empty.c
+
+diff --git a/redist/json_helpers.c b/redist/json_helpers.c
+index b933d5e..dd5b6ad 100644
+--- a/redist/json_helpers.c
++++ b/redist/json_helpers.c
+@@ -199,7 +199,9 @@ int json_run_callbacks(struct json_callbacks *cbs, const char *_JSON_STRING, int
+ 	jsmn_parser parser;
+ 	jsmn_init(&parser);
+ 	int32_t items = jsmn_parse(&parser, _JSON_STRING, JSON_STRING_LEN);
+-	if (items < 0) {
++	if (items <= 0) {
++		// An empty (or invalid) document has no tokens; the code below reads token 0 regardless.
++		jsmn_free(&parser);
+ 		return items;
+ 	}
+ 	char *JSON_STRING = malloc(JSON_STRING_LEN);
+diff --git a/src/driver_global_scene_solver.c b/src/driver_global_scene_solver.c
+index 753fad9..f5ef858 100644
+--- a/src/driver_global_scene_solver.c
++++ b/src/driver_global_scene_solver.c
+@@ -248,8 +248,13 @@ static void set_needs_solve(global_scene_solver *gss) {
+ 			return;
+ 	}
+ 
++	// needsSolve is shared with the solver thread, which reads and clears it under data_available_lock.
++	if (gss->threaded)
++		OGLockMutex(gss->data_available_lock);
+ 	gss->needsSolve = true;
+ 	gss->last_addition = now;
++	if (gss->threaded)
++		OGUnlockMutex(gss->data_available_lock);
+ }
+ 
+ static size_t check_object(global_scene_solver *gss, int i, SurviveObject *so) {
+@@ -290,15 +295,14 @@ static size_t check_object(global_scene_solver *gss, int i, SurviveObject *so) {
+ 
+ 	OGUnlockMutex(gss->scenes_lock);
+ 
+-	if (gss->needsSolve && (gss->last_addition + 1) < survive_run_time(ctx)) {
+-		if (!gss->threaded) {
+-			gss->needsSolve = false;
+-			run_optimization(gss);
+-		} else {
+-			OGLockMutex(gss->data_available_lock);
++	if (gss->threaded) {
++		OGLockMutex(gss->data_available_lock);
++		if (gss->needsSolve && (gss->last_addition + 1) < survive_run_time(ctx))
+ 			OGSignalCond(gss->data_available);
+-			OGUnlockMutex(gss->data_available_lock);
+-		}
++		OGUnlockMutex(gss->data_available_lock);
++	} else if (gss->needsSolve && (gss->last_addition + 1) < survive_run_time(ctx)) {
++		gss->needsSolve = false;
++		run_optimization(gss);
+ 	}
+ 
+ 	return scenes_added;
+@@ -400,8 +404,9 @@ void *survive_threaded_gss_thread_fn(void *_poser) {
+ 		OGWaitCond(self->data_available, self->data_available_lock);
+ 
+ 		while (self->needsSolve) {
+-			OGUnlockMutex(self->data_available_lock);
++			// Clear it while still holding the lock, so a request made during this solve is not lost.
+ 			self->needsSolve = false;
++			OGUnlockMutex(self->data_available_lock);
+ 			survive_get_ctx_lock(self->ctx);
+ 			run_optimization(self);
+ 			survive_release_ctx_lock(self->ctx);
+diff --git a/src/survive_optimizer.c b/src/survive_optimizer.c
+index 896c4e4..95c2da7 100644
+--- a/src/survive_optimizer.c
++++ b/src/survive_optimizer.c
+@@ -1302,7 +1302,14 @@ int survive_optimizer_run(survive_optimizer *optimizer, struct mp_result_struct
+ 			for (int lh = 0; lh < optimizer->cameraLength; lh++) {
+ 				for (int axis = 0; axis < 3; axis++) {
+ 					int idx = get_lighthouse_correction_idx_for(optimizer, i, lh, axis);
+-					if(idx > -1 && axis == 2 || meas_for_lhs_axis[lh * SURVIVE_CORRECTION_PARAMS + i] >= 6) {
++					if (idx < 0) {
++						// No correction parameter to free: idx -1 used to be written (and logged) through.
++						continue;
++					}
++					// Offsets (axes 0 and 1) need enough light measurements on that axis; meas_for_lhs_axis is
++					// indexed lh * 2 + axis, as get_meas_for_lhs_axis fills it. The scale (axis 2) always fits.
++					size_t axis_meas = axis < 2 ? meas_for_lhs_axis[lh * 2 + axis] : 0;
++					if (axis == 2 || axis_meas >= 6) {
+ 						optimizer->mp_parameters_info[idx].fixed = false;
+ 
+ 						survive_optimizer_measurement *meas = survive_optimizer_emplace_meas(
+@@ -1312,7 +1319,7 @@ int survive_optimizer_run(survive_optimizer *optimizer, struct mp_result_struct
+ 						meas->parameter_bias.expected_value = 0;
+ 					}
+ 					SV_VERBOSE(110, "%s %d %d %d %f (%d, %d) %s %d", survive_colorize_codename(so), i, lh, axis, get_lighthouse_correction_for(optimizer, i, lh, axis),
+-							   (int)meas_for_lhs_axis[lh * 2 + i], get_axis_count(meas_for_lhs_axis, 0),
++							   (int)axis_meas, get_axis_count(meas_for_lhs_axis, 0),
+ 							   optimizer->mp_parameters_info[idx].parname, optimizer->mp_parameters_info[idx].fixed);
+ 				}
+ 			}
+diff --git a/src/test_cases/CMakeLists.txt b/src/test_cases/CMakeLists.txt
+index 1ac1367..18b0ba3 100644
+--- a/src/test_cases/CMakeLists.txt
++++ b/src/test_cases/CMakeLists.txt
+@@ -1,10 +1,11 @@
+ SET(SURVIVE_TESTS
+         reproject
+         check_generated barycentric_svd optimizer
+-        rotate_angvel export_config ootx gss mpfit_stack)
++        rotate_angvel export_config ootx gss mpfit_stack json_empty)
+ 
+ set(barycentric_svd_ADDITIONAL_SRCS ../barycentric_svd/barycentric_svd.c)
+ set(mpfit_stack_ADDITIONAL_LIBS mpfit)
++set(json_empty_ADDITIONAL_SRCS ../../redist/json_helpers.c ../../redist/jsmn.c)
+ 
+ IF(NOT WIN32)
+     LIST(APPEND SURVIVE_TESTS watchman)
+diff --git a/src/test_cases/json_empty.c b/src/test_cases/json_empty.c
+new file mode 100644
+index 0000000..5df39f2
+--- /dev/null
++++ b/src/test_cases/json_empty.c
+@@ -0,0 +1,23 @@
++#include "test_case.h"
++
++#include "json_helpers.h"
++
++#include <string.h>
++
++static int values_seen = 0;
++static void count_value(struct json_callbacks *cb, struct json_stack_entry_s *entry) { values_seen++; }
++
++// An empty config file used to be parsed as if it had a top-level token: json_run_callbacks read token 0 of an
++// empty token pool (heap overflow under ASan) before checking that anything had been parsed.
++TEST(JSON, EmptyDocumentHasNoValues) {
++	struct json_callbacks cbs = {0};
++	cbs.json_tag_value = count_value;
++
++	ASSERT_EQ(json_run_callbacks(&cbs, "", 0), 0);
++	ASSERT_EQ(values_seen, 0);
++
++	const char *doc = "{\"a\": \"1\"}";
++	ASSERT_GT((double)json_run_callbacks(&cbs, doc, (int)strlen(doc)), 0.);
++	ASSERT_EQ(values_seen, 1);
++	return 0;
++}
+-- 
+2.53.0
+

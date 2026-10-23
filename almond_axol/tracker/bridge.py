@@ -41,6 +41,7 @@ start gesture.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import errno
 import json
 import logging
@@ -447,6 +448,14 @@ class TrackerBridge:
             )
         self._source = source
         self._keys = {"left": left, "right": right}
+        self._quality_fault_count = 0
+        self._quality_pair_fault = False
+        self._quality_pair_skew_fault = False
+        self._quality_native_fault_count = 0
+        self._quality_last_fault: str | None = None
+        self._diagnostic_fault_count = 0
+        self._diagnostic_last_frame = float("-inf")
+        self._reengage_required_after_loss = False
         self._host = host
         self._port = port
         self._hz = hz
@@ -655,6 +664,78 @@ class TrackerBridge:
         # per side lets an intervening callback pair unrelated instants and
         # hides real left/right skew.
         poses = self._source.poses()
+        # Judge timing against the raw samples. Held poses deliberately stop
+        # advancing during the disengage handshake and cannot establish
+        # whether the source itself has recovered.
+        pair = [poses.get(self._keys[side]) for side in ("left", "right")]
+        pair_skew_s = 0.0
+        skewed_side: str | None = None
+        if all(
+            p is not None
+            and valid_tracker_pose(p)
+            and now - p.t <= TRACKER_POSE_MAX_AGE_S
+            for p in pair
+        ):
+            left, right = pair
+            assert left is not None and right is not None
+            pair_skew_s = abs(left.t - right.t)
+            if pair_skew_s > TRACKER_PAIR_MAX_SKEW_S:
+                skewed_side = "left" if left.t < right.t else "right"
+        source_quality = getattr(self._source, "tracking_quality", None)
+        # A source reports None when it does not police tracking quality.
+        source_report = source_quality() if callable(source_quality) else None
+        if source_report is not None:
+            quality = dict(source_report)
+            native_fault_count = int(quality.get("faultCount", 0))
+            if native_fault_count != self._quality_native_fault_count:
+                self._quality_last_fault = quality.get("lastFault")
+                self._quality_native_fault_count = native_fault_count
+            quality["sourceId"] = self._pose_source_id
+            quality["bindings"] = dict(self._keys)
+            pair_fault = False
+            if all(p is not None and valid_tracker_pose(p) for p in pair):
+                left, right = pair
+                assert left is not None and right is not None
+                if (
+                    abs(left.t - right.t) <= TRACKER_PAIR_MAX_SKEW_S
+                    and now - min(left.t, right.t) <= TRACKER_POSE_MAX_AGE_S
+                ):
+                    separation = float(np.linalg.norm(left.pos - right.pos))
+                    quality["handSeparationM"] = separation
+                    # A conservative gross-corruption guard for one operator's
+                    # handheld rigs; this is not an accuracy tolerance.
+                    pair_fault = separation > 2.0
+            if pair_fault and not self._quality_pair_fault:
+                self._quality_fault_count += 1
+            self._quality_pair_fault = pair_fault
+            if skewed_side is not None and not self._quality_pair_skew_fault:
+                self._quality_fault_count += 1
+            self._quality_pair_skew_fault = skewed_side is not None
+            quality["faultCount"] = native_fault_count + self._quality_fault_count
+            quality["pairSkewMs"] = pair_skew_s * 1000.0
+            if pair_fault:
+                reason = (
+                    "Rigs appear more than 2 m apart. Stop and check base-station "
+                    "calibration and tracker visibility."
+                )
+                quality["status"] = "error"
+                quality["reasons"] = [*quality.get("reasons", []), reason]
+                self._quality_last_fault = reason
+            if skewed_side is not None:
+                reason = (
+                    f"{skewed_side.capitalize()} tracker sample is "
+                    f"{pair_skew_s * 1000:.0f} ms behind the other side "
+                    f"(limit {TRACKER_PAIR_MAX_SKEW_S * 1000:.0f} ms); "
+                    "gripper control is held until tracking recovers and a "
+                    "new take is started."
+                )
+                quality["status"] = "error"
+                quality["reasons"] = [*quality.get("reasons", []), reason]
+                self._quality_last_fault = reason
+            quality["lastFault"] = self._quality_last_fault or quality.get("lastFault")
+            frame["tracking_quality"] = quality
+            if quality.get("status") not in {"ready", "warning"}:
+                poses = {key: replace(p, tracking=False) for key, p in poses.items()}
         hold_pose_updates = self._auto_engage_enabled and (
             self._auto_engage_withdrawn
             or self._auto_disengage_pending
@@ -689,16 +770,8 @@ class TrackerBridge:
             }
             frame[f"{side[0]}_tracked"] = self._fresh[side]
 
-        left_held = self._held.get("left")
-        right_held = self._held.get("right")
-        if (
-            self._fresh["left"]
-            and self._fresh["right"]
-            and left_held is not None
-            and right_held is not None
-            and abs(left_held.t - right_held.t) > TRACKER_PAIR_MAX_SKEW_S
-        ):
-            older = "left" if left_held.t < right_held.t else "right"
+        if skewed_side is not None:
+            older = skewed_side
             self._fresh[older] = False
             frame[f"{older[0]}_tracked"] = False
             if not self._warned_skew[older]:
@@ -707,7 +780,7 @@ class TrackerBridge:
                     "%s tracker sample is %.0f ms behind the other side — "
                     "holding and requiring a fresh Mantis alignment",
                     older,
-                    abs(left_held.t - right_held.t) * 1000.0,
+                    pair_skew_s * 1000.0,
                 )
         else:
             self._warned_skew = {"left": False, "right": False}
@@ -743,7 +816,15 @@ class TrackerBridge:
         all_squeezed = all(value <= _GESTURE_PRESS_GRIP for value in grips.values())
         all_released = all(value >= _GESTURE_RELEASE_GRIP for value in grips.values())
         if all(reader is not None for reader in self._triggers.values()):
-            if not (all_required_fresh and all_required_triggers_fresh):
+            if self._state in (VRState.SAVING, VRState.ERROR):
+                # A squeeze during the post-take return must not queue an
+                # engage that fires as soon as the core unblocks. Require a
+                # full release before accepting a gesture in the next take.
+                self._start_gesture_squeezed = False
+                self._start_gesture_disarmed = True
+                for recognizer in self._gesture.values():
+                    recognizer.cancel_sequence()
+            elif not (all_required_fresh and all_required_triggers_fresh):
                 # A squeeze observed before a tracker or trigger dropout cannot
                 # authorize a later engage/start. Recovery starts a new cycle.
                 self._start_gesture_squeezed = False
@@ -819,6 +900,7 @@ class TrackerBridge:
             # the old world→base fit; once both sides are fresh, the normal
             # auto-engage path takes a new alignment snapshot.
             self._require_engage_confirmation()
+            self._reengage_required_after_loss = True
             self._auto_disengage_pending = True
             _logger.warning(
                 "tracker or trigger freshness lost — freezing Mantis until "
@@ -987,6 +1069,49 @@ class TrackerBridge:
         all_required_held_fresh = len(required_held) == len(required_sides)
         pair_t = max(p.t for p in required_held) if all_required_held_fresh else now
         frame["t"] = pair_t * 1000.0
+        if self._auto_engage_enabled and "tracking_quality" in frame:
+            # Optical health and command engagement are independent: healthy
+            # returning poses must not make a frozen gripper look operational.
+            quality = frame["tracking_quality"]
+            recovering = (
+                not all_required_inputs_fresh
+                or self._auto_disengage_pending
+                or self._auto_disengage_waiting_ack
+            )
+            quality["controlState"] = (
+                "recovering"
+                if recovering
+                else "engaged"
+                if self._engaged
+                else "awaiting_engagement"
+            )
+            quality["reengageRequired"] = self._reengage_required_after_loss
+            quality["triggersLive"] = dict(self._trigger_fresh)
+        quality = frame.get("tracking_quality")
+        if quality is not None:
+            count = int(quality.get("faultCount", 0))
+            new_fault = count > self._diagnostic_fault_count
+            self._diagnostic_fault_count = count
+            context = {
+                "sourceId": self._pose_source_id,
+                "bindings": dict(self._keys),
+                "pairSkewMs": pair_skew_s * 1000.0,
+                "sampleTimes": [None if p is None else p.t for p in pair],
+                "status": quality.get("status"),
+                "controlState": quality.get("controlState"),
+                "triggersLive": dict(self._trigger_fresh),
+                "faultCount": count,
+                "phase": str(self._state),
+            }
+            record = getattr(self._source, "diagnostic_event", None)
+            if callable(record) and (
+                new_fault or now - self._diagnostic_last_frame >= 0.05
+            ):
+                record("bridge_frame", **context)
+                self._diagnostic_last_frame = now
+            trigger = getattr(self._source, "diagnostic_trigger", None)
+            if new_fault and callable(trigger):
+                trigger(quality.get("lastFault") or "Tracking fault", context)
         return frame
 
     def _handle_tracking_state(self, engaged: bool) -> None:
@@ -1002,6 +1127,7 @@ class TrackerBridge:
                 # A reconnect can seed the current true state while our
                 # disengage toggle is still waiting to be consumed.
                 return
+            self._reengage_required_after_loss = False
             if self._auto_engage_waiting_ack:
                 self._auto_engage_waiting_ack = False
                 self._auto_engage_pending = False
@@ -1055,6 +1181,23 @@ class TrackerBridge:
             # If the high frame had engaged the core, its ordered tracking=true
             # broadcast would precede this release acknowledgement.
             self._auto_engage_withdrawn = False
+
+    def _handle_engage_rejected(self) -> None:
+        """Withdraw a request the core refused during an episode transition."""
+        if not self._auto_engage_enabled or not self._auto_engage_waiting_ack:
+            return
+        self._auto_engage_waiting_ack = False
+        self._require_engage_confirmation()
+        self._start_gesture_disarmed = True
+        self._start_gesture_squeezed = False
+        for recognizer in self._gesture.values():
+            recognizer.cancel_sequence()
+        self._request_auto_lock_release()
+        _logger.warning(
+            "Mantis engage was blocked during the episode transition. "
+            "Wait until Mantis is ready, release both triggers, then squeeze "
+            "and release them again."
+        )
 
     # -- Streaming -----------------------------------------------------------
 
@@ -1163,7 +1306,14 @@ class TrackerBridge:
                         f"could not compose tracker frame ({type(exc).__name__}: {exc})"
                     ) from exc
                 await ws.send(payload)
-                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+                now = time.perf_counter()
+                if deadline <= now:
+                    # A delayed compose/send missed this slot. Sampling the
+                    # current pose repeatedly cannot recover the missed poses;
+                    # a catch-up burst only fills the receiver's queue and
+                    # burns through lock/outcome pulses before it can respond.
+                    deadline = now + interval
+                await asyncio.sleep(deadline - now)
         finally:
             drain.cancel()
 
@@ -1192,5 +1342,7 @@ class TrackerBridge:
                     self._handle_tracking_state(bool(value))
                 elif msg_type == "lock_release":
                     self._handle_lock_release(value)
+                elif msg_type == "engage_rejected":
+                    self._handle_engage_rejected()
         except Exception:  # noqa: BLE001 - connection teardown ends the drain
             pass

@@ -16,6 +16,7 @@ import pwd
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 from ..utils.packages import failure_detail, run_package_manager
@@ -26,12 +27,26 @@ _logger = logging.getLogger(__name__)
 
 _REPO_URL = "https://github.com/collabora/libsurvive.git"
 _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
-# Bump this whenever build options change so existing installations are rebuilt.
-_BUILD_REVISION = "libusb-v2-runtime-attestation"
-# Earlier revisions compiled with the same CMake options as the current one.
-# A build cache stamped with any of these holds byte-identical artifacts, so a
-# stale machine manifest only needs re-attesting rather than a native rebuild.
-_REATTESTABLE_BUILD_REVISIONS = frozenset({_BUILD_REVISION, "libusb-v1"})
+# Fixes carried on top of the pinned commit, applied in name order after every
+# checkout (see the patch headers): lightcap timestamps across the 32-bit
+# device clock rollover, OOTX decoding through every tracker that sees a base
+# station, upstream's MPFIT covariance sizing (the fixed 28x28 buffer
+# overflowed once enough base stations were in the solve), a line-buffered
+# --record-stdout stream (block buffering held poses back by up to ~110 ms),
+# the global scene solver's out-of-bounds read once its 32-scene ring wrapped,
+# and mpfit's work arrays moved off the stack (a global-scene solve's Jacobian
+# overflowed the solver thread's stack) — the two mid-session SIGSEGVs seen
+# with four base stations — plus a solver-flag data race, a mis-indexed
+# lighthouse-correction count, and a read past an empty config file's tokens.
+_PATCH_DIR = Path(__file__).resolve().parent.parent / "tracker" / "libsurvive_patches"
+# Bump this whenever build options or the patch set change so existing
+# installations are rebuilt.
+_BUILD_REVISION = "libusb-v4-tracking-quality"
+_PATCH_COUNT = 10
+# Fixed calibration, fault diagnostics, and established-pose outlier rejection
+# extend those fixes. Earlier binaries require rebuilding; only this exact
+# patch revision may be re-attested without compilation.
+_REATTESTABLE_BUILD_REVISIONS = frozenset({_BUILD_REVISION})
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
 _MACHINE_STAMP = Path("/var/lib/almond/libsurvive-build-stamp")
@@ -178,6 +193,67 @@ def _sync_source(src: Path) -> bool:
         _run([git, "checkout", "--quiet", _PINNED_REF], cwd=src)
         and _run([git, "reset", "--hard", _PINNED_REF], cwd=src)
         and _run([git, "clean", "-fdq"], cwd=src)
+        and _apply_patches(git, src)
+    )
+
+
+def _patches() -> tuple[Path, ...]:
+    return tuple(sorted(_PATCH_DIR.glob("*.patch")))
+
+
+def _native_patches_already_applied(src: Path, patches: tuple[Path, ...]) -> bool:
+    """Verify overlapping patches by undoing the stack in a private file copy.
+
+    A later fix can change context required by an earlier patch's reverse check.
+    Git does not simulate sequential inverses when given several patch files in
+    one invocation, so check them one at a time without changing the build cache.
+    """
+    git = shutil.which("git")
+    if git is None or not src.is_dir() or any(not p.is_file() for p in patches):
+        return False
+    try:
+        paths: set[Path] = set()
+        for patch in patches:
+            for line in patch.read_text().splitlines():
+                if line.startswith(("--- a/", "+++ b/")):
+                    path = Path(line[6:].split("\t", 1)[0])
+                    if path.is_absolute() or ".." in path.parts:
+                        return False
+                    paths.add(path)
+        if not paths:
+            return False
+        with tempfile.TemporaryDirectory(
+            prefix="axol-native-patch-check-"
+        ) as directory:
+            private = Path(directory)
+            for path in paths:
+                source = src / path
+                if source.is_file():
+                    target = private / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+            for patch in reversed(patches):
+                if subprocess.run(
+                    [git, "apply", "--reverse", str(patch.resolve())],
+                    cwd=private,
+                    capture_output=True,
+                    timeout=30,
+                ).returncode:
+                    return False
+        return True
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
+        _logger.warning("could not inspect the libsurvive patch stack: %s", exc)
+        return False
+
+
+def _apply_patches(git: str, src: Path) -> bool:
+    """Apply the carried fixes to a clean checkout of the pinned commit."""
+    patches = _patches()
+    if len(patches) != _PATCH_COUNT or any(not patch.is_file() for patch in patches):
+        _logger.warning("libsurvive patch set is incomplete at %s", _PATCH_DIR)
+        return False
+    return _native_patches_already_applied(src, patches) or _run(
+        [git, "apply", "--whitespace=nowarn", *map(str, patches)], cwd=src
     )
 
 
@@ -427,16 +503,35 @@ def _install_machine_stamp(src: Path) -> bool:
 
 
 def _reattestable_build(src: Path) -> bool:
-    """Whether ``src`` holds a finished pinned build with the current options."""
+    """Whether installed artifacts still match this completed build's proof."""
     try:
         lines = (src / _STAMP).read_text().splitlines()
-    except OSError:
+    except (OSError, UnicodeError):
         return False
     if len(lines) < 2 or lines[0].strip() != _PINNED_REF:
         return False
     if lines[1].strip() not in _REATTESTABLE_BUILD_REVISIONS:
         return False
-    return (src / _INSTALL_MANIFEST).is_file()
+    try:
+        manifest = json.loads((src / ".axol-machine-install-manifest").read_text())
+        runtime_paths = _runtime_install_paths(src)
+    except (OSError, UnicodeError, ValueError, RuntimeError):
+        return False
+    if not (
+        isinstance(manifest, dict)
+        and manifest.get("schema") == _MANIFEST_SCHEMA
+        and manifest.get("pinnedRef") == _PINNED_REF
+        and manifest.get("buildRevision") == _BUILD_REVISION
+    ):
+        return False
+    runtime_valid, _ = _verified_runtime_artifacts(manifest, require_root_control=True)
+    if not runtime_valid:
+        return False
+    # A current cache stamp alone cannot certify binaries which were replaced
+    # or rolled back after installation. Require the recorded digest of every
+    # CMake-installed runtime artifact, including dynamically loaded plugins.
+    recorded_paths = {Path(record["path"]) for record in manifest["runtimeArtifacts"]}
+    return recorded_paths == set(runtime_paths)
 
 
 def _verified_runtime_artifacts(

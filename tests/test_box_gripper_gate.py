@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import unittest
 
+from almond_axol.kinematics.config import KinematicsConfig
 from almond_axol.robot.config import GRIPPER_TYPES
 from almond_axol.serve import settings as serve_settings
 from almond_axol.teleop.config import VRTeleopConfig, adopt_robot_gripper
@@ -94,10 +95,14 @@ class AdoptRobotGripperTest(unittest.TestCase):
         teleop = VRTeleop(
             _Robot(),
             config=config,
-            kinematics_config=object(),
+            kinematics_config=KinematicsConfig(robot_model="mobile"),
             vr_server_config=VRServerConfig(),
         )
         self.assertTrue(teleop._core.box_available)
+        # ...and the IK solver and headset overlay use the parcel gripper's
+        # model of Axol on Jelly.
+        self.assertEqual(teleop._kinematics_config.gripper, "parcel")
+        self.assertEqual(teleop._core._urdf_file, "axol_jelly_parcel.urdf")
 
 
 class LiveGateTest(unittest.TestCase):

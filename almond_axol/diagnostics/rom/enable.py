@@ -6,7 +6,10 @@ range, except wrist_2 and wrist_3, which stop ROM_LIMIT_MARGIN (5°) short of
 each limit so those motors are never driven hard into the ends of travel.
 
 Enables the motors, eases to home, then prompts to close each gripper onto the
-item and loops the sweep for two hours. When the soak finishes (or on Ctrl-C)
+item and loops the sweep for two hours. The item's mass (``--payload-kg``,
+default 2 kg per gripper) is added to the gravity model as each gripper closes
+on it, so the arms carry the load on feedforward instead of sagging behind
+their targets on the position spring. When the soak finishes (or on Ctrl-C)
 the robot returns home but keeps holding the item with the motors left enabled
 — run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
 and retrieve the item.
@@ -83,6 +86,7 @@ from ...constants import (
     CAN_MANTIS_LEFT,
     CAN_MANTIS_RIGHT,
     CAN_RIGHT,
+    GRIPPER_TIP_OFFSET,
     Joint,
 )
 from ...motor import CanBus, Motor, MotorError
@@ -95,6 +99,7 @@ from ...robot.axol import (
 )
 from ...robot.axol import LIMITS as _AXOL_LIMITS
 from ...robot.config import ArmConfig, AxolConfig, FrictionParams
+from ...robot.gravity import MAX_PAYLOAD_KG
 from ...rt import Axol, Mantis
 from ..telemetry_log import TelemetryCsvLogger
 
@@ -151,6 +156,13 @@ SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 GRIPPER_TORQUE_LIMIT = 2.0  # Nm — POSITION_FORCE grasp force (output cap)
 GRIPPER_SPEED = 1.0  # normalized [0, 1] per second — open/close speed
 
+# Mass of the item each gripper holds on a full-robot run, added to the gravity
+# model at the fingertips once the gripper closes on it. Unmodelled, the
+# soak's 2 kg weights left ~17 Nm on shoulder_2's position spring at the T pose
+# (a ~4.8° sag behind the sweep), and that loaded spring rang the joint at
+# ~25 Hz; modelled, the sag fell to ~1° and the ring by ~30% (2026-10-15).
+DEFAULT_PAYLOAD_KG = 2.0  # kg per gripper
+
 JOINT_INDEX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
 NUM_JOINTS = len(list(Joint))
 
@@ -159,6 +171,35 @@ FULL_JOINT_SET: frozenset[Joint] = frozenset(Joint)
 
 class CoreLimp(RuntimeError):
     """The realtime core dropped the arms to gravity comp mid-run."""
+
+
+def check_payload_kg(mass: float) -> float:
+    """Refuse a ``--payload-kg`` outside 0 to the gravity model's limit (kg).
+
+    Checked before bring-up, so a typo in the panel's field fails the run
+    before any motor is enabled rather than after the grasp.
+    """
+    if not (math.isfinite(mass) and 0.0 <= mass <= MAX_PAYLOAD_KG):
+        raise SystemExit(
+            f"--payload-kg must be between 0 and {MAX_PAYLOAD_KG:g} kg, got {mass:g}."
+        )
+    return mass
+
+
+def apply_grasp_payload(robot: Axol, side: str, payload_kg: float) -> None:
+    """Add the item one gripper just closed on to the gravity model.
+
+    A point mass at the fingertips (``GRIPPER_TIP_OFFSET``), from the next
+    control cycle on. ``0`` leaves the model as it is. Not persisted: it ends
+    with this process, and the hold ``rom.disable`` inherits is at home, where
+    the item hangs under the wrist and loads no joint.
+    """
+    if payload_kg <= 0.0:
+        return
+    robot.set_payload(side, payload_kg, GRIPPER_TIP_OFFSET)
+    print(
+        f"{side.capitalize()} gripper: {payload_kg:g} kg item added to the gravity model."
+    )
 
 
 def parse_joints(spec: str | None) -> set[Joint]:
@@ -737,6 +778,7 @@ async def run_axol(
     left_channel: str = CAN_LEFT,
     right_channel: str = CAN_RIGHT,
     target: str = "axol",
+    payload_kg: float = DEFAULT_PAYLOAD_KG,
 ) -> None:
     run_left = not no_left
     run_right = not no_right
@@ -760,7 +802,8 @@ async def run_axol(
         if present == set(Joint)
         else ", ".join(j.value for j in Joint if j in present)
     )
-    print(f"Running {arms_desc}  |  joints: {joints_desc}\n")
+    payload_desc = f"  |  item: {payload_kg:g} kg per gripper" if grasp else ""
+    print(f"Running {arms_desc}  |  joints: {joints_desc}{payload_desc}\n")
 
     config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
     if grasp:
@@ -879,6 +922,7 @@ async def run_axol(
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
                 )
+                apply_grasp_payload(robot, "right", payload_kg)
             if run_left:
                 await _confirm(
                     "Position the item in the LEFT gripper, then close it.",
@@ -890,6 +934,7 @@ async def run_axol(
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
                 )
+                apply_grasp_payload(robot, "left", payload_kg)
             print("Grippers closed.")
 
         closed_left_q = left_q.copy()
@@ -1003,6 +1048,16 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Test the Axol arms or Mantis grippers (default: %(default)s).",
     )
     parser.add_argument(
+        "--payload-kg",
+        type=float,
+        default=DEFAULT_PAYLOAD_KG,
+        metavar="KG",
+        help="Mass of the item each gripper holds on a full-robot run, added "
+        "to the gravity model when the gripper closes on it (0 to "
+        f"{MAX_PAYLOAD_KG:g} kg; 0 models no item). Ignored on a joint subset, "
+        f"which holds nothing (default: {DEFAULT_PAYLOAD_KG:g}).",
+    )
+    parser.add_argument(
         "--left-channel",
         default=None,
         metavar="IFACE",
@@ -1066,6 +1121,7 @@ def run_cli(args: argparse.Namespace) -> None:
             left_channel=args.left_channel or defaults[0],
             right_channel=args.right_channel or defaults[1],
             target=args.target,
+            payload_kg=check_payload_kg(args.payload_kg),
         )
     )
 

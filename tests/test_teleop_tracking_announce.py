@@ -12,6 +12,7 @@ import asyncio
 import threading
 import unittest
 
+from almond_axol.kinematics.config import KinematicsConfig
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.teleop import VRTeleop
 from almond_axol.vr.config import VRServerConfig
@@ -27,7 +28,7 @@ class TrackingAnnounceTest(unittest.TestCase):
         teleop = VRTeleop(
             _Robot(),
             config=VRTeleopConfig(),
-            kinematics_config=object(),
+            kinematics_config=KinematicsConfig(robot_model="classic"),
             vr_server_config=VRServerConfig(),
         )
         loop = asyncio.new_event_loop()

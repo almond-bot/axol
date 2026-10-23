@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..tracker.trigger import validate_trigger_full_scale
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
@@ -380,6 +381,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
         ),
         settings=(
             SettingDef(
+                key="kinematics.mount",
+                label="Robot model",
+                type="select",
+                options=("classic", "standalone", "ox_cart", "owl"),
+                help=(
+                    "What Axol is mounted on, when Jelly is not attached: "
+                    "classic (the legacy model), standalone (Axol on its "
+                    "own), ox_cart (on the Ox cart's lift) or owl (on the Owl "
+                    "mount). It picks the robot model — the body IK keeps the "
+                    "arms clear of, and what the viewers show. With Jelly "
+                    "attached and on, the robot is Axol on Jelly whatever "
+                    "this says."
+                ),
+                ui={"widget": "mount"},
+                effective_default="classic (legacy)",
+            ),
+            SettingDef(
                 key="axol.left_stiffness",
                 label="Left arm stiffness",
                 type="number",
@@ -663,6 +681,37 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 effective_default="can_mantis_r",
             ),
             SettingDef(
+                key="mantis.left_trigger_full_scale",
+                label="Left trigger full squeeze",
+                type="number",
+                help=(
+                    "Normalized trigger reading at a firm full squeeze. "
+                    "Set this to the measured left endpoint if it stops "
+                    "below 1.00; 1.00 leaves the input unchanged. A lower "
+                    "value makes the left gripper reach fully closed sooner."
+                ),
+                targets={
+                    "teleop": ("mantis_left_trigger_full_scale",),
+                    "collect-data": ("mantis_left_trigger_full_scale",),
+                },
+                ui={"widget": "slider", "min": 0.5, "max": 1.0, "step": 0.01},
+            ),
+            SettingDef(
+                key="mantis.right_trigger_full_scale",
+                label="Right trigger full squeeze",
+                type="number",
+                help=(
+                    "Normalized trigger reading at a firm full squeeze. "
+                    "Leave at 1.00 when the right gripper already closes fully. "
+                    "A lower value makes it reach fully closed sooner."
+                ),
+                targets={
+                    "teleop": ("mantis_right_trigger_full_scale",),
+                    "collect-data": ("mantis_right_trigger_full_scale",),
+                },
+                ui={"widget": "slider", "min": 0.5, "max": 1.0, "step": 0.01},
+            ),
+            SettingDef(
                 key="teleop.frequency",
                 label="Teleop rate (Hz)",
                 type="number",
@@ -698,13 +747,32 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Hold grips to engage",
                 type="boolean",
                 help=(
-                    "Dead-man grip scheme: hold both grips to start driving, "
-                    "and each arm tracks only while its grip stays held — "
-                    "release one and that arm freezes where it is. Off "
-                    "(default) is the toggle scheme: click both grips to "
-                    "engage from rest, then a click on either grip toggles "
-                    "that arm between tracking and frozen."
+                    "Per-arm dead-man grips: each arm moves only while its "
+                    "own grip is held — either grip alone engages its arm, "
+                    "from rest too — and releasing a grip freezes that arm "
+                    "where it is. Off (default) is the toggle scheme: click "
+                    "both grips to engage from rest, then a click on either "
+                    "grip toggles that arm between tracking and frozen."
                 ),
+            ),
+            SettingDef(
+                key="teleop.park_to_zero",
+                label="Park to zero on stop",
+                type="boolean",
+                help=(
+                    "On Stop (or Ctrl+C) the arms return to rest and then "
+                    "continue to the all-zero joint pose — hanging straight "
+                    "down — holding their grasp, before the motors are "
+                    "released, so nothing drops when the torque comes off. "
+                    "Off: the park stops at the rest pose."
+                ),
+                # Also a top-level field of the ops without a teleop subtree.
+                targets={
+                    "teleop": ("teleop.park_to_zero",),
+                    "collect-data": (f"{_VRT}.park_to_zero",),
+                    "run-policy": ("park_to_zero",),
+                    "replay-dataset": ("park_to_zero",),
+                },
             ),
             SettingDef(
                 key="teleop.box_mode",
@@ -941,10 +1009,36 @@ SETTINGS: tuple[SettingCategory, ...] = (
         key="kinematics",
         label="Kinematics",
         description=(
-            "IK solver cost weights for teleop and data collection — how the "
-            "arms trade off tracking the hands against posture and limits."
+            "Which IK solver every operation uses, and the JAX solver's cost "
+            "weights for teleop and data collection — how the arms trade off "
+            "tracking the hands against posture and limits."
         ),
         settings=(
+            SettingDef(
+                key="kinematics.backend",
+                label="IK solver",
+                type="select",
+                options=("jax", "mink"),
+                help=(
+                    "jax (default): the Pyroki/JAX solver. mink: the MuJoCo "
+                    "velocity-QP solver used by Cartesian policies — teleop "
+                    "tracking, Cartesian policy actions, and straight-line "
+                    "Cartesian return-to-rest / park paths all switch to it, "
+                    "and LeRobot sessions also run the realtime core's mink "
+                    "tracking profile. The weights below tune JAX only."
+                ),
+                # One switch for both config fields that name the backend.
+                # collect-dagger inherits collect-data's (settings_like).
+                targets={
+                    "teleop": ("kinematics.backend",),
+                    "collect-data": (
+                        f"{_KIN}.backend",
+                        f"{_ROBOT}.cartesian_controller",
+                    ),
+                    "run-policy": (f"{_ROBOT}.cartesian_controller",),
+                    "replay-dataset": (f"{_ROBOT}.cartesian_controller",),
+                },
+            ),
             SettingDef(
                 key="kinematics.pos_weight",
                 label="Position weight",
@@ -1676,6 +1770,18 @@ class SettingsStore:
                     and value is not None
                 ):
                     incoming[key] = parse_boolean(value, key=key)
+                if (
+                    key
+                    in {
+                        "mantis.left_trigger_full_scale",
+                        "mantis.right_trigger_full_scale",
+                    }
+                    and value is not None
+                ):
+                    try:
+                        incoming[key] = validate_trigger_full_scale(value)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(f"{key}: {exc}") from exc
             values = incoming
         with self._lock:
             if (

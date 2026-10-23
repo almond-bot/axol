@@ -39,6 +39,7 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
+from ..settings import resolve_robot_model
 from ..robot import lift_firmware
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
@@ -96,16 +97,18 @@ class OpStartRequest(BaseModel):
 
         {
           "serials": {"overhead": 41234567, "left_arm": ..., "right_arm": ...},
-          "mantis_serials": {"left_arm": ..., "right_arm": ...},
+          "mantis_serials": {"overhead": ..., "left_arm": ..., "right_arm": ...},
           "stream_resolution": "HD1200",   # capture res → headset; "off" disables
           "record_resolution": "SVGA",     # dataset downscale; "off" disables
           "stream": {"overhead": "both", "left_arm": true},   # per-slot headset
           "record": {"overhead": "left", "left_arm": false}   # per-slot dataset
         }
 
-    ``mantis_serials`` is a separate two-camera assignment used whenever the
+    ``mantis_serials`` is a separate head/wrist camera assignment used whenever the
     run's ``mantis`` flag is on (the panel sets it from its system-wide device
-    switch); Axol continues to use ``serials``.
+    switch); Axol continues to use ``serials``. Missing Mantis slots fall back
+    to ``serials`` for older saved setups; an explicit empty string unassigns
+    the slot for Mantis only.
     The ``stream`` / ``record`` maps decide per camera whether it takes part in
     each branch: ``false`` opts a camera out, ``true`` opts a mono camera in, and
     an eye name (``"both"`` / ``"left"`` / ``"right"``) opts a stereo camera in
@@ -2359,11 +2362,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- shared operator settings (see serve/settings.py) --------------------
 
+    def robot_model() -> str:
+        """The Axol version runs on this host would use: mobile when Jelly is on.
+
+        Derived (Jelly attached and not switched off, or an explicit
+        ``kinematics.robot_model``), so the panel's robot viewer shows the same
+        body the IK solver keeps the arms clear of.
+        """
+        try:
+            return resolve_robot_model(store=settings).value
+        except Exception:  # noqa: BLE001 - a bad value must not hide the settings
+            _logger.exception("could not resolve the Axol version; showing classic")
+            return "classic"
+
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
         """Stored shared settings + the schemas describing every category."""
         return {
             **settings.snapshot(),
+            "robotModel": robot_model(),
             "schema": settings_schema(),
             "advancedSchema": advanced_schema(),
         }
@@ -2385,7 +2402,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": "could not securely write the shared settings"},
                 status_code=500,
             )
-        return JSONResponse(snapshot)
+        # The Jelly switches (or an explicit kinematics.robot_model) may have
+        # just changed which Axol version runs.
+        return JSONResponse({**snapshot, "robotModel": robot_model()})
 
     def quest_calibration_key() -> object:
         snapshot = settings.snapshot()
@@ -2437,6 +2456,44 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=400,
             )
         return JSONResponse(result)
+
+    @app.put("/api/tracker/lighthouse/quality", response_model=None)
+    async def put_lighthouse_quality(request: Request) -> JSONResponse:
+        """Choose the standard or strict Lighthouse tracking policy."""
+        from ..tracker.config import (
+            load_tracker_config,
+            save_tracker_config,
+            validate_lighthouse_quality,
+        )
+
+        body, error = await redacted_json_body(request)
+        if error is not None:
+            return error
+        try:
+            mode = validate_lighthouse_quality(body.get("mode"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if runner.is_running() or _diagnostic_session_active():
+            # A running bridge resolved its policy at startup; changing it
+            # underneath would make the panel describe a policy not in force.
+            return JSONResponse(
+                {"error": "stop the running operation before changing this"},
+                status_code=409,
+            )
+
+        def save() -> None:
+            config = load_tracker_config()
+            config.lighthouse_quality = mode
+            save_tracker_config(config)
+
+        try:
+            await asyncio.to_thread(save)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not write the tracker configuration"},
+                status_code=400,
+            )
+        return JSONResponse({"mode": mode})
 
     @app.get("/api/tracker/calibration/{source}", response_model=None)
     async def get_tracker_calibration(source: str) -> JSONResponse:
@@ -2526,6 +2583,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
             from ..tracker import load_tracker_config
             from ..tracker.lighthouse_survey import load_lighthouse_survey
+            from ..tracker.lighthouse_validation import (
+                is_lighthouse_serial,
+                validation_snapshot,
+            )
             from ..vr.server import get_last_quest_pose_datum
             from .tracker_setup import TrackerSetupError, calibration_snapshot
 
@@ -2589,6 +2650,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         left
                         and right
                         and left != right
+                        and (
+                            backend != "survive"
+                            or (
+                                is_lighthouse_serial(left)
+                                and is_lighthouse_serial(right)
+                            )
+                        )
                         and (
                             backend != "ultimate"
                             or (
@@ -2668,6 +2736,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "liveDatum": get_last_quest_pose_datum(),
             }
             lighthouse = lighthouse_readiness()
+            lighthouse_survey = load_lighthouse_survey()
+            if lighthouse_survey is not None:
+                lighthouse_survey["expectedBaseStations"] = (
+                    config.expected_base_stations
+                )
             source_status["lighthouse"] = {
                 **lighthouse,
                 "binding": bindings["survive"],
@@ -2675,7 +2748,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 # Last base-station survey (Check base stations / Identify):
                 # libsurvive only logs a shared channel, so this is the panel's
                 # sole view of it. None until a survey has run on this host.
-                "baseStations": load_lighthouse_survey(),
+                "baseStations": lighthouse_survey,
+                "expectedBaseStations": config.expected_base_stations,
+                "qualityMode": config.lighthouse_quality,
+                "validation": validation_snapshot(config),
             }
             ultimate = ultimate_runtime_readiness()
             try:

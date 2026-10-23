@@ -12,9 +12,9 @@ stealing its frames.
 The trigger is a **continuous analog squeeze**, not a switch: the rig's
 trigger drives a potentiometer, and the node publishes a normalised
 position so the gripper tracks the operator's hand proportionally. The
-node self-calibrates (auto-zeroed rest at power-on, closing direction
-latched from the first real pull), so there is nothing to calibrate
-host-side.
+node auto-zeros rest at power-on and latches closing direction from the
+first real pull. A per-reader host-side full-squeeze endpoint can correct
+a node whose fully squeezed position falls short of 1.0.
 
 Firmware contract (node → host only; the host never transmits to it —
 source of truth: ``designs/mantis/firmware/firmware.c`` in the
@@ -42,8 +42,9 @@ circuits-py repo, protocol table in the adjacent README):
     host-side filtering or debounce is needed.
 
 The position maps to the VRFrame grip convention (0.0 = fully closed …
-1.0 = fully open) by :func:`position_to_grip`, which simply inverts it:
-released grip 1.0 (open), fully squeezed grip 0.0 (closed).
+1.0 = fully open) by :func:`position_to_grip`. With the default endpoint
+of 1.0, released grip is 1.0 (open) and fully squeezed grip is 0.0
+(closed). A calibrated endpoint below 1.0 saturates to closed there.
 
 Staleness policy: no frame for :data:`STALE_AFTER_S` (~25 missed frames
 at 100 Hz — device unplugged or powered off) marks the node stale, and
@@ -147,15 +148,33 @@ def encode_trigger_frame(position: float, raw: int | None = None) -> bytes:
     return struct.pack(_FRAME_FMT, position, raw)
 
 
-def position_to_grip(position: float) -> float:
+def validate_trigger_full_scale(full_scale: float) -> float:
+    """Return a valid normalized full-squeeze endpoint.
+
+    An invalid endpoint must fail before opening a CAN socket. The lower
+    bound prevents minor trigger noise from commanding a full jaw close;
+    non-finite values must never become motor commands.
+    """
+    if (
+        isinstance(full_scale, bool)
+        or not isinstance(full_scale, (int, float))
+        or not math.isfinite(full_scale)
+        or not 0.5 <= full_scale <= 1.0
+    ):
+        raise ValueError("trigger full_scale must be finite and in [0.5, 1]")
+    return float(full_scale)
+
+
+def position_to_grip(position: float, full_scale: float = 1.0) -> float:
     """Map the trigger position to the VRFrame grip command.
 
     VRFrame grip is 0.0 = fully closed … 1.0 = fully open, the inverse of
-    the node's 0.0 = released … 1.0 = squeezed, so this is just
-    ``1 - position``. Proportional throughout: a half-squeezed trigger
-    commands a half-closed gripper.
+    the node's 0.0 = released … 1.0 = squeezed. ``full_scale`` is the
+    node position observed at full physical squeeze. The mapping is
+    proportional until that endpoint and clamps to fully closed above it.
     """
-    return 1.0 - min(max(position, 0.0), 1.0)
+    scale = validate_trigger_full_scale(full_scale)
+    return 1.0 - min(max(position / scale, 0.0), 1.0)
 
 
 def is_stale(last_rx: float | None, now: float, timeout: float = STALE_AFTER_S) -> bool:
@@ -180,11 +199,16 @@ class TriggerReader:
 
     Args:
         channel: SocketCAN interface name, e.g. ``"can_mantis_l"``.
+        full_scale: Trigger position at full physical squeeze, in [0.5, 1].
+            The default of 1.0 preserves the firmware mapping.
         bus:     Pre-opened bus-like object (``recv``/``shutdown``) — used
             by the tests to feed synthetic frames without CAN hardware.
     """
 
-    def __init__(self, channel: str, *, bus: Any | None = None) -> None:
+    def __init__(
+        self, channel: str, *, full_scale: float = 1.0, bus: Any | None = None
+    ) -> None:
+        self._full_scale = validate_trigger_full_scale(full_scale)
         if bus is None:
             try:
                 import can
@@ -328,7 +352,7 @@ class TriggerReader:
             frame = parse_trigger_frame(bytes(msg.data))
             if frame is None:
                 continue
-            grip = position_to_grip(frame.position)
+            grip = position_to_grip(frame.position, self._full_scale)
             now = time.monotonic()
             with self._lock:
                 self._grip = grip

@@ -15,9 +15,11 @@ import {
 } from "lucide-react"
 import {
   fetchTrackerBindings,
+  saveLighthouseQualityMode,
   sendSessionInput,
   stopSession,
   useSessionLogs,
+  type LighthouseQualityMode,
   type SessionInfo,
   type TrackerBackend,
   type TrackerBinding,
@@ -33,11 +35,13 @@ type SetupCommand =
   | "tracker.install"
   | "tracker.pair"
   | "tracker.lighthouse.check"
+  | "tracker.lighthouse.validate"
+  | "tracker.lighthouse.calibrate"
   | "tracker.identify"
   | "tracker.ultimate.install"
   | "tracker.ultimate.check"
 
-type StepKey = "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify"
+type StepKey = "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify" | "validation"
 
 interface FlowStep {
   key: StepKey
@@ -59,7 +63,9 @@ function trackerSessionBackend(session: SessionInfo): TrackerBackend | null {
   if (
     session.command === "tracker.install" ||
     session.command === "tracker.pair" ||
-    session.command === "tracker.lighthouse.check"
+    session.command === "tracker.lighthouse.check" ||
+    session.command === "tracker.lighthouse.validate" ||
+    session.command === "tracker.lighthouse.calibrate"
   )
     return "survive"
   if (
@@ -84,6 +90,9 @@ function stepForCommand(command: string | undefined): StepKey | null {
     case "tracker.pair":
     case "tracker.lighthouse.check":
       return "stations"
+    case "tracker.lighthouse.validate":
+    case "tracker.lighthouse.calibrate":
+      return "validation"
     case "tracker.identify":
       return "identify"
     case "tracker.ultimate.check":
@@ -155,8 +164,11 @@ export function TrackerBindingPanel({
   const [bindingsLoaded, setBindingsLoaded] = useState(false)
   const [bindingsError, setBindingsError] = useState(false)
   const [readiness, setReadiness] = useState<TrackerSourceReadiness | null>(null)
+  const [checkedAt, setCheckedAt] = useState(() => Date.now() / 1000)
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [busy, setBusy] = useState(false)
+  const [expectedStationChoice, setExpectedStationChoice] = useState<number | null>(null)
+  const [qualityModeChoice, setQualityModeChoice] = useState<LighthouseQualityMode | null>(null)
   const [dismissed, setDismissed] = useState<{ id: string; promptIndex: number } | null>(null)
   // Keep ownership of an in-flight setup session even if the operator edits
   // the source selector. Otherwise its progress/prompt/Stop controls vanish
@@ -179,6 +191,7 @@ export function TrackerBindingPanel({
         if (cancelled) return
         setBindings(found)
         setReadiness(sources ?? null)
+        setCheckedAt(Date.now() / 1000)
         setBindingsLoaded(true)
         setBindingsError(false)
       })
@@ -199,11 +212,14 @@ export function TrackerBindingPanel({
   useEffect(() => {
     let cancelled = false
     const refresh = () => {
+      // An expired report must stop appearing current even if this host read hangs.
+      setCheckedAt(Date.now() / 1000)
       fetchTrackerBindings()
         .then(({ bindings: found, sources }) => {
           if (cancelled) return
           setBindings(found)
           setReadiness(sources ?? null)
+          setCheckedAt(Date.now() / 1000)
           setBindingsLoaded(true)
           setBindingsError(false)
         })
@@ -227,8 +243,11 @@ export function TrackerBindingPanel({
       : null
   const checkingUltimate = activeSession?.command === "tracker.ultimate.check"
   const checkingLighthouse = activeSession?.command === "tracker.lighthouse.check"
+  const validatingLighthouse =
+    activeSession?.command === "tracker.lighthouse.validate" ||
+    activeSession?.command === "tracker.lighthouse.calibrate"
   const checking = checkingUltimate || checkingLighthouse
-  const transcriptLimit = checking ? 24 : 6
+  const transcriptLimit = checking || validatingLighthouse ? 24 : 6
   const transcript = currentLines
     .filter((line) => line.trim() && !line.startsWith("[serve]") && !line.startsWith("[prompt] "))
     .slice(-transcriptLimit)
@@ -236,7 +255,10 @@ export function TrackerBindingPanel({
   // useSessionLogs can also retain the previous session's terminal status for
   // one render. Never let it complete a new run before that run has started.
   const current = status?.id === activeSession?.id ? status : activeSession
-  const running = current?.status === "starting" || current?.status === "running"
+  const running =
+    current?.status === "starting" ||
+    current?.status === "running" ||
+    current?.status === "stopping"
   const terminal = current?.status === "exited" || current?.status === "error"
   const succeeded = terminal && current?.status === "exited" && (current.exitCode ?? 0) === 0
   const pairing = activeSession?.command === "tracker.pair"
@@ -254,39 +276,47 @@ export function TrackerBindingPanel({
       activeSession.command === "tracker.ultimate.install"
     const checkedUltimate = activeSession.command === "tracker.ultimate.check"
     const checkedLighthouse = activeSession.command === "tracker.lighthouse.check"
+    const validatedLighthouse =
+      activeSession.command === "tracker.lighthouse.validate" ||
+      activeSession.command === "tracker.lighthouse.calibrate"
     fetchTrackerBindings()
       .then(({ bindings: found, sources }) => {
         setBindings(found)
         setReadiness(sources ?? null)
+        setCheckedAt(Date.now() / 1000)
         setBindingsLoaded(true)
         setBindingsError(false)
       })
       .catch(() => setBindingsError(true))
     if (current?.status === "exited" && (current.exitCode ?? 0) === 0) {
       toast.success(
-        checkedLighthouse
-          ? "Base stations are on distinct channels and both trackers report."
-          : checkedUltimate
-            ? "Ultimate host setup is ready."
-            : installed
-              ? displayedBackend === "ultimate"
-                ? "Ultimate Linux runtime installed."
-                : "Lighthouse tracking support installed."
-              : paired
-                ? "Lighthouse tracker paired."
-                : "Mantis tracker binding saved."
+        validatedLighthouse
+          ? "Lighthouse check finished. Review the tracking quality result."
+          : checkedLighthouse
+            ? "Base stations are on distinct channels and both trackers report."
+            : checkedUltimate
+              ? "Ultimate host setup is ready."
+              : installed
+                ? displayedBackend === "ultimate"
+                  ? "Ultimate Linux runtime installed."
+                  : "Lighthouse tracking support installed."
+                : paired
+                  ? "Lighthouse tracker paired."
+                  : "Mantis tracker binding saved."
       )
     } else {
       toast.error(
-        checkedLighthouse
-          ? "Base-station check found setup issues. Review the results in the step."
-          : checkedUltimate
-            ? "Ultimate readiness check found setup issues. Review the results in the step."
-            : installed
-              ? "Tracker runtime installation failed. See the status in the step."
-              : paired
-                ? "Tracker pairing failed. See the status in the step."
-                : "Tracker identification failed. See the status in the step."
+        validatedLighthouse
+          ? "Lighthouse validation failed. Review the results before recording."
+          : checkedLighthouse
+            ? "Base-station check found setup issues. Review the results in the step."
+            : checkedUltimate
+              ? "Ultimate readiness check found setup issues. Review the results in the step."
+              : installed
+                ? "Tracker runtime installation failed. See the status in the step."
+                : paired
+                  ? "Tracker pairing failed. See the status in the step."
+                  : "Tracker identification failed. See the status in the step."
       )
     }
     // Persist the terminal status for same-source feedback, but release an old
@@ -302,6 +332,7 @@ export function TrackerBindingPanel({
 
   // Each run gets a fresh session id, so the completion guard needs no reset.
   async function launch(command: SetupCommand, args: Record<string, unknown> = {}) {
+    if (busy || blockedReason !== null || running) return
     setBusy(true)
     setDismissed(null)
     try {
@@ -344,6 +375,21 @@ export function TrackerBindingPanel({
     source === "quest" ? "Quest / WebXR" : source === "ultimate" ? "VIVE Ultimate" : "Lighthouse"
   const actionsLocked = busy || blockedReason !== null || running
   const canAct = !actionsLocked && (sessionBackend === null || sessionBackend === backend)
+  const expectedStationCount =
+    expectedStationChoice ?? readiness?.lighthouse.expectedBaseStations ?? 2
+  const qualityMode = qualityModeChoice ?? readiness?.lighthouse.qualityMode
+
+  async function chooseQualityMode(mode: LighthouseQualityMode) {
+    setBusy(true)
+    try {
+      const saved = await saveLighthouseQualityMode(mode)
+      setQualityModeChoice(saved.mode)
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   if (!bindingsLoaded) {
     return (
@@ -397,13 +443,21 @@ export function TrackerBindingPanel({
               <>
                 <p className="text-sm text-amber-100/85">{pendingPrompt}</p>
                 <Button size="sm" className="self-start" onClick={capture}>
-                  Start 3-second capture
+                  {validatingLighthouse ? "Continue" : "Start 3-second capture"}
                 </Button>
               </>
             ) : dismissed?.id === activeSession.id ? (
-              <p className="flex items-center gap-2 text-sm text-white/60">
-                <Loader2 className="size-4 animate-spin" /> Capturing motion…
-              </p>
+              <>
+                {validatingLighthouse && prompt && (
+                  <p className="text-sm text-amber-100/85">{prompt.text}</p>
+                )}
+                <p className="flex items-center gap-2 text-sm text-white/60">
+                  <Loader2 className="size-4 animate-spin" />
+                  {validatingLighthouse
+                    ? "Running tracking check… Follow the current step's instructions."
+                    : "Capturing motion…"}
+                </p>
+              </>
             ) : (
               <p className="flex items-center gap-2 text-sm text-white/60">
                 <Loader2 className="size-4 animate-spin" />
@@ -413,12 +467,20 @@ export function TrackerBindingPanel({
                     ? "Running the non-invasive Ultimate readiness check…"
                     : checkingLighthouse
                       ? "Listening to libsurvive for base stations and trackers…"
-                      : pairing
-                        ? "Pairing remains active…"
-                        : "Waiting for both trackers…"}
+                      : validatingLighthouse
+                        ? "Preparing the Lighthouse tracking check…"
+                        : pairing
+                          ? "Pairing remains active…"
+                          : "Waiting for both trackers…"}
               </p>
             )}
-            <Button variant="ghost" size="sm" className="self-start" onClick={stop} disabled={busy}>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="self-start"
+              onClick={stop}
+              disabled={busy || current?.status === "stopping"}
+            >
               <Square /> Stop
             </Button>
           </>
@@ -427,15 +489,21 @@ export function TrackerBindingPanel({
             {succeeded
               ? checkingUltimate
                 ? "Ultimate host setup passed."
-                : checkingLighthouse
-                  ? "Every base station is on its own channel and both trackers report."
-                  : installing
-                    ? "Tracking support installed."
-                    : pairing
-                      ? "Tracker paired. Repeat for the other tracker if needed."
-                      : "Binding saved."
-              : (activeLine ??
-                current?.error ??
+                : validatingLighthouse
+                  ? "Check finished. Review the tracking quality result above before recording."
+                  : checkingLighthouse
+                    ? "Every base station is on its own channel and both trackers report."
+                    : installing
+                      ? "Tracking support installed."
+                      : pairing
+                        ? "Tracker paired. Repeat for the other tracker if needed."
+                        : "Binding saved."
+              : (current?.error ??
+                [...transcript].reverse().find((line) => /^\s*FAIL\b/.test(line)) ??
+                (activeLine?.startsWith("Saved to ") ? null : activeLine) ??
+                (validatingLighthouse
+                  ? "Lighthouse validation failed. Restore visibility and check the base-station setup."
+                  : null) ??
                 (checking
                   ? "The check found setup issues."
                   : installing
@@ -747,7 +815,7 @@ export function TrackerBindingPanel({
     const l = readiness.lighthouse
     const survey = l.baseStations ?? null
     const surveySupported = l.baseStations !== undefined
-    const expectedStations = survey?.expectedBaseStations ?? 2
+    const expectedStations = expectedStationCount
     const stationsMissing =
       survey !== null &&
       survey.clashingChannels.length === 0 &&
@@ -823,15 +891,16 @@ export function TrackerBindingPanel({
               : survey.baseStationCount === 0
                 ? "No base station was seen; power them and check again"
                 : stationsMissing
-                  ? `Only ${survey.baseStationCount} of ${expectedStations} base stations seen; put the other on its own channel and check again`
-                  : "Both trackers must report; pair the missing one and check again",
+                  ? `Only ${survey.baseStationCount} of ${expectedStations} base stations seen; check power, visibility and distinct channels`
+                  : "Both trackers need fresh poses; check power, dongles and visibility. Recalibrate if tracking is unstable.",
         body: (
           <StepBody>
             <ol className="flex flex-col gap-2">
               <SetupStep number={1}>
-                Power the base stations. Every Base Station 2.0 must show a different channel number
-                on the display on its back; the button next to it cycles 1–16. Two stations on the
-                same number cancel each other out, and libsurvive can only receive one of them.
+                Power all expected base stations and give each Base Station 2.0 a different channel.
+                The numbers shown here come from the tracking software. Missing stations can mean
+                blocked visibility, power or channel issues; the check will report a detected
+                channel conflict explicitly.
               </SetupStep>
               <SetupStep number={2}>
                 Pair each Tracker 3.0 to its own Watchman dongle: connect only that dongle, unplug
@@ -841,10 +910,14 @@ export function TrackerBindingPanel({
               </SetupStep>
               <SetupStep number={3}>
                 Connect both dongles, power both trackers in view of the base stations, and use
-                Check base stations. It listens to libsurvive for 20 seconds and must see every base
-                station on its own channel.
+                Check base stations. It listens to libsurvive for 20 seconds, or up to 150 seconds
+                while libsurvive calibrates newly added or moved base stations (keep the trackers
+                still), and must see every base station on its own channel.
               </SetupStep>
             </ol>
+            <ExternalSetupLink href="https://www.vive.com/eu/support/vive-pro/category_howto/configuring-the-base-station-channels.html">
+              HTC instructions for configuring Base Station 2.0 channels
+            </ExternalSetupLink>
             <div className="flex flex-wrap gap-2">
               <Button
                 variant="outline"
@@ -858,7 +931,9 @@ export function TrackerBindingPanel({
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => launch("tracker.lighthouse.check")}
+                onClick={() =>
+                  launch("tracker.lighthouse.check", { expected_stations: expectedStationCount })
+                }
                 disabled={!canAct}
               >
                 {busy ? <Loader2 className="animate-spin" /> : <ListChecks />}
@@ -887,10 +962,10 @@ export function TrackerBindingPanel({
                   </ReadinessBadge>
                   <ReadinessBadge tone={survey.trackers.length >= 2 ? "ready" : "warning"}>
                     {survey.trackers.length >= 2
-                      ? `Trackers ${survey.trackers.join(", ")} reporting`
+                      ? `Fresh poses from ${survey.trackers.join(", ")}`
                       : survey.trackers.length === 1
-                        ? `Only ${survey.trackers[0]} reporting`
-                        : "No tracker reporting"}
+                        ? `Only ${survey.trackers[0]} has a fresh pose`
+                        : "No fresh tracker pose"}
                   </ReadinessBadge>
                   <ReadinessBadge tone="neutral">Checked {ago(survey.checkedAt)}</ReadinessBadge>
                 </div>
@@ -927,13 +1002,206 @@ export function TrackerBindingPanel({
   }
 
   return (
-    <SetupFlow
-      key={source}
-      title={`${label} setup`}
-      steps={steps}
-      heldStep={running && sessionBackend === backend ? sessionStep : null}
-      notices={notices}
-    />
+    <>
+      {source === "lighthouse" && (
+        <FlowCard title="Lighthouse tracking quality">
+          {(() => {
+            const lighthouse = readiness.lighthouse
+            const validation = lighthouse.validation
+            const expectedStations = expectedStationCount
+            const expired = validation?.expiresAt != null && validation.expiresAt <= checkedAt
+            const countChanged =
+              validation?.expectedBaseStations != null &&
+              validation.expectedBaseStations !== expectedStations
+            const passed =
+              !bindingsError &&
+              validation?.valid &&
+              validation.status === "passed" &&
+              !expired &&
+              !countChanged
+            const stale = validation?.status === "stale" || expired || countChanged
+            const supported = lighthouse.validation !== undefined
+            // Standard hosts keep refining the calibration and never require
+            // a check, so a pass that aged out or predates a refinement is
+            // history, not a problem. Setup changes still read as stale.
+            const causes = validation?.staleCauses ?? []
+            const lastCheckOnly =
+              qualityMode === "standard" &&
+              !bindingsError &&
+              !countChanged &&
+              validation?.checkedAt != null &&
+              ((validation.status === "passed" && expired) ||
+                (validation.status === "stale" &&
+                  causes.length > 0 &&
+                  causes.every((cause) => cause === "expired" || cause === "refined")))
+            return (
+              <StepBody>
+                <p>
+                  Start with both rigs still on the table and their trackers visible. No fixed
+                  reference fixture is needed. Follow the prompts for a 5-second hold, a 12-second
+                  slow workspace sweep (at least 10 cm and 15° per rig), and a final 5-second hold.
+                  Recalibration first adds three preparation holds at different working positions,
+                  then restarts tracking to test the saved candidate using the same station geometry
+                  settings as collection.
+                </p>
+                <div role="status" aria-live="polite" className="flex flex-col gap-2">
+                  <ReadinessBadge
+                    tone={
+                      passed
+                        ? "ready"
+                        : lastCheckOnly
+                          ? "neutral"
+                          : validation?.status === "failed"
+                            ? "error"
+                            : "warning"
+                    }
+                  >
+                    {bindingsError
+                      ? "Validation status unavailable — reconnect to the host"
+                      : lastCheckOnly
+                        ? `Last check passed ${ago(validation!.checkedAt!)}${
+                            causes.includes("refined") ? " — calibration refined since" : ""
+                          }`
+                        : passed
+                          ? "Tracking check passed"
+                          : validation?.status === "needs_identification"
+                            ? "Calibration saved — identify sides, then validate tracking"
+                            : validation?.status === "failed"
+                              ? "Tracking check failed"
+                              : stale
+                                ? "Validation expired or setup changed — check again"
+                                : "Tracking quality not checked"}
+                  </ReadinessBadge>
+                  {validation?.checkedAt != null && !lastCheckOnly && (
+                    <p className="text-xs text-white/45">Checked {ago(validation.checkedAt)}</p>
+                  )}
+                  {!lastCheckOnly &&
+                    validation?.problems.map((problem, index) => (
+                      <p key={`${index}:${problem}`} className="text-xs text-amber-200/85">
+                        {problem}
+                      </p>
+                    ))}
+                </div>
+                <label className="flex items-center gap-3 text-sm">
+                  Expected base stations
+                  <select
+                    aria-label="Expected base stations"
+                    className="rounded-md border border-white/20 bg-[#141414] px-3 py-1.5 text-white"
+                    value={expectedStations}
+                    onChange={(event) => {
+                      const count = Number(event.target.value)
+                      if (Number.isInteger(count) && count >= 1 && count <= 4)
+                        setExpectedStationChoice(count)
+                    }}
+                    disabled={!canAct}
+                  >
+                    {[1, 2, 3, 4].map((count) => (
+                      <option key={count} value={count}>
+                        {count}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {qualityMode !== undefined && (
+                  <label className="flex items-center gap-3 text-sm">
+                    Tracking policy
+                    <select
+                      aria-label="Tracking policy"
+                      className="rounded-md border border-white/20 bg-[#141414] px-3 py-1.5 text-white"
+                      value={qualityMode}
+                      onChange={(event) =>
+                        void chooseQualityMode(event.target.value as LighthouseQualityMode)
+                      }
+                      disabled={!canAct}
+                    >
+                      <option value="standard">Standard</option>
+                      <option value="strict">Strict (fixed installation)</option>
+                    </select>
+                  </label>
+                )}
+                <p className="text-xs text-white/45">
+                  Select the number installed, including all three stations in a three-station
+                  setup.{" "}
+                  {qualityMode === "strict"
+                    ? "Strict keeps the station geometry fixed between recalibrations, requires a passed validation before collecting (reports expire after 12 hours), and marks any take with a tracking fault for retake."
+                    : "Standard lets libsurvive keep refining the calibration in the background; validation is optional and recording is judged by the episode quality gate."}{" "}
+                  The check measures tracking consistency, not absolute accuracy. Recalibrate after
+                  a station or tripod moves; the existing calibration is replaced only if the new
+                  check passes.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={
+                      !canAct ||
+                      !sourceSaved ||
+                      !lighthouse.installed ||
+                      !lighthouse.binding.complete ||
+                      !supported ||
+                      bindingsError
+                    }
+                    onClick={() =>
+                      launch("tracker.lighthouse.validate", {
+                        expected_stations: expectedStations,
+                        web_prompts: true,
+                      })
+                    }
+                  >
+                    <ListChecks /> Validate tracking
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={
+                      !canAct ||
+                      !sourceSaved ||
+                      !lighthouse.installed ||
+                      !supported ||
+                      bindingsError
+                    }
+                    onClick={() =>
+                      launch("tracker.lighthouse.calibrate", {
+                        expected_stations: expectedStations,
+                        web_prompts: true,
+                      })
+                    }
+                  >
+                    <RadioTower /> Recalibrate Lighthouse
+                  </Button>
+                </div>
+                {!supported && (
+                  <p className="text-xs text-amber-200/85">
+                    Update Axol on the host to enable guided validation and recalibration.
+                  </p>
+                )}
+                {!lighthouse.binding.complete && (
+                  <p className="text-xs text-amber-200/85">
+                    If Identify fails because tracking is unstable, run Recalibrate Lighthouse
+                    first. It can recover station geometry using two detected trackers without
+                    assigning sides. Then identify both rigs below and run Validate tracking before
+                    recording.
+                  </p>
+                )}
+                {blockedReason && (
+                  <p className="text-xs text-amber-200/85">
+                    Stop {blockedReason} before validating or recalibrating.
+                  </p>
+                )}
+                {progressFor("validation")}
+              </StepBody>
+            )
+          })()}
+        </FlowCard>
+      )}
+      <SetupFlow
+        key={source}
+        title={`${label} setup`}
+        steps={steps}
+        heldStep={running && sessionBackend === backend ? sessionStep : null}
+        notices={notices}
+      />
+    </>
   )
 }
 

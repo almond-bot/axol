@@ -789,6 +789,48 @@ export interface EpisodeBrief {
   grid?: EpisodeBriefGrid
 }
 
+export interface TrackingDiagnostics {
+  enabled: boolean
+  state:
+    | "disabled"
+    | "waiting_for_ready"
+    | "armed"
+    | "capturing"
+    | "saving"
+    | "saved"
+    | "error"
+    | "closed"
+  armed?: boolean
+  capture_count?: number
+  capture_limit?: number
+  pending_capture?: boolean
+  latest_path?: string | null
+  error?: string | null
+  counters?: Record<string, number>
+}
+
+export interface TrackingQuality {
+  /** Automatic fault capture is independent of tracking and episode validity. */
+  diagnostics?: TrackingDiagnostics
+  controlState?: "engaged" | "recovering" | "awaiting_engagement"
+  reengageRequired?: boolean
+  triggersLive?: { left: boolean; right: boolean }
+  pairSkewMs?: number
+  status: "checking" | "ready" | "warning" | "error"
+  reasons: string[]
+  faultCount: number
+  lastFault: string | null
+  /** Persistent setup faults require a new validation, not visibility recovery. */
+  calibrationRequired?: boolean
+  /** The tracking process exited or its reader failed. */
+  nativeFailure?: boolean
+  /** Remains set for the failed take, even after live tracking recovers. */
+  retakeRequired: boolean
+  /** Preserved after rejecting a take, until the next recording starts. */
+  lastEpisodeFault?: string | null
+  trackers?: Record<string, unknown>
+}
+
 export interface PolicyState {
   phase: PolicyPhase
   episodesRecorded: number
@@ -805,6 +847,11 @@ export interface PolicyState {
   dataset?: { repoId: string; root: string }
   /** What to set up / do for this episode, as a card above the status line. */
   brief?: EpisodeBrief
+  /** Why the last episode was not saved (quality-gate rejection, capture or
+   *  save failure). Persists until the next episode starts recording. */
+  notice?: { level: "error"; message: string }
+  /** Live Mantis pose checks and the current take's latched failure state. */
+  trackingQuality?: TrackingQuality
 }
 
 export interface OpStatus {
@@ -1027,8 +1074,8 @@ export const RESOLUTION_OFF = "off"
  */
 export interface CameraSpec {
   serials: Record<CameraSlot, string>
-  /** Mantis wrist-camera assignment, kept separate from the Axol camera map. */
-  mantis_serials?: Pick<Record<CameraSlot, string>, "left_arm" | "right_arm">
+  /** Mantis camera assignments. Missing slots inherit the legacy Axol map. */
+  mantis_serials?: Partial<Record<CameraSlot, string>>
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
   /** Dataset downscale target (collect-data recording), or `"off"`. */
@@ -1156,13 +1203,54 @@ export interface LighthouseTrackerReadiness {
    * `null` until one has run on this host; absent on older serve hosts.
    */
   baseStations?: LighthouseBaseStationSurvey | null
+  expectedBaseStations?: number
+  /**
+   * Host-wide tracking policy. Only "strict" requires a passed validation
+   * before collection and marks faulty takes for retake. Absent on older
+   * serve hosts, which never enforced it.
+   */
+  qualityMode?: LighthouseQualityMode
+  /** Absent on hosts without stationary tracking validation. */
+  validation?: LighthouseValidation | null
+}
+
+export type LighthouseQualityMode = "standard" | "strict"
+
+export async function saveLighthouseQualityMode(
+  mode: LighthouseQualityMode
+): Promise<{ mode: LighthouseQualityMode }> {
+  return json(
+    await fetch(apiUrl("/api/tracker/lighthouse/quality"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    })
+  )
+}
+
+export interface LighthouseValidation {
+  status: "passed" | "failed" | "stale" | "missing" | "needs_identification"
+  valid: boolean
+  checkedAt?: number | null
+  expiresAt?: number | null
+  expectedBaseStations?: number
+  baseStations?: unknown
+  trackers?: unknown
+  metrics?: Record<string, unknown>
+  problems: string[]
+  calibrated?: boolean
+  /**
+   * Why a passed check went stale: "expired", "refined" (only the native
+   * calibration changed), "setup" or "unverifiable". Absent on older hosts.
+   */
+  staleCauses?: Array<"expired" | "refined" | "setup" | "unverifiable">
 }
 
 export interface LighthouseBaseStationSurvey {
   checkedAt: number
   /**
    * Serials of the base stations a tracker actually received during the check,
-   * keyed by the channel number shown on the station (1–16).
+   * keyed by the channel number reported by the runtime (1–16).
    */
   channels: Record<string, string[]>
   /** Stations libsurvive replayed from its saved calibration; not counted as seen. */
@@ -1342,7 +1430,7 @@ export type SettingValue = string | number | boolean | (number | string)[]
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose" | "toggle-number"
+  widget?: "slider" | "pose" | "toggle-number" | "mount"
   min?: number
   max?: number
   step?: number
@@ -1397,6 +1485,8 @@ export interface SettingsSnapshot {
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
+  /** The Axol version runs use (hosts that predate it only have classic). */
+  robotModel?: AxolModel
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1424,24 +1514,70 @@ export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapsh
   return { schema: [], advancedSchema: [], ...res }
 }
 
-/** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */
-export function urdfUrl(): string {
-  return apiUrl("/api/urdf/axol.urdf")
+/**
+ * Which Axol hardware version the host runs: mobile whenever Jelly is enabled
+ * (attached and not switched off in the Robot tab), otherwise the mount picked
+ * in the Robot tab (`kinematics.mount`, legacy `classic` until one is). The
+ * host derives it and reports it with the settings as `robotModel`.
+ */
+export type AxolModel = "classic" | "standalone" | "ox_cart" | "owl" | "mobile"
+
+/** The versions to pick from without Jelly (the `kinematics.mount` options). */
+export type AxolMount = Exclude<AxolModel, "mobile">
+
+export const AXOL_MOUNTS: readonly AxolMount[] = ["classic", "standalone", "ox_cart", "owl"]
+
+const URDF_FILES: Record<AxolModel, string> = {
+  classic: "axol.urdf",
+  standalone: "axol_standalone.urdf",
+  ox_cart: "axol_ox_cart.urdf",
+  owl: "axol_owl.urdf",
+  mobile: "axol_jelly.urdf",
 }
 
-export function cameraSerials(
-  spec: CameraSpec,
-  mantis?: boolean
-): Partial<Record<CameraSlot, string>> {
-  if (mantis === true) {
-    return (
-      spec.mantis_serials ?? {
-        left_arm: spec.serials.left_arm,
-        right_arm: spec.serials.right_arm,
-      }
-    )
+export function parseAxolModel(value: unknown): AxolModel | null {
+  return typeof value === "string" && value in URDF_FILES ? (value as AxolModel) : null
+}
+
+/** A saved `kinematics.mount`, legacy (`classic`) when unset or unknown. */
+export function parseAxolMount(value: unknown): AxolMount {
+  return AXOL_MOUNTS.find((m) => m === value) ?? "classic"
+}
+
+/** The gripper fitted to both arms (the `axol.gripper` setting). */
+export type GripperType = "parallel" | "parcel"
+
+export function parseGripper(value: unknown): GripperType {
+  return value === "parcel" ? "parcel" : "parallel"
+}
+
+/**
+ * URL of an Axol version's URDF (meshes resolve relative to it via /api/urdf/…).
+ * The mobile Axol has one per gripper; the classic one shows the parallel
+ * gripper for either.
+ */
+export function urdfUrl(model: AxolModel = "classic", gripper: GripperType = "parallel"): string {
+  const file =
+    model === "mobile" && gripper === "parcel" ? "axol_jelly_parcel.urdf" : URDF_FILES[model]
+  return apiUrl(`/api/urdf/${file}`)
+}
+
+export function cameraSerials(spec: CameraSpec, mantis?: boolean): Record<CameraSlot, string> {
+  const axol = {
+    overhead: spec.serials?.overhead ?? "",
+    left_arm: spec.serials?.left_arm ?? "",
+    right_arm: spec.serials?.right_arm ?? "",
   }
-  return spec.serials
+  if (mantis === true) {
+    // Wrists fall back to the Axol layout. The Head slot is new to Mantis:
+    // older wrist-only layouts must not inherit Axol's overhead camera.
+    return {
+      overhead: spec.mantis_serials?.overhead ?? "",
+      left_arm: spec.mantis_serials?.left_arm ?? axol.left_arm,
+      right_arm: spec.mantis_serials?.right_arm ?? axol.right_arm,
+    }
+  }
+  return axol
 }
 
 export function cameraCount(spec: CameraSpec, mantis?: boolean): number {

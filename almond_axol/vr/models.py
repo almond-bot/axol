@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, FiniteFloat, model_validator
 
@@ -220,6 +220,8 @@ class VRFrame(BaseModel):
     r_tracked: bool = True
     l_trigger_live: bool = True
     r_trigger_live: bool = True
+    # Managed Lighthouse diagnostics are control metadata, never interpolated.
+    tracking_quality: dict[str, Any] | None = None
     l_stick_x: FiniteFloat = 0.0
     l_stick_y: FiniteFloat = 0.0
     r_stick_x: FiniteFloat = 0.0

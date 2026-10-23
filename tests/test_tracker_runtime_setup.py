@@ -172,14 +172,45 @@ class LighthouseReattestationTest(unittest.TestCase):
         )
         return src
 
+    def _installed_cache(self, root: Path) -> tuple[Path, Path, Path, Path]:
+        src = self._cache(root, tracker_install._BUILD_REVISION)
+        prefix = root / "installed"
+        cli = prefix / "bin" / "survive-cli"
+        library = prefix / "lib" / "libsurvive.so"
+        cli.parent.mkdir(parents=True)
+        library.parent.mkdir(parents=True)
+        library.write_bytes(b"patched native library")
+        rule = src / tracker_install._UDEV_RULE
+        rule.parent.mkdir(parents=True)
+        rule.write_text("test Vive rule\n")
+        _write_lighthouse_manifest(
+            src / ".axol-machine-install-manifest",
+            rule=rule,
+            cli=cli,
+            artifacts=(library,),
+        )
+        (src / tracker_install._INSTALL_MANIFEST).write_text(f"{cli}\n{library}\n")
+        return src, prefix, cli, library
+
     def test_stale_manifest_format_reattests_without_rebuilding(self) -> None:
         readiness = [
             {"installed": False, "available": False, "pinnedBuild": False},
             {"installed": True, "available": True, "pinnedBuild": True},
         ]
         with tempfile.TemporaryDirectory() as directory:
-            src = self._cache(Path(directory), "libusb-v1")
+            src, prefix, cli, _library = self._installed_cache(Path(directory))
+            verify = tracker_install._verified_runtime_artifacts
             with (
+                patch.object(tracker_install, "_INSTALL_PREFIX", prefix),
+                patch.object(tracker_install, "_SURVIVE_CLI", cli),
+                # Exercise real byte checks on unprivileged temporary files.
+                patch.object(
+                    tracker_install,
+                    "_verified_runtime_artifacts",
+                    side_effect=lambda manifest, **_: verify(
+                        manifest, require_root_control=False
+                    ),
+                ),
                 patch.object(tracker_install, "_src_dir", return_value=src),
                 patch.object(
                     tracker_install, "lighthouse_readiness", side_effect=readiness
@@ -200,6 +231,54 @@ class LighthouseReattestationTest(unittest.TestCase):
         stamp.assert_called_once_with(src)
         deps.assert_not_called()
         build.assert_not_called()
+
+    def test_current_cache_stamp_cannot_bless_rolled_back_runtime(self) -> None:
+        for replaced in ("cli", "library", "missing_record"):
+            with (
+                self.subTest(replaced=replaced),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                src, prefix, cli, library = self._installed_cache(Path(directory))
+                if replaced == "missing_record":
+                    cached_manifest = src / ".axol-machine-install-manifest"
+                    payload = json.loads(cached_manifest.read_text())
+                    payload["runtimeArtifacts"] = payload["runtimeArtifacts"][:1]
+                    cached_manifest.write_text(json.dumps(payload))
+                else:
+                    (cli if replaced == "cli" else library).write_bytes(
+                        b"old unpatched artifact"
+                    )
+                verify = tracker_install._verified_runtime_artifacts
+                with (
+                    patch.object(tracker_install, "_INSTALL_PREFIX", prefix),
+                    patch.object(tracker_install, "_SURVIVE_CLI", cli),
+                    patch.object(
+                        tracker_install,
+                        "_verified_runtime_artifacts",
+                        side_effect=lambda manifest, **_: verify(
+                            manifest, require_root_control=False
+                        ),
+                    ),
+                    patch.object(tracker_install, "_src_dir", return_value=src),
+                    patch.object(tracker_install, "_build_caches", return_value=(src,)),
+                    patch.object(
+                        tracker_install,
+                        "lighthouse_readiness",
+                        return_value={
+                            "installed": False,
+                            "available": False,
+                            "pinnedBuild": True,
+                        },
+                    ),
+                    patch.object(tracker_install, "_install_machine_stamp") as attest,
+                    patch.object(
+                        tracker_install, "_install_build_deps", return_value=False
+                    ) as rebuild,
+                ):
+                    self.assertFalse(tracker_install._reattestable_build(src))
+                    self.assertFalse(tracker_install.ensure_installed())
+                attest.assert_not_called()
+                rebuild.assert_called_once()
 
     def test_root_run_via_sudo_considers_the_operators_cache(self) -> None:
         operator = SimpleNamespace(pw_dir="/home/operator")
@@ -227,7 +306,10 @@ class LighthouseReattestationTest(unittest.TestCase):
     def test_different_options_or_unfinished_build_are_not_reattestable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             other_options = self._cache(Path(directory) / "a", "hidapi-v0")
-            unfinished = self._cache(Path(directory) / "b", "libusb-v1")
+            unfinished = self._cache(
+                Path(directory) / "b",
+                tracker_install._BUILD_REVISION,  # noqa: SLF001
+            )
             (unfinished / tracker_install._INSTALL_MANIFEST).unlink()  # noqa: SLF001
 
             self.assertFalse(
@@ -236,6 +318,124 @@ class LighthouseReattestationTest(unittest.TestCase):
             self.assertFalse(
                 tracker_install._reattestable_build(unfinished)  # noqa: SLF001
             )
+
+    def test_builds_without_the_carried_patches_are_rebuilt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            for name, revision in (
+                ("a", "libusb-v1"),
+                ("b", "libusb-v2-runtime-attestation"),
+                ("c", "libusb-v3-axol-patches-6"),
+                ("d", "libusb-v6-tracking-reliability"),
+            ):
+                unpatched = self._cache(Path(directory) / name, revision)
+                self.assertFalse(
+                    tracker_install._reattestable_build(unpatched)  # noqa: SLF001
+                )
+
+
+class LighthousePatchTest(unittest.TestCase):
+    def test_carried_patches_ship_with_the_package(self) -> None:
+        patches = tracker_install._patches()  # noqa: SLF001
+        names = [path.name for path in patches]
+
+        self.assertEqual(len(patches), 10)
+        self.assertTrue(names[0].startswith("0001-driver_vive-"))
+        self.assertTrue(names[1].startswith("0002-ootx-"))
+        self.assertTrue(names[2].startswith("0003-fix-correct-MPFIT-covariance"))
+        self.assertTrue(names[3].startswith("0004-recording-line-buffer"))
+        self.assertTrue(names[4].startswith("0005-gss-never-read-past"))
+        self.assertIn("src/test_cases/gss.c", patches[4].read_text())
+        self.assertTrue(names[5].startswith("0006-mpfit-allocate-the-work-arrays"))
+        self.assertIn("src/test_cases/mpfit_stack.c", patches[5].read_text())
+        self.assertTrue(names[6].startswith("0007-gss-optimizer-json"))
+        self.assertIn("src/test_cases/json_empty.c", patches[6].read_text())
+        self.assertTrue(names[7].startswith("0008-fixed-calibration"))
+        self.assertIn("disable-calibrate", patches[7].read_text())
+        self.assertTrue(names[8].startswith("0009-bounded-fault-diagnostics"))
+        self.assertIn("src/test_cases/diagnostics_smoke.py", patches[8].read_text())
+        self.assertTrue(names[9].startswith("0010-filter-established-pose"))
+        self.assertIn("mpfit-filter-individual-outliers", patches[9].read_text())
+        for path in patches:
+            self.assertIn("diff --git", path.read_text())
+        # Axol's own fixes carry the regression test that reproduces them;
+        # 0003 is upstream's commit, backported verbatim.
+        for path in patches[:2]:
+            self.assertIn("src/test_cases/", path.read_text())
+        self.assertIn(
+            "(cherry picked from commit df22f2d6be34cb54d43c46e8838eae8b326b88ff)",
+            patches[2].read_text(),
+        )
+
+    def test_overlapping_patch_stack_applies_once_without_changing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory)
+            native = src / "native.c"
+            native.write_text("function\nold calibration\nold receiver\nend\n")
+            first = src / "0001.patch"
+            first.write_text(
+                "--- a/native.c\n+++ b/native.c\n@@ -1,4 +1,4 @@\n function\n-old calibration\n+fixed calibration\n old receiver\n end\n"
+            )
+            second = src / "0002.patch"
+            second.write_text(
+                "--- a/native.c\n+++ b/native.c\n@@ -1,4 +1,4 @@\n function\n fixed calibration\n-old receiver\n+independent receivers\n end\n"
+            )
+            with (
+                patch.object(tracker_install, "_PATCH_DIR", src),
+                patch.object(tracker_install, "_PATCH_COUNT", 2),
+            ):
+                self.assertTrue(tracker_install._apply_patches("git", src))
+                expected = native.read_bytes()
+                self.assertTrue(tracker_install._apply_patches("git", src))
+                self.assertEqual(native.read_bytes(), expected)
+                native.write_text(
+                    "function\nold calibration\nindependent receivers\nend\n"
+                )
+                self.assertFalse(
+                    tracker_install._native_patches_already_applied(
+                        src, (first, second)
+                    )
+                )
+
+    def test_missing_native_patch_prevents_build_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(tracker_install, "_PATCH_DIR", Path(directory)),
+                patch.object(tracker_install, "_run") as run,
+            ):
+                self.assertFalse(tracker_install._apply_patches("git", Path(directory)))
+                run.assert_not_called()
+
+    def test_sync_applies_every_patch_after_a_clean_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / "libsurvive"
+            (src / ".git").mkdir(parents=True)
+            with (
+                patch.object(tracker_install.shutil, "which", return_value="git"),
+                patch.object(tracker_install, "_run", return_value=True) as run,
+            ):
+                self.assertTrue(tracker_install._sync_source(src))  # noqa: SLF001
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[-2], ["git", "clean", "-fdq"])
+        self.assertEqual(commands[-1][:3], ["git", "apply", "--whitespace=nowarn"])
+        self.assertEqual(
+            commands[-1][3:],
+            [str(path) for path in tracker_install._patches()],  # noqa: SLF001
+        )
+
+    def test_a_patch_that_no_longer_applies_fails_the_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            src = Path(directory) / "libsurvive"
+            (src / ".git").mkdir(parents=True)
+            with (
+                patch.object(tracker_install.shutil, "which", return_value="git"),
+                patch.object(
+                    tracker_install,
+                    "_run",
+                    side_effect=lambda cmd, **_: cmd[1] != "apply",
+                ),
+            ):
+                self.assertFalse(tracker_install._sync_source(src))  # noqa: SLF001
 
 
 class UltimateRuntimeReadinessTest(unittest.TestCase):

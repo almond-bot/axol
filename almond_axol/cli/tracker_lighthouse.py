@@ -13,6 +13,7 @@ with the fix.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from ..tracker.base import TRACKER_POSE_MAX_AGE_S, valid_tracker_pose
 from ..tracker.lighthouse_survey import (
@@ -27,35 +28,78 @@ from ..tracker.lighthouse_survey import (
 # decode; the channel-clash warning repeats about once a second. Hold the survey
 # open long enough to name the stations before deciding.
 _SURVEY_S = 20.0
+# Trackers report no pose until libsurvive has every live station's identity
+# and has solved where each one is. With no saved calibration (a new host, or
+# stations added or re-channelled) that took 35-92 s for four stations, so a
+# survey that sees live stations but no trackers keeps listening this long.
+_CALIBRATION_S = 150.0
 _EXPECTED_TRACKERS = 2
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``tracker.lighthouse.check`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "tracker.lighthouse.check",
         help="Check that every Lighthouse base station is seen on its own channel "
         "and both trackers report.",
-    ).set_defaults(func=run_check)
+    )
+    parser.add_argument(
+        "--expected_stations",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        help="Number of installed base stations (1–4; default: saved count).",
+    )
+    parser.set_defaults(func=run_check)
 
 
 def _result(level: str, label: str, detail: str) -> None:
     print(f"{level:<4} {label:<18} {detail}", flush=True)
 
 
-def survey_lighthouses(source, window_s: float = _SURVEY_S) -> LighthouseSurvey:  # type: ignore[no-untyped-def]
-    """Run a started ``SurviveSource`` for ``window_s`` and return its survey."""
-    deadline = time.perf_counter() + window_s
-    while time.perf_counter() < deadline:
-        source.poses()  # surfaces a backend failure promptly
-        time.sleep(0.2)
-    survey = source.lighthouse_survey()
+def _reporting_trackers(source) -> set[str]:  # type: ignore[no-untyped-def]
     now = time.perf_counter()
-    survey.trackers = {
+    return {
         key
         for key, sample in source.poses().items()
         if valid_tracker_pose(sample) and now - sample.t <= TRACKER_POSE_MAX_AGE_S
     }
+
+
+def survey_lighthouses(  # type: ignore[no-untyped-def]
+    source,
+    window_s: float = _SURVEY_S,
+    calibration_s: float = _CALIBRATION_S,
+    on_calibrating: Callable[[int], None] | None = None,
+) -> LighthouseSurvey:
+    """Run a started ``SurviveSource`` and return its survey.
+
+    Listens for ``window_s``. If base stations are live by then but the
+    trackers have not reported yet, libsurvive is still calibrating (a tracker
+    only receives a station's sweeps when it is powered and in view), so it
+    keeps listening until both trackers report or ``calibration_s`` has passed
+    since the start; ``on_calibrating`` is called once, with the number of
+    live stations, when that wait begins.
+    """
+    started = time.perf_counter()
+    waiting = False
+    while True:
+        source.poses()  # surfaces a backend failure promptly
+        elapsed = time.perf_counter() - started
+        if elapsed >= window_s:
+            live = len(source.lighthouse_survey().channels)
+            if (
+                elapsed >= calibration_s
+                or not live
+                or len(_reporting_trackers(source)) >= _EXPECTED_TRACKERS
+            ):
+                break
+            if not waiting and on_calibrating is not None:
+                on_calibrating(live)
+            waiting = True
+        time.sleep(0.2)
+    survey = source.lighthouse_survey()
+    survey.trackers = _reporting_trackers(source)
     return survey
 
 
@@ -104,8 +148,34 @@ def report_survey(survey: LighthouseSurvey) -> int:
     return failures
 
 
+def _source_details(source, survey: LighthouseSurvey) -> list[str]:  # type: ignore[no-untyped-def]
+    """Explain discovery versus localization before stopping the native owner."""
+    details: list[str] = []
+    discover = getattr(source, "discovered_tracker_serials", None)
+    if callable(discover) and len(survey.trackers) < _EXPECTED_TRACKERS:
+        identities = discover()
+        details.append(
+            "Hardware identities detected: " + (", ".join(sorted(identities)) or "none")
+        )
+        if len(identities) >= _EXPECTED_TRACKERS:
+            details.append(
+                "Both trackers were detected, but not both produced a fresh pose. "
+                "Check visibility and calibration; this does not by itself mean "
+                "pairing was lost."
+            )
+    warnings = getattr(source, "warnings", None)
+    if callable(warnings):
+        details.extend(f"Backend warning: {reason}" for reason in warnings()[-6:])
+    quality = getattr(source, "tracking_quality", None)
+    report = quality() if callable(quality) else None
+    if report is not None:
+        details.extend(f"Tracking check: {reason}" for reason in report["reasons"])
+    return details
+
+
 def run_check(_args: object = None) -> None:
     """Survey base stations and trackers, persist it, and fail on a clash."""
+    from ..tracker.config import load_tracker_config, save_tracker_config
     from ..tracker.survive import SurviveSource
     from .mantis_bridge import require_mantis_tracker_readiness
 
@@ -115,7 +185,19 @@ def run_check(_args: object = None) -> None:
         raise SystemExit(str(exc)) from None
 
     print("Lighthouse base-station check", flush=True)
-    source = SurviveSource()
+    config = load_tracker_config()
+    expected_stations = getattr(_args, "expected_stations", None)
+    if expected_stations is not None:
+        config.expected_base_stations = expected_stations
+        save_tracker_config(config)
+    # Standard mode lets libsurvive calibrate a new or re-channelled room
+    # during the check (as Identify and collection do); strict mode keeps the
+    # saved geometry fixed until an explicit Recalibrate.
+    source = SurviveSource(
+        expected_stations=config.expected_base_stations,
+        allow_frame_refinement=True,
+        strict=config.lighthouse_quality == "strict",
+    )
     try:
         source.start()
         print(
@@ -123,12 +205,26 @@ def run_check(_args: object = None) -> None:
             "powered and in view)...",
             flush=True,
         )
-        survey = survey_lighthouses(source)
+        survey = survey_lighthouses(
+            source,
+            on_calibrating=lambda live: print(
+                f"{live} base station(s) live but the trackers are not reporting "
+                "yet: station identity acquisition or localization is pending. "
+                "Keep both trackers still and in "
+                f"view; listening for up to {_CALIBRATION_S:.0f} s in total...",
+                flush=True,
+            ),
+        )
+        survey.expected = config.expected_base_stations
+        details = _source_details(source, survey)
     finally:
         source.stop()
 
     save_lighthouse_survey(survey)
     failures = report_survey(survey)
+    if failures:
+        for detail in details:
+            print(f"     {detail}", flush=True)
     print(f"Saved to {LIGHTHOUSE_SURVEY_FILE}", flush=True)
     if failures:
         raise SystemExit(1)

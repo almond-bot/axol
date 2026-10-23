@@ -76,7 +76,10 @@ class _Variant:
         return self.url.rsplit("/", 1)[-1]
 
 
-_DRIVER_BASE_URL = "https://download.stereolabs.com/drivers/zedx"
+# Almond's byte-identical mirror of download.stereolabs.com/drivers/zedx (same
+# path layout), so an in-place vendor republish can't break installs. Each
+# file was checked against its pinned sha256 below before upload.
+_DRIVER_BASE_URL = "https://downloads.almond.bot/stereolabs/drivers/zedx"
 # The ZED Box pins are the 1.4.3 release Stereolabs pairs with ZED SDK 5.4.1,
 # built for L4T 36.4 (JetPack 6.x). The ZED Link Duo pin is the 1.4.4 release
 # for ZED SDK 5.5 on L4T 39.2 (JetPack 7.2, the AGX Orin). Bump a variant's

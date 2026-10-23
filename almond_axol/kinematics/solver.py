@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import logging
 import math
 
@@ -29,16 +30,24 @@ import pyroki as pk
 
 from ..constants import (
     ARM_JOINTS,
+    AxolModel,
     Joint,
+    upper_arm_guard_links,
     urdf_arm_joint_names,
     urdf_body_name,
     urdf_joint_name,
+    urdf_path,
 )
+from ..settings import resolve_gripper, resolve_robot_model
+from .aot import ExportedJit
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
     collision_cost_params,
+    ik_urdf_xml,
+    lift_link_shift,
     shared_robot,
+    upper_arm_guard_floor,
     shared_robot_collision,
     shared_urdf,
 )
@@ -192,6 +201,34 @@ def _axes_meet(
 # ---------------------------------------------------------------------------
 
 
+def body_collision_distance(
+    robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
+    cfg: jax.Array,
+    link_shift: jax.Array | None = None,
+) -> jax.Array:
+    """Signed distance of each active arm/body pair at ``cfg``.
+
+    ``robot_coll.compute_self_collision_distance``, with each link first
+    moved by its row of ``link_shift`` (``(num_links, 3)``, torso frame):
+    where the live lift height puts the parts the lift leaves behind (see
+    :func:`.model.lift_link_shift`). ``None``: the model as frozen.
+    """
+    if link_shift is None:
+        return robot_coll.compute_self_collision_distance(robot, cfg)
+    Ts = robot.forward_kinematics(cfg)
+    Ts = Ts.at[..., 4:].add(link_shift)
+    coll = robot_coll.coll.transform(
+        jaxlie.SE3(Ts[..., robot_coll._geom_to_link_idx, :])
+    )
+    idx_i = jnp.asarray(robot_coll.active_idx_i, dtype=jnp.int32)
+    idx_j = jnp.asarray(robot_coll.active_idx_j, dtype=jnp.int32)
+    return pk.collision.collide(
+        jax.tree.map(lambda x: x[..., idx_i, :], coll),
+        jax.tree.map(lambda x: x[..., idx_j, :], coll),
+    )
+
+
 def _self_collision_residual(
     vals: jaxls.VarValues,
     robot: pk.Robot,
@@ -200,6 +237,7 @@ def _self_collision_residual(
     activation_start: jax.Array,
     ramp_width: jax.Array,
     weight: jax.Array | float,
+    link_shift: jax.Array | None = None,
 ) -> jax.Array:
     """pyroki's self-collision residual with decoupled activation and ramp.
 
@@ -215,10 +253,11 @@ def _self_collision_residual(
     (activate only when the pose gets closer than home). Pyroki's stock cost
     bottoms out at zero, which kept the ``base <-> e2`` gradient permanently
     active during ordinary front-of-torso work (see
-    :func:`.model.collision_cost_params`).
+    :func:`.model.collision_cost_params`). ``link_shift``: see
+    :func:`body_collision_distance`.
     """
     cfg = vals[joint_var]
-    d = robot_coll.compute_self_collision_distance(robot, cfg)
+    d = body_collision_distance(robot, robot_coll, cfg, link_shift)
     s = activation_start - d  # violation depth beyond the activation shell
     # Integral of smoothstep(clip(s / width, 0, 1)). At u=1 this is
     # width/2 with unit slope and zero curvature, matching the linear branch
@@ -244,6 +283,7 @@ def _base_collision_safe_step(
     q_to: jax.Array,
     clearance_floor: jax.Array,
     max_joint_delta: jax.Array,
+    link_shift: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Project a rate-limited joint step along the base-clearance boundary.
 
@@ -257,6 +297,7 @@ def _base_collision_safe_step(
     correction are scaled along their full joint-space direction to stay
     within the per-call delta budget and the robot's joint limits, after
     dropping any component that pushes a joint already on its limit outward.
+    ``link_shift``: see :func:`body_collision_distance`.
     """
 
     guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
@@ -314,7 +355,7 @@ def _base_collision_safe_step(
     q_to = bound_step(q_to)
 
     def margin(q: jax.Array) -> jax.Array:
-        distances = robot_coll.compute_self_collision_distance(robot, q)
+        distances = body_collision_distance(robot, robot_coll, q, link_shift)
         return jnp.min(distances - clearance_floor)
 
     to_margin = margin(q_to)
@@ -478,6 +519,7 @@ def _solve_ik(
     lambda_initial: float,
     lambda_factor: float,
     use_self_collision: bool,
+    link_shift: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     JointVar = robot.joint_var_cls
 
@@ -600,6 +642,7 @@ def _solve_ik(
                 activation_start=self_collision_start,
                 ramp_width=self_collision_ramp,
                 weight=self_collision_weight,
+                link_shift=link_shift,
             )
         )
 
@@ -755,6 +798,14 @@ def _quat_to_matrix(wxyz: np.ndarray) -> np.ndarray:
     )
 
 
+# The jitted solve and safe step, exported once per graph shape so a new
+# process deserializes them instead of re-tracing (see .aot).
+_SOLVE_IK = ExportedJit(
+    _solve_ik, "solve_ik", static_argnames=("max_iterations", "use_self_collision")
+)
+_SAFE_STEP = ExportedJit(_base_collision_safe_step, "safe_step")
+
+
 # ---------------------------------------------------------------------------
 # KinematicsSolver
 # ---------------------------------------------------------------------------
@@ -802,9 +853,18 @@ class KinematicsSolver:
         :meth:`ik` is fast.
 
         Args:
-            config: Cost weights and solver parameters.
+            config: Cost weights and solver parameters. ``config.robot_model``
+                picks the Axol version's URDF (mobile when Jelly is enabled,
+                else ``config.mount``, if ``None``).
         """
         self.config = config
+        self.robot_model = resolve_robot_model(config.robot_model, mount=config.mount)
+        # The fitted gripper (the mobile Axol has a URDF per gripper).
+        self.gripper = (
+            resolve_gripper(config.gripper)
+            if self.robot_model is AxolModel.MOBILE
+            else "parallel"
+        )
 
         enable_persistent_compilation_cache()
 
@@ -812,13 +872,20 @@ class KinematicsSolver:
         # including pyroki's per-instance JointVar class, a static field —
         # lets every solver after the first hit the in-memory jit cache
         # instead of re-tracing and re-running jaxls analysis.
-        self.robot = shared_robot()
+        self.robot = shared_robot(self.robot_model, gripper=self.gripper)
+        # What the exported programs were traced for (see .aot): the model
+        # IK loads, beyond what its arrays' shapes say.
+        self._export_fingerprint = hashlib.sha256(
+            ik_urdf_xml(urdf_path(self.robot_model, gripper=self.gripper)).encode()
+        ).hexdigest()
         # Base collision detection is opt-in (config.self_collision): when
         # off, no collision model is built at all — the soft cost is left out
         # of the solve graph and the hard base guard below is skipped, so the
         # only geometric constraint on the arms is their joint limits.
         self.robot_coll: pk.collision.RobotCollision | None = (
-            shared_robot_collision() if config.self_collision else None
+            shared_robot_collision(self.robot_model, gripper=self.gripper)
+            if config.self_collision
+            else None
         )
         if self.robot_coll is not None:
             starts, widths = collision_cost_params(
@@ -832,16 +899,15 @@ class KinematicsSolver:
         self._collision_ramps = jnp.asarray(widths)
         # A soft cost normally turns every arm/base pair away. Independently
         # hard-stop the physical contact pair found in the recorded cross-body
-        # run: either upper arm (e1) against base/s1. Its fitted capsule already
-        # overlaps at the safe straight-down pose, so the threshold is relative
-        # to that reference: at most 20 mm closer. The observed contact was
-        # 23-31 mm closer, leaving roughly 10 mm of model-space headroom.
+        # run: either upper arm (e1) against the body (see
+        # upper_arm_guard_floor for the threshold).
         clearance_floor = np.full_like(starts, -np.inf)
         if self.robot_coll is not None:
             q_home = jnp.zeros(self.robot.joints.num_actuated_joints)
             home_distances = np.asarray(
                 self.robot_coll.compute_self_collision_distance(self.robot, q_home)
             )
+            torso = upper_arm_guard_links(self.robot_model)
             for k, (i, j) in enumerate(
                 zip(
                     np.asarray(self.robot_coll.active_idx_i),
@@ -850,13 +916,18 @@ class KinematicsSolver:
             ):
                 a = self.robot_coll.link_names[int(i)]
                 b = self.robot_coll.link_names[int(j)]
-                arm_link = (
-                    b if a in ("base", "s1") else a if b in ("base", "s1") else ""
-                )
+                arm_link = b if a in torso else a if b in torso else ""
                 if arm_link.endswith("_e1"):
-                    clearance_floor[k] = home_distances[k] - 0.020
+                    clearance_floor[k] = upper_arm_guard_floor(home_distances[k])
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
+        # The lift (see set_lift): IK freezes it fully raised; the collision
+        # checks move what it leaves behind by its live height.
+        self._lift_shift, self._lift_travel = lift_link_shift(
+            self.robot_model, gripper=self.gripper
+        )
+        self._lift_lowered = 0.0
+        self._link_shift = jnp.zeros(self._lift_shift.shape, dtype=jnp.float32)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -889,7 +960,7 @@ class KinematicsSolver:
         # centre — the three shoulder axes meet at one point, fixed in the
         # world — and its wrist centre, where the forearm roll (wrist_1)
         # meets wrist_2, fixed in wrist_2's link.
-        urdf = shared_urdf()
+        urdf = shared_urdf(self.robot_model, gripper=self.gripper)
         fk0_np = np.asarray(fk0, np.float64)
         self._swivel: dict[str, _ArmSwivel] = {}
         for side, is_left in (("left", True), ("right", False)):
@@ -959,6 +1030,36 @@ class KinematicsSolver:
             q: Full ``(N,)`` joint array in radians (same ordering as :meth:`ik`).
         """
         self._posture_pose = jnp.asarray(self.to_pyroki_order(q), dtype=jnp.float32)
+
+    def set_lift(self, raised: float) -> None:
+        """Place the parts the lift leaves behind for the live lift height.
+
+        IK freezes the lift fully raised and solves in the torso frame, which
+        rides the lift with the arms; lowering it brings the deck and the
+        lower column up toward them. ``raised`` is the height as a fraction
+        of the lift's travel (1 = fully raised, 0 = fully lowered, as the
+        Jelly lift reports it). Until the first call the lift is taken as
+        fully raised. No effect on a version without a lift.
+        """
+        if self._lift_travel <= 0.0:
+            return
+        fraction = min(max(float(raised), 0.0), 1.0)
+        lowered = (1.0 - fraction) * self._lift_travel
+        if abs(lowered - self._lift_lowered) < 1e-4:
+            return
+        self._lift_lowered = lowered
+        self._link_shift = jnp.asarray(self._lift_shift * lowered, dtype=jnp.float32)
+
+    @property
+    def lift_lowered(self) -> float:
+        """How far below fully raised (m) the collision checks place the lift."""
+        return self._lift_lowered
+
+    @property
+    def link_shift(self) -> jax.Array:
+        """Per-link displacement (``(num_links, 3)``, torso frame) the live lift
+        height puts on the collision model (see :meth:`set_lift`)."""
+        return self._link_shift
 
     @property
     def posture_pose(self) -> np.ndarray:
@@ -1249,7 +1350,7 @@ class KinematicsSolver:
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
 
-        q_result, cost_history = _solve_ik(
+        q_result, cost_history = _SOLVE_IK(
             self.robot,
             self.robot_coll,
             target_L,
@@ -1286,6 +1387,8 @@ class KinematicsSolver:
             cfg.lambda_initial,
             cfg.lambda_factor,
             self.robot_coll is not None,
+            self._link_shift,
+            _fingerprint=self._export_fingerprint,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
 
@@ -1324,13 +1427,15 @@ class KinematicsSolver:
             # the joint-limit clamp it also provided still applies.
             q_out = _clamp_to_limits_np(self.robot, q_current, q_out)
             return self.from_pyroki_order(q_out)
-        q_out, guard_active_jax = _base_collision_safe_step(
+        q_out, guard_active_jax = _SAFE_STEP(
             self.robot,
             self.robot_coll,
             jnp.asarray(q_current, dtype=jnp.float32),
             jnp.asarray(q_out, dtype=jnp.float32),
             self._base_clearance_floor,
             jnp.asarray(delta_budget, dtype=jnp.float32),
+            self._link_shift,
+            _fingerprint=self._export_fingerprint,
         )
         guard_active = bool(guard_active_jax)
         if guard_active and not self._base_collision_guard_active:
