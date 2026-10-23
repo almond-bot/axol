@@ -1277,6 +1277,12 @@ class IKWorker:
             self._box = None
         setattr(self._config, key, coerced)
 
+    def set_lift(self, raised: float) -> None:
+        """The live lift height (``("lift", raised)`` message): where the
+        collision checks put the deck and lower column (see
+        :meth:`KinematicsSolver.set_lift`)."""
+        self._solver.set_lift(raised)
+
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
 
@@ -2629,6 +2635,35 @@ class IKWorker:
 # ---------------------------------------------------------------------------
 
 
+def configure_ik_process(backend: str = "jax") -> None:
+    """Set up this process the way the IK runs it (``backend``: the
+    kinematics backend; the XLA flag only matters to JAX).
+
+    Confine the JAX solve to a single core's worth of compute. The per-arm IK
+    is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
+    core for each solve; combined with the worker's nice(-10) boost, that
+    burst preempts the control loop's CAN round-trip and the video relay on
+    every step — exactly the engaged-only send/act latency spikes and grainy
+    frames seen in `collect-data`, which (unlike teleop) has no spare core
+    headroom once the relay's raw-frame branch is running. Single-threaded XLA
+    is no slower for a problem this small and leaves the real-time loop alone.
+
+    Must run before the first JAX op (backend init reads XLA_FLAGS lazily).
+    The flags are part of the compilation cache's key, so anything that
+    precompiles for the worker (:mod:`.warm`) calls this too.
+    """
+    xla = os.environ.get("XLA_FLAGS", "")
+    if backend == "jax" and "xla_cpu_multi_thread_eigen" not in xla:
+        os.environ["XLA_FLAGS"] = f"{xla} --xla_cpu_multi_thread_eigen=false".strip()
+    for var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(var, "1")
+
+
 def run_ik_worker(
     conn: multiprocessing.connection.Connection,
     config: VRTeleopConfig,
@@ -2678,28 +2713,7 @@ def run_ik_worker(
     # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    # Confine the JAX solve to a single core's worth of compute. The per-arm IK
-    # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
-    # core for each solve; combined with this process's nice(-10) boost, that
-    # burst preempts the control loop's CAN round-trip and the video relay on
-    # every step — exactly the engaged-only send/act latency spikes and grainy
-    # frames seen in `collect-data`, which (unlike teleop) has no spare core
-    # headroom once the relay's raw-frame branch is running. Single-threaded XLA
-    # is no slower for a problem this small and leaves the real-time loop alone.
-    # Must be set before the first JAX op (backend init reads XLA_FLAGS lazily).
-    if getattr(kinematics_config, "backend", "jax") == "jax":
-        _xla = os.environ.get("XLA_FLAGS", "")
-        if "xla_cpu_multi_thread_eigen" not in _xla:
-            os.environ["XLA_FLAGS"] = (
-                f"{_xla} --xla_cpu_multi_thread_eigen=false".strip()
-            )
-    for _var in (
-        "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-    ):
-        os.environ.setdefault(_var, "1")
+    configure_ik_process(getattr(kinematics_config, "backend", "jax"))
 
     try:
         os.nice(-10)
@@ -2761,6 +2775,8 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "set":
                 worker.set_config(str(msg[1]), msg[2])
+            elif isinstance(msg, tuple) and msg[0] == "lift":
+                worker.set_lift(float(msg[1]))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":

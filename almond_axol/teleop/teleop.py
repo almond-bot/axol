@@ -39,9 +39,11 @@ import signal
 import threading
 import time
 
+from dataclasses import replace
+
 import numpy as np
 
-from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, AxolModel
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
     HardwareCleanupError,
@@ -200,6 +202,23 @@ class VRTeleop:
         robot_gripper = getattr(arm, "gripper_type", None)
         if isinstance(robot_gripper, str):
             adopt_robot_gripper(config, robot_gripper)
+        # A session driving Jelly is on the mobile Axol; without one, infer it
+        # (a Sim on a Jelly host still models the mobile body). Resolved once
+        # so the IK worker and the headset overlay agree.
+        from ..settings import resolve_gripper, resolve_robot_model
+
+        robot_model = resolve_robot_model(
+            kinematics_config.robot_model,
+            jelly_enabled=True if jelly is not None else None,
+            mount=kinematics_config.mount,
+        )
+        kinematics_config = replace(kinematics_config, robot_model=robot_model.value)
+        # The mobile Axol has a URDF per gripper: solve with the fitted one.
+        if robot_model is AxolModel.MOBILE:
+            kinematics_config = replace(
+                kinematics_config,
+                gripper=resolve_gripper(kinematics_config.gripper or config.gripper),
+            )
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -222,6 +241,7 @@ class VRTeleop:
             self._broadcast_tracking,
             broadcast_mode=lambda key, value: self._live.on_changed(key, value),
             broadcast_json=self._broadcast_json,
+            robot_model=kinematics_config.robot_model,
         )
         # Live session settings (box mode, re-engage, grip force, …): applied
         # from `set` messages off any client, published back as `settings`.
@@ -1190,4 +1210,7 @@ class VRTeleop:
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
             get_measured=lambda: measured_arms(self._robot),
+            get_lift=(
+                (lambda: self._jelly.lift_raised) if self._jelly is not None else None
+            ),
         )

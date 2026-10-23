@@ -176,6 +176,24 @@ class KinematicsConfig:
             at or above shoulder height — fading it out stops garbage swivel
             targets from thrashing the null space exactly where the shoulder
             nears its joint limits.
+        robot_model: Which Axol hardware version to solve for (see
+            :class:`~almond_axol.constants.AxolModel`): ``"classic"``,
+            ``"standalone"``, ``"ox_cart"``, ``"owl"`` or ``"mobile"``.
+            Selects the URDF, and with it the body the arms are kept clear of
+            and the joint limits. ``None`` (the default) infers it: mobile
+            when Jelly is enabled (attached and not switched off), else
+            ``mount``.
+        mount: What Axol is mounted on when Jelly is not enabled — the
+            control panel's model picker: ``"classic"`` (the legacy model),
+            ``"standalone"``, ``"ox_cart"`` or ``"owl"``. ``None`` reads the
+            saved ``kinematics.mount`` (legacy if unset). Ignored while
+            Jelly is enabled: the robot is then the mobile Axol.
+        gripper: The fitted gripper, ``"parallel"`` or ``"parcel"``
+            (``AxolConfig.gripper``, which teleop passes on). The mobile Axol
+            has a URDF per gripper, so it selects the gripper geometry the
+            arms are kept clear of the body with; the classic Axol ignores
+            it. ``None`` (the default) reads ``axol.gripper`` from the shared
+            settings.
     """
 
     pos_weight: float = 50.0
@@ -199,6 +217,9 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+    robot_model: str | None = None
+    mount: str | None = None
+    gripper: str | None = None
     backend: str = "jax"
 
     def __post_init__(self) -> None:

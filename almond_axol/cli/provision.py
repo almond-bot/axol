@@ -27,6 +27,11 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       via rustup if needed; sources fetched at the installed
                       package's ref for tool installs), required by hardware
                       control (see :mod:`almond_axol.rt`).
+* ``ik.warm``       — the IK solver's first compile for this robot's model
+                      (Jelly if attached, else its saved mount), so the
+                      first session after an update starts without the ~1 min
+                      compile (see :mod:`almond_axol.teleop.warm`). Moves
+                      nothing.
 * shared install    — re-opens the hosted ``/opt/axol`` uv tool env to every
                       user after the root service's ``027`` umask rebuilt it
                       root-only, so ``axol`` keeps working from the operator's
@@ -411,6 +416,22 @@ def _reboot_if_pending(auto_reboot: bool) -> None:
         )
 
 
+# A cold IK compile is ~1 min on a Jetson; bound it so a wedged compile can't
+# hold the update.
+_IK_WARM_TIMEOUT_S = 10 * 60.0
+
+
+def _warm_ik() -> None:
+    """Run ``axol ik.warm`` in a fresh interpreter (see :mod:`..teleop.warm`)."""
+    result = subprocess.run(
+        [sys.executable, "-c", "from almond_axol.teleop.warm import run; run()"],
+        timeout=_IK_WARM_TIMEOUT_S,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ik.warm exited with {result.returncode}")
+
+
 def _run_locked() -> None:
     """Provision while the caller owns the host-wide mutation lock."""
     # Security migration, not a best-effort dependency: if inspection or
@@ -471,6 +492,11 @@ def _run_locked() -> None:
     # step it is reported rather than aborting the run, and any failure makes
     # the command exit non-zero below.
     step(_RT_STEP, rt_install.run)
+    # The IK's first compile for this robot's model (~1 min on a Jetson),
+    # done now rather than while the operator waits for the first session
+    # after the update. In its own process: the IK's XLA flags must be set
+    # before the backend starts, and the compilation cache keys on them.
+    step("IK solver precompile (ik.warm)", _warm_ik)
     # After every step that writes into the tool env (pyzed, PyGObject) and
     # after the reinstall a self-update just ran under serve's 027 umask:
     # without it the operator's own `axol` fails with "command not found".

@@ -143,6 +143,17 @@ describe("supervisor API client", () => {
     expect(api.apiUrl("/api/info")).toBe("https://robot.local:8001/api/info")
     expect(api.wsBaseUrl()).toBe("wss://robot.local:8001")
     expect(api.urdfUrl().endsWith("/api/urdf/axol.urdf")).toBe(true)
+    expect(api.urdfUrl("mobile").endsWith("/api/urdf/axol_jelly.urdf")).toBe(true)
+    expect(api.urdfUrl("mobile", "parcel").endsWith("/api/urdf/axol_jelly_parcel.urdf")).toBe(true)
+    expect(api.urdfUrl("classic", "parcel").endsWith("/api/urdf/axol.urdf")).toBe(true)
+    expect(api.urdfUrl("ox_cart").endsWith("/api/urdf/axol_ox_cart.urdf")).toBe(true)
+    expect(api.urdfUrl("owl", "parcel").endsWith("/api/urdf/axol_owl.urdf")).toBe(true)
+    expect(api.parseAxolModel("standalone")).toBe("standalone")
+    expect(api.parseAxolModel("hover")).toBe(null)
+    // The picker's value: legacy until a mount is saved; Jelly is never picked.
+    expect(api.parseAxolMount(undefined)).toBe("classic")
+    expect(api.parseAxolMount("owl")).toBe("owl")
+    expect(api.parseAxolMount("mobile")).toBe("classic")
     expect(
       api.motorFaultLabel({
         arm: "left",

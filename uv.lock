@@ -191,6 +191,7 @@ dependencies = [
     { name = "daqp" },
     { name = "draccus" },
     { name = "fastapi" },
+    { name = "flatbuffers" },
     { name = "jax" },
     { name = "jaxlie" },
     { name = "mink" },
@@ -237,11 +238,12 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiortc", specifier = ">=1.14.0,<1.15" },
-    { name = "almond-pyroki", specifier = ">=0.1.0,<0.2" },
+    { name = "almond-pyroki", specifier = ">=0.1.1,<0.2" },
     { name = "daqp", specifier = "==0.8.7" },
     { name = "datasets", marker = "extra == 'lerobot'", specifier = ">=4.8,<5" },
     { name = "draccus", specifier = ">=0.11.6,<0.12" },
     { name = "fastapi", specifier = ">=0.135.2,<0.136" },
+    { name = "flatbuffers", specifier = ">=24.3.25,<26" },
     { name = "hid", marker = "extra == 'tracker'", specifier = ">=1.0.5,<2" },
     { name = "jax", specifier = ">=0.9.2,<0.10" },
     { name = "jaxlie", specifier = ">=1.5.0,<2" },
@@ -297,7 +299,7 @@ wheels = [
 
 [[package]]
 name = "almond-pyroki"
-version = "0.1.0"
+version = "0.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "almond-jaxls" },
@@ -314,9 +316,9 @@ dependencies = [
     { name = "viser" },
     { name = "yourdfpy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/62/c7/fc6d9b3e9468eed3e2f0bba698cff53fe707f67c6fff9c4daa6f97e80253/almond_pyroki-0.1.0.tar.gz", hash = "sha256:e1ae10636554d32f17c90365d5caadd22c9e8864d86c96385d53c259d3eff508", size = 41124, upload-time = "2026-08-11T20:33:03.35Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ae/1b/385d7f3c03c3264a45c87e30424a879f07d7d29b303d9473f2415d5b6453/almond_pyroki-0.1.1.tar.gz", hash = "sha256:8b14fe5cbafd4202f0a6d15ac2401bc919dd01caafeaecabd97936034feb5111", size = 42396, upload-time = "2026-09-28T23:58:30.261Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/03/24/3b977247ca19366225244ab38194ee8ca2a14839f09a753a994f9c823189/almond_pyroki-0.1.0-py3-none-any.whl", hash = "sha256:35720e87af788575c8c8fcfd586e84a0003a614bb92853f23f0de819514091aa", size = 45383, upload-time = "2026-08-11T20:33:02.051Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/88/0b6eea46d7fe90a0debd791512b8692bf585248e01f6be232447c11e77b0/almond_pyroki-0.1.1-py3-none-any.whl", hash = "sha256:fd57d4dc8b032e8e9aabacadffa64c45f45c7d8b392dc3484dab4dce2d181512", size = 45714, upload-time = "2026-09-28T23:58:28.882Z" },
 ]
 
 [[package]]
@@ -1047,6 +1049,14 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/b8/00651a0f559862f3bb7d6f7477b192afe3f583cc5e26403b44e59a55ab34/filelock-3.25.2.tar.gz", hash = "sha256:b64ece2b38f4ca29dd3e810287aa8c48182bbecd1ae6e9ae126c9b35f1382694", size = 40480, upload-time = "2026-03-11T20:45:38.487Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a4/a5/842ae8f0c08b61d6484b52f99a03510a3a72d23141942d216ebe81fefbce/filelock-3.25.2-py3-none-any.whl", hash = "sha256:ca8afb0da15f229774c9ad1b455ed96e85a81373065fb10446672f64444ddf70", size = 26759, upload-time = "2026-03-11T20:45:37.437Z" },
+]
+
+[[package]]
+name = "flatbuffers"
+version = "25.12.19"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/flatbuffers-25.12.19-py2.py3-none-any.whl", hash = "sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4", size = 26661, upload-time = "2025-12-19T23:16:13.622Z" },
 ]
 
 [[package]]

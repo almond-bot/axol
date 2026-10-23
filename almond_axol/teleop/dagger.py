@@ -81,8 +81,9 @@ class DaggerTeleopCore(VRTeleopCore):
         config: VRTeleopConfig,
         logger: logging.Logger,
         broadcast_tracking: Callable[[bool], None],
+        robot_model: str | None = None,
     ) -> None:
-        super().__init__(config, logger, broadcast_tracking)
+        super().__init__(config, logger, broadcast_tracking, robot_model=robot_model)
         # Set while a policy episode is live; grips are inert otherwise.
         self.intervention_allowed = threading.Event()
         # Set while the CLI's idle (between-episode) phase runs: a VR reset

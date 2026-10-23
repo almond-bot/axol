@@ -1345,7 +1345,7 @@ export type SettingValue = string | number | boolean | (number | string)[]
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose" | "toggle-number"
+  widget?: "slider" | "pose" | "toggle-number" | "mount"
   min?: number
   max?: number
   step?: number
@@ -1400,6 +1400,8 @@ export interface SettingsSnapshot {
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
+  /** The Axol version runs use (hosts that predate it only have classic). */
+  robotModel?: AxolModel
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1427,9 +1429,52 @@ export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapsh
   return { schema: [], advancedSchema: [], ...res }
 }
 
-/** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */
-export function urdfUrl(): string {
-  return apiUrl("/api/urdf/axol.urdf")
+/**
+ * Which Axol hardware version the host runs: mobile whenever Jelly is enabled
+ * (attached and not switched off in the Robot tab), otherwise the mount picked
+ * in the Robot tab (`kinematics.mount`, legacy `classic` until one is). The
+ * host derives it and reports it with the settings as `robotModel`.
+ */
+export type AxolModel = "classic" | "standalone" | "ox_cart" | "owl" | "mobile"
+
+/** The versions to pick from without Jelly (the `kinematics.mount` options). */
+export type AxolMount = Exclude<AxolModel, "mobile">
+
+export const AXOL_MOUNTS: readonly AxolMount[] = ["classic", "standalone", "ox_cart", "owl"]
+
+const URDF_FILES: Record<AxolModel, string> = {
+  classic: "axol.urdf",
+  standalone: "axol_standalone.urdf",
+  ox_cart: "axol_ox_cart.urdf",
+  owl: "axol_owl.urdf",
+  mobile: "axol_jelly.urdf",
+}
+
+export function parseAxolModel(value: unknown): AxolModel | null {
+  return typeof value === "string" && value in URDF_FILES ? (value as AxolModel) : null
+}
+
+/** A saved `kinematics.mount`, legacy (`classic`) when unset or unknown. */
+export function parseAxolMount(value: unknown): AxolMount {
+  return AXOL_MOUNTS.find((m) => m === value) ?? "classic"
+}
+
+/** The gripper fitted to both arms (the `axol.gripper` setting). */
+export type GripperType = "parallel" | "parcel"
+
+export function parseGripper(value: unknown): GripperType {
+  return value === "parcel" ? "parcel" : "parallel"
+}
+
+/**
+ * URL of an Axol version's URDF (meshes resolve relative to it via /api/urdf/…).
+ * The mobile Axol has one per gripper; the classic one shows the parallel
+ * gripper for either.
+ */
+export function urdfUrl(model: AxolModel = "classic", gripper: GripperType = "parallel"): string {
+  const file =
+    model === "mobile" && gripper === "parcel" ? "axol_jelly_parcel.urdf" : URDF_FILES[model]
+  return apiUrl(`/api/urdf/${file}`)
 }
 
 export function cameraSerials(

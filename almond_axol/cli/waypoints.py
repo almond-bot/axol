@@ -950,7 +950,9 @@ async def _session(
     if cfg.sim:
         from ..robot.sim import Sim
 
-        robot: RobotBase = Sim()
+        robot: RobotBase = Sim(
+            robot_model=cfg.kinematics.robot_model, mount=cfg.kinematics.mount
+        )
     else:
         from ..robot import Axol
 

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeVar
 
 if TYPE_CHECKING:
+    from .constants import AxolModel
     from .serve.settings import SettingsStore
 
 __all__ = [
@@ -45,6 +46,7 @@ __all__ = [
     "shared_config",
     "shared_mantis_can_channels",
     "shared_overlay",
+    "resolve_robot_model",
     "store_path",
 ]
 
@@ -197,3 +199,92 @@ def shared_mantis_can_channels(
     if store is None:
         store = load_store()
     return store.mantis_can_channels()
+
+
+def resolve_robot_model(
+    model: AxolModel | str | None = None,
+    *,
+    jelly_enabled: bool | None = None,
+    mount: AxolModel | str | None = None,
+    store: SettingsStore | None = None,
+) -> AxolModel:
+    """Which Axol version's URDF to use: ``model`` if given, else inferred.
+
+    An explicit value (``KinematicsConfig.robot_model``) wins and is
+    validated. Otherwise the robot is the mobile Axol exactly when Jelly is
+    enabled — attached and not switched off — and else the version it is
+    mounted as (``mount``, ``KinematicsConfig.mount``: one of
+    :data:`~almond_axol.constants.MOUNTS`; ``None`` reads the saved
+    ``kinematics.mount``, legacy if unset). A session that has already
+    decided whether it drives Jelly passes ``jelly_enabled``; everything else
+    (the sim, run policy, the tuning tools, the control panel's viewer) takes
+    a ``kinematics.robot_model`` saved in the shared settings if there is
+    one, else runs the same detection as teleop against the shared ``jelly``
+    settings (:func:`almond_axol.robot.jelly.detect_jelly`).
+    """
+    from .constants import AxolModel
+
+    if isinstance(model, AxolModel):
+        return model
+    if model is not None:
+        return AxolModel(str(model).strip().lower())
+    saved = None
+    if jelly_enabled is None or (not jelly_enabled and mount is None):
+        from .kinematics.config import KinematicsConfig
+
+        if store is None:
+            store = load_store()
+        saved = shared_config(KinematicsConfig, "teleop", "kinematics", store=store)
+    if jelly_enabled is None:
+        from .robot.jelly import JellyConfig, detect_jelly
+
+        # A kinematics.robot_model saved in the settings overrides the
+        # inference for callers that built a default config.
+        if saved.robot_model is not None:
+            return AxolModel(str(saved.robot_model).strip().lower())
+        jelly = shared_config(JellyConfig, "teleop", "jelly", store=store)
+        jelly_enabled = detect_jelly(jelly) is not None
+    if jelly_enabled:
+        return AxolModel.MOBILE
+    return resolve_mount(mount if mount is not None else saved.mount)
+
+
+def resolve_mount(mount: AxolModel | str | None) -> AxolModel:
+    """``mount`` (``kinematics.mount``) as a version, validated: one of
+    :data:`~almond_axol.constants.MOUNTS`, legacy (``classic``) when unset."""
+    from .constants import MOUNTS, AxolModel
+
+    if mount is None:
+        return AxolModel.CLASSIC
+    try:
+        model = AxolModel(str(mount).strip().lower())
+    except ValueError:
+        model = None
+    if model not in MOUNTS:
+        raise ValueError(
+            f"mount must be one of {[m.value for m in MOUNTS]}, got {mount!r}"
+        )
+    return model
+
+
+def resolve_gripper(
+    gripper: str | None = None, *, store: SettingsStore | None = None
+) -> str:
+    """Which gripper the arms carry: ``gripper`` if given, else the saved one.
+
+    An explicit value (``KinematicsConfig.gripper``, set by teleop from
+    ``AxolConfig.gripper``) wins and is validated; otherwise it is the
+    ``axol.gripper`` saved in the shared settings (``"parallel"`` unless the
+    control panel or ``--axol.gripper`` changed it). It selects the mobile
+    Axol's URDF (:func:`almond_axol.constants.urdf_path`).
+    """
+    from .robot.config import GRIPPER_TYPES
+
+    if gripper is None:
+        gripper = shared_axol_config(store).gripper
+    gripper = str(gripper).strip().lower()
+    if gripper not in GRIPPER_TYPES:
+        raise ValueError(
+            f"gripper must be one of {list(GRIPPER_TYPES)}, got {gripper!r}"
+        )
+    return gripper

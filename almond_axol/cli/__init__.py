@@ -47,6 +47,7 @@ from .tune import motion as tune_motion
 from .tune import tf as tune_tf
 from .zed import driver as zed_driver
 from .zed import install as zed_install
+from ..teleop import warm as ik_warm
 
 # Commands that parse their config with draccus instead of argparse. Their
 # dotted ``--section.field`` overrides aren't compatible with argparse
@@ -172,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     gst_build_zed.add_parser(subparsers)
     rt_install.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
+    ik_warm.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)

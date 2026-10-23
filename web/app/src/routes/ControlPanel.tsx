@@ -4,6 +4,8 @@ import { cn } from "@/lib/utils"
 import {
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
+  parseAxolModel,
+  parseGripper,
   JELLY_DEVICES,
   JELLY_DEVICE_LABELS,
   OPERATIONS,
@@ -93,11 +95,13 @@ import { DatasetPreview } from "@/components/dataset-preview"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
+import { MountRequired } from "@/components/settings/mount-required"
 import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
+import type { SimRobot } from "@/components/sim-robot-picker"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
@@ -149,6 +153,19 @@ function persistLocalCameras(spec: CameraSpec) {
   }
 }
 
+const SIM_ROBOT_KEY = "axolSimRobot"
+
+/** The sim robot this browser last picked, if it is still a valid one. */
+function loadSimRobot(): SimRobot | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SIM_ROBOT_KEY) ?? "null")
+    const model = parseAxolModel(raw?.model)
+    return model ? { model, gripper: parseGripper(raw?.gripper) } : null
+  } catch {
+    return null
+  }
+}
+
 export default function ControlPanel() {
   const toast = useToast()
   const [commands, setCommands] = useState<CommandSpec[]>([])
@@ -178,6 +195,7 @@ export default function ControlPanel() {
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
+  const [simRobotChoice, setSimRobotChoice] = useState<SimRobot | null>(loadSimRobot)
   const [robotBusy, setRobotBusy] = useState(false)
   // A backend restart can leave the tab's old auto-connect latch intact. A
   // failed status poll followed by recovery starts a new connection epoch,
@@ -927,7 +945,54 @@ export default function ControlPanel() {
   // The device selection is system-wide: a Mantis-capable operation runs on
   // Mantis whenever it is selected, and the idle link auto-connects to it.
   const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
+  // An Axol is connected: its robot model can be picked (until then the
+  // picker previews only, like the Jelly card until Jelly is attached).
+  const axolConnected = robot?.state === "connected" && (robot?.profile ?? "axol") === "axol"
+  // No robot model picked yet: a host that offers the pick (kinematics.mount)
+  // and has none saved, on Axol without Jelly (Jelly is detected, never
+  // picked). The pick shows above the settings and gates Axol runs until saved.
+  //
+  // It waits for CAN discovery to settle: hardware still being identified
+  // may be the Jelly, which would make the pick moot. (Hosts that predate
+  // discovery report none: settled.)
+  const canDiscoverySettled =
+    canDiscovery == null || canDiscovery.status === "ready" || canDiscovery.status === "configured"
+  const needsMount =
+    conn.state === "ok" &&
+    canDiscoverySettled &&
+    !settingsError &&
+    hardwareProfile !== "mantis" &&
+    settingsSnap?.robotModel !== "mobile" &&
+    (settingsSnap?.schema ?? []).some((c) =>
+      c.settings.some((f) => f.key === "kinematics.mount")
+    ) &&
+    settingsSnap?.values["kinematics.mount"] == null
   const desiredHardwareProfile: HardwareProfile = hardwareProfile
+  // The robot sim runs simulate: this browser's last pick, else the robot this
+  // host is (its model and fitted gripper).
+  const simRobot: SimRobot = simRobotChoice ?? {
+    model: settingsSnap?.robotModel ?? "classic",
+    gripper: parseGripper(settingsSnap?.values["axol.gripper"]),
+  }
+
+  // The host derives the robot model (robotModel) from whether Jelly's CAN
+  // interfaces are present — but the panel only fetches it with the
+  // settings. Follow the 2 s CAN inventory instead of a one-off answer:
+  // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
+  // that comes up a moment after the panel connects turns the robot into
+  // Axol × Jelly (and drops the "Which Axol is this?" pick) without a reload.
+  const jellyPresent = canDevices
+    ? Boolean(canDevices.wheels?.present || canDevices.lift?.present)
+    : null
+  const robotModelInputs = conn.state === "ok" ? `${jellyPresent}:${canDiscoverySettled}` : null
+  const robotModelInputsRef = useRef<string | null>(null)
+  useEffect(() => {
+    const prev = robotModelInputsRef.current
+    robotModelInputsRef.current = robotModelInputs
+    if (prev !== null && robotModelInputs !== null && prev !== robotModelInputs) {
+      void loadSettings()
+    }
+  }, [robotModelInputs, loadSettings])
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -1700,6 +1765,13 @@ export default function ControlPanel() {
         args[HARDWARE_PROFILE_ARG] = true
         if (meta.id === "collect-data") args.mantis_source = mantisSource
       }
+      // A sim run simulates the robot picked for it (the "Sim robot" roster),
+      // which may differ from the robot's saved model; a run's args override
+      // the shared settings.
+      if (isSimSelected) {
+        args["kinematics.robot_model"] = simRobot.model
+        if (simRobot.model === "mobile") args["axol.gripper"] = simRobot.gripper
+      }
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim). Newer hosts also hold the
@@ -1889,6 +1961,19 @@ export default function ControlPanel() {
           </div>
         )}
 
+        {needsMount && (
+          <MountRequired
+            locked={!axolConnected}
+            onSave={async (mount) => {
+              await handleSettingsSave(
+                { values: { "kinematics.mount": mount } },
+                renderedConnectionGeneration
+              )
+              toast.success("Robot model saved. Change it any time in Settings → Robot.")
+            }}
+          />
+        )}
+
         {conn.state === "ok" && (
           <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
             <SettingsSection
@@ -1914,6 +1999,7 @@ export default function ControlPanel() {
                     : null
               }
               activeCommandSession={activeCommandSession}
+              axolConnected={axolConnected}
               onCommandSessionChange={(next) => {
                 if (connectionGenerationRef.current === renderedConnectionGeneration) {
                   setActiveCommandSession(next)
@@ -1987,6 +2073,16 @@ export default function ControlPanel() {
                 ? `${runningOp ?? "Another operation"} is running`
                 : null
           }
+          needsMount={needsMount}
+          simRobot={simRobot}
+          onSimRobotChange={(next) => {
+            setSimRobotChoice(next)
+            try {
+              localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
+            } catch {
+              // Private mode / storage off: the choice lasts this page view.
+            }
+          }}
           connected={conn.state === "ok"}
           policy={selectedLive ? policy : null}
           onStart={handleStart}

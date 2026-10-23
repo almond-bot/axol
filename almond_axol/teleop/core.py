@@ -41,8 +41,9 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, Joint
+from ..constants import ARM_JOINTS, AxolModel, Joint, urdf_path
 from ..robot.control import ContactWatchdog
+from ..settings import resolve_gripper, resolve_robot_model
 from .absolute_pose import AbsoluteCalibration
 from .config import VRTeleopConfig
 from .filter import (
@@ -270,6 +271,9 @@ class VRTeleopCore:
         broadcast_tracking: Callback ``(enabled: bool) -> None`` that pushes the
             engage state to the headset. Safe to call before the VR server
             exists (the adapter's implementation guards that).
+        robot_model: Axol version the IK solver runs (``KinematicsConfig.
+            robot_model``); names the URDF the headset overlay loads. ``None``
+            infers it from whether Jelly is enabled.
         broadcast_mode: Optional callback ``(key: str, value) -> None`` fired
             on the IK thread whenever a live setting changes (see
             :meth:`set_live`), so the adapter can push the new state to the
@@ -287,8 +291,19 @@ class VRTeleopCore:
         broadcast_tracking: Callable[[bool], None],
         broadcast_mode: Callable[[str, object], None] | None = None,
         broadcast_json: Callable[[dict], None] | None = None,
+        robot_model: str | None = None,
     ) -> None:
         self.config = config
+        # Resolved here, not per broadcast: it may read the settings file.
+        model = resolve_robot_model(robot_model)
+        self._urdf_file = urdf_path(
+            model,
+            gripper=(
+                resolve_gripper(config.gripper)
+                if model is AxolModel.MOBILE
+                else "parallel"
+            ),
+        ).name
         self._logger = logger
         self._broadcast = broadcast_tracking
         self._broadcast_mode = broadcast_mode
@@ -1949,6 +1964,7 @@ class VRTeleopCore:
         process_alive: Callable[[], bool],
         on_ik_sample: Callable[[float], None],
         get_measured: Callable[[], MeasuredArms | None] | None = None,
+        get_lift: Callable[[], float | None] | None = None,
     ) -> None:
         """Dispatch VR frames to the IK subprocess and publish raw targets.
 
@@ -1971,11 +1987,19 @@ class VRTeleopCore:
                 engaged and forwarded to the worker as ``("meas", left,
                 right, kp_left, kp_right)`` for the squeeze lean
                 (``IKWorker.note_measured``). Hardware flows only.
+            get_lift: Optional; returns the lift's height as a fraction of
+                its travel (``Jelly.lift_raised``), or ``None`` while it is
+                unknown. Forwarded as ``("lift", raised)`` whenever it moves,
+                so the solver's collision checks follow the deck up as the
+                lift lowers (``KinematicsSolver.set_lift``); until the first
+                reading the solver takes the lift as fully raised, and an
+                unknown height keeps the last one sent.
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0
+        sent_lift: float | None = None
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -1985,6 +2009,22 @@ class VRTeleopCore:
                 continue
 
             t0 = time.perf_counter()
+
+            if get_lift is not None:
+                try:
+                    raised = get_lift()
+                except Exception:  # noqa: BLE001 - never stall the solve
+                    self._logger.exception("lift height readout failed")
+                    raised = None
+                # 1 permille steps: the lift reports permille of its travel.
+                if raised is not None and (
+                    sent_lift is None or abs(raised - sent_lift) >= 1e-3
+                ):
+                    try:
+                        conn.send(("lift", float(raised)))
+                        sent_lift = raised
+                    except OSError:
+                        pass  # the dead-process path below reports it
 
             # Reset (return-to-rest) takes priority over normal tracking. Leave
             # the latch set if we can't dispatch yet (no solution, or a
@@ -2410,6 +2450,8 @@ class VRTeleopCore:
         self._broadcast_json(
             {
                 "type": "urdf_state",
+                # File under the server's /urdf mount for this Axol version.
+                "urdf": self._urdf_file,
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,

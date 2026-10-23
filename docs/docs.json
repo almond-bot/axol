@@ -144,6 +144,7 @@
                   "cli/serve",
                   "cli/provision",
                   "cli/rt-install",
+                  "cli/ik-warm",
                   "cli/jetson-setup"
                 ]
               },

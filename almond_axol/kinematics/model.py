@@ -17,27 +17,38 @@ additional objects is close to free.
 
 The collision model is built lazily and separately: forward-kinematics-only
 users (observation recording) never pay for capsule fitting.
+
+Each :class:`~almond_axol.constants.AxolModel` (hardware version) has its own
+URDF and therefore its own robot and collision model; both are cached per
+version (and, on the mobile Axol, per gripper). A ``model`` of ``None`` is
+inferred — mobile when Jelly is enabled — by
+:func:`almond_axol.settings.resolve_robot_model`, and a ``gripper`` of
+``None`` by :func:`almond_axol.settings.resolve_gripper`.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import threading
+from pathlib import Path
+from xml.etree import ElementTree
 
 import jax.numpy as jnp
 import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..constants import URDF_PATH
+from ..constants import (
+    AxolModel,
+    torso_links,
+    urdf_arm_joint_names,
+    urdf_path,
+)
+from ..settings import resolve_gripper, resolve_robot_model
 
 _logger = logging.getLogger(__name__)
 
-_TORSO_LINKS: tuple[str, ...] = ("base", "s1")
-"""Static body links that the arms must not collide into.
-
-Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
-"""
 
 # The two shoulder links mount directly onto the torso. Their conservative
 # capsules overlap the base by construction and cannot be used as collision
@@ -74,49 +85,176 @@ _RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
-_urdf: yourdfpy.URDF | None = None
-_robot: pk.Robot | None = None
-_robot_coll: pk.collision.RobotCollision | None = None
+# Keyed by (version, gripper): the parcel gripper has its own URDF.
+_Key = tuple[AxolModel, str]
+_urdf: dict[_Key, yourdfpy.URDF] = {}
+_robot: dict[_Key, pk.Robot] = {}
+_robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
+_lift_shift: dict[_Key, tuple[np.ndarray, float]] = {}
+
+# The lift's driving joint in the generated URDFs (0 = fully raised,
+# lowering the arms); any further stages mimic it.
+_LIFT_JOINT = "lift"
 
 
-def _load_urdf() -> yourdfpy.URDF:
-    global _urdf
-    if _urdf is None:
-        _logger.info("Loading Axol URDF...")
-        _urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-    return _urdf
+def _key(model: AxolModel | str | None, gripper: str | None) -> _Key:
+    resolved = resolve_robot_model(model)
+    # Only the mobile Axol has a URDF per gripper: skip the settings lookup
+    # for the others.
+    if resolved is AxolModel.MOBILE:
+        gripper = resolve_gripper(gripper)
+    else:
+        gripper = "parallel"
+    return resolved, gripper
 
 
-def shared_urdf() -> yourdfpy.URDF:
-    """The parsed bundled Axol URDF, loaded once per process."""
+def ik_urdf_xml(path: Path) -> str:
+    """The bundled URDF at ``path`` as IK sees it.
+
+    The generated models are full robots (see
+    :func:`~almond_axol.constants.urdf_path`). For IK every joint but the
+    arms' is frozen at zero — the body, lift, fingers and wheels — since
+    pyroki treats every movable joint as a variable; and each link's
+    capsule-friendly ``<ik_collision>`` pieces replace its per-part
+    ``<collision>`` hulls. A URDF without ``<ik_collision>`` (the classic
+    one) keeps its collision geometry.
+    """
+    root = ElementTree.parse(path).getroot()
+    solved = set(
+        urdf_arm_joint_names(is_left=True) + urdf_arm_joint_names(is_left=False)
+    )
+    for joint in root.findall("joint"):
+        if joint.get("type") == "fixed" or joint.get("name") in solved:
+            continue
+        joint.set("type", "fixed")
+        for tag in ("axis", "limit", "mimic", "dynamics", "drive"):
+            for el in joint.findall(tag):
+                joint.remove(el)
+    if root.find("link/ik_collision") is not None:
+        for link in root.findall("link"):
+            for el in link.findall("collision"):
+                link.remove(el)
+            for el in link.findall("ik_collision"):
+                el.tag = "collision"
+    return ElementTree.tostring(root, encoding="unicode")
+
+
+def ik_urdf(path: Path) -> yourdfpy.URDF:
+    """The bundled URDF at ``path`` as IK sees it (:func:`ik_urdf_xml`), with
+    meshes resolved next to it."""
+    return yourdfpy.URDF.load(io.StringIO(ik_urdf_xml(path)), mesh_dir=str(path.parent))
+
+
+def _load_urdf(key: _Key) -> yourdfpy.URDF:
+    if key not in _urdf:
+        path = urdf_path(key[0], gripper=key[1])
+        _logger.info("Loading Axol URDF (%s)...", path.name)
+        _urdf[key] = ik_urdf(path)
+    return _urdf[key]
+
+
+def shared_urdf(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> yourdfpy.URDF:
+    """The parsed bundled URDF for ``model``, as IK sees it, loaded once per
+    process."""
     with _lock:
-        return _load_urdf()
+        return _load_urdf(_key(model, gripper))
 
 
-def shared_robot() -> pk.Robot:
-    """The pyroki robot for the bundled Axol URDF, built once per process."""
-    global _robot
+def shared_robot(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> pk.Robot:
+    """The pyroki robot for ``model``'s bundled URDF, built once per process.
+
+    ``gripper`` is the fitted gripper (``AxolConfig.gripper``; ``None`` reads
+    it from the shared settings): the mobile Axol has a URDF per gripper.
+    """
     with _lock:
-        if _robot is None:
-            _robot = pk.Robot.from_urdf(_load_urdf())
-        return _robot
+        key = _key(model, gripper)
+        if key not in _robot:
+            _robot[key] = pk.Robot.from_urdf(_load_urdf(key))
+        return _robot[key]
 
 
-def shared_robot_collision() -> pk.collision.RobotCollision:
-    """The torso<->arm collision model, built once per process."""
-    global _robot_coll
+def shared_robot_collision(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> pk.collision.RobotCollision:
+    """``model``'s torso<->arm collision model, built once per process."""
     with _lock:
-        if _robot_coll is None:
-            _robot_coll = _build_robot_collision(_load_urdf())
-        return _robot_coll
+        key = _key(model, gripper)
+        if key not in _robot_coll:
+            _robot_coll[key] = _build_robot_collision(
+                _load_urdf(key), torso_links(key[0])
+            )
+        return _robot_coll[key]
 
 
-def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
+def lift_link_shift(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> tuple[np.ndarray, float]:
+    """How the lift moves each IK link relative to the arms, and its travel.
+
+    IK freezes the lift fully raised (:func:`ik_urdf_xml`) and solves in the
+    torso's frame, which the lift carries with the arms. Lowering it leaves
+    the parts below behind — the Jelly deck and the lower column sections —
+    so relative to the arms they rise. Returns ``(shift, travel)``:
+    ``shift`` is ``(num_links, 3)`` in the IK robot's link order, each link's
+    displacement in the torso frame per metre the lift is lowered (zero for
+    the links that ride with the arms), and ``travel`` the lift's full stroke
+    (m). A version without a lift has zero shift and travel.
+    """
+    with _lock:
+        key = _key(model, gripper)
+        if key not in _lift_shift:
+            names = list(shared_robot(key[0], gripper=key[1]).links.names)
+            _lift_shift[key] = _measure_lift_shift(
+                urdf_path(key[0], gripper=key[1]), names
+            )
+        return _lift_shift[key]
+
+
+def _measure_lift_shift(path: Path, names: list[str]) -> tuple[np.ndarray, float]:
+    shift = np.zeros((len(names), 3), dtype=np.float32)
+    full = yourdfpy.URDF.load(
+        str(path), build_collision_scene_graph=False, load_meshes=False
+    )
+    joint = full.joint_map.get(_LIFT_JOINT)
+    if joint is None or joint.limit is None:
+        return shift, 0.0
+    travel = float(joint.limit.upper)
+    root = full.base_link
+    # The torso root: the link the arms' first joints hang from (s1's
+    # ancestor chain ends there), whose frame IK solves in.
+    torso = "root" if "root" in full.link_map else "s1"
+
+    def relative(q: float) -> np.ndarray:
+        cfg = {n: 0.0 for n in full.actuated_joint_names}
+        cfg[_LIFT_JOINT] = q
+        full.update_cfg(cfg)
+        world_torso = full.get_transform(torso, root)
+        inv = np.linalg.inv(world_torso)
+        out = np.zeros((len(names), 3))
+        for k, name in enumerate(names):
+            if name in full.link_map:
+                out[k] = (inv @ full.get_transform(name, root))[:3, 3]
+        return out
+
+    shift[:] = (relative(travel) - relative(0.0)) / travel
+    full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
+    return shift, travel
+
+
+def _build_robot_collision(
+    urdf: yourdfpy.URDF, torso: tuple[str, ...] = torso_links()
+) -> pk.collision.RobotCollision:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
-    Each Axol arm is a serial chain attached to a static torso (``base`` +
-    ``s1``). pyroki's PCA capsule fit produces conservative single-capsule-
-    per-link shapes that always overlap at adjacent-link joint interfaces,
+    Each Axol arm is a serial chain attached to a static torso (``torso``:
+    ``base`` + ``s1`` on the classic Axol, plus the lift column's top plate
+    and the ``head`` camera mount on the mobile one — see
+    :func:`almond_axol.constants.torso_links`). pyroki's PCA capsule fit
+    produces conservative single-capsule-per-link shapes that always overlap at adjacent-link joint interfaces,
     so blanket self-collision causes persistent jitter the IK cannot
     resolve. We restrict the active pair set to the only collisions that
     actually matter: any link pair where exactly one side is the torso
@@ -134,12 +272,15 @@ def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
     arm moves closer to the base than that known-safe reference.
     """
     link_names = [link.name for link in urdf.robot.links]
+    # Frame-only links (camera optical frames, the fingers' own frames) would
+    # otherwise enter as zero-radius capsules at their origins.
+    has_geometry = {link.name for link in urdf.robot.links if link.collisions}
 
     def is_arm(n: str) -> bool:
-        return n.startswith("left_") or n.startswith("right_")
+        return (n.startswith("left_") or n.startswith("right_")) and n in has_geometry
 
     def is_torso(n: str) -> bool:
-        return n in _TORSO_LINKS
+        return n in torso
 
     ignore: set[tuple[str, str]] = set()
     for i, a in enumerate(link_names):
@@ -157,6 +298,25 @@ def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
         len(rc.active_idx_i),
     )
     return rc
+
+
+_UPPER_ARM_GUARD_SLACK = 0.020
+
+
+def upper_arm_guard_floor(home_clearance: float) -> float:
+    """Hard-stop clearance for an upper arm (e1) against the body.
+
+    On the classic Axol the fitted capsules already overlap at the safe
+    straight-down pose, so the threshold is relative to it: at most 20 mm
+    closer than home. The recorded cross-body contact was 23-31 mm closer,
+    leaving about 10 mm of model-space headroom. Where the body is genuinely
+    clear at home — the Jelly lift column sits behind the mobile arms, 84 mm
+    from the upper arm — "20 mm closer than home" would forbid ordinary
+    poses (the default rest pose comes 26 mm closer), so the floor is capped
+    at zero: there the guard stops actual capsule contact. Classic floors
+    (home clearance below 20 mm) are unchanged.
+    """
+    return min(float(home_clearance) - _UPPER_ARM_GUARD_SLACK, 0.0)
 
 
 def collision_cost_params(

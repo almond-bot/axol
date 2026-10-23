@@ -368,6 +368,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
         ),
         settings=(
             SettingDef(
+                key="kinematics.mount",
+                label="Robot model",
+                type="select",
+                options=("classic", "standalone", "ox_cart", "owl"),
+                help=(
+                    "What Axol is mounted on, when Jelly is not attached: "
+                    "classic (the legacy model), standalone (Axol on its "
+                    "own), ox_cart (on the Ox cart's lift) or owl (on the Owl "
+                    "mount). It picks the robot model — the body IK keeps the "
+                    "arms clear of, and what the viewers show. With Jelly "
+                    "attached and on, the robot is Axol on Jelly whatever "
+                    "this says."
+                ),
+                ui={"widget": "mount"},
+                effective_default="classic (legacy)",
+            ),
+            SettingDef(
                 key="axol.left_stiffness",
                 label="Left arm stiffness",
                 type="number",
