@@ -47,6 +47,7 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
+import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -83,6 +84,9 @@ export function OperationPanel({
   vrPort,
   startPhase,
   hostBlocker,
+  needsMount = false,
+  simRobot,
+  onSimRobotChange,
   connected,
   policy,
   onStart,
@@ -116,6 +120,13 @@ export function OperationPanel({
   startPhase: string | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
+  /** No robot model picked yet (`kinematics.mount`): a run that drives the
+   *  Axol arms waits for the "Which Axol is this?" pick above the settings
+   *  (sim and arms-off runs keep the legacy default). */
+  needsMount?: boolean
+  /** The robot a sim run simulates (sent as its kinematics.robot_model). */
+  simRobot?: SimRobot
+  onSimRobotChange?: (next: SimRobot) => void
   /** False while disconnected or validating a replacement host. */
   connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
@@ -333,6 +344,9 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
+  if (!live && needsMount && !mantisMode && meta.requiresRobot && !robotFree) {
+    blockers.push("Choose your Axol: pick what it is mounted on, above Axol settings")
+  }
   if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
       robotOk && robot?.profile !== "mantis"
@@ -576,6 +590,10 @@ export function OperationPanel({
                 </>
               )}
 
+              {isSim && simRobot && onSimRobotChange && (
+                <SimRobotPicker value={simRobot} onChange={onSimRobotChange} disabled={live} />
+              )}
+
               <button
                 type="button"
                 onClick={onOpenSettings}
@@ -665,6 +683,8 @@ function legacyStatus(phase: string): string {
       return "Reset the scene, then start the episode."
     case "resetting":
       return "Returning to rest…"
+    case "parking":
+      return "Parking the arms (rest, then zero) before releasing the motors…"
     default:
       return "Preparing…"
   }
@@ -730,6 +750,11 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
     },
     resetting: {
       label: "Resetting",
+      cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
+      kind: "spin",
+    },
+    parking: {
+      label: "Parking",
       cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
       kind: "spin",
     },

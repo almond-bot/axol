@@ -16,8 +16,11 @@ import {
   flattenFields,
   setQuestProximityDisabled,
   settingShown,
+  parseAxolMount,
+  parseGripper,
   visibleAdvancedSections,
   type AdvancedSection,
+  type AxolModel,
   type CameraDevice,
   type CameraSlot,
   type CameraSpec,
@@ -56,6 +59,8 @@ import {
 } from "@/lib/settings-scope"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
+import { MountPicker } from "./mount-picker"
+import { rebaseValues } from "@/lib/settings-rebase"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
@@ -130,6 +135,7 @@ export function SettingsSection({
   actionBlocker,
   activeCommandSession,
   onCommandSessionChange,
+  axolConnected = false,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -153,11 +159,16 @@ export function SettingsSection({
   /** Active generic setup/diagnostic session, if any. */
   activeCommandSession: SessionInfo | null
   onCommandSessionChange: (session: SessionInfo | null) => void
+  /** An Axol is connected: its robot model can be picked. */
+  axolConnected?: boolean
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
   const [saving, setSaving] = useState(false)
   const [seedKey, setSeedKey] = useState("")
+  // The stored values the draft was seeded from: what "untouched" means when
+  // the host's values change under a staged draft.
+  const [seedValues, setSeedValues] = useState<Record<string, SettingValue>>({})
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
@@ -179,9 +190,22 @@ export function SettingsSection({
   }
   const settingsResolved = snapshot !== null || supportError !== null
   const nextSeedKey = settingsResolved ? JSON.stringify([snapshot?.values, cameras]) : null
-  if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
-    setSeedKey(nextSeedKey)
-    setDraft(seedDraft())
+  if (nextSeedKey !== null && nextSeedKey !== seedKey) {
+    if (draft == null || !dirty) {
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot?.values ?? {})
+      setDraft(seedDraft())
+    } else if (snapshot) {
+      // Saved elsewhere while edits are staged (the main page's robot-model
+      // pick, another client): keys the operator has not touched follow the
+      // host; staged edits stay.
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot.values)
+      setDraft({
+        ...draft,
+        values: rebaseValues(draft.values, seedValues, snapshot.values),
+      })
+    }
   }
 
   const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
@@ -212,6 +236,7 @@ export function SettingsSection({
   function discard() {
     if (nextSeedKey === null) return
     setSeedKey(nextSeedKey)
+    setSeedValues(snapshot?.values ?? {})
     setDraft(seedDraft())
   }
 
@@ -563,7 +588,13 @@ export function SettingsSection({
             ) : tab === "usb" ? (
               <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
             ) : tab === "pose" ? (
-              <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
+              <PosePanel
+                fields={poseFields}
+                values={draft.values}
+                onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
+                gripper={parseGripper(snapshot?.values["axol.gripper"])}
+              />
             ) : tab === "advanced" ? (
               <AdvancedPanel
                 sections={generalAdvancedSections}
@@ -603,6 +634,8 @@ export function SettingsSection({
                 schema={schema}
                 values={draft.values}
                 onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
+                axolConnected={axolConnected}
                 excludeKeys={
                   activeCategory.key === "teleop"
                     ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS, ...MANTIS_TRIGGER_KEYS]
@@ -836,6 +869,8 @@ function CategoryPanel({
   values,
   onChange,
   excludeKeys = [],
+  robotModel = "classic",
+  axolConnected = false,
 }: {
   category: SettingsCategory
   /** Every category, to resolve the defaults `showWhen` gates read. */
@@ -843,16 +878,32 @@ function CategoryPanel({
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
   excludeKeys?: string[]
+  /** What the host runs now, for the robot-model picker. */
+  robotModel?: AxolModel
+  /** An Axol is connected: the robot-model picker is unlocked. */
+  axolConnected?: boolean
 }) {
-  const fields = category.settings.filter(
+  const shown = category.settings.filter(
     (s) =>
       s.ui.widget !== "pose" &&
       !excludeKeys.includes(s.key) &&
       settingShown(s.ui.showWhen, values, schema)
   )
+  // The robot-model picker gets the full width, above the other controls.
+  const mountFields = shown.filter((s) => s.ui.widget === "mount")
+  const fields = shown.filter((s) => s.ui.widget !== "mount")
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>
+      {mountFields.map((f) => (
+        <MountPicker
+          key={f.key}
+          mount={parseAxolMount(values[f.key] ?? f.default)}
+          robotModel={robotModel}
+          locked={!axolConnected}
+          onSelect={(mount) => onChange(f.key, mount)}
+        />
+      ))}
       <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
         {fields.map((f) => (
           <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />

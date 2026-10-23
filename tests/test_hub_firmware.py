@@ -128,6 +128,20 @@ class HubDiscoveryTest(unittest.TestCase):
             hub_fw.hubs_for_channels(["can0", "can_missing"], sysfs=self.sysfs.root), []
         )
 
+    def test_attached_hubs_include_one_without_interfaces(self) -> None:
+        # A Mantis hub whose CAN interfaces never came up: no netdev at all.
+        self.sysfs.usb("1-3", version=0x0201)
+        self.sysfs.usb(
+            "1-4", manufacturer="bytewerk", product="candleLight USB to CAN adapter"
+        )
+        self.sysfs.usb("1-5", vid=hub_fw.BOOT_VID, pid=hub_fw.BOOT_PID)
+        (self.sysfs.root / "bus" / "usb" / "devices" / "1-3:1.0").mkdir()
+        self.assertEqual(
+            hub_fw.attached_hubs(sysfs=self.sysfs.root),
+            [hub_fw.Hub(port="1-3", serial="A2418ACCB47A8F12", version=0x0201)],
+        )
+        self.assertEqual(hub_fw.bootloader_ports(sysfs=self.sysfs.root), ["1-5"])
+
     def test_version_format(self) -> None:
         self.assertEqual(hub_fw.format_version(0x0200), "2.00")
         self.assertEqual(hub_fw.format_version(0x0100), "1.00")

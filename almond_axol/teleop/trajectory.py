@@ -39,6 +39,7 @@ def solve_path_step(
     collision_weight: float,
     max_iterations: int,
     use_self_collision: bool = True,
+    link_shift: jax.Array | None = None,
 ) -> jax.Array:
     """One IK step toward ``q_interp`` with limit + self-collision costs only.
 
@@ -46,7 +47,8 @@ def solve_path_step(
     is the previous waypoint (or the starting pose for the first step).
     Returns the projected joint configuration. With ``use_self_collision``
     false (the solver was built without a collision model) only the joint
-    limits constrain the projection.
+    limits constrain the projection. ``link_shift``: where the live lift
+    height puts the body (see :meth:`KinematicsSolver.set_lift`).
     """
     JointVar = robot.joint_var_cls
     costs = [
@@ -63,6 +65,7 @@ def solve_path_step(
                 activation_start=collision_start,
                 ramp_width=collision_ramp,
                 weight=collision_weight,
+                link_shift=link_shift,
             )
         )
     var_joints = JointVar(jnp.array([0]))
@@ -167,6 +170,7 @@ def plan_collision_aware_trajectory(
             collision_weight,
             max_iterations,
             use_self_collision=use_collision,
+            link_shift=solver.link_shift,
         )
         q = np.asarray(result, dtype=np.float32)
         trajectory.append(solver.from_pyroki_order(q))

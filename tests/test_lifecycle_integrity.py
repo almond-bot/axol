@@ -162,7 +162,7 @@ class CollectDataAffinityIntegrityTest(unittest.TestCase):
                 action_features={},
                 observation_features={},
                 cameras={},
-                positions=([], []),
+                positions=([0.0] * 8, [0.0] * 8),
                 name="test-robot",
             )
             robot.get_joint_observation.return_value = {}

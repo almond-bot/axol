@@ -8,7 +8,12 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..constants import (
+    ARM_JOINTS,
+    AxolModel,
+    urdf_arm_joint_names,
+    urdf_path,
+)
 from ..utils.ports import reclaim_port
 from .base import RobotBase
 
@@ -39,6 +44,8 @@ class Sim(RobotBase):
             Defaults to the order reported by the loaded URDF.
         default_q: Initial joint configuration in radians. Defaults to zeros.
         port: Port for the viser web server.
+        robot_model: Axol version to render; inferred (Jelly, else the
+            saved mount) when ``None``.
 
     Example::
 
@@ -53,6 +60,9 @@ class Sim(RobotBase):
         joint_names: list[str] | None = None,
         default_q: np.ndarray | None = None,
         port: int = 8002,
+        robot_model: AxolModel | str | None = None,
+        mount: AxolModel | str | None = None,
+        gripper: str | None = None,
     ) -> None:
         """Construct the simulation.
 
@@ -63,10 +73,20 @@ class Sim(RobotBase):
                 Defaults to the hard-coded left-then-right arm order.
             default_q:   Initial joint configuration in radians; defaults to zeros.
             port:        Port for the viser web server.
+            robot_model: Axol version to render; inferred when ``None``.
+            mount:       What Axol is mounted on without Jelly
+                         (``KinematicsConfig.mount``); read from the shared
+                         settings when ``None``.
+            gripper:     Fitted gripper (``AxolConfig.gripper``), which picks
+                         the mobile Axol's URDF; read from the shared
+                         settings when ``None``.
         """
         self._joint_names = joint_names
         self._default_q = default_q
         self._port = port
+        self._robot_model = robot_model
+        self._mount = mount
+        self._gripper = gripper
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
@@ -188,7 +208,20 @@ class Sim(RobotBase):
         # Stopping here guarantees the in-process port is freed whenever the
         # loop exits, which is what makes the in-process restart reliable.
         try:
-            urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
+            from ..settings import resolve_gripper, resolve_robot_model
+
+            model = resolve_robot_model(self._robot_model, mount=self._mount)
+            # The full model: the joints the viewer is not driven on (the
+            # body, lift, fingers and wheels) stay at zero.
+            path = urdf_path(
+                model,
+                gripper=(
+                    resolve_gripper(self._gripper)
+                    if model is AxolModel.MOBILE
+                    else "parallel"
+                ),
+            )
+            urdf = yourdfpy.URDF.load(str(path), mesh_dir=str(path.parent))
             viser_urdf = ViserUrdf(
                 server,
                 urdf_or_path=urdf,
@@ -227,9 +260,15 @@ class Sim(RobotBase):
             )
             viser_urdf.update_cfg(_to_viser(q0))
 
-            server.scene.add_grid(
-                "/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0)
+            # The ground plane goes on the floor: the world origin on the
+            # classic Axol, the ``floor`` frame under the Jelly's wheels on
+            # the mobile one (the world frame itself stays the classic one).
+            floor = (
+                tuple(float(v) for v in urdf.get_transform("floor")[:3, 3])
+                if "floor" in urdf.link_map
+                else (0.0, 0.0, 0.0)
             )
+            server.scene.add_grid("/grid", width=2.0, height=2.0, position=floor)
 
             while not self._stop.is_set():
                 with self._condition:

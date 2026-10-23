@@ -36,10 +36,12 @@ from typing import Any, Callable
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
 from ..mantis.smoothing import rotvec_to_quat_xyzw
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..robot.start_pose import check_start_pose
 from ..utils.logquiet import quiet_noisy_loggers
 from .config import LogLevel, parse
 
@@ -153,6 +155,11 @@ class ReplayDatasetConfig:
     # has no interactive retry channel, so the hold lasts until the run is
     # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
     reset_torque_threshold: float = 6.0
+    # Shutdown park: on stop the arms return to rest and then continue to the
+    # all-zero joint pose — hanging straight down — holding their grasp,
+    # before the motors are released. False stops the park at rest. The
+    # control panel's "Park to zero on stop" (``teleop.park_to_zero``).
+    park_to_zero: bool = True
     # Contact watchdog while the episode itself plays back: the same
     # sustained-torque-residual trip, checked on every command. On a trip
     # playback stops and the arms drop into the limp gravity-comp hold until
@@ -166,6 +173,34 @@ class ReplayDatasetConfig:
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
     log_level: LogLevel = "INFO"
+
+
+def _park_before_torque_off(
+    reset_controller: Any, robot: Any, cfg: "ReplayDatasetConfig"
+) -> bool:
+    """Teardown park: rest, then (``cfg.park_to_zero``) zero, holding the grasp.
+
+    The run's stop flag is already set by now, so a deadline bounds the park
+    instead — the same caps as run-policy's and collect-dagger's parks
+    (:data:`PARK_TIMEOUT_S`, plus :data:`PARK_ZERO_TIMEOUT_S` for the zero
+    leg). Nobody is left to free the arms from a contact hold, so a contact
+    trip ends the park at once; the torque-off follows either way. Returns
+    whether the park finished.
+    """
+    park_to_zero = bool(cfg.park_to_zero)
+    deadline = time.perf_counter() + PARK_TIMEOUT_S
+    if park_to_zero:
+        deadline += PARK_ZERO_TIMEOUT_S
+    contact = threading.Event()
+    return reset_controller.return_to_rest(
+        robot,
+        torque_threshold=cfg.reset_torque_threshold,
+        gravity_comp_kd=cfg.reset_gravity_comp_kd,
+        stopped=lambda: contact.is_set() or time.perf_counter() >= deadline,
+        on_contact=contact.set,
+        path=("rest", "zero") if park_to_zero else None,
+        hold_grasp=True,
+    )
 
 
 def main(argv: list[str]) -> None:
@@ -402,37 +437,42 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     reset_controller.start()
     _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-    # Tracks whether the arm is currently parked at rest, so the teardown only
-    # adds a return-to-rest when one is actually needed (and not a redundant one
-    # right after a loop iteration already ended at rest).
-    rested = False
+    # Set once this run first commands the arms (the startup home): from then
+    # on the teardown parks them — rest pose, then zero — before torque-off.
+    arms_moved = False
 
     def _stopped() -> bool:
         return stop_event.is_set()
 
     def _go_to_rest(
-        message: str = "Returning to rest pose.", *, final: bool = False
+        message: str = "Returning to rest pose.",
+        *,
+        final: bool = False,
+        startup: bool = False,
     ) -> None:
         # Guarded: a sustained torque residual (contact) drops the arms into
         # a limp gravity-comp hold. Replay has no interactive retry channel, so the
-        # hold lasts until the run is stopped — `rested` then stays False and
-        # the teardown skips its redundant return attempt. The teardown's own
-        # return (``final=True``) must play even though the stop flag is
-        # already set, so it passes no stop hook; on contact it aborts
-        # immediately instead of holding (nothing could end that hold).
-        nonlocal rested
+        # hold lasts until the run is stopped, and the teardown then leaves the
+        # limp arms where they are (``arms_limp``).
+        #
+        # ``startup`` plays the run's first home through zero (the arms'
+        # natural resting pose). ``final`` is the teardown park
+        # (:func:`_park_before_torque_off`): bounded by its own deadline, since
+        # the stop flag is already set by then.
         _logger.info(message)
-        rested = reset_controller.return_to_rest(
+        if final:
+            _park_before_torque_off(reset_controller, robot, cfg)
+            return
+        reset_controller.return_to_rest(
             robot,
             torque_threshold=cfg.reset_torque_threshold,
             gravity_comp_kd=cfg.reset_gravity_comp_kd,
-            stopped=None if final else _stopped,
-            on_contact=None
-            if final
-            else lambda: _logger.info(
+            stopped=_stopped,
+            on_contact=lambda: _logger.info(
                 "Contact during return to rest — arms are limp. Free them, "
                 "then stop the run."
             ),
+            path=("zero", "rest") if startup else None,
         )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
@@ -574,6 +614,8 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     try:
         _logger.info("Connecting robot...")
         robot.connect()
+        # The first return to rest plays unsupervised; refuse it from far away.
+        check_start_pose(robot.positions)
 
         # A Cartesian dataset resolves each recorded EE pose to joints via IK in
         # send_action. Build that solver now so its one-time JIT warmup overlaps
@@ -583,8 +625,10 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             robot.prepare_cartesian_actions()
 
         # Start every take from rest, the same place collect-data records from,
-        # so the first replayed action is ~rest and there's no jump.
-        _go_to_rest()
+        # so the first replayed action is ~rest and there's no jump. The first
+        # home goes through zero, the arms' natural resting pose.
+        arms_moved = True
+        _go_to_rest("Returning to rest pose (through zero).", startup=True)
 
         loop = bool(cfg.loop)
         interp_note = (
@@ -592,11 +636,10 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         )
         iteration = 0
         # Replay once, or repeatedly when ``loop`` is set, until stopped (Ctrl+C
-        # or the UI's Stop). The arm is parked at rest before the op exits — on a
+        # or the UI's Stop). The arm is parked (rest, then zero) before the op exits — on a
         # clean finish and on a stop alike — by the teardown below.
         while not _stopped():
             iteration += 1
-            rested = False
             if loop:
                 _logger.info(
                     f"Replaying episode {episode} (loop {iteration}): "
@@ -663,14 +706,23 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # the HardwareCleanupError below.
         _ = active_playback_future
 
-        # Park the arm at rest before killing the operation, unless it's already
-        # there (a loop iteration just ended at rest) or never moved (connect
-        # failed). The reset is planned by the IK worker (a quick round-trip) and
-        # then played locally, so it still completes if a slow stop's watchdog
+        # Park the arm — rest pose, then zero — before killing the operation,
+        # unless this run never moved it (connect failed, or the start check
+        # refused) or a contact hold left it limp in the operator's hands. Both
+        # legs are planned by the IK worker in one quick round-trip and then
+        # played locally, so the park still completes if a slow stop's watchdog
         # force-kills the worker mid-move.
-        if playback_stopped and robot.is_connected and not rested:
+        if (
+            playback_stopped
+            and robot.is_connected
+            and arms_moved
+            and not reset_controller.arms_limp
+        ):
             try:
-                _go_to_rest("Replay finished. Returning to rest pose.", final=True)
+                _go_to_rest(
+                    "Replay finished. Parking the arms (rest pose, then zero).",
+                    final=True,
+                )
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 

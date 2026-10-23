@@ -369,6 +369,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
         ),
         settings=(
             SettingDef(
+                key="kinematics.mount",
+                label="Robot model",
+                type="select",
+                options=("classic", "standalone", "ox_cart", "owl"),
+                help=(
+                    "What Axol is mounted on, when Jelly is not attached: "
+                    "classic (the legacy model), standalone (Axol on its "
+                    "own), ox_cart (on the Ox cart's lift) or owl (on the Owl "
+                    "mount). It picks the robot model — the body IK keeps the "
+                    "arms clear of, and what the viewers show. With Jelly "
+                    "attached and on, the robot is Axol on Jelly whatever "
+                    "this says."
+                ),
+                ui={"widget": "mount"},
+                effective_default="classic (legacy)",
+            ),
+            SettingDef(
                 key="axol.left_stiffness",
                 label="Left arm stiffness",
                 type="number",
@@ -718,13 +735,32 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Hold grips to engage",
                 type="boolean",
                 help=(
-                    "Dead-man grip scheme: hold both grips to start driving, "
-                    "and each arm tracks only while its grip stays held — "
-                    "release one and that arm freezes where it is. Off "
-                    "(default) is the toggle scheme: click both grips to "
-                    "engage from rest, then a click on either grip toggles "
-                    "that arm between tracking and frozen."
+                    "Per-arm dead-man grips: each arm moves only while its "
+                    "own grip is held — either grip alone engages its arm, "
+                    "from rest too — and releasing a grip freezes that arm "
+                    "where it is. Off (default) is the toggle scheme: click "
+                    "both grips to engage from rest, then a click on either "
+                    "grip toggles that arm between tracking and frozen."
                 ),
+            ),
+            SettingDef(
+                key="teleop.park_to_zero",
+                label="Park to zero on stop",
+                type="boolean",
+                help=(
+                    "On Stop (or Ctrl+C) the arms return to rest and then "
+                    "continue to the all-zero joint pose — hanging straight "
+                    "down — holding their grasp, before the motors are "
+                    "released, so nothing drops when the torque comes off. "
+                    "Off: the park stops at the rest pose."
+                ),
+                # Also a top-level field of the ops without a teleop subtree.
+                targets={
+                    "teleop": ("teleop.park_to_zero",),
+                    "collect-data": (f"{_VRT}.park_to_zero",),
+                    "run-policy": ("park_to_zero",),
+                    "replay-dataset": ("park_to_zero",),
+                },
             ),
             SettingDef(
                 key="teleop.box_mode",
@@ -963,10 +999,36 @@ SETTINGS: tuple[SettingCategory, ...] = (
         key="kinematics",
         label="Kinematics",
         description=(
-            "IK solver cost weights for teleop and data collection — how the "
-            "arms trade off tracking the hands against posture and limits."
+            "Which IK solver every operation uses, and the JAX solver's cost "
+            "weights for teleop and data collection — how the arms trade off "
+            "tracking the hands against posture and limits."
         ),
         settings=(
+            SettingDef(
+                key="kinematics.backend",
+                label="IK solver",
+                type="select",
+                options=("jax", "mink"),
+                help=(
+                    "jax (default): the Pyroki/JAX solver. mink: the MuJoCo "
+                    "velocity-QP solver used by Cartesian policies — teleop "
+                    "tracking, Cartesian policy actions, and straight-line "
+                    "Cartesian return-to-rest / park paths all switch to it, "
+                    "and LeRobot sessions also run the realtime core's mink "
+                    "tracking profile. The weights below tune JAX only."
+                ),
+                # One switch for both config fields that name the backend.
+                # collect-dagger inherits collect-data's (settings_like).
+                targets={
+                    "teleop": ("kinematics.backend",),
+                    "collect-data": (
+                        f"{_KIN}.backend",
+                        f"{_ROBOT}.cartesian_controller",
+                    ),
+                    "run-policy": (f"{_ROBOT}.cartesian_controller",),
+                    "replay-dataset": (f"{_ROBOT}.cartesian_controller",),
+                },
+            ),
             SettingDef(
                 key="kinematics.pos_weight",
                 label="Position weight",

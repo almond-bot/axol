@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from almond_axol.cli import collect_dagger
@@ -31,7 +32,7 @@ class _RejectedRecorder:
 class DaggerControlCleanupTest(unittest.TestCase):
     def test_capture_rejection_is_episode_local_not_fatal(self) -> None:
         control_loop = _DaggerControlLoop(
-            robot=object(),
+            robot=SimpleNamespace(reset_cartesian_seed=lambda: None),
             policy=object(),
             teleop=object(),
             recorder=_RejectedRecorder(),
@@ -53,7 +54,7 @@ class DaggerControlCleanupTest(unittest.TestCase):
         # real-time class reaches the supervisor instead of quietly collecting
         # an episode of hitched actions.
         control_loop = _DaggerControlLoop(
-            robot=object(),
+            robot=SimpleNamespace(reset_cartesian_seed=lambda: None),
             policy=object(),
             teleop=object(),
             recorder=_RejectedRecorder(),

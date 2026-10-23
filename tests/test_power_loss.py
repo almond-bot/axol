@@ -69,7 +69,7 @@ class _FakeBus:
     that died for any other reason fails every send the same way without it.
     """
 
-    def __init__(self, channel: str) -> None:
+    def __init__(self, channel: str, *, publishes_stall: bool = True) -> None:
         self.channel = channel
         self.closed = False
         self.stalled = False

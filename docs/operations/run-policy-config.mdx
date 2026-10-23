@@ -81,6 +81,7 @@ A contact stop trips when a joint's torque is higher than the gravity model expe
 | `--reset_torque_threshold` | `6.0` | Contact stop during return-to-rest (Nm). `0` disables. |
 | `--policy_torque_threshold` | `0` (off) | Contact stop while the policy drives (Nm). A trip aborts the episode. The control panel arms it at `16`. |
 | `--reset_gravity_comp_kd` | `0.25` | Damping (Nm·s/rad) of the limp hold. |
+| `--park_to_zero` | `true` | Park rest, then zero (holding the grasp) before the motors are released. `false` stops at rest. |
 
 ## Robot {#robot-config}
 

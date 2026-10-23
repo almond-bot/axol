@@ -231,6 +231,34 @@ Guarded return stays on the same core: `torque_residuals` and
 streams its tuples through the same command sink — the contact watchdog,
 the limp contact hold, and the replanned reset all run against the core.
 
+### Mink tracking profile
+
+`Axol(tracking_profile="mink")` emits the strict optional config line
+`tracking_profile mink`. The last received joint target goes directly to the
+Rust trapezoid, each step uses measured tick spacing, and command
+velocity/acceleration derivatives continue across overruns. On an overrun the
+tracker step is capped at two control periods
+(`filter::MINK_MAX_OVERRUN_PERIODS`): the trapezoid is only well-behaved for
+small steps, and an uncapped 60 ms gap let it snap to the target and overshoot
+it. The default profile instead advances one nominal period on an overrun.
+Target holdover and the default profile's overrun derivative re-seeding are
+disabled. Mink
+supplies joint targets without a Python trapezoid ahead of this core.
+
+Both profiles use the same target validation, watchdog, timing/feedback health
+gates, and fault handling. Selecting Mink does not change configured joint
+gains. Omitting the directive retains the default profile. The directive arrived
+with config protocol 19, so an older binary refuses the configuration with the
+protocol mismatch (rebuild with `axol rt.install`) before CAN preparation.
+
+`cargo test mink_matches_reference_trace` checks all samples of an independent
+reference trace, including 30 Hz joint targets, 240 Hz reset targets, cadence
+transitions, target gaps, and core overruns. Regenerate it with
+`python tools/gen_mink_trace.py` (CPU only; no CAN access). The generator
+compiles the checked-in scalar equations in `tools/gen_mink_reference.rs`,
+which are independent of the runtime filters and profile selection. It needs
+only Python and `rustc`; no repository history or external checkout is needed.
+
 ### Control-term tracing
 
 `axol teleop --teleop.record NAME` automatically gates this trace to the

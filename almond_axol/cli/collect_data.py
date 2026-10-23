@@ -76,13 +76,13 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..constants import PARK_TIMEOUT_S, Joint
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
     resolution_for_dims,
 )
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..recording import (
@@ -95,9 +95,11 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
+from ..teleop.shutdown import OUTCOME_MESSAGES, abort_on_sigint
 from ..teleop_activity import TeleopActivityMarker
 from ..mantis.quality import EpisodeTrackingQuality, quality_ready
 from ..utils import affinity
@@ -1068,6 +1070,9 @@ class _NullCollectControl:
     def note_returning(self) -> None:
         pass
 
+    def note_parking(self) -> None:
+        pass
+
     def note_rejected(self, reason: str) -> None:
         pass
 
@@ -1233,6 +1238,12 @@ class _QueueCollectControl:
 
     def note_returning(self) -> None:
         self._set("resetting", "Returning to rest…")
+
+    def note_parking(self) -> None:
+        self._set(
+            "parking",
+            "Parking the arms (rest, then zero) before releasing the motors…",
+        )
 
     def note_rejected(self, reason: str) -> None:
         """The take just ended was discarded or failed to save, and why."""
@@ -1563,6 +1574,15 @@ def _run_session(
 
     mantis_mode = isinstance(cfg.robot_config, MantisRobotConfig)
 
+    # Axol and Mantis alike: the robot and the teleop IK worker must name the
+    # same backend (MantisRobotConfig is an AxolRobotConfig).
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
+
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
     # The Mantis always has grippers, so only the real robot propagates.
@@ -1796,6 +1816,10 @@ def _run_session(
 
     try:
         robot.connect()
+        if not mantis_mode:
+            # The teleop's startup move to rest plays unsupervised; refuse it
+            # from far away (a Mantis rig has no arm joints to check).
+            check_start_pose(robot.positions)
         if mantis_mode:
             # Open both grippers all the way (this is also the one-time
             # hard-stop calibration), then drop torque again, so the jaws are
@@ -2856,46 +2880,27 @@ def _run_session(
         finally:
             robot.set_control_trace_active(False)
 
-    async def _park_before_disconnect() -> None:
-        """Teardown return: the post-episode move, bounded and unattended.
+    async def _park_before_disconnect(abort: threading.Event) -> str:
+        """Teardown park: rest, then zero, bounded and unattended.
 
-        The session has already stopped by the time this runs, so a deadline
-        bounds the move and none of the operator hooks are offered: there is
+        The session has already stopped by the time this runs, so each leg
+        is bounded and none of the operator hooks are offered: there is
         nobody left at the headset or the panel to answer a contact hold, so
         a contact trip ends the park at once instead of holding limp until
-        the deadline — the torque-off follows either way.
+        the deadline — the torque-off follows either way. The sequencing is
+        the orchestrator shared with native ``axol teleop``
+        (:mod:`almond_axol.teleop.shutdown`).
         """
-        deadline = time.perf_counter() + PARK_TIMEOUT_S
-        contact = False
-
-        def _on_contact() -> None:
-            nonlocal contact
-            contact = True
-
-        # A both-grips squeeze mid-park would steer the arms off the path.
-        teleop.block_engage()
-        try:
-            if not teleop.is_resetting:
-                teleop.request_reset()
-            await teleop.guarded_return(
-                send_step=_guard_send_step,
-                gravity_step=_guard_gravity_step,
-                torque_residuals=robot.torque_residuals,
-                reset_command_state=robot.reset_command_state,
-                get_positions=lambda: robot.positions,
-                stopped=lambda: contact or time.perf_counter() >= deadline,
-                # The hold's "press reset" prompt has no one to read it here.
-                announce=lambda msg: None if contact else _logger.info(msg),
-                on_contact=_on_contact,
-                move_timeout_s=PARK_TIMEOUT_S,
-            )
-            if contact:
-                _logger.warning(
-                    "return to rest before disconnect stopped on contact; "
-                    "disabling the arms where they are"
-                )
-        finally:
-            teleop.unblock_engage()
+        return await teleop.park_arms(
+            park_to_zero=bool(vrt_cfg.park_to_zero),
+            send_step=_guard_send_step,
+            gravity_step=_guard_gravity_step,
+            torque_residuals=robot.torque_residuals,
+            reset_command_state=robot.reset_command_state,
+            get_positions=lambda: robot.positions,
+            announce=_logger.info,
+            abort=abort.is_set,
+        )
 
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
@@ -3319,42 +3324,58 @@ def _run_session(
         _cleanup("teleop activity marker", activity.stop)
         _cleanup("control trace", lambda: robot.set_control_trace_active(False))
         # Park before the torque comes off: ``disconnect()`` disables the
-        # motors, and arms left raised drop under gravity.
+        # motors, and arms left raised drop under gravity. The park is the
+        # guarded return to rest and then, with ``park_to_zero``, the move
+        # on to all-zero joints with the grasp held (see
+        # almond_axol.teleop.shutdown).
         #
         # Skipped on Mantis (handheld grippers, no arms to park), when the
-        # arms are already at rest, when a limp contact hold left them in the
-        # operator's hands, when the IK worker that plans the move is gone, or
-        # when the bus no longer reports a pose to plan from. A stop that
-        # lands mid-reset finishes that move. The rest states come off the
-        # teleop core here, rather than off an ``IKResetController`` as in
-        # run-policy and collect-dagger, because this flow's rest moves are
-        # planned by the teleop IK worker.
+        # arms are already at rest and the zero leg is off, when a limp
+        # contact hold left them in the operator's hands, when the IK worker
+        # that plans the moves is gone, or when the bus no longer reports a
+        # pose to plan from. A stop that lands mid-reset finishes that move.
+        # The rest states come off the teleop core here, rather than off an
+        # ``IKResetController`` as in run-policy and collect-dagger, because
+        # this flow's rest moves are planned by the teleop IK worker.
         #
-        # Bounded twice: by the deadline the coroutine installs, and by the
-        # hard wait below. Every failure is swallowed, so the disconnect that
-        # follows happens either way and a lost park costs only what was lost
-        # before it existed.
+        # Bounded twice: by the per-leg deadlines the orchestrator installs,
+        # and by the hard wait below. A second Ctrl+C aborts the park (the
+        # handler is main-thread only; under ``axol serve`` the panel has no
+        # Ctrl+C). Every failure is swallowed, so the disconnect that follows
+        # happens either way and a lost park costs only what was lost before
+        # it existed.
         try:
             if (
                 not mantis_mode
-                and (not teleop.at_rest or teleop.is_resetting)
+                and (
+                    bool(vrt_cfg.park_to_zero)
+                    or not teleop.at_rest
+                    or teleop.is_resetting
+                )
                 and not teleop.ik_paused
                 and teleop.ik_worker_alive
                 and arms_reporting(robot)
             ):
-                _logger.info("Returning to rest before disabling the arms.")
+                _logger.info("Parking the arms before disabling them.")
+                control.note_parking()
+                park_abort = threading.Event()
                 park = asyncio.run_coroutine_threadsafe(
-                    _park_before_disconnect(), robot.event_loop
+                    _park_before_disconnect(park_abort), robot.event_loop
                 )
                 try:
-                    park.result(timeout=PARK_TIMEOUT_S + 1.0)
+                    with abort_on_sigint(park_abort):
+                        outcome = park.result(
+                            timeout=PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 1.0
+                        )
+                    if outcome != "done":
+                        _logger.warning("%s", OUTCOME_MESSAGES.get(outcome, outcome))
                 finally:
-                    # A park that overran its own deadline must stop
+                    # A park that overran its own deadlines must stop
                     # commanding before the disconnect below disables the
                     # motors underneath it. A no-op once it has finished.
                     park.cancel()
         except BaseException:
-            _logger.exception("return to rest before disconnect failed")
+            _logger.exception("the park before disconnect failed")
         _cleanup("spring caps", _clear_spring_caps)
         _cleanup("robot disconnect", robot.disconnect)
         _cleanup("teleop disconnect", teleop.disconnect)

@@ -6,6 +6,10 @@ import math
 from dataclasses import dataclass
 
 
+# IK backends: "jax" (Pyroki, the default) and "mink" (MuJoCo velocity QP).
+KINEMATICS_BACKENDS = ("jax", "mink")
+
+
 @dataclass
 class KinematicsConfig:
     """Cost weights and solver parameters for :class:`KinematicsSolver`.
@@ -14,6 +18,12 @@ class KinematicsConfig:
     functions. Higher values make the solver prioritise that term more strongly.
 
     Attributes:
+        backend: IK backend. ``"jax"`` (default) is the Pyroki/JAX solver.
+            ``"mink"`` uses the Cartesian-policy Mink profile for teleop
+            tracking and Cartesian reset paths; its fixed QP costs replace
+            every JAX weight below (elbow hints and the Mantis profile are
+            ignored). Set once for every operation with the control panel's
+            ``kinematics.backend`` setting.
         pos_weight: Weight on end-effector position error.
         ori_weight: Weight on end-effector orientation error.
         elbow_weight: Weight on elbow position hints (position only, no
@@ -166,6 +176,24 @@ class KinematicsConfig:
             at or above shoulder height — fading it out stops garbage swivel
             targets from thrashing the null space exactly where the shoulder
             nears its joint limits.
+        robot_model: Which Axol hardware version to solve for (see
+            :class:`~almond_axol.constants.AxolModel`): ``"classic"``,
+            ``"standalone"``, ``"ox_cart"``, ``"owl"`` or ``"mobile"``.
+            Selects the URDF, and with it the body the arms are kept clear of
+            and the joint limits. ``None`` (the default) infers it: mobile
+            when Jelly is enabled (attached and not switched off), else
+            ``mount``.
+        mount: What Axol is mounted on when Jelly is not enabled — the
+            control panel's model picker: ``"classic"`` (the legacy model),
+            ``"standalone"``, ``"ox_cart"`` or ``"owl"``. ``None`` reads the
+            saved ``kinematics.mount`` (legacy if unset). Ignored while
+            Jelly is enabled: the robot is then the mobile Axol.
+        gripper: The fitted gripper, ``"parallel"`` or ``"parcel"``
+            (``AxolConfig.gripper``, which teleop passes on). The mobile Axol
+            has a URDF per gripper, so it selects the gripper geometry the
+            arms are kept clear of the body with; the classic Axol ignores
+            it. ``None`` (the default) reads ``axol.gripper`` from the shared
+            settings.
     """
 
     pos_weight: float = 50.0
@@ -189,6 +217,19 @@ class KinematicsConfig:
     manip_damping_boost: float = 60.0
     limit_damping_margin: float = 0.12
     elbow_fade_band: float = 0.15
+    robot_model: str | None = None
+    mount: str | None = None
+    gripper: str | None = None
+    backend: str = "jax"
+
+    def __post_init__(self) -> None:
+        # Validate here, not in the IK subprocess, so a typo fails the CLI
+        # parse instead of a worker startup.
+        if self.backend not in KINEMATICS_BACKENDS:
+            raise ValueError(
+                f"kinematics backend must be one of {KINEMATICS_BACKENDS}, "
+                f"got {self.backend!r}"
+            )
 
 
 # Solver values the Mantis profile forces (see
@@ -236,6 +277,11 @@ def apply_mantis_kinematics_profile(config: KinematicsConfig) -> None:
     override is applied only when the field still holds its dataclass
     default, so explicit ``--kinematics.<field>`` flags win over the profile.
     """
+    if config.backend == "mink":
+        # These are JAX solver weights. Mink keeps its policy-compatible
+        # profile; in particular, raising max_joint_delta would move Mink's
+        # QP step bound away from the one policies run with.
+        return
     defaults = KinematicsConfig()
     for name, value in MANTIS_KINEMATICS_OVERRIDES.items():
         if getattr(config, name) == getattr(defaults, name):
