@@ -1290,9 +1290,9 @@ function HelpPanel({
       : boxMode
         ? [
             "[Grip]  Lead / Freeze Pair",
-            "[Stick ←→]  Width",
-            "[Stick ↑↓]  Elbows",
-            "[Stick Click]  Flush / Straight",
+            "[Stick ↑↓]  Width",
+            "[Tap Click]  Flush / Straight",
+            "[Hold Click]  Lift Up",
           ]
         : ["[Grip]  Engage / Freeze Arm", ...(boxAvailable ? ["[Both Clicks]  Box Mode"] : [])]),
   ].join("\n")
@@ -1305,10 +1305,8 @@ function HelpPanel({
           ...(boxMode
             ? [
                 "[Grip]  Lead / Freeze Pair",
-                "[Stick ←→]  Width",
-                "[Stick ↑↓]  Elbows",
-                "[Stick Click]  Flush / Straight",
-                "[Frozen: Sticks]  Drive Jelly",
+                "[Tap Click]  Flush / Straight",
+                "[Hold Click]  Lift Down",
                 "[Both Clicks]  Box Mode",
               ]
             : [
@@ -1862,8 +1860,8 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick", "← → width, ↑ ↓ elbows"],
-                                ["Stick click", "Flush / straight grasp"],
+                                ["Stick tap", "Flush / straight grasp"],
+                                ["Stick hold", "Lower lift"],
                               ] as [string, string][])
                             : ([
                                 ["Grip", "Engage / freeze arm"],
@@ -1896,8 +1894,9 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick", "← → width, ↑ ↓ elbows"],
-                          ["Stick click", "Flush / straight grasp"],
+                          ["Stick", "↑ ↓ grip width"],
+                          ["Stick tap", "Flush / straight grasp"],
+                          ["Stick hold", "Raise lift"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}

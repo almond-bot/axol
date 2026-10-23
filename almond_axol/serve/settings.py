@@ -739,11 +739,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Start sessions in box mode: the grippers clamp the box "
                     "between their sides like two flat hands (level, the "
                     "tool's contact face along the box side) and one grip "
-                    "drives both arms by position and heading — the pair "
-                    "stays level (the other hand's grip hands over the "
-                    "lead). Thumbsticks set the grip width "
-                    "while a grip leads and drive the base once the pair is "
-                    "frozen. Can also be toggled live from the headset menu "
+                    "drives both arms, following the hand's position and "
+                    "full rotation (the other hand's grip hands over the "
+                    "lead). The right stick's forward/back sets the grip "
+                    "width while a grip leads; the rest of the sticks drive "
+                    "the base and lift as usual. Can also be toggled live "
+                    "from the headset menu "
                     "or both thumbstick clicks; switching engages at once."
                 ),
                 targets={

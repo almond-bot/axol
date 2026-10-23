@@ -59,8 +59,8 @@ async with VRServer() as vr:
 | `l_pose_space` / `r_pose_space` | `"grip" \| "target-ray" \| None` | Datum used for each Quest pose. Production Mantis requires the calibrated `gripSpace`; `target-ray` is compatibility bring-up only. |
 | `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick axes (right = +1; pushed forward = -1). Drive [Jelly](/guides/vr-interface#jelly)'s translation when one is configured |
 | `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right = +1). Drives Jelly's rotation |
-| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (pushed forward = -1). Only read in [box mode](/guides/vr-interface#box-mode) (forward/back moves the elbows, `box_elbow_out`); Jelly ignores it |
-| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers Jelly's lift, right raises it; while a box-mode leader is engaged a single click-and-release of either stick toggles the grasp (`box_grasp`: flush face / fingers straight; the sticks themselves set grip width and tilt, no modifiers); with the pair frozen the sticks drive Jelly as usual. Both pressed together (within ~0.35 s) toggle [box mode](/guides/vr-interface#box-mode) (the headset sends the `set` message below). Neutral defaults keep older web builds (which omit these fields) compatible |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (pushed forward = -1). Only read in [box mode](/guides/vr-interface#box-mode), while a grip leads the pair: forward/back sets the grip width (forward = wider); Jelly ignores it |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers Jelly's lift, right raises it. In box mode a click is split by how long it's held: a tap (released within ~0.3 s, the other stick up) switches the grasp while a grip leads, and only a hold past that runs the lift. Both pressed together (within ~0.35 s) toggle [box mode](/guides/vr-interface#box-mode) (the headset sends the `set` message below). Neutral defaults keep older web builds (which omit these fields) compatible |
 | `box_leader` | `"left" \| "right" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: which controller currently leads the pair in box mode |
 | `reengage` | `"clutch" \| "ramp" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: the session's effective [re-engage behaviour](/guides/vr-interface#re-engaging). Session modes are switched out of band with the `set` message, not through frames |
 
@@ -95,7 +95,7 @@ The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, 
 | Key | Type | Applies |
 |-----|------|---------|
 | `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
-| `box_grasp` | `"straight"` / `"flush"` | fingers straight forward (the default) vs. the tool's contact face along the box side; a live pair blends over to it. Also toggled by a stick click, which the worker reports back so the value stays in sync |
+| `box_grasp` | `"straight"` / `"flush"` | fingers straight forward (the default) vs. the tool's contact face along the box side; a live pair blends over to it |
 | `box_flush_deg` | number, ° | how far the angled (`flush`) grasp turns each gripper inward from the parallel grasp, about the parcel plate's front edge (39°); read at the next engage or grasp switch |
 | `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
 | `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
