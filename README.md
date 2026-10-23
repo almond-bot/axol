@@ -163,7 +163,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
 - [`can.driver`](https://docs.almond.bot/cli/can-driver)
 - [`hub.info`](https://docs.almond.bot/cli/hub-info)
-- [`hub.flash`](https://docs.almond.bot/cli/hub-flash) — arm hub firmware (updated automatically on bring-up)
+- [`hub.flash`](https://docs.almond.bot/cli/hub-flash) — arm and Mantis hub firmware (the arm hub updates automatically on bring-up)
 - [`lift.home`](https://docs.almond.bot/cli/lift-home)
 - [`lift.goto`](https://docs.almond.bot/cli/lift-goto)
 - [`lift.update`](https://docs.almond.bot/cli/lift-update)
