@@ -126,6 +126,10 @@ _BOX_EXIT_MARGIN_S = 0.25
 # a frame gap under load; far shorter than the walk from the panel to the
 # headset.
 _AUTO_ENGAGE_WINDOW_S = 1.0
+# Rigid mode holds the gripper strokes; after it, a trigger takes its gripper
+# back only once it comes within this much (normalized stroke) of the held
+# value or crosses it, so a relaxed trigger can't drop what the pair held.
+_GRIP_CATCH_TOL = 0.05
 # Largest gap (rad, any arm joint) a shutdown park accepts between the planned
 # zero-leg trajectory's ends and the pose it was planned from / its goal. A
 # plan outside it is refused rather than played (``_check_park_plan``).
@@ -467,7 +471,9 @@ class VRTeleopCore:
         # switched by :meth:`set_box_mode`); ``_box_leader`` is the leading
         # side while engaged in that mode. Mutated on the IK thread like the
         # engage state. Only the parcel gripper has box mode
-        # (:attr:`box_available`).
+        # (:attr:`box_available`); every other gripper gets rigid mode
+        # instead (:attr:`rigid_available`), the same mode with the pair
+        # locked as it is — ``box_mode`` is the flag for both.
         if config.box_mode and not self.box_available:
             logger.warning(
                 "Box mode needs the parcel gripper (gripper=%r); starting with it off",
@@ -482,6 +488,11 @@ class VRTeleopCore:
         # base command. Set when the lead drops, cleared by the first neutral
         # frame; see :attr:`pair_owns_sticks`.
         self._box_sticks_held: bool = False
+        # Gripper strokes rigid mode held, per side, as ``[held, sign]``:
+        # after the mode the trigger takes the gripper back only once it
+        # reaches the held stroke (see :meth:`_track_grip`); ``sign`` is
+        # which side of it the trigger started on (None until first seen).
+        self._grip_hold: dict[str, list] = {}
 
         # Re-engage behaviour ("clutch": the controller matches the arm,
         # "ramp": the arm ramps out to the controller — see
@@ -850,6 +861,35 @@ class VRTeleopCore:
         (``VRTeleopConfig.gripper``)."""
         return self.config.gripper == "parcel"
 
+    @property
+    def rigid_available(self) -> bool:
+        """Whether this session has rigid mode: every gripper but the parcel
+        gripper (which has box mode instead, :attr:`box_available`).
+
+        Rigid mode is the stock gripper's pair mode: one controller moves
+        both arms as one rigid body — position and full orientation — with
+        the grippers kept where the operator put them relative to each other
+        and their strokes held. It shares box mode's engage rules (one grip
+        leads, the other takes over, the sticks jog the elbows while leading
+        and drive Jelly once frozen) and its state (:attr:`box_mode`).
+        """
+        return not self.box_available
+
+    @property
+    def pair_name(self) -> str:
+        """``"box"`` or ``"rigid"``: what the pair mode is called in this session."""
+        return "box" if self.box_available else "rigid"
+
+    def set_rigid_mode(self, enabled: bool) -> None:
+        """Switch rigid mode on/off (headset HUD / control panel / SDK); see
+        :meth:`set_box_mode`, whose state it shares.
+
+        Raises:
+            ValueError: Switching it on with the parcel gripper (which has
+                box mode instead, :attr:`rigid_available`).
+        """
+        self.set_live("rigid_mode", bool(enabled))
+
     def set_box_mode(self, enabled: bool) -> None:
         """Switch box mode on/off (headset HUD / control panel / SDK). Safe
         from any thread.
@@ -906,7 +946,8 @@ class VRTeleopCore:
     def set_live(self, key: str, value: object) -> None:
         """Queue a live change to a session mode or config field.
 
-        ``key`` is ``"box_mode"``, ``"reengage"``, or one of the
+        ``key`` is ``"box_mode"``, ``"rigid_mode"`` (the same mode under
+        the stock gripper's name), ``"reengage"``, or one of the
         :class:`VRTeleopConfig` fields in ``_LIVE_CORE_FIELDS`` /
         ``_LIVE_WORKER_FIELDS``. Safe from any thread; applied on the IK
         thread before the next frame (see :meth:`_apply_live_requests`).
@@ -914,20 +955,28 @@ class VRTeleopCore:
         field; switching box mode on without the parcel gripper raises
         ``ValueError``.
         """
-        if key not in ("box_mode", "reengage") and not (
+        if key not in ("box_mode", "rigid_mode", "reengage") and not (
             key in self._LIVE_CORE_FIELDS or key in self._LIVE_WORKER_FIELDS
         ):
             raise KeyError(f"{key!r} is not a live-adjustable teleop setting")
         if key == "box_mode" and value and not self.box_available:
             raise ValueError(
-                f"box mode needs the parcel gripper (gripper={self.config.gripper!r})"
+                f"box mode needs the parcel gripper (gripper={self.config.gripper!r}); "
+                "this gripper has rigid mode"
             )
+        if key == "rigid_mode":
+            if value and not self.rigid_available:
+                raise ValueError(
+                    "rigid mode is for the stock gripper; the parcel gripper "
+                    "has box mode"
+                )
+            key = "box_mode"
         with self._live_lock:
             self._live_requests[key] = value
 
     def live_value(self, key: str) -> object:
         """Current value of a live setting (see :meth:`set_live`)."""
-        if key == "box_mode":
+        if key in ("box_mode", "rigid_mode"):
             return self.box_mode
         if key == "reengage":
             return self.reengage
@@ -1102,7 +1151,9 @@ class VRTeleopCore:
         (``set_spring_caps``); the caps ride the next command to the
         realtime core. Cheap and pure — safe to call every cycle.
         """
-        if not self.box_mode or self.is_resetting:
+        if not self.box_mode or self.is_resetting or not self.box_available:
+            # Rigid mode holds whatever the pair carries at any orientation:
+            # its joints keep their full authority.
             return None
         caps: dict[Joint, float] = {}
         wrist = float(self.config.box_wrist_torque)
@@ -1216,9 +1267,22 @@ class VRTeleopCore:
         if self.teleop_enabled:
             self._disengage_all("Teleop disabled (mode switch)")
         self.box_mode = want
-        self._logger.info(
-            "Box mode %s", "on: one grip engages both arms" if want else "off"
-        )
+        if self.box_available:
+            self._logger.info(
+                "Box mode %s", "on: one grip engages both arms" if want else "off"
+            )
+        else:
+            self._logger.info(
+                "Rigid mode %s",
+                "on: one grip moves both arms as one rigid pair" if want else "off",
+            )
+            if not want:
+                # The triggers take the grippers back only once they reach
+                # the strokes the pair held (see _track_grip).
+                self._grip_hold = {
+                    "left": [self.l_grip, None],
+                    "right": [self.r_grip, None],
+                }
         if engage:
             self._auto_engage_until = time.perf_counter() + _AUTO_ENGAGE_WINDOW_S
 
@@ -1258,10 +1322,14 @@ class VRTeleopCore:
             self._box_leader = leader
             self._box_sticks_held = False
             self._logger.info(
-                "Teleop enabled (box mode, %s hand leads — switched on)", leader
+                "Teleop enabled (%s mode, %s hand leads — switched on)",
+                self.pair_name,
+                leader,
             )
         else:
-            self._logger.info("Teleop enabled (both arms — box mode switched off)")
+            self._logger.info(
+                "Teleop enabled (both arms — %s mode switched off)", self.pair_name
+            )
         self.left_enabled = True
         self.right_enabled = True
         self._require_both_engage = False
@@ -1298,7 +1366,7 @@ class VRTeleopCore:
             return False
         cfg = self.config
         grasp = str(getattr(cfg, "box_grasp", "straight")).strip().lower()
-        if grasp != "flush" or not self.teleop_enabled:
+        if grasp != "flush" or not self.teleop_enabled or not self.box_available:
             return False
         self._box_exit_deadline = (
             time.perf_counter()
@@ -1460,9 +1528,33 @@ class VRTeleopCore:
         # Only track a gripper while its arm is engaged, so a frozen arm's
         # grasp (and a disengaged session) can't be actuated by the trigger.
         if self.left_enabled:
-            self.l_grip = frame.l_grip
+            self.l_grip = self._track_grip("left", float(frame.l_grip), self.l_grip)
         if self.right_enabled:
-            self.r_grip = frame.r_grip
+            self.r_grip = self._track_grip("right", float(frame.r_grip), self.r_grip)
+
+    def _track_grip(self, side: str, trigger: float, current: float) -> float:
+        """The gripper command for an engaged arm's ``trigger`` (IK thread).
+
+        Normally the trigger itself. After rigid mode held a side's stroke
+        (``_grip_hold``) the gripper stays at ``current`` until the trigger
+        comes within ``_GRIP_CATCH_TOL`` of it or crosses it — an operator
+        who relaxed the trigger while the pair held an object squeezes back
+        to take the gripper over instead of dropping the object the moment
+        rigid mode ends.
+        """
+        hold = self._grip_hold.get(side)
+        if hold is None:
+            return trigger
+        held, sign = hold
+        diff = trigger - float(held)
+        now_sign = 1 if diff > 0.0 else -1
+        if sign is None:
+            hold[1] = sign = now_sign
+        if abs(diff) <= _GRIP_CATCH_TOL or now_sign != sign:
+            self._grip_hold.pop(side, None)
+            self._logger.info("%s trigger has the gripper back", side.capitalize())
+            return trigger
+        return current
 
     def _ack_lock_release(self, frame: object, l_lock: bool, r_lock: bool) -> None:
         """Acknowledge a managed tracker bridge's lock-release request.
@@ -1492,8 +1584,10 @@ class VRTeleopCore:
         lead over to that hand (the pair stays where it is). Dead-man scheme
         (``config.hold_to_engage``): the pair tracks while any grip is held,
         led by the held hand (a hand-over happens when the leader lets go
-        while the other still holds). Each gripper follows its own
-        controller's trigger while the pair is engaged, whichever hand leads.
+        while the other still holds). In box mode each gripper follows its
+        own controller's trigger while the pair is engaged, whichever hand
+        leads; in rigid mode (:attr:`rigid_available`) both strokes stay
+        where they were when the mode came on.
 
         The thumbsticks set the grip width while someone leads and
         drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
@@ -1545,11 +1639,13 @@ class VRTeleopCore:
         self._require_both_engage = False
 
         if enabled and not was_enabled:
-            self._logger.info("Teleop enabled (box mode, %s hand leads)", leader)
+            self._logger.info(
+                "Teleop enabled (%s mode, %s hand leads)", self.pair_name, leader
+            )
             self._broadcast(True)
             self._start_engage_ramp()
         elif was_enabled and not enabled:
-            self._logger.info("Teleop disabled (box pair frozen)")
+            self._logger.info("Teleop disabled (%s pair frozen)", self.pair_name)
             self._broadcast(False)
             # Hand the sticks to Jelly only once they've been released.
             self._box_sticks_held = not _sticks_neutral(frame)
@@ -1558,9 +1654,10 @@ class VRTeleopCore:
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
 
-        if enabled:
+        if enabled and self.box_available:
             self.l_grip = float(frame.l_grip)
             self.r_grip = float(frame.r_grip)
+        # Rigid mode holds both strokes where the operator set them.
 
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
@@ -1827,6 +1924,7 @@ class VRTeleopCore:
                 self._hold_target(q.copy())
                 self.l_grip = l_grip
                 self.r_grip = r_grip
+                self._grip_hold = {}
                 self._at_rest = True
                 seed_l = np.append(q[self.left_indices], l_grip)
                 seed_r = np.append(q[self.right_indices], r_grip)
@@ -2399,7 +2497,12 @@ class VRTeleopCore:
                     for key, value in self._worker_updates:
                         conn.send(("set", key, value))
                     self._worker_updates = []
-                if get_measured is not None and self.box_mode and self.teleop_enabled:
+                if (
+                    get_measured is not None
+                    and self.box_mode
+                    and self.box_available
+                    and self.teleop_enabled
+                ):
                     try:
                         measured = get_measured()
                     except Exception:  # noqa: BLE001 - never stall the solve

@@ -110,7 +110,10 @@ export type AxolSettingDef = {
  * server-side against the value the server holds. The value set includes at
  * least `reengage` (`AxolReengage`); `box_mode` (boolean) and the other
  * `box_*` keys only when the robot has the parcel gripper (box mode exists
- * only there).
+ * only there). With any other gripper the pair mode is `rigid_mode`
+ * (boolean) instead — the grippers locked together as they are, one
+ * controller moving them in all six degrees of freedom — published with
+ * the `box_*` keys it shares (`box_lead_hand`, `box_elbow_out`).
  */
 export type AxolSettings = {
   schema: AxolSettingDef[]

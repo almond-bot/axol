@@ -169,10 +169,21 @@ class VRTeleopConfig:
             here that disagrees with the robot's is overridden with a
             warning. Box mode exists only with ``"parcel"``, the parcel
             gripper: with ``"parallel"`` (the stock two-finger gripper, and
-            what ``None`` means with no robot to follow) every
-            box-mode setting is hidden from the headset and the control
+            what ``None`` means with no robot to follow) the box-only
+            settings are hidden from the headset and the control
             panel, ``box_mode`` is forced off and :meth:`VRTeleopCore.set_box_mode`
-            refuses to switch it on. The parcel gripper has a fixed blade
+            refuses to switch it on. That gripper has **rigid mode**
+            instead (``rigid_mode`` live, :meth:`VRTeleopCore.set_rigid_mode`,
+            the headset's **Rigid** button or both thumbstick clicks): the
+            operator sets each gripper's pose and stroke in ordinary teleop,
+            and switching it on locks the two together exactly as they are
+            — no alignment — while one controller moves the pair as a
+            rigid body in all six degrees of freedom, turning it about its
+            centre. The strokes are held (after the mode each trigger takes
+            its gripper back once squeezed to the held stroke), the
+            thumbsticks only jog the elbows (``box_elbow_out``), and box
+            mode's spring caps don't apply. It shares box mode's engage
+            rules and ``box_lead_hand``. The parcel gripper has a fixed blade
             across the mount axis from the box and a hinged plate that folds
             back along the wrist on the box side at its open stop; box mode
             places its contact geometry

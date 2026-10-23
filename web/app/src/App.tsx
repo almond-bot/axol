@@ -46,6 +46,14 @@ import { SuggestInput } from "@/components/suggest-input"
 import { authorizeCert } from "@/lib/cert-accept"
 import { VR_HOST_HISTORY_STORAGE, loadHostHistory, recordHost } from "@/lib/host-history"
 import { hostCertAuthorizeVisible, usbCertOrigin } from "@/lib/usb-transport"
+import {
+  type PairKind,
+  pairHints,
+  pairKey,
+  pairKind as pairKindOf,
+  pairLabel,
+  pairModeOn,
+} from "@/lib/pair-mode"
 import { cn } from "@/lib/utils"
 
 // Pin drei's <Text> (troika) to a locally-bundled font. By default troika
@@ -1049,29 +1057,36 @@ function ToolsRow({
   trim: number
   onOpenSettings: () => void
 }) {
-  // The server only offers box mode with the parcel gripper.
-  const boxMode =
-    settings && "box_mode" in settings.values ? settings.values.box_mode === true : null
+  // The server offers box mode with the parcel gripper, rigid mode with
+  // any other (see lib/pair-mode).
+  const kind = pairKindOf(settings)
+  const pairOn = kind !== null ? pairModeOn(settings) : null
   const reengage = settings ? String(settings.values.reengage ?? "") : null
-  const boxDetail = [grasp, squeeze > 0 ? `${squeeze} N` : "", trim !== 0 ? `${trim}° in` : ""]
-    .filter(Boolean)
-    .join(", ")
-  const boxLabel = boxMode
-    ? `Box: ON${boxDetail ? ` (${boxDetail})` : ""}`
-    : aligned
-      ? "Box: OFF (aligned)"
-      : "Box: OFF"
+  // Rigid mode has no grasp, clamp or alignment to show.
+  const boxDetail =
+    kind === "box"
+      ? [grasp, squeeze > 0 ? `${squeeze} N` : "", trim !== 0 ? `${trim}° in` : ""]
+          .filter(Boolean)
+          .join(", ")
+      : ""
+  const showAligned = kind === "box" && aligned
+  const name = kind !== null ? pairLabel(kind) : ""
+  const pairButtonLabel = pairOn
+    ? `${name}: ON${boxDetail ? ` (${boxDetail})` : ""}`
+    : showAligned
+      ? `${name}: OFF (aligned)`
+      : `${name}: OFF`
   return (
     <>
-      {boxMode !== null && (
+      {kind !== null && pairOn !== null && (
         <HudButton
           x={-0.16}
-          label={boxLabel}
-          active={boxMode}
-          accent={!boxMode && aligned ? "#38bdf8" : undefined}
+          label={pairButtonLabel}
+          active={pairOn}
+          accent={!pairOn && showAligned ? "#38bdf8" : undefined}
           // "toggle" flips server-side, so a stale local copy can't send the
           // wrong value (same as the both-sticks gesture).
-          onClick={() => onSet("box_mode", "toggle")}
+          onClick={() => onSet(pairKey(kind), "toggle")}
         />
       )}
       {reengage !== null && reengage !== "" && (
@@ -1260,16 +1275,17 @@ function HudTools({
 function HelpPanel({
   onDismiss,
   mode,
-  boxMode,
-  boxAvailable,
+  pairMode,
+  pairKind,
   rampAvailable,
   settingsAvailable,
   poseSourceKind,
 }: {
   onDismiss: () => void
   mode: AxolMode | null
-  boxMode: boolean
-  boxAvailable: boolean
+  pairMode: boolean
+  // Box (parcel gripper) or rigid (any other); null: no pair mode offered.
+  pairKind: PairKind | null
   // The tools-row buttons exist only once the server announces its settings.
   rampAvailable: boolean
   settingsAvailable: boolean
@@ -1279,22 +1295,23 @@ function HelpPanel({
   const H = 0.175
   const col = 0.11
   const viewOnly = poseSourceKind === "tracker"
+  const pairToggle = pairKind ? [`[Both Clicks]  ${pairLabel(pairKind)} Mode`] : []
+  const pairRows =
+    pairKind === "box"
+      ? [
+          "[Grip]  Lead / Freeze Pair",
+          "[Stick ←→]  Width",
+          "[Stick ↑↓]  Elbows",
+          "[Stick Click]  Flush / Straight",
+        ]
+      : ["[Grip]  Lead / Freeze Pair", "[Stick ↑↓]  Elbows"]
   // Recording only exists in data collection; teleop drops the [A] hint.
   const rightRows = [
     ...(mode === "teleop" || viewOnly ? [] : ["[A]  Start / Stop Rec"]),
     "[Trigger]  Move Screen",
     "[2x Trigger]  Resize",
     "[B]  Reset Screens",
-    ...(viewOnly
-      ? []
-      : boxMode
-        ? [
-            "[Grip]  Lead / Freeze Pair",
-            "[Stick ←→]  Width",
-            "[Stick ↑↓]  Elbows",
-            "[Stick Click]  Flush / Straight",
-          ]
-        : ["[Grip]  Engage / Freeze Arm", ...(boxAvailable ? ["[Both Clicks]  Box Mode"] : [])]),
+    ...(viewOnly ? [] : pairMode ? pairRows : ["[Grip]  Engage / Freeze Arm", ...pairToggle]),
   ].join("\n")
   const leftRows = [
     "[Y]  Exit VR",
@@ -1302,15 +1319,8 @@ function HelpPanel({
       ? ["[Tracker]  Robot Control"]
       : [
           "[X]  Reset Pose",
-          ...(boxMode
-            ? [
-                "[Grip]  Lead / Freeze Pair",
-                "[Stick ←→]  Width",
-                "[Stick ↑↓]  Elbows",
-                "[Stick Click]  Flush / Straight",
-                "[Frozen: Sticks]  Drive Jelly",
-                "[Both Clicks]  Box Mode",
-              ]
+          ...(pairMode
+            ? [...pairRows, "[Frozen: Sticks]  Drive Jelly", ...pairToggle]
             : [
                 "[Grip]  Engage / Freeze Arm",
                 ...(rampAvailable ? ["[Ramp]  Arm Comes To Hand"] : []),
@@ -1400,15 +1410,15 @@ function HelpPanel({
 
 function HelpIcon({
   mode,
-  boxMode,
-  boxAvailable,
+  pairMode,
+  pairKind,
   rampAvailable,
   settingsAvailable,
   poseSourceKind,
 }: {
   mode: AxolMode | null
-  boxMode: boolean
-  boxAvailable: boolean
+  pairMode: boolean
+  pairKind: PairKind | null
   rampAvailable: boolean
   settingsAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
@@ -1434,8 +1444,8 @@ function HelpIcon({
         <HelpPanel
           onDismiss={() => setOpen(false)}
           mode={mode}
-          boxMode={boxMode}
-          boxAvailable={boxAvailable}
+          pairMode={pairMode}
+          pairKind={pairKind}
           rampAvailable={rampAvailable}
           settingsAvailable={settingsAvailable}
           poseSourceKind={poseSourceKind}
@@ -1630,9 +1640,9 @@ export default function App() {
     setSetting,
     step: stepSetting,
   } = useAxolSettings(wsRef, status === AxolConnectionStatus.Open)
-  const boxMode = settings?.values.box_mode === true
-  // Offered by the server only with the parcel gripper.
-  const boxAvailable = settings != null && "box_mode" in settings.values
+  // The pair mode the server offers: box (parcel gripper) or rigid (any other).
+  const pairKind = pairKindOf(settings)
+  const pairMode = pairModeOn(settings)
   const reengage = settings ? String(settings.values.reengage ?? "") : null
   const [xrError, setXrError] = useState<string | null>(null)
 
@@ -1729,8 +1739,9 @@ export default function App() {
   }, [settings])
   const handleBothStickClick = () => {
     const cur = settingsRef.current
-    if (!cur || !("box_mode" in cur.values)) return
-    setSetting("box_mode", "toggle")
+    const kind = pairKindOf(cur)
+    if (!kind) return
+    setSetting(pairKey(kind), "toggle")
   }
 
   return (
@@ -1859,12 +1870,8 @@ export default function App() {
                       : [
                           ["Y", "Exit VR"],
                           ["X", "Reset pose"],
-                          ...(boxMode
-                            ? ([
-                                ["Grip", "Lead both arms"],
-                                ["Stick", "← → width, ↑ ↓ elbows"],
-                                ["Stick click", "Flush / straight grasp"],
-                              ] as [string, string][])
+                          ...(pairMode && pairKind
+                            ? pairHints(pairKind)
                             : ([
                                 ["Grip", "Engage / freeze arm"],
                                 ...(reengage
@@ -1878,8 +1885,13 @@ export default function App() {
                                     ] as [string, string][])
                                   : []),
                               ] as [string, string][])),
-                          ...(boxAvailable
-                            ? ([["Both stick clicks", "Toggle box mode"]] as [string, string][])
+                          ...(pairKind
+                            ? ([
+                                [
+                                  "Both stick clicks",
+                                  `Toggle ${pairLabel(pairKind).toLowerCase()} mode`,
+                                ],
+                              ] as [string, string][])
                             : []),
                         ]
                   }
@@ -1893,12 +1905,8 @@ export default function App() {
                     ["Trigger", "Move screen"],
                     ["2× Trigger", "Resize screen"],
                     ["B", "Reset screens"],
-                    ...(boxMode
-                      ? ([
-                          ["Grip", "Lead both arms"],
-                          ["Stick", "← → width, ↑ ↓ elbows"],
-                          ["Stick click", "Flush / straight grasp"],
-                        ] as [string, string][])
+                    ...(pairMode && pairKind
+                      ? pairHints(pairKind)
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}
                 />
@@ -1959,8 +1967,8 @@ export default function App() {
               <ExitButton />
               <HelpIcon
                 mode={vrMode}
-                boxMode={boxMode}
-                boxAvailable={boxAvailable}
+                pairMode={pairMode}
+                pairKind={pairKind}
                 rampAvailable={!!reengage}
                 settingsAvailable={settings != null}
                 poseSourceKind={poseSourceKind}

@@ -1,9 +1,10 @@
-"""Box mode exists only with the parcel gripper.
+"""Box mode exists only with the parcel gripper; the stock one has rigid mode.
 
 ``AxolConfig.gripper`` (adopted into ``VRTeleopConfig.gripper`` by the CLIs
 and ``VRTeleop``) selects the fitted gripper. With the stock parallel gripper
-the whole of box mode is absent: the core refuses it, the live settings drop every ``box_*``
-key, and the control panel hides its box settings.
+box mode is absent — the core refuses it, the live settings drop every
+box-only ``box_*`` key, and the control panel hides its box settings — and
+rigid mode takes its place, sharing the lead hand and elbows-out knobs.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from almond_axol.teleop.live import LIVE_SETTINGS, LiveSettings
 from almond_axol.vr.config import VRServerConfig
 
 _BOX_KEYS = {d.key for d in LIVE_SETTINGS if d.key.startswith("box_")}
+# The box_* knobs rigid mode uses too.
+_PAIR_KEYS = {"box_lead_hand", "box_elbow_out"}
 
 
 def _core(**overrides) -> VRTeleopCore:
@@ -51,6 +54,18 @@ class CoreGateTest(unittest.TestCase):
             core.set_box_mode(True)
         core.set_box_mode(False)
         _core(gripper="parcel").set_box_mode(True)
+
+    def test_rigid_mode_is_the_stock_grippers_pair_mode(self) -> None:
+        core = _core(gripper="parallel")
+        self.assertTrue(core.rigid_available)
+        self.assertEqual(core.pair_name, "rigid")
+        core.set_rigid_mode(True)  # queued, applied at the next frame
+        self.assertTrue(_core().rigid_available)  # None = parallel
+        parcel = _core(gripper="parcel")
+        self.assertFalse(parcel.rigid_available)
+        self.assertEqual(parcel.pair_name, "box")
+        with self.assertRaisesRegex(ValueError, "box mode"):
+            parcel.set_rigid_mode(True)
 
 
 class AdoptRobotGripperTest(unittest.TestCase):
@@ -94,18 +109,25 @@ class LiveGateTest(unittest.TestCase):
     def _live(self, gripper: str) -> LiveSettings:
         return LiveSettings(_core(gripper=gripper), object(), lambda _s: None)
 
-    def test_parallel_publishes_no_box_settings(self) -> None:
+    def test_parallel_publishes_rigid_mode_and_no_box_only_settings(self) -> None:
         live = self._live("parallel")
         keys = {d["key"] for d in live.schema()}
-        self.assertFalse(keys & _BOX_KEYS)
-        self.assertFalse(set(live.values()) & _BOX_KEYS)
+        self.assertEqual(keys & _BOX_KEYS, _PAIR_KEYS)
+        self.assertEqual(set(live.values()) & _BOX_KEYS, _PAIR_KEYS)
+        self.assertIn("rigid_mode", keys)
+        self.assertIs(live.values()["rigid_mode"], False)
         self.assertIn("reengage", keys)
         with self.assertRaises(ValueError):
             live.apply("box_mode", "toggle")
+        live.apply("rigid_mode", "toggle")  # queued on the core
 
     def test_parcel_publishes_box_mode(self) -> None:
-        keys = {d["key"] for d in self._live("parcel").schema()}
+        live = self._live("parcel")
+        keys = {d["key"] for d in live.schema()}
         self.assertTrue({"box_mode", "box_grasp", "box_flush_deg"} <= keys)
+        self.assertNotIn("rigid_mode", keys)
+        with self.assertRaises(ValueError):
+            live.apply("rigid_mode", "toggle")
 
     def test_box_tool_is_gone(self) -> None:
         self.assertNotIn("box_tool", {d.key for d in LIVE_SETTINGS})
@@ -127,6 +149,10 @@ class PanelGateTest(unittest.TestCase):
         ]
         self.assertTrue(box)
         for s in box:
+            if s.key in serve_settings._PAIR_SETTINGS:
+                # Shared with rigid mode: shown whichever gripper is fitted.
+                self.assertNotIn("showWhen", s.ui, s.key)
+                continue
             self.assertEqual(
                 s.ui.get("showWhen"),
                 {"key": "axol.gripper", "equals": "parcel"},
