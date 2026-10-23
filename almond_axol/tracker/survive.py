@@ -52,7 +52,7 @@ from .base import (
 from .diagnostics import FaultDiagnosticRecorder
 from .lighthouse_survey import LighthouseSurvey
 from .quality import LighthouseQuality, rotation_distance
-from .survive_config import parse_survive_config
+from .survive_config import native_seed, parse_survive_config
 
 _logger = logging.getLogger(__name__)
 
@@ -1459,9 +1459,16 @@ class SurviveSource(TrackerSource):
                     "Saved Lighthouse calibration is missing. Run Recalibrate Lighthouse "
                     "before validation or recording."
                 ) from None
-            contents = b"{}\n"
+            contents = None
         try:
-            config = parse_survive_config(contents.decode("utf-8"))
+            if self._force_calibrate or self._setup_discovery:
+                # Setup may start without a calibration (see native_seed).
+                contents = native_seed(contents)
+            config = (
+                parse_survive_config(contents.decode("utf-8"))
+                if contents is not None and contents.strip()
+                else {}
+            )
             if not isinstance(config, dict):
                 raise ValueError("Expected a native configuration object")
             if not (self._force_calibrate or self._setup_discovery):

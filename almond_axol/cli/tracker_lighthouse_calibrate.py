@@ -31,7 +31,7 @@ from ..tracker.lighthouse_validation import (
     validation_fingerprint,
     validation_snapshot,
 )
-from ..tracker.survive_config import parse_survive_config
+from ..tracker.survive_config import native_seed, parse_survive_config
 from ..utils.state_files import (
     secure_atomic_write_bytes,
     secure_open_new_text,
@@ -452,9 +452,7 @@ def run(args: argparse.Namespace) -> None:
             prefix=".axol-check-", dir=native_path.parent
         ) as directory:
             candidate = Path(directory) / "config.json"
-            secure_atomic_write_bytes(
-                candidate, original if original is not None else b"{}\n"
-            )
+            secure_atomic_write_bytes(candidate, native_seed(original))
             source = SurviveSource(
                 force_calibrate=args.recalibrate,
                 config_path=candidate,

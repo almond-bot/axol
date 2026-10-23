@@ -70,3 +70,17 @@ def parse_survive_config(text: str) -> dict[str, Any]:
             if position == len(text):
                 raise ValueError("Native configuration ends with a comma")
     return _unique_members(members)
+
+
+def native_seed(contents: bytes | None) -> bytes:
+    """The bytes to start a native run from, given a saved configuration.
+
+    survive-cli segfaults on a file holding only an empty object (``{}``), while
+    an empty file starts it from scratch exactly like a missing one. Seed a
+    fresh calibration with no content instead.
+    """
+    if contents is None or not contents.strip():
+        return b""
+    if parse_survive_config(contents.decode("utf-8")) == {}:
+        return b""
+    return contents

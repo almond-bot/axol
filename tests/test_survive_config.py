@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from almond_axol.tracker.survive_config import parse_survive_config
+import pytest
+
+from almond_axol.tracker.survive_config import native_seed, parse_survive_config
 
 
 # config_save() writes the global members without outer braces, then appends
@@ -105,3 +107,16 @@ class ParseSurviveConfigTest(unittest.TestCase):
             with self.subTest(text=text):
                 with self.assertRaises(ValueError):
                     parse_survive_config(text)
+
+
+@pytest.mark.parametrize("saved", [None, b"", b"  \n", b"{}\n", b"{ }"])
+def test_native_seed_never_hands_survive_cli_an_empty_object(saved) -> None:
+    # survive-cli 1.0 (f1e6edd) segfaults on a configuration holding only "{}";
+    # an empty file calibrates from scratch like a missing one (seen on an
+    # AGX Orin with four base stations).
+    assert native_seed(saved) == b""
+
+
+def test_native_seed_keeps_a_saved_calibration_verbatim() -> None:
+    saved = b'"v":"0",\n"lighthouse0":{"index":"0"}\n'
+    assert native_seed(saved) is saved

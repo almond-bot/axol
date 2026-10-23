@@ -185,3 +185,28 @@ def test_invalid_frames_while_disengaged_do_not_latch_a_tracking_loss() -> None:
     core.left_enabled = core.right_enabled = True
     core.note_raw_tcp_frame(_untracked_frame())
     assert core._raw_tcp_tracking_lost
+
+
+@pytest.mark.parametrize("calibrate", [False, True])
+def test_strict_setup_without_a_saved_calibration_starts_from_an_empty_file(
+    tmp_path: Path, calibrate: bool
+) -> None:
+    missing = tmp_path / "config.json"
+    source = SurviveSource(force_calibrate=calibrate, allow_frame_refinement=True)
+    source._cli_executable = Path("/attested/survive-cli")
+    seeds: list[bytes] = []
+
+    def launch(args: list[str], **kwargs):  # type: ignore[no-untyped-def]
+        seeds.append(Path(args[args.index("--configfile") + 1]).read_bytes())
+        source._stop.set()
+        return SimpleNamespace(stdout=[], poll=lambda: 0)
+
+    with (
+        patch(
+            "almond_axol.tracker.survive.prepare_survive_config", return_value=missing
+        ),
+        patch("almond_axol.tracker.survive.subprocess.Popen", side_effect=launch),
+    ):
+        source._run_cli()
+    # "{}" crashes survive-cli; an empty file calibrates from scratch.
+    assert seeds == [b""]

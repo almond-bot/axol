@@ -142,7 +142,8 @@ def test_station_discovery_can_read_light_without_saved_geometry_or_publish(
         "almond_axol.tracker.survive.default_survive_config_path", return_value=saved
     ):
         native = source._prepare_native_config(private)
-    assert native.read_text() == "{}\n"
+    # An empty file, never "{}": survive-cli segfaults on an empty object.
+    assert native.read_text() == ""
     assert not saved.exists()
     assert source._runtime_geometry == {}
 
