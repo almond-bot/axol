@@ -508,3 +508,56 @@ class TrackerReconnectTest(_NativeConfigFixture):
         self.assertIn("tracker LHR-BDD65467 disconnected", logs.output[0])
         # A planned restart is not a failure and not counted as a crash.
         self.assertEqual(set(source.poses()), {"LHR-E0FCD01B", "LHR-BDD65467"})
+
+
+class _StallingRun(_Run):
+    """survive-cli on a first SIGTERM: begins shutdown, keeps stdout open."""
+
+    def __init__(self, lines: list[str]) -> None:
+        super().__init__(lines)
+        self.terminate = Mock()
+
+    def wait(self, timeout: float | None = None) -> int:
+        if not self._ended.wait(timeout):
+            raise survive.subprocess.TimeoutExpired("survive-cli", timeout)
+        return -9
+
+
+class TrackerReconnectStallTest(_NativeConfigFixture):
+    def test_a_restart_kills_a_survive_cli_that_ignores_its_first_sigterm(
+        self,
+    ) -> None:
+        # Seen on an AGX Orin: after a tracker dongle left the bus, the
+        # planned restart's single SIGTERM left survive-cli running with no
+        # output, and both trackers stayed silent until the session ended.
+        source = survive.SurviveSource()
+        source._cli_executable = Path("/attested/survive-cli")
+        both = [
+            _config_line("WM0", "LHR-E0FCD01B"),
+            _config_line("WM1", "LHR-BDD65467"),
+        ]
+        first = _StallingRun([*both, "2.0 INFO LOG 2.0 WM1 Device disconnect: 5\n"])
+
+        def second_stream():  # type: ignore[no-untyped-def]
+            yield from both
+            yield "3.0 WM1 POSE 0.2 0 0 1 0 0 0\n"
+            source._stop.set()
+
+        second = SimpleNamespace(
+            stdout=second_stream(), stderr=iter(()), poll=lambda: 0, terminate=Mock()
+        )
+        with (
+            patch.object(
+                survive.subprocess, "Popen", side_effect=[first, second]
+            ) as popen,
+            patch.object(survive, "_RECONNECT_DELAY_S", 0.01),
+            patch.object(survive, "_RESTART_TERM_GRACE_S", 0.05),
+            self.assertLogs(survive._logger, "WARNING") as logs,
+        ):
+            source._run_worker(source._run_cli_supervised)
+
+        first.terminate.assert_called_once_with()
+        first.kill.assert_called()
+        self.assertEqual(popen.call_count, 2)
+        self.assertTrue(any("killing it" in line for line in logs.output))
+        self.assertIn("LHR-BDD65467", source.poses())

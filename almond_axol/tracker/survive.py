@@ -308,6 +308,10 @@ _STDERR_TAIL_LINES = 40
 _RECONNECT_DELAY_S = 2.0
 _RECONNECT_RETRY_S = 5.0
 _RECONNECT_WINDOW_S = 60.0
+# survive-cli treats a first SIGTERM as a graceful shutdown that can stall
+# indefinitely with its stdout still open (a second signal ends it). A planned
+# restart escalates to SIGKILL after this grace, as stop() does.
+_RESTART_TERM_GRACE_S = 3.0
 _DEVICE_DISCONNECT = re.compile(r"(\S+) Device disconnect\b")
 
 
@@ -1677,6 +1681,16 @@ class SurviveSource(TrackerSource):
                 return
             planned_restart.set()
             proc.terminate()
+            # The reader loop only ends when stdout closes; a stalled
+            # shutdown would otherwise leave every tracker silent for good.
+            try:
+                proc.wait(timeout=_RESTART_TERM_GRACE_S)
+            except subprocess.TimeoutExpired:
+                _logger.warning(
+                    "survive-cli did not exit %.0f s after SIGTERM; killing it",
+                    _RESTART_TERM_GRACE_S,
+                )
+                proc.kill()
 
         def check_devices() -> None:
             missing = self._known_serials - reporting
