@@ -764,7 +764,7 @@ const TABS: WbTab[] = [
         key: "velocities",
         label: "velocities (°/s)",
         type: "text",
-        placeholder: "7.2 18 36 54 72",
+        placeholder: "1 2 3 5 8 15 30",
         width: "w-44",
         hint: "fewer velocities = quicker run, coarser friction fit",
       },
