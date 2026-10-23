@@ -165,6 +165,15 @@ def test_a_pose_starved_capture_failure_names_the_tracking_loss() -> None:
         "tracking failed mid-take "
         "(Lighthouse calibration invalidated for station fecdd975)"
     )
+    strict.tracking_quality_faults += [
+        "Right tracker sample is 94 ms behind the other side",
+        "Right tracker sample is 118 ms behind the other side",
+    ]
+    assert collect_data._tracking_capture_reason(strict, stall) == (
+        "tracking failed mid-take "
+        "(Lighthouse calibration invalidated for station fecdd975; "
+        "2 more in the tracking report)"
+    )
     lost = collect_data.EpisodeQAStats(
         total_frames=100, untracked_frames=8, disengaged_frames=9, stale_frames=7
     )

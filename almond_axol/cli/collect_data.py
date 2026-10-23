@@ -945,12 +945,16 @@ def _tracking_capture_reason(
 
     if capture_failure is None or ROBOT_STATE_STALLED not in capture_failure:
         return None
-    if stats.tracking_quality_faults:
-        return (
-            "tracking failed mid-take ("
-            + "; ".join(stats.tracking_quality_faults)
-            + ")"
+    faults = stats.tracking_quality_faults
+    if faults:
+        # The first fault is the cause; later ones are usually the same loss
+        # re-measured (e.g. a growing left/right skew). Keep the notice short.
+        more = (
+            f"; {len(faults) - 1} more in the tracking report"
+            if len(faults) > 1
+            else ""
         )
+        return f"tracking failed mid-take ({faults[0]}{more})"
     lost = stats.untracked_frames + stats.disengaged_frames + stats.stale_frames
     if lost:
         return (
