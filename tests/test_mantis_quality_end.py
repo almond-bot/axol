@@ -27,7 +27,13 @@ from almond_axol.vr.models import VRState
 
 
 def _run_take(
-    *, fault_during: str, dataset_root=None, observed=None, tcp_available=True
+    *,
+    fault_during: str,
+    dataset_root=None,
+    observed=None,
+    tcp_available=True,
+    policy="strict",
+    held_since=None,
 ):
     quality = {
         "status": "ready",
@@ -96,7 +102,8 @@ def _run_take(
         get_action=lambda: {},
         recording_pose_snapshot=lambda: (
             TCPPoseSnapshot.from_message(
-                {"left": pose, "right": pose}, collect_data.time.perf_counter()
+                {"left": pose, "right": pose},
+                collect_data.time.perf_counter() if held_since is None else held_since,
             )
             if tcp_available
             else None
@@ -111,6 +118,7 @@ def _run_take(
         start_episode=start_capture,
         finish_episode=finish_capture,
         publish=publish,
+        rows=rows,
         poll_capture_error=lambda: None,
         save_episode=Mock(),
         discard_episode=Mock(),
@@ -125,9 +133,7 @@ def _run_take(
         "quat_xyzw_to_rotvec": quat_xyzw_to_rotvec,
         "_LEFT_EE_KEYS": _LEFT_EE_KEYS,
         "_RIGHT_EE_KEYS": _RIGHT_EE_KEYS,
-        "cfg": SimpleNamespace(
-            mantis_source="lighthouse", _lighthouse_quality="strict"
-        ),
+        "cfg": SimpleNamespace(mantis_source="lighthouse", _lighthouse_quality=policy),
         "mantis_mode": True,
         "teleop": teleop,
         "robot": robot,
@@ -321,3 +327,23 @@ def test_interrupted_attempt_diagnostics_skip_unstarted_take_and_bound_reason(
     )
     assert len(report["terminationReason"]) == 1000
     assert report["verdict"] == "retake_required"
+
+
+@pytest.mark.parametrize("policy", ["standard", "strict"])
+def test_a_held_pose_is_restamped_only_under_the_standard_policy(policy):
+    # Tracking stopped delivering samples a second before the take: the only
+    # pose on hand is held. Standard keeps rows on the control clock so camera
+    # exposures stay paired and the QA gate judges the stale ticks (as before
+    # strict checks existed); strict keeps the real capture time.
+    held_since = collect_data.time.perf_counter() - 1.0
+    observed: dict = {}
+    _run_take(
+        fault_during="none", observed=observed, policy=policy, held_since=held_since
+    )
+    stamps = [row[2] for row in observed["recorder"].rows]
+    assert stamps
+    assert stamps == sorted(stamps)
+    if policy == "standard":
+        assert min(stamps) > held_since + 0.9
+    else:
+        assert set(stamps) == {held_since}

@@ -129,6 +129,11 @@ class _CaptureGate(threading.Event):
             self.commit_lock.release()
 
 
+# Prefix of a capture failure caused by robot-state rows that stopped
+# advancing. Mantis collection maps it to the tracking loss that caused it.
+ROBOT_STATE_STALLED = "the control loop stopped publishing robot state"
+
+
 def _capture_gate_state(
     event: threading.Event | None,
 ) -> tuple[int | None, bool, float]:
@@ -1112,7 +1117,7 @@ def _describe_snapshot_miss(
         age_ms = (target_ts - latest_ts) * 1e3
         since_ms = ((now if now is not None else time.perf_counter()) - latest_ts) * 1e3
         return (
-            "the control loop stopped publishing robot state: newest snapshot is "
+            f"{ROBOT_STATE_STALLED}: newest snapshot is "
             f"{age_ms:.0f} ms older than the exposure ({since_ms:.0f} ms old now) "
             "(control-process stall, not a recorder backlog)"
         )

@@ -930,6 +930,38 @@ def _newer_pose(
     return snapshot.pose_host_ts >= previous.pose_host_ts
 
 
+def _tracking_capture_reason(
+    stats: "EpisodeQAStats", capture_failure: str | None
+) -> str | None:
+    """The tracking loss behind a capture failure, when there was one.
+
+    A Mantis row is stamped with its pose's capture time. Under the strict
+    Lighthouse policy a held pose is never restamped, so once tracking stops
+    delivering fresh samples the recorder has no robot-state row to pair with
+    later camera exposures and reports a stalled control loop. Name the
+    tracking failure instead, so the operator is not sent to debug cameras.
+    """
+    from ..recording.record_proc import ROBOT_STATE_STALLED
+
+    if capture_failure is None or ROBOT_STATE_STALLED not in capture_failure:
+        return None
+    if stats.tracking_quality_faults:
+        return (
+            "tracking failed mid-take ("
+            + "; ".join(stats.tracking_quality_faults)
+            + ")"
+        )
+    lost = stats.untracked_frames + stats.disengaged_frames + stats.stale_frames
+    if lost:
+        return (
+            "tracking was lost mid-take "
+            f"({stats.untracked_frames} untracked, "
+            f"{stats.disengaged_frames} disengaged and "
+            f"{stats.stale_frames} stale control ticks)"
+        )
+    return None
+
+
 def _row_observation(
     robot: Any, live: dict[str, Any], pose_ts: float | None
 ) -> dict[str, Any]:
@@ -2233,6 +2265,9 @@ def _run_session(
         # Hold that immutable sample across ticks without restamping it; before
         # the first usable engage sample, publish no dataset row at all.
         last_tcp: TCPPoseSnapshot | None = None
+        # Newest timestamp handed to the recorder (Mantis): rows must never
+        # step backwards, including when a held pose was restamped.
+        last_row_ts: float | None = None
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
         # Capture-health ack: ~2 s into recording, poll the recorder's row
@@ -2261,7 +2296,7 @@ def _run_session(
         async def _tracking_tick() -> None:
             """Run one normal teleop tick without consuming boundary events."""
             nonlocal capture_failure, last_robot_act, last_dataset_act
-            nonlocal last_tcp, was_engaged
+            nonlocal last_tcp, last_row_ts, was_engaged
             if _stopped() and last_robot_act is not None:
                 # Ctrl+C/Stop during recorder startup must drain the bounded
                 # worker before teardown, but must not keep following a moving
@@ -2328,6 +2363,14 @@ def _run_session(
                 if pose_ts is not None:
                     row_ts = pose_ts
                     lag = t0 - pose_ts
+                    if lag > _QA_STALE_POSE_S and not quality_monitor.required:
+                        # Standard policy, as before strict Lighthouse
+                        # checks: while no fresh sample arrives (tracking
+                        # lost, disengaged), keep rows on the control clock
+                        # so camera exposures stay paired, and let the QA
+                        # gate judge the stale/untracked ticks. Strict never
+                        # restamps a held pose; its retake latch decides.
+                        row_ts = t0
                     if lag > max_pose_lag["v"]:
                         max_pose_lag["v"] = lag
                     if recording and lag > stats.max_pose_lag_s:
@@ -2357,8 +2400,17 @@ def _run_session(
 
             last_robot_act = robot_act
             last_dataset_act = dataset_act
-            if not mantis_mode or (last_tcp is not None and pose_ts is not None):
+            if not mantis_mode:
                 recorder.publish(joint_obs, dataset_act, row_ts)
+            elif (
+                last_tcp is not None
+                and pose_ts is not None
+                and (last_row_ts is None or row_ts >= last_row_ts)
+            ):
+                # A fresh capture after a restamped hold is older than the
+                # hold's last row; skip it until capture time passes it.
+                recorder.publish(joint_obs, dataset_act, row_ts)
+                last_row_ts = row_ts
 
             # Per-episode QA counters (Mantis only — encoder-FK poses can't go
             # stale). Held TCPs retain their last capture timestamp; a
@@ -2436,8 +2488,17 @@ def _run_session(
             # Closing capture may still consume final camera exposures. Their
             # pose must stay on its real timeline; an idle/held tick must not
             # invent fresh TCP data or silently switch back to virtual FK.
+            nonlocal last_row_ts
             if last_tcp is None or last_tcp.pose_host_ts is None:
                 return
+            row_ts = last_tcp.pose_host_ts
+            now = time.perf_counter()
+            if now - row_ts > _QA_STALE_POSE_S and not quality_monitor.required:
+                # Standard policy: same control-clock hold as the take.
+                row_ts = now
+            if last_row_ts is not None and row_ts < last_row_ts:
+                return
+            last_row_ts = row_ts
             observation = dict(gripper_obs)
             for keys, pose in (
                 (_LEFT_EE_KEYS, last_tcp.left),
@@ -2445,7 +2506,7 @@ def _run_session(
             ):
                 pose6 = [*pose[:3], *quat_xyzw_to_rotvec(np.asarray(pose[3:7]))]
                 observation.update(zip(keys, pose6))
-            recorder.publish(observation, last_dataset_act, last_tcp.pose_host_ts)
+            recorder.publish(observation, last_dataset_act, row_ts)
 
         async def _idle_tick() -> None:
             """Mantis boundary tick: publish state, command nothing.
@@ -2991,10 +3052,18 @@ def _run_session(
         rerecord: bool,
         captured_rows: int,
         capture_failure: str | None,
+        tracking_reason: str | None = None,
     ) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
-        if capture_failure is not None:
+        if capture_failure is not None and tracking_reason is not None:
+            _reject_take(
+                f"Episode {episode_idx + 1} was not saved: {tracking_reason}; "
+                "the camera frames after it had no tracked pose to pair with. "
+                "Record it again."
+            )
+            _discard_episode()
+        elif capture_failure is not None:
             _reject_take(
                 f"Episode {episode_idx + 1} was not saved: camera capture "
                 f"failed ({capture_failure})."
@@ -3257,6 +3326,9 @@ def _run_session(
                     rerecord,
                     captured_rows,
                     capture_failure,
+                    _tracking_capture_reason(qa, capture_failure)
+                    if recording and mantis_mode
+                    else None,
                 )
                 home_future.result()
             except BaseException:

@@ -148,3 +148,33 @@ def test_successful_save_increments_count_and_clears_previous_rejection():
     control.note_saved()
     assert "notice" not in control.snapshot()
     assert control.snapshot()["episodesRecorded"] == 2
+
+
+def test_a_pose_starved_capture_failure_names_the_tracking_loss() -> None:
+    stall = (
+        "no retained robot-state snapshot brackets camera exposure 5071.8: "
+        "the control loop stopped publishing robot state: newest snapshot is "
+        "333 ms older than the exposure"
+    )
+    strict = collect_data.EpisodeQAStats(
+        tracking_quality_faults=[
+            "Lighthouse calibration invalidated for station fecdd975"
+        ]
+    )
+    assert collect_data._tracking_capture_reason(strict, stall) == (
+        "tracking failed mid-take "
+        "(Lighthouse calibration invalidated for station fecdd975)"
+    )
+    lost = collect_data.EpisodeQAStats(
+        total_frames=100, untracked_frames=8, disengaged_frames=9, stale_frames=7
+    )
+    assert "8 untracked, 9 disengaged and 7 stale" in (
+        collect_data._tracking_capture_reason(lost, stall) or ""
+    )
+    # A real camera or recorder fault, or a stall without any tracking
+    # trouble, still reads as a capture failure.
+    assert collect_data._tracking_capture_reason(lost, "ZED grab timed out") is None
+    assert (
+        collect_data._tracking_capture_reason(collect_data.EpisodeQAStats(), stall)
+        is None
+    )
