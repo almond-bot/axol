@@ -1,14 +1,11 @@
 ---
 title: "Run Policy"
-description: "Run a trained policy autonomously — from the web control panel or the CLI, locally or on a remote server."
+description: "Run a trained policy on Axol, with inference on the robot's computer or a remote server."
 ---
 
-Run Policy executes a trained policy on the robot autonomously: it streams the robot's joint positions and camera frames to the policy, which returns action chunks that drive the arms. It runs on the same machine as [data collection](/operations/data-collection) — the computer wired to the robot with the ZED cameras attached.
+Run Policy lets a trained policy drive Axol's arms. Axol sends the arm positions and camera frames to the policy, and the policy sends back chunks of actions. Run it on the same computer as [data collection](/operations/data-collection): the one wired to the robot with the ZED cameras attached. Start it from the web control panel or with `axol run-policy`.
 
-For LeRobot policy types, inference runs **locally** by default. It can be
-offloaded to a more powerful machine on the network: the robot sends
-observations over gRPC and receives actions back. Custom policies use the
-[custom policy interface](/api/policy-plan) to connect to an existing endpoint.
+For LeRobot policies, inference runs on the robot's computer by default. You can move it to a more powerful computer on the network instead. Custom policies connect to an endpoint you run, through the [custom policy interface](/api/policy-plan).
 
 ```mermaid
 flowchart LR
@@ -22,18 +19,25 @@ flowchart LR
   infer -->|action chunks| proc
 ```
 
-You can launch a rollout from the **web control panel** or the **CLI** (`axol run-policy`).
-
 <Tip>
-  Not a LeRobot checkpoint? Pick policy type **`custom`** to use the [custom policy interface](/api/policy-plan). The robot sends compressed observations and plan references, then executes the endpoint's absolute targets. Model selection and instructions stay at the endpoint; no checkpoint path is needed on the robot. See [Run Your Own Policy](/operations/custom-policy).
+  To run a model that isn't a LeRobot checkpoint, choose policy type **`custom`**. You choose the model and instructions on your endpoint, so the robot needs no checkpoint path. See [Run Your Own Policy](/operations/custom-policy).
 </Tip>
 
 ## Before you start
 
-- **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them.
-- **A trusted trained checkpoint and any existing rollout dataset you append to** that you created or obtained from a source you trust (local path or HuggingFace repo), plus the checkpoint's policy type (`act`, `smolvla`, `pi0`, …). Upstream model deserialization and dataset parsing are not sandboxed. Assign the **same** cameras, and use the **same** camera resolution, stereo setting, and fps the policy was trained on.
-- **For local GPU inference**, a CUDA-capable PyTorch install — or offload to a remote server (below). The hosted aarch64/Jetson install deliberately receives PyPI's CPU-only Torch 2.10 build; use an explicitly managed JetPack-compatible Torch + Torchvision build, select a remote server, or pass `--device cpu`. Axol's hosted updater will not overwrite an existing custom/CUDA build.
+- Install Axol with the [one-command install](/installation). Bring up CAN and check the motors.
+- Connect at least one of the ZED cameras the policy was trained on, and have their serial numbers ready. See the [Data Collection](/operations/data-collection#before-you-start) tip for how to list them.
+- Have a trained checkpoint and its policy type (`act`, `smolvla`, `pi0` and so on). The checkpoint can be a local path or a HuggingFace repo.
+- Use the **same** cameras, camera resolution, stereo setting and recording rate the policy was trained on.
+- For GPU inference on the robot's computer, you need a PyTorch build with CUDA. Otherwise, use a remote server (below) or pass `--device cpu`.
+
+<Warning>
+  Load only checkpoints and datasets that you made or got from a source you trust. Model and dataset loading is not sandboxed.
+</Warning>
+
+<Note>
+  On a Jetson, the hosted install comes with the CPU-only PyTorch build. For GPU inference, install a JetPack-compatible Torch and Torchvision yourself. Axol's updater doesn't replace a build you installed.
+</Note>
 
 ## Run it
 
@@ -41,30 +45,30 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on under **Axol settings → Cameras** (at least one). See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**. Under **Axol settings → Cameras**, assign at least one of the cameras the policy was trained on. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
-      <Step title="Select Run Policy and fill the fields">
-        Pick **Run Policy**. Set the **policy path**, **policy type**, and **task** description — the per-run inputs. Remote inference (**server host**/port), aggregation, and chunking now live in the [Settings](/guides/control-panel#settings) **Inference** tab.
+      <Step title="Select Run policy and fill in the fields">
+        Pick **Run policy** and fill in **Policy path**, **Policy type** and **Task**. The remote server's host and port, and the chunk settings, are in the **Inference** tab of [Settings](/guides/control-panel#settings).
       </Step>
 
-      <Step title="Start and control rollouts">
-        Press **Start**, then use the **Episode control** box that appears:
+      <Step title="Start and run episodes">
+        Press **Start**, then use the **Episode control** box:
 
-        | Button | Effect |
+        | Button | What it does |
         |---|---|
-        | **Start episode** | Begin the next rollout. |
-        | **Save** | Save the current episode and return to the reset gate. |
-        | **Discard** | Drop the current episode. Because a failed rollout usually leaves the arms somewhere they shouldn't be, they go **limp** for hand-repositioning instead of driving home from that pose — clear them of the scene, then **Return to rest**. |
-        | **Return to rest** | Send the limp arms home, replanning the collision-aware return from wherever they were left. Appears after a **Discard** (limp cleanup), when the guarded between-episode return meets resistance, or when the opt-in rollout [contact stop](/cli/run-policy) aborts an episode (a **Contact** hold). |
+        | **Start episode** | Start the next episode. |
+        | **Save** | Save the episode and wait for the next one. |
+        | **Discard** | Drop the episode. The arms go **limp** so you can move them clear by hand. Then press **Return to rest**. |
+        | **Return to rest** | Plan a return to rest from where the arms are. Appears after **Discard** or a contact stop. |
 
-        To end the run, press **Stop** in the card header.
+        To end the run, press **Stop** at the top of the card.
       </Step>
     </Steps>
   </Tab>
 
   <Tab title="CLI">
-    On the robot machine:
+    On the robot's computer:
 
     ```bash
     axol run-policy \
@@ -74,57 +78,70 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
         --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. For CPU inference add `--device cpu`. Replace the serials with your cameras' — assign the same cameras the policy was trained on (at least one; omitted slots are dropped). The `cameras` dict is one inline YAML value — see [Command configuration](/cli/configuration#field-name-conventions).
+    This starts a policy server on the same computer. For CPU inference, add `--device cpu`.
 
-    Control the rollout from stdin in the `run-policy` terminal:
+    Replace the serial numbers with your cameras' and assign the cameras the policy was trained on. Slots you leave out aren't used. The `cameras` value is one inline YAML dictionary. See [Command configuration](/cli/configuration#field-name-conventions).
+
+    Control each episode from the `run-policy` terminal:
 
     | Key | Action |
     |---|---|
-    | `s` | Save the rollout and end the episode |
-    | `r` | Discard the episode — the arms drop **limp** for hand-repositioning; clear them, then press **Enter** to return to rest and re-record |
-    | `q` | Discard and quit |
+    | `s` | Save the episode. |
+    | `r` | Discard the episode. The arms go **limp**. Move them clear, then press **Enter** to return to rest. |
+    | `q` | Discard the episode and quit. |
 
-    See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields.
+    See [`run-policy`](/cli/run-policy) for the chunk and dataset fields.
   </Tab>
 </Tabs>
 
-`--episode_time_s` is a safety cap (default 120 s) that falls back to the same save / discard / quit prompt if no key is pressed. If a dataset repo is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory — **guarded**: if a joint's torque strays from the gravity model for a sustained window (something still grasped, or a person grabbing an arm) the move stops where it is and the arms drop into a limp gravity-compensation hold. Free them by hand, then continue (Enter on the terminal, **Return to rest** on the control panel) to replan from wherever they were left. Tune with `--reset_torque_threshold` (default 6.0 Nm; `0` disables the watchdog) or the control panel's **Reset contact threshold**.
+### Episodes
 
-You can also arm a watchdog for the **rollout itself** — while the policy is driving the arms. It's **off by default** (a policy pushes on the scene on purpose): set `--policy_torque_threshold` (the control panel's **Policy contact stop**; suggested `16` Nm) and a sustained torque past the threshold **aborts the episode — nothing is saved** — and drops the arms limp. Clear them by hand, then continue (Enter / **Return to rest**) to return to rest and start the next attempt.
+- `--episode_time_s` limits each episode, 120 s by default. When it runs out, you get the same save, discard or quit choice.
+- If you set a dataset repo ID, each saved episode is added to a LeRobot dataset.
+- **Discard** makes the arms go limp first, because a failed episode often leaves them in a bad spot. Move them clear by hand, then return to rest.
 
-**Discarding** an episode uses that same limp hold up front: because a bad rollout usually leaves the arms somewhere they shouldn't be, they go slack for hand-repositioning first, so you untangle them by hand rather than dragging them home from a failed pose — then return to rest replans from where you left them.
+### Contact stops
 
-<Info>
-  Execution filters constrain joint commands downstream of the policy. LeRobot
-  policies also use chunk ensembling and alignment (`--ensemble_blend_s`,
-  `--align_fade_s`). Custom-policy endpoints publish their final plan and own
-  any ensembling; the robot keeps its accepted suffix unchanged. Smooth model
-  boundaries still require compatible targets and sufficient inference
-  throughput. See [`run-policy`](/cli/run-policy) and the
-  [custom policy interface timing](/api/policy-plan#robot-control-loop).
-</Info>
+Between episodes, the arms return to the rest pose along a path that avoids collisions. The return is guarded. If an arm meets resistance, such as a held object or a person, the move stops and the arms go limp.
+
+1. Move the arms clear by hand.
+2. Press **Enter** in the terminal or **Return to rest** in the panel. Axol plans a new return from where the arms are.
+
+Set the sensitivity with **Return-to-rest contact stop** in the panel, or `--reset_torque_threshold` (default `6.0` Nm, `0` turns it off).
+
+You can also stop an episode when the arms push hard while the policy drives them. This check is off by default, because a policy often pushes on the scene on purpose. Set **Policy contact stop** in the panel, or `--policy_torque_threshold`. The panel suggests `16` Nm.
+
+When it trips, the episode is dropped without saving and the arms go limp. Move them clear, then return to rest and start the next episode.
+
+### Smooth motion
+
+Axol limits joint speed and acceleration on every command the policy sends. For LeRobot policies, Axol also blends overlapping chunks (`--ensemble_blend_s`, `--align_fade_s`). A custom policy's server does any blending itself, and Axol runs its plan as sent.
+
+Smooth motion still needs consistent targets and fast enough inference. See [`run-policy`](/cli/run-policy) and [custom policy timing](/api/policy-plan#robot-control-loop).
 
 ## Offload LeRobot inference to a remote server (optional)
 
+<Warning>
+  Use remote inference only on an isolated, trusted network or a VPN. Set the server's firewall to accept only the robot's IP address. The link is not encrypted or authenticated. Anyone on the network could load checkpoints on the server, or pose as the server and send actions to the robot.
+</Warning>
+
 <Steps>
-  <Step title="Start the inference server on the GPU machine">
-    The inference server runs on the GPU machine from the CLI — it isn't one of the control panel's operations. With the `lerobot` extra installed there:
+  <Step title="Start the inference server on the GPU computer">
+    Start the server from the CLI. The control panel doesn't run it. Install the `lerobot` extra on the GPU computer, then run:
 
     ```bash
     axol inference-server --host 192.168.1.99
     ```
 
-    Replace the example with the inference machine's exact LAN IP, or omit `--host` to use the default `0.0.0.0` (all interfaces). It listens on port `8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
-
-    Use remote inference only across an isolated trusted network (or authenticated VPN), with a host firewall allowing the robot IP alone. Axol replaces LeRobot 0.6's pickle transport with bounded, versioned messages, but gRPC still has no TLS/client authentication: a peer can request checkpoint loads or impersonate the server and return arbitrary robot actions, so shared or untrusted networks remain unsafe.
+    Replace the address with the GPU computer's LAN IP. Leave out `--host` to listen on all interfaces (`0.0.0.0`). The server listens on port `8765` until you press `Ctrl+C`. See [`inference-server`](/cli/inference-server).
   </Step>
 
   <Step title="Point Run Policy at it">
-    On the robot machine, run Run Policy exactly as above but pointed at the server's address:
+    On the robot's computer, run Run Policy as above with the server's address:
 
     <Tabs>
       <Tab title="Control Panel">
-        In the [Settings](/guides/control-panel#settings) **Inference** tab, set the **server host** to the GPU machine's address (e.g. `192.168.1.99`) and **Save**, then press **Start** in the **Run Policy** panel.
+        In the **Inference** tab of [Settings](/guides/control-panel#settings), set the server host to the GPU computer's address, such as `192.168.1.99`, and press **Save**. Then press **Start** in the **Run policy** panel.
       </Tab>
 
       <Tab title="CLI">
@@ -141,7 +158,7 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
       </Tab>
     </Tabs>
 
-    The server downloads the policy itself, so `--policy_path` must be reachable from it (e.g. a HuggingFace Hub repo ID).
+    The server downloads the policy, so it must be able to reach `--policy_path`. A HuggingFace Hub repo ID works.
   </Step>
 </Steps>
 
@@ -155,7 +172,7 @@ You can also arm a watchdog for the **rollout itself** — while the policy is d
     Record more episodes to improve the policy.
   </Card>
   <Card title="run-policy reference" icon="terminal" href="/cli/run-policy">
-    Every flag, aggregation strategy, and threading detail.
+    Every flag and aggregation strategy.
   </Card>
   <Card title="Run Your Own Policy" icon="code" href="/operations/custom-policy">
     Drive the arms from a model that isn't a LeRobot checkpoint.

@@ -1703,9 +1703,9 @@ def _run(
             else control.note_gate
         )
         announce_gate(
-            "Contact during return to rest — the arms are limp and free to "
-            "move. Clear them, then press the VR reset button, or return to "
-            "rest here.",
+            "The arms hit something while returning to rest and are now limp. "
+            "Move them clear by hand, then press reset in VR or Return to rest "
+            "here.",
             "Return to rest",
             phase=_GATE_CONTACT,
         )

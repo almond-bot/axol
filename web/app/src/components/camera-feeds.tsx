@@ -214,8 +214,7 @@ export function CameraFeeds({
       ) : videoOff ? (
         <p className="flex items-center gap-2 text-xs text-white/45">
           <VideoOff className="size-3.5 shrink-0" />
-          No camera stream from this operation — check that streaming is enabled in the camera
-          settings.
+          This operation isn&apos;t streaming video. Turn on streaming in the camera settings.
         </p>
       ) : (
         <p className="flex items-center gap-2 text-xs text-white/45">
@@ -226,9 +225,7 @@ export function CameraFeeds({
 
       {certHint && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-white/45">
-          <span>
-            If the feed never connects, authorize the camera server&apos;s certificate once:
-          </span>
+          <span>If the video never connects, authorize the camera certificate once.</span>
           <Button variant="outline" size="sm" onClick={() => authorizeCert(vrOrigin)}>
             <ShieldCheck />
             Authorize

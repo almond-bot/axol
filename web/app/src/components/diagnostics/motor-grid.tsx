@@ -122,7 +122,7 @@ export function MotorGrid({
                     ? "OK"
                     : reading && !reading.reachable
                       ? "UNREACHABLE"
-                      : (reading?.status ?? "—")}
+                      : (reading?.status ?? "–")}
                 </span>
               </span>
             </div>
@@ -135,7 +135,7 @@ export function MotorGrid({
                   temp != null && temp >= TEMP_WARN_C && temp < TEMP_HOT_C && "text-amber-300"
                 )}
               />
-              <Stat label="Bus" value={fmt(reading?.voltage, 1, "V")} />
+              <Stat label="Volts" value={fmt(reading?.voltage, 1, "V")} />
               <Stat label="Pos" value={fmt(pos == null ? null : (pos * 180) / Math.PI, 1, "°")} />
             </div>
           </button>

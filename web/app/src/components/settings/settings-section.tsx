@@ -318,7 +318,7 @@ export function SettingsSection({
         }
       })
     } catch (e) {
-      toast.error(`Import failed: ${e}`)
+      toast.error(`Couldn't import settings: ${String(e).replace(/^Error:\s*/, "")}`)
     }
   }
 
@@ -414,7 +414,7 @@ export function SettingsSection({
             {scopeMeta.title}
           </span>
           <span className="hidden truncate text-xs text-white/35 md:block">
-            shared by all operations on this robot
+            Shared by all operations on this robot
           </span>
         </button>
         <div
@@ -533,10 +533,9 @@ export function SettingsSection({
                 <div className="flex flex-col gap-1.5">
                   <Label>Full squeeze calibration</Label>
                   <p className="max-w-prose text-xs leading-relaxed text-white/40">
-                    A fully pressed trigger should close its gripper. If its live reading peaks
-                    below 1.00, set that side to the measured peak. For example, a left trigger that
-                    peaks around 0.90 can use 0.90 here. These values apply to Mantis teleoperation
-                    and Lighthouse or Ultimate data collection.
+                    A fully pressed trigger should close the gripper. If a trigger&apos;s reading
+                    peaks below 1.00, enter its peak here (for example, 0.90). These values apply to
+                    Mantis teleop and to Lighthouse and Ultimate data collection.
                   </p>
                 </div>
                 {mantisTriggerFields.length > 0 ? (
@@ -552,20 +551,18 @@ export function SettingsSection({
                   </div>
                 ) : (
                   <p className="text-sm text-white/40">
-                    This host does not expose Mantis trigger calibration; update it to edit the
-                    endpoints.
+                    Update Axol on the host to edit trigger calibration.
                   </p>
                 )}
               </div>
             ) : tab === "mantis-can" ? (
               <div className="flex flex-col gap-4">
                 <div className="flex flex-col gap-1.5">
-                  <Label>Logical left/right CAN mapping</Label>
+                  <Label>Left and right CAN channels</Label>
                   <p className="max-w-prose text-xs leading-relaxed text-white/40">
-                    Defaults are <span className="font-mono">can_mantis_l</span> and{" "}
-                    <span className="font-mono">can_mantis_r</span>. Swap the two interface values
-                    to swap logical left and right without moving cables; each side&apos;s trigger
-                    reader follows the same channel.
+                    The defaults are <span className="font-mono">can_mantis_l</span> and{" "}
+                    <span className="font-mono">can_mantis_r</span>. To swap left and right without
+                    moving cables, swap the two values. The triggers swap with them.
                   </p>
                 </div>
                 {mantisChannelFields.length > 0 ? (
@@ -581,7 +578,7 @@ export function SettingsSection({
                   </div>
                 ) : (
                   <p className="text-sm text-white/40">
-                    This host does not expose a Mantis CAN mapping; update it to edit the channels.
+                    Update Axol on the host to edit the CAN channels.
                   </p>
                 )}
               </div>
@@ -606,9 +603,8 @@ export function SettingsSection({
               jellyParameters ? (
                 <div className="flex flex-col gap-4">
                   <p className="text-xs text-white/45">
-                    How the wheels and lift respond to the sticks: peak speed, rotation weight,
-                    slew, axis snap, the heading hold, and the parked hold. One value here applies
-                    to <span className="text-white/65">every operation</span> that drives Jelly.
+                    How the wheels and lift respond to the sticks. These values apply to{" "}
+                    <span className="text-white/65">every operation</span> that drives Jelly.
                   </p>
                   <FlatSchemaForm
                     nodes={jellyParameters.nodes}
@@ -620,13 +616,12 @@ export function SettingsSection({
                 </div>
               ) : (
                 <p className="text-sm text-white/40">
-                  This host does not expose Jelly&apos;s parameters; update it to edit them here.
+                  Update Axol on the host to edit Jelly&apos;s parameters.
                 </p>
               )
             ) : tab === "jelly" && !activeCategory ? (
               <p className="text-sm text-white/40">
-                This host does not expose the Jelly wheels / lift switches; update it to edit them
-                here.
+                Update Axol on the host to edit the wheel and lift switches.
               </p>
             ) : activeCategory ? (
               <CategoryPanel
@@ -721,11 +716,11 @@ function computePatch(
 function UpdateRequired({ error }: { error: string }) {
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
-      <span className="font-medium text-amber-300/90">Serve host update required</span>
+      <span className="font-medium text-amber-300/90">Update required</span>
       <p className="text-white/55">
-        This Axol host doesn&apos;t support shared settings yet — update it from the banner on the
-        control panel (or run <span className="font-mono">axol update</span>), then reconnect.
-        Cameras still work in the meantime.
+        Update Axol on the host to edit these settings. Use the update banner on the control panel
+        or run <span className="font-mono">axol update</span>, then reconnect. Camera settings work
+        without the update.
       </p>
       <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">{error}</code>
     </div>
@@ -753,8 +748,8 @@ function UsbPanel({
       await setQuestProximityDisabled(disabled)
       toast.success(
         disabled
-          ? "Proximity sensor disabled — the headset stays awake until it reboots."
-          : "Proximity sensor restored."
+          ? "Proximity sensor off. The headset stays awake until it restarts."
+          : "Proximity sensor on."
       )
     } catch (e) {
       toast.error(String(e))
@@ -775,7 +770,7 @@ function UsbPanel({
           ? "bg-white/30"
           : "bg-amber-400"
   const label = !usb
-    ? "—"
+    ? "Checking…"
     : !usb.installed
       ? "adb not installed"
       : usb.ready
@@ -789,24 +784,23 @@ function UsbPanel({
               : usb.state
   // Per-state hint, mirroring the help line every other settings field has.
   const hint = !usb
-    ? "Waiting for the host to report the USB link state."
+    ? "Checking for a headset on USB."
     : !usb.installed
       ? "Install adb on the host, then reconnect the headset."
       : usb.ready
-        ? "Controller poses stream over the cable; a dropped cable fails over to Wi-Fi instantly."
+        ? "Controller poses stream over the cable. If the cable drops, they switch to Wi-Fi."
         : usb.state === "device"
-          ? "Headset detected — the tunnel connects automatically; use Connect to retry."
+          ? "Headset found and connecting. Press Connect to retry."
           : usb.state === "none"
-            ? "Plug the Quest into the Axol host with a USB-C cable."
+            ? "Plug the Quest into the host with a USB-C cable."
             : usb.state === "unauthorized"
               ? "Put the headset on and accept the “Allow USB debugging?” prompt."
               : "Reconnect the headset's USB cable."
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Stream controller poses over a USB cable instead of Wi-Fi for lower latency. The link is set
-        up automatically when an authorized headset is plugged into the host; camera video keeps
-        using the LAN.
+        Stream controller poses over USB instead of Wi-Fi for lower latency. The link starts when
+        you plug an authorized headset into the host. Camera video still uses the network.
       </p>
       <div className="flex max-w-xl flex-col gap-1.5">
         <div className="flex items-center justify-between gap-4">
@@ -828,14 +822,13 @@ function UsbPanel({
       </div>
       <div className="flex max-w-xl flex-col gap-1.5">
         <div className="flex items-center justify-between gap-4">
-          <Label>Keep awake (headless)</Label>
+          <Label>Keep headset awake</Label>
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
               size="sm"
               onClick={() => setProximity(true)}
               disabled={!proxReady || proxBusy != null}
-              title="Disable the proximity sensor (adb) so the headset stays awake with nobody wearing it."
             >
               {proxBusy === "off" ? <Loader2 className="animate-spin" /> : <EyeOff />}
               Keep awake
@@ -845,17 +838,16 @@ function UsbPanel({
               size="sm"
               onClick={() => setProximity(false)}
               disabled={!proxReady || proxBusy != null}
-              title="Restore normal proximity-sensor behavior (the headset sleeps when taken off)."
             >
               {proxBusy === "on" ? <Loader2 className="animate-spin" /> : <Eye />}
-              Restore
+              Allow sleep
             </Button>
           </div>
         </div>
         <p className="max-w-prose text-xs text-white/35">
-          Disables the headset's proximity sensor so it keeps running when set down — for sessions
-          driven from this panel with nobody wearing it. Resets when the headset reboots; battery
-          drains at full rate, so keep it charging. Needs the headset plugged in and authorized.
+          Turns off the headset&apos;s proximity sensor so it stays awake when nobody is wearing it.
+          The headset must be plugged in and authorized. The setting resets when the headset
+          restarts. The battery drains fast, so keep it charging.
         </p>
       </div>
     </div>
@@ -1048,7 +1040,8 @@ function SettingRow({
   }
 
   const text = set ? String(value) : ""
-  const placeholder = field.default != null ? String(field.default) : (field.defaultText ?? "unset")
+  const placeholder =
+    field.default != null ? String(field.default) : (field.defaultText ?? "Not set")
   return (
     <div className="flex flex-col gap-1.5">
       {labelNode}
@@ -1114,13 +1107,13 @@ function AdvancedPanel({
   const editedCount = Object.keys(overrides).length
 
   if (sections.length === 0) {
-    return <p className="text-sm text-white/40">No advanced settings available on this host.</p>
+    return <p className="text-sm text-white/40">No advanced settings available.</p>
   }
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Everything not covered by the other tabs. One value set here applies to{" "}
-        <span className="text-white/65">every operation</span> that uses the subsystem.
+        Settings not covered by the other tabs. Each value applies to{" "}
+        <span className="text-white/65">every operation</span> that uses it.
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-48 flex-1">
@@ -1128,7 +1121,7 @@ function AdvancedPanel({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search all config…"
+            placeholder="Search advanced settings…"
             className="pl-9"
           />
         </div>
@@ -1141,7 +1134,7 @@ function AdvancedPanel({
       {matches ? (
         <div className="flex max-w-xl flex-col gap-4">
           {matches.length === 0 ? (
-            <p className="text-sm text-white/35">No matching config.</p>
+            <p className="text-sm text-white/35">No matching settings.</p>
           ) : (
             matches.map((f) => <FieldRow key={f.key} field={f} showPath {...common} />)
           )}

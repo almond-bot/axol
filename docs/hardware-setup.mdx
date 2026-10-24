@@ -1,16 +1,20 @@
 ---
 title: "Hardware Setup"
-description: "Step-by-step setup guides for each Axol configuration."
+description: "Find the step-by-step guide to mount, power and wire your Axol."
 ---
 
-Pick the guide for your mount. Each one walks through mounting Axol and connecting power. Then fit the cameras with the Axol Cameras guide, which is the same for every mount.
+Setting up Axol takes three steps:
+
+1. **Mount and power Axol.** Pick the guide for your mount below.
+2. **Fit the cameras.** If you have the Camera Kit, follow [Axol Cameras](/hardware-setup/cameras). It is the same for every mount.
+3. **Install the software.** Follow [Installation](/installation).
 
 <CardGroup cols={2}>
   <Card title="Axol Standalone" icon="table" href="/hardware-setup/standalone">
     Bolt Axol to your own table or fixture.
   </Card>
   <Card title="Axol + Owl Mount" icon="tower-cell" href="/hardware-setup/owl-mount">
-    Fix the rigid 8080 column to a bench or cell, then mount Axol.
+    Bolt the column to a table or bench, then mount Axol.
   </Card>
   <Card title="Axol + Ox Cart" icon="cart-flatbed" href="/hardware-setup/ox-cart">
     Level the cart, set the crank height, and mount Axol.
@@ -25,12 +29,12 @@ Pick the guide for your mount. Each one walks through mounting Axol and connecti
     Mount the Camera Kit's wrist and head cameras and wire them to the compute.
   </Card>
   <Card title="Advantech Thor (MIC-742)" icon="microchip" href="/hardware-setup/thor">
-    Wire the cameras, flash Advantech's JetPack image, and install the camera driver on the Thor Compute Kit.
+    Wire the cameras, install the operating system and add the camera driver on the Jetson Thor Compute Kit.
   </Card>
 </CardGroup>
 
 <Note>
-  Once Axol is mounted and powered, calibrate it. [Calibrating Axol](/guides/axol-calibration) fits each joint's friction and gravity model with one command, and every machine that drives that Axol picks the result up.
+  After you install the software, calibrate Axol so its arms move smoothly at slow speed. Follow [Calibrating Axol](/guides/axol-calibration). It takes one command and about 1.5 hours.
 </Note>
 
 Not sure which mount you have? See the [Hardware Overview](/hardware).

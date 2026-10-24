@@ -1,25 +1,30 @@
 ---
 title: "Teleoperation"
-description: "Drive Axol from a VR headset, or run the Mantis rigs' grippers straight from their triggers."
+description: "Drive Axol's arms from a Meta Quest headset, or test the Mantis grippers from their triggers."
 ---
 
-Teleoperation drives the arms live from a Meta Quest headset. It runs on either device: **Axol** (the robot, or the browser **sim**) or **Mantis** (the handheld rigs — teleop drives just the grippers from the rig triggers over CAN; tracking belongs to [data collection](/operations/data-collection)). You can run either from the **web control panel** or the **CLI** (`axol teleop`).
+Teleoperation drives Axol's arms live from a Meta Quest headset. You can drive the real robot or the browser **sim**. With **Mantis** selected, teleoperation drives only the two grippers from the rig triggers. Start it from the web control panel or with `axol teleop`.
 
 ## Before you start
 
-- **Axol installed** — the [one-command install](/installation) on the robot machine, or a [development install](/advanced/development-install) for sim.
-- **The device selected and connected.** The control panel's **Axol** / **Mantis** tile carries the system-wide device choice (**Select**) and brings up CAN and checks the motors on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once. Mantis needs its [hardware setup](/mantis/hardware) only — teleop never uses a pose source (that's [data collection](/operations/data-collection)'s job, set up under [Mantis Tracking](/mantis/tracking)).
-- **A Meta Quest** with the [TLS certificate authorized](#authorize-the-tls-certificate) — for Axol. Mantis teleop needs no headset.
+- Install Axol with the [one-command install](/installation) on the robot's computer. For sim, a [development install](/advanced/development-install) is enough.
+- Select and connect the device. In the control panel, press **Select** on the **Axol** or **Mantis** tile. The panel brings up CAN and checks the motors when it connects. On the CLI, run [`axol can.setup`](/cli/can-setup) once.
+- For Axol, have a Meta Quest with the [TLS certificate authorized](#authorize-the-tls-certificate). Mantis teleoperation needs no headset.
+- For Mantis, finish the [hardware setup](/mantis/hardware). Tracking is not used here, so you don't need [Mantis Tracking](/mantis/tracking) yet.
 
 <Note>
-  No CAN setup or motor check is needed in **sim** — there's no hardware to talk to.
+  Sim needs no CAN setup or motor check.
 </Note>
 
 ## Authorize the TLS certificate
 
-The VR app connects over a self-signed HTTPS/WSS link, so its certificate needs a one-time approval in the headset browser — otherwise the WebSocket handshake is silently rejected.
+The VR app connects to the robot over HTTPS with a self-signed certificate. Approve it once in each headset's browser, or the connection fails without an error.
 
-The easiest way is from the app itself: when you press **Connect** and the certificate hasn't been approved yet, the connection fails and an **Authorize certificate** button appears. Tap it, proceed past the warning in the popup, and the app reconnects automatically. You only need to do this once per headset (the cert is cached in `~/.almond/vr/certs/` on the host). To approve it manually instead, open `https://<hostname>.local:8000` or `https://<local-ip>:8000` in the headset browser and proceed past the warning.
+1. In the VR app, press **Connect**.
+2. If the certificate isn't approved yet, the connection fails and an **Authorize certificate** button appears. Tap it.
+3. Proceed past the warning in the popup. The app reconnects.
+
+To approve it by hand instead, open `https://<hostname>.local:8000` or `https://<local-ip>:8000` in the headset browser and proceed past the warning.
 
 ## Run it
 
@@ -27,112 +32,149 @@ The easiest way is from the app itself: when you press **Connect** and the certi
   <Tab title="Axol">
     <Steps>
       <Step title="Connect the host and robot">
-        Open the control panel and connect the **Axol Host**. With **Axol** selected on its tile, the panel brings up the robot automatically (running `can.setup` the first time); if the tile isn't green, press **Connect** on it. For **sim**, you can skip the robot connection. See the [Web Control Panel guide](/guides/control-panel#connections) for the connect flow.
+        Open the control panel and connect the **Axol Host**. With **Axol** selected, the panel connects the robot and runs `can.setup` the first time. If the tile isn't green, press **Connect** on it. For sim, skip the robot connection. See [Connections](/guides/control-panel#connections).
       </Step>
 
-      <Step title="(Optional) assign cameras">
-        To see the robot's camera feeds in the headset, open **Axol settings → Cameras** and assign the ZED cameras to their overhead / left arm / right arm slots. Skip this for camera-free teleop. See [Cameras](/guides/control-panel#cameras).
+      <Step title="Assign cameras (optional)">
+        To see the camera feeds in the headset, open **Axol settings → Cameras** and assign the ZED cameras to the overhead, left arm and right arm slots. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Teleoperation and Start">
-        Pick **Teleoperation** from the operation selector. Toggle **sim** to drive the browser visualizer with no hardware. Press **Start**. The panel begins streaming and is ready for the headset to connect.
+        Pick **Teleoperation** from the operation selector. Turn on **sim** to drive the browser visualizer instead of the robot. Press **Start**.
       </Step>
 
       <Step title="Connect the headset">
-        Put on the Quest, open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the host's address, and press **Connect** — then **Start** to enter the session. From rest, press both grips together to engage; the [controller layout](#quest-controller-layout) below has the rest.
+        Put on the Quest and open [axol.almond.bot](https://axol.almond.bot). Enter the host's address, press **Connect**, then press **Start**. Press both grips together to engage the arms. See the [controller layout](#quest-controller-layout).
       </Step>
     </Steps>
 
-    **From the CLI**, on the robot machine:
+    **From the CLI**, on the robot's computer:
 
     ```bash
     axol teleop
     ```
 
-    For **sim**, add `--sim` — this opens a browser visualizer at [http://localhost:8002](http://localhost:8002) and runs the same VR server on port 8000, so you can drive the simulated robot from the headset exactly like the real one (great for verifying network and tracking before powering the robot):
+    To drive the sim, add `--sim`. This opens a visualizer at [http://localhost:8002](http://localhost:8002) and runs the same VR server on port 8000. Use it to check the network and tracking before you power the robot.
 
     ```bash
     axol teleop --sim
     ```
 
-    The terminal prints the hostname and IP. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset, enter either address, and press **Connect**, then **Start**.
+    The terminal prints the hostname and IP address. In the headset, open [axol.almond.bot](https://axol.almond.bot), enter either address, press **Connect**, then press **Start**.
 
     <Tip>
-      Have ZED cameras attached? Pass `--cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"` to relay the overhead and wrist feeds into the headset — all shown at once, each movable and resizable with the controllers. See [Camera views](/guides/vr-interface#camera-views).
+      To show the ZED camera feeds in the headset, pass their serial numbers: `--cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"`. You can move and resize each feed with the controllers. See [Camera views](/guides/vr-interface#camera-views).
     </Tip>
 
-    See the [`teleop`](/cli/teleop) reference for the full flag list (stiffness, gripper limits, per-joint gains, config files).
+    See [`teleop`](/cli/teleop) for every flag, including stiffness, gripper limits, per-joint gains and config files.
   </Tab>
 
   <Tab title="Mantis">
-    Mantis teleop is **grippers only, by design**: the rig triggers drive the two physical grippers over CAN, and no tracking, headset, or cameras are used. Use it to prove the hub wiring, the left/right side mapping, and gripper health. Tracked Mantis runs — pose source, engage gesture, mount transforms — are [data collection](/operations/data-collection)'s job, set up under [Mantis Tracking](/mantis/tracking).
+    Mantis teleoperation drives the two grippers from the rig triggers. It uses no tracking, headset or cameras. Use it to check the hub wiring, the left and right mapping, and the grippers. To record tracked Mantis data, use [data collection](/operations/data-collection).
 
     <Steps>
       <Step title="Select and connect Mantis">
-        Press **Select** on the **Mantis** tile; the panel connects the rigs automatically (or press **Connect**). The tile shows both grippers' CAN health. If you have not yet confirmed the side mapping, do that first — see [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
+        Press **Select** on the **Mantis** tile. The panel connects the rigs, or you can press **Connect**. The tile shows the CAN health of both grippers. If you haven't checked the side mapping yet, do that first. See [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
       </Step>
 
       <Step title="Start and check the grippers">
-        With Mantis selected only **Teleoperation** and **Collect data** are listed. Pick **Teleoperation** (there is no sim or Jelly option on Mantis) and press **Start**. Once both triggers read live and released, the grippers open to their hard stops (keep them clear), then each trigger closes its gripper proportionally. Squeeze the physical **left** trigger: if the **right** gripper moves, swap the CAN side mapping. If a trigger is fully squeezed but its gripper does not fully close, [check its full squeeze endpoint](/mantis/hardware#testing-the-triggers-and-grippers). Only a faulted gripper or a stale trigger heartbeat blocks this run; **Stop** disables both grippers.
+        Pick **Teleoperation** and press **Start**. Mantis has no sim or Jelly option.
+
+        When both triggers report in and are released, the grippers open to their hard stops. Keep your hands clear. Each trigger then closes its gripper in proportion to how far you squeeze it.
+
+        - Squeeze the **left** trigger. If the **right** gripper moves, swap the CAN side mapping.
+        - If a fully squeezed trigger doesn't fully close its gripper, [check its full-squeeze endpoint](/mantis/hardware#testing-the-triggers-and-grippers).
+
+        A faulted gripper or a trigger that stops reporting stops the run. **Stop** turns off both grippers.
       </Step>
     </Steps>
 
-    **From the CLI** (the saved **Mantis settings** channel map is used automatically):
+    **From the CLI**, using the channel map saved in **Mantis settings**:
 
     ```bash
     axol teleop --mantis
     ```
 
-    Ready to track the rigs? Finish the pose-source setup in [Mantis Tracking](/mantis/tracking), then run [Collect data](/operations/data-collection) — that operation owns the tracker bridge, the engage gesture, and the recording flow.
+    To track the rigs, finish [Mantis Tracking](/mantis/tracking), then run [data collection](/operations/data-collection).
   </Tab>
 </Tabs>
 
 ## Quest controller layout
 
-The bindings below are for Axol. (Mantis teleop uses no headset — the rig triggers drive the grippers directly. For the tracked Mantis gestures used by data collection, see [Start gesture and recovery](/mantis/tracking#start-gesture-and-recovery).)
+These bindings are for Axol. For the Mantis gestures used in data collection, see [Start gesture and recovery](/mantis/tracking#start-gesture-and-recovery).
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both 1 + 2 together to **engage** both arms; once engaged, each grip **toggles its own arm** between tracking and frozen (a frozen arm holds its pose and grasp while the other keeps going) |
-| 2 | Right grip | Same as above |
-| 3 | Left trigger | Actuate left gripper |
-| 4 | Right trigger | Actuate right gripper |
-| 5 | X | **Reset** — returns both arms to the rest pose; also retries the return out of the contact hold (below) |
-| 7 | Y | **Exit AR** — closes the VR session (the arms return to rest on the way out) |
+| 1 | Left grip | Press both grips together to **engage** both arms. After that, each grip freezes or resumes the arm on its side. |
+| 2 | Right grip | Same as the left grip. |
+| 3 | Left trigger | Close the left gripper. |
+| 4 | Right trigger | Close the right gripper. |
+| 5 | X | **Reset**: return both arms to the rest pose. Also returns the arms home from a contact hold. |
+| 7 | Y | **Exit AR**: close the VR session. The arms return to rest. |
 
-<Note>
-  **Per-arm engage.** From rest, press both grips together to start moving the arms. After that each grip is independent: a click **toggles just that arm** between tracking and frozen — a frozen arm holds its pose and keeps its gripper where it is (handy for steadying a grasped object) while the other keeps tracking. A forced disengage (reset, contact stop, or dropped link) drops both arms and needs a deliberate both-grips re-engage. Prefer a hold instead of a toggle? Turn on **Hold grips to engage** (`--teleop.hold_to_engage`): each arm moves exactly while you hold its own grip — either grip alone engages its arm, from rest too — and releasing a grip freezes that arm where it is. After a forced disengage, release a grip you were still holding before it engages again.
-</Note>
+### Engaging and freezing
 
-<Note>
-  On hardware, every return to rest — an **X** reset and the startup move — is **guarded**: a torque watchdog compares each joint against the gravity model while the move plays. If the move meets unexpected resistance (something still grasped, or you grabbing an arm), it stops where it is and the arms drop into a limp **gravity-compensation hold** — hand-guide them clear, then press **X** to replan home from wherever you left them. The hold has no timeout: if you leave VR or the link drops while the arms are limp, they stay in gravity comp (free to move by hand, never stiffening on their own) until you put the headset back on and press **X**. Tune with the **Reset contact threshold** in the control panel's **Axol settings → Robot** (`--teleop.reset_torque_threshold` on the CLI; `0` disables the watchdog). Not available in `--sim` (no torque feedback — and nothing to protect).
-</Note>
+- From rest, press both grips together to start moving the arms.
+- After that, a click on one grip freezes or resumes that arm only. A frozen arm holds its pose and its grasp, which helps steady a grasped object.
+- A reset, a contact stop or a dropped link disengages both arms. Press both grips again to re-engage.
 
-<Note>
-  **Starting needs the arms near zero.** Teleop, data collection, DAgger, run-policy and replay all refuse to start while any arm joint is more than 25° from zero — the robot's natural resting pose, where the arms settle once torqued off — and name each offending joint. The check is against zero, not the configured rest pose. Move the arms back by hand (e.g. under `axol gravity-comp`) and start again. Not applied to `collect-dagger --start_from_current_pose` (unless `--home_on_start` is also set), which never homes on start. Once the check passes, the first move goes to zero and then out to the rest pose, so it follows the same path every session whatever rest pose is configured.
-</Note>
+To move an arm only while you hold its grip, turn on **Hold grips to engage** (`--teleop.hold_to_engage`). Each grip then engages the arm on its side, from rest too, and releasing the grip freezes that arm. After a forced disengage, release any grip you were still holding before it engages again.
 
-<Note>
-  **Stopping parks the arms.** Ending the session — **Stop** in the control panel, `Ctrl+C` on the CLI — returns the arms to the rest pose and then, with **Park to zero on stop** (`--teleop.park_to_zero`, on by default), on to the all-zero joint pose, hanging straight down, holding whatever grasp was commanded; only then are the motors torqued off, so nothing drops under gravity on the way out. Both legs are the guarded return described above, capped at 6 s (rest) and 10 s (zero); if a leg runs out of time or hits something, the arms are torqued off where they are, and a second `Ctrl+C` aborts the park where it is. It is skipped when there is nothing to park or no safe way to park it: in `--sim`, when a contact hold has left the arms limp in your hands, when the IK worker that plans the path has died, or when the CAN bus has stopped reporting positions. Turn **Park to zero on stop** off to stop at the rest pose.
-</Note>
+## Safety behavior
 
-<Note>
-  **Contact stop while driving (opt-in).** The return-to-rest guard above is always on; you can also arm a watchdog for the **tracking** phase itself — while you're actively driving the arms. It's **off by default**, since teleop pushes on the scene on purpose. Set the **Teleop contact stop** in the control panel's **Axol settings → Robot** (`--teleop.teleop_torque_threshold` on the CLI; the panel suggests `16` Nm) and a sustained torque past the threshold **disengages tracking** and drops the arms into the same limp gravity-comp hold — hand-guide them clear, then press **X** to return to rest and carry on. `0` (the default) leaves it off. Hardware only.
-</Note>
+### Starting
 
-<Note>
-  **Losing the link never moves the robot.** If pose updates stop while tracking is engaged — you doff the headset, open the system menu, quit the VR app, or the link drops — the arms **auto-disengage** (freeze in place) after about half a second and then **hold position** wherever they are, for as long as it takes you to come back. Re-entering VR is inert until you deliberately re-engage (both grips), which takes a **fresh engage snapshot** — tracking resumes relative to where the arms already are, so they never snap toward wherever the controllers drifted during the gap. Press **X** when you want them back at the rest pose.
-</Note>
+Teleoperation, data collection, DAgger, run policy and replay refuse to start while any arm joint is more than 25° from zero. Zero is the pose the arms settle into when the motors are off. The error names each joint that is out of range. Move the arms back by hand, for example under `axol gravity-comp`, then start again.
 
-<Note>
-  On a robot with **Jelly**, the headset thumbsticks drive Jelly's base and lift during teleop — see [Jelly](/guides/vr-interface#jelly). Nothing to enable: Jelly is inferred from the CAN devices attached, and the Robot tab's **Jelly wheels** / **Jelly lift** switches (or [`--jelly.wheels false` / `--jelly.lift false`](/cli/teleop)) opt attached hardware out. Drive just Jelly with the arms left untouched by switching **Axol arms** off (or [`axol teleop --arms false`](/cli/teleop)).
-</Note>
+Once the check passes, the arms move to zero and then out to the rest pose. `collect-dagger --start_from_current_pose` skips this check unless `--home_on_start` is also set.
+
+### Returning to rest
+
+On the real robot, every return to rest is guarded, including the **X** reset and the first move at startup. If an arm meets resistance, such as a held object or a person, the move stops.
+
+1. The arms go limp in a **gravity-compensation hold**.
+2. Guide them clear by hand.
+3. Press **X** to plan a new return from where they are.
+
+The hold has no timeout. If you leave VR or the link drops, the arms stay limp until you put the headset back on and press **X**.
+
+Set the sensitivity with **Return-to-rest contact stop** in **Axol settings → Robot** (`--teleop.reset_torque_threshold`). `0` turns the check off. Sim has no torque feedback, so it has no guard.
+
+### Contact stop while driving
+
+You can also stop the arms when they push hard while you drive them. This check is off by default, because teleoperation often pushes on the scene on purpose. Set **Teleop contact stop** in **Axol settings → Robot** (`--teleop.teleop_torque_threshold`). The panel suggests `16` Nm.
+
+When a joint pushes past the threshold for a moment, tracking disengages and the arms go limp in the same hold. Guide them clear, then press **X** to return to rest. This works on the real robot only.
+
+### Losing the link
+
+If pose updates stop while the arms are engaged, the arms freeze in place after about half a second. This happens when you take off the headset, open the system menu, quit the VR app or lose the network. The arms hold that pose until you come back.
+
+Re-entering VR doesn't move the arms. Press both grips to re-engage, and tracking resumes from where the arms are. Press **X** to send them to the rest pose.
+
+### Stopping
+
+When you press **Stop** in the control panel or `Ctrl+C` on the CLI, the arms return to the rest pose. With **Park to zero on stop** on (`--teleop.park_to_zero`, the default), they then move to zero and hang straight down, holding their grasp. Only then do the motors turn off, so the arms don't drop.
+
+- Each move is guarded like a return to rest. The move to rest can take up to 6 s and the move to zero up to 10 s.
+- If a move times out or hits something, the motors turn off where the arms are.
+- Press `Ctrl+C` again to stop the park where it is.
+- Axol skips the park in `--sim`, while the arms are limp in a contact hold, and when the IK planner or the CAN feedback has failed.
+
+Turn off **Park to zero on stop** to stop at the rest pose.
+
+### Driving Jelly
+
+On Axol on Jelly, the thumbsticks drive Jelly's base and lift. See [Jelly](/guides/vr-interface#jelly). Axol detects Jelly from the CAN devices that are attached.
+
+- To leave attached Jelly hardware out, turn off **Jelly wheels** or **Jelly lift** in the Robot tab, or pass [`--jelly.wheels false` or `--jelly.lift false`](/cli/teleop).
+- To drive only Jelly, turn off **Axol arms**, or run [`axol teleop --arms false`](/cli/teleop).
 
 ## Network tip
 
-If VR tracking feels jittery or arrives in bursts, configure the following on your router or access point:
+If VR tracking feels jittery or arrives in bursts, set these on your router or access point:
 
 | Setting | Value |
 |---|---|
@@ -140,30 +182,30 @@ If VR tracking feels jittery or arrives in bursts, configure the following on yo
 | Beacon interval | `100` ms |
 | WMM APSD (U-APSD) | disabled |
 
-These prevent the AP from batching packets between beacon intervals, which causes intermittent latency spikes that are especially noticeable in VR.
+These settings stop the access point from holding packets between beacons, which causes latency spikes in VR.
 
 ## Latency tuning
 
-Teleop deliberately trades a little latency for smoothness: the pose stream is buffered and filtered before it reaches IK so that controller tracking glitches and network jitter don't turn into arm jitter. The defaults add roughly **100–120 ms** between your hand and the commanded arm on a clean link — the table below shows where it goes and which knob controls each stage. All of them are CLI flags (or [config-file](/cli/configuration) fields); none require code changes.
+Teleoperation smooths the pose stream before it reaches the arms, so tracking glitches and network jitter don't shake them. With the defaults, the arm lags your hand by about 100 to 120 ms on a clean link. Each setting below is a CLI flag or a [config file](/cli/configuration) field.
 
-| Knob | Default | What it buys | Latency cost |
+| Flag | Default | What it does | Delay it adds |
 |---|---|---|---|
-| `--vr_server.interp_smooth_window_s` | `0.12` | Zero-phase pose smoothing + tracking-glitch rejection (glitches up to ~half the window are erased outright) | **+60 ms**, fixed — half the window. The largest single contributor |
-| `--vr_server.interp_max_delay_s` | `0.15` | Cap on the adaptive jitter buffer that replays bursty network delivery smoothly | 0 ms on a clean link (USB, quiet Wi-Fi); grows only while the network is actually jittery, up to the cap, and decays within seconds |
-| `--teleop.pose_cutoff` | `2.5` | Tremor rejection on the raw VR poses — pole (Hz) of a linear lag-compensated low-pass (velocity feedforward cancels most of the filter's own lag) | ~40 ms effective; worst-case ~50 mm of tracking error during the fastest hand motions |
-| `--teleop.ik_alpha` | `0.3` | Smoothing of the IK output before the velocity filter | ~19 ms at the default; ~8 ms at `0.5` |
+| `--vr_server.interp_smooth_window_s` | `0.12` | Smooths the pose and removes short tracking glitches. | Half the window: 60 ms at the default. The largest delay. |
+| `--vr_server.interp_max_delay_s` | `0.15` | Caps the buffer that evens out bursty network delivery. | None on a clean link. Grows only while the network is jittery. |
+| `--teleop.pose_cutoff` | `2.5` | Filters hand tremor out of the VR poses (Hz). | About 40 ms. |
+| `--teleop.ik_alpha` | `0.3` | Smooths the joint targets. | About 19 ms at the default, 8 ms at `0.5`. |
 
-If teleop feels too laggy, adjust in this order — one knob at a time, on the real robot, since the same smoothing is what makes contact-heavy work (deburring, insertion) feel good:
+If teleoperation feels too slow, change one setting at a time, in this order, and test each on the real robot. The same smoothing makes contact-heavy work such as deburring or insertion feel steady.
 
-1. **`--vr_server.interp_smooth_window_s 0.08`** — buys back 20 ms; glitch rejection stays effective for the common short tracking glitches.
-2. **`--teleop.ik_alpha 0.4`** — a few ms, minor smoothness cost.
-3. **`--teleop.pose_cutoff 3.5`** — less pose-filter lag, but re-admits hand tremor in the band the arm's structure responds to; watch for joint jitter before keeping it.
-4. **`--vr_server.interp_smooth_window_s 0`** — disables the fixed-lag smoother entirely (pure jitter-buffer playout). Only worth it on a wired [USB connection](/guides/quest-over-usb) with a well-tracked controller.
+1. `--vr_server.interp_smooth_window_s 0.08` saves 20 ms and still removes most short glitches.
+2. `--teleop.ik_alpha 0.4` saves a few ms with little loss of smoothness.
+3. `--teleop.pose_cutoff 3.5` cuts filter delay but lets more hand tremor through. Watch for joint jitter.
+4. `--vr_server.interp_smooth_window_s 0` turns the smoother off. Use it only over a [USB connection](/guides/quest-over-usb) with well-tracked controllers.
 
 <Note>
-  The jitter buffer (`interp_max_delay_s`) self-regulates — it only adds delay while packet delivery is actually bursty, so lowering its cap mostly changes how much of a bad Wi-Fi episode gets smoothed versus played as a catch-up. If you're chasing network-induced lag, the [USB connection](/guides/quest-over-usb) and the [router settings above](#network-tip) are worth more than any knob here.
+  The network buffer only adds delay while the network is bursty. For network lag, a [USB connection](/guides/quest-over-usb) and the [router settings](#network-tip) help more than any setting here.
 
-  A stall is handled separately from jitter: a pose frame arriving more than `--vr_server.interp_max_lag_s` (default `0.5` s) later than the stream's normal transit is not played. When the headset's Wi-Fi uplink stalls for a few seconds and then drains its backlog, the arms hold instead of performing your motion seconds after you made it, then move to your current pose once on-time frames resume. The teleop log shows a warning when a stall starts (`VR pose stream arriving … late`) and when it ends (`VR pose stream on time again after …`). `0` disables the gate.
+  If the headset's Wi-Fi stalls and then delivers a backlog, the arms don't replay the late motion. They hold, then move to your current pose when on-time frames resume. A frame counts as late when it arrives more than `--vr_server.interp_max_lag_s` behind (default `0.5` s, `0` turns this off). The log shows `VR pose stream arriving … late` when a stall starts and `VR pose stream on time again after …` when it ends.
 </Note>
 
 ## Next steps

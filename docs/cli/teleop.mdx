@@ -3,69 +3,74 @@ title: "teleop"
 description: "Launch a VR teleoperation session on the robot or simulator."
 ---
 
-Launches a VR teleoperation session. When started, the hostname (`.local`) and local IP address are printed — enter either of these in the VR app at [axol.almond.bot](https://axol.almond.bot) to connect.
+Launches a VR teleoperation session. On start it prints the robot's hostname (`.local`) and local IP address. Enter either one in the VR app at [axol.almond.bot](https://axol.almond.bot) to connect.
 
-Runs on the **real robot by default**; pass `--sim` for the browser visualizer. Hardware control always uses the required `axol-rt` realtime core, which owns CAN — at 240 Hz on the default impedance controller, or at 400 Hz with `--axol.controller position`, which runs every joint on its motor's own firmware position loop (see `controller` in the [robot config](/cli/configuration)) — while Python handles VR, IK, and the slow model. The full robot config is exposed via draccus, so every gain, stiffness, and gripper limit is reachable from the CLI or a config file — see [Command configuration](/cli/configuration) for the syntax. The table below covers the commonly used flags; every field of the nested `axol`, `teleop`, `kinematics`, `vr_server`, and `cart` configs is listed with its default in [Teleoperation Config Parameters](/operations/teleop-config).
+Teleop runs on the real robot by default. Pass `--sim` to use the browser visualizer instead.
+
+On hardware, the `axol-rt` realtime core runs the arms at 240 Hz with the default impedance controller. With `--axol.controller position` it runs at 400 Hz, and each joint uses its motor's firmware position loop (see `controller` in the [robot config](/cli/configuration)).
+
+The table below lists the common flags. Every field of the nested `axol`, `teleop`, `kinematics`, `vr_server` and `cart` configs is listed with its default in [Teleoperation Config Parameters](/operations/teleop-config). See [Command configuration](/cli/configuration) for the syntax.
 
 <Tip>
-  For a guided, step-by-step walkthrough including the VR controller layout, see the [Teleoperation guide](/operations/teleop).
+  For a step-by-step walkthrough, including the VR controller layout, see the [Teleoperation guide](/operations/teleop).
 </Tip>
 
 <Warning>
-  **Before opening the VR app**, accept the self-signed HTTPS certificate in the VR browser by navigating to `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceeding past the security warning.
+  **Before opening the VR app**, accept the self-signed HTTPS certificate in the VR browser. Go to `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceed past the security warning.
 </Warning>
 
 <Note>
-  **Network tip:** If VR tracking feels jittery or packets arrive in bursts, configure the following on your router/access point:
-  - **DTIM interval** → `1`
-  - **Beacon interval** → `100` ms
-  - **WMM APSD (U-APSD)** → disabled
+  **Network tip:** If VR tracking feels jittery or packets arrive in bursts, set these on your router or access point:
+  - **DTIM interval**: `1`
+  - **Beacon interval**: `100` ms
+  - **WMM APSD (U-APSD)**: disabled
 
-  These settings prevent the AP from buffering packets between beacon intervals, which causes intermittent delivery delays that are especially noticeable for latency-sensitive VR traffic.
+  With these settings the access point stops holding packets between beacons, which delays VR traffic.
 </Note>
 
 | Flag | Description |
 |---|---|
-| `--sim` | Use the software visualizer instead of the real robot. Bare `--sim` works (or `--sim true`). Omit to run on real hardware (the default). |
-| `--mantis` | Mantis teleop — **grippers only, by design**: the rig triggers drive the two handheld grippers over CAN on the separately persisted Mantis channel mapping (default `can_mantis_l/r`, inherited from **Mantis settings**), and nothing else starts — no tracking, VR server, tracker bridge, cameras, or transforms. Both triggers must read live and released before the grippers enable (each opens fully to find its hard stop); a stale trigger stream stops the run. Tracked Mantis runs belong to [`collect-data --mantis`](/cli/collect-data), which owns the pose source and bridge. Mutually exclusive with `--sim`. |
-| `--arms BOOL` | Drive the Axol arms (default: `true`; the control panel's **Axol arms** switch, Robot tab). `false` drives **only** [Jelly](#jelly) — the arms are never constructed and the Axol hub CAN channels are never opened, so no arm hardware need be connected. The arms are also skipped automatically when their CAN interfaces are absent while Jelly's are present. Sim needs the arms on. |
+| `--sim` | Run in the browser visualizer instead of on the robot. A bare `--sim` works, as does `--sim true`. |
+| `--mantis` | Drive the two Mantis grippers from the rig triggers. Nothing else starts. See [Mantis grippers](#mantis-grippers). Can't be combined with `--sim`. |
+| `--arms BOOL` | Drive the Axol arms (default: `true`). `false` drives only [Jelly](#jelly). Control panel: **Axol arms** on the Robot tab. |
 | `--left_channel <ch\|null>` | CAN channel for the left arm; `null` disables it. Default: `CAN_LEFT`. |
 | `--right_channel <ch\|null>` | CAN channel for the right arm; `null` disables it. Default: `CAN_RIGHT`. |
-| `--jelly.wheels BOOL` | Drive [Jelly](#jelly)'s wheels when their CAN interface (`--jelly.channel`) is attached (the control panel's **Jelly wheels** switch). `false` leaves attached wheels cold. Default: `true`. |
-| `--jelly.channel <ch\|null>` | SocketCAN interface for Jelly's wheel motors; `null` disables the wheels (lift-only). Default: `can_alm_axol_b`, pinned by [`can.setup`](/cli/can-setup). |
-| `--jelly.lift BOOL` | Run the telescoping lift (the jelly_legs controller, on its own chest bus or sharing the wheel bus) when its bus is attached (the control panel's **Jelly lift** switch). `false` leaves an attached lift cold; a lift bus that is down at start only disables the lift with a warning — Jelly still drives. Default: `true`. |
-| `--jelly.lift_channel <ch\|null>` | SocketCAN interface carrying the lift controller. Default `null` follows the wiring [`can.setup`](/cli/can-setup) found: `can_alm_axol_c` when that chest bus exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the motors. |
-| `--jelly.imu BOOL` | Feed the carrier board's IMU into Jelly's straight-line heading hold as its yaw reference (independent of the cameras). Default: `false`. |
-| `--jelly.<field> VALUE` | Any other Jelly tunable — peak wheel speed (`--jelly.max_speed`), turn rate, command slew, stick deadzone, park-hold stiffness, … The full set is the `JellyConfig` dataclass, and each field also appears under **Advanced → Jelly** in the [control panel](/guides/control-panel#settings). |
-| `--axol.left_stiffness S` | Compliance blend for the left arm in `[0, 1]`. Scalar (`0.8`) or a 7-element list (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`, one per arm joint in `Joint` enum order). `1` (default) = the tuned production gains; lower only adds compliance, down to fully hand-guidable at `0`. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--jelly.wheels BOOL` | Drive Jelly's wheels when their CAN interface is attached (default: `true`). Control panel: **Jelly wheels**. |
+| `--jelly.channel <ch\|null>` | CAN interface for Jelly's wheels; `null` disables them. Default: `can_alm_axol_b`, set by [`can.setup`](/cli/can-setup). |
+| `--jelly.lift BOOL` | Run Jelly's lift when its CAN bus is attached (default: `true`). Control panel: **Jelly lift**. |
+| `--jelly.lift_channel <ch\|null>` | CAN interface for the lift. Default `null` uses `can_alm_axol_c` if it exists, otherwise the wheel bus `can_alm_axol_b`. |
+| `--jelly.imu BOOL` | Use the carrier board's IMU to hold Jelly's heading while driving straight (default: `false`). |
+| `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
+| `--axol.left_stiffness S` | Left arm stiffness, from `0` (fully hand-guidable) to `1` (default, the tuned production gains). A scalar (`0.8`) or one value per joint (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`). See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
-| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5). Use `right` for the right gripper. |
-| `--axol.gripper TYPE` | Which gripper is fitted (default: `parallel`, the stock two-finger gripper; `parcel` for the hinged-plate parcel gripper). Sets which way each jaw closes for the enable-time end-stop calibration, which refuses a measured stroke that belongs to the other type. [Box mode](/guides/vr-interface#box-mode) and all of its `--teleop.box_*` settings exist only with `parcel`. Control panel: **Robot → Gripper**. |
-| `--axol.<side>.<joint>.<gain> VALUE` | Override any per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left`/`right`; `<joint>` is `shoulder_1…wrist_3`; `<gain>` is `kp`/`kd`/etc. |
-| `--teleop.position_multiplier FLOAT` | Scale factor on hand **position** (not orientation): the end-effector target moves this many times as far as your hand. `1.0` (default) is 1:1; `2.0` moves the arm twice as far, helping cover the robot's full reach when the arm is longer than the operator's. |
-| `--teleop.rotation_multiplier FLOAT` | Scale factor on hand **orientation** (not position): the end-effector rotates this many times as far as your wrist. `1.0` (default) is 1:1; `2.0` rotates the arm twice as far. |
-| `--teleop.absolute_mode true` | Generic absolute mapping: engaging solves a world-anchored robot base from the two input poses vs the rest pose, then tracks 1:1 targets in that frame (no engage-relative deltas or elbow hints). `--sim --teleop.absolute_mode true` is useful for a protocol/mapping demo, but it does not select a Mantis source or its mount transform and is **not** a physical alignment acceptance test. Use a live [`collect-data --mantis`](/cli/collect-data) bring-up run for that. `--teleop.base_height H` optionally pins the base height above the tracking floor, in metres. |
-| `--teleop.reset_torque_threshold FLOAT` | Contact watchdog for every return-to-rest (X reset, startup move; hardware only — default: 6.0 Nm). A joint torque residual (measured minus modeled gravity) sustained above this means the move hit something, so it stops and the arms drop into a limp **gravity-compensation hold** — free them by hand, then press **X** to replan home from wherever they are. `0` disables the watchdog. |
-| `--teleop.reset_gravity_comp_kd FLOAT` | Velocity damping (Nm·s/rad) for that contact-fallback hold (default: 0.25); same semantics as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
-| `--teleop.teleop_torque_threshold FLOAT` | Contact watchdog for the **tracking** phase — while you're actively driving the arms — separate from the always-on return-to-rest guard above (hardware only). **Off by default** (`0`), since teleop pushes on the scene on purpose; set a threshold (the control panel suggests `16.0`) and a sustained torque residual past it **disengages tracking** and drops the arms into the limp gravity-comp hold (press **X** to return to rest, then re-engage). Shared with [`collect-data`](/cli/collect-data). |
-| `--teleop.hold_to_engage BOOL` | Grip scheme (default: `false`). `false` is the toggle scheme — both grips from rest engage, then each grip toggles its own arm between tracking and frozen. `true` is a **per-arm dead-man** scheme: each arm moves exactly while its own grip is held — either grip alone engages its arm, from rest too — and releasing a grip freezes that arm (pose and grasp) where it is. After a forced disengage (reset, dropped link, contact stop) a grip that is still held must be released once before it engages again. |
-| `--teleop.park_to_zero BOOL` | Shutdown park (default: `true`): on **Stop** / `Ctrl+C` the arms return to rest and then continue to the all-zero joint pose — hanging straight down — holding their grasp, before the motors are released. `false` stops the park at the rest pose. See [Stopping parks the arms](/operations/teleop). |
-| `--teleop.reengage {clutch,ramp}` | What a grip does when an arm [re-engages](/guides/vr-interface#re-engaging) after a freeze, a walk-away, or being moved by hand (default: `clutch`). `clutch`: the arm stays put and your controller's current pose becomes its origin — you match the arm. `ramp`: the arm eases out to where your controller is under the mapping from its previous engage — the arm matches you — paced by `--teleop.reengage_ramp_speed` (m/s, default `0.15`) with a `--teleop.reengage_ramp_min_s` (s, `0.75`) floor. Can also be switched live from the headset's **Ramp** HUD button or the control panel's **Session settings** card. A reset drops the mapping. Engages within box mode ignore it (they blend the pair into the grasp), but leaving box mode in `ramp` blends both arms back out to the mapping from before box mode. |
-| `--teleop.box_mode BOOL` | Start in [box mode](/guides/vr-interface#box-mode) (default: `false`; parcel gripper only — with `--axol.gripper parallel` box mode and its settings don't exist and this is ignored with a warning): the grippers clamp the box between their sides like two flat hands — level, the fitted gripper's flat contact face along each side — and **one grip drives both arms as a pair, by position and heading** (the pair stays level, turning only about vertical with the hand; the other grip hands over the lead); the thumbsticks set the grip width (left/right) while a grip leads it (freeze the pair and they drive Jelly again, see [Driving with the box](/guides/vr-interface#driving-with-the-box)). Can also be toggled live from the headset's **Box** HUD button, by clicking both thumbsticks together, or from the control panel's **Session settings** card; a switch engages at once — into box mode led by `--teleop.box_lead_hand` (`right`, or `left`), out of it with both arms. The pair's tunables are `--teleop.box_grasp` (`straight`, the default — fingers straight forward, 0° — or `flush` — each gripper turned `--teleop.box_flush_deg` (`39`°) inward about the parcel plate's front edge, onto its chamfer facet and the fixed tip, the blade at its stop as everywhere; a click of either stick while leading toggles between the two, the pair blends over), the width measured between the [parcel gripper's](/guides/vr-interface#box-tool) contact faces in both, `--teleop.box_face_left` / `box_face_right` (`auto`, `+x`, `-x`) to pin which side of a gripper faces the box, `--teleop.box_grip_tilt` (degrees, default `0` — a fixed inward yaw trim on top of the grasp's yaw, pivoting about the contact face; a calibration constant, not a live control), `--teleop.box_width_speed` (m/s, `0.08`), `--teleop.box_width_min` / `box_width_max` (m, `0.02` / `0.70`, the distance between the two contact faces; the fitted tool raises the floor, per grasp, to where the grippers' bodies would meet — with the parcel gripper the flush grasp's faces close to the floor, the straight grasp stops at ~77 mm with the wrists a centimetre apart) `--teleop.box_align_duration` (s, `1.5` — how long the engage-time blend into the parallel pair takes) and the elbows: `--teleop.box_elbow_out` (degrees from straight down, `30` to start) is how far out an IK elbow hint holds them — either thumbstick's forward/back jogs it live at `--teleop.box_elbow_speed` (°/s, `30`) — with `--teleop.box_elbow_weight` (default `10`; `0` turns the hint off, the elbows left to the arm↔torso collision model alone and the sticks' elbow control inert). `--teleop.box_squeeze_lean` (×, default `1`; `0` = off) scales the squeeze lean: each gripper's target is leaned into the box in proportion to how far the width is jogged past contact (about 1.3° of inward yaw per cm, from the arm's stiffness model) so the clamp presses evenly on the parcel gripper's facet and tip instead of the facet digging in while the tip lifts — an offset to the target, nothing on the command path; live as **Squeeze lean**. `--teleop.box_squeeze_trim` (°, default `5`; `0` = off) bounds the squeeze trim on top of it: while the grippers press, the measured toe-out of the tips (each gripper's yaw off its parallel slot, signed tip-out) is integrated, per arm and while the pair is still, into extra inward yaw of that arm's target until its measured face sits parallel to the box — closing what backlash and wrist give the lean's model misses, so the tips clamp as hard as the roots on heavy boxes; live as **Squeeze trim**. `--teleop.box_squeeze_force` (N, default `0` = off) caps the clamp force per arm: past it the targets are held at the cap's depth into the box, both arms alike, at any pose; live as **Squeeze force**. `--teleop.box_wrist_torque` (Nm, default `5`; `0` = off) caps `wrist_2` / `wrist_3`'s spring torque while box mode is on — plain teleop runs the wrists uncapped — and sets the automatic clamp-force limit (~39 N a side). `--teleop.box_squeeze_torque` (Nm, default `0` = off) is an opt-in hard per-joint backstop under it on the shoulder torque that squeezes (`shoulder_2` / `shoulder_3`) — it also slows the arm moving toward the other, which is why it's off; live as **Squeeze cap**. Both hardware (realtime core) only. |
-| `--teleop.ik_alpha FLOAT`, `--teleop.pose_cutoff FLOAT` | The pose/IK smoothing filters — the smoothness↔latency trade. See [Latency tuning](/operations/teleop#latency-tuning) for what each costs and the recommended adjustment order. Defaults: `0.3` / `2.5`. Mantis raises the pose cutoff to `5.0` (transparent smoothing — there is no physical arm to protect). |
-| `--teleop.record PREFIX` | Capture the whole teleop pipeline to `PREFIX_{ik,cmd,meas,rt}.npz` for offline jitter attribution with [`diag.teleop-jitter`](/cli/diag-teleop-jitter). The `rt` stage automatically includes the Rust core's actual 240 Hz motor command, command derivatives, individual gravity/friction/inertia/damping torques, loop timing, and feedback—no separate environment variable is needed. Captures the latest engage→disengage segment: Python stages write at disengage, the compact Rust stage finalizes when the core disarms, and re-engaging starts over. Unset records nothing. |
-| `--vr_server.interp_smooth_window_s FLOAT`, `--vr_server.interp_max_delay_s FLOAT` | The VR pose stream's fixed-lag smoothing window (glitch rejection; adds half the window as latency — default `0.12` ≈ +60 ms) and the adaptive jitter-buffer cap (only spent while the network is actually bursty — default `0.15`). See [Latency tuning](/operations/teleop#latency-tuning). |
-| `--vr_server.interp_max_lag_s FLOAT` | Late-frame gate: pose frames arriving more than this many seconds behind the stream's normal transit are not played, so after a Wi-Fi stall the arms hold and then follow your current pose instead of replaying the delayed motion (default `0.5`; `0` disables). See [Latency tuning](/operations/teleop#latency-tuning). |
-| `--cameras DICT` | Map camera slots to the serial numbers of locally attached ZED cameras, e.g. `--cameras "{overhead: 41234567, left_arm: 41234568}"` (any of `overhead` / `left_arm` / `right_arm`). When set, teleop opens those cameras and relays them to the headset over WebRTC (overhead + both wrist views shown at once, each freely moved and resized). Stereo ZED X cameras are detected automatically from their serial: a stereo overhead is relayed as a single side-by-side track, `overhead_sbs` (both eyes packed into one stream), rendered per-lens on the headset, while a stereo wrist streams a single eye under its slot name (one feed, like a mono camera). Requires `pyzed` ([`zed.install`](/cli/zed-install)) and the GStreamer NVENC stack ([`gst.install`](/cli/gst-install)). Default: `{}` (no headset video). |
-| `--camera_eyes DICT` | Override which eye(s) of a **stereo** slot are streamed to the headset, keyed by slot: `--camera_eyes "{overhead: both, left_arm: left}"` (`both` / `left` / `right`). Unset slots fall back to the default policy — overhead streams both eyes (packed side-by-side, rendered per-lens), wrists stream their left eye. Ignored for mono slots. Default: `{}`. |
+| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5). Use `right` for the right gripper. |
+| `--axol.gripper TYPE` | Fitted gripper: `parallel` (default, the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Control panel: **Gripper** on the Robot tab. |
+| `--axol.<side>.<joint>.<gain> VALUE` | Override a per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left` or `right`, `<joint>` is `shoulder_1` to `wrist_3`, and `<gain>` is `kp`, `kd` and so on. |
+| `--teleop.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand, which helps cover the arm's full reach. |
+| `--teleop.rotation_multiplier FLOAT` | Scale hand rotation by this factor (default: `1.0`). At `2.0` the gripper turns twice as far as your wrist. |
+| `--teleop.absolute_mode true` | Track hand poses 1:1 in a fixed robot frame solved at engage, instead of moving relative to the engage pose. For sim demos of the mapping only. |
+| `--teleop.base_height H` | With `absolute_mode`, fix the robot base height above the tracking floor, in metres. |
+| `--teleop.reset_torque_threshold FLOAT` | Contact limit (Nm) for every return to rest (default: 6.0). `0` turns it off. See [Contact stops](#contact-stops). |
+| `--teleop.reset_gravity_comp_kd FLOAT` | Damping (Nm·s/rad) while the arms hang limp after a contact stop (default: 0.25). Same as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
+| `--teleop.teleop_torque_threshold FLOAT` | Contact limit (Nm) while you drive the arms (default: `0`, off). The control panel suggests `16.0`. |
+| `--teleop.hold_to_engage BOOL` | `true` makes each grip a hold-to-move switch for its arm (default: `false`, toggle). See [Engaging](#engaging). |
+| `--teleop.park_to_zero BOOL` | On **Stop** or `Ctrl+C`, move the arms from rest on to the all-zero pose before releasing the motors (default: `true`). See [Stopping parks the arms](/operations/teleop). |
+| `--teleop.reengage {clutch,ramp}` | What an arm does when you [re-engage](/guides/vr-interface#re-engaging) it (default: `clutch`). See [Engaging](#engaging). |
+| `--teleop.box_mode BOOL` | Start in [box mode](/guides/vr-interface#box-mode) (default: `false`). Parcel gripper only. See [Box mode settings](#box-mode-settings). |
+| `--teleop.ik_alpha FLOAT`, `--teleop.pose_cutoff FLOAT` | Pose and IK smoothing filters, which trade smoothness for latency (defaults: `0.3` / `2.5`). See [Latency tuning](/operations/teleop#latency-tuning). |
+| `--teleop.record PREFIX` | Record the teleop pipeline to `PREFIX_{ik,cmd,meas,rt}.npz` for [`diag.teleop-jitter`](/cli/diag-teleop-jitter) or [`motion.build`](/cli/motion-build). Unset records nothing. |
+| `--vr_server.interp_smooth_window_s FLOAT`, `--vr_server.interp_max_delay_s FLOAT` | VR pose smoothing window (default: `0.12`, which adds about 60 ms) and jitter-buffer cap (default: `0.15`). See [Latency tuning](/operations/teleop#latency-tuning). |
+| `--vr_server.interp_max_lag_s FLOAT` | Skip pose frames that arrive more than this many seconds late (default: `0.5`; `0` turns it off). After a Wi-Fi stall the arms hold, then follow your current pose. |
+| `--cameras DICT` | Map camera slots (`overhead`, `left_arm`, `right_arm`) to ZED serial numbers to stream them to the headset. Default: `{}` (no video). See [Camera streaming](#camera-streaming-to-the-headset). |
+| `--camera_eyes DICT` | Which eyes of a stereo camera to stream, by slot: `both`, `left` or `right`. Default: `{}`. |
 | `--resolution {SVGA,HD1080,HD1200}` | Capture resolution for all cameras. Default `null`: each camera's SDK default (HD1200 on GMSL). |
-| `--kinematics.<field> VALUE` | Override an IK solver cost weight or solver parameter, e.g. `--kinematics.pos_weight 100` or `--kinematics.max_joint_delta 0.02`. See [`almond_axol.kinematics`](/api/kinematics) for every field and its default. |
-| `--vr_server.port INT` | Port for the VR teleop WebSocket server (default: 8000). The TLS cert/key paths live here too (`--vr_server.certfile`, `--vr_server.keyfile`); `null` (the default) uses the auto-generated cert. |
+| `--kinematics.<field> VALUE` | Override an IK weight or solver setting, e.g. `--kinematics.pos_weight 100`. See [`almond_axol.kinematics`](/api/kinematics) for every field. |
+| `--vr_server.port INT` | Port for the VR WebSocket server (default: 8000). `--vr_server.certfile` and `--vr_server.keyfile` set a TLS cert; the default `null` uses a generated cert. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
-| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. See [Command configuration](/cli/configuration). |
-| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it (`~/.almond/settings.json` applies by default, beneath `--config_path` and the flags). |
+| `--config_path PATH` | Load a whole-config JSON/YAML file. Flags override it. See [Command configuration](/cli/configuration). |
+| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. By default `~/.almond/settings.json` applies, beneath `--config_path` and the flags. |
 
-To verify the effective loop rather than trusting its console log, leave the [Diagnostics dashboard](/guides/diagnostics-dashboard#control-loop-and-can-timing) open while teleop runs. Its passive CAN timing graph measures command/feedback rate, jitter, response latency, and missed 240 Hz deadlines with kernel timestamps.
+To check the real control loop rate while teleop runs, open the [Diagnostics dashboard](/guides/diagnostics-dashboard#control-loop-and-can-timing). Its CAN timing graph shows command and feedback rate, jitter, response latency and missed 240 Hz deadlines.
 
 ```bash
 axol teleop                                       # real robot
@@ -85,24 +90,102 @@ axol teleop --config_path my_teleop.json          # whole-config file
 axol teleop --no_settings                          # ignore ~/.almond/settings.json (panel settings)
 ```
 
+## Engaging
+
+With the default toggle scheme (`--teleop.hold_to_engage false`):
+
+- From rest, squeeze both grips to engage.
+- After that, each grip toggles its arm between tracking and frozen.
+
+With `--teleop.hold_to_engage true`:
+
+- Each arm moves only while you hold its grip. Either grip alone engages its arm, including from rest.
+- Releasing a grip freezes that arm, pose and grasp, where it is.
+- After a forced disengage (a reset, a dropped link or a contact stop), release a held grip once before it engages again.
+
+`--teleop.reengage` sets what happens when an arm re-engages after a freeze, a walk-away or being moved by hand:
+
+- `clutch` (default): the arm stays put, and your controller's current pose becomes its new origin. You match the arm.
+- `ramp`: the arm eases out to where your controller is, using the mapping from its last engage. The arm matches you. `--teleop.reengage_ramp_speed` sets the pace (default `0.15` m/s), and `--teleop.reengage_ramp_min_s` sets the shortest ramp (default `0.75` s).
+
+You can also switch it live with the headset's **Ramp** button or the control panel's **Session settings** card. A reset clears the saved mapping. Engaging in box mode ignores this setting. Leaving box mode in `ramp` blends both arms back to the mapping from before box mode.
+
+`--teleop.absolute_mode true` doesn't select a Mantis source or its mount transform, so it is not a test of physical alignment. To check alignment, run [`collect-data --mantis`](/cli/collect-data).
+
+## Contact stops
+
+Two torque watchdogs stop the arms when they hit something. Each compares every joint's measured torque with the gravity model. When the difference stays above the limit, the move stops and the arms go limp in a gravity-compensation hold. Both work on hardware only.
+
+- **Return to rest** (`--teleop.reset_torque_threshold`, on by default): guards the startup move and every **X** reset. Free the arms by hand, then press **X** to plan the return from where they are.
+- **Tracking** (`--teleop.teleop_torque_threshold`, off by default): guards the arms while you drive them. A stop disengages tracking. Press **X** to return to rest, then engage again. The same setting applies to [`collect-data`](/cli/collect-data).
+
+Raise a limit if normal moves trip it. Set it to `0` to turn the watchdog off.
+
+## Mantis grippers
+
+`axol teleop --mantis` drives only the two handheld grippers, from the rig triggers. It doesn't start tracking, the VR server, the tracker bridge, cameras or transforms. To record tracked Mantis data, use [`collect-data --mantis`](/cli/collect-data).
+
+- The grippers use the Mantis CAN channels saved in **Mantis settings** (default `can_mantis_l` and `can_mantis_r`).
+- Both triggers must be reading and released before the grippers turn on. Each gripper then opens fully to find its end stop.
+- If the trigger stream goes stale, the run stops.
+
+## Box mode settings
+
+[Box mode](/guides/vr-interface#box-mode) needs the parcel gripper (`--axol.gripper parcel`). With the parallel gripper, box mode and its settings don't exist, and `--teleop.box_mode` is ignored with a warning.
+
+In box mode the grippers clamp a box between their flat faces, like two hands. One grip drives both arms as a pair, by position and by heading about the vertical. The other grip takes over the lead. While a grip leads, the thumbsticks set the grip width. Freeze the pair and the thumbsticks drive Jelly again (see [Driving with the box](/guides/vr-interface#driving-with-the-box)).
+
+To switch box mode on or off during a session, press the headset's **Box** button, click both thumbsticks together, or use the control panel's **Session settings** card. The switch engages right away.
+
+| Flag | Description |
+|---|---|
+| `--teleop.box_lead_hand` | Hand that leads when box mode turns on: `right` (default) or `left`. |
+| `--teleop.box_grasp` | `straight` (default, fingers point straight forward) or `flush` (each gripper turned inward onto the plate's chamfer). Click either stick while leading to switch. |
+| `--teleop.box_flush_deg` | How far the flush grasp turns each gripper inward (default: `39`°). |
+| `--teleop.box_face_left` / `box_face_right` | Which side of each gripper faces the box: `auto` (default), `+x` or `-x`. |
+| `--teleop.box_grip_tilt` | Fixed inward yaw trim in degrees (default: `0`). A calibration value, not a live control. |
+| `--teleop.box_width_speed` | How fast the thumbsticks change the width (default: `0.08` m/s). |
+| `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0.02` / `0.70` m). The gripper bodies raise the minimum. The straight grasp stops at about 77 mm. |
+| `--teleop.box_align_duration` | Time to blend into the pair when box mode engages (default: `1.5` s). |
+| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `30`). Push either thumbstick forward or back to adjust it live. |
+| `--teleop.box_elbow_speed` | How fast the thumbsticks move the elbows (default: `30`°/s). |
+| `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and the thumbsticks don't move the elbows. |
+| `--teleop.box_squeeze_lean` | Lean each gripper into the box as you squeeze, so the face presses evenly from root to tip (default: `1`; `0` is off). Live control: **Squeeze lean**. |
+| `--teleop.box_squeeze_trim` | Largest extra inward turn, in degrees, added while squeezing to square each face to the box (default: `5`; `0` is off). Live control: **Squeeze trim**. |
+| `--teleop.box_squeeze_force` | Clamp force cap per arm, in N (default: `0`, off). Live control: **Squeeze force**. |
+| `--teleop.box_wrist_torque` | Torque cap (Nm) on `wrist_2` and `wrist_3` in box mode (default: `5`; `0` is off). It also sets the automatic clamp force limit, about 39 N a side. |
+| `--teleop.box_squeeze_torque` | Torque cap (Nm) on the squeezing shoulder joints, `shoulder_2` and `shoulder_3` (default: `0`, off). It also slows the arms moving toward each other. Live control: **Squeeze cap**. |
+
+The wrist and shoulder torque caps work on hardware only.
+
 ## Camera streaming to the headset
 
-With `--cameras` set, teleop opens the locally attached ZED cameras by serial number and relays them to the headset over WebRTC, so the operator sees the robot's cameras instead of (or alongside) passthrough. All streamed feeds show at once and can be moved and resized with the controllers — see the [VR Interface guide](/guides/vr-interface#camera-views) for the layout and controls. Requires `pyzed` ([`zed.install`](/cli/zed-install)) and the GStreamer NVENC stack ([`gst.install`](/cli/gst-install) — the hosted installer runs it).
+With `--cameras` set, teleop opens the ZED cameras attached to the robot by serial number and streams them to the headset over WebRTC. All feeds show at once, and you can move and resize each one with the controllers. See the [VR Interface guide](/guides/vr-interface#camera-views) for the layout.
 
-Teleop and [`collect-data`](/cli/collect-data) share one **GPU-resident** video path (`almond_axol.video.gst_zed`): the zed-gstreamer source elements (`zedxonesrc` mono / `zedsrc` stereo) grab and **NVENC**-encode (`nvvidconv` → `nvv4l2h264enc`) entirely on the GPU, and Python only ever sees the encoded H.264 access units — which **aiortc** forwards as pre-encoded packets (RTP/SRTP/ICE + SDP signaling), with no Python encode step. The headset branch is fixed at 30 fps; camera capture remains independent and may run faster for dataset recording or policy observations. Stereo ZED X cameras are auto-detected from their serial: a **stereo overhead** grabs both eyes on one pass and is relayed as a single side-by-side source, `overhead_sbs` (both eyes packed into one track — one decoder session on the headset), rendered per-lens, while a **stereo wrist** is relayed as a single source under its slot name (one feed, like a mono camera). When the gst stack is unavailable the path falls back to the ZED SDK grab (`almond_axol.video.zed_sdk`, no `lerobot` dependency) plus in-Python NVENC (`almond_axol.video.hw_video`), which streams the overhead as the two per-eye sources `overhead_left` / `overhead_right` instead.
+- Streaming needs `pyzed` ([`zed.install`](/cli/zed-install)) and the GStreamer hardware encoder stack ([`gst.install`](/cli/gst-install)). The hosted installer sets up both.
+- The headset stream runs at 30 fps. Cameras can capture faster for recording or policies.
+- Stereo ZED X cameras are detected from their serial number. A stereo overhead camera streams both eyes and shows each eye to its own lens. A stereo wrist camera streams one eye, like a mono camera. Use `--camera_eyes` to change this.
+- Without the GStreamer stack, teleop falls back to the ZED SDK.
+- If no hardware encoder is present, the video is encoded in software. Use `--resolution SVGA` in that case.
 
-The whole relay — camera grab/encode plus WebRTC sending — runs in a **dedicated subprocess** (`almond_axol.video.video_proc`), the same isolation pattern used for the IK solver: it keeps the camera pump off the teleop process so the control loops stay at full rate. Only SDP signaling crosses the process boundary.
-
-For low-latency encode the NVENC/VIC engine clocks must be pinned to their maximum (the default Jetson devfreq governor scales them for throughput, not latency, which roughly triples per-frame encode time). This is handled by [`axol provision`](/cli/provision) (see [`jetson.setup`](/cli/jetson-setup)) and re-applied at boot by the installer's systemd unit — not at teleop startup. If no GStreamer hardware encoder is present at all, aiortc falls back to software H.264 — `SVGA` is then the recommended resolution.
+The video runs in a separate process, so it doesn't slow the control loop. [`axol provision`](/cli/provision) pins the Jetson's encoder clocks to their maximum for low latency.
 
 <a id="jelly"></a>
 
 ## Jelly
 
-Robots fitted with **Jelly** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Nothing needs enabling: Jelly is **inferred from the CAN devices attached** — the wheels are driven when their interface (`can_alm_axol_b`) exists, the lift when its bus does (`can_alm_axol_c`, or the shared wheel bus). [`can.setup`](/cli/can-setup) and the control panel's automatic CAN discovery pin those names. `--jelly.wheels false` / `--jelly.lift false` (the control panel's **Jelly wheels** / **Jelly lift** switches) keep attached hardware cold; the other parameters live in the nested `jelly` config (`--jelly.max_speed`, `--jelly.channel`, `--jelly.imu`, …). Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
+When Axol is on **Jelly** (an omni-wheel base with a telescoping lift), you can drive it from the headset thumbsticks. The left stick moves, the right stick turns, and the stick clicks run the lift. For the full controls see the [VR interface guide](/guides/vr-interface#jelly).
 
-`--arms false` runs *just* Jelly: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive Jelly without the arm hardware connected. The same happens on its own when the arm hub's interfaces are absent but Jelly's are present (a warning says so). Jelly brings its own CAN interface up on start, so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#jelly).
+Teleop finds Jelly from the attached CAN devices:
+
+- It drives the wheels when their interface (`can_alm_axol_b`) exists.
+- It runs the lift when its bus exists (`can_alm_axol_c`, or the shared wheel bus). If the lift bus is down at start, the lift is disabled with a warning and the wheels still drive.
+- [`can.setup`](/cli/can-setup) and the control panel's CAN discovery set these names. Teleop brings Jelly's CAN up on start, so you don't need [`can.enable`](/cli/can-enable).
+
+To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift false` (the control panel's **Jelly wheels** and **Jelly lift** switches). Jelly motion is never recorded into a dataset, and a policy never drives it.
+
+`--arms false` drives only Jelly. Teleop doesn't start the arms or open the Axol hub's CAN bus, so the arms don't need to be connected. Teleop does the same, with a warning, when the arms' CAN interfaces are missing and Jelly's are present.
 
 <Note>
-  This command takes its config via draccus, not fixed `argparse` flags. Field names use underscores, nested fields are dot-separated, `None` is `null`, and lists use `[a,b,c]` — see [Command configuration](/cli/configuration) for the full model.
+  This command takes its config through draccus. Field names use underscores, nested fields are separated by dots, `None` is `null`, and lists use `[a,b,c]`. See [Command configuration](/cli/configuration).
 </Note>

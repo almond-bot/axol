@@ -1,13 +1,9 @@
 ---
 title: "can.enable"
-description: "Manually re-run the CAN interface bring-up."
+description: "Bring the CAN interfaces up by hand."
 ---
 
-Re-runs the CAN startup script to configure and bring up the interfaces. Normally you don't need it: [`can.setup`](/cli/can-setup) registers a `@reboot` cron hook **and** a hotplug service that re-runs the bring-up whenever the Axol Hub (re-)enumerates, so both reboots and mid-session replugs recover on their own. It remains useful as a manual fallback (e.g. after stopping the interfaces yourself, or on a machine set up with an older `can.setup` that lacked the hotplug service). Requires [`can.setup`](/cli/can-setup) to have been run first.
-
-For setups without the Axol Hub CAN adapter, pass `--channels` to bring up other SocketCAN interfaces directly — one for a single arm, two for both. This skips the hub startup script (no `can.setup` needed): each named interface is configured (1 Mbit/s bitrate, txqueuelen) and brought up; interfaces already up are left untouched.
-
-The startup script also brings up [Jelly](/guides/vr-interface#jelly)'s pinned wheel bus (`can_alm_axol_b`) and, when the lift controller has its own adapter, the chest bus (`can_alm_axol_c`); a lift sharing the wheel bus rides `can_alm_axol_b` and needs no extra interface. It skips any interface — arm hub, Jelly, or chest — that isn't attached, so every hardware combination (Jelly-only, arm-only, all of them) comes up cleanly. You rarely need to run this for Jelly or its lift anyway: [`axol teleop`](/cli/teleop) brings their interfaces up itself when it starts.
+Brings up the CAN interfaces that [`can.setup`](/cli/can-setup) configured. You rarely need it, because the interfaces come up on every boot and whenever an adapter is plugged back in. Use it after you take the interfaces down yourself, or if they didn't come back after a replug. Run [`can.setup`](/cli/can-setup) first.
 
 ```bash
 axol can.enable                      # every configured Axol/Mantis interface
@@ -15,5 +11,8 @@ axol can.enable --channels can0      # one non-hub adapter
 axol can.enable --channels can0 can1 # two adapters / channels
 ```
 
-No hardware-profile flag is needed: the command runs every startup profile
-created by `can.setup`, skipping adapters that are currently unplugged.
+With no flags, `can.enable` brings up every interface `can.setup` configured: the arms, Mantis, and [Jelly](/guides/vr-interface#jelly)'s wheel and lift buses. It skips any adapter that is unplugged. [`axol teleop`](/cli/teleop) also brings up Jelly's interfaces when it starts.
+
+## Adapters other than the Axol Hub
+
+Pass `--channels` with one interface for a single arm, or two for both. `can.enable` sets each one to 1 Mbit/s and brings it up. Interfaces that are already up are left alone. This form doesn't need `can.setup`.

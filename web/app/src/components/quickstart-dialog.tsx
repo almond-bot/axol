@@ -4,7 +4,7 @@ import { Check, Copy, Rocket, X } from "lucide-react"
 
 const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
   {
-    label: "Run on the robot machine",
+    label: "Run on the robot's computer",
     cmd: "curl https://axol.almond.bot/install -fsS | bash",
   },
 ]
@@ -54,8 +54,8 @@ export function QuickstartDialog({ open, onClose }: { open: boolean; onClose: ()
             </div>
           ))}
           <p className="text-xs text-white/45">
-            Then press <span className="text-white/70">Connect</span> and enter the machine&apos;s
-            IP.
+            Then press <span className="text-white/70">Connect</span> and enter the computer&apos;s
+            IP address.
           </p>
         </div>
       </div>

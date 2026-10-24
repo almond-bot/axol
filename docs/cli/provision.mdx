@@ -1,87 +1,112 @@
 ---
 title: "provision"
-description: "Install or refresh the native and non-PyPI pieces — the required axol-rt control core, Lighthouse tracking, Quest USB, and ZED cameras."
+description: "Install the system pieces Axol needs beyond the Python package, such as axol-rt and camera drivers."
 ---
 
-Installs and refreshes the pieces `uv tool install` can't manage on its own:
-
-- **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
-- [`tracker.install`](/cli/tracker) — a pinned **libsurvive** build and Vive USB permissions for Mantis Lighthouse tracking.
-- [`zed.driver`](/cli/zed-driver) — replaces a ZED Box's outdated factory **GMSL camera driver** (`stereolabs-zedbox-duo` on the Duo, `stereolabs-zedbox-mini` on the Mini, `stereolabs-zedlink-duo` for a ZED Link Duo card on a Jetson AGX Orin) with the release pinned for the ZED SDK. Takes effect at boot, so provisioning ends in a reboot (see below). A no-op on a host with no Stereolabs driver package installed; warns about a Stereolabs driver package it has no pin for.
-- **board IMU** (`gyro.install`) — grants the `imu` group access to the carrier board's BMI088 sampling timer, [Jelly](/guides/vr-interface#jelly)'s heading-hold yaw reference, so teleop can start it without root. Self-gates on the board driver's presence.
-- **CAN e-stop purge grant** — writes `/etc/sudoers.d/50-axol-can-purge` so a manual `axol serve` / `axol teleop` can flap a CAN interface without a password when motor power dies. The realtime core purges the interface's queued position commands the moment it declares the bus stalled; without this grant that escalation fails on a non-root session, the frames survive, and the arm jerks to its pre-e-stop command on the next bring-up (see [`can.setup`](/cli/can-setup)). The rule covers only the root-owned reset and bring-up scripts (the arm hub is USB-reset, since its firmware keeps frames a flap cannot reach) and the named CAN interfaces, and is checked with `visudo` before it is installed. Takes effect immediately.
-- **real-time scheduling grant** — writes `/etc/security/limits.d/50-axol-rtprio.conf` so your login can run the control loop and the camera relay's capture chain `SCHED_FIFO` from a manual `axol serve` / `axol teleop` (the systemd unit already has `LimitRTPRIO`). Login shells otherwise start with an `rtprio` limit of zero, and then:
-  - **the control loop refuses to start** — `axol teleop`, `collect-data`, `collect-dagger` and `run-policy` raise `refusing to run without real-time scheduling` rather than run a loop that lands roughly one tick in fifty 15–65 ms late (felt as the arms hitching and lunging, and masked by turning the cameras off). Set `AXOL_ALLOW_CFS_CONTROL=1` to run degraded anyway.
-  - **the relay silently falls back to CFS** — `camera capture threads stay SCHED_OTHER` at startup, and recordings under load discard episodes on skipped exposures.
-
-  Takes effect at your **next login**; check with `ulimit -r` (should print `20`).
-
-  <Warning>
-  Only **PAM** applies this file, so it reaches a normal `ssh` login and nothing else. A session that bypasses PAM — **Tailscale SSH** (and terminals tunnelled over it), or a systemd unit without `LimitRTPRIO` — inherits its parent's limit of zero no matter how many times you run `axol provision`. `provision` fixes this for you: when the session it runs in can't use the grant, it raises the limit in place (`prlimit`, with the sudo it already holds) on every ancestor process you own — your shell and the terminal host above it (an IDE's `node`, `tmux`), so later commands from that shell and new terminals from that host inherit it. It stops at processes owned by another account (`sshd`, `tailscaled`), which it leaves alone, and the fix lasts as long as those processes do; a fresh `ssh` login gets it from the grant. Only when it can't escalate does it fall back to naming the ancestor the limit came from and both manual ways out: reconnect over `ssh`, or run `sudo prlimit --pid $$ --rtprio=20:20` in that shell. The check stays silent when run as root (the curl installer, the systemd unit): root holds `CAP_SYS_NICE`, which bypasses `RLIMIT_RTPRIO` entirely, so root's own limit of zero is normal and harmless. Note `axol-rt` is unaffected either way — `rt.install` gives the binary `cap_sys_nice`, so the CAN loops stay real-time while the Python control loop is not.
-  </Warning>
-- [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
-- [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
-- [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
-- [`rt.install`](/cli/rt-install) — the required **`axol-rt` realtime core** hardware-control binary (Rust toolchain via rustup if needed; sources fetched at the installed package's exact ref on tool installs). Self-gates on network/toolchain availability.
-- [`ik.warm`](/cli/ik-warm) — the **IK solver's first compile** for this robot's model, so the first session after an install or update starts without the ~1 min compile. Optional: a failure only warns.
-- **shared install permissions** — on a hosted install (`/opt/axol`), re-applies the installer's `chmod -R a+rX` to the uv tool and Python trees holding the running `axol`, so the operator's own login can still run it after a control-panel self-update (which reinstalls under `axol serve`'s `027` umask and would otherwise leave `axol: command not found`). Root only, and only on the trees that actually hold this install; runs after every step that writes into the tool env.
+Installs the parts of Axol that `uv tool install` can't manage: system packages, drivers, permissions and the `axol-rt` control core. Run it after you install or update `axol`. It is safe to run on any computer and to run again at any time.
 
 ```bash
 axol provision
 ```
 
-Every step is idempotent and best-effort by default — failures are logged while
-the remaining steps continue, and optional hardware steps self-gate on the ZED
-SDK / `apt` / NVENC — so plain `axol provision` is safe to run on any host and
-re-run anytime.
+Run it from your normal login. It asks for your `sudo` password once, for the steps that need root. Without a working `sudo`, it exits with a message.
 
-Use the strict form when the required control core must be present:
+## What it installs
+
+Steps that don't apply to the computer, such as camera steps on a computer without a ZED SDK, are skipped.
+
+| Step | What it does |
+|---|---|
+| **adb** | Installs adb and the Quest udev rule for [Quest over USB](/guides/quest-over-usb). |
+| [`tracker.install`](/cli/tracker) | Installs libsurvive and Vive USB permissions for Mantis Lighthouse tracking. |
+| [`zed.driver`](/cli/zed-driver) | Updates a ZED Box's GMSL camera driver to the version the ZED SDK needs. Takes effect after a reboot. |
+| **Board IMU** (`gyro.install`) | Lets teleop read the carrier board's IMU without root. [Jelly](/guides/vr-interface#jelly) uses it to hold its heading. |
+| **CAN e-stop recovery** | Lets a manual `axol serve` or `axol teleop` reset the CAN interfaces after an emergency stop. See [`can.setup`](/cli/can-setup#recovery-after-an-emergency-stop). |
+| **Real-time scheduling** | Lets your login run the control loop and camera capture at real-time priority. Takes effect at your next login. See [Real-time scheduling](#real-time-scheduling). |
+| [`zed.install`](/cli/zed-install) | Installs the pyzed bindings for the ZED SDK. |
+| [`gst.install`](/cli/gst-install) | Installs GStreamer and PyGObject for the camera relay. |
+| [`gst.build-zed`](/cli/gst-build-zed) | Builds the patched ZED GStreamer plugins, so camera images line up with joint data. |
+| [`rt.install`](/cli/rt-install) | Builds and installs the `axol-rt` control core. **Required.** |
+| [`ik.warm`](/cli/ik-warm) | Compiles the IK solver ahead of time, so your first session doesn't wait about a minute. |
+| **Shared install permissions** | On a hosted install (`/opt/axol`), keeps `axol` runnable from your login after a control panel update. |
+| **Host tuning** | Applies the Jetson power, clock and CPU settings. See [Host tuning](#host-tuning). |
+
+On a computer without the ZED SDK at `/usr/local/zed`, the pyzed and ZED GStreamer steps are skipped. The GStreamer steps are also skipped on computers that aren't Jetsons. Everything else, including `axol-rt`, is installed on any Linux computer.
+
+## Exit codes
+
+`provision` runs every step even when one fails, then reports what failed.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every step succeeded or was skipped. |
+| `1` | `axol-rt` failed to install. Axol can't control hardware until you fix it. |
+| `3` | Only optional steps failed. The last line lists them (`Optional provisioning steps failed: ...`). Axol runs without them. |
+
+When `axol serve` runs `provision` during an update, it exits `0` if only optional steps failed. The update still goes ahead, and the control panel shows the missing steps as a warning.
+
+`--require-rt` is accepted for compatibility. `provision` already exits `1` when `axol-rt` fails.
 
 ```bash
 axol provision --require-rt
 ```
 
-`--require-rt` leaves the optional steps best-effort but makes the command exit
-non-zero if [`rt.install`](/cli/rt-install) fails. The hosted installer and the
-[`axol serve`](/cli/serve) self-updater use this form, so an RT build or
-capability-setup failure aborts installation or blocks the restart onto updated
-code. Both still share this single provisioning path, keeping their steps in
-lockstep.
+### If apt fails
 
-When only optional steps fail (Lighthouse tracking, the patched zed-gstreamer
-plugins, adb, ...), the last line names them (`Optional provisioning steps
-failed: ...`) and the command exits `3`. The installer then finishes with a
-warning instead of aborting. A provision run by `axol serve` exits `0` in that
-case, so an update still restarts onto the new release, and the control panel
-shows the missing steps as a warning. A failed `rt.install` exits `1`.
+`provision` never interrupts `apt-get` or `dpkg`, even if `axol.service` restarts. If an install fails, the log names the package `dpkg` couldn't process. Repair it, then run `provision` again:
 
-Every `apt-get` / `dpkg` run is protected from interruption: it never times
-out, and it runs in its own session and systemd scope, so a stopped or
-restarted `axol.service` or a timed-out update leaves it to finish. A package
-manager killed partway leaves dpkg half-configured, and every later install on
-the host then fails. When apt fails, the log names the package dpkg could not
-process. Repair it with `sudo dpkg --configure -a`, then re-run `axol
-provision`.
+```bash
+sudo dpkg --configure -a
+axol provision
+```
 
-Provisioning holds the host-wide update lock, which is root-only. Run from a terminal as a regular user, the steps still execute as that user (their `uv`, download caches, and Python environment) and only a small lock-holder process escalates via `sudo` (one password prompt, shared with the steps that need root). Without a usable `sudo` the command exits with a message instead of a traceback.
+## Real-time scheduling
 
-- **host tuning** — last, the runtime tuning for the host it runs on, detected from what the host exposes. On a Jetson (Orin NX 16GB, AGX Orin, Thor T5000): the max power mode, the NVENC/VIC/GPU and CPU clock pins, the CAN adapters' interrupt steered onto a CAN core, and the Argus camera daemon run `SCHED_FIFO` on the camera cores — see [`jetson.setup`](/cli/jetson-setup) for why each matters. On a Raspberry Pi 5 or a workstation there is nothing to tune. Either way it logs the board and the CPU core layout the control, IK, CAN, camera and recorder work will pin to, e.g. `core layout: 14 cores online: CAN 12-13, control 2, IK 3, relay 4-5, recorder 10-11, camera 0-1,5-9`.
+The control loop needs real-time priority. Without it, `axol teleop`, `collect-data`, `collect-dagger` and `run-policy` stop with `refusing to run without real-time scheduling`, because the arms would hitch and lunge. The camera relay also logs `camera capture threads stay SCHED_OTHER`, and recordings may drop episodes under load. Set `AXOL_ALLOW_CFS_CONTROL=1` to run without real-time priority anyway.
+
+`provision` writes `/etc/security/limits.d/50-axol-rtprio.conf`, which takes effect at your next login. To check it, run `ulimit -r`. It should print `20`.
+
+<Warning>
+  This file applies only to a normal `ssh` login. **Tailscale SSH**, terminals opened over it, and systemd units without `LimitRTPRIO` don't get it.
+
+  When `provision` runs in such a session, it raises the limit on your shell and the terminal above it, such as `tmux` or an IDE, so new commands and terminals from there get it. The fix lasts until those processes exit. If `provision` can't do this, it prints two ways out:
+
+  - Reconnect over `ssh`.
+  - Run `sudo prlimit --pid $$ --rtprio=20:20` in that shell.
+
+  `axol-rt` keeps real-time priority in any session, and so does anything run as root.
+</Warning>
+
+## Host tuning
+
+Host tuning runs last. On a Jetson (Orin NX 16GB, AGX Orin, Thor T5000), it sets:
+
+- the maximum power mode
+- fixed video encoder, GPU and CPU clocks
+- the CAN adapters' interrupt on a CAN core
+- real-time priority for the camera service on the camera cores
+
+See [`jetson.setup`](/cli/jetson-setup) for why each one matters. A Raspberry Pi 5 or a workstation needs no tuning. On every computer, `provision` logs which CPU cores each part of Axol uses, for example `core layout: 14 cores online: CAN 12-13, control 2, IK 3, relay 4-5, recorder 10-11, camera 0-1,5-9`.
 
 <Note>
-  This tuning resets at every reboot, so `axol provision --boot` runs just this step — no installs, no update lock — and the installer's `axol.service` runs it as its `ExecStartPre` at each boot. You never need a second command: after pulling a fix, `axol provision` (and logging in again for the scheduling grant) is enough. `axol jetson.setup` still works as an alias of `--boot`, for units written by older installers. The `axol serve` self-updater's provisioning pass skips this step: it can overlap a robot session, and the service restart the update ends with re-tunes the host before serve starts.
+  Host tuning resets at every reboot. `axol.service` reapplies it at each boot by running `axol provision --boot`, which runs only this step. `axol jetson.setup` does the same thing. You don't need to run it yourself: after an update, `axol provision` and a fresh login are enough.
+
+  When the control panel updates `axol`, its provisioning skips host tuning, because the service restart at the end of the update applies it.
 </Note>
 
 ### Reboots
 
-Some steps only take effect at boot: a new ZED Box camera driver, or a Jetson power mode that `nvpmodel` will only switch across a reboot. When one of them runs, a clean `axol provision` **reboots the host at the end of the run**, which ends an SSH session. A run with failed steps never reboots. The pending reboot is remembered until the host restarts, so the successful retry still reboots, even though the step that asked is now a no-op.
+Some steps take effect only after a reboot, such as a new ZED Box camera driver or a Jetson power mode change. When one of them runs, `axol provision` **reboots the computer at the end of the run**, which ends your SSH session.
+
+- A run with failed steps never reboots. The reboot stays pending, so the next successful run reboots.
+- If a reboot didn't fix the step that asked for it, `provision` reports the problem instead of rebooting again.
+- A `provision` started by `axol serve` never reboots by itself.
 
 | Flag | Effect |
 |---|---|
-| `--no-reboot` | Leave a required reboot pending and say so, for callers that reboot at their own safe point. |
-| `--apply-reboot` | Provision nothing; reboot if an earlier `--no-reboot` run left one pending. |
+| `--no-reboot` | Leave a required reboot pending and say so, so you can reboot at a safe time. |
+| `--apply-reboot` | Provision nothing. Reboot if an earlier `--no-reboot` run left one pending. |
 
-The hosted installer provisions with `--no-reboot` and finishes with `--apply-reboot`, after writing the service. The [`axol serve`](/cli/serve) self-updater provisions with `--no-reboot`, then reboots the host in place of its usual service restart, and only while no operation is running. A provision started by `axol serve` never reboots on its own, whatever its flags. If a reboot didn't clear the step that asked for it, `provision` won't reboot again for the same reason. It reports the problem instead of looping the robot through reboots.
+The hosted installer runs `provision --no-reboot`, then `provision --apply-reboot` once the service is installed. The [`axol serve`](/cli/serve) updater runs `provision --no-reboot`, then reboots instead of restarting the service, and only while no operation is running.
 
-When there's no ZED SDK at `/usr/local/zed`, only the pyzed and zed-gstreamer build steps are skipped. The GStreamer/NVENC steps also skip on non-Jetson hosts, where that pipeline cannot run. adb, board access, the scheduling grant, Lighthouse tracking, and `axol-rt` are still provisioned on normal Linux workstations.
-
-See [Development install → Headset-video stack](/advanced/development-install#headset-video-stack) for when you'd run this by hand.
+See [Development install: Headset-video stack](/advanced/development-install#headset-video-stack) for when you'd run this by hand.

@@ -52,7 +52,7 @@ test("a pre-v2 export still imports, curated values over advanced", () => {
 })
 
 test("garbage is rejected and non-object sections are ignored", () => {
-  assert.throws(() => parseSettingsFile("nope"), /invalid settings file/)
+  assert.throws(() => parseSettingsFile("nope"), /Not a valid settings file/)
   assert.deepEqual(parseSettingsFile({ version: 2, axol: 5, teleop: { frequency: 1 } }), {
     values: { "teleop.frequency": 1 },
     cameras: undefined,

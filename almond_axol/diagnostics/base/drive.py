@@ -255,7 +255,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--lift-channel",
         default=JellyConfig.lift_channel,
-        help="SocketCAN interface carrying the jelly_legs lift controller "
+        help="CAN interface for the Jelly lift controller "
         f"(default: {CAN_CHEST} when that chest bus exists, otherwise the "
         f"wheel bus {CAN_BASE} the lift shares with the motors)",
     )

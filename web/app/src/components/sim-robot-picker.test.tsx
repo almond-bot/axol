@@ -32,7 +32,7 @@ describe("SimRobotPicker", () => {
     const radios = container.querySelectorAll('[role="radio"]')
     expect(radios).toHaveLength(5)
     expect(radio("Axol Legacy").getAttribute("aria-checked")).toBe("true")
-    await act(async () => radio("Axol × Jelly").click())
+    await act(async () => radio("Axol on Jelly").click())
     expect(onChange).toHaveBeenCalledWith({ model: "mobile", gripper: "parallel" })
     // The parcel gripper exists on Jelly only.
     expect(container.querySelector('[aria-label="Parcel gripper"]')).toBeNull()
@@ -54,7 +54,7 @@ describe("SimRobotPicker", () => {
     await act(async () =>
       root.render(<SimRobotPicker value={value} onChange={onChange} disabled />)
     )
-    await act(async () => radio("Axol × Ox").click())
+    await act(async () => radio("Axol on Ox Cart").click())
     expect(onChange).not.toHaveBeenCalled()
   })
 })

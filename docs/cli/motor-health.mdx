@@ -1,13 +1,18 @@
 ---
 title: "motor.health"
-description: "Probe every motor on both arms and report which responded."
+description: "Check that every motor on both arms responds."
 ---
 
-Probes all 16 Axol motors (8 per arm), or both Mantis grippers with `--target mantis`, and reports which responded. For each motor it runs the same status reads as [`motor.info`](https://docs.almond.bot/cli/motor-info) — position, velocity, torque, temperature, voltage, error code, control mode, firmware version, and model — and prints `OK` if every read succeeds or the error string if any read fails.
+Checks all 16 Axol motors (8 per arm), or both Mantis grippers with `--target mantis`. For each motor it runs the same reads as [`motor.info`](https://docs.almond.bot/cli/motor-info), such as position, temperature, voltage and error code. It prints one line per joint, left arm first: `OK` if every read succeeds, or the error if one fails.
 
-The command iterates the left arm (`CAN_LEFT`) then the right arm (`CAN_RIGHT`), printing one line per joint. It exits with status `1` if any motor failed to respond, making it suitable for scripts and provisioning checks.
+It exits with status `1` if any motor fails to respond, so you can use it in scripts.
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each side; `--no-left` / `--no-right` skip one side. `--joints` restricts the Axol check to a comma-separated subset. Mantis always checks only ID 8 on `can_mantis_l` / `can_mantis_r` by default.
+| Flag | Description |
+|---|---|
+| `--target {axol,mantis}` | Check the Axol arms or the Mantis grippers (default: `axol`). Mantis checks only ID 8 on `can_mantis_l` and `can_mantis_r` |
+| `--no-left` / `--no-right` | Skip one side |
+| `--left-channel IFACE` / `--right-channel IFACE` | Use this SocketCAN interface for that side instead of the default |
+| `--joints JOINTS` | Comma-separated subset of joints to check |
 
 ```bash
 axol motor.health

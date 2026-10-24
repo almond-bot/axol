@@ -82,7 +82,7 @@ export function CuratedForm({
   strictKeys?: string[]
 }) {
   if (fields.length === 0) {
-    return <p className="text-sm text-white/40">No settings — just press Start.</p>
+    return <p className="text-sm text-white/40">No settings. Press Start.</p>
   }
   return (
     <div className="flex flex-col gap-4">
@@ -147,7 +147,7 @@ function StrictSelect({
           )}
           {suggestions.map((s) => (
             <option key={s.value} value={s.value} className="bg-[#1a1a1a]">
-              {s.label ? `${s.value} — ${s.label}` : s.value}
+              {s.label ? `${s.value}: ${s.label}` : s.value}
             </option>
           ))}
         </>

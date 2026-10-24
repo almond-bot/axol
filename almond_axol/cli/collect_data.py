@@ -1254,7 +1254,7 @@ class _QueueCollectControl:
         with self._lock:
             self._rejection = None
             self._last_episode_fault = None
-        self._set("recording", "Recording — save or discard the episode to end it.")
+        self._set("recording", "Recording. Save or discard the episode to end it.")
 
     def note_saving(self) -> None:
         self._set("saving", "Saving episode…")
@@ -1267,9 +1267,8 @@ class _QueueCollectControl:
     def note_contact(self) -> None:
         self._set(
             "contact",
-            "Contact — torque exceeded the threshold, so the arms are limp "
-            "and free to move. Clear them, then press reset on the controller "
-            "(or return to rest here) to replan from where they are.",
+            "The arms hit something and are now limp. Move them clear by hand, "
+            "then press reset on the controller or Return to rest here.",
         )
 
     def note_returning(self) -> None:

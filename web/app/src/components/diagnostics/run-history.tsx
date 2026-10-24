@@ -28,7 +28,7 @@ function fmtWhen(t: number): string {
 }
 
 function fmtDuration(meta: DiagnosticsRunMeta): string {
-  if (meta.endedAt == null) return "running"
+  if (meta.endedAt == null) return ""
   const s = Math.max(0, Math.round(meta.endedAt - meta.startedAt))
   if (s < 90) return `${s}s`
   const m = Math.floor(s / 60)
@@ -39,10 +39,13 @@ function runBadge(meta: DiagnosticsRunMeta): {
   variant: "success" | "destructive" | "neutral"
   text: string
 } {
-  if (meta.status === "running") return { variant: "neutral", text: "running" }
+  if (meta.status === "running") return { variant: "neutral", text: "Running" }
   if (meta.status === "error" || (meta.exitCode ?? 0) !== 0)
-    return { variant: "destructive", text: `failed (${meta.exitCode ?? "?"})` }
-  return { variant: "success", text: "ok" }
+    return {
+      variant: "destructive",
+      text: meta.exitCode != null ? `Failed (exit ${meta.exitCode})` : "Failed",
+    }
+  return { variant: "success", text: "OK" }
 }
 
 /** Runs shown per page — telemetry-heavy details load per run on expand, so
@@ -106,9 +109,7 @@ export function RunHistory({
         </div>
       </div>
       {runs.length === 0 ? (
-        <p className="text-sm text-white/35">
-          No runs yet — launch a diagnostic above and it will be recorded here.
-        </p>
+        <p className="text-sm text-white/35">No runs yet. Diagnostics you run are recorded here.</p>
       ) : (
         <>
           <div className="flex flex-col divide-y divide-white/[0.06]">
@@ -310,10 +311,7 @@ function RunDetail({ id }: { id: string }) {
           />
         </div>
       ) : (
-        <p className="text-sm text-white/35">
-          No telemetry was captured for this run (the script owned the CAN bus and did not write its
-          own capture).
-        </p>
+        <p className="text-sm text-white/35">No telemetry was captured for this run.</p>
       )}
       <div>
         <Button variant="ghost" size="sm" onClick={() => setShowLog((v) => !v)}>

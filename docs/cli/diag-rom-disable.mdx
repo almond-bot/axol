@@ -1,11 +1,13 @@
 ---
 title: "diag.rom-disable"
-description: "Open the grippers left clamped by the ROM test and power down."
+description: "Open the grippers left clamped by the range-of-motion test and power down."
 ---
 
-Releases the item gripped by [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable) and disables the robot. Attaches to the already-enabled motors without recalibrating (a normal enable would force the grippers open and drop the item), opens each gripper one at a time so an operator can catch the item, then disables all motors. The arms never move here — they keep holding the pose the ROM run left them in until the final disable.
+Releases the items gripped by [`diag.rom-enable`](/cli/diag-rom-enable) and disables the robot. The command connects to the motors without recalibrating them, because a normal enable would open the grippers at once and drop the items. It opens one gripper at a time so you can catch each item, then disables all motors.
 
-Pass `--target mantis` after a Mantis gripper soak; this addresses only ID 8 on each selected Mantis bus.
+The arms don't move. They hold the pose the test left them in until the final disable.
+
+After a Mantis gripper test, pass `--target mantis`. The command then addresses only ID 8 on each selected Mantis bus.
 
 ```bash
 axol diag.rom-disable
@@ -14,6 +16,9 @@ axol diag.rom-disable --no-right --left-channel can0   # one arm on a non-hub CA
 axol diag.rom-disable --target mantis                 # both Mantis grippers
 ```
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each side. Defaults follow `--target`; pass the same target and channels the `diag.rom-enable` run used.
-
-By default each gripper-open step is an interactive `input()` prompt; `--web-prompts` makes it a `[prompt] …` marker the dashboard turns into a **Continue** button (set automatically from the dashboard).
+| Flag | Description |
+|---|---|
+| `--target axol\|mantis` | Pass the same target the `diag.rom-enable` run used |
+| `--no-left` / `--no-right` | Leave out one arm |
+| `--left-channel IFACE` / `--right-channel IFACE` | CAN interface for each side (default: set by `--target`). Pass the same channels the `diag.rom-enable` run used. |
+| `--web-prompts` | Show a **Continue** button in the dashboard before each gripper opens, instead of a terminal prompt. The dashboard sets this for you. |

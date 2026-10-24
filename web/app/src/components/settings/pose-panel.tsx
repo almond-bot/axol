@@ -97,8 +97,8 @@ export function PosePanel({
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
-        The rest pose is where the arms start from (and return to) in teleop and data collection.
-        Drag the sliders to preview the pose on the robot model, then save.
+        The rest pose is where the arms start and return to in teleoperation and data collection.
+        Drag the sliders to preview it on the robot model, then press Save.
       </p>
 
       <div className="h-72 overflow-hidden rounded-xl border border-white/10 bg-black/30">

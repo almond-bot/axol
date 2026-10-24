@@ -32,7 +32,7 @@ export function MountPicker({
   /** What the host runs now: `mobile` while Jelly is enabled. */
   robotModel: AxolModel
   onSelect: (mount: AxolMount) => void
-  /** Badge the version the host runs ("In play"); off before a first pick. */
+  /** Badge the version the host runs ("Current"); off before a first pick. */
   showActive?: boolean
   /** No Axol connected: the mounts can be previewed but not picked, like
    *  Jelly until it is attached. */
@@ -40,7 +40,7 @@ export function MountPicker({
 }) {
   const jelly = robotModel === "mobile"
   // The stage shows what the operator points at, else the selection (the
-  // robot is Axol × Jelly while Jelly is attached), else what the robot is.
+  // robot is Axol on Jelly while Jelly is attached), else what the robot is.
   const [hovered, setHovered] = useState<AxolModel | null>(null)
   const staged = ROSTER[hovered ?? (jelly ? "mobile" : (mount ?? robotModel))]
 
@@ -48,23 +48,19 @@ export function MountPicker({
     <div className="flex flex-col gap-3">
       <div className="flex items-baseline justify-between gap-3">
         <span className="font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
-          Choose your Axol
+          Mount
         </span>
         {jelly ? (
           <span className="text-xs text-white/45">
-            Jelly is attached, so this robot is Axol × Jelly. Your pick applies when it is off.
+            Jelly is attached, so this is Axol on Jelly. Your choice applies when Jelly is off.
           </span>
         ) : (
-          locked && (
-            <span className="text-xs text-white/45">
-              Connect the Axol to choose what it is mounted on.
-            </span>
-          )
+          locked && <span className="text-xs text-white/45">Connect Axol to choose a mount.</span>
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
         <Stage character={staged} active={showActive && staged.model === robotModel} />
-        <div role="radiogroup" aria-label="Robot model" className="grid gap-2">
+        <div role="radiogroup" aria-label="Mount" className="grid gap-2">
           {AXOL_MOUNTS.map((m) => (
             <RosterCard
               key={m}
@@ -110,7 +106,7 @@ function Stage({ character, active }: { character: Character; active: boolean })
           <span className="text-lg font-semibold tracking-tight text-white">{character.name}</span>
           {active && (
             <span className="rounded-sm bg-[#eff483] px-1.5 py-0.5 font-mono text-[0.6rem] font-bold tracking-widest text-black uppercase">
-              In play
+              Current
             </span>
           )}
         </div>
@@ -187,7 +183,7 @@ function RosterCard({
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-sm font-medium text-white">{character.name}</span>
         <span className="truncate font-mono text-[0.6rem] tracking-widest text-white/40 uppercase">
-          {locked ? "Connect Axol to choose" : character.kind}
+          {character.kind}
         </span>
       </div>
       {locked ? (
@@ -239,7 +235,7 @@ function JellyCard({
           {character.name}
         </span>
         <span className="truncate font-mono text-[0.6rem] tracking-widest text-white/40 uppercase">
-          {detected ? "Detected · automatic" : "Attach Jelly to unlock"}
+          {detected ? "Jelly attached" : "Attach Jelly to use"}
         </span>
       </div>
       {detected ? (

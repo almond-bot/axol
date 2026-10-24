@@ -837,7 +837,7 @@ def _detect_cameras() -> dict[str, Any]:
     except ImportError:
         return {
             "devices": [],
-            "error": "pyzed is not installed — run `axol zed.install` first",
+            "error": "pyzed is not installed. Run `axol zed.install` first.",
         }
     except Exception as exc:  # noqa: BLE001 - SDK errors surface to the UI
         return {"devices": [], "error": f"{type(exc).__name__}: {exc}"}
@@ -1290,7 +1290,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             f"{f['arm']} {f['joint'].lower()} ({f['problem']})" for f in faults
         )
         return JSONResponse(
-            {"error": f"motor fault — fix before starting: {detail}"},
+            {"error": f"Motor fault: {detail}. Fix it before starting."},
             status_code=409,
         )
 
@@ -1367,7 +1367,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Why the host can't be powered off right now, or None when it can."""
         if not _is_idle():
             return JSONResponse(
-                {"error": "an operation or session is running — stop it first"},
+                {"error": "An operation or session is running. Stop it first."},
                 status_code=409,
             )
         if updater.installing:
@@ -1375,8 +1375,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # failing every later install until `dpkg --configure -a`.
             return JSONResponse(
                 {
-                    "error": "the robot is installing an update or system "
-                    "packages — wait for it to finish"
+                    "error": "The robot is installing an update or system "
+                    "packages. Wait for it to finish."
                 },
                 status_code=409,
             )
@@ -1898,12 +1898,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 return JSONResponse({"error": str(exc)}, status_code=400)
             if runner.is_running():
                 return JSONResponse(
-                    {"error": "an operation is running — stop it first"},
+                    {"error": "An operation is running. Stop it first."},
                     status_code=409,
                 )
             if _diagnostic_session_active():
                 return JSONResponse(
-                    {"error": "another session is running — stop it first"},
+                    {"error": "Another session is running. Stop it first."},
                     status_code=409,
                 )
             profile = robot.profile()
@@ -2323,7 +2323,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 data = await asyncio.to_thread(_capture)
             except ImportError:
                 return JSONResponse(
-                    {"error": "pyzed is not installed — run `axol zed.install` first"},
+                    {"error": "pyzed is not installed. Run `axol zed.install` first."},
                     status_code=503,
                 )
             except KeyError as exc:
@@ -3014,7 +3014,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 )
             if runner.is_running(ignore_cleanup_lockout=True):
                 return JSONResponse(
-                    {"error": "an operation is still running — stop it first"},
+                    {"error": "An operation is still running. Stop it first."},
                     status_code=409,
                 )
             refusal = await asyncio.to_thread(prove_motors_torque_free, robot)
@@ -3043,8 +3043,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if _diagnostic_session_active():
                 return JSONResponse(
                     {
-                        "error": "a setup or diagnostics session is running — "
-                        "stop it first"
+                        "error": "A setup or diagnostics session is running. "
+                        "Stop it first."
                     },
                     status_code=409,
                 )

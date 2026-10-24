@@ -1,17 +1,17 @@
 ---
 title: "motor.set-can-id"
-description: "Change a motor's CAN ID and persist it to flash."
+description: "Change a motor's CAN ID and save it to the motor."
 ---
 
-Changes a motor's CAN ID and persists it to flash. The motor must be the only device on the bus or its current ID must be known. `--type` is required here.
+Changes a motor's CAN ID and saves it to the motor's flash. You need the motor's current ID, or the motor must be the only device on the bus. `--type` is required for this command.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
 | `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
-| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
-| `--current-id ID` | Current CAN ID (hex or decimal, required) |
-| `--new-id ID` | New CAN ID to assign (hex or decimal, required) |
+| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
+| `--current-id ID` | Current CAN ID, hex or decimal (required) |
+| `--new-id ID` | New CAN ID, hex or decimal (required) |
 | `--type {myactuator,damiao}` | Motor type (required) |
 
 ```bash

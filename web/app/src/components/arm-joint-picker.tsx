@@ -109,8 +109,7 @@ export function ArmJointPicker({
         })}
       </div>
       <p className="text-xs text-white/35">
-        Checked joints are held weightless and can be moved by hand; unchecked joints hold their
-        position.
+        You can move checked joints by hand. Unchecked joints hold their position.
       </p>
     </div>
   )

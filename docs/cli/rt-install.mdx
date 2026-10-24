@@ -1,41 +1,46 @@
 ---
 title: "rt.install"
-description: "Build and install the required axol-rt hardware control core."
+description: "Build and install axol-rt, the real-time core that controls Axol's motors."
 ---
 
-Builds and installs the `axol-rt` Rust realtime core, the sole production hardware control backend for teleop and every other arm-motion command. It runs automatically as a step of [`provision`](/cli/provision); run it by hand to (re)build on demand:
+Builds and installs `axol-rt`, the real-time core that controls the motors for teleop and every other command that moves the arms. Axol can't control hardware without it. [`axol provision`](/cli/provision) runs it for you. Run it yourself to rebuild:
 
 ```bash
 axol rt.install
 ```
 
-On Linux this also grants the built `axol-rt` binary two narrowly scoped
-capabilities: `CAP_SYS_NICE`, used by its two CAN threads to enter their
-real-time scheduling class, and `CAP_IPC_LOCK`, which lets it lock its memory
-(`mlockall`) past the unprivileged `RLIMIT_MEMLOCK` so a page reclaimed under
-recording I/O pressure can never fault a CAN thread mid-tick. The step escalates on
-its own: directly as root (the installer and the system service), otherwise
-through passwordless or already-cached `sudo`, or one password prompt on a
-terminal. It is skipped entirely when the binary already carries both
-capabilities, which reading needs no privilege for. Only a run with none of
-those fails, and it prints the exact `sudo setcap` command to run once. The control core refuses to arm if its requested real-time
-scheduler cannot be established, so a normal scheduler pause can never occur
-after the motors enable; a failed memory lock is only reported (the core runs
-unlocked, as every session did before it locked at all).
+## What it does
 
-Three concerns, each idempotent and self-gating:
+1. **Installs Rust if needed.** If `cargo` isn't on your PATH or in `~/.cargo/bin`, it installs a minimal Rust toolchain with rustup into `~/.cargo`. This doesn't need `sudo`.
+2. **Gets the source code.** In a development checkout it builds `rust/axol-rt`. Otherwise it downloads the source that matches the installed `axol` version into `~/.almond/axol-rt-src`.
+3. **Builds and installs the binary.** In a development checkout the binary stays in `rust/axol-rt/target/release/`. Otherwise it goes in `UV_TOOL_BIN_DIR` if that is set, or in `~/.local/bin/axol-rt`. The hosted installer puts it in `/usr/local/bin/axol-rt`. Running it again at the same version skips the build.
+4. **Grants permissions.** It gives the binary permission to run at real-time priority (`CAP_SYS_NICE`) and to lock its memory (`CAP_IPC_LOCK`). This needs root, so it may ask for your `sudo` password. Without `sudo`, it prints the `sudo setcap` command to run once.
 
-- **Toolchain** — if no working `cargo` is available (PATH or `~/.cargo/bin`), a minimal stable Rust toolchain is installed via rustup (no sudo; lands in `~/.cargo`). Candidates are probed before use, so a rustup shim inherited from another user's PATH does not block the bootstrap.
-- **Sources** — a dev checkout builds the in-repo crate (`rust/axol-rt`). Tool installs have no sources on disk, so the crate is fetched into `~/.almond/axol-rt-src` at the exact ref matching the installed package: the git commit for `uv tool install git+...` installs, or the `v<version>` release tag for PyPI installs. A tool install made from a local checkout (`uv tool install /path/to/axol`) builds that checkout's crate. When none of that applies (a wheel file, a release that predates the crate), or guesses wrong, set `AXOL_RT_SOURCE` to a checkout path or to `<git url>@<branch|tag|commit>` — e.g. `AXOL_RT_SOURCE=https://github.com/almond-bot/axol@main axol rt.install`. An explicit override always rebuilds.
-- **Binary** — dev checkouts leave it in `rust/axol-rt/target/release/` (where the rt link already looks, and where a manual `cargo build` stays authoritative). Tool installs copy it into `UV_TOOL_BIN_DIR` when that environment variable is set, or to `~/.local/bin/axol-rt` otherwise, and stamp the built ref so re-running `provision` at the same version skips the build. The hosted installer sets `UV_TOOL_BIN_DIR=/usr/local/bin`, so its binary lands at `/usr/local/bin/axol-rt` alongside the `axol` launcher.
+Each step is skipped when its work is already done.
 
-The binary lookup order at runtime is `AXOL_RT_BIN` (env override), then the current checkout's repo build, then `axol-rt` on PATH — so a manual checkout build or an explicit override wins over the provisioned copy.
+### Building from other source
 
-The package and the binary must speak the same wire protocol. Python declares its generation in the core's config (`proto <n>` — `CONFIG_PROTO` in `almond_axol.rt.link`, currently `18`), and a binary built from a different layout refuses to configure — before any motor is touched — with a message naming the fix (`config: client speaks proto …, this axol-rt speaks proto …`); the session then fails with `axol-rt … refused the configuration and exited`. That is the signal to rebuild: `axol rt.install`, or `cargo build --release` in `rust/axol-rt` for a checkout whose `target/release/` binary has gone stale.
+If `rt.install` can't find the right source, such as when `axol` was installed from a wheel file, set `AXOL_RT_SOURCE` to a checkout path, or to `<git url>@<branch|tag|commit>`. Setting it always rebuilds.
+
+```bash
+AXOL_RT_SOURCE=https://github.com/almond-bot/axol@main axol rt.install
+```
+
+## Which binary runs
+
+Axol uses the first `axol-rt` it finds, in this order:
+
+1. the path in `AXOL_RT_BIN`
+2. the build in the current development checkout
+3. `axol-rt` on your PATH
+
+## If arming fails
+
+- **Version mismatch.** `axol` and `axol-rt` must come from the same version. If they don't, `axol-rt` refuses to start before any motor moves, and the session fails with `axol-rt … refused the configuration and exited`. Run `axol rt.install`, or run `cargo build --release` in `rust/axol-rt` in a development checkout.
+- **No real-time priority.** `axol-rt` won't arm the motors if it can't get real-time priority. Run `axol rt.install` again to restore its permissions.
+
+If `axol-rt` can't lock its memory, it logs a warning and runs anyway.
 
 <Note>
-  A failed rustup download, source fetch, build, or capability setup is
-  warning-only inside plain `axol provision`. Pass `--require-rt` to make that
-  failure exit non-zero; the hosted installer and self-updater use this strict
-  form. Running `axol rt.install` directly also surfaces the full error.
+  When `axol provision` runs this step and it fails, `provision` finishes the other steps and then exits with code `1`. Run `axol rt.install` by itself to see the full error.
 </Note>

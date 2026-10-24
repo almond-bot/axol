@@ -1,22 +1,30 @@
 ---
 title: "gst.install"
-description: "Install the host-side GStreamer + PyGObject support for the GPU-resident ZED camera pipeline."
+description: "Install GStreamer and PyGObject for the ZED camera pipeline on a Jetson."
 ---
 
-Installs the host-side GStreamer support — the GObject-introspection typelibs and **PyGObject** — that the unified ZED camera pipeline needs for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). Both commands grab and encode the cameras entirely on the GPU via [`almond_axol.video.gst_zed`](/api/vr): the zed-gstreamer source elements (`zedxonesrc` / `zedsrc`) feed the Jetson hardware **NVENC** (`nvvidconv` / `nvv4l2h264enc`). An in-process `appsink` pulls the headset's H.264 access units, while collection normally carries independently paced, pre-encoded dataset access units and their sensor PTS through GStreamer Data Protocol over native shared memory. WebRTC transport itself stays on **aiortc** (a normal Python dependency) — this command does **not** install the `webrtcbin`/libnice path.
+Installs GStreamer and **PyGObject**, which the ZED camera pipeline for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) needs. That pipeline captures and encodes the cameras on the Jetson's GPU and hardware video encoder.
 
 ```bash
 axol gst.install
 ```
 
-This command:
+The [one-command install](/installation) and [`axol provision`](/cli/provision) run it for you. The ZED camera plugins themselves come from [`gst.build-zed`](/cli/gst-build-zed), which runs right after this command.
 
-- `apt`-installs the GStreamer tools/plugins and the GObject-introspection typelibs + build deps (`gstreamer1.0-tools`, `gstreamer1.0-plugins-base` for the headset's 30 fps `videorate` branch, `gstreamer1.0-plugins-bad`, `gir1.2-gstreamer-1.0`, `gir1.2-gst-plugins-base-1.0`, `libgirepository1.0-dev`, `gobject-introspection`, `libcairo2-dev`, `pkg-config`).
-- Builds **PyGObject** (`pygobject>=3.50,<3.52`) into the axol environment so the in-process pipeline can read `appsink` buffers. PyGObject is not a usable PyPI wheel (it builds against the system gobject-introspection), so it can't be a normal dependency — the same reason [`zed.install`](/installation) builds `pyzed` here.
-- Verifies its **own** deliverables — that PyGObject can import `gi` + `GstApp`, and that `videorate`, GDP/shared-memory transport, and the NVENC elements (`nvvidconv`, `nvv4l2h264enc`) are present — and fails if any are missing. The NVENC elements aren't `apt`-installable; they ship with the Jetson L4T BSP. The zed-gstreamer source elements (`zedxonesrc` / `zedsrc`) are **not** gated here — they're built separately by [`gst.build-zed`](/cli/gst-build-zed), which the one-command install runs right *after* this command, so their absence is expected on a first install and is reported only as an informational note (not a warning).
+## What it does
 
-The [one-command install](/installation) runs this for you. It is **not** run at `teleop` / `serve` startup — those entry points just run; install (the source-plugin build [`gst.build-zed`](/cli/gst-build-zed) and the Jetson clock setup [`jetson.setup`](/cli/jetson-setup), both run by [`provision`](/cli/provision)) is owned by the installer.
+1. Installs the GStreamer packages with `apt`: `gstreamer1.0-tools`, `gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-bad`, `gir1.2-gstreamer-1.0`, `gir1.2-gst-plugins-base-1.0`, `libgirepository1.0-dev`, `gobject-introspection`, `libcairo2-dev` and `pkg-config`.
+2. Builds **PyGObject** (`pygobject>=3.50,<3.52`) into the `axol` environment. PyGObject has to be built against the system libraries, so it can't be a normal dependency.
+3. Checks that PyGObject imports and that the GStreamer elements Axol needs are present, including the Jetson's hardware encoder (`nvvidconv`, `nvv4l2h264enc`). It fails if any are missing.
+
+The hardware encoder elements ship with the Jetson system image and can't be installed with `apt`. On a first install, the ZED camera plugins are reported as missing in an informational note, because `gst.build-zed` hasn't run yet.
+
+Video to the headset still uses **aiortc**, a normal Python dependency. This command doesn't install GStreamer's WebRTC support.
 
 <Note>
-  Jetson-only, best-effort, and idempotent: it skips on non-L4T hosts, on machines without `apt-get`, and when the stack is already present. On a non-Jetson Linux workstation, seeing the ZED SDK at `/usr/local/zed` does not trigger installation of the Jetson-only NVENC elements; cameras use the ZED Python SDK path instead. When the gst stack is unavailable on a Jetson, that same SDK path is the higher-latency fallback.
+  `gst.install` runs only on a Jetson. It skips computers without `apt-get` and computers where everything is already installed. On other computers, and on a Jetson where this setup isn't available, Axol uses the ZED SDK camera path, which has higher latency.
+</Note>
+
+<Note>
+  Rebuilding the `axol` environment, such as during a release upgrade, removes PyGObject. Run `axol provision` afterward to put it back.
 </Note>

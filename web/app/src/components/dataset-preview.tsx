@@ -149,7 +149,7 @@ export function DatasetPreview({
         setError(
           // An older host answers the unknown route with the SPA's generic 404.
           e instanceof ApiRequestError && e.status === 404 && e.message === "not found"
-            ? "This host does not offer dataset preview (update axol)."
+            ? "This host can't preview datasets. Update the Axol software on the host."
             : errorText(e)
         )
       })
@@ -194,8 +194,8 @@ export function DatasetPreview({
         <CardHeader>
           <CardTitle>Dataset preview</CardTitle>
           <CardDescription>
-            Watch saved episodes and fix their task. Follows the dataset the running operation
-            records into.
+            Watch saved episodes and edit their task. While you record, it shows the dataset you are
+            recording to.
           </CardDescription>
         </CardHeader>
         <Button variant="outline" size="sm" onClick={toggle}>
@@ -236,7 +236,7 @@ export function DatasetPreview({
                     setChosenEpisode(null)
                   }}
                 >
-                  Follow session
+                  Show current recording
                 </Button>
               )}
               <Button
@@ -254,7 +254,7 @@ export function DatasetPreview({
           {error && <p className="text-xs text-red-300/80">{error}</p>}
           {following && (
             <p className="text-xs text-white/45">
-              Recording in progress — a take appears here once it is saved.
+              Recording. Each episode appears here after it is saved.
             </p>
           )}
 
@@ -567,7 +567,7 @@ function EpisodePlayer({
             onChange={(e) => onPreviewFps(Number(e.target.value))}
             className="h-8 w-32 shrink-0"
             aria-label="Preview quality"
-            title="Lighter previews keep every Nth frame, so they load over slow links"
+            title="Lower frame rates load faster on slow networks"
           >
             {choices.map((fps) => (
               <SelectOption
@@ -608,9 +608,9 @@ function TaskEditor({
       onRenamed(await setEpisodeTask(repoId, episode.index, text.trim()))
     } catch (e) {
       if (e instanceof ApiRequestError && e.status === 409) {
-        toast.warning("The recorder is saving an episode — try again in a moment.")
+        toast.warning("An episode is being saved. Try again in a moment.")
       } else {
-        toast.error(`Could not rename the task: ${errorText(e)}`)
+        toast.error(`Could not save the task: ${errorText(e)}`)
       }
     } finally {
       setSaving(false)

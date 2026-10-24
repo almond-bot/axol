@@ -14,8 +14,8 @@ import { MountPicker } from "./mount-picker"
 const NAMES: Record<AxolMount, string> = {
   classic: "Axol Legacy",
   standalone: "Axol Standalone",
-  ox_cart: "Axol × Ox",
-  owl: "Axol × Owl",
+  ox_cart: "Axol on Ox Cart",
+  owl: "Axol on Owl Mount",
 }
 
 export function MountRequired({
@@ -43,11 +43,10 @@ export function MountRequired({
   return (
     <Card className="gap-3 border-[#eff483]/30 p-5">
       <div className="flex flex-col gap-1">
-        <span className="text-base font-semibold text-white">Which Axol is this?</span>
+        <span className="text-base font-semibold text-white">What is Axol mounted on?</span>
         <p className="text-xs text-white/50">
-          Pick what this Axol is mounted on before the first run: it sets the body IK keeps the arms
-          clear of. Change it any time in Settings → Robot. With Jelly attached the robot is Axol ×
-          Jelly automatically.
+          Axol needs to know its mount so the arms don&apos;t hit it. You can change this later in
+          Axol settings → Robot. When Jelly is attached, Axol on Jelly is used automatically.
         </p>
       </div>
       <MountPicker
@@ -59,11 +58,7 @@ export function MountRequired({
       />
       <div className="flex items-center justify-end gap-3">
         <span className="text-xs text-white/45">
-          {locked
-            ? "Connect the Axol to choose."
-            : picked
-              ? `${NAMES[picked]} selected`
-              : "Select a version, then save."}
+          {locked ? "" : picked ? `${NAMES[picked]} selected` : "Select a mount, then press Save."}
         </span>
         <Button size="sm" onClick={() => void save()} disabled={locked || !picked || saving}>
           {saving && <Loader2 className="animate-spin" />}

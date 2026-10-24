@@ -3,18 +3,22 @@ title: "tune.repeatability"
 description: "Measure how reliably the left arm returns to the same pose after many motions."
 ---
 
-Repeatability test for the **left arm**: moves rest → pose **A** once, then bounces between two hard-coded poses (**A → B → A → B …**) for the requested number of cycles, returning to rest at the end (or on Ctrl-C). Each leg is planned in joint space with pyroki + the URDF so the arm can't clip the torso, and the playback is a pure joint-space interpolation — no per-waypoint IK — so it's smooth and perfectly repeatable. The gripper is held closed throughout, the right arm is left untouched (its CAN channel is disabled entirely).
+Tests the repeatability of the **left arm**. The arm moves from rest to pose **A**, then moves between two fixed poses (A, B, A, B and so on) for the number of cycles you ask for. At the end, or when you press Ctrl-C, it returns to rest.
+
+- Each move is planned in joint space so the arm can't hit the torso, and it plays back the same way every cycle.
+- The gripper stays closed throughout.
+- The right arm isn't used, and its CAN bus stays off.
 
 | Flag | Description |
 |---|---|
-| `--cycles INT` | Number of A→B→A round trips; `0` (default) = run until Ctrl-C |
+| `--cycles INT` | Number of A-to-B-to-A round trips (default: 0, run until Ctrl-C) |
 | `--gripper-torque-limit FLOAT` | Gripper closing torque limit in Nm (default: 0.3) |
-| `--no-gripper` | Run on the gripperless SKU — the gripper motor is never enabled or calibrated (`--gripper-torque-limit` is then ignored) |
+| `--no-gripper` | Run on an Axol without grippers. The gripper motor is never enabled, and `--gripper-torque-limit` is ignored. |
 | `--dwell FLOAT` | Seconds to hold at each waypoint except B (default: 0.5) |
 | `--dwell-b FLOAT` | Seconds to hold at pose B before returning to A (default: 3.0) |
-| `--rate FLOAT` | Control loop / waypoint rate in Hz — higher = finer steps and smoother playback at the same speed (default: 250) |
-| `--speed FLOAT` | Average joint speed in rad/s of the worst-case joint; peak is 1.5× this (default: ~0.31) |
-| `--stiffness FLOAT` | Arm stiffness scale 0–1 — lower softens the motors and reduces tracking jitter (default: 1.0, the tuned production gains) |
+| `--rate FLOAT` | Control and waypoint rate in Hz. Higher gives finer steps and smoother motion at the same speed (default: 250). |
+| `--speed FLOAT` | Average speed of the fastest joint in rad/s. The peak is 1.5 times this (default: about 0.31). |
+| `--stiffness FLOAT` | Arm stiffness, 0 to 1. Lower softens the arm and reduces tracking jitter (default: 1.0, the standard gains). |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
@@ -23,5 +27,5 @@ axol tune.repeatability --cycles 5    # five A→B→A round trips, then rest
 ```
 
 <Note>
-  Poses A and B are hand-posed and live at the top of `almond_axol/cli/tune/repeatability.py` — `_POSE_A_LEFT` / `_POSE_B_LEFT`, in raw motor-frame angles. To re-calibrate: pose the arm by hand, run `axol motor.info --l`, and paste the printed numbers in.
+  Poses A and B are set in `almond_axol/cli/tune/repeatability.py` as `_POSE_A_LEFT` and `_POSE_B_LEFT`, in raw motor angles. To change them, pose the arm by hand, run `axol motor.info --l`, and paste the printed angles into the file.
 </Note>

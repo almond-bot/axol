@@ -127,23 +127,21 @@ type PowerAction = "shutdown" | "restart"
 
 const POWER_ACTIONS: Record<
   PowerAction,
-  { title: string; command: string; body: string; button: string; done: string }
+  { title: string; body: string; button: string; done: string }
 > = {
   shutdown: {
     title: "Shut down host",
-    command: "shutdown -h now",
     body:
-      "This panel loses its connection immediately, and turning the robot " +
-      "back on requires physical access to it.",
+      "Turn off the robot's computer. This panel disconnects right away, and " +
+      "you need to be at the robot to turn it back on.",
     button: "Shut down",
     done: "Host is shutting down.",
   },
   restart: {
     title: "Restart host",
-    command: "shutdown -r now",
     body:
-      "This panel loses its connection while the host reboots — reconnect " +
-      "once it's back up (typically under a minute).",
+      "Restart the robot's computer. This panel disconnects until it is back " +
+      "up, usually within a minute.",
     button: "Restart",
     done: "Host is restarting.",
   },
@@ -188,11 +186,7 @@ function DeviceSelect({
       type="button"
       onClick={() => onSelect(profile)}
       disabled={disabled}
-      title={
-        disabled
-          ? (disabledReason ?? undefined)
-          : "Run every operation on this device (Axol-only operations wait for Axol)."
-      }
+      title={disabled ? (disabledReason ?? undefined) : "Run operations on this device."}
       className="shrink-0 rounded-full border border-white/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-white/45 uppercase transition-colors hover:border-white/30 hover:text-white/80 disabled:cursor-not-allowed disabled:opacity-50"
     >
       select
@@ -343,13 +337,13 @@ export function ConnectionsBar({
       state === "connected"
         ? "Connected"
         : state === "busy"
-          ? "In use by task"
+          ? "Used by a running test or operation"
           : state === "connecting"
             ? "Connecting…"
             : state === "error"
               ? robot?.error || "Error"
               : detected
-                ? "CAN detected"
+                ? "Detected"
                 : canProfiles
                   ? "Not detected"
                   : "Disconnected"
@@ -393,7 +387,7 @@ export function ConnectionsBar({
             title={
               opRunning
                 ? "Wait for the active operation or setup session to finish."
-                : `Release the ${title} link (CAN). The hardware stays powered.`
+                : `Disconnect ${title}. It stays powered on.`
             }
             className="size-8"
           >
@@ -465,7 +459,7 @@ export function ConnectionsBar({
             title={
               opRunning || view.state === "busy"
                 ? "Wait for the active operation or setup session to finish."
-                : `Release the ${title} link (CAN). The hardware stays powered.`
+                : `Disconnect ${title}. It stays powered on.`
             }
             className="size-7 shrink-0"
           >
@@ -480,7 +474,7 @@ export function ConnectionsBar({
             aria-label={`Connect ${title}`}
             title={
               !jellySupported
-                ? "Update the serve host to connect Jelly's wheels and lift from the panel."
+                ? "Update the software on the host to connect Jelly."
                 : opRunning
                   ? "Wait for the active operation or setup session to finish."
                   : `Connect ${title}`
@@ -513,8 +507,8 @@ export function ConnectionsBar({
       ? "Wheels and lift connected"
       : jellyLive === 1
         ? "One of two connected"
-        : jellyViews.some((v) => v.label === "CAN detected")
-          ? "CAN detected"
+        : jellyViews.some((v) => v.label === "Detected")
+          ? "Detected"
           : "Disconnected"
   const battery = jellySupported ? jellyBattery(jelly) : null
 
@@ -542,7 +536,7 @@ export function ConnectionsBar({
               size="icon"
               onClick={() => setPowerOpen("restart")}
               aria-label="Restart host"
-              title="Reboot the robot host (shutdown -r now)."
+              title="Restart the robot's computer."
               className="size-8"
             >
               <RotateCcw />
@@ -552,7 +546,7 @@ export function ConnectionsBar({
               size="icon"
               onClick={() => setPowerOpen("shutdown")}
               aria-label="Shut down host"
-              title="Power off the robot host (shutdown -h now)."
+              title="Shut down the robot's computer."
               className="size-8 text-red-300 hover:bg-red-400/10"
             >
               <Power />
@@ -562,7 +556,7 @@ export function ConnectionsBar({
               size="icon"
               onClick={onHostDisconnect}
               aria-label="Disconnect Axol Host"
-              title="Disconnect this panel from the host. The host keeps running."
+              title="Disconnect this panel. The robot's computer keeps running."
               className="size-8"
             >
               <Unplug />
@@ -611,19 +605,15 @@ export function ConnectionsBar({
                 {POWER_ACTIONS[powerOpen].title}
               </h3>
               <p className="text-sm leading-relaxed text-white/45">
-                {powerOpen === "shutdown" ? "Power off" : "Reboot"} the robot host (
-                <span className="font-mono">{POWER_ACTIONS[powerOpen].command}</span>).{" "}
                 {POWER_ACTIONS[powerOpen].body}
               </p>
             </div>
             {opRunning ? (
-              <p className="text-xs text-amber-200/70">
-                A run or operation is in flight — stop it first.
-              </p>
+              <p className="text-xs text-amber-200/70">An operation is running. Stop it first.</p>
             ) : (
               hostInstalling && (
                 <p className="text-xs text-amber-200/70">
-                  The robot is installing an update or system packages — wait for it to finish.
+                  The robot is installing updates. Wait for it to finish.
                 </p>
               )
             )}
@@ -673,7 +663,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
   const color = (m: MotorHealth) =>
     m.reachable == null ? "unknown" : motorHealthy(m) ? "ok" : "err"
   const tip = (m: MotorHealth) => {
-    if (m.reachable == null) return `${jointName(m)}: unknown (a task owns the bus)`
+    if (m.reachable == null) return `${jointName(m)}: unknown while in use`
     if (!m.reachable) return `${jointName(m)}: unreachable`
     const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
     const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""

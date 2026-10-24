@@ -217,8 +217,8 @@ describe("Mantis tracking quality", () => {
     }
     render({ ...policy({}), trackingQuality: recovered }, onEpisode)
     expect(container.textContent).toContain("Gripper control paused")
-    expect(container.textContent).toContain("gripper control remains disengaged")
-    expect(container.textContent).toContain("Squeeze both triggers together, then release both")
+    expect(container.textContent).toContain("gripper control is still off")
+    expect(container.textContent).toContain("Squeeze both triggers, then release them")
     expect(button("Start recording").disabled).toBe(false)
     render({ ...recording, trackingQuality: { ...recovered, retakeRequired: true } }, onEpisode)
     expect(container.textContent).toContain("Discard this take. When Mantis is ready")
@@ -226,7 +226,7 @@ describe("Mantis tracking quality", () => {
 
     render({ ...policy({}), trackingQuality: { ...clean, controlState: "engaged" } }, onEpisode)
     expect(container.textContent).toContain("Live tracking checks passed")
-    expect(container.textContent).not.toContain("gripper control remains disengaged")
+    expect(container.textContent).not.toContain("gripper control is still off")
   })
 
   it("shows a missing trigger input even when optical tracking is healthy", () => {
@@ -242,8 +242,8 @@ describe("Mantis tracking quality", () => {
       vi.fn()
     )
     expect(container.textContent).toContain("Gripper control paused")
-    expect(container.textContent).toContain("Left trigger heartbeat is missing")
-    expect(container.textContent).not.toContain("Right trigger heartbeat is missing")
+    expect(container.textContent).toContain("No signal from the left trigger")
+    expect(container.textContent).not.toContain("No signal from the right trigger")
   })
 
   it("distinguishes a stopped runtime, persistent setup faults and recoverable visibility", () => {
@@ -255,8 +255,8 @@ describe("Mantis tracking quality", () => {
       },
       onEpisode
     )
-    expect(container.textContent).toContain("The tracking process stopped")
-    expect(container.textContent).not.toContain("Restore both trackers to view")
+    expect(container.textContent).toContain("Tracking stopped. Stop this session")
+    expect(container.textContent).not.toContain("Bring both trackers back into view")
 
     render(
       {
@@ -268,11 +268,11 @@ describe("Mantis tracking quality", () => {
     expect(container.textContent).toContain("Stop collection")
     expect(container.textContent).toContain("Recalibrate Lighthouse")
     expect(container.textContent).not.toContain("Validate tracking")
-    expect(container.textContent).toContain("Waiting for visibility alone cannot clear this fault")
-    expect(container.textContent).not.toContain("The tracking process stopped")
+    expect(container.textContent).toContain("come back into view won't clear this fault")
+    expect(container.textContent).not.toContain("Tracking stopped. Stop this session")
 
     render({ ...policy({}), trackingQuality: { ...clean, status: "error" } }, onEpisode)
-    expect(container.textContent).toContain("Restore both trackers to view")
+    expect(container.textContent).toContain("Bring both trackers back into view")
     expect(container.textContent).not.toContain("repair Lighthouse support")
   })
 
@@ -291,7 +291,7 @@ describe("Mantis tracking quality", () => {
     render({ ...recording, trackingQuality: fault }, onEpisode)
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("retake required")
     expect(container.textContent).toContain(
-      "1 tracking fault events since tracking started (includes setup and idle time)."
+      "1 tracking fault since tracking started, including setup and idle time."
     )
     expect(button("Confirm: Save episode?").disabled).toBe(true)
     act(() => button("Confirm: Save episode?").click())
@@ -363,9 +363,7 @@ describe("Mantis tracking quality", () => {
       onEpisode
     )
     expect(container.textContent).toContain("Tracking diagnostics saved")
-    expect(container.textContent).toContain(
-      "Stop this collection session and share the capture path"
-    )
+    expect(container.textContent).toContain("Stop this session and share the file below")
     expect(container.textContent).toContain(path)
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("retake required")
     expect(button("Save episode").disabled).toBe(true)

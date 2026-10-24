@@ -2084,10 +2084,10 @@ class VRTeleopCore:
         if on_contact is not None:
             on_contact()
         announce(
-            "Return path rejected. Arms are free — guide them clear and "
-            "press reset to retry."
+            "Return path rejected. The arms are limp. Move them clear by hand, "
+            "then press reset to try again."
             if reason == "blocked"
-            else "Contact. Arms are free — press reset to continue."
+            else "The arms hit something and are now limp. Press reset to continue."
         )
         deadline = time.perf_counter()
         while not stopped() and not self.reset_pending:

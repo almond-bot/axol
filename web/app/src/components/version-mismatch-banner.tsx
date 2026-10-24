@@ -18,12 +18,12 @@ function label(commit: string, version: string | null): string {
 export function VersionMismatchBanner({ mismatch }: { mismatch: VersionMismatch }) {
   const reloadFixes = !mismatch.local && !mismatch.serverDev && !mismatch.serverOlder
   const hint = mismatch.local
-    ? "The web bundle this machine serves is out of date — rebuild it (`npm run build` in web/), then reload."
+    ? "This computer's copy of the UI is out of date. Run `npm run build` in web/, then reload."
     : mismatch.serverDev
-      ? "The robot is running a development build from a different commit — use the UI served by the robot itself, or match the two checkouts."
+      ? "The robot runs a development build from a different commit. Open the UI from the robot's address instead."
       : mismatch.serverOlder
-        ? "The robot software is older than this UI and some features may not work — update it."
-        : "Reload to pick up the UI matching the robot software."
+        ? "The robot software is older than this UI, so some features may not work. Update the robot software."
+        : "Reload the page to get the UI that matches the robot software."
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
       <div className="flex min-w-0 flex-col gap-0.5">

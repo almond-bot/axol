@@ -1,33 +1,55 @@
 ---
 title: "tune.gravity"
-description: "Fit one link's real centre of mass from the motors, correcting the gravity feedforward."
+description: "Measure one link's center of mass from the motors to correct gravity compensation."
 ---
 
-Identifies one link's real centre of mass from a friction-cancelled torque sweep instead of trusting the CAD constants, and corrects the gravity feedforward with it. Also available from the diagnostics dashboard (`axol serve`).
+Measures one link's real center of mass from motor torques and corrects the gravity feed-forward with it. You can also run it from the diagnostics dashboard (`axol serve`). To calibrate every joint at once, use [`tune.factory`](/cli/tune-factory).
 
-**Why:** gravity feedforward comes from the URDF masses/CoMs — CAD values shared by every robot. If the real link is a few percent off (cables, end-effector variance, build spread), the `kp` spring has to make up the missing torque and the joint parks with a static droop under load: `droop = unmodeled torque / kp`. No amount of kp/kd tuning fixes that cleanly; correcting the model does, at every angle at once.
+## When to use it
 
-**How:** the same bidirectional constant-velocity sweep as [`tune.friction`](/cli/tune-friction) — averaging forward and backward torque at the same position cancels friction exactly, leaving `gravity(q) + Fo`. The residual against the current model is fit to a shift of this link's centre of mass, by ridge-regularized least squares straight through the MuJoCo gravity model, so the correction generalizes to every arm pose. Mass stays at CAD: gravity torque only depends on the first moment `m·c`, so a CoM shift with fixed mass covers every identifiable error. (For a custom gripper much heavier than stock, set the link mass first with [`tune.factory --mass`](/cli/tune-factory#custom-end-effectors).) A single-joint sweep is a one-dimensional slice of pose space and can never observe all three CoM components equally — the ridge keeps weakly observed directions at their current value instead of letting them absorb torque noise with a huge lever arm, and a fitted shift beyond 60 mm is rejected as bad data.
+The gravity feed-forward starts from the CAD masses and centers of mass. Cables, the end-effector and build differences can make a real link a few percent off.
 
-**Loaded sweep poses:** gravity has zero moment about a vertical axis, no matter where the mass sits — so a joint whose axis hangs vertical at rest carries no CoM signal at all. Three joints are therefore swept with other joints posed to tilt and load them: `shoulder_3` runs with shoulder_1 raised to humerus-horizontal (+90° left, −90° right — the frame is mirrored and +90° is the right arm's hard stop) and the elbow bent; `wrist_1` with the elbow bent and wrist_2 rotated 85°; `wrist_2` keeps the elbow raise (base clearance) and adds wrist_1 at 90° to restore the load the raise removed. Clearance and load poses were verified against the torso collision model, are ramped proximal-first, and feed the model predictions so the fit is computed at the pose the sweep actually ran at. A sweep the model says is still unloaded is refused as unobservable rather than fit to noise.
+The position spring then has to carry the missing torque, so the joint sags under load by `unmodeled torque / kp`. Raising the gains won't fix the sag. Correcting the model fixes it at every angle.
 
-Run **distal → proximal** (`wrist_3` → … → `shoulder_1`): a proximal joint's sweep rotates every distal link with it, so on an uncalibrated arm their errors get lumped into the proximal link's CoM — exact at the sweep pose, approximate once the elbow/wrists bend away from it. The tool prints a note when distal links are still uncalibrated.
+## How it works
 
-Sweep safety otherwise matches [`tune.friction`](/cli/tune-friction): shoulder_2 sweeps only its outboard side, capped at 0 (starting at rest is fine — travel past it swings into the base); shoulder_3 / wrist_1 sweeps hold shoulder_2 10° outboard to clear the chest cameras and are capped at ±90° at their loaded poses. Run [`tune.friction --save`](/cli/tune-friction) beforehand — the friction offset `Fo` is refit against the corrected model and saved with the CoM (the two are coupled: what the old `Fo` absorbed as a constant may really have been gravity shape).
+The joint sweeps back and forth at a constant speed, as in [`tune.friction`](/cli/tune-friction). Averaging the forward and backward torques cancels friction, which leaves gravity. The tool fits the difference from the current model as a shift in the link's center of mass.
+
+- The link's mass stays at its CAD value. For a custom gripper much heavier than stock, set its mass first with [`tune.factory --mass`](/cli/tune-factory#custom-end-effectors).
+- One joint's sweep can't see every direction of the center of mass equally well. Directions it can't see stay at their current value.
+- A fitted shift of more than 60 mm is rejected as bad data.
+
+## Sweep poses
+
+Gravity can't turn a joint whose axis is vertical, so the tool poses other joints to load the test joint:
+
+| Joint | Pose during the sweep |
+|---|---|
+| `shoulder_3` | `shoulder_1` raised so the upper arm is horizontal (+90° left, −90° right), elbow bent |
+| `wrist_1` | Elbow bent, `wrist_2` at 85° |
+| `wrist_2` | Elbow raised to clear the base, `wrist_1` at 90° |
+
+The clearance rules from [`tune.friction`](/cli/tune-friction) also apply. `shoulder_2` sweeps only outboard of rest. `shoulder_3` and `wrist_1` sweep with `shoulder_2` held 10° outboard, and are limited to ±90° in their loaded poses. If a sweep would still carry no gravity load, the tool refuses to fit it.
+
+## Order
+
+Run from `wrist_3` to `shoulder_1`. A shoulder sweep moves every link past it, so errors in uncalibrated wrist and elbow links end up in the shoulder's fit. The tool prints a note when links further out are still uncalibrated.
+
+Run [`tune.friction --save`](/cli/tune-friction) on the joint first. The tool refits the friction offset `Fo` against the corrected model and saves it with the center of mass.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
 | `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
-| `--velocity DEG_S` | Sweep velocity in deg/s (default: 18). Keep ≤25 so shoulder torque telemetry stays clean |
+| `--velocity DEG_S` | Sweep speed in deg/s (default: 18). Keep it at 25 or below, because the shoulder torque readings get noisy above that. |
 | `--lo DEG` / `--hi DEG` | Override the sweep limits (degrees) |
-| `--kp FLOAT` / `--kd FLOAT` | Sweep-hold gains (default: the calibration gains — see [`tune.friction`](/cli/tune-friction)) |
-| `--save` | Write the fitted CoM (and refit `Fo`) to `~/.almond/calibration.json`, together with the link mass it was fitted against; the gravity model then uses it everywhere on this machine |
-| `--save-run` | Persist the sweep (measured vs model torque per angle) as a tuning run for the dashboard charts |
-| `--label NOTE` | Free-form note stored with the saved run |
+| `--kp FLOAT` / `--kd FLOAT` | Gains during the sweep (default: the [calibration gains](/cli/tune-friction#calibration-gains)) |
+| `--save` | Save the fitted center of mass, the refit `Fo` and the link mass to `~/.almond/calibration.json`. This computer then uses them everywhere. |
+| `--save-run` | Save the sweep (measured and model torque per angle) for the dashboard charts |
+| `--label NOTE` | Note stored with the saved run |
 
-The report prints the CoM shift in mm, the shape residual before/after, and the **worst parked droop** before/after at the joint's config `kp` — the user-visible payoff.
+The report prints the center-of-mass shift in mm, how well the model fits before and after, and the worst sag at rest before and after, at the joint's configured `kp`.
 
 ```bash
 axol tune.gravity --l --joint shoulder_1

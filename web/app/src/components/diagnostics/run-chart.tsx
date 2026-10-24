@@ -459,7 +459,7 @@ export function RunChart({
               onClick={() => setView(null)}
               title="Reset zoom (double-click the plot)"
             >
-              reset zoom
+              Reset zoom
             </Button>
           )}
           <Button
@@ -520,9 +520,6 @@ export function RunChart({
             <span className="text-white/50">{s.label}</span>
           </span>
         ))}
-        <span className="ml-auto text-[0.65rem] text-white/25">
-          scroll to zoom · drag to pan · double-click resets
-        </span>
       </div>
     </Card>
   )

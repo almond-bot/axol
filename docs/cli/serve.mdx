@@ -1,11 +1,11 @@
 ---
 title: "serve"
-description: "Run the Axol web control panel — drive the robot from a browser instead of the terminal."
+description: "Run the Axol web control panel to drive the robot from a browser."
 ---
 
-Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, dataset replay, and policy inference — in-process.
+Runs the **Axol web control panel**, a local server that lets you drive the robot from a browser instead of a terminal. From the panel you can start, watch and stop teleoperation, gravity compensation, data collection, dataset replay and policy inference.
 
-With the [one-command install](/installation), this command already runs as a root systemd service (`axol.service`) that starts at boot, restarts automatically, and offers an update in the control panel whenever a newer [release](https://github.com/almond-bot/axol/releases) exists — you don't run it by hand. Manual invocation is for development installs:
+With the [one-command install](/installation), this command already runs as a system service (`axol.service`). It starts at boot and restarts automatically, and the control panel offers an update when a newer [release](https://github.com/almond-bot/axol/releases) exists. You run it by hand only on a development install:
 
 ```bash
 axol serve                    # https://localhost:8001 (LAN-reachable)
@@ -16,13 +16,13 @@ axol serve --no-tls           # plain HTTP instead of HTTPS
 sudo "$(command -v axol)" serve              # hardware development (CAN setup, ZED daemon)
 ```
 
-The root development form lets the panel run CAN discovery/setup and restart
-the ZED daemon. Datasets go to `$HF_LEROBOT_HOME` (or the panel's **Dataset
-root** setting); when that lives in a user's home, each recording is handed
-back to that user after every episode save, as with the installed service.
+Run it with `sudo` so the panel can set up CAN and restart the ZED daemon.
+Datasets go to `$HF_LEROBOT_HOME`, or to the panel's **Dataset root** setting.
+When that folder is in a user's home, each recording is owned by that user
+after every episode save, as with the installed service.
 
 <Tip>
-  For a guided walkthrough of the control panel — connecting the Axol host and Axol, assigning the cameras, and running each operation — see the [Web Control Panel guide](/guides/control-panel).
+  For a walkthrough of the control panel, from connecting to Axol and assigning cameras to running each operation, see the [Web Control Panel guide](/guides/control-panel).
 </Tip>
 
 | Flag | Description |
@@ -38,13 +38,13 @@ back to that user after every episode save, as with the installed service.
 
 ## TLS
 
-TLS is **on by default** so a browser on an HTTPS origin (e.g. the hosted VR app at `axol.almond.bot`) can reach this machine without mixed-content blocking. On first run a self-signed certificate is generated in `~/.almond/vr/certs/` — the **same** certificate the VR teleop WSS server uses, so accepting it once covers both the control panel and VR teleop.
+TLS is **on by default**, so HTTPS pages such as the hosted VR app at `axol.almond.bot` can reach this machine. On first run a self-signed certificate is created in `~/.almond/vr/certs/`. VR teleop uses the same certificate, so accepting it once covers both.
 
 To connect from a browser on another machine, open the printed **LAN** URL once and accept the certificate warning. Pass `--no-tls` to disable TLS entirely (plain HTTP).
 
 ## Building the web UI
 
-The server looks for the built web bundle at `web/app/dist` (a repo checkout only — one-command installs have no checkout). If it isn't there, `axol serve` still runs and the **API is available**; use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to the server directly. To serve the UI locally instead, build it once with:
+The server looks for the built web UI at `web/app/dist`, which exists only in a repo checkout. Without it, `axol serve` still runs and the **API is available**. Use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to the server directly. To serve the UI locally instead, build it once:
 
 ```bash
 cd web
@@ -53,18 +53,18 @@ npm run build --workspace=packages/axol-vr-client
 npm run build --workspace=app
 ```
 
-See [Development install → Build the web UI](/advanced/development-install#build-the-web-ui) for details.
+For details, see [Build the web UI](/advanced/development-install#build-the-web-ui) in the development install guide.
 
 ## What it serves
 
 | Path | Description |
 |---|---|
 | `/control` | The control panel UI (operations, connections, settings). |
-| `/diagnostics` | The [diagnostics dashboard](/guides/diagnostics-dashboard) — live motor telemetry, health tiles, and diagnostics scripts (same build). |
-| `/vr` | The [VR teleop interface](/guides/vr-interface) (same build). |
-| `/` | Redirects by device — headset browsers to `/vr`, everything else to `/control`. |
+| `/diagnostics` | The [diagnostics dashboard](/guides/diagnostics-dashboard): live motor data, health tiles and diagnostic scripts. |
+| `/vr` | The [VR teleop interface](/guides/vr-interface). |
+| `/` | Sends headset browsers to `/vr` and everything else to `/control`. |
 | `/api/*` | JSON + WebSocket API used by the UI. |
 
 <Note>
-  The operations launched from the panel run **in-process** inside the `serve` process — the same Python entry points as the [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), and [`run-policy`](/cli/run-policy) CLI commands. Anything those commands need on the host (CAN, the `lerobot`/`sim`/`tracker` extras, ZED access) is required here too.
+  Operations launched from the panel run inside the `serve` process, the same way as the [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset) and [`run-policy`](/cli/run-policy) commands. Anything those commands need on the host is needed here too: CAN, the `lerobot`, `sim` and `tracker` extras, and ZED access.
 </Note>

@@ -383,10 +383,10 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol — and Jelly's wheels and lift when attached — from a "
-        "VR headset. Enable simulation to preview in the browser without "
-        "hardware. Mantis drives the rig grippers from their triggers (no "
-        "tracking).",
+        "Drive Axol from a VR headset, along with Jelly's wheels and lift when Jelly "
+        "is attached. Turn on sim to preview in the browser without hardware. "
+        "With Mantis, the triggers open and close the grippers, and nothing is "
+        "tracked.",
         "Operate",
         "draccus",
         _teleop,
@@ -412,9 +412,8 @@ COMMANDS: dict[str, CommandDef] = {
         "gravity-comp",
         "gravity-comp",
         "Gravity compensation",
-        "Hold the arms in gravity-comp so they can be moved by hand. Set a "
-        "recording name to capture the hand-guided motion for Build motion "
-        "in the tuning workbench.",
+        "Make the arms weightless so you can move them by hand. To save the motion "
+        "for Build reference motion, enter a name in Record.",
         "Operate",
         "draccus",
         _gravity_comp,
@@ -427,9 +426,8 @@ COMMANDS: dict[str, CommandDef] = {
         "waypoints",
         "waypoints",
         "Waypoints",
-        "Hand-guide the arms in gravity comp to record waypoints, then replay "
-        "them as straight-line moves solved with inverse kinematics. Enable "
-        "simulation to preview a saved path in the browser, and lower the "
+        "Guide the arms by hand to record waypoints, then replay them as straight-line "
+        "moves. Turn on sim to preview a saved path in the browser. Lower the "
         "speed scale to try a new path slowly on the robot.",
         "Operate",
         "draccus",
@@ -450,8 +448,8 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes with local ZED cameras. Mantis supports "
-        "Quest, Lighthouse, or Ultimate tracking.",
+        "Record teleoperation episodes with the ZED cameras. Mantis works with "
+        "Quest, Lighthouse or Ultimate tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -478,9 +476,9 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-dagger",
         "collect-dagger",
         "Collect DAgger data",
-        "Run a trained policy while the operator watches in VR and intervenes "
-        "with the grip buttons; policy segments and corrections are recorded "
-        "to a LeRobot dataset.",
+        "Run a trained policy while you watch in VR and take over with the grip "
+        "buttons. The policy's moves and your corrections are recorded to a LeRobot "
+        "dataset.",
         "Operate",
         "draccus",
         _collect_dagger,
@@ -511,7 +509,8 @@ COMMANDS: dict[str, CommandDef] = {
         "run-policy",
         "run-policy",
         "Run policy",
-        "Run a trained policy on the robot via LeRobot async inference.",
+        "Run a trained policy on Axol, on this computer or on a remote inference "
+        "server.",
         "Operate",
         "draccus",
         _run_policy,
@@ -532,8 +531,8 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.rom-enable",
         "diag.rom-enable",
         "ROM enable",
-        "Sweep every joint through its full range of motion for two hours; "
-        "telemetry is captured for the dashboard.",
+        "Sweep every joint through its full range of motion for two hours, and record "
+        "telemetry for the dashboard.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.rom.enable"),
@@ -558,8 +557,8 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.lift-cycle",
         "diag.lift-cycle",
         "Lift cycle",
-        "Raise the arm S1 joints for clearance, then cycle the telescoping "
-        "lift down and up for the requested number of repetitions.",
+        "Raise each arm's first shoulder joint for clearance, then run the lift down "
+        "and up for the number of cycles you set.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.lift.cycle"),
@@ -572,8 +571,8 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.zed-cable",
         "diag.zed-cable",
         "ZED cable check",
-        "Capture and validate frames from a connected ZED-X One camera to "
-        "verify its GMSL cable. Camera-only — does not touch the arms.",
+        "Capture frames from a connected ZED camera and check them to verify its "
+        "cable. Works with ZED X One and ZED X cameras, and doesn't move the arms.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.zed.cable"),
@@ -586,9 +585,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.pid",
         "tune.pid",
         "PID tuning",
-        "Test impedance Kp/Kd candidates on one joint (sine or step tracking) "
-        "with production-matched feedforward, rank them, and optionally save "
-        "the best pair to this robot's calibration.",
+        "Try several Kp and Kd pairs on one joint with a sine or step motion, and rank "
+        "them. You can save the best pair to this robot's calibration.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.pid"),
@@ -602,13 +600,12 @@ COMMANDS: dict[str, CommandDef] = {
     "tune.a4": CommandDef(
         "tune.a4",
         "tune.a4",
-        "Firmware position loop (0xA4)",
-        "Tune a MyActuator joint's own position/speed loop — the controller "
-        "behind wire_mode a4 — with a sine or constant-speed triangle: set "
-        "firmware gains (RAM unless persisted), the speed cap and the "
-        "planner acceleration, score tracking and creep smoothness, and "
-        "save the run. A buzz guard restores the previous gains on any "
-        "high-frequency motion.",
+        "Firmware position loop",
+        "Tune the position and speed loop inside a MyActuator motor (wire_mode a4) "
+        "with a sine or triangle motion. Set the firmware gains, speed cap and "
+        "acceleration, then score tracking and smoothness. Gains stay in RAM unless "
+        "you persist them. If the joint starts to buzz, the previous gains are "
+        "restored.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.a4"),
@@ -623,9 +620,9 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.friction",
         "tune.friction",
         "Friction identification",
-        "Identify one joint's friction model (Fc, k, Fv, Fo) with a "
-        "bidirectional velocity sweep, and optionally save it to this "
-        "robot's calibration. Run per joint, per arm, on every new robot.",
+        "Measure one joint's friction by sweeping it back and forth at several speeds. "
+        "You can save the result to this robot's calibration. To calibrate every joint "
+        "at once, use Factory calibration (all joints).",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.friction"),
@@ -638,10 +635,9 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.gravity",
         "tune.gravity",
         "Gravity CoM identification",
-        "Fit one link's real centre of mass from a friction-cancelled torque "
-        "sweep, correcting the gravity feedforward — removes the static "
-        "droop the joint shows under load. Run distal→proximal; --save "
-        "writes the CoM to this robot's calibration.",
+        "Measure where one link's center of mass is, so the joint stops sagging under "
+        "load. Work from the wrist toward the shoulder. Turn on save to write the "
+        "result to this robot's calibration.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.gravity"),
@@ -654,12 +650,9 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.factory",
         "tune.factory",
         "Factory calibration (all joints)",
-        "Friction (the slow-motion profile: load-dependent sliding friction "
-        "and the Stribeck excess, in the realtime core's own law) + gravity "
-        "identification for all 14 joints (both arms, distal→proximal) in "
-        "one run, ~1.5 h — saved to this robot's calibration and uploaded to "
-        "the cloud keyed by the hub adapter serial when Supabase credentials "
-        "are configured.",
+        "Measure friction and gravity for all 14 joints of both arms, starting at the "
+        "wrists. Takes about 1.5 hours. The result is saved to this robot's "
+        "calibration, and uploaded to the cloud when an upload key is set.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.factory"),
@@ -672,9 +665,8 @@ COMMANDS: dict[str, CommandDef] = {
         "calibration.pull",
         "calibration.pull",
         "Fetch factory calibration",
-        "Download this robot's factory calibration (friction + gravity, by "
-        "hub adapter serial) from the cloud into the local cache; every "
-        "config then overlays it under the local calibration file.",
+        "Download this robot's factory calibration from the cloud, looked up by the "
+        "hub's serial number. A local calibration file still overrides it.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.calibration"),
@@ -686,10 +678,9 @@ COMMANDS: dict[str, CommandDef] = {
         "calibration.push",
         "calibration.push",
         "Upload local calibration",
-        "Upload this robot's local calibration file (friction, Stribeck, "
-        "gravity, gains — everything saved here) to the cloud by hub adapter "
-        "serial, merged per joint over what is stored; needs the Supabase "
-        "write key.",
+        "Upload this robot's local calibration file to the cloud under the hub's "
+        "serial number. Joints in the file replace their stored values, and other "
+        "joints are kept. Needs the upload key.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.calibration"),
@@ -701,12 +692,10 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.motion",
         "tune.motion",
         "Reference-motion replay",
-        "Replay a committed reference motion through the production control "
-        "path and score tracking accuracy and smoothness per joint — or run "
-        "it as IK, where the motion's Cartesian end-effector path is "
-        "re-solved live and the arms execute the solver's output. Override "
-        "gains per run to A/B-compare on the identical motion; every run is "
-        "saved for the Tuning charts.",
+        "Replay a reference motion and score each joint's tracking and smoothness. In "
+        "IK mode, the motion's gripper path is solved live and the arms follow the "
+        "solver. Override gains per run to compare them on the same motion. Every run "
+        "is saved for the Tuning charts.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.motion"),
@@ -721,12 +710,10 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.filter",
         "tune.filter",
         "Filter noise-rejection test",
-        "Inject network noise (jitter/outliers/stalls, before the pose "
-        "low-pass) or IK noise (solver churn/jumps, after it) — or both — "
-        "into a clean motion and replay through the production teleop "
-        "filter stack, offline, seeded and reproducible. Each source "
-        "enters at its real pipeline point, so they are testable "
-        "independently. Scores how much the stack removes, per joint.",
+        "Add network noise, IK noise or both to a clean motion, and replay it offline "
+        "through the teleop filters. Each kind of noise enters where it would in a "
+        "real session, and runs are repeatable. Scores how much noise the filters "
+        "remove from each joint.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.filter"),
@@ -737,10 +724,10 @@ COMMANDS: dict[str, CommandDef] = {
         "motion.build",
         "motion.build",
         "Build reference motion",
-        "Postprocess a recorded session (teleop's record option, or "
-        "gravity-comp's for a hand-guided one) into a reference motion: "
-        "clip to the engaged span / trim the still ends, resample, smooth, "
-        "and project through the collision-aware solver.",
+        "Turn a recorded session into a reference motion. Record with teleop's record "
+        "option, or with gravity comp's for a hand-guided motion. The build trims the "
+        "still ends, resamples and smooths the motion, and keeps the path "
+        "collision-free.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.motion"),
@@ -751,9 +738,9 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.offline",
         "diag.offline",
         "Offline pipeline analysis",
-        "Analyze a teleop flight-recorder capture without hardware: wifi "
-        "transport jitter, filter-stack pass-through and lag, or IK-injected "
-        "motion. Results save as tuning runs for the charts.",
+        "Analyze a recorded teleop session without hardware. Check Wi-Fi jitter, what "
+        "the filters let through and the lag they add, or motion the IK adds. Results "
+        "are saved as tuning runs for the charts.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.offline_suites"),
@@ -769,12 +756,10 @@ COMMANDS: dict[str, CommandDef] = {
         "lift.home",
         "lift.home",
         "Home the lift",
-        "Calibrate the telescoping lift: drive both legs to their end stops "
-        "and save the height scale to the lift board's flash (~1-2 min). "
-        "One-time — the calibration persists across power cycles. Legs home "
-        "together by default (safe on the robot); turn on Independent only "
-        "for loose legs off the robot, to level them. Stop aborts safely "
-        "(rolls back).",
+        "Calibrate the lift by driving both legs to their end stops. Takes 1 to 2 "
+        "minutes, and you only need to do it once. Turn on Independent only to level "
+        "loose legs that are off the robot. Press Stop to cancel, which keeps the "
+        "previous calibration.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.home"),
@@ -785,7 +770,7 @@ COMMANDS: dict[str, CommandDef] = {
     "lift.goto": CommandDef(
         "lift.goto",
         "lift.goto",
-        "Raise lift (install height)",
+        "Raise lift to install height",
         "Move the lift to a target height in percent of travel. The default "
         "75% is the robot install height. Requires a homed lift.",
         "Diagnostics",
@@ -799,11 +784,11 @@ COMMANDS: dict[str, CommandDef] = {
         "lift.update",
         "lift.update",
         "Update lift firmware",
-        "Upload a jelly_legs firmware.bin and install it on the lift board "
-        "over CAN (~1 min). The new firmware boots on trial and reverts on "
-        "its own unless it comes up healthy; the lift's homing is kept. "
-        "Without a file it reports the running firmware. Needs lift firmware "
-        "0.9+ (installed once over USB).",
+        "Install a Jelly lift firmware file (.bin) on the lift board over CAN, in "
+        "about a minute. If the new firmware doesn't start correctly, the board goes back to "
+        "the old one, and the lift keeps its homing. Without a file, it shows the "
+        "running firmware version. Needs lift firmware 0.9 or later, installed once "
+        "over USB.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.lift.update"),
@@ -837,10 +822,9 @@ COMMANDS: dict[str, CommandDef] = {
     "motor.dump-config": CommandDef(
         "motor.dump-config",
         "motor.dump-config",
-        "Dump config",
-        "Read every configuration parameter from one or all motors, MyActuator "
-        "or Damiao. Read-only — the run log is the snapshot to attach to a "
-        "support thread.",
+        "Read all parameters",
+        "Read every configuration parameter from one motor or all of them, MyActuator "
+        "or Damiao. Nothing is written. Attach the run log when you contact support.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.dump_config"),
@@ -849,10 +833,9 @@ COMMANDS: dict[str, CommandDef] = {
     "motor.set-config": CommandDef(
         "motor.set-config",
         "motor.set-config",
-        "Set config parameter",
-        "Read or write a single configuration parameter on either motor family "
-        "— protection thresholds, position limits, motion planning caps, and "
-        "Damiao's CAN timeout.",
+        "Edit parameter",
+        "Read or write one configuration parameter on a MyActuator or Damiao motor, "
+        "such as a protection threshold, a position limit or Damiao's CAN timeout.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.set_config"),
@@ -862,9 +845,9 @@ COMMANDS: dict[str, CommandDef] = {
         "motor.flash",
         "motor.flash",
         "Flash firmware",
-        "Overwrite a MyActuator motor's firmware from a .bin on the robot host. "
-        "Nothing else may use the bus while it runs, and an interrupted flash "
-        "leaves the motor in its bootloader until the flash is re-run.",
+        "Replace a MyActuator motor's firmware with a .bin file on the robot's "
+        "computer. Nothing else can use the bus while it runs. If the flash is "
+        "interrupted, the motor stays in its bootloader until you run it again.",
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.flash"),
@@ -910,8 +893,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tracker.lighthouse.check",
         "tracker.lighthouse.check",
         "Check Lighthouse base stations",
-        "Listen to libsurvive briefly and verify every base station uses a "
-        "different channel and both trackers report.",
+        "Check that each base station uses a different channel and that both trackers "
+        "report.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.tracker_lighthouse"),
@@ -922,7 +905,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tracker.lighthouse.validate",
         "tracker.lighthouse.validate",
         "Check Lighthouse session",
-        "Measure stationary tracking consistency before collection.",
+        "Check that tracking holds steady while the trackers sit still. Run it before "
+        "you collect data.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.tracker_lighthouse_calibrate"),
@@ -933,7 +917,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tracker.lighthouse.calibrate",
         "tracker.lighthouse.calibrate",
         "Calibrate Lighthouse stations",
-        "Rebuild station geometry and measure stationary tracking consistency.",
+        "Recalibrate the base station positions, then check that tracking holds steady "
+        "while the trackers sit still.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.tracker_lighthouse_calibrate"),
@@ -967,7 +952,7 @@ COMMANDS: dict[str, CommandDef] = {
         "can.setup",
         "can.setup",
         "CAN setup",
-        "Name the CAN interfaces and register a @reboot bring-up entry.",
+        "Name the CAN interfaces and set them to come up automatically at boot.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.can.setup"),

@@ -180,7 +180,7 @@ async function json<T>(res: Response): Promise<T> {
   try {
     return (await res.json()) as T
   } catch {
-    throw new Error("the host did not answer like an axol serve host — set the axol host address")
+    throw new Error("this address is not an Axol host. Check the Axol host address.")
   }
 }
 
@@ -367,12 +367,12 @@ export interface RobotStatus {
   hasGripper?: boolean
 }
 
-/** Short display label for a fault, e.g. "L elbow — over temperature (78°C)". */
+/** Short display label for a fault, e.g. "L elbow: over temperature (78°C)". */
 export function motorFaultLabel(f: MotorFault): string {
   const joint = f.joint.replace(/_/g, " ").toLowerCase()
   const temp =
     f.problem.includes("temp") && f.temperature != null ? ` (${Math.round(f.temperature)}°C)` : ""
-  return `${f.arm[0].toUpperCase()} ${joint} — ${f.problem}${temp}`
+  return `${f.arm[0].toUpperCase()} ${joint}: ${f.problem}${temp}`
 }
 
 export async function fetchRobotStatus(): Promise<RobotStatus> {
@@ -488,8 +488,8 @@ export async function discoverCanHardware(force = false): Promise<CanInterfaceIn
 export type JellyDevice = "wheels" | "lift"
 export const JELLY_DEVICES: readonly JellyDevice[] = ["wheels", "lift"]
 export const JELLY_DEVICE_LABELS: Record<JellyDevice, string> = {
-  wheels: "Jelly Wheels",
-  lift: "Jelly Lift",
+  wheels: "Jelly wheels",
+  lift: "Jelly lift",
 }
 
 /** One wheel motor from the idle ping (IDs 1–4, Damiao). */
@@ -622,9 +622,9 @@ export function liftFaultLabel(status: JellyLiftStatus | null | undefined): stri
   if (status.reachable === false) return "Lift board not answering"
   const board = status.status
   if (!board) return null
-  if (board.stallFault) return "Leg stall fault"
+  if (board.stallFault) return "Lift stalled"
   if (board.driverFaultMask) return "Lift driver fault"
-  if (board.vmPresent === false) return "Lift motor power absent"
+  if (board.vmPresent === false) return "No power to lift motors"
   return null
 }
 
@@ -1811,7 +1811,8 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
     label: "Teleoperation",
-    description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+    description:
+      "Drive Axol from a VR headset. Mantis works with Quest, Lighthouse or Ultimate tracking.",
     fields: ["sim"],
     suggestedFields: [],
     strictFields: [],
@@ -1829,7 +1830,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "gravity-comp",
     label: "Gravity compensation",
-    description: "Hold the arms weightless so they can be moved by hand.",
+    description: "Hold the arms weightless so you can move them by hand.",
     fields: ["free_joints"],
     suggestedFields: [],
     strictFields: [],
@@ -1848,7 +1849,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect data",
     description:
-      "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+      "Record episodes with the ZED cameras. Mantis works with Quest, Lighthouse or Ultimate tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
     strictFields: [],
@@ -1888,8 +1889,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "run-policy",
     label: "Run policy",
-    description:
-      "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
+    description: "Run a trained policy on Axol, on this computer or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
     suggestedFields: [],
     strictFields: [],
@@ -2012,7 +2012,7 @@ export function perRunFields(
 export const CUSTOM_POLICY_TYPE = "custom"
 
 const CUSTOM_POLICY_PATH_HELP =
-  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
+  "Not used for a custom policy. Choose the model on your policy server."
 
 /** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
 export function isCustomPolicyRun(values: Record<string, unknown>): boolean {

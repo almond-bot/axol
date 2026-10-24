@@ -64,10 +64,10 @@ export function SetupDialog({
         <div className="flex flex-col gap-6 p-5">
           <section className="flex flex-col gap-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="setup-server-host">Axol Host Address</Label>
+              <Label htmlFor="setup-server-host">Axol host address</Label>
               <ConnBadge state={conn.state} />
             </div>
-            <p className="text-xs text-white/45">The host connected to Axol.</p>
+            <p className="text-xs text-white/45">The computer connected to Axol.</p>
             <form
               className="flex gap-2"
               onSubmit={(e) => {
@@ -101,13 +101,13 @@ export function SetupDialog({
               <div className="flex flex-col gap-2 text-xs text-red-400">
                 <span className="flex items-center gap-1.5">
                   <AlertTriangle className="size-3" />
-                  Can&apos;t reach {base || "the server"}.
+                  Can&apos;t reach {base || "the host"}.
                 </span>
                 {base && (
                   <>
                     <span className="text-white/45">
-                      If it&apos;s running, its self-signed TLS certificate needs a one-time
-                      approval. Authorize it, accept the warning in the popup, then it reconnects.
+                      If the host is running, authorize its certificate. Accept the warning in the
+                      window that opens, and the panel reconnects.
                     </span>
                     <Button
                       type="button"
@@ -153,7 +153,7 @@ export function ConnectionPill({
     <button
       type="button"
       onClick={onClick}
-      title="Server connection & setup"
+      title="Host connection"
       className="flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.03] px-2.5 py-1.5 text-xs text-white/70 transition-colors hover:border-white/25 hover:bg-white/[0.06]"
     >
       <span

@@ -129,7 +129,7 @@ class FirmwareImageTest(unittest.TestCase):
     def test_rejects_wrong_files(self) -> None:
         cases = (
             (b"", "empty"),
-            (b"\0" * 4096, "identity block"),
+            (b"\0" * 4096, "not a Jelly lift firmware file"),
             (b"UF2\n" + _image(), "uf2"),
             (b"\x7fELF" + _image(), "elf"),
             (_image(size=lift_firmware.MAX_IMAGE_BYTES + 1), "at most"),
@@ -306,7 +306,7 @@ class LiftFirmwareUploadApiTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             response = await self._post(b"\0" * 1024, Path(tmp))
             self.assertEqual(response.status_code, 400)
-            self.assertIn("identity block", response.json()["error"])
+            self.assertIn("not a Jelly lift firmware file", response.json()["error"])
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     async def test_rejects_oversized_uploads(self) -> None:

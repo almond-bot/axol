@@ -8,7 +8,7 @@ const RELEASES_URL = "https://github.com/almond-bot/axol/releases"
 /** Human-readable label for the current update step (shown on the button). */
 const PHASE_LABEL: Record<UpdatePhase, string> = {
   upgrading: "Upgrading…",
-  provisioning: "Installing deps…",
+  provisioning: "Installing packages…",
   restarting: "Restarting…",
   rebooting: "Rebooting host…",
 }
@@ -42,7 +42,7 @@ export function UpdateBanner({
   busyReason?: string
   onUpdate: () => void
 }) {
-  const hint = busyReason ?? "The server is busy"
+  const hint = busyReason ?? "The host is busy"
   const updatingLabel = (phase && PHASE_LABEL[phase]) || "Updating…"
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">

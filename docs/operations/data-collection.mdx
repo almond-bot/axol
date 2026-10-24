@@ -1,28 +1,34 @@
 ---
 title: "Data Collection"
-description: "Record VR teleoperation episodes to a LeRobot dataset — from the web control panel or the CLI."
+description: "Record teleoperation episodes with camera video to a LeRobot dataset for training."
 ---
 
-Data collection records teleoperation episodes plus synchronized camera frames into a [LeRobot](/api/lerobot) dataset you can later train on. Axol records joint trajectories by default and can record Cartesian TCP poses with **Observe Cartesian**; **Mantis** records Cartesian TCP poses from Quest, Lighthouse, or Ultimate tracking. Everything runs on **one machine**: the computer wired to the hardware with the ZED cameras attached (typically a ZED Box / Jetson), so images and actions share one clock.
+Data collection records teleoperation episodes and camera video into a [LeRobot](/api/lerobot) dataset you can train on. Start it from the web control panel or with `axol collect-data`.
 
-Axol and Mantis episodes can share one dataset. For each on-robot run, enable **Observe Cartesian** so its state/action schema matches Mantis, and keep the gripper capability, camera slots, image resolution, and FPS identical. A dataset created by Mantis may contain `observation.pose_lag`; on-robot recording fills that column automatically. If the dataset began on Axol without it, later Mantis recording keeps the original schema and omits that optional column.
+- **Axol** records joint positions by default. Turn on **Observe Cartesian** to record gripper poses instead.
+- **Mantis** records gripper poses from Quest, Lighthouse or Ultimate tracking.
 
-You can launch either profile from the **web control panel** or the **CLI** (`axol collect-data`). Quest uses the **A** button for recording. Managed Lighthouse/Ultimate Mantis runs use rig-trigger gestures (both squeezed then released to engage and start; x3 to save, x4 to discard), and the control panel can drive every source with on-screen episode buttons.
+Run it on the computer that is wired to the hardware and has the ZED cameras attached, usually a ZED Box or Jetson. Images and actions then share one clock.
 
 ## Before you start
 
-- **Axol installed** ([one-command install](/installation)) and the selected device connected: **Axol**, or **Mantis** with its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) set up (setup complete under **Mantis settings → Tracking**, and an approved factory or measured tracker→TCP transform for both sides).
-- **At least one ZED camera connected** over GMSL and assigned with **Record** enabled. Axol uses the overhead / left arm / right arm slots; Mantis uses the separately stored Head / Left Mantis / Right Mantis layout. Both can record the head stereo camera and both wrists together.
-- **A Meta Quest** with the VR TLS certificate authorized once — for Axol, and for Mantis with the Quest source. Lighthouse/Ultimate Mantis collects with no headset.
+- Install Axol with the [one-command install](/installation) and connect the device you selected.
+  - For **Axol**, connect the robot.
+  - For **Mantis**, finish its [hardware](/mantis/hardware) and [pose source](/mantis/tracking) setup. **Mantis settings → Tracking** must show setup complete, with an approved tracker-to-gripper transform for both sides.
+- Connect at least one ZED camera over GMSL. Assign it to a slot with **Record** turned on.
+  - Axol uses the overhead, left arm and right arm slots.
+  - Mantis uses separate Head, Left Mantis and Right Mantis slots.
+  - Both can record the stereo head camera and both wrist cameras together.
+- For Axol, and for Mantis with the Quest source, have a Meta Quest with the [TLS certificate authorized](/operations/teleop#authorize-the-tls-certificate). Mantis with Lighthouse or Ultimate needs no headset.
 
 <Tip>
-  List the connected cameras and their serials from Python:
+  To list the connected cameras and their serial numbers, run:
 
   ```bash
   python -c "from almond_axol.zed import list_zed_devices; print(list_zed_devices())"
   ```
 
-  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** under **Axol settings → Cameras** or **Mantis settings → Cameras** in the control panel.
+  If a camera plugged in after boot doesn't show up, press **Restart camera service** under **Axol settings → Cameras** or **Mantis settings → Cameras**. On the CLI, run `sudo systemctl restart zed_x_daemon`.
 </Tip>
 
 ## Run it
@@ -31,23 +37,24 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
   <Tab title="Axol">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and, with **Axol** selected on its tile, the robot. Open **Axol settings → Cameras** and assign each detected camera to its slot (overhead / left arm / right arm) — at least one with **Record** enabled. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and, with **Axol** selected, the robot. Open **Axol settings → Cameras** and assign each camera to the overhead, left arm or right arm slot. Turn on **Record** for at least one. Axol detects stereo ZED X cameras automatically. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
-      <Step title="Select Collect Data and fill the fields">
-        Pick **Collect Data**. Set the dataset **repo&nbsp;id** — type a new one (e.g. `myorg/pick-place`) or pick an existing dataset from the dropdown (each shown with its episode count) to **resume** it — and the **task** description; those are the only per-run inputs. Everything reusable (fps, teleop rate, stiffness, push-to-hub) lives in the [Settings](/guides/control-panel#settings) tabs.
+      <Step title="Select Collect data and fill in the fields">
+        Pick **Collect data** and fill in:
+
+        - **Repo ID**: type a new name such as `myorg/pick-place`, or pick an existing dataset from the list to add to it. The list shows each dataset's episode count.
+        - **Task**: a description of the task.
+
+        Recording rate, teleoperation rate, stiffness and upload settings are in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
 
       <Step title="Start and record from the headset">
-        Press **Start**, connect the headset, and drive the arms. Recording is normally controlled from the VR controllers — see [Recording an episode](#recording-an-episode) below — and the panel mirrors the camera feeds and episode state while you go, with on-screen buttons for the same decisions ([Driving from the panel](#driving-from-the-panel)).
+        Press **Start**, connect the headset and drive the arms. Record with the controllers, as described in [Recording an episode](#recording-an-episode). The panel shows the camera feeds and episode state, and has buttons for the same actions. See [Driving from the panel](#driving-from-the-panel).
       </Step>
     </Steps>
 
-    <Note>
-      The session is locked to data collection; there's no mode toggle.
-    </Note>
-
-    **From the CLI**, on the robot machine:
+    **From the CLI**, on the robot's computer:
 
     ```bash
     axol collect-data \
@@ -56,50 +63,81 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
         --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Replace the serials with your cameras'. Assign only the slots you have — at least one is required, and any you omit are simply not recorded (e.g. `--robot_config.cameras "{overhead: {serial: 41234567}}"` records the overhead alone). The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). Stereo ZED X cameras are detected from their serial automatically: a stereo **overhead** records both eyes as `overhead_left` / `overhead_right`, while a stereo **wrist** records its left eye under the plain slot name (like a mono camera). To override the auto-detection, set `stereo: true` together with the eye policy you want — `eyes: both` records `X_left` / `X_right`, `eyes: left` (or `right`) records a single eye under the plain name `X` (so a forced wrist needs `eyes: left` to stay single-eye). For example, to force the overhead:
+    Replace the serial numbers with your cameras'. Assign at least one slot. Slots you leave out aren't recorded, so `--robot_config.cameras "{overhead: {serial: 41234567}}"` records the overhead camera only.
+
+    The `cameras` value is one inline YAML dictionary. See [Command configuration](/cli/configuration#field-name-conventions).
+
+    Axol detects stereo ZED X cameras from their serial number:
+
+    - A stereo **overhead** camera records both eyes, as `overhead_left` and `overhead_right`.
+    - A stereo **wrist** camera records its left eye under the slot name, like a mono camera.
+
+    To override the detection, set `stereo: true` and choose the eyes:
+
+    - `eyes: both` records `X_left` and `X_right`.
+    - `eyes: left` or `eyes: right` records one eye under the slot name `X`. A forced stereo wrist camera needs `eyes: left` to stay single-eye.
+
+    For example, to force a stereo overhead camera:
 
     ```bash
         --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Connect the headset and record from the controllers — see [Recording an episode](#recording-an-episode). Press `Ctrl+C` to finish. See [`collect-data`](/cli/collect-data) for the full field list (`--fps`, `--teleop_hz`, stiffness, `--push_to_hub`) and [Command configuration](/cli/configuration) for the override syntax.
+    Connect the headset and record from the controllers. See [Recording an episode](#recording-an-episode). Press `Ctrl+C` to finish. See [`collect-data`](/cli/collect-data) for every field, including `--fps`, `--teleop_hz`, stiffness and `--push_to_hub`.
   </Tab>
 
   <Tab title="Mantis">
-    Complete the [Mantis tracking acceptance](/mantis/tracking#acceptance) with the same source before creating training data. An unapproved CAD candidate, legacy unkeyed offset, generic absolute-mode sim, or start-pose-only alignment is not production calibration; the built-in VIVE factory transforms are approved values.
+    Before you record training data, pass the [Mantis tracking acceptance](/mantis/tracking#acceptance) with the same pose source. Collection refuses to start with a missing or unapproved tracker-to-gripper transform. The built-in VIVE factory transforms count as approved.
 
     <Steps>
       <Step title="Select Mantis and check its settings">
-        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**: the pose source's setup flow must be complete under **Tracking** ([Mantis Tracking](/mantis/tracking)), the two CAN channels distinct under **CAN**, the [rig trigger endpoints](/mantis/hardware#testing-the-triggers-and-grippers) checked under **Triggers**, and at least one **Head / Left Mantis / Right Mantis** camera assigned with **Record** enabled under **Cameras**. For stereo head recording, enable both **L** and **R** under **Record**.
+        Press **Select** on the **Mantis** tile and let it connect. Click the tile's title to open **Mantis settings**, then check:
+
+        - **Tracking**: the pose source's setup is complete. See [Mantis Tracking](/mantis/tracking).
+        - **CAN**: the two channels are different.
+        - **Triggers**: the [trigger endpoints](/mantis/hardware#testing-the-triggers-and-grippers) are checked.
+        - **Cameras**: at least one **Head**, **Left Mantis** or **Right Mantis** camera has **Record** on. For stereo head video, turn on both **L** and **R** under **Record**.
       </Step>
 
-      <Step title="Select Collect Data and fill the fields">
-        Pick **Collect Data** and set the **repo&nbsp;id** and **task** as for Axol. Start stays blocked until source setup, both transforms, the Mantis link, and the camera selection are ready; the "Before you can start" list names what is missing. `mantis_allow_uncalibrated` exists only for a calibration capture that will not enter training.
+      <Step title="Select Collect data and fill in the fields">
+        Pick **Collect data** and fill in **Repo ID** and **Task** as for Axol. **Start** stays unavailable until the pose source, both transforms, the Mantis link and the cameras are ready. The **Before you can start** list names what is missing.
+
+        `mantis_allow_uncalibrated` is only for a calibration capture that won't be used for training.
       </Step>
 
-      <Step title="Start and bring up the source">
-        Press **Start**. Quest: connect and enter VR at [axol.almond.bot](https://axol.almond.bot); left/right comes from WebXR handedness. Lighthouse/Ultimate: power both trackers in the tracked volume and wait for two fresh poses **and** two trigger heartbeats — no headset required.
+      <Step title="Start and bring up the pose source">
+        Press **Start**.
+
+        - **Quest**: open [axol.almond.bot](https://axol.almond.bot) and enter VR. Left and right come from the controllers.
+        - **Lighthouse or Ultimate**: power on both trackers inside the tracked area. Wait until both trackers report a pose and both triggers report in. No headset is needed.
       </Step>
 
       <Step title="Record with the source's controls">
         <Tabs>
           <Tab title="Quest">
-            Hold the rigs at the start pose, release both controller grips, then press both to align and engage. Record with **A** exactly as on Axol — countdown, then **A** again to arm **Save episode?**, **X** to arm **Discard episode?** — or from the panel's episode buttons.
+            Hold the rigs at the start pose and release both controller grips. Press both grips to align and engage. Then record with **A** and **X** as on Axol (see [Recording an episode](#recording-an-episode)), or with the panel's episode buttons.
           </Tab>
           <Tab title="Lighthouse / Ultimate">
-            Hold the rigs where the take should begin, **squeeze both rig triggers together, then release both**. That one gesture fits the world→robot base transform at the rigs' pose, engages tracking, and — once the teleop core acknowledges the engage — starts the take. The physical grippers enable only for the take and are force-disabled again after every save, discard, stop, or error.
+            Hold the rigs where the take should begin. **Squeeze both rig triggers together, then release both.** This aligns the rigs to the robot, engages tracking and starts the take. The grippers are powered only during a take.
 
-            While recording, rapidly fully squeeze and release either trigger (or both together) **three times** to end and save, or **four times** to end and discard (the same outcome as the panel's **Discard episode**). Three presses resolve after a short pause so a fourth can still select discard. The saved episode ends where the first of the three squeezes *began* — the rows captured during the clicks are trimmed, so the gesture leaves no trace in the data. A triple press while idle does nothing; the panel's **Start recording** still requires an engaged rig.
+            While recording, fully squeeze and release either trigger quickly:
+
+            - **Three times** to end and save the take.
+            - **Four times** to end and discard it, like the panel's **Discard episode**.
+
+            After three squeezes, Axol waits a moment in case a fourth follows. The saved take ends where the first squeeze began, so the gesture doesn't appear in the data. Squeezing three times while idle does nothing. The panel's **Start recording** needs an engaged rig.
           </Tab>
         </Tabs>
       </Step>
 
-      <Step title="Treat any tracking or input break as a failed take">
-        A pose loss, stale trigger heartbeat, disengagement, or stale pose freezes the rig and fails the in-flight Mantis quality check; the panel then shows why the take was not saved (see [Driving from the panel](#driving-from-the-panel)). Restore both sides, then repeat the start gesture to re-anchor and open a clean take. After every take the virtual arms return to rest and tracking disengages, so each take starts with this gesture — wherever the rigs are at that moment. Nothing re-anchors and resumes automatically, and the grippers stay motor-disabled between takes.
+      <Step title="Re-record after any tracking break">
+        If a tracker loses its pose, a trigger stops reporting or tracking disengages, the rig freezes and the take fails its quality check. The panel shows why the take wasn't saved. See [Driving from the panel](#driving-from-the-panel).
+
+        After every take, tracking disengages and the grippers turn off. To start the next take, restore both sides if needed, then repeat the start gesture wherever the rigs are. Nothing resumes automatically.
       </Step>
     </Steps>
 
-    **From the CLI**, the run owns the managed bridge and trigger readers (the saved source is used when `--mantis_source` is omitted):
+    **From the CLI**, `collect-data` starts the tracker bridge and trigger readers itself. Without `--mantis_source`, it uses the source saved in the settings.
 
     ```bash
     axol collect-data --mantis true --mantis_source lighthouse \
@@ -107,98 +145,120 @@ You can launch either profile from the **web control panel** or the **CLI** (`ax
       --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    The `overhead` slot is the head camera and records both stereo eyes as `overhead_left` / `overhead_right`; omit any camera slots you do not use. Change the source to `quest` or `ultimate` as needed; do not start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
+    The `overhead` slot is the head camera. It records both stereo eyes as `overhead_left` and `overhead_right`. Leave out any slots you don't use.
+
+    Set the source to `quest` or `ultimate` as needed. Don't start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
   </Tab>
 </Tabs>
 
 ## Quest controller layout
 
-For Axol and Quest-source Mantis, episodes can be driven from the Quest controllers (the control panel can take the same decisions — see [Driving from the panel](#driving-from-the-panel)). The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** record button. Lighthouse/Ultimate Mantis uses the rig-trigger gestures in the Mantis tab above instead. The session is locked to data collection mode, so there's no mode toggle.
+With Axol, and with Mantis on the Quest source, you record from the Quest controllers. The arm controls are the same as in [teleoperation](/operations/teleop). Data collection adds the **A** button for recording.
+
+The control panel can take the same actions. See [Driving from the panel](#driving-from-the-panel).
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **engage** tracking from rest; once engaged, each grip **toggles its own arm** between tracking and frozen (a frozen arm holds its pose and grasp). With **Hold grips to engage** on, hold a grip to move that arm — either grip alone, from rest too — and release to freeze it |
-| 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
-| 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
-| 5 | X | **Reset** to rest pose — including out of the contact-fallback [gravity-comp hold](#recording-an-episode), where it sends the hand-guided arms home; during the start countdown, cancels it. During a recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
-| 6 | A | **Record**: start a take (3-second countdown). During a recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording |
-| 7 | Y | **Exit** the VR session |
-| — | Right **B** | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes; see [Camera views](/guides/vr-interface#camera-views) |
-| — | Thumbsticks | **Drive [Jelly](/guides/vr-interface#jelly)** (robots so equipped) to reposition between takes — operator mobility only, so Jelly motion is **never recorded** into the dataset |
+| 1 | Left grip | Press both grips together to **engage**. After that, each grip freezes or resumes the arm on its side. With **Hold grips to engage** on, hold a grip to move that arm. |
+| 2 | Right grip | Same as the left grip. |
+| 3 | Left trigger | Close the left gripper. While disengaged, point at a camera screen and hold to **move** it. Use both triggers on one screen to **resize** it. |
+| 4 | Right trigger | Close the right gripper. While disengaged, moves and resizes camera screens like the left trigger. |
+| 5 | X | **Reset** the arms to the rest pose, including out of a contact hold. Cancels the countdown. During a take, asks **Discard episode?** |
+| 6 | A | **Record**: start a take after a 3-second countdown. During a take, asks **Save episode?** |
+| 7 | Y | **Exit** the VR session. |
+| | Right **B** | **Reset the camera screens** to where you are looking. See [Camera views](/guides/vr-interface#camera-views). |
+| | Thumbsticks | **Drive [Jelly](/guides/vr-interface#jelly)** between takes, on Axol on Jelly. Jelly motion is never recorded. |
 
-<Note>
-  The camera feeds are relayed to the headset during collection, so you can line up takes from the robot's point of view.
-</Note>
+The camera feeds are shown in the headset, so you can line up takes from the robot's view.
 
 ## Recording an episode
 
 <Steps>
   <Step title="Drive to the start pose">
-    The session is already in **Data Collection** — put on the headset, engage tracking, and drive the arms to where you want the take to begin.
+    Put on the headset, engage tracking and drive the arms to where the take should begin.
   </Step>
 
   <Step title="Start a take">
-    Press **A** to begin recording — a 3-second countdown runs, then frame capture begins. Press **A** again during the countdown, or **X**, to cancel.
+    Press **A**. Recording starts after a 3-second countdown. Press **A** again or **X** to cancel the countdown.
   </Step>
 
-  <Step title="Finish the take">
-    Stopping is **confirmation-gated** — the first press arms an in-headset popup instead of stopping immediately, so a fumbled button never loses a take:
+  <Step title="End the take">
+    The first press asks for confirmation in the headset, so a stray press never loses a take.
 
-    - Press **A** to arm **Save episode?** — press **A** again to save, or **X** to cancel and keep recording.
-    - Press **X** to arm **Discard episode?** — press **X** again to discard and re-record, or **A** to cancel and keep recording.
+    - Press **A** for **Save episode?** Press **A** again to save, or **X** to keep recording.
+    - Press **X** for **Discard episode?** Press **X** again to discard and re-record, or **A** to keep recording.
 
-    Nothing is committed until you confirm. After you confirm a **save**, the headset enters the **Saving** state and every control except **Y** (exit) is blocked while the episode is written to disk. Confirming a **discard** drops the take and rewinds to re-record it.
+    After you confirm a save, the headset shows **Saving** and only **Y** works until the episode is written.
   </Step>
 
-  <Step title="The arms return home — guarded">
-    After a take ends — saved or discarded — the arms head back to the rest pose on their own, but **guarded**: a torque watchdog compares every joint against the gravity model as the move plays.
+  <Step title="Let the arms return to rest">
+    After each take, the arms return to the rest pose on their own. The move is guarded: if an arm meets resistance, such as a gripper caught on a handle or a person, the move stops.
 
-    If the move meets **unexpected resistance** — a gripper still hooked on a handle, or you grabbing an arm — it stops where it is and the arms drop into a limp **gravity-compensation hold**, free to be hand-guided. Ease them clear of the scene (the episode keeps saving in the background), then press **X** to send them home again — the return replans **from wherever you left the arms**. Recording is blocked while limp; pressing **A** just gets you a reminder to reset first.
+    1. The arms go limp in a **gravity-compensation hold**. The episode keeps saving.
+    2. Guide the arms clear by hand.
+    3. Press **X** to plan a new return from where they are.
 
-    The grips can't engage tracking during this stretch — from the end of the take until the arms are home and the episode has finished saving or discarding, a squeeze is ignored. Once it's over, release both grips, then squeeze both again to engage; a grip held through the save doesn't count.
+    You can't record while the arms are limp. Pressing **A** reminds you to reset first.
 
-    The same guard covers **every** rest move — an **X** reset between takes and the startup move too, not just the post-episode return. Its sensitivity is the **Reset contact threshold** in the control panel's **Axol settings → Robot** (`--teleop_config.vr_teleop_config.reset_torque_threshold` on the CLI) — raise it if normal returns trip it falsely, or set `0` to disable it and always complete the return.
-
-    You can also arm a watchdog for the **tracking** phase — while you're actively driving the arms during a take. It's **off by default** (recording pushes on the scene on purpose): set the **Teleop contact stop** in the control panel's **Axol settings → Robot** (`--teleop_config.vr_teleop_config.teleop_torque_threshold`; the panel suggests `16` Nm). A trip mid-take **disengages tracking, discards the in-flight episode**, and drops the arms limp — clear them by hand, then press **X** to return to rest and re-record. Shared with [`teleop`](/operations/teleop), so both flows behave identically.
+    The grips don't engage tracking until the arms are home and the episode is saved or discarded. Then release both grips and squeeze both again. A grip held through the save doesn't count.
   </Step>
 </Steps>
 
-These return-to-rest/contact-watchdog steps describe the physical Axol arms. On Mantis there are no physical arms to home; each take starts with the source's [start gesture](/mantis/tracking#start-gesture-and-recovery), and both grippers are motor-disabled between takes.
-
-The HUD shows an **Episode N** readout (top-right) with the 1-based number of the episode you're about to record, so you always know where you are in the dataset.
+The HUD shows **Episode N** at the top right: the number of the episode you are about to record, counting from 1.
 
 | Headset state | Meaning |
 |---|---|
-| `Data Collection` | Driving the arms; ready to record |
-| `Recording` | Capturing frames to the dataset |
-| `Saving` | Episode being written to disk; controls blocked |
+| `Data collection` | Driving the arms, ready to record |
+| `Recording` | Recording frames to the dataset |
+| `Saving` | Writing the episode to disk. Controls are blocked. |
 
-Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown.
+If `--root` already holds the dataset, collection adds to it. If you stop a new session before saving any episode, Axol deletes the empty dataset.
+
+### Contact stops
+
+Every return to rest is guarded, including the **X** reset and the first move at startup. Set the sensitivity with **Return-to-rest contact stop** in **Axol settings → Robot** (`--teleop_config.vr_teleop_config.reset_torque_threshold`). Raise it if normal returns stop for no reason. Set `0` to turn it off.
+
+You can also stop the arms when they push hard during a take. This check is off by default, because recording often pushes on the scene on purpose. Set **Teleop contact stop** in **Axol settings → Robot** (`--teleop_config.vr_teleop_config.teleop_torque_threshold`). The panel suggests `16` Nm.
+
+When it trips, tracking disengages, the take is discarded and the arms go limp. Guide them clear, then press **X** and record again. [Teleoperation](/operations/teleop) uses the same settings.
+
+These stops apply to Axol's arms. Mantis has no arms to return home. Each Mantis take starts with the source's [start gesture](/mantis/tracking#start-gesture-and-recovery), and the grippers are off between takes.
 
 ## Driving from the panel
 
-The Axol flow above assumes the headset is on your face; managed Lighthouse/Ultimate does not require one. When you launch from the [control panel](/guides/control-panel), it doubles as an operator display and can take the same episode decisions for either profile.
+When you start from the [control panel](/guides/control-panel), it also works as an operator display. It shows the camera feeds the headset receives, with a full-screen option. The **Episode control** box shows the phase, the episode number and the saved count, with these buttons:
 
-The panel mirrors the **camera feeds** the headset receives (with a fullscreen toggle for a proper operator display) and an **Episode control** box carrying the phase, the episode number, the saved count, and the buttons that make sense right now: **Start recording** (a 3-second countdown mirroring the in-headset one, so you can pick the controllers back up; click again to cancel), **Save episode**, and **Discard episode** — the last two click-to-confirm, standing in for the controller's double-press. During a contact hold a **Return to rest** button appears, which does what **X** does: replan the return from wherever you left the arms.
+- **Start recording** starts the same 3-second countdown as the headset. Click it again to cancel.
+- **Save episode** and **Discard episode** ask you to click again to confirm.
+- **Return to rest** appears during a contact hold. It does the same as **X**.
 
-A take that ends without being saved — refused by the Mantis quality gate, emptied by a camera-capture failure, ended before its first dataset row, or refused by the recorder at save — leaves a red explanation in the Episode control box. It stays through the return to **Ready** until the next take starts recording, so a lost take never reads as a saved one; the same reason is in the log.
+The controllers keep working. Whichever input arrives first ends the take. Anything you start on the controllers, such as a confirmation or a countdown, also shows in the panel. See [Episode controls](/guides/control-panel#episode-controls).
 
-The controller stays live the whole time — the panel is a parallel input, and whichever arrives first ends the take. Anything you arm on the controller (the confirmation popup, the record countdown) is mirrored into the panel too, so the dashboard follows a controller-driven session as well as a panel-driven one. See [Episode controls](/guides/control-panel#episode-controls).
+When a take ends without being saved, the **Episode control** box shows the reason in red, and the log shows it too. The message stays until the next take starts recording. A take isn't saved when:
 
-<Note>
-  **Crash-safe by design.** Every episode is durable the moment it saves — its parquet footers are flushed and recording rotates to fresh per-episode files — so at any point between saves the dataset on disk is complete and resumable, and killing the recorder costs at most the take being written. Finalizing on stop is near-instant now (no session-length flush or whole-session video re-verification), so there's no slow shutdown tempting a hard kill. A resume still runs a **crash-consistency check** for that one in-flight window (and for datasets recorded before durability landed): if the saved episodes aren't a contiguous `0…N-1` — the tell-tale of a recorder killed mid-save, where buffered episodes were lost while the counter had already advanced — the dataset is **repaired in place**, truncating back to the longest intact run of episodes and resuming after it (recording past the gap would silently pair every later episode with a different episode's video). Only if not a single complete episode survives does it refuse and point you to delete the dataset. [Keep the host on a current release](/installation#staying-up-to-date) to pick this up on an older station.
-</Note>
+- the Mantis quality check rejects it,
+- a camera fails during capture,
+- it ends before its first frame is recorded, or
+- the recorder refuses it at save.
 
-<Note>
-  **Saved takes are integrity-checked.** If the camera encoder drops frames during a take (a feed-queue overflow under heavy load), the video no longer lines up with its recorded rows — so that episode is **discarded instead of saved**, with an error explaining why (in the CLI output / control panel log console). The session stays up — the next take starts as usual — so re-record it rather than adding a misaligned episode to the dataset.
-</Note>
+## Saved data
 
-<Note>
-  The full controller bindings and headset state machine are documented in the [VR Interface](/guides/vr-interface) guide.
-</Note>
+- **Each episode is on disk as soon as it is saved.** If the recorder stops unexpectedly, you lose at most the take being written.
+- **Resuming checks the dataset.** If the saved episodes have a gap, Axol keeps the complete episodes before the gap, removes the rest and continues from there. If no complete episode is left, it asks you to delete the dataset.
+- **Takes with dropped video frames are discarded.** If the camera encoder drops frames under heavy load, the video doesn't match the recorded rows. Axol discards that take and logs why. The session keeps running, so record the take again.
+
+See the [VR Interface](/guides/vr-interface) guide for every controller binding and headset state.
+
+## Mix Axol and Mantis episodes
+
+Axol and Mantis episodes can go in one dataset. For each Axol run:
+
+- Turn on **Observe Cartesian**, so the recorded state and actions match Mantis.
+- Keep the gripper setting, camera slots, image resolution and recording rate the same as the Mantis runs.
+
+A dataset started on Mantis may have an `observation.pose_lag` column, which Axol fills in automatically. A dataset started on Axol without that column keeps its layout, and Mantis leaves the column out.
 
 ## Next steps
 
@@ -207,9 +267,9 @@ The controller stays live the whole time — the panel is a parallel input, and 
     Every setting for data collection, with its default.
   </Card>
   <Card title="Run Policy" icon="robot" href="/operations/run-policy">
-    Run a trained policy autonomously on the same machine.
+    Run a trained policy on the same computer.
   </Card>
   <Card title="collect-data reference" icon="terminal" href="/cli/collect-data">
-    Every flag and the dataset capture internals.
+    Every flag for data collection.
   </Card>
 </CardGroup>

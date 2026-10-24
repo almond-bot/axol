@@ -12,12 +12,12 @@ import type { ArmSide, ControlTiming, TelemetryFrame, TimingFrame } from "@/lib/
 const SIDES: ArmSide[] = ["left", "right"]
 
 const METRICS = [
-  { key: "rate", label: "Loop rate", title: "On-wire control rate", unit: "Hz", index: 0 },
+  { key: "rate", label: "Loop rate", title: "Control rate on the CAN bus", unit: "Hz", index: 0 },
   { key: "jitter", label: "Jitter", title: "CAN period jitter (p95)", unit: "ms", index: 1 },
   {
     key: "latency",
     label: "Latency",
-    title: "Per-motor command → feedback latency (p95)",
+    title: "Per-motor command-to-feedback latency (p95)",
     unit: "ms",
     index: 2,
   },
@@ -160,7 +160,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
       ? [
           ...commandSeries,
           ...feedbackSeries,
-          { key: "target", label: "RT target", color: COLORS.target },
+          { key: "target", label: "Target rate", color: COLORS.target },
         ]
       : metric.key === "jitter"
         ? [...commandSeries, ...feedbackSeries]
@@ -192,7 +192,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
               ? [
                   ...commandSeries,
                   ...feedbackSeries,
-                  { key: "target", label: "RT period target", color: COLORS.target },
+                  { key: "target", label: "Target period", color: COLORS.target },
                 ]
               : [...commandSeries, ...feedbackSeries]
 
@@ -200,9 +200,9 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
   const stale = newest === 0 || nowT - newest > 2
   const quietReason =
     frames.length === 0
-      ? "start teleop and wait for PyRoKi to finish"
+      ? "Start teleop and wait for it to finish loading"
       : stale
-        ? "control traffic stopped"
+        ? "Control traffic stopped"
         : null
 
   return (
@@ -211,8 +211,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
         <div className="mr-2">
           <h2 className="font-heading text-base font-semibold">Control loop & CAN timing</h2>
           <p className="text-xs text-white/35">
-            Post-PyRoKi teleop only · passive kernel timestamps · rolling 1s · zero added bus
-            traffic
+            Measured during teleop · rolling 1 s window · adds no bus traffic
           </p>
         </div>
         <div className="flex overflow-hidden rounded-md border border-white/10">
@@ -264,8 +263,8 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
                   {clean && timing
                     ? `${Math.round(timing.targetHz)} Hz clean`
                     : isFresh
-                      ? "timing issue"
-                      : "idle"}
+                      ? "Timing issue"
+                      : "Idle"}
                 </Badge>
                 {timing && (
                   <span className="ml-auto text-[0.65rem] text-white/30">
@@ -275,52 +274,52 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
               </div>
               <div className="grid grid-cols-3 gap-x-3 gap-y-2 text-xs">
                 <div>
-                  <p className="text-white/35">command</p>
+                  <p className="text-white/35">Command</p>
                   <p className="font-mono text-sm text-white/85 tabular-nums">
                     {fmt(timing?.commandHz)}{" "}
                     <span className="text-[0.65rem] text-white/35">Hz</span>
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">feedback</p>
+                  <p className="text-white/35">Feedback</p>
                   <p className="font-mono text-sm text-white/85 tabular-nums">
                     {fmt(timing?.feedbackHz)}{" "}
                     <span className="text-[0.65rem] text-white/35">Hz</span>
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">full cycle p95</p>
+                  <p className="text-white/35">Full cycle p95</p>
                   <p className="font-mono text-sm text-white/85 tabular-nums">
                     {fmt(timing?.canCycleP95Ms, 2)}{" "}
                     <span className="text-[0.65rem] text-white/35">ms</span>
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">send batch p95</p>
+                  <p className="text-white/35">Send batch p95</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.commandBatchP95Ms, 2)} ms
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">reply batch p95</p>
+                  <p className="text-white/35">Reply batch p95</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.feedbackBatchP95Ms, 2)} ms
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">motor RTT p95</p>
+                  <p className="text-white/35">Motor RTT p95</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.roundTripP95Ms, 2)} ms
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">command jitter</p>
+                  <p className="text-white/35">Command jitter</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.commandJitterP95Ms, 2)} ms
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">worst command gap</p>
+                  <p className="text-white/35">Worst command gap</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.commandGapMaxMs, 2)} ms
                   </p>
@@ -332,21 +331,19 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">
-                    missed {timing ? Math.round(timing.targetHz) : 240} Hz
-                  </p>
+                  <p className="text-white/35">Missed periods</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {timing?.deadlineMisses ?? "–"}/s
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">lost feedback</p>
+                  <p className="text-white/35">Lost feedback</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {timing?.missedFeedback ?? "–"}/s
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">headroom p05</p>
+                  <p className="text-white/35">Headroom p05</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {fmt(timing?.canHeadroomP05Ms, 2)} ms
                   </p>
@@ -370,11 +367,9 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
         height={300}
       />
       <p className="text-xs leading-relaxed text-white/35">
-        Send batch is first-to-last arm command; full cycle continues through the final feedback.
-        “Missed N Hz” counts command gaps that lost one or more loop periods — 4.17 ms on the 240 Hz
-        impedance controller, 2.5 ms on the 400 Hz position controller; the observer infers which is
-        running. All values come from passive kernel-timestamped evidence on the Rust-owned CAN
-        wire.
+        Send batch is the time from an arm&apos;s first command to its last. Full cycle runs until
+        the last feedback arrives. Missed periods counts command gaps longer than one loop period:
+        4.17 ms for the 240 Hz impedance controller, or 2.5 ms for the 400 Hz position controller.
       </p>
     </section>
   )

@@ -84,7 +84,7 @@ export function MotorParamsPanel({ arm, joint }: { arm: string; joint: string })
       setRowStatus((s) => ({
         ...s,
         [param.name]: clamped
-          ? { ok: false, text: `Motor stored ${formatParamValue(result.value)}` }
+          ? { ok: false, text: `Motor saved ${formatParamValue(result.value)} instead` }
           : { ok: true, text: "Saved" },
       }))
       await load()
@@ -179,7 +179,7 @@ export function MotorParamsPanel({ arm, joint }: { arm: string; joint: string })
         ))}
       </div>
       <p className="text-[0.7rem] text-white/35">
-        Each Set writes one parameter to the motor and persists it to flash.
+        Set writes one parameter and saves it to the motor&apos;s flash.
       </p>
     </div>
   )

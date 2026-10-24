@@ -6,6 +6,52 @@
 
 Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no physical robot hardware is available in the cloud VM, all development and testing uses the **sim** mode (`--sim`), which renders the robot in a browser via viser.
 
+### Products
+
+Our product website, [almond.bot](https://almond.bot), is the source of truth for what we sell and what each product is called. Read the relevant page before you write about a product, or when you need to understand what hardware a code path is for. It lists specs, options, what's in the box and how the pieces fit together.
+
+| Product | Page | What it is |
+|---|---|---|
+| Axol | [almond.bot/axol](https://almond.bot/axol) | The dual-arm robot: two 7-DOF arms with grippers. Every setup starts here. |
+| Owl Mount | [almond.bot/owl-mount](https://almond.bot/owl-mount) | A rigid T-slot column that bolts Axol to a table or fixture. |
+| Ox Cart | [almond.bot/ox-cart](https://almond.bot/ox-cart) | A height-adjustable cart with a manual crank lift and leveling casters. |
+| Jelly Mobile | [almond.bot/jelly-mobile](https://almond.bot/jelly-mobile) | A powered omni-wheel base with a battery and a telescoping lift. It is a base, not a robot. |
+| Mantis UMI | [almond.bot/mantis-umi](https://almond.bot/mantis-umi) | A pair of handheld grippers for collecting data without a robot, tracked by Quest controllers, Lighthouse or VIVE Ultimate trackers. |
+| Camera Kit | [almond.bot/camera-kit](https://almond.bot/camera-kit) | Two ZED X One S wrist cameras and a ZED X Mini head camera, with mounts and GMSL2 cables. |
+| Compute | [almond.bot/compute](https://almond.bot/compute) | The onboard NVIDIA Jetson: Orin NX 16GB, AGX Orin 64GB or Thor 128GB. |
+| PSU | [almond.bot/psu](https://almond.bot/psu) | The 24 V power supply: Standard (desktop) or Industrial (with E-Stop and brake resistor). |
+
+Other sites: the docs are at [docs.almond.bot](https://docs.almond.bot) (sources in `docs/`), the VR app and control panel at [axol.almond.bot](https://axol.almond.bot) (sources in `web/`), and drawings and CAD at `downloads.almond.bot`. Write the website as `https://almond.bot`, without `www.`. Don't copy prices into the repo, because they change.
+
+### Writing docs and UI text
+
+These rules cover everything a customer reads: `docs/`, the web UI under `web/`, settings help in `almond_axol/serve/settings.py`, command and diagnostic descriptions, and CLI help and log lines meant for operators. Code comments, docstrings and commit messages are not covered. Write for an operator standing next to the robot, not for the engineer who wrote the code. Read your text back before you commit it, out loud if that helps. If a sentence only makes sense to someone who saw the diff, rewrite it.
+
+**Names.** Use the product names in the table above. Jelly Mobile (short form **Jelly**) is a base, not a robot: write "Axol on Jelly", never "the Jelly robot". Never name our own test units ("the jelly robot", "our in-house Axol"). Call a control by the label it has in the UI, in bold, and don't invent names for features.
+
+**Describe the product as it is now.** Leave out history and tuning notes: no dates, no "used to", "older", "now", "no longer" or "new", no A/B results ("30% rougher", "−57% ripple", "over three interleaved rounds"), and no record of how a default was chosen. That belongs in the commit message. Give a number only when the reader needs it: a time to plan for, a limit, a value to type.
+
+**Say what the reader does and what happens.** Leave out implementation detail and design rationale unless it changes what the reader does. Don't explain security boundaries or internal plumbing ("the web API deliberately accepts neither path", "the observer pairs each command with its feedback"). Put internals on an Advanced or API page, or leave them out.
+
+**Short, plain sentences.**
+- One idea per sentence and at most four sentences per paragraph. When a paragraph lists several behaviors, flags or cases, make it a list or a table.
+- No em dashes. Use a period, a comma, a colon or parentheses. Use at most one parenthetical per sentence, and never nest them. Don't chain clauses with semicolons.
+- Every sentence must make sense on its own. Never point at something that isn't there ("the numbers above", "the older quick profile") or at a version the reader never saw.
+- Prefer common words. Avoid filler and coinages such as "deliberately", "genuinely", "exactly", "simply", "just", "at once", "its own" ("the core's own law"), "plumbing", "ad hoc", "heals itself", "that beats", "nothing to enable", "lights up". Don't use arrows (→, ↔) in prose.
+- Lead with the action. Write "Run `axol tune.factory`", not "Calibration is performed by running ...".
+
+**Page front matter.** `title` is a short noun phrase ("Calibrating Axol"). `description` is one sentence of 20 words or fewer that says what the page helps you do.
+
+**UI text.**
+- Read each screen as a customer who bought Axol and has never seen the code. A sentence that only makes sense if you know how the code works ("it sets the body IK keeps the arms clear of") fails. Say what it means for the customer ("so the arms don't hit the mount").
+- Use product names, not coinages ("Axol on Ox Cart", not "Axol × Ox"), and no game-like wording ("In play", "unlock", "character").
+- Say each thing once on a screen. Don't repeat the same hint on every card and in the header.
+- Buttons are a verb plus an object ("Start recording"). Labels are one to three words.
+- A tooltip or hint is one short sentence. It says what the control does, not how it is built.
+- An error says what went wrong and what to do next ("Left arm not found on can_alm_axol_l. Check the USB cable, then press Retry.").
+- Capitalize the first word only, and keep the same word for the same thing across the page and the docs.
+- When you change visible text, update any test that matches on it.
+
 ### Running the application
 
 - **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --sim`

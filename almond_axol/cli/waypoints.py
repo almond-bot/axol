@@ -553,11 +553,11 @@ class _Session:
             controls.append({"command": "clear", "label": "Clear all"})
         if message is None:
             if count == 0:
-                message = "Teaching — hand-guide the arms and record a waypoint."
+                message = "Move the arms by hand and record a waypoint."
             elif count == 1:
-                message = "Teaching — 1 waypoint. Record at least one more to play."
+                message = "1 waypoint recorded. Record at least one more to play."
             else:
-                message = f"Teaching — {count} waypoints. Play when you are ready."
+                message = f"{count} waypoints recorded. Press Play when you are ready."
         self._control.set_state("teaching", message, controls, count)
 
     def _publish(self, phase: str, message: str, stoppable: bool = False) -> None:
@@ -916,7 +916,7 @@ def _run(
     if stop_event is None:
         stop_event = threading.Event()
     if not cfg.sim and cfg.left_channel is None and cfg.right_channel is None:
-        raise ValueError("Both arms disabled — nothing to do.")
+        raise ValueError("Both arms are turned off, so there is nothing to run.")
     if not (math.isfinite(cfg.speed_scale) and 0.0 < cfg.speed_scale <= 1.0):
         raise ValueError(
             f"speed_scale must be in (0, 1], got {cfg.speed_scale!r}: it can "
