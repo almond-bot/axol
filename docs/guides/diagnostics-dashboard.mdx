@@ -36,8 +36,8 @@ The buttons above the motor cards run these commands:
 | **CAN enable** | Opens the CAN adapter picker. See [Choose CAN adapters](#choose-can-adapters). |
 | **Set CAN ID** | Changes a motor's CAN ID ([`motor.set-can-id`](/cli/motor-set-can-id)). |
 | **Set zero position** | Sets one motor's zero, or walks you through zeroing each joint against its end stop ([`motor.set-zero-pos`](/cli/motor-set-zero-pos)). Axol only. |
-| **Dump config** | Reads every configuration parameter from one motor, or from all motors if you leave the CAN ID blank ([`motor.dump-config`](/cli/motor-dump-config)). |
-| **Set config** | Reads or writes one configuration parameter ([`motor.set-config`](/cli/motor-set-config)). |
+| **Read all parameters** | Reads every configuration parameter from one motor, or from all motors if you leave the CAN ID blank ([`motor.dump-config`](/cli/motor-dump-config)). |
+| **Edit parameter** | Reads or writes one configuration parameter ([`motor.set-config`](/cli/motor-set-config)). |
 | **Flash firmware** | Installs motor firmware from a `.bin` file on the robot's computer ([`motor.flash`](/cli/motor-flash)). Axol only. |
 
 Mantis grippers calibrate themselves, so Mantis has no zeroing. To restore a saved configuration file, run [`motor.restore-config`](/cli/motor-restore-config) in a terminal.
@@ -78,7 +78,7 @@ Each arm's card shows:
 | **Motor RTT p95** | Time from a command to that motor's reply. |
 | **Command jitter** / **Worst command gap** | How unevenly commands are spaced, and the longest gap. |
 | **CAN occupied p95** / **Headroom p05** | How busy the bus is, and the time left over in each cycle. |
-| **Missed 240 Hz** | Command gaps longer than one loop period, per second. |
+| **Missed periods** | Command gaps longer than one loop period, per second. |
 | **Lost feedback** | Replies that never arrived, per second. |
 
 The loop runs at 240 Hz (a 4.17 ms period) on the impedance controller, and 400 Hz (2.5 ms) on the position controller. A card shows **240 Hz clean** (or **400 Hz clean**) when all of these hold:
@@ -145,7 +145,7 @@ Some tests pause for you, for example to put an item in the gripper. The card th
 |---|---|
 | **ROM disable** ([`diag.rom-disable`](/cli/diag-rom-disable)) | Opens grippers left closed by the ROM test, and turns the arms off. |
 | **Home the lift** ([`lift.home`](/cli/lift-home)) | Calibrates Jelly's lift. Both legs home together by default. Turn on **Independent** only for loose legs off the robot, to level them. |
-| **Raise lift (install height)** ([`lift.goto`](/cli/lift-goto)) | Moves the lift to the robot's install height. |
+| **Raise lift to install height** ([`lift.goto`](/cli/lift-goto)) | Moves the lift to the robot's install height. |
 | **Update lift firmware** ([`lift.update`](/cli/lift-update)) | Pick the lift's `firmware.bin`, then press **Run** to install it over CAN. Run it without a file to see the lift's current firmware. |
 
 The lift helpers appear only on Axol on Jelly. To restart or shut down the robot's computer, use **Restart** or **Shut down** on the control panel's [Axol Host tile](/guides/control-panel#axol-host).
@@ -161,7 +161,7 @@ Gain fields (kp, kd, kd_host, kd_host_hz, kd_host_q) start at the joint's curren
 | **Sine** / **Step** | [`tune.pid`](/cli/tune-pid) on one joint. Leave the gains empty to test the current ones, or type several space-separated kp or kd values to try each in its own run. |
 | **Firmware loop** | [`tune.a4`](/cli/tune-a4): tunes a joint's built-in motor position loop. |
 | **Recorded motion** | [`tune.motion`](/cli/tune-motion): replays a reference motion and scores how well each joint follows it. |
-| **Friction** | [`tune.friction`](/cli/tune-friction): measures one joint's friction. Tick **save to calibration** to keep the result. |
+| **Friction** | [`tune.friction`](/cli/tune-friction): measures one joint's friction. Turn on **Save to calibration** to keep the result. |
 | **Gravity** | [`tune.gravity`](/cli/tune-gravity): measures one link's center of mass. Run it after friction, from the wrist to the shoulder. |
 | **Factory** | [`tune.factory`](/cli/tune-factory): measures friction and gravity for all 14 joints. See [Calibrating Axol](/guides/axol-calibration). |
 | **Build motion** | [`motion.build`](/cli/motion-build): turns a recorded session into a reference motion for **Recorded motion**. |
@@ -171,21 +171,21 @@ Gain fields (kp, kd, kd_host, kd_host_hz, kd_host_q) start at the joint's curren
 
 - kd_host_hz sets the center of the damping band. Aim it at the ring frequency that the step score reports.
 - kd_host_q sets the band's width. Raise it to 2 or 3 when the center sits on a measured ring.
-- **holder wobble** shows how far the other joints moved during the run. Above about 0.5°, part of the ring came from a neighboring joint, not the one under test.
+- **Holder wobble** shows how far the other joints moved during the run. Above about 0.5°, part of the ring came from a neighboring joint, not the one under test.
 
 ### Friction, gravity and factory
 
 Gravity fixes the sag a joint shows when it holds still under load, which gain tuning can't fix. Its chart shows measured torque against joint angle, with the model before and after the fit.
 
-On the **Factory** tab, leave **velocities** empty to use the default slow speeds (1, 2, 3, 5, 8, 15 and 30 °/s). On the **Friction** tab, an empty field sweeps 7.2 to 72 °/s. A factory run takes about 1.5 hours.
+On the **Factory** tab, leave **Velocities** empty to use the default slow speeds (1, 2, 3, 5, 8, 15 and 30 °/s). On the **Friction** tab, an empty field sweeps 7.2 to 72 °/s. A factory run takes about 1.5 hours.
 
 ### Recorded motion
 
 - **Gains:** the table shows each joint's current gains. Edit a cell to change it for this run only, on both arms. Clear a cell to go back to the configured value, or press **Reset overrides** to clear them all.
-- **controller:** **impedance** runs the normal teleop controller at 240 Hz. **position** runs every joint on its motor's own position loop at 400 Hz.
-- **controller per joint:** with impedance, click a cell to put that joint on its motor's position loop for this run. A joint already set to the motor loop in the configuration can't be switched back here.
-- **run as IK:** solves the motion through the IK solver, as teleop does, instead of replaying joint angles. The score then includes both IK and tracking error.
-- **inject noise** and **filter stack:** add network noise, IK noise or both, and turn teleop's smoothing filters on or off. Run once with filters off and once with them on to see what the filters remove and how much lag they add.
+- **Controller:** **impedance** runs the normal teleop controller at 240 Hz. **position** runs every joint on its motor's own position loop at 400 Hz.
+- **Controller per joint:** with impedance, click a cell to put that joint on its motor's position loop for this run. A joint already set to the motor loop in the configuration can't be switched back here.
+- **Run as IK:** solves the motion through the IK solver, as teleop does, instead of replaying joint angles. The score then includes both IK and tracking error.
+- **Inject noise** and **Filter stack:** add network noise, IK noise or both, and turn teleop's smoothing filters on or off. Run once with filters off and once with them on to see what the filters remove and how much lag they add.
 
 ### Build motion and IK
 
@@ -195,7 +195,7 @@ On the **Factory** tab, leave **velocities** empty to use the default slow speed
 
 ### Read the results
 
-- The **Failure map** shows one bar per joint for both arms, colored green, amber or red. Click a joint to jump to its chart.
+- **Error by joint** shows one bar per joint for both arms, colored green, amber or red. Click a joint to jump to its chart.
 - Each joint's chart shows commanded against actual position, with the error below.
 - The scores table has one row per joint: tracking error (RMS, in degrees), lag, 3 to 15 Hz jitter, ringing, torque chatter and buzz.
 - Buzz catches a joint you can hear. A healthy joint sits near 0.005°. An audible buzz is 2 to 5 times that.

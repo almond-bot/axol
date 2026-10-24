@@ -137,11 +137,11 @@ const STATE_BADGE: Record<
   RobotState,
   { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
 > = {
-  connected: { variant: "success", text: "streaming" },
-  busy: { variant: "warning", text: "bus in use" },
-  connecting: { variant: "neutral", text: "connecting" },
-  disconnected: { variant: "neutral", text: "robot disconnected" },
-  error: { variant: "destructive", text: "error" },
+  connected: { variant: "success", text: "Streaming" },
+  busy: { variant: "warning", text: "Bus in use" },
+  connecting: { variant: "neutral", text: "Connecting" },
+  disconnected: { variant: "neutral", text: "Robot disconnected" },
+  error: { variant: "destructive", text: "Error" },
 }
 
 // Commands this dashboard launches as manager sessions besides the fetched
@@ -963,7 +963,7 @@ export default function Diagnostics() {
     linkState === "busy"
       ? "Bus in use, showing observed CAN traffic"
       : linkState !== "connected"
-        ? "Robot link down"
+        ? "Robot disconnected"
         : null
   // The CAN bus is owned by something we didn't launch (an in-process
   // operation like teleop) — the server would reject a diagnostic launch, so
@@ -1104,8 +1104,8 @@ export default function Diagnostics() {
           key: "guided",
           label: "Guided",
           description:
-            "Zero each selected joint of one arm against an end stop. wrist_2 and " +
-            "wrist_3 accept either side. Each step shows instructions and waits " +
+            "Zero each selected joint of one arm against an end stop. Wrist 2 and " +
+            "wrist 3 can use either end stop. Each step shows instructions and waits " +
             "for Continue.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
@@ -1115,7 +1115,7 @@ export default function Diagnostics() {
     {
       key: "dump-config",
       command: "motor.dump-config",
-      label: "Dump config",
+      label: "Read all parameters",
       icon: ClipboardList,
       description:
         "Read every configuration parameter from one motor, or from all motors " +
@@ -1126,25 +1126,25 @@ export default function Diagnostics() {
     {
       key: "set-config",
       command: "motor.set-config",
-      label: "Set config",
+      label: "Edit parameter",
       icon: SlidersHorizontal,
       modes: [
         {
           key: "read",
           label: "Read",
           description:
-            "Read one configuration parameter without writing anything. Parameter " +
-            "names cover both motor families, including Damiao's CAN timeout.",
+            "Read one configuration parameter without changing it. Works for " +
+            "MyActuator and Damiao motors.",
           hideKeys: ["value", "force_protected", "yes"],
         },
         {
           key: "write",
           label: "Write",
           description:
-            "Write one configuration parameter and save it. Damiao's CAN timeout is " +
-            "in milliseconds. Protected parameters (factory calibration, CAN IDs, " +
-            "baud rate) need the override. A wrong value can leave the motor unable " +
-            "to commutate or unreachable on the bus.",
+            "Write one configuration parameter and save it to the motor's flash. " +
+            "Damiao's CAN timeout is in milliseconds. Protected parameters (factory " +
+            "calibration, CAN IDs, baud rate) need Force protected turned on. A wrong " +
+            "value can leave the motor unable to commutate or unreachable on the bus.",
           // Running the dialog is the confirmation; the CLI prompt would other-
           // wise block the session waiting on stdin.
           presetArgs: { yes: true },
@@ -1230,8 +1230,8 @@ export default function Diagnostics() {
         {robot && robot.state === "disconnected" && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
             <p className="text-sm text-white/60">
-              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected. Connect to
-              stream motor telemetry.
+              {robot.profile === "mantis" ? "Mantis" : "Axol"} is disconnected. Connect it to see
+              motor telemetry.
             </p>
             <div className="ml-auto flex items-center gap-2">
               <Button
@@ -1249,7 +1249,7 @@ export default function Diagnostics() {
                 disabled={robotBusy || hardwareSessionBusy || launchBusy}
               >
                 {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect{" "}
-                {robot.profile === "mantis" ? "Mantis" : "robot"}
+                {robot.profile === "mantis" ? "Mantis" : "Axol"}
               </Button>
             </div>
           </div>
@@ -1284,8 +1284,8 @@ export default function Diagnostics() {
           <div className="flex flex-wrap items-center gap-3">
             <h2 className="font-heading text-base font-semibold">Hardware</h2>
             <span className="text-xs text-white/40">
-              Axol and Mantis share one telemetry link. The Jelly wheels and lift connect
-              separately.
+              Only one of Axol and Mantis can be connected at a time. Jelly&apos;s wheels and lift
+              connect separately.
             </span>
           </div>
           <HardwareOverview

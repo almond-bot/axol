@@ -337,13 +337,13 @@ export function ConnectionsBar({
       state === "connected"
         ? "Connected"
         : state === "busy"
-          ? "In use by a task"
+          ? "Used by a running test or operation"
           : state === "connecting"
             ? "Connecting…"
             : state === "error"
               ? robot?.error || "Error"
               : detected
-                ? "CAN detected"
+                ? "Detected"
                 : canProfiles
                   ? "Not detected"
                   : "Disconnected"
@@ -507,8 +507,8 @@ export function ConnectionsBar({
       ? "Wheels and lift connected"
       : jellyLive === 1
         ? "One of two connected"
-        : jellyViews.some((v) => v.label === "CAN detected")
-          ? "CAN detected"
+        : jellyViews.some((v) => v.label === "Detected")
+          ? "Detected"
           : "Disconnected"
   const battery = jellySupported ? jellyBattery(jelly) : null
 
@@ -663,7 +663,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
   const color = (m: MotorHealth) =>
     m.reachable == null ? "unknown" : motorHealthy(m) ? "ok" : "err"
   const tip = (m: MotorHealth) => {
-    if (m.reachable == null) return `${jointName(m)}: unknown (in use by a task)`
+    if (m.reachable == null) return `${jointName(m)}: unknown while in use`
     if (!m.reachable) return `${jointName(m)}: unreachable`
     const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
     const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""

@@ -43,6 +43,9 @@ These rules cover everything a customer reads: `docs/`, the web UI under `web/`,
 **Page front matter.** `title` is a short noun phrase ("Calibrating Axol"). `description` is one sentence of 20 words or fewer that says what the page helps you do.
 
 **UI text.**
+- Read each screen as a customer who bought Axol and has never seen the code. A sentence that only makes sense if you know how the code works ("it sets the body IK keeps the arms clear of") fails. Say what it means for the customer ("so the arms don't hit the mount").
+- Use product names, not coinages ("Axol on Ox Cart", not "Axol × Ox"), and no game-like wording ("In play", "unlock", "character").
+- Say each thing once on a screen. Don't repeat the same hint on every card and in the header.
 - Buttons are a verb plus an object ("Start recording"). Labels are one to three words.
 - A tooltip or hint is one short sentence. It says what the control does, not how it is built.
 - An error says what went wrong and what to do next ("Left arm not found on can_alm_axol_l. Check the USB cable, then press Retry.").

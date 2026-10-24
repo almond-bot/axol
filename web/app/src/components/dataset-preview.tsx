@@ -236,7 +236,7 @@ export function DatasetPreview({
                     setChosenEpisode(null)
                   }}
                 >
-                  Follow session
+                  Show current recording
                 </Button>
               )}
               <Button
@@ -610,7 +610,7 @@ function TaskEditor({
       if (e instanceof ApiRequestError && e.status === 409) {
         toast.warning("An episode is being saved. Try again in a moment.")
       } else {
-        toast.error(`Could not rename the task: ${errorText(e)}`)
+        toast.error(`Could not save the task: ${errorText(e)}`)
       }
     } finally {
       setSaving(false)

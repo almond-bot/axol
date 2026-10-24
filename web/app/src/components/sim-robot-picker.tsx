@@ -33,7 +33,7 @@ export function SimRobotPicker({
       <div className="flex items-baseline justify-between gap-3">
         <span className="text-sm font-medium text-white">Sim robot</span>
         <span className="text-xs text-white/40">
-          Applies to this run only. The robot&apos;s saved model stays the same.
+          Applies to this run only. The saved mount doesn&apos;t change.
         </span>
       </div>
       <div

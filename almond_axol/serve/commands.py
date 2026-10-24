@@ -384,8 +384,8 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive Axol from a VR headset, along with Jelly's wheels and lift when Jelly "
-        "is attached. Turn on simulation to preview in the browser without hardware. "
-        "With Mantis, the triggers drive the rig grippers and the rigs are not "
+        "is attached. Turn on sim to preview in the browser without hardware. "
+        "With Mantis, the triggers open and close the grippers, and nothing is "
         "tracked.",
         "Operate",
         "draccus",
@@ -412,8 +412,8 @@ COMMANDS: dict[str, CommandDef] = {
         "gravity-comp",
         "gravity-comp",
         "Gravity compensation",
-        "Hold the arms in gravity comp so you can move them by hand. Set a recording "
-        "name to save the motion for Build motion in the tuning workbench.",
+        "Make the arms weightless so you can move them by hand. To save the motion "
+        "for Build reference motion, enter a name in Record.",
         "Operate",
         "draccus",
         _gravity_comp,
@@ -427,7 +427,7 @@ COMMANDS: dict[str, CommandDef] = {
         "waypoints",
         "Waypoints",
         "Guide the arms by hand to record waypoints, then replay them as straight-line "
-        "moves. Turn on simulation to preview a saved path in the browser. Lower the "
+        "moves. Turn on sim to preview a saved path in the browser. Lower the "
         "speed scale to try a new path slowly on the robot.",
         "Operate",
         "draccus",
@@ -448,8 +448,8 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes with local ZED cameras. Mantis supports "
-        "Quest, Lighthouse, or Ultimate tracking.",
+        "Record teleoperation episodes with the ZED cameras. Mantis works with "
+        "Quest, Lighthouse or Ultimate tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -509,7 +509,8 @@ COMMANDS: dict[str, CommandDef] = {
         "run-policy",
         "run-policy",
         "Run policy",
-        "Run a trained policy on the robot via LeRobot async inference.",
+        "Run a trained policy on Axol, on this computer or on a remote inference "
+        "server.",
         "Operate",
         "draccus",
         _run_policy,
@@ -556,8 +557,8 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.lift-cycle",
         "diag.lift-cycle",
         "Lift cycle",
-        "Raise the arms' S1 joints for clearance, then run the lift down and up for "
-        "the number of cycles you set.",
+        "Raise each arm's first shoulder joint for clearance, then run the lift down "
+        "and up for the number of cycles you set.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.lift.cycle"),
@@ -571,7 +572,7 @@ COMMANDS: dict[str, CommandDef] = {
         "diag.zed-cable",
         "ZED cable check",
         "Capture frames from a connected ZED camera and check them to verify its "
-        "cable. Works with ZED-X One and ZED X cameras, and doesn't move the arms.",
+        "cable. Works with ZED X One and ZED X cameras, and doesn't move the arms.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.zed.cable"),
@@ -599,7 +600,7 @@ COMMANDS: dict[str, CommandDef] = {
     "tune.a4": CommandDef(
         "tune.a4",
         "tune.a4",
-        "Firmware position loop (0xA4)",
+        "Firmware position loop",
         "Tune the position and speed loop inside a MyActuator motor (wire_mode a4) "
         "with a sine or triangle motion. Set the firmware gains, speed cap and "
         "acceleration, then score tracking and smoothness. Gains stay in RAM unless "
@@ -769,7 +770,7 @@ COMMANDS: dict[str, CommandDef] = {
     "lift.goto": CommandDef(
         "lift.goto",
         "lift.goto",
-        "Raise lift (install height)",
+        "Raise lift to install height",
         "Move the lift to a target height in percent of travel. The default "
         "75% is the robot install height. Requires a homed lift.",
         "Diagnostics",
@@ -783,8 +784,8 @@ COMMANDS: dict[str, CommandDef] = {
         "lift.update",
         "lift.update",
         "Update lift firmware",
-        "Install a jelly_legs firmware.bin on the lift board over CAN, in about a "
-        "minute. If the new firmware doesn't start correctly, the board goes back to "
+        "Install a Jelly lift firmware file (.bin) on the lift board over CAN, in "
+        "about a minute. If the new firmware doesn't start correctly, the board goes back to "
         "the old one, and the lift keeps its homing. Without a file, it shows the "
         "running firmware version. Needs lift firmware 0.9 or later, installed once "
         "over USB.",
@@ -821,7 +822,7 @@ COMMANDS: dict[str, CommandDef] = {
     "motor.dump-config": CommandDef(
         "motor.dump-config",
         "motor.dump-config",
-        "Dump config",
+        "Read all parameters",
         "Read every configuration parameter from one motor or all of them, MyActuator "
         "or Damiao. Nothing is written. Attach the run log when you contact support.",
         "Calibrate",
@@ -832,7 +833,7 @@ COMMANDS: dict[str, CommandDef] = {
     "motor.set-config": CommandDef(
         "motor.set-config",
         "motor.set-config",
-        "Set config parameter",
+        "Edit parameter",
         "Read or write one configuration parameter on a MyActuator or Damiao motor, "
         "such as a protection threshold, a position limit or Damiao's CAN timeout.",
         "Calibrate",

@@ -135,8 +135,8 @@ export function UltimateWifiPanel() {
         <span className={`rounded-full px-2 py-0.5 text-[11px] ${statusClass}`}>{statusLabel}</span>
       </div>
       <p className="max-w-prose text-xs leading-relaxed text-white/45">
-        The private network the two trackers use to share their map. This is not your router&apos;s
-        Wi-Fi. The saved password is never shown here.
+        The private network the two trackers use to share their map. Don&apos;t use your
+        router&apos;s Wi-Fi or the robot&apos;s network. The saved password is never shown here.
       </p>
 
       {loading ? (
@@ -226,12 +226,11 @@ export function UltimateWifiPanel() {
         <div className="flex flex-wrap items-center gap-3">
           <Button type="button" size="sm" onClick={save} disabled={!valid || saving}>
             {saving ? <Loader2 className="animate-spin" /> : <Save />}
-            Save private Wi-Fi
+            Save tracker Wi-Fi
           </Button>
           {config?.configured && (
             <span className="text-[11px] text-white/30">
-              Password {config.passwordSet ? "saved" : "missing"} ·{" "}
-              {config.status === "valid" ? "file protected" : "file needs attention"}
+              Password {config.passwordSet ? "saved" : "missing"}
             </span>
           )}
         </div>

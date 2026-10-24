@@ -28,7 +28,7 @@ export function wheelName(m: WheelMotorHealth): string {
 /** The lift's one-line state: height and homed state, or why it is silent. */
 export function liftSummaryText(status: JellyLiftStatus): string {
   const board = status.status
-  if (status.reachable == null) return "unknown (in use by a task)"
+  if (status.reachable == null) return "unknown while in use"
   if (status.reachable === false) return "board not answering"
   if (board == null) return "waiting for status…"
   return [
@@ -158,13 +158,13 @@ export function jellyDeviceView(
     state === "connected"
       ? (fault ?? "Connected")
       : state === "busy"
-        ? "In use by task"
+        ? "Used by a running test or operation"
         : state === "connecting"
           ? "Connecting…"
           : state === "error"
             ? status?.error || "Error"
             : detected
-              ? "CAN detected"
+              ? "Detected"
               : presence
                 ? "Not detected"
                 : "Disconnected"

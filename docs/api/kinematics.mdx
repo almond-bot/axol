@@ -68,9 +68,9 @@ The bundled URDFs are in `almond_axol/kinematics/urdf/`, one per version. All bu
 - **freezes every joint except the arm joints.** The base, lift, fingers and wheels stay at zero, so the lifts are fully raised.
 - **uses simpler collision shapes than each part's hull.** These are the custom `<ik_collision>` elements, which other importers ignore. They cover the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck and the Owl Mount foot plate as strips, and each gripper's jaws as one body over their whole motion.
 
-**Picking the version.** With Jelly enabled, the model is Axol on Jelly. Otherwise it is the mount picked under **Choose your Axol** on the control panel's Robot tab, saved as `kinematics.mount`: `classic` (Legacy, the default), `standalone`, `ox_cart` or `owl`. `kinematics.robot_model` forces a version.
+**Picking the version.** With Jelly enabled, the model is Axol on Jelly. Otherwise it is the mount picked under **Mount** on the control panel's Robot tab, saved as `kinematics.mount`: `classic` (Legacy, the default), `standalone`, `ox_cart` or `owl`. `kinematics.robot_model` forces a version.
 
-Each version sets which parts of the body IK keeps the arms clear of:
+Each version tells IK which parts of the body to keep the arms away from:
 
 - **Ox Cart:** the lift column. IK keeps the cart's lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and IK doesn't account for it.
 - **Owl Mount:** the column and its foot plate, as six thin strips. The strips are left out of the hard upper-arm guard, since they sit under the arms' path.

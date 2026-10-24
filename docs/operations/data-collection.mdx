@@ -218,7 +218,7 @@ If `--root` already holds the dataset, collection adds to it. If you stop a new 
 
 ### Contact stops
 
-Every return to rest is guarded, including the **X** reset and the first move at startup. Set the sensitivity with **Reset contact threshold** in **Axol settings → Robot** (`--teleop_config.vr_teleop_config.reset_torque_threshold`). Raise it if normal returns stop for no reason. Set `0` to turn it off.
+Every return to rest is guarded, including the **X** reset and the first move at startup. Set the sensitivity with **Return-to-rest contact stop** in **Axol settings → Robot** (`--teleop_config.vr_teleop_config.reset_torque_threshold`). Raise it if normal returns stop for no reason. Set `0` to turn it off.
 
 You can also stop the arms when they push hard during a take. This check is off by default, because recording often pushes on the scene on purpose. Set **Teleop contact stop** in **Axol settings → Robot** (`--teleop_config.vr_teleop_config.teleop_torque_threshold`). The panel suggests `16` Nm.
 

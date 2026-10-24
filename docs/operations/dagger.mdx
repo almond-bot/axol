@@ -99,7 +99,7 @@ Between episodes, the arms return to the rest pose, so every episode starts in t
 - The grips work as plain teleoperation, so you can reset the scene with the arms. Press both grips to engage and one to release. Nothing is recorded.
 - Press **Reset** in VR to send the arms home. If you leave the arms away from rest, they also return home when you press **Record**.
 
-Every return to rest is guarded, as in [data collection](/operations/data-collection) and [run policy](/operations/run-policy). If an arm meets resistance, the move stops and the arms go limp in a **gravity-compensation hold**. Move them clear by hand, then press **Reset** in VR or **Return to rest** in the panel. Set the sensitivity with **Reset contact threshold** in the panel, or `--teleop_config.vr_teleop_config.reset_torque_threshold` (default `6.0` Nm, `0` turns it off).
+Every return to rest is guarded, as in [data collection](/operations/data-collection) and [run policy](/operations/run-policy). If an arm meets resistance, the move stops and the arms go limp in a **gravity-compensation hold**. Move them clear by hand, then press **Reset** in VR or **Return to rest** in the panel. Set the sensitivity with **Return-to-rest contact stop** in the panel, or `--teleop_config.vr_teleop_config.reset_torque_threshold` (default `6.0` Nm, `0` turns it off).
 
 ## What gets recorded
 

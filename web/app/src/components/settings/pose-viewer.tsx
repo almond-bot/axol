@@ -72,7 +72,7 @@ export default function PoseViewer({
       robot = r
     })
     manager.onError = (url) => {
-      if (!cancelled) setError(`failed to load ${url}`)
+      if (!cancelled) setError(url)
     }
     // Meshes stream in through the manager after the URDF callback; only when
     // everything is in can we size the camera to the real bounding box.

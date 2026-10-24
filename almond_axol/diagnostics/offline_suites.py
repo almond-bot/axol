@@ -34,7 +34,7 @@ def _add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "suite",
         choices=["wifi", "filtering", "kinematics"],
-        help="Which pipeline stage to analyze",
+        help="Which teleop stage to analyze: wifi, filtering or kinematics.",
     )
     ap.add_argument(
         "prefix",
@@ -53,7 +53,7 @@ def _add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "--label",
         default=None,
-        help="Free-form note stored on the run artifact",
+        help="A note saved with the run.",
     )
 
 
@@ -66,7 +66,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     """
     p = subparsers.add_parser(
         "diag.offline",
-        help="Offline wifi/filtering/kinematics analysis of a recording.",
+        help="Analyze a teleop recording offline: Wi-Fi, filtering or kinematics.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )

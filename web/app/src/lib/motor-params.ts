@@ -23,7 +23,7 @@ export interface ParamUi {
 
 export const MYACTUATOR_SECTIONS: { title: string; params: string[] }[] = [
   {
-    title: "Protect parameters",
+    title: "Protection parameters",
     params: [
       "OVER_VOLTAGE",
       "LOW_VOLTAGE",
@@ -39,7 +39,7 @@ export const MYACTUATOR_SECTIONS: { title: string; params: string[] }[] = [
     ],
   },
   {
-    title: "Plan parameters",
+    title: "Motion planning parameters",
     params: [
       "MAX_POSITIVE_POSITION",
       "MIN_NEGATIVE_POSITION",
@@ -95,8 +95,8 @@ export const PARAM_UI: Record<string, ParamUi> = {
       { value: 1, label: "Braking resistor" },
     ],
   },
-  ENCODER2_ABNORMAL_VALUE: { label: "Encoder2 abnormal value" },
-  ENCODER2_ABNORMAL_SPEED: { label: "Encoder2 abnormal speed" },
+  ENCODER2_ABNORMAL_VALUE: { label: "Encoder 2 abnormal value" },
+  ENCODER2_ABNORMAL_SPEED: { label: "Encoder 2 abnormal speed" },
   ERROR_DETECTION_LPF_CF: { label: "Error detection LPF cutoff" },
   AUTOMATIC_ERROR_RECOVERY: { label: "Automatic error recovery", kind: "toggle" },
   MAX_POSITIVE_POSITION: { label: "Max positive position" },

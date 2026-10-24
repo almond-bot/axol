@@ -829,7 +829,6 @@ function UsbPanel({
               size="sm"
               onClick={() => setProximity(true)}
               disabled={!proxReady || proxBusy != null}
-              title="Keep the headset awake when nobody is wearing it."
             >
               {proxBusy === "off" ? <Loader2 className="animate-spin" /> : <EyeOff />}
               Keep awake
@@ -839,10 +838,9 @@ function UsbPanel({
               size="sm"
               onClick={() => setProximity(false)}
               disabled={!proxReady || proxBusy != null}
-              title="Let the headset sleep again when taken off."
             >
               {proxBusy === "on" ? <Loader2 className="animate-spin" /> : <Eye />}
-              Restore
+              Allow sleep
             </Button>
           </div>
         </div>
@@ -1123,7 +1121,7 @@ function AdvancedPanel({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search all settings…"
+            placeholder="Search advanced settings…"
             className="pl-9"
           />
         </div>

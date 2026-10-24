@@ -1007,7 +1007,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
         configure_mantis.assert_not_called()
         self.assertIn(f"Wheels   : {setup._CAN_B}", output.getvalue())
         self.assertIn(
-            f"Lift     : {setup._CAN_B} (jelly_legs shares the wheel bus)",
+            f"Lift     : {setup._CAN_B} (Jelly lift shares the wheel bus)",
             output.getvalue(),
         )
         self.assertNotIn(setup._CAN_C, output.getvalue())

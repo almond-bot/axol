@@ -529,7 +529,7 @@ export function TrackerBindingPanel({
       body: (
         <StepBody>
           <p>
-            The trackers don&apos;t report which rig they are on. Identify watches which tracker
+            The trackers don&apos;t report which Mantis they are on. Identify watches which tracker
             moves and saves its side. During each 3-second capture, move only the Mantis it asks
             for.
           </p>
@@ -593,8 +593,7 @@ export function TrackerBindingPanel({
               </SetupStep>
               <SetupStep number={2}>
                 Start Collect data with <span className="font-mono">mantis_allow_uncalibrated</span>{" "}
-                turned on under Advanced. Mantis teleop doesn&apos;t start the VR server, so use
-                Collect data.
+                turned on under Advanced. Teleoperation doesn&apos;t work for this step.
               </SetupStep>
               <SetupStep number={3}>
                 In the Quest browser, open <span className="text-white/70">axol.almond.bot</span>,
@@ -690,14 +689,16 @@ export function TrackerBindingPanel({
     steps = [
       {
         key: "runtime",
-        title: "Runtime",
+        title: "Software",
         done: u.installed,
         pending: "Install Ultimate support on this host",
         body: (
           <StepBody>
             <div className="flex flex-wrap gap-1.5">
               <ReadinessBadge tone={u.pinnedPyvut ? "ready" : "error"}>
-                {u.pinnedPyvut ? `Pinned ${u.pinnedRef.slice(0, 12)}` : "Unsupported pyvut version"}
+                {u.pinnedPyvut
+                  ? `Version ${u.pinnedRef.slice(0, 12)}`
+                  : "Unsupported pyvut version"}
               </ReadinessBadge>
               <ReadinessBadge tone={u.nativeDependencies && u.pythonHid ? "ready" : "error"}>
                 {u.nativeDependencies && u.pythonHid
@@ -807,11 +808,6 @@ export function TrackerBindingPanel({
             : "Save the trackers' Wi-Fi settings",
         body: (
           <StepBody>
-            <p>
-              The trackers share their map over a private access point. Enter its SSID, password,
-              country and frequency. Don&apos;t use the robot&apos;s network or your router&apos;s
-              Wi-Fi.
-            </p>
             <UltimateWifiPanel />
           </StepBody>
         ),
@@ -838,7 +834,7 @@ export function TrackerBindingPanel({
     steps = [
       {
         key: "runtime",
-        title: "Runtime",
+        title: "Software",
         done: l.installed,
         pending: "Install Lighthouse support on this host",
         body: (
@@ -846,7 +842,7 @@ export function TrackerBindingPanel({
             <div className="flex flex-wrap gap-1.5">
               <ReadinessBadge tone={l.pinnedBuild ? "ready" : "error"}>
                 {l.pinnedBuild
-                  ? `Pinned ${l.pinnedRef.slice(0, 12)} · ${l.buildRevision}`
+                  ? `Version ${l.pinnedRef.slice(0, 12)} · ${l.buildRevision}`
                   : "libsurvive missing or out of date"}
               </ReadinessBadge>
               <ReadinessBadge tone={l.udevReady ? "ready" : "error"}>

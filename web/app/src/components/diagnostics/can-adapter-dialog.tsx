@@ -181,9 +181,9 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              Choose Axol or Mantis, then the SocketCAN interface for each side. Robot operations
-              use the same Axol mapping. Choosing Mantis here does not change the robot&apos;s saved
-              channels.
+              Choose Axol or Mantis, then the CAN interface for each side. Teleop and every other
+              operation use the Axol choice. Saving a Mantis choice leaves the Axol choice
+              unchanged.
             </p>
           </div>
           <Button
@@ -243,7 +243,7 @@ export function CanAdapterDialog({
 
         {mappingsLoading && (
           <p className="flex items-center gap-1.5 text-xs text-white/40">
-            <Loader2 className="size-3 animate-spin" /> Loading saved mappings…
+            <Loader2 className="size-3 animate-spin" /> Loading saved interfaces…
           </p>
         )}
 
@@ -251,8 +251,7 @@ export function CanAdapterDialog({
           <p className="rounded-md border border-amber-400/25 bg-amber-400/[0.05] p-2.5 text-xs leading-relaxed text-amber-100/90">
             {detectFailed
               ? "Couldn't list the host's CAN interfaces. The host may be offline, or " +
-                "its axol serve may be too old for this page, so update it. You can " +
-                "still type an interface name."
+                "its software may need an update. You can still type an interface name."
               : "No CAN interfaces found on the host. Plug in a CAN adapter, or type " +
                 "the interface name it will have."}
           </p>

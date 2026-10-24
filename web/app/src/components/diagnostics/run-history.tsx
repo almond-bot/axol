@@ -28,7 +28,7 @@ function fmtWhen(t: number): string {
 }
 
 function fmtDuration(meta: DiagnosticsRunMeta): string {
-  if (meta.endedAt == null) return "running"
+  if (meta.endedAt == null) return ""
   const s = Math.max(0, Math.round(meta.endedAt - meta.startedAt))
   if (s < 90) return `${s}s`
   const m = Math.floor(s / 60)
@@ -39,10 +39,13 @@ function runBadge(meta: DiagnosticsRunMeta): {
   variant: "success" | "destructive" | "neutral"
   text: string
 } {
-  if (meta.status === "running") return { variant: "neutral", text: "running" }
+  if (meta.status === "running") return { variant: "neutral", text: "Running" }
   if (meta.status === "error" || (meta.exitCode ?? 0) !== 0)
-    return { variant: "destructive", text: `failed (${meta.exitCode ?? "?"})` }
-  return { variant: "success", text: "ok" }
+    return {
+      variant: "destructive",
+      text: meta.exitCode != null ? `Failed (exit ${meta.exitCode})` : "Failed",
+    }
+  return { variant: "success", text: "OK" }
 }
 
 /** Runs shown per page — telemetry-heavy details load per run on expand, so

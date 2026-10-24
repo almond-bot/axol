@@ -32,11 +32,11 @@ const STATE_BADGE: Record<
   RobotState,
   { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
 > = {
-  connected: { variant: "success", text: "connected" },
-  busy: { variant: "warning", text: "in use" },
-  connecting: { variant: "neutral", text: "connecting" },
-  disconnected: { variant: "neutral", text: "disconnected" },
-  error: { variant: "destructive", text: "error" },
+  connected: { variant: "success", text: "Connected" },
+  busy: { variant: "warning", text: "In use" },
+  connecting: { variant: "neutral", text: "Connecting" },
+  disconnected: { variant: "neutral", text: "Disconnected" },
+  error: { variant: "destructive", text: "Error" },
 }
 
 /**
@@ -167,13 +167,13 @@ export function HardwareOverview({
           ? motorFaultLabel(faults[0]) + (faults.length > 1 ? ` +${faults.length - 1}` : "")
           : `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 0} motors reachable`
         : state === "busy"
-          ? "In use by a task"
+          ? "Used by a running test or operation"
           : state === "connecting"
             ? "Connecting…"
             : state === "error"
               ? robot?.error || "Error"
               : detected
-                ? "CAN detected"
+                ? "Detected"
                 : canProfiles
                   ? "Not detected"
                   : "Disconnected"
@@ -207,7 +207,7 @@ export function HardwareOverview({
           disabled={!online || robotBusy || hardwareBusy || otherLive}
           title={
             otherLive
-              ? `Disconnect ${PROFILE_LABELS[activeProfile]} first. The telemetry link shows one device at a time.`
+              ? `Disconnect ${PROFILE_LABELS[activeProfile]} first. Only one of Axol and Mantis can be connected at a time.`
               : hardwareBusy
                 ? busyTitle
                 : undefined

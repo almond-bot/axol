@@ -121,7 +121,7 @@ export function OperationPanel({
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
   /** No robot model picked yet (`kinematics.mount`): a run that drives the
-   *  Axol arms waits for the "Which Axol is this?" pick above the settings
+   *  Axol arms waits for the "What is Axol mounted on?" pick above the settings
    *  (sim and arms-off runs keep the legacy default). */
   needsMount?: boolean
   /** The robot a sim run simulates (sent as its kinematics.robot_model). */
@@ -345,7 +345,7 @@ export function OperationPanel({
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
   if (!live && needsMount && !mantisMode && meta.requiresRobot && !robotFree) {
-    blockers.push("Choose what Axol is mounted on, above the Axol settings")
+    blockers.push("Choose what Axol is mounted on")
   }
   if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
@@ -408,8 +408,9 @@ export function OperationPanel({
       if (!status.pythonHid || !status.apiCompatible)
         trackerIssues.push("Install Ultimate support in Mantis settings")
       else if (!status.pinnedPyvut) trackerIssues.push("Repair Ultimate support in Mantis settings")
-      if (!status.logSuppression)
-        trackerIssues.push("Install a pyvut version that keeps credentials out of its logs")
+      // An old pyvut that logs credentials is fixed by the same repair.
+      if (!status.logSuppression && !trackerIssues.some((i) => i.includes("Ultimate support")))
+        trackerIssues.push("Repair Ultimate support in Mantis settings")
       if (!status.udevReady) trackerIssues.push("Install the Ultimate USB rule")
       if (!status.operatorAccess) trackerIssues.push("Give this user access to the Ultimate dongle")
       if (!status.dongleConnected) trackerIssues.push("Connect the Ultimate wireless dongle")
@@ -436,9 +437,7 @@ export function OperationPanel({
         (currentTrackerReadiness.quest.datumStatus !== "configured" ||
           currentTrackerReadiness.quest.poseSpace !== "grip")
       ) {
-        blockers.push(
-          "Choose a grip-space Quest calibration key on the Tracking tab of Mantis settings"
-        )
+        blockers.push("Finish the Headset step on the Tracking tab of Mantis settings")
       }
     }
   }
@@ -710,7 +709,7 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       kind: "pulse",
     },
     deciding: {
-      label: "Decide",
+      label: "Time up",
       cls: "border-amber-400/50 bg-amber-400/10 text-amber-200",
       kind: "pulse",
     },
@@ -750,7 +749,7 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       kind: "spin",
     },
     parking: {
-      label: "Parking",
+      label: "Parking arms",
       cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
       kind: "spin",
     },
@@ -1394,8 +1393,8 @@ function Unavailable({ spec }: { spec: CommandSpec | null }) {
         Not available on this Axol host
       </div>
       <p className="text-white/55">
-        This operation needs software or hardware the Axol host doesn&apos;t have, such as the{" "}
-        <span className="font-mono">lerobot</span> or ZED extras, or the Axol arms.
+        This operation needs software or hardware that this Axol host doesn&apos;t have, such as
+        LeRobot, the ZED SDK or the Axol arms.
       </p>
       {spec?.error && (
         <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">

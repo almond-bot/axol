@@ -23,7 +23,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}limit_damping_margin</F> | `0.12` | Distance (rad) from a joint limit inside which the joint is damped while moving toward it. |
 | <F>--{prefix}elbow_fade_band</F> | `0.15` | Height (m) above the shoulder over which the elbow hint fades out. |
 | <F>--{prefix}robot_model</F> | `None` | Axol version to solve for: `classic`, `standalone`, `ox_cart`, `owl` or `mobile` (Axol on Jelly). It sets the joint limits and the body the arms are kept clear of, and `None` picks `mobile` when Jelly is enabled, else `mount`. |
-| <F>--{prefix}mount</F> | `None` | What Axol is mounted on when Jelly isn't enabled: `classic` (Legacy), `standalone`, `ox_cart` or `owl`, as picked under **Choose your Axol** in the control panel. `None` reads `kinematics.mount` from the shared settings, or Legacy if it is unset. |
+| <F>--{prefix}mount</F> | `None` | What Axol is mounted on when Jelly isn't enabled: `classic` (Legacy), `standalone`, `ox_cart` or `owl`, as picked under **Mount** in the control panel. `None` reads `kinematics.mount` from the shared settings, or Legacy if it is unset. |
 | <F>--{prefix}gripper</F> | `None` | Fitted gripper, `parallel` or `parcel`. Teleop sets it from `--axol.gripper`, and only Axol on Jelly uses it to pick a model. `None` reads `axol.gripper` from the shared settings. |
 
 <Note>

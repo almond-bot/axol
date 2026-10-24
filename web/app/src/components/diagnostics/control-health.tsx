@@ -12,7 +12,7 @@ import type { ArmSide, ControlTiming, TelemetryFrame, TimingFrame } from "@/lib/
 const SIDES: ArmSide[] = ["left", "right"]
 
 const METRICS = [
-  { key: "rate", label: "Loop rate", title: "On-wire control rate", unit: "Hz", index: 0 },
+  { key: "rate", label: "Loop rate", title: "Control rate on the CAN bus", unit: "Hz", index: 0 },
   { key: "jitter", label: "Jitter", title: "CAN period jitter (p95)", unit: "ms", index: 1 },
   {
     key: "latency",
@@ -160,7 +160,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
       ? [
           ...commandSeries,
           ...feedbackSeries,
-          { key: "target", label: "RT target", color: COLORS.target },
+          { key: "target", label: "Target rate", color: COLORS.target },
         ]
       : metric.key === "jitter"
         ? [...commandSeries, ...feedbackSeries]
@@ -192,7 +192,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
               ? [
                   ...commandSeries,
                   ...feedbackSeries,
-                  { key: "target", label: "RT period target", color: COLORS.target },
+                  { key: "target", label: "Target period", color: COLORS.target },
                 ]
               : [...commandSeries, ...feedbackSeries]
 
@@ -331,9 +331,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
                   </p>
                 </div>
                 <div>
-                  <p className="text-white/35">
-                    Missed {timing ? Math.round(timing.targetHz) : 240} Hz
-                  </p>
+                  <p className="text-white/35">Missed periods</p>
                   <p className="font-mono text-white/75 tabular-nums">
                     {timing?.deadlineMisses ?? "–"}/s
                   </p>
@@ -370,8 +368,8 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
       />
       <p className="text-xs leading-relaxed text-white/35">
         Send batch is the time from an arm&apos;s first command to its last. Full cycle runs until
-        the last feedback arrives. Missed N Hz counts command gaps longer than one loop period: 4.17
-        ms for the 240 Hz impedance controller, or 2.5 ms for the 400 Hz position controller.
+        the last feedback arrives. Missed periods counts command gaps longer than one loop period:
+        4.17 ms for the 240 Hz impedance controller, or 2.5 ms for the 400 Hz position controller.
       </p>
     </section>
   )

@@ -170,7 +170,7 @@ export function CamerasPanel({
           ? "Assign the cameras connected to this host to the head and to each Mantis. This layout is separate from Axol's."
           : "Assign the cameras connected to this host to their places on Axol."}{" "}
         Then choose what each camera does. Collect data and Run policy need at least one camera set
-        to Record. Teleop sends the cameras set to Stream to the headset.
+        to Record. Teleoperation sends the cameras set to Stream to the headset.
       </p>
 
       <div className="flex flex-col gap-2">
@@ -182,7 +182,7 @@ export function CamerasPanel({
               size="sm"
               onClick={refresh}
               disabled={detecting || restarting}
-              title="Refresh the camera list and previews. To detect a camera you plugged in or unplugged, restart the camera service."
+              title="Refresh the camera list and previews."
             >
               {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
               Refresh

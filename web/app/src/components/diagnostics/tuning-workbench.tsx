@@ -237,13 +237,13 @@ const TABS: WbTab[] = [
       "sweep them (each value becomes its own run).",
     presets: { mode: "sine", save_run: true },
     fields: [
-      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
-      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
+      { key: "arm", label: "Arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "Joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
-      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      { key: "amp", label: "Amplitude (°)", type: "number", placeholder: "10" },
       {
         key: "center",
-        label: "center (°)",
+        label: "Center (°)",
         type: "number",
         placeholder: "auto",
         hint:
@@ -252,43 +252,49 @@ const TABS: WbTab[] = [
       },
       {
         key: "pose",
-        label: "hold other joints (°)",
+        label: "Hold other joints (°)",
         type: "pose",
         hint:
           "Hold other joints at these angles during the test. Load and inertia " +
           "change with pose, so test the worst case. The joints return afterwards.",
       },
-      { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
-      { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
+      { key: "freq", label: "Frequency (Hz)", type: "number", placeholder: "1.0" },
+      { key: "duration", label: "Duration (s)", type: "number", placeholder: "5" },
       {
         key: "rate",
-        label: "rate (Hz)",
+        label: "Rate (Hz)",
         type: "number",
         placeholder: "240",
         hint: "Command loop rate. 240 is the production rate, and the loop Hz score shows the rate achieved.",
       },
       {
         key: "ff",
-        label: "feedforward",
+        label: "Feedforward",
         type: "select",
         options: ["full", "gravity", "friction", "none"],
       },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "–" },
+      {
+        key: "stiffness",
+        label: "Stiffness (0 to 1)",
+        type: "number",
+        placeholder: "–",
+        hint: "Stiffness slider position. 1 is the default and lower is softer. Gains typed here still override it.",
+      },
       {
         key: "target_noise",
-        label: "target noise (°)",
+        label: "Target noise (°)",
         type: "number",
         placeholder: "off",
       },
       {
         key: "no_imu",
-        label: "skip wrist IMU",
+        label: "Skip wrist IMU",
         type: "boolean",
         hint:
           "By default, the wrist ZED X One IMU is recorded to score shake the joint " +
           "encoders can't see, such as backlash and flex.",
       },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
@@ -303,13 +309,13 @@ const TABS: WbTab[] = [
       "to use config, or type several kp or kd values to sweep them.",
     presets: { mode: "step", save_run: true },
     fields: [
-      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
-      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
+      { key: "arm", label: "Arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "Joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
-      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      { key: "amp", label: "Amplitude (°)", type: "number", placeholder: "10" },
       {
         key: "center",
-        label: "center (°)",
+        label: "Center (°)",
         type: "number",
         placeholder: "auto",
         hint:
@@ -318,36 +324,42 @@ const TABS: WbTab[] = [
       },
       {
         key: "pose",
-        label: "hold other joints (°)",
+        label: "Hold other joints (°)",
         type: "pose",
         hint:
           "Hold other joints at these angles during the test. Load and inertia " +
           "change with pose, so test the worst case. The joints return afterwards.",
       },
-      { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
+      { key: "hold", label: "Hold (s)", type: "number", placeholder: "2" },
       {
         key: "rate",
-        label: "rate (Hz)",
+        label: "Rate (Hz)",
         type: "number",
         placeholder: "240",
         hint: "Command loop rate. 240 is the production rate, and the loop Hz score shows the rate achieved.",
       },
       {
         key: "ff",
-        label: "feedforward",
+        label: "Feedforward",
         type: "select",
         options: ["full", "gravity", "friction", "none"],
       },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "–" },
+      {
+        key: "stiffness",
+        label: "Stiffness (0 to 1)",
+        type: "number",
+        placeholder: "–",
+        hint: "Stiffness slider position. 1 is the default and lower is softer. Gains typed here still override it.",
+      },
       {
         key: "no_imu",
-        label: "skip wrist IMU",
+        label: "Skip wrist IMU",
         type: "boolean",
         hint:
           "By default, the wrist ZED X One IMU is recorded to score shake the joint " +
           "encoders can't see, such as backlash and flex.",
       },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
@@ -365,39 +377,39 @@ const TABS: WbTab[] = [
       "around the arm.",
     presets: { save_run: true },
     fields: [
-      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      { key: "arm", label: "Arm", type: "select", options: ["left", "right"] },
       {
         key: "joint",
-        label: "joint",
+        label: "Joint",
         type: "select",
         options: ARM_JOINT_OPTIONS,
       },
-      { key: "mode", label: "wave", type: "select", options: ["triangle", "sine"] },
+      { key: "mode", label: "Wave", type: "select", options: ["triangle", "sine"] },
       {
         key: "center",
-        label: "center (°)",
+        label: "Center (°)",
         type: "number",
         placeholder: "mid",
         hint: "Center in the joint frame (0 = rest). Also test under gravity load, for example -35 on shoulder_1.",
       },
-      { key: "amp", label: "half-travel (°)", type: "number", placeholder: "10" },
+      { key: "amp", label: "Half-travel (°)", type: "number", placeholder: "10" },
       {
         key: "pose",
-        label: "hold other joints (°)",
+        label: "Hold other joints (°)",
         type: "pose",
         hint:
           "Hold other joints at these angles during the run, in place of the sweep's " +
           "clearance pose. A loop that is stable with the arm hanging can oscillate " +
           "with it extended, so test the worst case too. Held joints are sampled and scored.",
       },
-      { key: "speed", label: "triangle speed (°/s)", type: "number", placeholder: "3" },
-      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.3" },
-      { key: "duration", label: "duration (s)", type: "number", placeholder: "12" },
-      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "400" },
-      { key: "cap", label: "speed cap (°/s)", type: "number", placeholder: "60" },
+      { key: "speed", label: "Triangle speed (°/s)", type: "number", placeholder: "3" },
+      { key: "freq", label: "Sine frequency (Hz)", type: "number", placeholder: "0.3" },
+      { key: "duration", label: "Duration (s)", type: "number", placeholder: "12" },
+      { key: "rate", label: "Rate (Hz)", type: "number", placeholder: "400" },
+      { key: "cap", label: "Speed cap (°/s)", type: "number", placeholder: "60" },
       {
         key: "cap_track",
-        label: "cap tracks speed ×",
+        label: "Cap tracks speed (×)",
         type: "number",
         placeholder: "0",
         hint:
@@ -406,7 +418,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "cap_floor",
-        label: "cap floor (°/s)",
+        label: "Cap floor (°/s)",
         type: "number",
         placeholder: "1",
         hint: "Lowest cap the tracking cap can set, so a stationary target still gets corrected.",
@@ -418,37 +430,44 @@ const TABS: WbTab[] = [
         placeholder: "stored",
         vendors: ["damiao"],
         hint:
-          "Acceleration and deceleration of the wrist_2 and wrist_3 profiler. Set for " +
-          "the run and restored afterwards unless you check keep.",
+          "Acceleration and deceleration of the wrist_2 and wrist_3 profiler. Restored " +
+          "after the run unless Keep gains and planner after run is on.",
       },
       {
         key: "accel",
-        label: "planner accel (dps/s)",
+        label: "Planner accel (°/s²)",
         type: "text",
         fwGainKey: "planner_accel",
         vendors: ["myactuator"],
         width: "w-24",
         hint:
-          "0 means direct PI tracking, which the joint needs to follow the stream. Set " +
-          "for the run and restored afterwards unless you check keep.",
+          "0 means direct PI tracking, which the joint needs to follow the stream. " +
+          "Restored after the run unless Keep gains and planner after run is on.",
       },
       ...FW_GAIN_FIELDS,
       {
         key: "held_gain",
-        label: "held joint gains",
+        label: "Held joint gains",
         type: "text",
         width: "w-72",
         placeholder: "shoulder_2.position_kp=0.5 wrist_2.position_kp=200",
         hint:
           "JOINT.GAIN=VALUE pairs, separated by spaces, for the joints held during the " +
-          "wave. Set in RAM and restored afterwards unless you check keep. The run's " +
+          "wave. Set in RAM and restored after the run unless Keep gains and planner " +
+          "after run is on. The run's " +
           "power table shows which held joints feed a ring. Damiao wrists accept " +
           "position and speed kp and ki only.",
       },
-      { key: "buzz_abort", label: "buzz abort (°)", type: "number", placeholder: "0.3" },
+      {
+        key: "buzz_abort",
+        label: "Buzz abort (°)",
+        type: "number",
+        placeholder: "0.3",
+        hint: "Stop the run when motion above 10 Hz exceeds this, in degrees RMS over 0.1 s. 0 turns it off.",
+      },
       {
         key: "iq_abort",
-        label: "current abort (A)",
+        label: "Current abort (A)",
         type: "number",
         placeholder: "30",
         hint:
@@ -467,18 +486,18 @@ const TABS: WbTab[] = [
           "jump per step gives firmware.tf_rated_current_a. 5 is a gentle step of about " +
           "1 Nm on a shoulder, and planner accel must be 0.",
       },
-      { key: "persist", label: "persist gains to ROM", type: "boolean" },
-      { key: "keep", label: "keep gains + planner after run", type: "boolean" },
+      { key: "persist", label: "Save gains to ROM", type: "boolean" },
+      { key: "keep", label: "Keep gains and planner after run", type: "boolean" },
       {
         key: "no_imu",
-        label: "skip wrist IMU",
+        label: "Skip wrist IMU",
         type: "boolean",
         hint:
           "By default, the wrist ZED X One IMU is recorded to score shake the joint " +
           "encoders can't see, such as backlash and flex.",
       },
 
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
@@ -491,14 +510,14 @@ const TABS: WbTab[] = [
       "Replay a reference motion through the production control path and score " +
       "tracking per joint. Gain overrides apply to this run only, so run once " +
       "without and once with them and compare the scores. To test the teleop " +
-      "filters, inject noise and toggle filter stack. The charts overlay the " +
-      "clean reference, the stream sent and the measured position.",
+      "filters, set Inject noise and run with Filter stack off and on. The charts " +
+      "overlay the clean reference, the stream sent and the measured position.",
     presets: {},
     fields: [
-      { key: "motion", label: "motion", type: "select", options: [] },
+      { key: "motion", label: "Motion", type: "select", options: [] },
       {
         key: "arms",
-        label: "arms",
+        label: "Arms",
         type: "select",
         options: ["both", "left", "right"],
         placeholder: "both",
@@ -506,7 +525,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "controller",
-        label: "controller",
+        label: "Controller",
         type: "select",
         options: ["impedance", "position"],
         placeholder: "impedance",
@@ -517,7 +536,13 @@ const TABS: WbTab[] = [
           "loop tab's gains, with no host feedforward and no contact watchdog on " +
           "MyActuator joints.",
       },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
+      {
+        key: "stiffness",
+        label: "Stiffness (0 to 1)",
+        type: "number",
+        placeholder: "1",
+        hint: "Stiffness slider position for both arms. 1 is the default and lower is softer.",
+      },
       {
         key: "fast_impedance",
         label: "480 Hz impedance joints",
@@ -530,7 +555,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "impedance_hz",
-        label: "impedance rate (Hz)",
+        label: "Impedance rate (Hz)",
         type: "select",
         options: ["240", "480"],
         placeholder: "240",
@@ -540,7 +565,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "loop_hz",
-        label: "core loop (Hz)",
+        label: "Core loop (Hz)",
         type: "number",
         placeholder: "auto",
         hint:
@@ -550,7 +575,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "record",
-        label: "record",
+        label: "Record",
         type: "text",
         width: "w-32",
         placeholder: "prefix",
@@ -560,7 +585,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "hold",
-        label: "hold joints steady",
+        label: "Hold joints steady",
         type: "text",
         width: "w-56",
         placeholder: "right.elbow right.wrist_2=10",
@@ -571,7 +596,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "repeat",
-        label: "repeat",
+        label: "Repeat",
         type: "number",
         placeholder: "1",
         hint:
@@ -580,16 +605,16 @@ const TABS: WbTab[] = [
       },
       {
         key: "no_imu",
-        label: "skip wrist IMU",
+        label: "Skip wrist IMU",
         type: "boolean",
         hint:
           "By default, each driven arm's wrist ZED X One IMU is recorded to score " +
           "shake the joint encoders can't see, such as backlash and flex.",
       },
-      { key: "gain", label: "gain overrides (this run only)", type: "overrides" },
+      { key: "gain", label: "Gain overrides (this run only)", type: "overrides" },
       {
         key: "a4",
-        label: "controller per joint (click to switch)",
+        label: "Controller per joint (click to switch)",
         type: "wire",
         hint:
           "Run single MyActuator joints on their 0xA4 firmware loop for this run. " +
@@ -598,7 +623,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "ik",
-        label: "run as IK",
+        label: "Run as IK",
         type: "boolean",
         hint:
           "Re-solve the motion's end-effector path through the IK solver, as teleop " +
@@ -607,7 +632,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "noise",
-        label: "inject noise",
+        label: "Inject noise",
         type: "select",
         options: ["none", "network", "ik", "combined"],
         hint:
@@ -616,23 +641,23 @@ const TABS: WbTab[] = [
       },
       {
         key: "filter",
-        label: "filter stack",
+        label: "Filter stack",
         type: "boolean",
         hint:
           "Pass the stream through the production teleop filters (pose low-pass, EMA, " +
           "trapezoid) before sending. Off sends it raw.",
       },
-      { key: "seed", label: "seed", type: "number", placeholder: "0" },
+      { key: "seed", label: "Seed", type: "number", placeholder: "0" },
       {
         key: "torque_threshold",
-        label: "contact Nm",
+        label: "Contact limit (Nm)",
         type: "number",
         placeholder: "8",
         hint:
           "Stop playback when a joint's torque, minus modeled gravity, stays above " +
           "this value. 0 turns the contact watchdog off.",
       },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: ["motion"],
     drivesMotors: true,
@@ -643,16 +668,16 @@ const TABS: WbTab[] = [
     command: "tune.friction",
     description:
       "Fit one joint's friction model (Coulomb, viscous, offset) from a velocity " +
-      "sweep in both directions. Check save to calibration to write the fit to " +
-      "this robot's calibration file.",
+      "sweep in both directions. Turn on Save to calibration to write the fit to " +
+      "this robot's calibration.",
     presets: {},
     fields: [
-      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
-      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
-      { key: "save", label: "save to calibration", type: "boolean" },
+      { key: "arm", label: "Arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "Joint", type: "select", options: ARM_JOINT_OPTIONS },
+      { key: "save", label: "Save to calibration", type: "boolean" },
       {
         key: "velocities",
-        label: "velocities (°/s)",
+        label: "Velocities (°/s)",
         type: "text",
         placeholder: "7.2 18 36 54 72",
         width: "w-44",
@@ -683,21 +708,21 @@ const TABS: WbTab[] = [
       "Fit one link's center of mass from a torque sweep with friction " +
       "cancelled, to correct the gravity feedforward. This removes the static " +
       "droop a joint shows under load, which kp and kd tuning can't fix. Run " +
-      "from the wrist inward (wrist_3 first, shoulder_1 last). Check save to " +
+      "from the wrist inward (wrist_3 first, shoulder_1 last). Turn on Save to " +
       "calibration to write the result to this robot's calibration.",
     presets: { save_run: true },
     fields: [
-      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
-      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
-      { key: "save", label: "save to calibration", type: "boolean" },
+      { key: "arm", label: "Arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "Joint", type: "select", options: ARM_JOINT_OPTIONS },
+      { key: "save", label: "Save to calibration", type: "boolean" },
       {
         key: "velocity",
-        label: "velocity (°/s)",
+        label: "Velocity (°/s)",
         type: "number",
         placeholder: "18",
         hint: "Sweep speed. Keep it at 25 or below so shoulder torque readings stay clean.",
       },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
@@ -709,15 +734,15 @@ const TABS: WbTab[] = [
     description:
       "Calibrate friction and gravity for all 14 joints in one run, working from " +
       "the wrist inward on each arm. Each fit is saved to this robot's " +
-      "calibration as it finishes. If a Supabase key is set (AXOL_SUPABASE_KEY), " +
-      "the result is also uploaded under the hub serial. Plan for a long run: 7 " +
-      "joints per arm, several sweep speeds each.",
+      "calibration as it finishes. If the upload key (AXOL_SUPABASE_KEY) is set, " +
+      "the result is also uploaded to the cloud under the hub serial. The run " +
+      "takes about 1.5 hours.",
     presets: {},
     fields: [
-      { key: "arms", label: "arms", type: "select", options: ["both", "left", "right"] },
+      { key: "arms", label: "Arms", type: "select", options: ["both", "left", "right"] },
       {
         key: "velocities",
-        label: "velocities (°/s)",
+        label: "Velocities (°/s)",
         type: "text",
         placeholder: "1 2 3 5 8 15 30",
         width: "w-44",
@@ -725,7 +750,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "hub_serial",
-        label: "hub serial",
+        label: "Hub serial",
         type: "text",
         placeholder: "auto-detect",
         width: "w-52",
@@ -742,22 +767,22 @@ const TABS: WbTab[] = [
     description:
       "Turn a recording into a reference motion for the Recorded motion tab. " +
       "The recording is clipped, resampled, smoothed and checked for collisions, " +
-      "then saved to the package's motions folder (commit it to git to use it on " +
-      "other robots). Record first with axol teleop --teleop.record NAME, or by " +
+      "then saved to ~/.almond/motions on the robot. Record first with axol " +
+      "teleop --teleop.record NAME, or by " +
       "hand-guiding the arms in gravity comp (axol gravity-comp --record NAME). " +
       "Recordings are saved in ~/.almond/recordings/.",
     presets: {},
     fields: [
       {
         key: "name",
-        label: "motion name",
+        label: "Motion name",
         type: "text",
         placeholder: "same as recording",
         hint: "Name the motion is saved and listed under. Empty uses the recording name.",
       },
       {
         key: "prefix",
-        label: "recording",
+        label: "Recording",
         type: "select",
         placeholder: "newest recording",
         width: "w-56",
@@ -765,7 +790,7 @@ const TABS: WbTab[] = [
       },
       {
         key: "cutoff",
-        label: "cutoff (Hz)",
+        label: "Cutoff (Hz)",
         type: "number",
         placeholder: "6",
         hint:
@@ -774,18 +799,18 @@ const TABS: WbTab[] = [
       },
       {
         key: "rate",
-        label: "rate (Hz)",
+        label: "Rate (Hz)",
         type: "number",
         placeholder: "240",
         hint: "Sample rate of the built motion. 240 matches the production control loop.",
       },
       {
         key: "time_scale",
-        label: "time scale",
+        label: "Time scale",
         type: "number",
         placeholder: "1.0",
       },
-      { key: "notes", label: "notes", type: "text", placeholder: "provenance", width: "w-40" },
+      { key: "notes", label: "Notes", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: [],
     drivesMotors: false,
@@ -803,7 +828,7 @@ const TABS: WbTab[] = [
     fields: [
       {
         key: "prefix",
-        label: "recording",
+        label: "Recording",
         type: "text",
         placeholder: "newest recording",
         width: "w-44",
@@ -811,7 +836,7 @@ const TABS: WbTab[] = [
           "A --teleop.record name or a full path prefix. Empty uses the newest in " +
           "~/.almond/recordings/.",
       },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+      { key: "label", label: "Note", type: "text", placeholder: "optional", width: "w-40" },
     ],
     required: [],
     drivesMotors: false,
@@ -844,9 +869,20 @@ function runTab(meta: TuningRunMeta): string | null {
   return KIND_TABS[meta.kind] ?? null
 }
 
-/** What to call a run in badges: its kind, except firmware-loop runs. */
+/** Run kinds as the launcher tabs name them, for badges and tooltips. */
+const KIND_LABELS: Record<string, string> = {
+  sine: "Sine",
+  step: "Step",
+  motion: "Recorded motion",
+  gravity: "Gravity",
+  filter: "Filter",
+  build: "Build motion",
+  kinematics: "IK",
+}
+
+/** What to call a run in badges: its tab's name, with firmware-loop runs apart. */
 function runKindLabel(meta: TuningRunMeta): string {
-  return isA4Run(meta) ? "a4" : meta.kind
+  return isA4Run(meta) ? "Firmware loop" : (KIND_LABELS[meta.kind] ?? meta.kind)
 }
 
 /* ------------------------------------------------------------------ */
@@ -2084,89 +2120,89 @@ interface ScoreCol {
 }
 
 const MOTION_COLS: ScoreCol[] = [
-  { key: "rms_err", label: "tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
-  { key: "lag_ms", label: "lag ms", digits: 0, warn: 40, bad: 80 },
-  { key: "err_band_mid", label: "jitter °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
-  { key: "amplification", label: "ringing ×", warn: 1.15, bad: 1.5 },
-  { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
-  { key: "buzz", label: "buzz °", deg: true, digits: 3, warn: 0.01, bad: 0.02 },
-  { key: "buzz_hz", label: "buzz Hz", digits: 0 },
+  { key: "rms_err", label: "Tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "lag_ms", label: "Lag ms", digits: 0, warn: 40, bad: 80 },
+  { key: "err_band_mid", label: "Jitter °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
+  { key: "amplification", label: "Ringing ×", warn: 1.15, bad: 1.5 },
+  { key: "torque_hf", label: "Torque chatter Nm", digits: 3 },
+  { key: "buzz", label: "Buzz °", deg: true, digits: 3, warn: 0.01, bad: 0.02 },
+  { key: "buzz_hz", label: "Buzz Hz", digits: 0 },
 ]
 
 const SINE_COLS: ScoreCol[] = [
-  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
-  { key: "max", label: "max err °", deg: true, digits: 3, warn: 3, bad: 6 },
-  { key: "hz", label: "loop Hz", digits: 0 },
-  { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
-  { key: "pos_ripple", label: "ripple", digits: 4 },
-  { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
-  { key: "score", label: "score", digits: 3 },
+  { key: "rms", label: "Tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "max", label: "Max error °", deg: true, digits: 3, warn: 3, bad: 6 },
+  { key: "hz", label: "Loop Hz", digits: 0 },
+  { key: "torque_hf", label: "Torque chatter Nm", digits: 3 },
+  { key: "pos_ripple", label: "Ripple", digits: 4 },
+  { key: "holder_peak_deg", label: "Holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
+  { key: "score", label: "Score", digits: 3 },
 ]
 
 // tune.a4's creep-smoothness scorecard (see a4_metrics): the MIT frame's
 // stick-slip sits near 0.8 velocity ripple, smooth is under 0.2.
 const A4_COLS: ScoreCol[] = [
-  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 0.5, bad: 2.0 },
-  { key: "max", label: "max err °", deg: true, digits: 3, warn: 1.5, bad: 5 },
-  { key: "lag_ms", label: "lag ms", digits: 0, warn: 100, bad: 300 },
-  { key: "v_ripple", label: "vel ripple", digits: 2, warn: 0.3, bad: 0.8 },
-  { key: "stuck_frac", label: "stuck", digits: 2, warn: 0.05, bad: 0.3 },
+  { key: "rms", label: "Tracking RMS °", deg: true, digits: 3, warn: 0.5, bad: 2.0 },
+  { key: "max", label: "Max error °", deg: true, digits: 3, warn: 1.5, bad: 5 },
+  { key: "lag_ms", label: "Lag ms", digits: 0, warn: 100, bad: 300 },
+  { key: "v_ripple", label: "Velocity ripple", digits: 2, warn: 0.3, bad: 0.8 },
+  { key: "stuck_frac", label: "Stuck", digits: 2, warn: 0.05, bad: 0.3 },
   { key: "band_1_4", label: "1–4 Hz °", deg: true, digits: 3, warn: 0.1, bad: 0.3 },
   { key: "buzz", label: ">10 Hz buzz °", deg: true, digits: 3, warn: 0.02, bad: 0.1 },
   { key: "iq_mode", label: "3–8 Hz mode A", digits: 2, warn: 0.5, bad: 1.0 },
-  { key: "iq_sd", label: "current spread A", digits: 2, warn: 1.3, bad: 1.8 },
-  { key: "iq_rms", label: "current RMS A", digits: 2 },
-  { key: "iq_max", label: "peak A", digits: 1 },
-  { key: "hz", label: "loop Hz", digits: 0 },
+  { key: "iq_sd", label: "Current spread A", digits: 2, warn: 1.3, bad: 1.8 },
+  { key: "iq_rms", label: "Current RMS A", digits: 2 },
+  { key: "iq_max", label: "Peak current A", digits: 1 },
+  { key: "hz", label: "Loop Hz", digits: 0 },
 ]
 
 const FILTER_COLS: ScoreCol[] = [
-  { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
-  { key: "rms_err", label: "error out °", deg: true, digits: 3 },
-  { key: "rms_err_lagfree", label: "lag-free °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
-  { key: "lag_ms", label: "lag ms", digits: 0, warn: 60, bad: 120 },
-  { key: "jitter_passed", label: "jitter passed ×", warn: 0.7, bad: 1.0 },
-  { key: "peak_err", label: "peak err °", deg: true, digits: 3 },
-  { key: "accel_peak", label: "peak accel °/s²", deg: true, digits: 0 },
+  { key: "input_rms", label: "Noise in °", deg: true, digits: 3 },
+  { key: "rms_err", label: "Error out °", deg: true, digits: 3 },
+  { key: "rms_err_lagfree", label: "Lag-free °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "lag_ms", label: "Lag ms", digits: 0, warn: 60, bad: 120 },
+  { key: "jitter_passed", label: "Jitter passed ×", warn: 0.7, bad: 1.0 },
+  { key: "peak_err", label: "Peak error °", deg: true, digits: 3 },
+  { key: "accel_peak", label: "Peak accel °/s²", deg: true, digits: 0 },
 ]
 
 // motion.build before/after: values are already in display units (degrees).
 const BUILD_COLS: ScoreCol[] = [
-  { key: "dev_rms_deg", label: "change RMS °", digits: 3 },
-  { key: "dev_max_deg", label: "change max °", digits: 2, warn: 3, bad: 8 },
-  { key: "peak_vel_raw_dps", label: "peak vel in °/s", digits: 0 },
-  { key: "peak_vel_built_dps", label: "peak vel out °/s", digits: 0, warn: 120, bad: 180 },
+  { key: "dev_rms_deg", label: "Change RMS °", digits: 3 },
+  { key: "dev_max_deg", label: "Change max °", digits: 2, warn: 3, bad: 8 },
+  { key: "peak_vel_raw_dps", label: "Peak velocity in °/s", digits: 0 },
+  { key: "peak_vel_built_dps", label: "Peak velocity out °/s", digits: 0, warn: 120, bad: 180 },
 ]
 
 // IK per-joint churn (values already in degrees / Hz).
 const KIN_COLS: ScoreCol[] = [
-  { key: "churn_deg_min", label: "churn °/min", digits: 0, warn: 200, bad: 600 },
+  { key: "churn_deg_min", label: "Churn °/min", digits: 0, warn: 200, bad: 600 },
   { key: "mid_band_deg", label: "3–15 Hz °", digits: 3, warn: 0.15, bad: 0.4 },
-  { key: "peak_hz", label: "peak Hz", digits: 1 },
+  { key: "peak_hz", label: "Peak Hz", digits: 1 },
 ]
 
 const GRAVITY_COLS: ScoreCol[] = [
-  { key: "rms_before", label: "residual before Nm", digits: 3 },
-  { key: "rms_after", label: "residual after Nm", digits: 3, warn: 0.15, bad: 0.4 },
-  { key: "droop_before_deg", label: "droop before °", digits: 3 },
-  { key: "droop_after_deg", label: "droop after °", digits: 3, warn: 0.1, bad: 0.3 },
+  { key: "rms_before", label: "Residual before Nm", digits: 3 },
+  { key: "rms_after", label: "Residual after Nm", digits: 3, warn: 0.15, bad: 0.4 },
+  { key: "droop_before_deg", label: "Droop before °", digits: 3 },
+  { key: "droop_after_deg", label: "Droop after °", digits: 3, warn: 0.1, bad: 0.3 },
   { key: "fo", label: "Fo Nm", digits: 3 },
 ]
 
 const STEP_COLS: ScoreCol[] = [
-  { key: "settling_s", label: "settling s", warn: 0.4, bad: 0.8 },
-  { key: "overshoot", label: "overshoot °", deg: true, digits: 3, warn: 1, bad: 3 },
-  { key: "ss_rms", label: "steady-state RMS °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
-  { key: "ring_hz", label: "ring Hz", digits: 1 },
-  { key: "hz", label: "loop Hz", digits: 0 },
-  { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
-  { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
-  { key: "score", label: "score", digits: 3 },
+  { key: "settling_s", label: "Settling s", warn: 0.4, bad: 0.8 },
+  { key: "overshoot", label: "Overshoot °", deg: true, digits: 3, warn: 1, bad: 3 },
+  { key: "ss_rms", label: "Steady-state RMS °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
+  { key: "ring_hz", label: "Ring Hz", digits: 1 },
+  { key: "hz", label: "Loop Hz", digits: 0 },
+  { key: "torque_hf", label: "Torque chatter Nm", digits: 3 },
+  { key: "holder_peak_deg", label: "Holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
+  { key: "score", label: "Score", digits: 3 },
 ]
 
 const A4_LEGEND =
   "Firmware position loop (0xA4). Tracking RMS, max and lag: how well the joint " +
-  "followed the stream. Vel ripple: spread of the velocity error relative to the " +
+  "followed the stream. Velocity ripple: spread of the velocity error relative to the " +
   "commanded speed (impedance stick-slip is near 0.8, smooth is under 0.2). " +
   "Stuck: fraction of the pass where the joint did not move. 1–4 Hz: the " +
   "stick-slip band in the error. >10 Hz buzz: high-frequency position motion. " +
@@ -2218,7 +2254,7 @@ const SCORE_LEGEND: Record<string, string> = {
     "much resampling, smoothing and collision checks moved the motion. A few " +
     "degrees is normal smoothing of a jittery recording. Tens of degrees means " +
     "waypoints were pushed off a joint limit or the torso, so check that part " +
-    "of the graph. Peak vel out is the speed tune.motion will command.",
+    "of the graph. Peak velocity out is the speed tune.motion will command.",
   kinematics:
     "Churn: total joint travel per minute. Churn without end-effector motion " +
     "points to IK settings, not motors. 3–15 Hz: mid-band jitter on this joint. " +
@@ -2294,7 +2330,7 @@ const MAP_SPECS: Record<
   motion: {
     metric: "rms_err",
     deg: true,
-    label: "tracking RMS",
+    label: "Tracking RMS",
     unit: "°",
     warn: 1.0,
     bad: 2.5,
@@ -2302,7 +2338,7 @@ const MAP_SPECS: Record<
   filter: {
     metric: "rms_err_lagfree",
     deg: true,
-    label: "lag-free residual",
+    label: "Lag-free residual",
     unit: "°",
     warn: 1.0,
     bad: 2.5,
@@ -2310,7 +2346,7 @@ const MAP_SPECS: Record<
   build: {
     metric: "dev_max_deg",
     deg: false,
-    label: "built − recorded max",
+    label: "Built − recorded max",
     unit: "°",
     warn: 3,
     bad: 8,
@@ -2318,7 +2354,7 @@ const MAP_SPECS: Record<
   kinematics: {
     metric: "mid_band_deg",
     deg: false,
-    label: "solver 3–15 Hz jitter",
+    label: "Solver 3–15 Hz jitter",
     unit: "°",
     warn: 0.15,
     bad: 0.4,
@@ -2376,7 +2412,7 @@ function FailureMap({
   return (
     <Card className="gap-3 p-4">
       <div className="flex flex-wrap items-baseline gap-2">
-        <h3 className="font-heading text-sm font-semibold">Failure map</h3>
+        <h3 className="font-heading text-sm font-semibold">Error by joint</h3>
         <span className="text-xs text-white/35">
           {spec.label} per joint, both arms. Click a joint to see its graph.
         </span>
@@ -2390,7 +2426,7 @@ function FailureMap({
                 side === arm ? "text-[#eff483]" : "text-white/45"
               )}
             >
-              {side} arm{side === arm ? " · charted" : ""}
+              {side} arm{side === arm ? " · shown below" : ""}
             </span>
             {joints.map((joint) => {
               const v = value(side, joint)
@@ -3006,7 +3042,7 @@ export function TuningWorkbench({
                           {defaultOpt == null && (
                             <option value="">
                               {tab.required.includes(f.key)
-                                ? "select…"
+                                ? "Select…"
                                 : (f.placeholder ?? "default")}
                             </option>
                           )}
@@ -3111,7 +3147,10 @@ export function TuningWorkbench({
         </div>
 
         {missing.length > 0 && (
-          <p className="text-xs text-red-300">Required: {missing.join(", ")}</p>
+          <p className="text-xs text-red-300">
+            Required:{" "}
+            {missing.map((k) => tab.fields.find((f) => f.key === k)?.label ?? k).join(", ")}
+          </p>
         )}
         {spec && !spec.available && (
           <p className="text-xs text-red-300">Unavailable: {spec.error}</p>
@@ -3129,7 +3168,7 @@ export function TuningWorkbench({
           the runner (decimated ~25 Hz), full-resolution artifact follows. */}
       {runningOurs && live && live.t.length > 1 && (
         <RunChart
-          title={`live · ${live.joint} · ${live.mode}`}
+          title={`Live: ${live.joint}, ${live.mode}`}
           unit="°"
           series={[
             { label: "commanded", color: COMMANDED_COLOR, x: live.t, data: degSeries(live.target) },
@@ -3144,7 +3183,7 @@ export function TuningWorkbench({
       {comparing && (
         <>
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <Badge variant="neutral">compare</Badge>
+            <Badge variant="neutral">Compare</Badge>
             {compareIds.map((id, i) => {
               const r = runs.find((x) => x.id === id)
               if (!r) return null
@@ -3268,7 +3307,7 @@ export function TuningWorkbench({
                   <thead>
                     <tr className="text-left text-white/40">
                       <th rowSpan={2} className="py-1 pr-4 align-bottom font-normal">
-                        joint
+                        Joint
                       </th>
                       {cmpScores.cols.map((c) => (
                         <th key={c.key} colSpan={2} className="py-1 pr-4 font-normal">
@@ -3408,18 +3447,24 @@ export function TuningWorkbench({
           No joint moved more than 1° in this run, so there is nothing to chart.
         </p>
       )}
+      {((comparing && cmpReady && cmpCharts.length > 0) ||
+        (!comparing && run && jointCharts.length > 0)) && (
+        <p className="text-xs text-white/30">
+          Scroll a chart to zoom and drag to pan. Double-click it to reset the view.
+        </p>
+      )}
 
       {/* Per-joint scores under the graphs. */}
       {!comparing && scores && (
         <Card className="gap-3 p-4">
           <h3 className="font-heading text-sm font-semibold">
-            Tracking scores{armed ? ` (${arm} arm)` : ""}
+            Scores{armed ? ` (${arm} arm)` : ""}
           </h3>
           <div className="overflow-x-auto">
             <table className="w-full max-w-3xl text-xs">
               <thead>
                 <tr className="text-left text-white/40">
-                  <th className="py-1 pr-4 font-normal">joint</th>
+                  <th className="py-1 pr-4 font-normal">Joint</th>
                   {scores.cols.map((c) => (
                     <th key={c.key} className="py-1 pr-4 font-normal">
                       {c.label}
@@ -3460,15 +3505,15 @@ export function TuningWorkbench({
             <table className="w-full max-w-3xl text-xs">
               <thead>
                 <tr className="text-left text-white/40">
-                  <th className="py-1 pr-4 font-normal">side</th>
-                  <th className="py-1 pr-4 font-normal">shake p2p (mm)</th>
+                  <th className="py-1 pr-4 font-normal">Side</th>
+                  <th className="py-1 pr-4 font-normal">Shake p2p (mm)</th>
                   <th className="py-1 pr-4 font-normal">p90 (mm)</th>
-                  <th className="py-1 pr-4 font-normal">vertical (mm)</th>
+                  <th className="py-1 pr-4 font-normal">Vertical (mm)</th>
                   <th className="py-1 pr-4 font-normal">1–3 Hz (mm)</th>
                   <th className="py-1 pr-4 font-normal">3–15 Hz (mm)</th>
-                  <th className="py-1 pr-4 font-normal">accel (m/s²)</th>
-                  <th className="py-1 pr-4 font-normal">gyro (°/s)</th>
-                  <th className="py-1 pr-4 font-normal">peak (Hz)</th>
+                  <th className="py-1 pr-4 font-normal">Accel (m/s²)</th>
+                  <th className="py-1 pr-4 font-normal">Gyro (°/s)</th>
+                  <th className="py-1 pr-4 font-normal">Peak (Hz)</th>
                 </tr>
               </thead>
               <tbody className="font-mono tabular-nums">
@@ -3556,7 +3601,7 @@ export function TuningWorkbench({
                     disabled={cmpBlocked}
                     title={
                       cmpBlocked
-                        ? `Only ${compareKind} runs can be compared with this one`
+                        ? `Only ${KIND_LABELS[compareKind] ?? compareKind} runs can be compared with this one`
                         : "Select two runs to compare them"
                     }
                     onClick={(e) => e.stopPropagation()}

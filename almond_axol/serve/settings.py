@@ -364,21 +364,20 @@ SETTINGS: tuple[SettingCategory, ...] = (
         key="robot",
         label="Robot",
         description=(
-            "Which hardware a session drives, and arm settings that every operation on "
-            "this robot uses."
+            "Axol's mount, arms and grippers. Every operation on this robot uses "
+            "these settings."
         ),
         settings=(
             SettingDef(
                 key="kinematics.mount",
-                label="Robot model",
+                label="Mount",
                 type="select",
                 options=("classic", "standalone", "ox_cart", "owl"),
                 help=(
-                    "What Axol is mounted on when Jelly is not attached: classic (the "
-                    "legacy model), standalone, ox_cart (the Ox Cart lift) or owl (the "
-                    "Owl Mount). It sets the robot model that IK keeps the arms clear "
-                    "of and that the viewers show. When Jelly is attached and turned "
-                    "on, Axol on Jelly is used instead."
+                    "What Axol is mounted on: classic (Axol Legacy), standalone, "
+                    "ox_cart (Ox Cart) or owl (Owl Mount). Axol uses it to keep the "
+                    "arms from hitting the mount, and the 3D views show it. When Jelly "
+                    "is attached, Axol on Jelly is used instead."
                 ),
                 ui={"widget": "mount"},
                 effective_default="classic (legacy)",
@@ -388,9 +387,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Left arm stiffness",
                 type="number",
                 help=(
-                    "How stiff the left arm is, from 0 to 1. 1 (the default) uses the "
-                    "tuned gains, and lower values make the arm more compliant. When "
-                    "you run a policy, use the value you collected its data with."
+                    "How stiff the left arm is, from 0 to 1. 1 (the default) is full "
+                    "stiffness, and lower values make the arm softer. When you run a "
+                    "policy, use the value you collected its data with."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
             ),
@@ -399,8 +398,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Right arm stiffness",
                 type="number",
                 help=(
-                    "How stiff the right arm is, from 0 to 1. 1 (the default) uses the "
-                    "tuned gains, and lower values make the arm more compliant."
+                    "How stiff the right arm is, from 0 to 1. 1 (the default) is full "
+                    "stiffness, and lower values make the arm softer. When you run a "
+                    "policy, use the value you collected its data with."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
             ),
@@ -443,8 +443,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help=(
                     "The gripper fitted to both arms. parallel is the stock two-finger "
                     "gripper. parcel is the hinged-plate parcel gripper, which adds "
-                    "box mode settings to Teleop & VR. Bring-up measures the gripper's "
-                    "stroke and stops if it looks like the other type."
+                    "box mode settings to Teleop & VR. At startup, Axol measures the "
+                    "gripper's travel and stops if it looks like the other type."
                 ),
             ),
             SettingDef(
@@ -476,7 +476,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Axol arms",
                 type="boolean",
                 help=(
-                    "Drive Axol's arms during teleop. Turn off to drive only Jelly, "
+                    "Drive Axol's arms during teleoperation. Turn off to drive only Jelly, "
                     "with or without the arms connected. Data collection and policies "
                     "always use the arms."
                 ),
@@ -484,14 +484,14 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="teleop.reset_torque_threshold",
-                label="Reset contact threshold (Nm)",
+                label="Return-to-rest contact stop (Nm)",
                 type="number",
                 help=(
-                    "Stops a return-to-rest move when a joint's torque stays this far "
-                    "(Nm) from the gravity model, and lets the arms go limp. Free the "
-                    "arms by hand, then press reset in VR or continue in the panel to "
-                    "retry from where they are. Raise it if normal returns stop by "
-                    "mistake, or set 0 to turn the check off."
+                    "Stops a move back to rest when a joint meets this much unexpected "
+                    "torque (Nm), and lets the arms go limp. Free the arms by hand, "
+                    "then press X in VR or Return to rest in the panel to try again "
+                    "from where they are. Raise it if normal returns stop by mistake, "
+                    "or set 0 to turn the check off."
                 ),
                 # Also a top-level field of the ops without a teleop subtree.
                 targets={
@@ -506,11 +506,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Teleop contact stop (Nm)",
                 type="number",
                 help=(
-                    "Stops tracking or replay when a joint's torque stays this far "
-                    "(Nm) from the gravity model, and lets the arms go limp. Free the "
-                    "arms by hand, then press reset to return to rest. Off by default, "
-                    "because teleop often pushes on things on purpose. Raise it if "
-                    "normal task contact trips it."
+                    "Stops tracking or replay when a joint meets this much unexpected "
+                    "torque (Nm), and lets the arms go limp. Free the arms by hand, "
+                    "then reset to return to rest. Off by default, because "
+                    "teleoperation often pushes on things on purpose. Raise it if "
+                    "normal contact trips it."
                 ),
                 # One combined control: a switch that arms the watchdog
                 # (filling in the suggested threshold) with the value
@@ -527,24 +527,24 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Policy contact stop (Nm)",
                 type="number",
                 help=(
-                    "Ends the policy episode without saving it when a joint's torque "
-                    "stays this far (Nm) from the gravity model, and lets the arms go "
-                    "limp. Off by default, because a policy often pushes on things on "
-                    "purpose. Raise it if normal task contact trips it."
+                    "Ends the policy episode without saving it when a joint meets this "
+                    "much unexpected torque (Nm), and lets the arms go limp. Off by "
+                    "default, because a policy often pushes on things on purpose. "
+                    "Raise it if normal contact trips it."
                 ),
                 ui={"widget": "toggle-number", "onValue": 16},
             ),
             SettingDef(
                 key="gravity.kd",
-                label="Gravity comp damping (kd)",
+                label="Gravity compensation damping (kd)",
                 type="number",
-                help="Velocity damping on the joints you move by hand in gravity comp.",
+                help="Damping on the joints you move by hand in Gravity compensation.",
             ),
             SettingDef(
                 key="gravity.rate_hz",
-                label="Gravity comp rate (Hz)",
+                label="Gravity compensation rate (Hz)",
                 type="number",
-                help="Gravity compensation control-loop rate.",
+                help="Control-loop rate of Gravity compensation.",
             ),
         ),
     ),
@@ -556,8 +556,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
         key="jelly",
         label="Jelly",
         description=(
-            "Which parts of Jelly teleop drives. Jelly is detected from its CAN "
-            "adapters, and these switches only turn attached parts off."
+            "Which parts of Jelly teleoperation drives. Axol detects Jelly when it is "
+            "attached. Use these switches to turn parts off."
         ),
         settings=(
             SettingDef(
@@ -565,8 +565,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Jelly wheels",
                 type="boolean",
                 help=(
-                    "Drive Jelly's omni base when its CAN adapter is attached. The "
-                    "left stick moves the base and the right stick turns it. Jelly's "
+                    "Drive Jelly's wheels when they are attached. The left stick moves "
+                    "the base and the right stick turns it. Jelly's "
                     "motion is never recorded or driven by a policy. Set speeds and "
                     "heading hold in Jelly's Parameters tab."
                 ),
@@ -594,10 +594,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="select",
                 options=("lighthouse", "ultimate", "quest"),
                 help=(
-                    "How Mantis data collection tracks the rigs. Quest connects over "
-                    "WebXR, and Lighthouse and Ultimate start their tracker bridge "
-                    "automatically. Mantis teleop doesn't track the rigs. It drives "
-                    "the grippers from the triggers."
+                    "How Mantis data collection tracks the rigs. Quest uses the "
+                    "headset's controllers, and Lighthouse and Ultimate use VIVE "
+                    "trackers. Mantis teleop doesn't track the rigs. The triggers "
+                    "drive the grippers."
                 ),
                 targets={
                     "collect-data": ("mantis_source",),
@@ -608,10 +608,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Quest calibration key",
                 type="text",
                 help=(
-                    "The Quest controller key that both saved mount calibrations use, "
-                    "in the form quest:<WebXR-profile>:grip. Start a Quest bring-up "
-                    "collection run, then use the live key shown under this setting. "
-                    "Used only when Mantis tracking is Quest."
+                    "Identifies the Quest controllers Mantis is calibrated for, in the "
+                    "form quest:<controller-profile>:grip. Follow the Headset step "
+                    "below to fill it in. Used only when Mantis tracking is Quest."
                 ),
                 targets={
                     "collect-data": (f"{_VRT}.tracker_key",),
@@ -621,11 +620,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.left_channel",
                 label="Left Mantis CAN channel",
                 type="text",
-                help=(
-                    "SocketCAN interface connected to the left handheld rig. "
-                    "Use this to swap hub channels without moving cables. "
-                    "The trigger reader follows the same interface."
-                ),
+                help=("CAN interface of the left Mantis."),
                 # Applied conditionally by SettingsStore.merged_args only when
                 # that run has Mantis enabled; Axol runs retain robot.*.
                 targets={},
@@ -635,11 +630,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.right_channel",
                 label="Right Mantis CAN channel",
                 type="text",
-                help=(
-                    "SocketCAN interface connected to the right handheld rig. "
-                    "Use this to swap hub channels without moving cables. "
-                    "The trigger reader follows the same interface."
-                ),
+                help=("CAN interface of the right Mantis."),
                 targets={},
                 effective_default="can_mantis_r",
             ),
@@ -647,11 +638,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.left_trigger_full_scale",
                 label="Left trigger full squeeze",
                 type="number",
-                help=(
-                    "The left trigger's reading at a firm full squeeze. If the reading "
-                    "stops short of 1.00, set this to the value it reaches. A lower "
-                    "value closes the left gripper fully with less squeeze."
-                ),
+                help=("The left trigger's reading at a full squeeze."),
                 targets={
                     "teleop": ("mantis_left_trigger_full_scale",),
                     "collect-data": ("mantis_left_trigger_full_scale",),
@@ -662,11 +649,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.right_trigger_full_scale",
                 label="Right trigger full squeeze",
                 type="number",
-                help=(
-                    "The right trigger's reading at a firm full squeeze. Leave it at "
-                    "1.00 if the right gripper already closes fully. A lower value "
-                    "closes the gripper fully with less squeeze."
-                ),
+                help=("The right trigger's reading at a full squeeze."),
                 targets={
                     "teleop": ("mantis_right_trigger_full_scale",),
                     "collect-data": ("mantis_right_trigger_full_scale",),
@@ -826,11 +809,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box squeeze cap (Nm)",
                 type="number",
                 help=(
-                    "Caps the shoulder torque that squeezes the box (shoulder_2 and "
-                    "shoulder_3 on each arm). Jogging the width past contact then "
+                    "Caps the shoulder torque that squeezes the box. Jogging the width "
+                    "past contact then "
                     "presses with at most this torque. It also slows an arm moving "
                     "toward the other, so leave it at 0 (off, the default) unless you "
-                    "need it. Also in the headset menu as Squeeze cap. Hardware only."
+                    "need it. Also in the headset menu as Squeeze cap. No effect in sim."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_torque",),
@@ -848,7 +831,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "is about 1.3° of inward yaw per cm past contact. Raise it if the "
                     "tip lifts as you squeeze, lower it if the facet lifts, or set 0 "
                     "to turn it off. Also in the headset menu as Squeeze lean. "
-                    "Hardware only."
+                    "No effect in sim."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_lean",),
@@ -865,7 +848,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "their faces sit parallel to it. This helps the blade tips clamp "
                     "as hard as the roots on heavy boxes. Sets the most inward yaw it "
                     "can add, and 0 turns it off. Also in the headset menu as Squeeze "
-                    "trim. Hardware only."
+                    "trim. No effect in sim."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_trim",),
@@ -882,7 +865,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "grows by about 6 N for each cm you jog past contact. 0 (off, the "
                     "default) leaves the squeeze to the width you set, and 8 N is a "
                     "good working value. Also in the headset menu as Squeeze force. "
-                    "Hardware only."
+                    "No effect in sim."
                 ),
                 targets={
                     "teleop": ("teleop.box_squeeze_force",),
@@ -1015,7 +998,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
     SettingCategory(
         key="recording",
         label="Recording",
-        description="Dataset recording shared by collect-data and run-policy.",
+        description="Dataset recording for Collect data and Run policy.",
         settings=(
             SettingDef(
                 key="recording.fps",
@@ -1126,7 +1109,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
     SettingCategory(
         key="inference",
         label="Inference",
-        description="Where and how run-policy executes the policy.",
+        description="Where and how Run policy runs the policy.",
         settings=(
             SettingDef(
                 key="inference.device",
@@ -1192,7 +1175,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="inference.temporal_ensemble_coeff",
-                label="Temporal ensemble coeff",
+                label="Temporal ensemble coefficient",
                 type="number",
                 help=(
                     "Exponential weight for the temporal_ensemble aggregation "

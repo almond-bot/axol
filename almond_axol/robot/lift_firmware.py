@@ -67,7 +67,7 @@ _STATUS_NAMES = (
     "chunk out of sequence",
     "flash verify failed",
     "image CRC mismatch",
-    "not a Jelly Legs firmware image",
+    "not a Jelly lift firmware file",
     "no image on trial",
     "bootrom explicit_buy failed",
 )
@@ -135,8 +135,7 @@ class FirmwareImage:
                     crc=zlib.crc32(data),
                 )
         raise FirmwareUpdateError(
-            "not a Jelly Legs firmware image (no identity block); upload the "
-            "jelly_legs build's firmware.bin"
+            "This is not a Jelly lift firmware file. Upload the lift's firmware.bin."
         )
 
     def describe(self) -> str:

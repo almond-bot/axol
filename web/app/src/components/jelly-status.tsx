@@ -44,7 +44,7 @@ export function WheelGrid({ status }: { status: JellyWheelsStatus }) {
   const color = (m: WheelMotorHealth) =>
     m.reachable == null ? "unknown" : wheelMotorHealthy(m) ? "ok" : "err"
   const tip = (m: WheelMotorHealth) => {
-    if (m.reachable == null) return `${wheelName(m)}: unknown (in use by a task)`
+    if (m.reachable == null) return `${wheelName(m)}: unknown while in use`
     if (!m.reachable) return `${wheelName(m)}: unreachable`
     const state = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
     const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""

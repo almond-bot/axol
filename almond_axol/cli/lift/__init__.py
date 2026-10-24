@@ -32,7 +32,7 @@ def add_channel_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--channel",
         default=None,
-        help="SocketCAN interface carrying the jelly_legs lift controller "
+        help="CAN interface for the Jelly lift controller "
         f"(default: {CAN_CHEST} when that chest bus exists, otherwise the "
         f"wheel bus {CAN_BASE} the lift shares with the motors)",
     )
@@ -108,8 +108,9 @@ async def open_lift(channel: str | None) -> Lift:
     if lift.status is None:
         await lift.close()
         raise SystemExit(
-            f"ERROR: no status from the jelly_legs board on {channel} — "
-            f"is the lift controller powered and wired to this adapter?"
+            f"ERROR: the Jelly lift controller did not answer on {channel}. "
+            "Check that Jelly is powered on and the lift is connected to this "
+            "CAN adapter."
         )
     return lift
 
@@ -137,8 +138,8 @@ def require_motion_preflight(
     if any(value is None for value in health):
         raise SystemExit(
             f"ERROR: cannot start {operation}: the controller does not report "
-            "current driver/interlock health; flash the current Jelly Legs "
-            "firmware first."
+            "current driver/interlock health. Update the lift firmware with "
+            "axol lift.update first."
         )
     if st.driver_fault_mask:
         raise SystemExit(

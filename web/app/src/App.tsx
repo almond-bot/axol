@@ -1289,7 +1289,7 @@ function HelpPanel({
       ? []
       : boxMode
         ? [
-            "[Grip]  Lead / freeze pair",
+            "[Grip]  Lead / freeze both arms",
             "[Stick left/right]  Width",
             "[Stick up/down]  Elbows",
             "[Stick click]  Flush / straight",
@@ -1304,7 +1304,7 @@ function HelpPanel({
           "[X]  Reset pose",
           ...(boxMode
             ? [
-                "[Grip]  Lead / freeze pair",
+                "[Grip]  Lead / freeze both arms",
                 "[Stick left/right]  Width",
                 "[Stick up/down]  Elbows",
                 "[Stick click]  Flush / straight",
@@ -1826,10 +1826,10 @@ export default function App() {
                     )}
                   >
                     {poseStatus === AxolConnectionStatus.Open
-                      ? "connected over USB"
+                      ? "connected"
                       : poseStatus === AxolConnectionStatus.Connecting
-                        ? "connecting… (using WiFi for now)"
-                        : "USB not connected, using WiFi"}
+                        ? "connecting, using Wi-Fi for now"
+                        : "not connected, using Wi-Fi"}
                   </span>
                 </p>
                 {poseStatus !== AxolConnectionStatus.Open && (
@@ -1908,8 +1908,8 @@ export default function App() {
             {status === AxolConnectionStatus.Failed && (
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
-                  Could not connect to <span className="font-mono">{hostname || "the server"}</span>
-                  . Check that <span className="font-mono">axol teleop</span> is running
+                  Could not connect to <span className="font-mono">{hostname || "the host"}</span>.
+                  Check that Teleoperation or Collect data is running on the host
                   {hostCertAuthorizeVisible(hostname)
                     ? ", then authorize its certificate below."
                     : "."}

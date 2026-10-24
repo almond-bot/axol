@@ -107,7 +107,7 @@ Between episodes, the arms return to the rest pose along a path that avoids coll
 1. Move the arms clear by hand.
 2. Press **Enter** in the terminal or **Return to rest** in the panel. Axol plans a new return from where the arms are.
 
-Set the sensitivity with **Reset contact threshold** in the panel, or `--reset_torque_threshold` (default `6.0` Nm, `0` turns it off).
+Set the sensitivity with **Return-to-rest contact stop** in the panel, or `--reset_torque_threshold` (default `6.0` Nm, `0` turns it off).
 
 You can also stop an episode when the arms push hard while the policy drives them. This check is off by default, because a policy often pushes on the scene on purpose. Set **Policy contact stop** in the panel, or `--policy_torque_threshold`. The panel suggests `16` Nm.
 

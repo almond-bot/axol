@@ -285,8 +285,8 @@ _POLICY_PHASE_CONTROLS: dict[str, tuple[dict[str, Any], ...]] = {
 # show their live gate message, which carries the operator instruction.
 _POLICY_PHASE_MESSAGES: dict[str, str] = {
     "preparing": "Preparing…",
-    "recording": "Episode running — Save to keep it, Discard to re-record.",
-    "deciding": "Time cap reached — Save to keep it, Discard to re-record.",
+    "recording": "Episode running. Press Save to keep it or Discard to redo it.",
+    "deciding": "Time limit reached. Press Save to keep it or Discard to redo it.",
     "resetting": "Returning to rest…",
 }
 
@@ -294,23 +294,23 @@ _POLICY_PHASE_MESSAGES: dict[str, str] = {
 # gravity-comp hold. Shared by both controls so the terminal prompt and the
 # panel's status line say the same thing.
 _CONTACT_PROMPT = (
-    "Contact during return to rest — the arms are limp and free to move. "
-    "Clear them, then continue to replan the return from where they are."
+    "The arms hit something while returning to rest and are now limp. "
+    "Move them clear by hand, then press Return to rest."
 )
 
 # A discarded episode drops the arms into the same limp hold so the operator
 # can untangle/reposition them by hand before anything moves on its own.
 _DISCARD_LIMP_PROMPT = (
-    "Episode discarded — the arms are limp and free to move. "
-    "Reposition them and reset the scene, then return to rest."
+    "Episode discarded. The arms are limp, so you can move them by hand. "
+    "Reset the scene, then press Return to rest."
 )
 
 # The tracking contact watchdog tripped mid-episode (the policy pushed or
 # pulled on something sustained above the threshold), so the rollout was
 # aborted and the arms dropped into the limp hold.
 _EPISODE_CONTACT_PROMPT = (
-    "Contact — torque exceeded the threshold, so the episode stopped and "
-    "the arms are limp and free to move. Clear them, then return to rest."
+    "The arms hit something, so the episode stopped and the arms are now "
+    "limp. Move them clear by hand, then press Return to rest."
 )
 
 # Panel phases a gate can open in (snapshot() renders a single gate button

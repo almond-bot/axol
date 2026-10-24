@@ -85,22 +85,22 @@ The banner also warns when the panel and the host run different versions. This h
 
 #### Axol version
 
-Axol comes in several versions with the same arms. The version sets the body the arms must stay clear of (lift column, Owl mount, head camera) and the joint limits.
+Axol comes in several versions with the same arms. The version tells Axol where its mount is, so the arms don't hit it, and sets the joint limits.
 
-When Jelly is attached, Axol is **Axol × Jelly** automatically. This applies while Jelly's wheel or lift adapter is plugged in and not switched off under **Jelly settings → Wheels & lift**. Otherwise, pick what Axol is mounted on under **Choose your Axol** at the top of **Axol settings → Robot**, then press **Save**:
+When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies while Jelly's wheel or lift adapter is plugged in and not switched off under **Jelly settings → Wheels & lift**. Otherwise, pick what Axol is mounted on under **Mount** at the top of **Axol settings → Robot**, then press **Save**:
 
 | Version | Mount |
 |---|---|
 | **Axol Legacy** | The original model, and the default. |
-| **Axol Standalone** | The shoulder bar and head camera on their own. |
-| **Axol × Ox** | On the Ox Cart's lift column, with the lift fully raised. |
-| **Axol × Owl** | On the Owl Mount's column and foot plate. |
+| **Axol Standalone** | No mount. Axol is bolted to your own table or fixture. |
+| **Axol on Ox Cart** | On the Ox Cart's lift column, with the lift fully raised. |
+| **Axol on Owl Mount** | On the Owl Mount's column. |
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, the main page shows a **Which Axol is this?** card, and runs that drive the arms list *Choose your Axol* under [Before you can start](#before-you-can-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, the main page shows a **What is Axol mounted on?** card, and runs that drive the arms list *Choose what Axol is mounted on* under [Before you can start](#before-you-can-start). Sim runs and runs with the arms off don't need it.
 
-On Axol × Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
+On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
 ### Axol and Mantis
 
@@ -149,12 +149,12 @@ Settings that apply to every run live in the **Settings** card below the tiles. 
 | Tab | What's in it |
 |---|---|
 | **Cameras** | Camera previews and the Axol camera layout. See [Cameras](#cameras). |
-| **Robot** | **Choose your Axol** ([Axol version](#axol-version)), arm stiffness, CAN channels, gripper type and limits, gravity-comp damping and rate, the contact stops, and the **Axol arms** switch. |
+| **Robot** | **Mount** ([Axol version](#axol-version)), arm stiffness, CAN channels, gripper type and limits, gravity-comp damping and rate, the contact stops, and the **Axol arms** switch. |
 | **Teleop & VR** | Teleop rate, position and rotation multipliers, **Hold grips to engage** and **Park to zero on stop**. |
 | **Rest pose** | A 3D editor with a slider per joint. The arms start from and return to this pose in teleop and data collection. |
 | **Kinematics** | The **IK solver** (`jax` by default, or `mink`, see [Mink IK](/operations/mink)) and its main weights. |
 
-**Contact stops.** The **Reset contact threshold** is always on: it stops a return to rest that runs into something and leaves the arms limp. The **Teleop contact stop** and **Policy contact stop** are off by default. Turn one on to stop the arms and leave them limp when they push on something during teleop or a policy run. Raise a threshold if normal motion trips it.
+**Contact stops.** The **Return-to-rest contact stop** is always on: it stops a return to rest that runs into something and leaves the arms limp. The **Teleop contact stop** and **Policy contact stop** are off by default. Turn one on to stop the arms and leave them limp when they push on something during teleop or a policy run. Raise a threshold if normal motion trips it.
 
 **Axol arms.** Turn it off to drive only Jelly from the headset. Axol doesn't need to be connected then.
 
@@ -229,7 +229,7 @@ The **Quest** tab under **General settings** runs the optional [Quest over USB](
 
 If the cable is pulled, poses continue over Wi-Fi with no reconnect.
 
-For [headless](/guides/quest-headless) use, press **Keep awake** with the headset plugged in. The headset keeps the VR session running while it sits on a table. **Restore** turns normal sleep back on, and so does rebooting the headset.
+For [headless](/guides/quest-headless) use, press **Keep awake** with the headset plugged in. The headset keeps the VR session running while it sits on a table. **Allow sleep** turns normal sleep back on, and so does rebooting the headset.
 
 ## Operations
 
@@ -267,7 +267,7 @@ Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to pr
 **Start** stays disabled until the operation has what it needs. A **Before you can start** list says what is missing, for example:
 
 - *Connect Axol*
-- *Choose your Axol* (see [Axol version](#axol-version))
+- *Choose what Axol is mounted on* (see [Axol version](#axol-version))
 - *Fix motor fault*, followed by the motor and the fault
 - *Assign a camera and enable Record in Axol settings → Cameras*
 - *Identify left + right Lighthouse trackers*

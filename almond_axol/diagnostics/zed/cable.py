@@ -316,8 +316,8 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         "--kind",
         choices=("auto", "mono", "stereo"),
         default="auto",
-        help="Camera pipeline to test: mono (ZED-X One), stereo (ZED X), or "
-        "auto to detect from the connected camera (default: auto).",
+        help="Camera to test: mono (ZED X One), stereo (ZED X), or auto to "
+        "detect the connected camera (default: auto).",
     )
 
 

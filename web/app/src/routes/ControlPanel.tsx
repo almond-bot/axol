@@ -899,10 +899,10 @@ export default function ControlPanel() {
       if (changedDesiredProfile) manualRobotOverrideRef.current = false
       const label =
         changedChannelProfiles.length === 2
-          ? "CAN mappings"
-          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN mapping`
+          ? "CAN channels"
+          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN channels`
       if (!changedDesiredProfile) {
-        toast.info(`${label} saved. It applies the next time that hardware connects.`)
+        toast.info(`${label} saved. They apply the next time that hardware connects.`)
       } else if (isLive || robot?.state === "busy") {
         toast.info(`${label} saved. The robot reconnects when this run stops.`)
       } else {
@@ -976,7 +976,7 @@ export default function ControlPanel() {
   // settings. Follow the 2 s CAN inventory instead of a one-off answer:
   // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
   // that comes up a moment after the panel connects turns the robot into
-  // Axol × Jelly (and drops the "Which Axol is this?" pick) without a reload.
+  // Axol on Jelly (and drops the "What is Axol mounted on?" pick) without a reload.
   const jellyPresent = canDevices
     ? Boolean(canDevices.wheels?.present || canDevices.lift?.present)
     : null
@@ -1155,6 +1155,10 @@ export default function ControlPanel() {
   // disabled "Stopping…" until a terminal status flips the op back to idle.
   const isStopping = isLive && sources.some((s) => s.status === "stopping")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
+  // Names shown to the operator: the command's label, not its id.
+  const commandLabel = (id: string | null | undefined) =>
+    id ? (commands.find((c) => c.id === id)?.label ?? id) : null
+  const runningLabel = commandLabel(runningOp)
   const selectedLive = isLive && runningOp === opId
   const selectedStopping = isStopping && runningOp === opId
 
@@ -1293,7 +1297,7 @@ export default function ControlPanel() {
         const noticeKey = `request:${attemptKey}`
         if (canDiscoveryNoticesRef.current.has(noticeKey)) return
         canDiscoveryNoticesRef.current.add(noticeKey)
-        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
+        toast.error(`Automatic CAN identification failed: ${String(error)}`)
       })
   }, [
     activeCommandSession,
@@ -1969,9 +1973,7 @@ export default function ControlPanel() {
                 { values: { "kinematics.mount": mount } },
                 renderedConnectionGeneration
               )
-              toast.success(
-                "Robot model saved. You can change it in the Robot tab of Axol settings."
-              )
+              toast.success("Mount saved. You can change it in Axol settings → Robot.")
             }}
           />
         )}
@@ -1995,9 +1997,9 @@ export default function ControlPanel() {
               onUsbConnect={() => void usbConnectClick(renderedConnectionGeneration)}
               actionBlocker={
                 isLive
-                  ? `${runningOp ?? "An operation"} is running`
+                  ? `${runningLabel ?? "An operation"} is running`
                   : activeCommandSession
-                    ? `${activeCommandSession.command} is running`
+                    ? `${commandLabel(activeCommandSession.command)} is running`
                     : null
               }
               activeCommandSession={activeCommandSession}
@@ -2020,8 +2022,8 @@ export default function ControlPanel() {
 
         {isLive && !selectedLive && (
           <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-            <span className="font-mono text-amber-200">{runningOp}</span> is running. Stop it before
-            you start another operation.
+            <span className="text-amber-200">{runningLabel}</span> is running. Stop it before you
+            start another operation.
           </p>
         )}
 
@@ -2068,9 +2070,9 @@ export default function ControlPanel() {
           startPhase={startPhase}
           hostBlocker={
             activeCommandSession
-              ? `${activeCommandSession.command} is running`
+              ? `${commandLabel(activeCommandSession.command)} is running`
               : isLive && !selectedLive
-                ? `${runningOp ?? "Another operation"} is running`
+                ? `${runningLabel ?? "Another operation"} is running`
                 : null
           }
           needsMount={needsMount}
