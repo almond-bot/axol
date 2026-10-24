@@ -1,28 +1,44 @@
 ---
 title: "tune.breakaway"
-description: "Measure a joint's static (breakaway) friction and compare it to its sliding fc."
+description: "Measure a joint's static (breakaway) friction and compare it with its sliding friction."
 ---
 
-Measures the torque at which a stationary joint first moves — its **breakaway** or static friction — in both directions, and compares it to the sliding Coulomb torque `fc` the friction model already carries.
+Measures the torque at which a stationary joint starts to move, in both directions. This is the joint's static or **breakaway** friction. The tool compares it with the sliding friction `fc` that the friction model already holds.
 
-[`tune.friction`](/cli/tune-friction) cannot answer this: its model `fc·tanh(0.1·k·v) + fv·v` is monotonic in velocity and has no static/kinetic distinction, and its sweep bottoms out around 0.13 rad/s, above the creep speeds where a geared joint stick-slips. Stick-slip exists precisely *because* breakaway exceeds sliding friction — a joint tracking a slow target sticks until `kp·err` covers the gap, lets go, overshoots and re-sticks. On the X8-P20 shoulders that is a 2 Hz, ~0.5° stair pattern during slow extended-reach moves. This command measures the gap directly, with no velocity signal at all.
+A joint stick-slips when its breakaway friction is higher than its sliding friction. While it tracks a slow target, it sticks until the position error builds enough torque to break it free, then it overshoots and sticks again. [`tune.friction`](/cli/tune-friction) can't measure this gap, because its model has no separate static term. This command measures it directly.
 
-**Method, per pose.** The arm is homed and the [sweep-safety](/cli/tune-friction) clearances applied; the test joint ramps to the pose under impedance control, then drops to `kp = 0` with a small `kd` so only the gravity feed-forward holds it. That feed-forward is trimmed until the joint stands still (a joint sits still for any trim inside its stiction band, so this converges quickly — and without it a loaded pose is unmeasurable, since a 2 % gravity-model error at 15 Nm outweighs the whole breakaway torque). An extra torque is then ramped up and down in a triangle; the first motion past `--move-deg` is the release, the extra torque at that instant is recorded, and the joint is caught under `kp` and returned to the pose. Peaks escalate over attempts and stop at the first release, so the joint never sees more torque than it took to move it.
+## How it works
 
-**What comes out.** Releases in both directions split into a symmetric half — **F_static**, the friction — and an antisymmetric half, the standing torque the trimmed feed-forward still missed. The report gives `F_static / fc`, the predicted stick-slip stair `(F_static − fc) / kp` in degrees (compare it to the stairs a slow [`tune.motion`](/cli/tune-motion) replay shows), and the ceiling for the joint's `stiction_gain` (`F_static / fc − 1`): compensation that exceeds the friction it compensates hunts around the target at rest, so start at 60–80 % of that ceiling.
+For each pose:
+
+1. The arm homes and moves to the same safe clearance pose as [`tune.friction`](/cli/tune-friction).
+2. The test joint moves to the pose, then drops its position spring (`kp = 0`). Only a small damping and the gravity feed-forward hold it.
+3. The tool trims the gravity feed-forward until the joint stands still.
+4. It ramps an extra torque up and back down. The first motion past `--move-deg` counts as the release, and the tool records the torque at that moment. The joint is then caught and returned to the pose.
+
+Each attempt ramps a little higher and the run stops at the first release, so the joint never sees more torque than it took to move it.
+
+## Reading the results
+
+The report gives:
+
+- **F_static**: the breakaway friction, averaged over both directions.
+- **`F_static / fc`**: how much higher breakaway is than sliding friction.
+- **Predicted stair**: `(F_static − fc) / kp`, in degrees. Compare it with the steps a slow [`tune.motion`](/cli/tune-motion) replay shows.
+- **`stiction_gain` ceiling**: `F_static / fc − 1`. Compensation above this makes the joint hunt around its target at rest. Start at 60 to 80% of the ceiling.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
 | `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
-| `--poses DEG [DEG ...]` | Joint-frame poses (degrees, 0 = rest) to probe (default: 0). Base-collision joints are pushed 5° outboard of their boundary so a release cannot cross it |
+| `--poses DEG [DEG ...]` | Joint-frame poses to probe, in degrees with 0 at rest (default: 0). Joints that could reach the base are kept 5° clear of it. |
 | `--trials N` | Releases per direction (default: 3) |
 | `--ramp-s S` | Seconds for one up-and-back torque ramp (default: 4) |
-| `--max-torque M` | Largest ramp peak, as a multiple of the joint's `fc` (floored at 0.2 Nm for the low-friction wrists; default: 3.0) |
-| `--move-deg DEG` | Motion that counts as a release — about 3 LSB of the 16-bit MIT position (default: 0.06) |
-| `--kd KD` | Firmware damping during the `kp = 0` phases, so a released joint creeps rather than runs (default: 1.0) |
-| `--csv PATH` | Dump every ramp sample (`t, extra_nm, pos_deg, tau_nm`) for offline plotting |
+| `--max-torque M` | Largest ramp peak, as a multiple of the joint's `fc` (default: 3.0). At least 0.2 Nm on the wrists. |
+| `--move-deg DEG` | Motion that counts as a release (default: 0.06) |
+| `--kd KD` | Damping while the position spring is off, so a released joint creeps instead of running (default: 1.0) |
+| `--csv PATH` | Write every ramp sample (`t, extra_nm, pos_deg, tau_nm`) to a CSV for plotting |
 
 ```bash
 axol tune.breakaway --r --joint shoulder_1
@@ -31,5 +47,5 @@ axol tune.breakaway --r --joint shoulder_1 --poses -30 0 30   # load dependence
 ```
 
 <Note>
-  The joint under test spends most of the run with **no position spring** — only a trimmed gravity feed-forward and light damping hold it. Keep the workspace around the arm clear and stay within reach of the e-stop, as for every tuning probe.
+  The test joint spends most of the run with no position spring. Only the trimmed gravity feed-forward and light damping hold it. Keep the space around the arm clear and the E-Stop within reach.
 </Note>

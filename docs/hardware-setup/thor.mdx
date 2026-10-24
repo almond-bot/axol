@@ -1,12 +1,16 @@
 ---
 title: "Advantech Thor (MIC-742)"
-description: "Wire, flash, and bring up the Advantech MIC-742 Jetson Thor Compute Kit with GMSL cameras."
+description: "Wire the cameras, install the operating system and add the camera driver on the Jetson Thor Compute Kit."
 ---
 
-The Jetson Thor Compute Kit is the **Advantech MIC-742-AT** (Jetson T5000, 128GB) fitted with a GMSL2 frame grabber and Wi-Fi. This guide covers what's in the box, wiring the Camera Kit to it, and putting the right OS image and camera driver on it before you [install Axol](/installation).
+The Jetson Thor Compute Kit is the **Advantech MIC-742-AT** (Jetson T5000, 128GB) with Wi-Fi and a GMSL2 frame grabber, the card the cameras plug into. Before you [install the Axol software](/installation), follow this guide to:
+
+1. Connect the Camera Kit.
+2. Install Advantech's operating system image.
+3. Install the camera driver.
 
 <Warning>
-  **Never flash the MIC-742 with NVIDIA's stock JetPack image.** JetPack BSPs are built per carrier board: the image NVIDIA publishes for its Thor developer kit does not match the MIC-742's carrier. With it, the Stereolabs MIC-742 camera driver hangs `nvidia_drm` at boot. Always use Advantech's MIC-742 image (see [Flash the OS](#flash-the-os)).
+  **Never flash the MIC-742 with NVIDIA's standard JetPack image.** That image is for NVIDIA's own Thor developer kit. On the MIC-742, it makes the camera driver hang at boot. Always use Advantech's MIC-742 image (see [Flash the OS](#flash-the-os)).
 </Warning>
 
 ## What's in the box
@@ -22,38 +26,38 @@ The Jetson Thor Compute Kit is the **Advantech MIC-742-AT** (Jetson T5000, 128GB
 | Wi-Fi module | `EWM-W179M201E` | Factory-installed |
 | Wi-Fi antenna cables and antennas | `1751000620-01` ×2, `1751000460-01` ×2 | |
 
-GMSL and Wi-Fi are factory options on the MIC-742. Advantech fits them before the unit ships, and installing them yourself voids the warranty. If a unit arrives without them, contact Almond rather than opening the chassis.
+Advantech fits the frame grabber and Wi-Fi at the factory. Installing them yourself voids the warranty. If your unit arrives without them, contact Almond. Don't open the case.
 
 ## Power
 
-The MIC-742 takes DC through a **2-pin plug-in terminal block** on the chassis. The mating plug ships with the system. For a spare, or to build your own harness (for example, to power the Thor from a Jelly base), the plug is Advantech `1652002202`, which is **Dinkle `5ESDVM-02P`** ([DigiKey](https://www.digikey.com/en/products/detail/dinkle-corporation-usa/5ESDVM-02P/14566173)).
+The MIC-742 takes DC power through a **2-pin plug-in terminal block** on its case. The matching plug ships with the system. If you need a spare, or want to build your own power cable (for example, to power the Thor from Jelly Mobile), order Advantech `1652002202`. It is the same part as **Dinkle `5ESDVM-02P`** ([DigiKey](https://www.digikey.com/en/products/detail/dinkle-corporation-usa/5ESDVM-02P/14566173)).
 
 <Note>
-  Abruptly cutting power to the Jetson can corrupt the OS. Shut it down from the OS first, then unplug its adapter.
+  Cutting power to a running Jetson can corrupt its operating system. Shut it down from the operating system first, then unplug its adapter.
 </Note>
 
 ## Wire the cameras
 
-The Camera Kit's GMSL cables end in standard FAKRA connectors, and the MIC-742 frame grabber takes **Mini-FAKRA**. The `1751000758-01` adapter cable converts between them, carrying up to **4 cameras** per cable. The Camera Kit's three cameras (two wrist, one head) fit on one adapter.
+The Camera Kit's cables end in standard FAKRA connectors, but the MIC-742 frame grabber takes **Mini-FAKRA**. The `1751000758-01` adapter cable connects the two. Each adapter carries up to **4 cameras**, so the Camera Kit's three cameras fit on one adapter.
 
 <Steps>
   <Step title="Mount the cameras on Axol">
-    Follow [Axol Cameras](/hardware-setup/cameras) to fit the wrist and head cameras, and note which serial goes where.
+    Follow [Axol Cameras](/hardware-setup/cameras) to fit the wrist and head cameras. Write down which camera serial number goes where.
   </Step>
   <Step title="Connect the adapter cable">
     Plug the adapter's Mini-FAKRA end into the frame grabber's GMSL2 port on the MIC-742.
   </Step>
   <Step title="Connect the cameras">
-    Plug the head camera's GMSL cable and the two GMSL cables from the wrist-camera ports on the back of the robot into the adapter's FAKRA inputs.
+    Plug these three cables into the adapter's FAKRA inputs: the head camera's cable, and the two cables from the wrist-camera ports on the back of Axol.
   </Step>
   <Step title="Connect USB and power">
-    Run the USB cable from the back of the robot to the MIC-742, then connect the MIC-742's DC adapter.
+    Run the USB cable from the back of Axol to the MIC-742. Then connect the MIC-742's power adapter.
   </Step>
 </Steps>
 
 ## Flash the OS
 
-Axol targets Advantech's MIC-742 image for **JetPack 7.2 (L4T 39.2)**. Units can arrive with an earlier JetPack 7 release, so reflash unless the unit already reports L4T 39.2 (see [Verify](#verify)).
+Axol needs Advantech's MIC-742 image for **JetPack 7.2 (L4T 39.2)**. Your unit may arrive with an earlier JetPack 7 release. Reflash it unless it already reports L4T 39.2 (see [Verify](#verify)).
 
 | File | Download | MD5 |
 |---|---|---|
@@ -61,12 +65,12 @@ Axol targets Advantech's MIC-742 image for **JetPack 7.2 (L4T 39.2)**. Units can
 | Advantech flashing SOP | [MIC-742_Jetpack_7_Flash_SOP.pdf](https://downloads.almond.bot/mic742/jp7.2/MIC-742_Jetpack_7_Flash_SOP.pdf) | |
 
 <Warning>
-  Flashing erases the SSD. Copy off any datasets or calibration you want to keep first.
+  Flashing erases the SSD. First copy off any datasets or calibration you want to keep.
 </Warning>
 
-You need a separate **x86_64 host PC running Ubuntu 24.04**, a **USB-A to Micro-USB** cable, and an HDMI monitor for the MIC-742. Advantech's notes for the host:
+You need a separate **x86_64 PC running Ubuntu 24.04**, a **USB-A to Micro-USB** cable, and an HDMI monitor for the MIC-742. We call that PC the host. Follow Advantech's rules for the host:
 
-- Use a physical machine, not a virtual machine. USB passthrough to VMs drops the connection mid-flash.
+- Use a physical PC, not a virtual machine. A virtual machine can drop the USB connection during the flash.
 - Plug the cable straight into the host, with no USB hub in between.
 - Run the commands as a normal user with `sudo`, not logged in as `root`.
 - Keep the HDMI monitor attached to the MIC-742 until the flash finishes and it boots to the desktop.
@@ -118,13 +122,13 @@ You need a separate **x86_64 host PC running Ubuntu 24.04**, a **USB-A to Micro-
     ```
   </Step>
   <Step title="Reboot">
-    When the script reports success, press **RST**. The MIC-742 boots into the new image. Complete the Ubuntu first-boot setup on the HDMI monitor.
+    When the script reports success, press **RST**. The MIC-742 starts up with the new image. Finish the Ubuntu first-boot setup on the HDMI monitor.
   </Step>
 </Steps>
 
 ## Install the camera driver
 
-Once the image boots, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that pairs with Advantech's image. Driver packages for the ZED Box, the ZED Link, or NVIDIA's devkit will not work on this carrier.
+Once the new image is running, install the **Stereolabs driver built for the MIC-742**: `stereolabs-advantech-mic742` release **1.4.3 for L4T 39.2.0**. It is the only driver that works with Advantech's image. Drivers for the ZED Box, the ZED Link or NVIDIA's developer kit do not work on the MIC-742.
 
 | File | Download | MD5 |
 |---|---|---|
@@ -141,29 +145,31 @@ sudo reboot
 Then install the ZED SDK release for JetPack 7.2 (L4T 39.2) from the [Stereolabs download page](https://www.stereolabs.com/developers/release).
 
 <Note>
-  Axol's [`zed.driver`](/cli/zed-driver) step manages only the ZED Box and ZED Link driver packages (`stereolabs-zed*`). It leaves the MIC-742 driver alone, so the installer and self-updater never replace it. Upgrade it by hand, and only to a release built for the L4T version Advantech's image runs.
+  The Axol installer and updater never change the MIC-742 camera driver. Upgrade it by hand, and only to a release built for the L4T version that Advantech's image runs.
 </Note>
 
 ## Verify
 
-Check the L4T release and the driver before installing Axol:
+Before you install the Axol software, check the L4T release and the driver:
 
 ```bash
 head -1 /etc/nv_tegra_release      # expect: # R39 (release), REVISION: 2.x
 dpkg -l | grep stereolabs           # expect: stereolabs-advantech-mic742  1.4.3-L4T39.2.0
 ```
 
-If the first line doesn't say `R39` with revision `2`, reflash with Advantech's image. If the system hangs at boot after the driver install, the unit is running a non-Advantech image: reflash it from [Flash the OS](#flash-the-os). The driver install alone can't fix it.
+If the first line doesn't say `R39` with revision `2`, reflash with Advantech's image.
+
+If the MIC-742 hangs at boot after you install the driver, it is not running Advantech's image. Reinstalling the driver won't fix it. Reflash it with [Flash the OS](#flash-the-os).
 
 ## Install Axol
 
-With the image and driver in place, run the [one-command install](/installation). On the Thor it also applies the real-time tuning for the T5000 ([`jetson.setup`](/cli/jetson-setup)): max power mode, the GPU's `performance` governor, the CAN interrupt, and the camera daemon's scheduling.
+With the image and driver in place, run the [one-command install](/installation). On the Thor, the installer also tunes the system for real-time robot control (see [`jetson.setup`](/cli/jetson-setup)).
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Installation" icon="download" href="/installation">
-    Install Axol on the Thor and open the web control panel.
+    Install the software on the Thor and open the control panel.
   </Card>
   <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
     Mount the Camera Kit's wrist and head cameras.

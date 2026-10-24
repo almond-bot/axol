@@ -1,13 +1,13 @@
 ---
 title: "Command configuration"
-description: "How the teleop, gravity-comp, waypoints, collect-data, collect-dagger, replay-dataset, run-policy, and inference-server commands are configured with draccus."
+description: "Set any field of the robot operation commands from flags, a config file or the shared settings file."
 ---
 
-Eight commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`collect-dagger`](/cli/collect-dagger), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+Eight commands expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus): [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`collect-dagger`](/cli/collect-dagger), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy) and [`inference-server`](/cli/inference-server). You can set every field of their config from the command line or load the whole config from a file.
 
-This page covers the **syntax**. Each operation mode has its own **Config Parameters** page listing every field with its default: [Teleoperation](/operations/teleop-config), [Gravity Compensation](/operations/gravity-comp-config), [Data Collection](/operations/data-collection-config), [Replay Dataset](/operations/replay-dataset-config), [Run Policy](/operations/run-policy-config), and [DAgger Collection](/operations/dagger-config). `waypoints` and `inference-server` list their flags on their own CLI pages.
+This page covers the **syntax**. Each operation mode has a **Config Parameters** page listing every field with its default: [Teleoperation](/operations/teleop-config), [Gravity Compensation](/operations/gravity-comp-config), [Data Collection](/operations/data-collection-config), [Replay Dataset](/operations/replay-dataset-config), [Run Policy](/operations/run-policy-config), and [DAgger Collection](/operations/dagger-config). `waypoints` and `inference-server` list their flags on their own CLI pages.
 
-The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `provision`, `tune.*`, and `serve`) still use plain `argparse` flags and are unaffected by anything on this page.
+The other commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `provision`, `tune.*` and `serve`) use plain flags, and nothing on this page applies to them.
 
 ## Three ways to set any field
 
@@ -19,15 +19,15 @@ The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `p
     Load a complete JSON/YAML config with `--config_path run.json`, then layer CLI overrides on top.
   </Card>
   <Card title="Shared settings file" icon="sliders" href="/guides/control-panel-settings">
-    Save a value once in the control panel (`~/.almond/settings.json`) and every operation — panel, CLI, or SDK — uses it by default.
+    Save a value once in the control panel (`~/.almond/settings.json`), and the panel, the CLI and the SDK all use it by default.
   </Card>
 </CardGroup>
 
 ### The shared settings file
 
-The robot has **one** settings file, `~/.almond/settings.json` (`$ALMOND_HOME/settings.json`), edited by the [control panel](/guides/control-panel#settings). The same file is read **by default** by every draccus command on this page and by the [SDK constructors](/api/robot#shared-settings), so arm stiffness, per-joint gains and link masses, gripper limits, teleop rates and rest poses, CAN adapters — anything saved once — apply identically whether you drive the robot from the browser, the terminal, or Python.
+The robot has **one** settings file, `~/.almond/settings.json` (`$ALMOND_HOME/settings.json`), edited by the [control panel](/guides/control-panel#settings). Every command on this page and the [SDK constructors](/api/robot#shared-settings) read it **by default**. A value you save once, such as arm stiffness, a joint gain, a gripper limit or a CAN adapter, applies the same way from the browser, the terminal or Python.
 
-The file uses the **same vocabulary as a `--config_path` file**: it is a nested tree whose `axol`, `teleop`, `kinematics`, `jelly` and `vr_server` sections are the config dataclasses themselves, plus a few sections for operation-level knobs (`robot` for the CAN channels, `gravity`, `recording`, `inference`, …). For `axol teleop` the file is literally a partial teleop config; the other commands embed the same subsystems at their own paths and the translation is automatic. See the [Settings File](/guides/control-panel-settings) page for the layout.
+The file uses the **same field names as a `--config_path` file**. Its `axol`, `teleop`, `kinematics`, `jelly` and `vr_server` sections match the config sections of the same name. A few more sections hold operation settings, such as `robot` for the CAN channels, `gravity`, `recording` and `inference`. Each command reads the sections it uses. See the [Settings File](/guides/control-panel-settings) page for the layout.
 
 ```json
 {
@@ -52,11 +52,13 @@ axol teleop --settings_path bench.json       # a different robot's settings
 axol teleop --no_settings --axol.left_stiffness 0.8   # built-in defaults only
 ```
 
-A missing `~/.almond/settings.json` is fine (a fresh host runs the built-in defaults), but a file that exists and cannot be read — corrupt JSON, a permission problem, a symlink in its path — is a usage error, not a silent fallback: the command refuses to start rather than run a different robot's numbers. Fix the file, or pass `--no_settings` to run without it. The same applies to the SDK (`Axol()`, `Mantis()`, `Jelly()`, `VRTeleop()` raise). Only `axol serve` tolerates an unreadable file, so the control panel can come up for you to repair it.
+If `~/.almond/settings.json` is missing, the command uses the built-in defaults. If the file exists but can't be read, the command refuses to start. That covers corrupt JSON, a permission problem or a symlink in its path. Fix the file, or pass `--no_settings` to run without it.
+
+The SDK constructors (`Axol()`, `Mantis()`, `Jelly()`, `VRTeleop()`) raise an error in the same case. Only `axol serve` starts with an unreadable file, so you can repair it from the control panel.
 
 ### Dotted overrides
 
-Each command is backed by a config dataclass (for example `TeleopCmdConfig` wraps the full [`AxolConfig`](/api/robot)). Nest into it with dots:
+Each command has a config dataclass. For example, `TeleopCmdConfig` contains the full [`AxolConfig`](/api/robot). Reach nested fields with dots:
 
 ```bash
 axol teleop --axol.left_stiffness 0.8
@@ -67,7 +69,7 @@ axol collect-data --repo_id myorg/pick --task "pick" \
     --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
 ```
 
-Any field you don't override keeps its default — overriding `--axol.left.elbow.kp` leaves every other per-joint gain at its tuned default.
+Any field you don't override keeps its default. Overriding `--axol.left.elbow.kp` leaves every other per-joint gain at its tuned default.
 
 ### Config files
 
@@ -76,14 +78,27 @@ axol teleop --config_path my_teleop.json
 axol run-policy --config_path rollout.yaml --device cpu   # file, then override
 ```
 
-Precedence is **defaults → shared settings file → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the robot's saved settings, which override the built-in defaults. Operations launched from the [control panel](/guides/control-panel#settings) resolve in exactly the same order, so a direct CLI run and a panel-launched one agree on every value neither of you overrode.
+Values are applied in this order, and later ones win:
+
+1. Built-in defaults
+2. The shared settings file
+3. The `--config_path` file
+4. CLI flags
+
+Operations launched from the [control panel](/guides/control-panel#settings) use the same order. A CLI run and a panel run agree on every value that neither overrides.
 
 ### Same knob, different path
 
-Each command embeds the shared subsystem configs at its own dotted path — arm stiffness is `axol.left_stiffness` on `teleop` but `robot_config.axol_config.left_stiffness` on `collect-data`. Each mode's Config Parameters page spells its keys with the right prefix for that command.
+Each command places the shared configs at a different dotted path. Arm stiffness is `axol.left_stiffness` on `teleop` but `robot_config.axol_config.left_stiffness` on `collect-data`. Each mode's Config Parameters page uses the right prefix for that command.
 
 <Note>
-  On a calibrated robot the "defaults" already include that robot's own measurements, layered in this order (later wins): the coded constants ← the factory calibration fetched from the cloud by [`calibration.pull`](/cli/tune-factory#calibration-pull) (`~/.almond/factory_calibration.json`) ← per-joint gains, friction parameters, and link centres of mass and masses saved locally by [`tune.pid --save`](/cli/tune-pid) / [`tune.friction --save`](/cli/tune-friction) / [`tune.gravity --save`](/cli/tune-gravity) to `~/.almond/calibration.json`. All are loaded into `AxolConfig` at construction; config files and CLI flags still override them like any other default.
+  On a calibrated robot the defaults include that robot's measurements. They are applied in this order, and later ones win:
+
+  1. The built-in values.
+  2. The factory calibration downloaded by [`calibration.pull`](/cli/tune-factory#calibration-pull), in `~/.almond/factory_calibration.json`.
+  3. Gains, friction, masses and centres of mass saved on this computer by [`tune.pid --save`](/cli/tune-pid), [`tune.friction --save`](/cli/tune-friction) or [`tune.gravity --save`](/cli/tune-gravity), in `~/.almond/calibration.json`.
+
+  Config files and CLI flags still override them like any other default.
 </Note>
 
 ## Field-name conventions
@@ -94,16 +109,16 @@ Each command embeds the shared subsystem configs at its own dotted path — arm 
 | Nested fields are **dot-separated** | `--a.b.c` | `--axol.left.gripper.torque_limit 0.7` |
 | `None` is written `null` | `--field null` | `--left_channel null` (disable the left arm) |
 | Lists use bracket syntax | `[a,b,c]` | `--free_joints [SHOULDER_1,WRIST_3]` |
-| Dict fields take **one inline YAML/JSON value** (dotted paths can't reach inside a dict) | `--field "{k: v}"` | `--cameras "{overhead: 41234567}"` (teleop); `--robot_config.cameras "{overhead: {serial: 41234567}}"` (collect-data / run-policy) |
+| Dict fields take **one inline YAML/JSON value**. Dotted paths can't reach inside a dict. | `--field "{k: v}"` | `--cameras "{overhead: 41234567}"` (teleop), `--robot_config.cameras "{overhead: {serial: 41234567}}"` (collect-data, run-policy) |
 | Booleans take an explicit value | `--flag true` | `--push_to_hub true` |
 | Shared settings selectors (every draccus command) | `--settings_path PATH`, `--no_settings` | `--no_settings` (built-in defaults only) |
 
 <Note>
-  Booleans are value-taking under draccus (`--push_to_hub true`, not a bare `--push_to_hub`). The one exception is `teleop`'s `--sim`, which is normalized so a bare `--sim` works as well as `--sim true`.
+  Booleans need a value: `--push_to_hub true`, not a bare `--push_to_hub`. The one exception is `teleop`'s `--sim`, where a bare `--sim` works as well as `--sim true`.
 </Note>
 
 ## Validation
 
-Choice fields (e.g. `--log_level`, `--policy_type`, `--aggregate_fn`) are validated against their allowed values, and missing required fields or type mismatches are reported as a clean usage error rather than a traceback.
+Choice fields such as `--log_level`, `--policy_type` and `--aggregate_fn` are checked against their allowed values. A missing required field or a wrong type gives a usage error, not a traceback.
 
-`axol <command> --help` lists only the **common** fields (top-level options plus stiffness and gripper limits) to keep the output readable — the deeply-nested per-joint gains are hidden but remain fully overridable with their dotted paths (e.g. `--axol.left.elbow.kp`). This page is the complete reference for the override syntax; each mode's Config Parameters page (e.g. [Teleoperation](/operations/teleop-config)) is the complete list of fields.
+`axol <command> --help` lists only the **common** fields: top-level options, stiffness and gripper limits. The nested per-joint gains are hidden, but you can still set them with their dotted paths, such as `--axol.left.elbow.kp`. Each mode's Config Parameters page, such as [Teleoperation](/operations/teleop-config), lists every field.

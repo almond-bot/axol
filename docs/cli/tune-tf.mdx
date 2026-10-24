@@ -1,54 +1,69 @@
 ---
 title: "tune.tf / motion.chirp"
-description: "Identify a joint's closed-loop tracking dynamics with a sine sweep, and pre-compensate known motions with the inverse."
+description: "Measure a joint's tracking response with a sine sweep, then pre-compensate motions with it."
 ---
 
-The linear half of motion calibration — what Reforge's per-axis sine sweeps measure. A chirp excites one joint through the production controller; `tune.tf` turns the replay into the joint's command → position frequency response and fits
+These commands measure how a joint follows its command at different frequencies, and use that to make a known motion track better. The workflow has four steps:
+
+1. `motion.chirp` builds a sine sweep for one joint.
+2. `tune.motion` replays it on the robot.
+3. `tune.tf` fits a tracking model to the replay.
+4. `tune.motion --invert` replays a motion through the inverse of that model, which cancels the joint's lag and resonance.
+
+The fitted model is
 
 `H(s) = K (1 + s/ωz) ωn² / (s² + 2ζωn s + ωn²) · e^(−sτ)`
 
-— the closed loop's natural frequency, damping, an optional zero and the delay. `tune.motion --invert` then streams a known motion through the inverse, cancelling the tracking lag and resonance.
+with a natural frequency `ωn`, damping `ζ`, an optional zero `ωz` and a delay `τ`.
 
-It is the smaller half on slow motion: on slow_osc only 3–9% of the 1–3 Hz shake was a linear response to the command — the rest is friction, calibrated with [`tune.friction --profile slow`](/cli/tune-friction). It dominates the error of faster motion.
+For slow motion, most of the shake comes from friction, not from the tracking response. Calibrate friction first with [`tune.friction --profile slow`](/cli/tune-friction). The tracking model matters more for faster motion.
 
-## 1. Build the sweep — `motion.chirp`
+## 1. Build the sweep: `motion.chirp`
 
 | Flag | Description |
 |---|---|
-| `SIDE.JOINT` | The joint to excite, e.g. `right.shoulder_1` |
-| `--base MOTION` | Motion whose first pose the sweep is centred on (default: the built-in start pose, `shoulder_1` and the elbow raised) |
-| `--f0` / `--f1` | Sweep band, Hz (default `0.3` / `8`) |
-| `--duration S` | Sweep length (default `60`) |
-| `--amp-deg D` | Low-frequency amplitude (default `1.5`) |
-| `--acc-max DEG_S2` | Amplitude cap by acceleration (default `200`: full amplitude to 1.8 Hz, 0.08° at 8 Hz) |
-| `--carrier DEG_S` | Ride a triangle wave of this speed over ±7.5° so the joint slides one way for seconds at a time — friction linearises around a sliding joint, where slow motion lives (default `0`) |
-| `--out PATH` | Output (default `~/.almond/motions/chirp_<side>_<joint>.npz`) |
+| `SIDE.JOINT` | The joint to sweep, for example `right.shoulder_1` |
+| `--base MOTION` | Motion whose first pose the sweep starts from (default: a built-in pose with `shoulder_1` and the elbow raised) |
+| `--f0` / `--f1` | Sweep band, Hz (default: `0.3` / `8`) |
+| `--duration S` | Sweep length in seconds (default: `60`) |
+| `--amp-deg D` | Amplitude at low frequency (default: `1.5`) |
+| `--acc-max DEG_S2` | Acceleration limit that shrinks the amplitude at high frequency (default: `200`, full amplitude up to 1.8 Hz and 0.08° at 8 Hz) |
+| `--carrier DEG_S` | Add a triangle wave of this speed over ±7.5°, so the joint keeps sliding one way for seconds at a time (default: `0`). Use it to measure the joint the way slow motion moves it. |
+| `--out PATH` | Output file (default: `~/.almond/motions/chirp_<side>_<joint>.npz`) |
 
-The sweep is refused if it would leave the joint's range.
+The command refuses a sweep that would leave the joint's range.
 
-## 2. Replay it — `tune.motion`
+## 2. Replay it: `tune.motion`
 
 ```bash
 axol tune.motion --motion ~/.almond/motions/chirp_right_shoulder_1.npz --arms right \
   --hold right.wrist_2 --hold right.wrist_3 --gain right.shoulder_1.kp=450 --label "chirp s1"
 ```
 
-Add the same `--gain` / `--fast-impedance` overrides you run the motion with — the model belongs to that loop.
+Use the same `--gain` and `--fast-impedance` settings you will run the motion with. The model is only valid for those settings.
 
-## 3. Fit — `tune.tf`
+## 3. Fit: `tune.tf`
 
 | Flag | Description |
 |---|---|
-| `SIDE.JOINT RUN_ID [RUN_ID ...]` | The joint and the chirp run(s) (pooled) |
-| `--f0` / `--f1` | Band to fit (default `0.3` / `8`) |
-| `--min-coherence C` | Bins below this coherence are left out (default `0.6`) |
-| `--save` | Store the model (with the run's gain overrides) in `~/.almond/tracking_models.json` |
+| `SIDE.JOINT RUN_ID [RUN_ID ...]` | The joint and one or more chirp runs, fitted together |
+| `--f0` / `--f1` | Band to fit, Hz (default: the chirp's band) |
+| `--min-coherence C` | Leave out frequencies with coherence below this (default: `0.6`) |
+| `--save` | Save the model and the run's gain overrides to `~/.almond/tracking_models.json` |
 
-It prints the response at a few frequencies, the model, a warning when the loop is lightly damped (how much a command component at its resonance is amplified) or when the fitted resonance lies above the band the data covers, and — when the run has the wrist IMU — how coherent the wrist's vertical motion is with the command per band: where it drops, something the joint encoder does not see is moving the tool.
+The command prints:
 
-## 4. Use it — `tune.motion --invert`
+- the response at a few frequencies, and the fitted model
+- a warning if the joint is lightly damped, with how much it amplifies a command at its resonance
+- a warning if the fitted resonance lies above the band the data covers
+- if the run recorded the wrist IMU, how closely the wrist's vertical motion follows the command in each band. Where it drops, something the joint encoder can't see is moving the tool.
 
-Pre-compensates every modelled, moving, unheld joint of the streamed motion (frequency domain over the whole trajectory, inverse gain capped at 3× and faded to 1 above the identified band, correction tapered in and out over 0.5 s so the stream still starts and ends on the motion). Scored against the clean reference. A joint whose stored gains differ from the run's is warned about; one whose model's resonance was extrapolated is skipped.
+## 4. Use it: `tune.motion --invert`
+
+`--invert` pre-compensates every modelled joint that moves and isn't held. The correction boosts no frequency more than 3 times, fades out above the measured band, and ramps in and out over 0.5 s, so the motion still starts and ends where it should. The run is scored against the original motion.
+
+- If a joint's saved gains differ from the run's, the tool warns.
+- If a joint's model has a resonance outside the measured band, the tool skips that joint.
 
 ```bash
 axol motion.chirp right.shoulder_1 --carrier 3

@@ -128,7 +128,7 @@ describe("supervisor API client", () => {
       "fetch",
       vi.fn(async () => new Response("not json"))
     )
-    await expect(api.fetchInfo()).rejects.toThrow("did not answer like an axol serve host")
+    await expect(api.fetchInfo()).rejects.toThrow("this address is not an Axol host")
   })
 
   it("turns connection probe timeouts into a concise offline error", async () => {
@@ -161,7 +161,7 @@ describe("supervisor API client", () => {
         problem: "over temperature",
         temperature: 77.6,
       })
-    ).toBe("L shoulder 1 — over temperature (78°C)")
+    ).toBe("L shoulder 1: over temperature (78°C)")
   })
 })
 

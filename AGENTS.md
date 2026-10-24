@@ -6,6 +6,32 @@
 
 Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no physical robot hardware is available in the cloud VM, all development and testing uses the **sim** mode (`--sim`), which renders the robot in a browser via viser.
 
+### Writing docs and UI text
+
+These rules cover everything a customer reads: `docs/`, the web UI under `web/`, settings help in `almond_axol/serve/settings.py`, command and diagnostic descriptions, and CLI help and log lines meant for operators. Code comments, docstrings and commit messages are not covered. Write for an operator standing next to the robot, not for the engineer who wrote the code. Read your text back before you commit it, out loud if that helps. If a sentence only makes sense to someone who saw the diff, rewrite it.
+
+**Names.** **Axol** is the dual-arm robot. The mounts are **Standalone**, **Owl Mount**, **Ox Cart** and **Jelly Mobile** (short form **Jelly**). Jelly is a powered mobile base, not a robot: write "Axol on Jelly", never "the Jelly robot". **Mantis** is the pair of handheld data-collection rigs. The **Camera Kit** and **Compute Kit** are add-ons. Never name our own test units ("the jelly robot", "our in-house Axol"). Call a control by the label it has in the UI, in bold, and don't invent names for features.
+
+**Describe the product as it is now.** Leave out history and tuning notes: no dates, no "used to", "older", "now", "no longer" or "new", no A/B results ("30% rougher", "−57% ripple", "over three interleaved rounds"), and no record of how a default was chosen. That belongs in the commit message. Give a number only when the reader needs it: a time to plan for, a limit, a value to type.
+
+**Say what the reader does and what happens.** Leave out implementation detail and design rationale unless it changes what the reader does. Don't explain security boundaries or internal plumbing ("the web API deliberately accepts neither path", "the observer pairs each command with its feedback"). Put internals on an Advanced or API page, or leave them out.
+
+**Short, plain sentences.**
+- One idea per sentence and at most four sentences per paragraph. When a paragraph lists several behaviors, flags or cases, make it a list or a table.
+- No em dashes. Use a period, a comma, a colon or parentheses. Use at most one parenthetical per sentence, and never nest them. Don't chain clauses with semicolons.
+- Every sentence must make sense on its own. Never point at something that isn't there ("the numbers above", "the older quick profile") or at a version the reader never saw.
+- Prefer common words. Avoid filler and coinages such as "deliberately", "genuinely", "exactly", "simply", "just", "at once", "its own" ("the core's own law"), "plumbing", "ad hoc", "heals itself", "that beats", "nothing to enable", "lights up". Don't use arrows (→, ↔) in prose.
+- Lead with the action. Write "Run `axol tune.factory`", not "Calibration is performed by running ...".
+
+**Page front matter.** `title` is a short noun phrase ("Calibrating Axol"). `description` is one sentence of 20 words or fewer that says what the page helps you do.
+
+**UI text.**
+- Buttons are a verb plus an object ("Start recording"). Labels are one to three words.
+- A tooltip or hint is one short sentence. It says what the control does, not how it is built.
+- An error says what went wrong and what to do next ("Left arm not found on can_alm_axol_l. Check the USB cable, then press Retry.").
+- Capitalize the first word only, and keep the same word for the same thing across the page and the docs.
+- When you change visible text, update any test that matches on it.
+
 ### Running the application
 
 - **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --sim`

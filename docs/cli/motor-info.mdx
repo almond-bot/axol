@@ -1,13 +1,17 @@
 ---
 title: "motor.info"
-description: "Read and print a full status snapshot from one motor or every motor on a bus."
+description: "Print the status of one motor, or every motor on a bus."
 ---
 
-Reads and prints a full status snapshot from one motor (or all motors on the bus when `--id` is omitted): model and firmware version (MyActuator only), status/error code, control mode (Damiao only), position, velocity, torque, temperature, and voltage.
+Prints the status of one motor, or of every motor on the bus when you omit `--id`. Use it to check that a motor answers at a given CAN ID. It shows position, velocity, torque, temperature, voltage and the status or error code. MyActuator motors also report their model and firmware version, and Damiao motors report their control mode.
 
-<Note>
-  `--l` / `--r` selects a side. Add `--target mantis` to use that side's Mantis gripper bus instead of its Axol arm bus; `--channel` overrides either derived interface (for example, `can0`). For `motor.info`, omitting `--id` queries IDs 1–8 on Axol and only the Mantis gripper at ID 8. `--type` can be `myactuator` or `damiao` and is inferred from the ID if omitted.
-</Note>
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
+| `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
+| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
+| `--id ID` | Motor CAN ID, hex or decimal. Omit to query IDs 1 to 8 on Axol, or ID 8 on Mantis |
+| `--type {myactuator,damiao}` | Motor type. Inferred from the ID if omitted |
 
 ```bash
 axol motor.info --l                   # scan all 8 motors on the left bus

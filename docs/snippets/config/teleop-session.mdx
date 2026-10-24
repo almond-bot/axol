@@ -8,7 +8,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}ik_frequency</F> | `120` | How often VR poses are sent to the IK solver (Hz). The control loop interpolates between solutions. |
 | <F>--{prefix}position_multiplier</F> | `1.0` | Scales hand movement. `2` moves the arm twice as far as your hand. Ignored in `absolute_mode`. |
 | <F>--{prefix}rotation_multiplier</F> | `1.0` | Scales hand rotation the same way. Ignored in `absolute_mode`. |
-| <F>--{prefix}hold_to_engage</F> | `false` | `false`: click both grips to engage, then click a grip to freeze or unfreeze that arm. `true`: per-arm dead-man grips — each arm tracks only while its own grip is held, either grip alone engages its arm (from rest too), release freezes that arm. |
+| <F>--{prefix}hold_to_engage</F> | `false` | `false`: click both grips to engage, then click a grip to freeze or unfreeze that arm. `true`: each arm tracks only while you hold its own grip, from rest too, and freezes when you release it. |
 | <F>--{prefix}park_to_zero</F> | `true` | On Stop / `Ctrl+C` the arms return to rest and then continue to the all-zero joint pose (hanging straight down), holding their grasp, before the motors are released. `false` stops the park at the rest pose. |
 | <F>--{prefix}disengage_timeout</F> | `0.5` | Seconds without a VR frame before tracking disengages and the arms hold position. `0` disables. |
 | <F>--{prefix}record</F> | `null` | Record every stage of the teleop pipeline to `~/.almond/recordings/<name>_*.npz` for [`motion.build`](/cli/motion-build) and [`diag.offline`](/cli/diag-offline). A bare name like `rec1` goes in that folder; a path is used as-is. |
@@ -19,8 +19,8 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}reset_collision_margin</F> | `0.025` | Minimum self-collision clearance (m) when planning a return. |
 | <F>--{prefix}reset_collision_weight</F> | `100.0` | IK weight on self-collision when planning a return. |
 | <F>--{prefix}reset_max_iterations</F> | `10` | IK iterations per return waypoint. |
-| <F>--{prefix}reset_torque_threshold</F> | `6.0` | **Contact stop during return-to-rest** (Nm of unexpected torque). If the arm hits something, the move stops and the arms go limp; press reset to retry. `0` disables. Hardware only. |
-| <F>--{prefix}teleop_torque_threshold</F> | `0` (off) | **Contact stop while tracking.** Same behaviour; a running episode is discarded. The control panel arms it at `16`. Hardware only. |
+| <F>--{prefix}reset_torque_threshold</F> | `6.0` | **Contact stop during return-to-rest**, in Nm of unexpected torque. If an arm hits something, the move stops and the arms go limp until you press reset. `0` disables (hardware only). |
+| <F>--{prefix}teleop_torque_threshold</F> | `0` (off) | **Contact stop while tracking.** It works the same way and discards a running episode. The control panel sets it to `16` (hardware only). |
 | <F>--{prefix}reset_gravity_comp_kd</F> | `0.25` | Damping (Nm·s/rad) of the limp hold after a contact stop. |
 | <F>--{prefix}engage_max_vel</F> | `0.628` | Joint speed cap (rad/s) right after engaging, so the first move is gentle. |
 | <F>--{prefix}engage_duration</F> | `1.0` | Seconds to ramp from `engage_max_vel` up to `teleop_max_vel`. |
@@ -30,7 +30,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}pose_cutoff</F> | `2.5` | Low-pass cutoff (Hz) on raw controller poses before IK. Lower rejects more hand tremor but adds lag. |
 | <F>--{prefix}absolute_mode</F> | `false` | Mantis mapping: track controller poses 1:1 in a fixed world frame instead of relative to where you engaged. Forced `true` by `--mantis`. |
 | <F>--{prefix}base_height</F> | `null` | In `absolute_mode`, fix the robot base this many metres above the VR floor instead of inferring it. Keeps datasets consistent across operators. |
-| <F>--{prefix}tcp_transform_left</F> | `null` | *Mantis data collection.* Tracker → gripper transform `[x, y, z, qx, qy, qz, qw]` for the left rig. Normally read from the saved calibration; set to override. See [`tracker`](/cli/tracker#transform-file). |
+| <F>--{prefix}tcp_transform_left</F> | `null` | *Mantis data collection.* Transform from tracker to gripper, `[x, y, z, qx, qy, qz, qw]`, for the left rig. It is read from the saved calibration, so set it only to override. See [`tracker`](/cli/tracker#transform-file). |
 | <F>--{prefix}tcp_transform_right</F> | `null` | *Mantis data collection.* Same for the right rig. |
 | <F>--{prefix}tracker_key</F> | `null` | *Mantis data collection, Quest.* Which saved calibration to use, e.g. `quest:oculus-touch-v3:grip`. Set from **Mantis settings** in the panel. |
 | <F>--{prefix}quest_controller_profile</F> | `null` | *Mantis data collection, Quest.* Expected controller profile. Filled from `tracker_key`. |

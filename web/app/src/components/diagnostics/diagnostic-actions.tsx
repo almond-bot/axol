@@ -447,11 +447,11 @@ export function ActionDialog({
         )}
         {blocked && (
           <p className="text-xs text-amber-200/70">
-            Another diagnostic is running — stop it or wait for it to finish.
+            Another diagnostic is running. Stop it or wait for it to finish.
           </p>
         )}
         {missing.length > 0 && (
-          <p className="text-xs text-red-300">Missing required: {missing.join(", ")}</p>
+          <p className="text-xs text-red-300">Required: {missing.join(", ")}</p>
         )}
 
         {jointsField && (
@@ -485,8 +485,7 @@ export function ActionDialog({
         {hasWebPrompts && (
           <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
             <Hand className="mt-0.5 size-3.5 shrink-0 text-white/35" />
-            Hands-on steps pause the run and show a Continue button — the run waits for you, then
-            proceeds when you click it.
+            Hands-on steps pause the run until you press Continue.
           </p>
         )}
 

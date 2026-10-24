@@ -106,9 +106,7 @@ export function RunHistory({
         </div>
       </div>
       {runs.length === 0 ? (
-        <p className="text-sm text-white/35">
-          No runs yet — launch a diagnostic above and it will be recorded here.
-        </p>
+        <p className="text-sm text-white/35">No runs yet. Diagnostics you run are recorded here.</p>
       ) : (
         <>
           <div className="flex flex-col divide-y divide-white/[0.06]">
@@ -310,10 +308,7 @@ function RunDetail({ id }: { id: string }) {
           />
         </div>
       ) : (
-        <p className="text-sm text-white/35">
-          No telemetry was captured for this run (the script owned the CAN bus and did not write its
-          own capture).
-        </p>
+        <p className="text-sm text-white/35">No telemetry was captured for this run.</p>
       )}
       <div>
         <Button variant="ghost" size="sm" onClick={() => setShowLog((v) => !v)}>

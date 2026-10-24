@@ -122,7 +122,7 @@ export function MotorGrid({
                     ? "OK"
                     : reading && !reading.reachable
                       ? "UNREACHABLE"
-                      : (reading?.status ?? "—")}
+                      : (reading?.status ?? "–")}
                 </span>
               </span>
             </div>

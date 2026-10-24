@@ -133,7 +133,7 @@ describe("Lighthouse validation", () => {
     }
     await render()
     expect(container.textContent).toContain(
-      "Calibration saved — identify sides, then validate tracking"
+      "Calibration saved. Identify sides, then validate tracking."
     )
     expect(container.textContent).not.toContain("Tracking check passed")
   })
@@ -180,7 +180,7 @@ describe("Lighthouse validation", () => {
   it("keeps validation and recalibration visible after device setup completes", async () => {
     await render()
     expect(container.textContent).toContain("Tracking quality not checked")
-    expect(container.textContent).toContain("reference fixture is needed")
+    expect(container.textContent).toContain("need a reference fixture")
     expect(button("Validate tracking").disabled).toBe(false)
     expect(button("Recalibrate Lighthouse").disabled).toBe(false)
     expect(container.querySelector<HTMLSelectElement>("select")?.value).toBe("3")
@@ -257,7 +257,7 @@ describe("Lighthouse validation", () => {
       'select[aria-label="Tracking policy"]'
     )!
     expect(policy.value).toBe("standard")
-    expect(container.textContent).toContain("validation is optional")
+    expect(container.textContent).toContain("Validation is optional")
     await act(async () => {
       policy.value = "strict"
       policy.dispatchEvent(new Event("change", { bubbles: true }))
@@ -281,14 +281,14 @@ describe("Lighthouse validation", () => {
     }
     await render()
     expect(container.textContent).toContain(
-      "Last check passed 10 min ago — calibration refined since"
+      "Last check passed 10 min ago. Calibration refined since then."
     )
     expect(container.textContent).not.toContain("run it again")
     act(() => root.unmount())
     root = createRoot(container)
     snapshot.sources!.lighthouse.qualityMode = "strict"
     await render()
-    expect(container.textContent).toContain("Validation expired or setup changed — check again")
+    expect(container.textContent).toContain("Validation expired or setup changed. Check again.")
     expect(container.textContent).toContain("run it again")
   })
 
@@ -304,7 +304,7 @@ describe("Lighthouse validation", () => {
       staleCauses: ["setup"],
     }
     await render()
-    expect(container.textContent).toContain("Validation expired or setup changed — check again")
+    expect(container.textContent).toContain("Validation expired or setup changed. Check again.")
   })
 
   it("hides the tracking policy on hosts that do not report it", async () => {

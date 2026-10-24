@@ -3,10 +3,10 @@ title: "almond_axol.motor"
 description: "Low-level async motor interface through the Rust CAN core."
 ---
 
-Low-level async interface for individual motors. The API is Python, but every
-CAN frame is sent and received by the Rust `axol-rt` transport; Python never
-opens SocketCAN. Most users work through `Axol` — this layer is exposed for
-diagnostics, custom control modes, and bench testing individual motors.
+Low-level async interface for individual motors. The API is Python, but the
+Rust `axol-rt` transport sends and receives every CAN frame. Python never opens
+SocketCAN. Most code uses `Axol` instead. This layer is for diagnostics, custom
+control modes and bench tests of single motors.
 
 ```python
 from almond_axol.motor import CanBus, Motor, ControlMode, MotorStatus, MotorGains, Joint
@@ -35,12 +35,12 @@ asyncio.run(main())
 
 | Method | Description |
 |---|---|
-| `enable()` / `disable()` | Enable motor / engage brake. On a Damiao motor left in the `LOST_COMM` fault (a session that ended without a clean teardown), `disable()` clears that fault so the motor confirms `DISABLED`; clearing never enables it, and other faults are left in place. |
-| `attach(mode)` | Reconnect to an already-enabled motor without disturbing its torque state: verifies it is enabled, fault-free, and in `mode`, using reads only (`set_control_mode` would reboot a MyActuator motor, dropping torque for ~2 s) |
-| `is_holding()` | `True` if the motor is enabled and holding torque (read-only). Damiao: feedback status `ENABLED` (an enabled-but-never-commanded motor also reports `True`). MyActuator: status-1 running byte set and no fault latched |
+| `enable()` / `disable()` | Enable the motor, or disable it and engage the brake. On a Damiao motor, `disable()` also clears a `LOST_COMM` fault (see below). |
+| `attach(mode)` | Reconnect to a motor that is already enabled, without changing its torque. Checks with reads only that it is enabled, fault-free and in `mode`. |
+| `is_holding()` | `True` if the motor is enabled and holding torque. Read-only (see below for how each motor family reports it). |
 | `clear_errors()` | Clear latched error flags |
-| `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
-| `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands. **MyActuator motors reboot to switch (torque off ~2 s)** — never call it on a motor holding a load. Damiao is a plain register write; a live flip is non-disruptive |
+| `set_zero_position()` | Save the current position as the encoder zero, in flash. Set it at a mechanical end stop, not the rest pose. |
+| `set_control_mode(mode)` | Set the `ControlMode`, which mode-specific commands require. **MyActuator motors reboot to switch, with torque off for about 2 s**, so never call it on a motor holding a load. |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
 | `get_model()` | Motor model string, e.g. `"X8S2V"` (`None` for Damiao) |
 | `get_firmware_version()` | Firmware VersionDate `int`, e.g. `2026042402` (`None` for Damiao) |
@@ -58,14 +58,23 @@ asyncio.run(main())
 | `set_acceleration(acceleration, deceleration)` | Acceleration ramp (rad/s²) |
 | `set_can_id(can_id)` | Change CAN ID (persisted to flash) |
 | `start_telemetry(hz, torque=False)` / `stop_telemetry()` | Background polling loop |
-| `motor.telemetry_active` | `True` while the background polling loop is running (`get_position()` / `get_torque()` do direct reads and raise while it is) |
+| `motor.telemetry_active` | `True` while the background polling loop is running. `get_position()` and `get_torque()` raise while it runs. |
 | `motor.position` | Cached position (rad); populated by telemetry or `set_impedance` responses |
-| `motor.has_position` | `True` once a position has been cached (i.e. telemetry has warmed up) |
+| `motor.has_position` | `True` once a position has been cached |
 | `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
+
+Notes on the methods above:
+
+- `disable()` on a Damiao motor in the `LOST_COMM` fault, left by a session that ended without a clean shutdown, clears that fault so the motor reports `DISABLED`. Clearing never enables the motor, and other faults stay in place.
+- `attach()` uses reads only because `set_control_mode()` would reboot a MyActuator motor and drop its torque for about 2 s.
+- `is_holding()` on a Damiao motor means the feedback status is `ENABLED`, which is also true of a motor that was enabled but never commanded. On a MyActuator motor it means the running byte of status 1 is set and no fault is latched.
+- Damiao motors switch control modes with a register write, so switching while holding doesn't disturb them.
 
 ## Configuration parameters
 
-Both motor families expose a named configuration table — MyActuator's `0xC0` parameters and Damiao's `0x7FF` registers — for servicing a motor over CAN without the vendor setup software. These back the [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config), [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config), and [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) commands; the CLI is the usual way in, but the same surface is on `Motor`.
+Both motor families have a named configuration table: MyActuator's `0xC0` parameters and Damiao's `0x7FF` registers. Use it to service a motor over CAN without the vendor's setup software. The [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config), [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config) and [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) commands are the usual way in.
+
+The same methods are on `Motor`:
 
 | Method | Description |
 |---|---|
@@ -78,7 +87,10 @@ Both motor families expose a named configuration table — MyActuator's `0xC0` p
 | `get_can_timeout()` / `set_can_timeout(milliseconds)` | Loss-of-comms alarm time (ms); Damiao only |
 
 <Note>
-  MyActuator motors apply a low undervoltage threshold (`LOW_VOLTAGE`, -2 V) on `enable()` so a brief bus-voltage sag can't latch the level-2 undervoltage fault. Parameters whose `ParamSpec.min_firmware` is newer than the motor's firmware are left out of dumps and restores, and `read_config` / `write_config` raise `MotorError` for them. Read-only parameters are never written, and protected ones (factory calibration and identity, CAN IDs, baud rate) are skipped by a restore unless you opt in, since rewriting them can leave a motor unable to commutate or unreachable on the bus.
+  - On `enable()`, MyActuator motors set a low undervoltage threshold (`LOW_VOLTAGE`, -2 V), so a brief sag in bus voltage can't latch the level-2 undervoltage fault.
+  - Parameters whose `ParamSpec.min_firmware` is newer than the motor's firmware are left out of dumps and restores. `read_config` and `write_config` raise `MotorError` for them.
+  - Read-only parameters are never written.
+  - A restore skips protected parameters (factory calibration and identity, CAN IDs, baud rate) unless you pass `include_protected=True`. Writing them can leave a motor unable to commutate or unreachable on the bus.
 </Note>
 
 ## `ControlMode` values
@@ -96,7 +108,7 @@ Both motor families expose a named configuration table — MyActuator's `0xC0` p
 
 \* MyActuator only
 
-## Joint → driver mapping
+## Joint to driver mapping
 
 | Joint | Driver | CAN ID |
 |---|---|---|

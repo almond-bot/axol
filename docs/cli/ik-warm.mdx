@@ -3,15 +3,15 @@ title: "ik.warm"
 description: "Precompile this robot's IK so the next session starts without waiting for it."
 ---
 
-The first time the IK solver runs for a robot model, or after an update changes it, XLA compiles it: about a minute on a Jetson, spent while teleop or data collection waits to become ready. Later starts reuse that work. The compiled program is cached, and the traced solve is kept as an export under `~/.almond/jax-cache/exports`, so a warm start takes about 5 s on a Jetson.
+The first time the IK solver runs for a robot model, or after an update changes it, the solver is compiled. That takes about a minute on a Jetson, while teleop or data collection waits to become ready. Later starts reuse the compiled solver, saved under `~/.almond/jax-cache/exports`, and take about 5 s on a Jetson.
 
-`ik.warm` does that first start ahead of time. It builds the IK worker exactly as a session on this robot would:
+`ik.warm` does that first start ahead of time. It sets up the IK solver the same way a session on this robot would:
 
-- **The robot model:** Axol × Jelly when Jelly is attached and on, otherwise the saved mount (Settings → Robot), or `kinematics.robot_model` if one is forced.
+- **The robot model:** `kinematics.robot_model` if you set one. Otherwise Axol on Jelly when Jelly is attached and on, or else the mount saved on the **Robot** settings tab.
 - **The gripper:** the fitted gripper, for the parcel model on Jelly.
-- **The rest:** the shared IK settings and the IK worker's XLA flags.
+- **The rest:** the shared IK settings.
 
-It then runs the worker's startup: both solve variants and the move to the rest pose. Nothing moves and no hardware is opened.
+It then runs the solver's startup, including planning the move to the rest pose. Nothing moves and no hardware is opened.
 
 ```bash
 axol ik.warm
@@ -19,4 +19,4 @@ axol ik.warm
 
 It runs automatically as one of the last steps of [`provision`](/cli/provision), which every install and update runs, so a robot comes back from an update ready to go. Run it by hand after pulling a development checkout, or after changing the robot model, to take the compile out of the next session's start. A model picked only for a sim run still compiles on its first use.
 
-Set `ALMOND_IK_EXPORTS=0` to make the IK trace its solve on every start instead of reusing exports.
+Set `ALMOND_IK_EXPORTS=0` to rebuild the solver on every start instead of reusing the saved one.

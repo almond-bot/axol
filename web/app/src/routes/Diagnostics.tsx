@@ -138,7 +138,7 @@ const STATE_BADGE: Record<
   { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
 > = {
   connected: { variant: "success", text: "streaming" },
-  busy: { variant: "warning", text: "test owns the bus" },
+  busy: { variant: "warning", text: "bus in use" },
   connecting: { variant: "neutral", text: "connecting" },
   disconnected: { variant: "neutral", text: "robot disconnected" },
   error: { variant: "destructive", text: "error" },
@@ -434,7 +434,7 @@ export default function Diagnostics() {
     if (activeStatus.status === "exited" && (activeStatus.exitCode ?? 0) === 0) {
       toast.success(`${label} finished.`)
     } else {
-      toast.error(`${label} failed — see its run in the history for the log.`)
+      toast.error(`${label} failed. Open its run in Run history to see the log.`)
     }
     const t = setTimeout(() => {
       refreshRuns()
@@ -567,7 +567,10 @@ export default function Diagnostics() {
         if (!autoRobotMountedRef.current) return false
         setRobot(status)
         if (!status.connected) {
-          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+          throw new Error(
+            status.error ??
+              `Could not connect the ${profile === "mantis" ? "Mantis" : "Axol"} CAN link.`
+          )
         }
         if (!automatic) manualRobotOverrideRef.current = true
         return true
@@ -594,7 +597,10 @@ export default function Diagnostics() {
         const status = await robotConnect(channels, profile)
         setRobot(status)
         if (!status.connected) {
-          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+          throw new Error(
+            status.error ??
+              `Could not connect the ${profile === "mantis" ? "Mantis" : "Axol"} CAN link.`
+          )
         }
         manualRobotOverrideRef.current = true
         setAdapterOpen(false)
@@ -618,7 +624,7 @@ export default function Diagnostics() {
       if (!autoRobotMountedRef.current) return
       setRobot(status)
       if (status.state !== "disconnected") {
-        throw new Error(status.error ?? "Could not disconnect the CAN link")
+        throw new Error(status.error ?? "Could not disconnect the CAN link.")
       }
     } catch (e) {
       if (autoRobotMountedRef.current) toast.error(String(e))
@@ -638,7 +644,7 @@ export default function Diagnostics() {
         setJelly(status)
         if (!status[device].connected) {
           throw new Error(
-            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link.`
           )
         }
         return true
@@ -662,7 +668,7 @@ export default function Diagnostics() {
         setJelly(status)
         if (status[device].state !== "disconnected") {
           throw new Error(
-            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link.`
           )
         }
       } catch (e) {
@@ -690,9 +696,9 @@ export default function Diagnostics() {
       if (result?.status === "configured" || result?.status === "ready") {
         toast.success("CAN hardware identified")
       } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware still needs identification")
+        toast.warning(result.message ?? "Some CAN hardware is still unidentified.")
       } else {
-        toast.error(result?.message ?? "CAN hardware could not be identified")
+        toast.error(result?.message ?? "CAN hardware could not be identified.")
       }
     } catch (error) {
       if (autoRobotMountedRef.current) {
@@ -775,7 +781,7 @@ export default function Diagnostics() {
     canDiscoveryNoticesRef.current.add(noticeKey)
     const fallback =
       canDiscovery.status === "unidentified"
-        ? "Power the attached hardware, then use Retry CAN identification below."
+        ? "Power on the attached hardware, then press Retry CAN identification."
         : "Run axol can.setup in a terminal if the problem continues."
     if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
     else toast.error(canDiscovery.message ?? fallback)
@@ -955,9 +961,9 @@ export default function Diagnostics() {
   // note explains both the passive source and any lull between commands.
   const quietReason =
     linkState === "busy"
-      ? "a task owns command — live from passive bus tap"
+      ? "Bus in use, showing observed CAN traffic"
       : linkState !== "connected"
-        ? "robot link down"
+        ? "Robot link down"
         : null
   // The CAN bus is owned by something we didn't launch (an in-process
   // operation like teleop) — the server would reject a diagnostic launch, so
@@ -1090,17 +1096,17 @@ export default function Diagnostics() {
           key: "single",
           label: "Specific motor",
           description:
-            "Set one motor's zero to its current mechanical position (persisted to " +
-            "flash). Damiao motors need a power cycle afterwards.",
+            "Set one motor's zero to its current position and save it to flash. " +
+            "Damiao motors need a power cycle afterwards.",
           hideKeys: ["guided", "joints"],
         },
         {
           key: "guided",
           label: "Guided",
           description:
-            "Walk the selected joints of one arm and zero each against an end " +
-            "stop (wrist_2/wrist_3 accept either side) — each step pauses with " +
-            "instructions and a Continue button.",
+            "Zero each selected joint of one arm against an end stop. wrist_2 and " +
+            "wrist_3 accept either side. Each step shows instructions and waits " +
+            "for Continue.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },
@@ -1112,10 +1118,10 @@ export default function Diagnostics() {
       label: "Dump config",
       icon: ClipboardList,
       description:
-        "Read every configuration parameter from one motor, or all of them when the " +
-        "CAN ID is left blank. Works for MyActuator and Damiao alike. Read-only — the " +
-        "run log is kept in the history below, so this is what to capture before " +
-        "changing anything.",
+        "Read every configuration parameter from one motor, or from all motors " +
+        "if CAN ID is blank. Works for MyActuator and Damiao motors and changes " +
+        "nothing. The log is saved in Run history, so run this before you change " +
+        "any parameter.",
     },
     {
       key: "set-config",
@@ -1135,10 +1141,10 @@ export default function Diagnostics() {
           key: "write",
           label: "Write",
           description:
-            "Write one configuration parameter and persist it. Damiao's CAN timeout " +
-            "is in milliseconds. Protected parameters — factory calibration, CAN IDs, " +
-            "baud rate — need the override, since changing those can leave the motor " +
-            "unable to commutate or unreachable on the bus.",
+            "Write one configuration parameter and save it. Damiao's CAN timeout is " +
+            "in milliseconds. Protected parameters (factory calibration, CAN IDs, " +
+            "baud rate) need the override. A wrong value can leave the motor unable " +
+            "to commutate or unreachable on the bus.",
           // Running the dialog is the confirmation; the CLI prompt would other-
           // wise block the session waiting on stdin.
           presetArgs: { yes: true },
@@ -1151,9 +1157,9 @@ export default function Diagnostics() {
       label: "Flash firmware",
       icon: Upload,
       description:
-        "Overwrite one motor's firmware from a .bin file on the robot host. Leave " +
-        "the arm powered and idle — nothing else may use the bus. An interrupted " +
-        "flash leaves the motor in its bootloader until you run this again.",
+        "Replace one motor's firmware with a .bin file on the robot host. Keep the " +
+        "arm powered and idle, with nothing else using the bus. If a flash is " +
+        "interrupted, the motor stays in its bootloader until you run this again.",
       // Running the dialog is the confirmation; the CLI prompt would otherwise
       // block the session waiting on stdin.
       presetArgs: { yes: true },
@@ -1199,9 +1205,8 @@ export default function Diagnostics() {
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
             <p className="min-w-0 flex-1 text-xs text-amber-100/80">
               {canDiscovery?.message ??
-                "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
-              Power the hardware, then retry identification. The idle robot link may disconnect
-              briefly while it is probed.
+                "CAN hardware is attached but not yet identified as Axol, Mantis, or Jelly."}{" "}
+              Power on the hardware, then retry. The robot link may drop briefly during the check.
             </p>
             <Button
               variant="outline"
@@ -1225,8 +1230,8 @@ export default function Diagnostics() {
         {robot && robot.state === "disconnected" && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
             <p className="text-sm text-white/60">
-              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected — connect
-              to start streaming motor telemetry.
+              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected. Connect to
+              stream motor telemetry.
             </p>
             <div className="ml-auto flex items-center gap-2">
               <Button
@@ -1234,9 +1239,9 @@ export default function Diagnostics() {
                 size="sm"
                 onClick={() => setAdapterOpen(true)}
                 disabled={robotBusy || hardwareSessionBusy || launchBusy}
-                title="Choose Axol or Mantis and the CAN interface(s) to inspect."
+                title="Choose Axol or Mantis and the CAN interfaces to inspect."
               >
-                <Cable /> CAN adapter…
+                <Cable /> Choose CAN adapter
               </Button>
               <Button
                 size="sm"
@@ -1279,8 +1284,8 @@ export default function Diagnostics() {
           <div className="flex flex-wrap items-center gap-3">
             <h2 className="font-heading text-base font-semibold">Hardware</h2>
             <span className="text-xs text-white/40">
-              Axol and Mantis share one telemetry link; the Jelly wheels and lift connect on their
-              own.
+              Axol and Mantis share one telemetry link. The Jelly wheels and lift connect
+              separately.
             </span>
           </div>
           <HardwareOverview
@@ -1333,7 +1338,7 @@ export default function Diagnostics() {
                     size="sm"
                     title={
                       id === "can.enable"
-                        ? "Choose which CAN adapter drives each arm (or a single arm) and bring the interfaces up. The mapping is saved and applied to every diagnostic and calibration run."
+                        ? "Choose the CAN adapter for each arm and bring the interfaces up. Every run uses this mapping."
                         : cmd.description
                     }
                     disabled={
@@ -1453,7 +1458,7 @@ export default function Diagnostics() {
           </div>
           <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} joints={joints} />
           <p className="text-xs text-white/30">
-            Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
+            Scroll to zoom and drag to pan. Zooming pauses the live view until you press Go live.
           </p>
           {/* One metric at a time — the toggle row above picks it (temperature
               reads the 1 Hz sweep buffer) — charted as a left/right pair
@@ -1463,7 +1468,7 @@ export default function Diagnostics() {
             {(["left", "right"] as ArmSide[]).map((side) => (
               <TelemetryChart
                 key={side}
-                title={`${metric.title} — ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
+                title={`${metric.title}, ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
                 unit={metric.unit}
                 series={seriesBySide[side]}
                 frames={chartFrames}

@@ -907,8 +907,8 @@ class OperationRunner:
         session.emit(f"[serve] starting {op_id} (in-process)")
         if grippers_only:
             session.emit(
-                "[serve] teleop: Mantis grippers only — the rig triggers "
-                "drive the grippers and no tracking starts"
+                "[serve] teleop: Mantis grippers only. The rig triggers "
+                "drive the grippers, and the rigs are not tracked."
             )
 
         if needs_robot and self._robot_link is not None:
@@ -1006,8 +1006,8 @@ class OperationRunner:
                 stalled_since = now
             elif now - stalled_since >= STALL_DETECT_S:
                 session.emit(
-                    "[serve] motor power lost — no motor is answering on the CAN "
-                    "bus; stopping the operation"
+                    "[serve] Motor power lost: no motor is answering on the CAN "
+                    "bus. Stopping the operation."
                 )
                 _logger.warning(
                     "motor power lost during %s; stopping", session.command_id
@@ -1091,9 +1091,8 @@ class OperationRunner:
         thread.join(timeout=grace)
         if thread.is_alive():
             session.emit(
-                f"[serve] still stopping after {grace:.0f}s — "
-                "force-killing the operation's child processes (sparing the "
-                "dataset recorder)"
+                f"[serve] Still stopping after {grace:.0f}s. Force-stopping the "
+                "operation's child processes, except the dataset recorder."
             )
             spared = self._kill_op_children(session, spare={_RECORDER_PROC_NAME})
             if spared and thread.is_alive():
@@ -1111,8 +1110,8 @@ class OperationRunner:
             # still owns the CAN bus, so the session stays "running"/"stopping"
             # and is_running() keeps a new op from clobbering it.
             session.emit(
-                "[serve] operation did not exit after force-kill and is now "
-                "abandoned — restart axol serve if it persists"
+                "[serve] The operation did not exit after a force stop. "
+                "Restart axol serve if this keeps happening."
             )
 
     def _kill_op_children(
@@ -1149,7 +1148,7 @@ class OperationRunner:
             if spare and child.name in spare:
                 session.emit(
                     f"[serve] sparing child process {child.name} "
-                    f"(pid {child.pid}) — dataset finalize in progress"
+                    f"(pid {child.pid}) while the dataset finishes saving"
                 )
                 spared_any = True
                 continue

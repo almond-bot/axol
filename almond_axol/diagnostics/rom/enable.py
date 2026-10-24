@@ -1033,10 +1033,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--joints",
         default=None,
-        help="Comma-separated joints to sweep (e.g. wrist_1,wrist_2,wrist_3). "
-        "Every motor found on the bus is brought up and held; only these "
-        "move. Selected joints must be present; unselected joints that do "
-        "not answer are treated as absent (partial bench arm). Default: all. "
+        help="Comma-separated joints to sweep, such as wrist_1,wrist_2,wrist_3 "
+        "(default: all). The other joints hold still. Each selected joint must "
+        "answer on the bus, but other joints may be missing. "
         f"One of: {', '.join(valid_joints)}.",
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
@@ -1052,10 +1051,9 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_PAYLOAD_KG,
         metavar="KG",
-        help="Mass of the item each gripper holds on a full-robot run, added "
-        "to the gravity model when the gripper closes on it (0 to "
-        f"{MAX_PAYLOAD_KG:g} kg; 0 models no item). Ignored on a joint subset, "
-        f"which holds nothing (default: {DEFAULT_PAYLOAD_KG:g}).",
+        help="Mass of the item each gripper holds during a full run, from 0 "
+        f"to {MAX_PAYLOAD_KG:g} kg (default: {DEFAULT_PAYLOAD_KG:g}). Set 0 if "
+        "the grippers hold nothing. Ignored when you sweep only some joints.",
     )
     parser.add_argument(
         "--left-channel",

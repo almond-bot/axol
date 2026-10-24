@@ -52,14 +52,10 @@ export function MountPicker({
         </span>
         {jelly ? (
           <span className="text-xs text-white/45">
-            Jelly is attached, so this robot is Axol × Jelly. Your pick applies when it is off.
+            Jelly is attached, so this is Axol on Jelly. Your choice applies when Jelly is off.
           </span>
         ) : (
-          locked && (
-            <span className="text-xs text-white/45">
-              Connect the Axol to choose what it is mounted on.
-            </span>
-          )
+          locked && <span className="text-xs text-white/45">Connect Axol to choose its mount.</span>
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">

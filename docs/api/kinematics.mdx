@@ -3,30 +3,32 @@ title: "almond_axol.kinematics"
 description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
 ---
 
-Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds the arm↔torso collision model (`self_collision`, on by default), and JIT-compiles the solver during `__init__` — both graph shapes, with and without elbow hints, so box mode's first frame never waits on a compile; the first solver in a process takes a few seconds (a persistent on-disk cache makes later runs fast); subsequent calls (and subsequent solver instances) are fast.
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Creating a `KinematicsSolver` loads the bundled URDF, builds the collision model between the arms and the torso (`self_collision`, on by default), and JIT-compiles the solver. It compiles the solve both with and without elbow hints, so box mode's first frame never waits for a compile.
+
+The first solver in a process takes a few seconds to create. Later calls and later solver instances are fast.
 
 <Note>
   Solver startup is cached at two levels, both automatic:
 
-  - **Per machine** — the XLA compile (the expensive part, minutes cold on a Jetson) is cached to disk (`~/.almond/jax-cache`), so it's paid **once per machine**, not on every process start. The cache key covers the solver graph plus the `jax`/`jaxlib` versions and backend, so upgrading JAX or changing the solver simply recompiles and refreshes the cache (stale entries are never reused). Set `JAX_COMPILATION_CACHE_DIR` to override the location.
-  - **Per process** — the URDF, pyroki robot, and collision model are built once per process and shared by every `KinematicsSolver` / `AxolForwardKinematics` instance, so creating additional instances doesn't repeat the JAX trace or jaxls problem analysis.
+  - **Per machine.** The XLA compile is saved to `~/.almond/jax-cache`, so its cost (minutes on a Jetson with an empty cache) is paid once per machine. The cache key includes the solver graph and the `jax`/`jaxlib` versions and backend, so upgrading JAX or changing the solver compiles again. Set `JAX_COMPILATION_CACHE_DIR` to use another location.
+  - **Per process.** The URDF, pyroki robot and collision model are built once per process and shared by every `KinematicsSolver` and `AxolForwardKinematics` instance. Extra instances don't repeat the JAX trace or the jaxls analysis.
 
-  What remains on every fresh process start is the Python side: imports, URDF parsing, and the jaxls analysis/tracing pass (the `Building optimization problem` / `Vectorizing group` log lines) — several seconds that no disk cache can skip. Within a process it's paid once, up front: additional solver instances reuse the shared model and the already-traced solve. (`axol teleop` / `serve` absorb it in the IK worker's startup handshake, which is why it isn't felt there.)
+  Every new process still spends several seconds on imports, URDF parsing and the jaxls tracing pass (the `Building optimization problem` and `Vectorizing group` log lines). `axol teleop` and `axol serve` do this while the IK worker starts.
 
-  The disk cache only covers compiles that happen after it's enabled, which `KinematicsSolver` / `AxolForwardKinematics` do in `__init__`. A script that runs its own JAX/jaxls work **before** creating a solver can call `almond_axol.kinematics.enable_persistent_compilation_cache()` first so those compiles are disk-cached too.
+  The disk cache covers compiles that happen after it is turned on, which `KinematicsSolver` and `AxolForwardKinematics` do in `__init__`. If your script runs its own JAX or jaxls work **before** creating a solver, call `almond_axol.kinematics.enable_persistent_compilation_cache()` first.
 </Note>
 
 ```python
 from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
 ```
 
-All poses live in the robot's world frame — **+x forward, +y left, +z up**
-(FLU), origin at the base of the torso axis.
+All poses are in the robot's world frame: **+x forward, +y left, +z up**
+(FLU), with the origin at the base of the torso axis.
 
-Every joint vector the solver takes or returns is ordered the way the robot
-itself is: the left arm's 7 joints in `ARM_JOINTS` order (`shoulder_1` …
-`wrist_3`) followed by the right arm's. `q[:7]` and `q[7:]` are exactly the
-per-arm arrays `motion_control` takes (minus the gripper slot).
+Every joint vector the solver takes or returns is in the robot's own order:
+the left arm's 7 joints in `ARM_JOINTS` order (`shoulder_1` to `wrist_3`),
+then the right arm's. `q[:7]` and `q[7:]` are the per-arm arrays
+`motion_control` takes, without the gripper slot.
 
 ```python
 import numpy as np
@@ -50,34 +52,46 @@ q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 
 ## Robot models
 
-The bundled URDFs live in `almond_axol/kinematics/urdf/`, one per version. All but `axol.urdf` are generated from the Onshape exports by `scripts/build_urdfs.py`. They share the body and arm meshes in `meshes/jelly/` and keep only their own parts in `meshes/<version>/`:
+The bundled URDFs are in `almond_axol/kinematics/urdf/`, one per version. All but `axol.urdf` are generated from the Onshape exports by `scripts/build_urdfs.py`. They share the body and arm meshes in `meshes/jelly/`, and keep the parts specific to each version in `meshes/<version>/`:
 
 | File | Version | Joints besides the 14 arm joints |
 |---|---|---|
 | `axol.urdf` | Axol Legacy, the original model (the default) | none |
-| `axol_standalone.urdf` | Axol standalone: the shoulder bar and head camera, nothing below | fingers |
-| `axol_ox_cart.urdf` | Axol on the Ox cart | the cart's lift (`lift`), fingers |
-| `axol_owl.urdf` | Axol on the Owl mount: a column on a foot plate | fingers |
+| `axol_standalone.urdf` | Standalone: the shoulder bar and head camera, nothing below | fingers |
+| `axol_ox_cart.urdf` | Axol on Ox Cart | the cart's lift (`lift`), fingers |
+| `axol_owl.urdf` | Axol on Owl Mount: a column on a foot plate | fingers |
 | `axol_jelly.urdf` | Axol on Jelly, picked automatically when Jelly is enabled | `base_x`, `base_y`, `base_yaw` (the base in the plane, for simulators), the two-stage lift (`lift`, `lift_2`), wheels, fingers |
-| `axol_jelly_parcel.urdf` | the same with the parcel gripper, when `axol.gripper` is `parcel` | as above, with a hinged plate per gripper |
+| `axol_jelly_parcel.urdf` | Axol on Jelly with the parcel gripper, when `axol.gripper` is `parcel` | as above, with a hinged plate per gripper |
 
-**One model for everything.** Each generated file is the full robot: IK, the sim viewer, the headset overlay, the control panel's viewer and physics simulators all load it. With every body joint at zero the torso root (`root`) is the world origin, so poses match the classic `axol.urdf`. IK loads it through `almond_axol.kinematics.model.ik_urdf`, which:
+**One model for everything.** Each generated file describes the full robot. IK, the sim viewer, the headset overlay, the control panel's viewer and physics simulators all load it. With every body joint at zero, the torso root (`root`) is the world origin, so poses match `axol.urdf`. IK loads the file through `almond_axol.kinematics.model.ik_urdf`, which:
 
-- **freezes every joint but the arms':** the base, lift, fingers and wheels stay at zero, so the lifts are fully raised.
-- **collides capsule-friendly pieces instead of each part's hull:** the custom `<ik_collision>` elements, which importers ignore. These are the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck and the Owl foot plate as strips, and each gripper's jaws as one body over their whole motion.
+- **freezes every joint except the arm joints.** The base, lift, fingers and wheels stay at zero, so the lifts are fully raised.
+- **uses simpler collision shapes than each part's hull.** These are the custom `<ik_collision>` elements, which other importers ignore. They cover the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck and the Owl Mount foot plate as strips, and each gripper's jaws as one body over their whole motion.
 
-**Picking the version.** With Jelly enabled the robot is Axol on Jelly. Otherwise it is the mount picked in the control panel's Robot tab (**Choose your Axol**), saved as `kinematics.mount`: `classic` (legacy, the default), `standalone`, `ox_cart` or `owl`. Each picks the body IK keeps the arms clear of: the Ox cart's lift column, and the Owl mount's column and its foot plate (six thin strips, kept off the hard upper-arm guard since they sit under the arms' path). On Jelly, IK also collides the deck (three strips, kept off the hard upper-arm guard like the Owl foot). It follows the lift: the lift carries the arms down while the deck stays on the ground, so teleop forwards the height the lift reports and IK moves the deck and the lower column up toward the arms by it. Until the lift first reports a homed height, IK takes it as fully raised; if the readings stop, it keeps the last height. IK keeps the Ox cart's lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and IK does not see it. `kinematics.robot_model` still forces a version outright.
+**Picking the version.** With Jelly enabled, the model is Axol on Jelly. Otherwise it is the mount picked under **Choose your Axol** on the control panel's Robot tab, saved as `kinematics.mount`: `classic` (Legacy, the default), `standalone`, `ox_cart` or `owl`. `kinematics.robot_model` forces a version.
 
-**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere the URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`, a revolute `*_plate_joint` over a half turn, 0 = alongside the jaw). The parcel gripper has no wrist cameras, so its model carries only the head camera frames. It is on Jelly only: the other versions keep the parallel gripper whichever gripper is fitted.
+Each version sets which parts of the body IK keeps the arms clear of:
 
-All of them share the same arm chain, so forward kinematics match. Every generated model carries camera optical frames — `left_wrist_camera_optical`, `right_wrist_camera_optical` (parallel gripper only), `head_camera_left_optical`, `head_camera_right_optical` — in the ROS optical convention (+z along the optical axis, +x image right, +y image down).
+- **Ox Cart:** the lift column. IK keeps the cart's lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and IK doesn't account for it.
+- **Owl Mount:** the column and its foot plate, as six thin strips. The strips are left out of the hard upper-arm guard, since they sit under the arms' path.
+- **Jelly:** the deck, as three strips, also left out of the hard upper-arm guard. The lift carries the arms down while the deck stays on the ground. Teleop passes the height the lift reports to IK, which moves the deck and the lower column up toward the arms by that amount. Until the lift first reports a homed height, IK treats it as fully raised, and if the readings stop, IK keeps the last height.
+
+**Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere a URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`). The hinge, `*_plate_joint`, turns through half a turn, with 0 alongside the jaw. The parcel gripper has no wrist cameras, so this model has only the head camera frames.
+
+The parcel gripper model exists for Jelly only. The other versions keep the parallel gripper whichever gripper is fitted.
+
+All versions share the same arm chain, so their forward kinematics match. Every generated model has camera optical frames in the ROS optical convention (+z along the optical axis, +x to the right of the image, +y down):
+
+- `left_wrist_camera_optical` and `right_wrist_camera_optical` (parallel gripper only)
+- `head_camera_left_optical` and `head_camera_right_optical`
 
 **In a physics simulator.** Mesh paths are relative, so the files import without a ROS package:
 
-- **Joints:** every moving part. The Jelly base drives through `base_x`, `base_y` and `base_yaw` (the x-drive's omni rollers are not modelled, so plain wheels cannot strafe). Each finger pair is one joint (`left_finger_1_joint`, `right_finger_1_joint`) with the second finger mimicking it. Importers that ignore `<mimic>` see the mimicked joints as independent: command them with the same value.
-- **Joint friction and drives:** each arm joint carries `AxolConfig`'s measured friction as `<dynamics friction>` (Coulomb) and `damping` (viscous), per arm. The motors' impedance gains are on the same joint as `<drive stiffness damping>` (`kp` in N·m/rad, `kd` in N·m·s/rad). URDF has no drive-gain element, so this is a custom one that importers ignore: read it and set each joint's position-drive stiffness and damping after import. The controller-only terms `j_eff` and `kd_host` are left out.
-- **Masses:** arm masses and centres of mass are `AxolConfig`'s tuned values: the arms weigh exactly what gravity compensation models. Wrist 3's lump is split across the gripper parts, keeping its total and CoM. The body, head, wheel and gripper-part masses are estimates, listed in each `Body`'s `masses` and each gripper's `wrist_parts` in the generator; replace them with measured values. In MuJoCo, compile with `fusestatic="false"`: fusing fixed-jointed links misplaces their centres of mass.
-- **Cameras:** attach Isaac Sim cameras to the `*_optical` links with ROS camera axes. The wrist cameras (ZED X One S fisheye) sit at the projection centre from Stereolabs' camera model, rolled so the gripper is at the bottom of the image as in real frames; render them with the factory fisheye (Kannala-Brandt) calibration, not a pinhole model. The head camera (ZED X Mini Wide) frames are likewise each lens's projection centre from Stereolabs' model, 7.2 mm behind its front cover, 50 mm apart.
+- **Joints:** Every moving part is a joint. The Jelly base moves through `base_x`, `base_y` and `base_yaw`. The x-drive's omni rollers are not modelled, so plain wheels can't strafe. Each finger pair is one joint (`left_finger_1_joint`, `right_finger_1_joint`), and the second finger mimics it. Importers that ignore `<mimic>` treat the mimicked joints as independent, so command them with the same value.
+- **Joint friction and drives:** Each arm joint carries `AxolConfig`'s measured friction for its arm, as `<dynamics friction>` (Coulomb) and `damping` (viscous). The motors' impedance gains are on the same joint as `<drive stiffness damping>` (`kp` in N·m/rad, `kd` in N·m·s/rad). URDF has no drive-gain element, so importers ignore this custom one: read it and set each joint's position-drive stiffness and damping after import. The controller-only terms `j_eff` and `kd_host` are left out.
+- **Masses:** The arm masses and centres of mass are `AxolConfig`'s tuned values, the same ones gravity compensation uses. Wrist 3's mass is split across the gripper parts, keeping its total and centre of mass. The body, head, wheel and gripper-part masses are estimates, listed in each `Body`'s `masses` and each gripper's `wrist_parts` in the generator. Replace them with measured values.
+- **MuJoCo:** Compile with `fusestatic="false"`. Fusing fixed-jointed links misplaces their centres of mass.
+- **Cameras:** Attach Isaac Sim cameras to the `*_optical` links with ROS camera axes. Each wrist camera (ZED X One S fisheye) sits at the projection centre from Stereolabs' camera model, rolled so the gripper is at the bottom of the image as in real frames. Render the wrist cameras with the factory fisheye (Kannala-Brandt) calibration, not a pinhole model. The head camera (ZED X Mini Wide) frames are at each lens's projection centre from Stereolabs' model, 7.2 mm behind its front cover and 50 mm apart.
 
 ## `KinematicsSolver` interface
 
@@ -85,33 +99,48 @@ All of them share the same arm chain, so forward kinematics match. Every generat
 |---|---|
 | `num_joints` | Total actuated joints across both arms |
 | `joint_names` | Joint name strings (left arm then right, `ARM_JOINTS` order) |
-| `left_indices` / `right_indices` | Indices into the full `q` array for each arm — `[0…6]` and `[7…13]`, kept as a readable way to split a full vector |
-| `fk(q)` | Forward kinematics → `((pos_3, rot_3x3), (pos_3, rot_3x3))` — the same format `ik` takes |
-| `elbow_positions(q)` | World-frame elbow positions → `(left_3, right_3)` |
-| `elbow_swivel(q)` | Per side, an `ElbowSwivel`: the shoulder centre (where the three shoulder axes meet), the elbow, the wrist centre (forearm roll ∩ `wrist_2`) in the gripper mount frame, and the unit direction the elbow moves in as the arm swings with its mount held (from the arm's Jacobian null space — the wrist is not spherical, so the swing is not a circle) |
-| `ik(q_current, left_pose, right_pose, left_elbow_pos, right_elbow_pos, ..., pose_weight_scale)` | IK from the current joint vector; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays; `pose_weight_scale` (`(position, orientation)`, default `(1, 1)`) multiplies `pos_weight` / `ori_weight` for one solve — box mode uses `(2, 4)` |
-| `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
-| `to_pyroki_order(q)` / `from_pyroki_order(q)` | Convert to/from the internal pyroki joint ordering — only needed when driving `solver.robot` / `solver.robot_coll` directly |
+| `left_indices` / `right_indices` | Indices of each arm in the full `q` array: `[0…6]` and `[7…13]`. |
+| `fk(q)` | Forward kinematics. Returns `((pos_3, rot_3x3), (pos_3, rot_3x3))`, the same format `ik` takes. |
+| `elbow_positions(q)` | World-frame elbow positions, as `(left_3, right_3)`. |
+| `elbow_swivel(q)` | An `ElbowSwivel` per side, describing how the elbow can swing with the gripper mount held still. See below. |
+| `ik(q_current, left_pose, right_pose, left_elbow_pos, right_elbow_pos, ..., pose_weight_scale)` | IK from the current joint vector. Each pose is `(pos_3, rot_3x3)`, and the elbow hints are optional `(3,)` arrays. |
+| `set_posture_pose(q)` / `posture_pose` | Set or read the null-space attractor: the home pose that prevents joint drift. |
+| `to_pyroki_order(q)` / `from_pyroki_order(q)` | Convert to and from pyroki's internal joint order. Needed only when you use `solver.robot` or `solver.robot_coll` directly. |
+
+`ElbowSwivel` holds:
+
+- the shoulder centre, where the three shoulder axes meet
+- the elbow
+- the wrist centre, where the forearm roll axis meets `wrist_2`, in the gripper mount frame
+- the unit direction the elbow moves in as the arm swings with its mount held, from the null space of the arm's Jacobian. The wrist isn't spherical, so this swing isn't a circle.
+
+`pose_weight_scale` in `ik()` is a `(position, orientation)` pair, default `(1, 1)`. It multiplies `pos_weight` and `ori_weight` for one solve. Box mode uses `(2, 4)`.
 
 ## Straight-line paths
 
-`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both **gripper tips** along a straight world-frame line between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
+`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns joint vectors that move both **gripper tips** along a straight world-frame line between the poses of two joint configurations. Position is interpolated linearly and orientation with slerp. Each sample is solved with `ik()`, and the posture attractor moves between the endpoints so the elbow keeps the configuration you started from.
 
-`fk()` and `ik()` work in the gripper *mount* frame, which the URDF chain ends at; the fingers close `GRIPPER_TIP_OFFSET` (145 mm along the link's -Z) beyond it. The planner holds the line at the tip and converts back to a mount target per solve, since a mount held straight swings the tip through an arc as the wrist reorients. `tip_poses(solver, q)` returns the tip frames directly.
+`fk()` and `ik()` work in the gripper *mount* frame, where the URDF chain ends. The fingers close `GRIPPER_TIP_OFFSET` (145 mm along the link's -Z) beyond it. The planner keeps the tip on the line, because a mount moved in a straight line swings the tip through an arc as the wrist turns. `tip_poses(solver, q)` returns the tip frames.
 
-The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. Timing follows the minimum-jerk curve `ease()` — zero velocity *and* zero acceleration at both ends, so a leg neither jolts as it departs nor as it arrives, at the cost of peaking at 1.875x the average speed rather than smoothstep's 1.5x.
+The planner solves the whole segment before anything moves and returns one vector per control tick at `rate`. You can stream the result to `motion_control` as it is. Timing follows the minimum-jerk curve `ease()`, with zero velocity and zero acceleration at both ends. Its peak speed is 1.875 times the average.
 
-IK does not run at every tick. It runs a couple of dozen times a second — `plan_rate` sets a floor, `MAX_STEP_M` and `MAX_STEP_RAD` a ceiling on how far the tip may travel between solves — and a clamped cubic spline fills in the rest. Solving more finely is not just wasted work but actively worse: each solve lands a fraction of a milliradian off its neighbours' trend (the cost's flat direction, not early stopping — more iterations do not change it), and commanding those samples directly turns that wobble into acceleration noise. Interpolating between sparse solves leaves it behind. Measured peak tip acceleration on a 35 cm leg was 1.7 m/s² solving every tick against 0.11 solving 20 a second, where the profile's own optimum is 0.105.
+IK doesn't run on every tick:
 
-Because the ceiling is a distance and the floor is rarely the binding one, a leg is sampled the same way however fast it is run, and accuracy does not degrade with speed: the same 35 cm leg holds its line to 0.74 mm and lands 0.02 mm from its target at 0.08 m/s and at 1.0 m/s alike, planning in 0.15 s either way. Speed buys itself in acceleration instead, which rises with its square.
+- The planner solves at least `plan_rate` samples per second of motion (default 10, capped at `rate`).
+- It solves more often when the tip would otherwise move more than `MAX_STEP_M` (10 mm) or turn more than `MAX_STEP_RAD` (0.1 rad) between samples.
+- A clamped cubic spline fills in the ticks between solved samples.
 
-Two separate thresholds govern accuracy. `settle_fraction` is how close a sample is driven before the planner moves on, by re-solving against the same target; `pos_tolerance` and `ori_tolerance` are where a sample is declared unreachable and `PathPlanningError` is raised, before anything has moved. Conflating them leaves every sample a different distance behind its target, which is itself a source of acceleration noise. The delivered trajectory is then checked *between* solved samples too, where a chord deviates most from the line.
+Solving on every tick would make the motion rougher. Each solve lands slightly off its neighbours' trend, and commanding every sample turns that error into acceleration noise. Because sample spacing follows distance, accuracy doesn't drop as speed rises. A faster segment has higher acceleration instead, which grows with the square of the speed.
 
-An arm whose tip travels less than `min_travel` (and turns less than `min_rotation`) is pinned at `q_from` for the whole segment rather than tracked. Below that scale the difference between two taught configurations is drift rather than intent, and a redundant arm chasing it wanders through its null space — degrees of elbow for a millimetre of tip.
+These parameters control accuracy:
 
-The first vector returned is the configuration IK settles into at the start of the line, which reaches the same gripper pose as `q_from` but generally holds the elbow slightly differently. Commanding it directly puts that difference into a single tick, so plan each segment from the previous one's final vector and blend the remainder in over a few tenths of a second (`axol waypoints` does both).
+- `settle_fraction`: how close each sample is driven to its target, by solving again, before the planner moves on.
+- `pos_tolerance` and `ori_tolerance`: the error at which a sample counts as unreachable. The planner then raises `PathPlanningError` before anything moves. It also checks the path between solved samples, where a chord strays furthest from the line.
+- `min_travel` and `min_rotation`: an arm whose tip moves less than `min_travel` and turns less than `min_rotation` stays at `q_from` for the whole segment. At that scale the difference between two taught configurations is drift, and an arm chasing it would swing its elbow a long way for a tiny tip motion.
 
-Planning calls `ik()` without elbow hints, which is a different JAX trace from the one `KinematicsSolver` warms up; call `path.warmup(solver)` once (off the hot path) to absorb that compile. This is what [`axol waypoints`](/cli/waypoints) replays — for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
+The first vector returned reaches the same gripper pose as `q_from`, but usually with the elbow placed slightly differently. Commanding it directly puts that difference into a single tick. Plan each segment from the previous segment's final vector, and blend in the rest over a few tenths of a second. [`axol waypoints`](/cli/waypoints) does both.
+
+Planning uses a JAX trace that `KinematicsSolver` doesn't compile at startup. Call `path.warmup(solver)` once, outside time-critical code, to compile it. For a shortest-path move in joint space instead, such as a return to rest, see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
 
 ```python
 from almond_axol.kinematics import KinematicsSolver, plan_linear_segment
@@ -127,22 +156,40 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 |---|---|---|
 | `pos_weight` | `50.0` | End-effector position tracking weight |
 | `ori_weight` | `10.0` | End-effector orientation tracking weight |
-| `elbow_weight` | `0.0` | Elbow hint tracking weight for the headset's elbow. `0` (the default) disables it — the headset's inferred elbow proved unreliable on hardware, so in plain teleop the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`). Independent of this, box mode can pass its own synthetic "elbows out" hint with a per-call weight (`VRTeleopConfig.box_elbow_out` / `box_elbow_weight`, off by default, via `ik(elbow_weight=...)`, no fade) |
-| `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
+| `elbow_weight` | `0.0` | Weight on the elbow hint from the headset. `0` (the default) turns it off, because the headset's inferred elbow is unreliable on hardware. |
+| `rest_weight` | `15.0` | Per-step damping that penalises deviation from `q_current`. |
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
-| `self_collision` | `True` | Whether the arm↔torso (`base` / `s1`) collision model is part of the solve. On by default: the capsule model is built, the soft self-collision cost is in the IK graph, the hard upper-arm/base guard runs on every final step so a pose target cannot push an arm into the torso, and the return-to-rest planner is collision-aware. Plain teleop rarely exercises it (the operator's own arms keep targets plausible); [box mode](/guides/vr-interface#box-mode) does, since its parallel, closing gripper poses would otherwise fold the elbows into the base. `False` drops all of it and the reset planner interpolates in joint space with joint limits only (limits are clamped every step either way). The two fields below tune the collision-aware solve |
-| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies (with `self_collision` on). Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
+| `self_collision` | `True` | Whether the collision model between the arms and the torso (`base` / `s1`) is part of the solve. See [Self-collision](#self-collision). |
+| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. It is below the arm-to-torso clearance of normal teleop poses, so the collision cost stays inactive during ordinary tracking. |
 | `self_collision_weight` | `150.0` | Self-collision penalty weight (with `self_collision` on) |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
-| `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
-| `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |
-| `lambda_factor` | `10.0` | LM damping multiplier after each rejected step, so damping spans its useful range within the iteration budget |
-| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call — an over-limit step is scaled as a whole vector (not clipped per joint), so the commanded configuration keeps its direction |
-| `max_reach` | `0.82` m | Asymptotic cap on the shoulder-to-EE target distance. A soft runaway-target guard, **not** the true reach boundary (which is direction-dependent, ~0.69–0.78 m); targets are soft-clamped so they approach but never reach it. Extension smoothness is handled by the manipulability damping instead |
-| `reach_soft_start` | `0.78` m | Distance from the shoulder where the reach soft-clamp begins to engage (C1-smooth, so it only ever acts on targets beyond any reachable pose) |
-| `manip_damping_threshold` | `0.015` | Translational manipulability below which per-arm adaptive damping ramps in — off in normal use (~0.027 at rest), on only approaching a singular boundary |
-| `manip_damping_boost` | `60.0` | Extra rest-cost weight added to an arm at zero manipulability, ramped in quadratically from `manip_damping_threshold` to slow the solver smoothly near singularities. `0` disables |
-| `limit_damping_margin` | `0.12` rad | Distance from a joint limit within which that joint's damping ramps in — gated on approach, so a joint parked against a limit by task pressure stays free |
-| `elbow_fade_band` | `0.15` m | Height band above the shoulder over which the elbow hint's weight fades to zero (the inferred elbow becomes unreliable at/above shoulder height) |
+| `cost_tolerance` | `1e-4` | Convergence tolerance. It is small enough that only real convergence ends a solve, not a rejected step. |
+| `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for each solve. |
+| `lambda_factor` | `10.0` | Multiplier on the damping after each rejected step, so the damping covers its useful range within the iteration budget. |
+| `max_joint_delta` | `~0.035` rad | Largest joint change per `ik()` call. A larger step is scaled as a whole vector, not clipped per joint, so the motion keeps its direction. |
+| `max_reach` | `0.82` m | Soft cap on the distance from shoulder to target, which stops runaway targets. It isn't the true reach, which depends on direction (about 0.69 to 0.78 m). |
+| `reach_soft_start` | `0.78` m | Distance from the shoulder where the soft reach cap starts to act. It is smooth and acts only on targets beyond any reachable pose. |
+| `manip_damping_threshold` | `0.015` | Manipulability below which extra damping ramps in for that arm. It is about 0.027 at rest, so the damping acts only near a singular pose. |
+| `manip_damping_boost` | `60.0` | Extra damping weight at zero manipulability, ramped in from `manip_damping_threshold` to slow the solver near singular poses. `0` disables. |
+| `limit_damping_margin` | `0.12` rad | Distance from a joint limit within which the joint is damped while it moves toward the limit. A joint resting against a limit stays free. |
+| `elbow_fade_band` | `0.15` m | Height band above the shoulder over which the elbow hint fades to zero, since the inferred elbow is unreliable at shoulder height and above. |
+| `robot_model` | `None` | Axol version to solve for: `classic`, `standalone`, `ox_cart`, `owl` or `mobile` (Axol on Jelly). `None` picks `mobile` when Jelly is enabled, else `mount`. |
+| `mount` | `None` | Mount without Jelly: `classic`, `standalone`, `ox_cart` or `owl`. `None` reads `kinematics.mount` from the shared settings. |
+| `gripper` | `None` | Fitted gripper, `parallel` or `parcel`. `None` reads `axol.gripper` from the shared settings. |
+| `backend` | `"jax"` | IK backend: `"jax"` (Pyroki, the default) or `"mink"`. The control panel sets it with **IK solver** under **Kinematics**. |
+
+When the headset elbow hint is on (`elbow_weight` above `0`), it is projected onto the elbow positions the robot can reach and fades out above shoulder height (see `elbow_fade_band`). In plain teleop with the hint off, the posture attractor sets the arm's swivel. Box mode can pass its own "elbows out" hint with a per-call weight, through `ik(elbow_weight=...)` and with no fade. It is set by `VRTeleopConfig.box_elbow_out` and `box_elbow_weight`, and is off by default.
+
+### Self-collision
+
+With `self_collision` on (the default):
+
+- the capsule model is built, and a soft self-collision cost is part of the IK solve
+- a hard guard between the upper arms and the base runs on every final step, so a pose target can't push an arm into the torso
+- the return-to-rest planner avoids collisions
+
+Plain teleop rarely needs it, because the operator's own arms keep targets plausible. [Box mode](/guides/vr-interface#box-mode) does need it: its parallel, closing gripper poses would otherwise fold the elbows into the base.
+
+With `self_collision` off, all of this is dropped, and the return-to-rest planner interpolates in joint space within the joint limits. Joint limits are clamped on every step either way. `self_collision_margin` and `self_collision_weight` tune the collision-aware solve.

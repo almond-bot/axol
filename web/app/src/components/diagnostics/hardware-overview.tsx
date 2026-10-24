@@ -167,7 +167,7 @@ export function HardwareOverview({
           ? motorFaultLabel(faults[0]) + (faults.length > 1 ? ` +${faults.length - 1}` : "")
           : `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 0} motors reachable`
         : state === "busy"
-          ? "In use by task"
+          ? "In use by a task"
           : state === "connecting"
             ? "Connecting…"
             : state === "error"
@@ -195,9 +195,7 @@ export function HardwareOverview({
           onClick={onRobotDisconnect}
           disabled={robotBusy || hardwareBusy}
           aria-label={`Disconnect ${title}`}
-          title={
-            hardwareBusy ? busyTitle : `Release the ${title} link. The hardware stays powered.`
-          }
+          title={hardwareBusy ? busyTitle : `Disconnect ${title}. It stays powered on.`}
         >
           <Unplug />
         </Button>
@@ -209,7 +207,7 @@ export function HardwareOverview({
           disabled={!online || robotBusy || hardwareBusy || otherLive}
           title={
             otherLive
-              ? `Disconnect ${PROFILE_LABELS[activeProfile]} first — the telemetry link shows one device at a time.`
+              ? `Disconnect ${PROFILE_LABELS[activeProfile]} first. The telemetry link shows one device at a time.`
               : hardwareBusy
                 ? busyTitle
                 : undefined
@@ -227,7 +225,7 @@ export function HardwareOverview({
         state={state}
         dot={dot}
         status={<Text title={label}>{label}</Text>}
-        channels={channelText || "—"}
+        channels={channelText || "–"}
         action={action}
       />
     )
@@ -238,7 +236,7 @@ export function HardwareOverview({
     const view = jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
     const busy = jellyBusy[device] ?? false
     const live = view.state === "connected" || view.state === "busy"
-    const channel = jelly?.[device]?.channel ?? canDevices?.[device]?.channel ?? "—"
+    const channel = jelly?.[device]?.channel ?? canDevices?.[device]?.channel ?? "–"
     const battery = device === "lift" && jellySupported ? jellyBattery(jelly) : null
     const summary =
       jelly && view.state === "connected" && !view.fault ? (
@@ -273,7 +271,7 @@ export function HardwareOverview({
         title={
           hardwareBusy || view.state === "busy"
             ? busyTitle
-            : `Release the ${title} link. The hardware stays powered.`
+            : `Disconnect ${title}. It stays powered on.`
         }
       >
         {busy ? <Loader2 className="animate-spin" /> : <Unplug />}
@@ -286,7 +284,7 @@ export function HardwareOverview({
         disabled={!online || !jellySupported || busy || hardwareBusy}
         title={
           !jellySupported
-            ? "Update the serve host to connect Jelly's wheels and lift from the panel."
+            ? "Update the software on the host to connect Jelly."
             : hardwareBusy
               ? busyTitle
               : undefined

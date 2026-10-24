@@ -81,7 +81,7 @@ export const PARAM_UI: Record<string, ParamUi> = {
   OVER_VOLTAGE: { label: "Over voltage" },
   LOW_VOLTAGE: {
     label: "Low voltage",
-    hint: "The driver sets this to −2 V on enable to suppress the undervoltage fault.",
+    hint: "Axol sets this to −2 V when it enables the motor, so the low-voltage fault never trips.",
   },
   STALL_TIME_LIMIT: { label: "Stall time limit" },
   EBRAKE_START_DUTY: { label: "E-brake start duty cycle" },

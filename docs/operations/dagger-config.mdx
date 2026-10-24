@@ -1,7 +1,7 @@
 ---
 title: "DAgger Collection Config Parameters"
 sidebarTitle: "Config Parameters"
-description: "Every setting for axol collect-dagger — what it does and its default."
+description: "Every setting for axol collect-dagger, what it does and its default."
 ---
 
 import Robot from "/snippets/config/robot.mdx";
@@ -12,9 +12,18 @@ import Kinematics from "/snippets/config/kinematics.mdx";
 import VRServer from "/snippets/config/vr-server.mdx";
 import Jelly from "/snippets/config/jelly.mdx";
 
-Every setting for `axol collect-dagger`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+Every setting for `axol collect-dagger`. Add any flag below to the command, or set it once in the control panel. See [Command configuration](/cli/configuration) for config files and syntax.
 
-In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the same sections appear without this command's wrapper prefixes — `robot_config.axol_config.*` is the file's `axol`, `teleop_config.vr_teleop_config.*` is `teleop`, `teleop_config.kinematics_config.*` is `kinematics`, the other `robot_config.*` fields are `lerobot`, and the recording fields live under `recording` — exactly as for [data collection](/operations/data-collection-config).
+The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`) is read by default. It stores these flags in the same sections as for [data collection](/operations/data-collection-config), without this command's prefixes.
+
+| Flag | Section in the settings file |
+|---|---|
+| `robot_config.axol_config.*` | `axol` |
+| `robot_config.left_channel`, `robot_config.right_channel` | `robot` |
+| Other `robot_config.*` fields | `lerobot` |
+| `teleop_config.vr_teleop_config.*` | `teleop` |
+| `teleop_config.kinematics_config.*` | `kinematics` |
+| Recording flags | `recording` |
 
 ```bash
 axol collect-dagger --policy_path myorg/pick-act --policy_type act \
@@ -23,64 +32,62 @@ axol collect-dagger --policy_path myorg/pick-act --policy_type act \
 ```
 
 <Warning>
-  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same as when the policy's data was collected**. A policy only works with the dynamics it was trained on.
+  Use the **same** stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps` and cameras as when the policy's training data was recorded. A policy only works with the settings it was trained on.
 </Warning>
 
 ## Policy
 
 | Flag | Default | Description |
 |---|---|---|
-| `--policy_path` | required for local policies | Policy checkpoint — a HuggingFace Hub repo id or local path. Unused for `custom`; model selection stays at the endpoint. |
-| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, `groot`, or `custom` for the remote custom policy interface. |
-| `--device` | `cuda` | `cuda`, `cpu`, or `mps`; local policies only. |
+| `--policy_path` | required for local policies | Checkpoint, as a HuggingFace Hub repo ID or a local path. Not used with `custom`. |
+| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, `groot` or `custom` ([your own model](/operations/custom-policy)). |
+| `--device` | `cuda` | `cuda`, `cpu` or `mps`. Local policies only. |
 | `--episode_time_s` | `600` | Maximum episode length (s), including interventions. `0` removes the cap. |
-| `--policy_max_vel` | `6.283` | Local policies: speed limit (rad/s) on joint actions. `0` disables. |
+| `--policy_max_vel` | `6.283` | Local policies: speed limit (rad/s) on joint actions. `0` turns it off. |
 | `--policy_max_accel` | `21.99` | Local policies: acceleration limit (rad/s²) on joint actions. |
-| `--subtasks` | `null` | Local policies: ordered sub-instructions, e.g. `["reach","grasp","lift"]`. Typing `1..N` switches instructions mid-episode. Rejected for custom policies, which manage instructions at the endpoint. |
+| `--subtasks` | `null` | Local policies: a list of instructions, such as `["reach","grasp","lift"]`. Type a number from 1 to N to switch instruction during an episode. Not allowed with `custom`. |
 
 ## Custom policy interface
 
-`--policy_type custom` uses the [custom policy interface](/api/policy-plan).
-Set these fields on the DAgger command itself; its shared settings inherit
-from `collect-data`, not the run-policy inference category.
+These fields apply with `--policy_type custom`, which uses the [custom policy interface](/api/policy-plan). Set them on the `collect-dagger` command. DAgger reads its shared settings from data collection, not from the **Inference** settings that run policy uses.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--server_host` | `127.0.0.1` | Address of the existing policy endpoint. |
 | `--server_port` | `8765` | Policy endpoint port. |
-| `--actions_per_chunk` | `30` | Maximum returned plan horizon. |
-| `--plan_config.request_interval` | `5` | Dispatch this many rows between policy requests. |
-| `--plan_config.max_adoption_offset_steps` | `6` | Maximum reply age in control steps; must be inside the action horizon. |
-| `--plan_config.late_policy` | `blocking_refresh` | Hold and request reset plans on expiry, or choose `abort`. |
-| `--hold_to_intervene` | `false` | Must be `true` for custom policies: held grips take control; releasing both requests policy handback. |
-| `--shadow_inference` | `true` | Continue prediction during operator control, discarding replies. |
-| `--handover_duration_s` | `0.2667` | Joint-space handback ramp after IK, followed by limited convergence. |
-| `--record_joint_actions` | `false` | Record resolved joint commands independently of the wire action layout. |
-| `--start_from_current_pose` | `false` | Skip startup home and the home after idle teleop. |
-| `--home_on_start` | `false` | Restore startup home when current-pose episode starts are enabled. |
+| `--actions_per_chunk` | `30` | Maximum number of actions in each plan. |
+| `--plan_config.request_interval` | `5` | Run this many actions between policy requests. |
+| `--plan_config.max_adoption_offset_steps` | `6` | How many control steps a reply may arrive after its request. Must be shorter than the plan. |
+| `--plan_config.late_policy` | `blocking_refresh` | When the plan runs out, hold and request a new one. `abort` ends the session instead. |
+| `--hold_to_intervene` | `false` | Must be `true` with `custom`. Hold a grip to take control, and release both to hand back. |
+| `--shadow_inference` | `true` | Keep the policy predicting while you drive. Its replies are ignored. |
+| `--handover_duration_s` | `0.2667` | Time (s) to blend from your last command back to the policy when you hand back. |
+| `--record_joint_actions` | `false` | Record joint commands as the actions, whatever action layout the policy uses. |
+| `--start_from_current_pose` | `false` | Skip the move to rest at startup and after teleoperating between episodes. |
+| `--home_on_start` | `false` | With `--start_from_current_pose`, still move to rest at startup. |
 
 ## Recording
 
 | Flag | Default | Description |
 |---|---|---|
-| `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
-| `--task` | required | Task description stored with every frame. Sent to local policies; custom policies choose instructions at the endpoint. |
-| `--fps` | `30` | Recording rate and the policy state's control rate; must match the policy's training fps. Cameras capture at 60 and are decimated to this before encoding. |
+| `--repo_id` | required | Dataset ID, `<user>/<dataset>`. |
+| `--task` | required | Task description saved with every frame and sent to local policies. A custom policy chooses instructions on its server. |
+| `--fps` | `30` | Recording rate and control rate. Must match the policy's training rate. Cameras capture at 60 and drop frames to match. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while you intervene, independent of `fps`. |
-| `--policy_fps` | `20` | Rate the relay feeds the policy's observation frames at, capped at the capture rate. Independent of `fps`: it only thins the RGB ring the control process reads inference images from, so the relay fits beside the headset and panel streams. Between ring frames a tick re-uses the last frame set; the loop, the recorded state rows and the action stream stay at `fps`. |
-| `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to, and the resolution the policy sees: `SVGA`, `HD1080`, or `HD1200`. |
+| `--policy_fps` | `20` | Rate of new camera images for the policy, up to the capture rate. Between images the policy reuses the last ones. Recording and control stay at `fps`. |
+| `--dataset_resolution` | `SVGA` | Resolution of the recorded video and of the images the policy sees: `SVGA`, `HD1080` or `HD1200`. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
 | `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
 | `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
-| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
+| `--config_path` | none | Load a JSON or YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. The config file and flags override it. |
 
 ## Robot {#robot-config}
 
-CAN buses, cameras, and what goes into observations.
+CAN buses, cameras and what goes into observations.
 
 <LeRobotRobot prefix="robot_config." />
 
@@ -90,7 +97,7 @@ CAN buses, cameras, and what goes into observations.
 
 ### Arm gains {#robot}
 
-Arm stiffness, gripper limits, and per-joint gains.
+Arm stiffness, gripper limits and per-joint gains.
 
 <Robot prefix="robot_config.axol_config." />
 
@@ -114,7 +121,7 @@ The connection the headset streams poses over.
 
 ## Jelly {#jelly}
 
-The optional powered cart, driven from the headset thumbsticks between takes. Jelly motion is never recorded.
+Jelly Mobile, the optional powered base. You drive it from the headset thumbsticks between episodes. Jelly motion is never recorded.
 
 <Jelly prefix="teleop_config.jelly." />
 
@@ -123,6 +130,6 @@ The optional powered cart, driven from the headset thumbsticks between takes. Je
 | Flag | Default | Description |
 |---|---|---|
 | `--teleop_config.has_gripper` | `true` | Set automatically from `--robot_config.axol_config.has_gripper`. |
-| `--teleop_config.vr_teleop_config.gripper` | `parallel` | Set automatically from `--robot_config.axol_config.gripper`; box mode exists only with `parcel`. |
-| `--teleop_config.id` | `null` | LeRobot bookkeeping, unused by Axol. |
-| `--teleop_config.calibration_dir` | `null` | LeRobot bookkeeping, unused by Axol. |
+| `--teleop_config.vr_teleop_config.gripper` | `parallel` | Set automatically from `--robot_config.axol_config.gripper`. Box mode is available only with `parcel`. |
+| `--teleop_config.id` | `null` | Used by LeRobot only. Axol ignores it. |
+| `--teleop_config.calibration_dir` | `null` | Used by LeRobot only. Axol ignores it. |

@@ -167,10 +167,10 @@ export function CamerasPanel({
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
         {mantisMode
-          ? "Assign the ZED cameras connected to this machine to the head and the left and right Mantis. This mapping is stored separately from the Axol camera layout."
-          : "Assign the ZED cameras connected to this machine to their Axol slots."}{" "}
-        Then choose what each one is used for. Collect data and run policy need at least one camera
-        recording; teleop streams whichever are set to the headset.
+          ? "Assign the cameras connected to this host to the head and to each Mantis. This layout is separate from Axol's."
+          : "Assign the cameras connected to this host to their places on Axol."}{" "}
+        Then choose what each camera does. Collect data and Run policy need at least one camera set
+        to Record. Teleop sends the cameras set to Stream to the headset.
       </p>
 
       <div className="flex flex-col gap-2">
@@ -182,7 +182,7 @@ export function CamerasPanel({
               size="sm"
               onClick={refresh}
               disabled={detecting || restarting}
-              title="Re-query the ZED daemon's current device list and grab fresh preview frames. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
+              title="Refresh the camera list and previews. To detect a camera you plugged in or unplugged, restart the camera service."
             >
               {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
               Refresh
@@ -192,10 +192,10 @@ export function CamerasPanel({
               size="sm"
               onClick={restartDaemon}
               disabled={detecting || restarting}
-              title="Restart the ZED X daemon so it re-scans the GMSL links — needed to pick up any camera plugged in or unplugged since boot"
+              title="Restart the camera service to detect cameras you plugged in or unplugged."
             >
               {restarting ? <Loader2 className="animate-spin" /> : null}
-              Restart daemon
+              Restart camera service
             </Button>
           </div>
         </div>
@@ -203,8 +203,8 @@ export function CamerasPanel({
           <p className="text-xs text-white/35">Detecting…</p>
         ) : devices.length === 0 ? (
           <p className="text-xs text-white/35">
-            No cameras detected. Check the GMSL cables, or restart the daemon if a camera was
-            plugged in after boot.
+            No cameras found. Check the camera cables. If you plugged a camera in after startup,
+            press Restart camera service.
           </p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -240,21 +240,21 @@ export function CamerasPanel({
         <ResolutionSelect
           id="camera-stream-resolution"
           label="Streaming resolution"
-          hint="Capture resolution sent to the headset (Off disables streaming)"
+          hint="Resolution sent to the headset, or Off to stop streaming."
           value={streamResolution}
           onChange={(v) => onChange({ ...spec, stream_resolution: v })}
         />
         <ResolutionSelect
           id="camera-record-resolution"
           label="Recording resolution"
-          hint="Dataset video is downscaled to this (Off disables recording)"
+          hint="Resolution saved in the dataset, or Off to stop recording."
           value={recordResolution}
           onChange={(v) => onChange({ ...spec, record_resolution: v })}
         />
       </div>
 
       <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-        <Label>{mantisMode ? "Mantis cameras" : "Axol Cameras"}</Label>
+        <Label>{mantisMode ? "Mantis cameras" : "Axol cameras"}</Label>
         {cameraSlots.map((slot) => {
           const serial = serials[slot.key]?.trim() ?? ""
           const kind = kindBySerial.get(serial)
@@ -337,8 +337,8 @@ function KindBadge({ kind }: { kind: string }) {
       className="rounded border border-white/15 bg-white/[0.03] px-1.5 py-0.5 text-[10px] tracking-wide text-white/55 uppercase"
       title={
         kind === "stereo"
-          ? "Stereo ZED X (both eyes from one grab) — detected automatically"
-          : "Mono ZED-X One — detected automatically"
+          ? "Stereo camera (ZED X), detected automatically"
+          : "Mono camera (ZED X One), detected automatically"
       }
     >
       {kind}

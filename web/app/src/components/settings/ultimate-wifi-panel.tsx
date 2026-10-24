@@ -101,10 +101,10 @@ export function UltimateWifiPanel() {
       // Blank now means preserve the host-side secret on later edits.
       setPassword("")
       setShowPassword(false)
-      toast.success("Ultimate shared-map Wi-Fi saved securely on the host.")
+      toast.success("Tracker Wi-Fi saved on the host.")
     } catch (reason) {
       setError(message(reason))
-      toast.error(`Could not save Ultimate Wi-Fi: ${message(reason)}`)
+      toast.error(`Couldn't save the tracker Wi-Fi: ${message(reason)}`)
     } finally {
       setSaving(false)
     }
@@ -114,7 +114,7 @@ export function UltimateWifiPanel() {
     config?.status === "valid"
       ? "Configured"
       : config?.status === "permissions-warning"
-        ? "Permissions need repair"
+        ? "Save again to fix permissions"
         : config?.status === "invalid"
           ? "Invalid"
           : config?.status === "missing"
@@ -131,18 +131,17 @@ export function UltimateWifiPanel() {
     <section className="flex flex-col gap-4 rounded-lg border border-white/10 bg-white/[0.02] p-4">
       <div className="flex flex-wrap items-center gap-2">
         <Wifi className="size-4 text-white/50" />
-        <span className="text-sm font-medium text-white/80">Ultimate shared-map Wi-Fi</span>
+        <span className="text-sm font-medium text-white/80">Tracker Wi-Fi</span>
         <span className={`rounded-full px-2 py-0.5 text-[11px] ${statusClass}`}>{statusLabel}</span>
       </div>
       <p className="max-w-prose text-xs leading-relaxed text-white/45">
-        This is pyvut&apos;s protected shared-map AP configuration/fallback for synchronizing two
-        trackers, not your router Wi-Fi. Dongle firmware may supply the active host credentials. The
-        saved password is write-only and is never returned to this browser.
+        The private network the two trackers use to share their map. This is not your router&apos;s
+        Wi-Fi. The saved password is never shown here.
       </p>
 
       {loading ? (
         <p className="flex items-center gap-2 text-xs text-white/45">
-          <Loader2 className="size-4 animate-spin" /> Loading host configuration…
+          <Loader2 className="size-4 animate-spin" /> Loading…
         </p>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2">
@@ -159,7 +158,7 @@ export function UltimateWifiPanel() {
           </div>
           <div className="flex flex-col gap-1.5 sm:col-span-2">
             <Label htmlFor="ultimate-wifi-password">
-              Password {config?.passwordSet ? "(leave blank to preserve)" : "(required)"}
+              Password {config?.passwordSet ? "(leave blank to keep)" : "(required)"}
             </Label>
             <div className="relative">
               <Input
@@ -171,9 +170,7 @@ export function UltimateWifiPanel() {
                 spellCheck={false}
                 minLength={8}
                 maxLength={64}
-                placeholder={
-                  config?.passwordSet ? "Saved password remains unchanged" : "Choose a password"
-                }
+                placeholder={config?.passwordSet ? "Keep saved password" : "Choose a password"}
                 className="pr-10"
               />
               <button
@@ -220,8 +217,9 @@ export function UltimateWifiPanel() {
       )}
       {!loading && !valid && (
         <p className="text-[11px] leading-relaxed text-amber-300/75">
-          Enter a 1–32 byte SSID, ISO country code, valid Wi-Fi channel center in MHz, and an 8–63
-          character password on the first save. Verify the channel is permitted in that country.
+          Enter an SSID (up to 32 bytes), a two-letter country code, a Wi-Fi channel frequency in
+          MHz and a password of 8 to 63 characters. After the first save you can leave the password
+          blank. Check that the channel is allowed in your country.
         </p>
       )}
       {!loading && (
@@ -233,7 +231,7 @@ export function UltimateWifiPanel() {
           {config?.configured && (
             <span className="text-[11px] text-white/30">
               Password {config.passwordSet ? "saved" : "missing"} ·{" "}
-              {config.status === "valid" ? "protected host file" : "host file needs attention"}
+              {config.status === "valid" ? "file protected" : "file needs attention"}
             </span>
           )}
         </div>

@@ -40,15 +40,15 @@ def _add_arguments(ap: argparse.ArgumentParser) -> None:
         "prefix",
         nargs="?",
         default=None,
-        help="Flight-recorder prefix used with --teleop.record. A bare name "
-        "resolves in the recordings directory (~/.almond/recordings/); "
-        "omit it entirely to analyze the newest recording there.",
+        help="Recording to analyze: the prefix given to --teleop.record, or a "
+        "name in ~/.almond/recordings/. Leave it empty to use the newest "
+        "recording there.",
     )
     ap.add_argument(
         "--save-run",
         action="store_true",
-        help="Persist the analysis as a tuning-run artifact "
-        "(~/.almond/diagnostics/tuning/) for the diagnostics UI",
+        help="Save the analysis as a tuning run for the diagnostics dashboard "
+        "(in ~/.almond/diagnostics/tuning/).",
     )
     ap.add_argument(
         "--label",

@@ -45,9 +45,9 @@ export function MountRequired({
       <div className="flex flex-col gap-1">
         <span className="text-base font-semibold text-white">Which Axol is this?</span>
         <p className="text-xs text-white/50">
-          Pick what this Axol is mounted on before the first run: it sets the body IK keeps the arms
-          clear of. Change it any time in Settings → Robot. With Jelly attached the robot is Axol ×
-          Jelly automatically.
+          Choose what this Axol is mounted on before the first run. Axol uses it to keep the arms
+          clear of the mount. You can change it later in the Robot tab of the Axol settings. When
+          Jelly is attached, Axol switches to Axol on Jelly.
         </p>
       </div>
       <MountPicker
@@ -60,7 +60,7 @@ export function MountRequired({
       <div className="flex items-center justify-end gap-3">
         <span className="text-xs text-white/45">
           {locked
-            ? "Connect the Axol to choose."
+            ? "Connect Axol to choose."
             : picked
               ? `${NAMES[picked]} selected`
               : "Select a version, then save."}

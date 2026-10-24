@@ -18,13 +18,13 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}max_joint_delta</F> | `0.0346` | Largest joint change (rad) per IK call. Raise for faster tracking, lower for gentler motion. |
 | <F>--{prefix}max_reach</F> | `0.82` | Maximum shoulder-to-target distance (m). Targets beyond it are pulled in. |
 | <F>--{prefix}reach_soft_start</F> | `0.78` | Distance (m) at which the reach limit starts to act. |
-| <F>--{prefix}manip_damping_threshold</F> | `0.015` | Below this manipulability, extra damping kicks in (near full extension). |
+| <F>--{prefix}manip_damping_threshold</F> | `0.015` | Below this manipulability, extra damping starts (near full extension). |
 | <F>--{prefix}manip_damping_boost</F> | `60.0` | Extra damping at zero manipulability. `0` disables. |
 | <F>--{prefix}limit_damping_margin</F> | `0.12` | Distance (rad) from a joint limit inside which the joint is damped while moving toward it. |
 | <F>--{prefix}elbow_fade_band</F> | `0.15` | Height (m) above the shoulder over which the elbow hint fades out. |
-| <F>--{prefix}robot_model</F> | `None` | Axol version to solve for: `classic`, `standalone`, `ox_cart`, `owl` or `mobile` (Jelly base). Picks the URDF, so the body the arms are kept clear of and the joint limits. `None` infers it: `mobile` when Jelly is enabled (attached and not switched off), else `mount`. |
-| <F>--{prefix}mount</F> | `None` | What Axol is mounted on without Jelly: `classic` (legacy), `standalone`, `ox_cart` or `owl` — the control panel's **Choose your Axol**. Ignored while Jelly is enabled. `None` reads `kinematics.mount` from the shared settings (legacy if unset). |
-| <F>--{prefix}gripper</F> | `None` | Fitted gripper, `parallel` or `parcel` — teleop sets it from `--axol.gripper`. Axol on Jelly has a URDF per gripper, so it picks the gripper geometry kept clear of the body; the classic Axol ignores it. `None` reads `axol.gripper` from the shared settings. |
+| <F>--{prefix}robot_model</F> | `None` | Axol version to solve for: `classic`, `standalone`, `ox_cart`, `owl` or `mobile` (Axol on Jelly). It sets the joint limits and the body the arms are kept clear of, and `None` picks `mobile` when Jelly is enabled, else `mount`. |
+| <F>--{prefix}mount</F> | `None` | What Axol is mounted on when Jelly isn't enabled: `classic` (Legacy), `standalone`, `ox_cart` or `owl`, as picked under **Choose your Axol** in the control panel. `None` reads `kinematics.mount` from the shared settings, or Legacy if it is unset. |
+| <F>--{prefix}gripper</F> | `None` | Fitted gripper, `parallel` or `parcel`. Teleop sets it from `--axol.gripper`, and only Axol on Jelly uses it to pick a model. `None` reads `axol.gripper` from the shared settings. |
 
 <Note>
   **Mantis mode** replaces any of these still at their default with `pos_weight 200`, `ori_weight 120`, `manipulability_weight 0`, `self_collision_margin 0.02`, `max_joint_delta 0.05`, `max_iterations 12`. A value you set explicitly still wins.

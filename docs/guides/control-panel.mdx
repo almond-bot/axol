@@ -1,23 +1,28 @@
 ---
 title: "Web Control Panel"
-description: "Drive Axol from a browser — connect the Axol host and robot, assign the cameras, then run any operation without touching the terminal."
+description: "Connect to Axol from a browser, set up cameras and settings, and run every operation without a terminal."
 ---
 
-The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the core operations — **teleoperation**, **gravity compensation**, **data collection**, **dataset replay**, and **policy inference** — behind connect/run buttons, with live status for the robot motors and the camera setup.
+The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
 
-It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
+From top to bottom, the page has:
 
-## Start the server
+- **Connection tiles** for the robot's computer, Axol, Mantis and Jelly.
+- The **Settings** card.
+- The **operation panel**, where you pick an operation and press **Start**.
+- The **Logs** console.
 
-With the [one-command install](/installation), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+## Open the control panel
 
-On a development install, start it yourself:
+With the [one-command install](/installation), the server already runs on the robot's computer (the one wired to the arms, with the ZED cameras attached). It starts at boot and restarts if it stops. Open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+
+On a development install, start the server yourself:
 
 ```bash
 axol serve
 ```
 
-This prints a local and a LAN URL (HTTPS by default):
+It prints a local and a LAN URL:
 
 ```
 Axol control panel:
@@ -25,233 +30,318 @@ Axol control panel:
   LAN   : https://192.168.1.50:8001
 ```
 
-Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`. The layout is **responsive**, so you can run it from a phone or tablet on the same network, not just a desktop.
+Open the **Local** URL on the robot's computer, or the **LAN** URL from another machine on the same network. Accept the self-signed certificate the first time. The panel is at `/control`, and it works on a phone or tablet too.
 
 <Note>
-  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Development install](/advanced/development-install#build-the-web-ui).
+  On a development install, build the local UI once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). Or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve`. See [Development install](/advanced/development-install#build-the-web-ui).
 </Note>
 
 <Tip>
-  The nav bar's **Quickstart** button — in the **☰** menu on a phone — has copyable commands for installing the CLI and launching the server.
+  The **Quickstart** button in the nav bar (in the **☰** menu on a phone) has commands to copy for installing the CLI and starting the server.
 </Tip>
 
 ## Connections
 
-The top of the panel has three tiles — **Axol Host**, **Axol**, and **Mantis** — each with a colored status dot. Axol and Mantis share the host's idle telemetry connection: connecting one switches the live CAN health view to that hardware. The Mantis tile checks the two grippers on `can_mantis_l/r`; switching back to Axol restores the arm-motor view. **Click a tile's title to open its settings**: the Axol and Mantis tiles open their own [device settings](#settings), and the host tile opens the general (shared) settings.
+The top of the page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
 
-The **Axol** and **Mantis** tiles also carry the one system-wide choice of which hardware every operation runs on: the selected device's tile shows a **selected** marker and the other offers **Select**. There is no per-operation Mantis toggle: teleop and data collection follow the selection, the idle link auto-connects to the selected device, and while Mantis is selected only **Teleoperation** and **Collect data** are listed — the Axol-only operations (gravity comp, waypoints, replay, run policy, DAgger) return when Axol is selected again. The selection is stored with the [shared settings](#settings) on the host, so every operator device sees the same choice; it is locked while an operation is running.
+**Choose the device.** Every operation runs on either Axol or Mantis. The chosen tile shows **selected**, and the other shows **Select**.
 
-The selection follows the hardware: when CAN discovery has settled and exactly one of Axol or Mantis is attached while the other is selected, the panel switches the selection to the attached device (a rejected save is retried twice with backoff). It does this once per change in which devices are attached, so if you deliberately **Select** the absent device it stays selected until the attached hardware changes. With both or neither attached, the stored selection is left alone. It never switches while an operation is running.
+- With Mantis selected, only **Teleoperation** and **Collect data** are offered.
+- The choice is saved on the host, so every browser sees the same one.
+- You can't change it while an operation is running.
+- If only one of Axol or Mantis is plugged in, the panel selects it for you.
+
+<Warning>
+  Closing the browser tab, or disconnecting from the host, does **not** stop anything. The robot connection and any running operation keep going in `axol serve`. Press **Stop** to end an operation.
+</Warning>
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). Click the field for a dropdown of the last five hosts this browser connected to successfully, newest first; pick one or keep typing, and press **Escape** to close the list without closing the dialog; if the host can't be reached the attempt gives up after a couple of seconds with a *can't reach the host* message instead of leaving the tile stuck on *Connecting…*. When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot. Teleop and gravity comp need only this connection.
+The **Axol Host** is the computer running `axol serve`. Press **Connect** on its tile and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
 
-#### Axol version
+Once connected, the tile shows the host's name and its installed version (for example `axol v0.1.2`). Teleoperation and gravity compensation need nothing else.
 
-Axol comes in several versions with the same arms. **Axol × Jelly**, on the Jelly mobile base, is never picked: a robot is the mobile Axol whenever [Jelly](/guides/vr-interface#jelly) is enabled, that is, its wheel or lift adapter is attached and not switched off in the Robot tab. Without Jelly, pick what Axol is mounted on at the top of the Robot tab (**Choose your Axol**), then save:
+The connected tile has three buttons:
 
-- **Axol Legacy:** the original model, and the default.
-- **Axol Standalone:** the shoulder bar and head camera on their own.
-- **Axol × Ox:** on the Ox cart's lift column, with the lift fully raised.
-- **Axol × Owl:** on the Owl mount's column and foot plate.
+| Button | What it does |
+|---|---|
+| **Restart** | Reboots the robot's computer after you confirm. Reconnect when it is back, usually in under a minute. |
+| **Shut down** | Powers the robot's computer off after you confirm. You need physical access to turn it back on. |
+| **Disconnect** | Disconnects this browser only. The server, the robot and any running operation keep going. |
 
-Hover a card to see that version turn on the stage. The Jelly card shows **Detected** while Jelly is enabled, and otherwise stays locked until it is attached. The mount cards are likewise locked (previewable, not pickable) until an Axol is connected.
-
-Until a model is saved, the main page shows a **Which Axol is this?** card above Axol settings: select a version, then press **Save** (the picker then lives in **Settings → Robot**). Runs that drive the Axol arms list *Choose your Axol* under [Before you can start](#before-you-can-start) until then; sim and arms-off runs keep the legacy default. The card waits for CAN discovery to settle and is not shown with Jelly attached or on Mantis, and the panel follows Jelly coming and going without a reload.
-
-Every operation uses the chosen robot model. It sets the body the IK solver keeps the arms clear of (the lift column, the Owl mount, the head camera) and the joint limits (every version but Legacy has elbows that reach 24° further past straight). Gravity compensation, recorded end-effector poses and the tuned per-joint masses are identical on all of them. The **Rest pose** viewer shows whichever version the host is running. On the mobile Axol the robot model also follows the fitted gripper (**Gripper** in the Robot tab): with the parcel gripper, IK, the viewers and the headset overlay use the parcel gripper's model. To force one outright, Jelly or not, set `kinematics.robot_model` under **Advanced → Kinematics** (or pass `--kinematics.robot_model`).
-
-A connected tile carries three buttons:
-
-- **Restart** reboots the robot host (`shutdown -r now`) behind a confirmation dialog. The panel loses its connection while the host reboots — reconnect once it's back up, typically under a minute.
-- **Shut down** powers the host off (`shutdown -h now`), also behind a confirmation. Turning the robot back on requires physical access to it.
-- **Disconnect** (the unplug button) drops **this browser only** — a client-side disconnect that leaves the server, the robot link, and any running operation untouched, so another operator driving the same host isn't affected.
-
-Restart and shut down are **refused while any operation or session is running** — cutting power mid-run would drop the arms — so stop what's in flight first; the confirm button stays disabled until the host is idle. (The one-command install runs as root and powers off directly; a development `axol serve` escalates with `sudo -n`, so a host with no passwordless sudo reports that it couldn't and stays up.) On success the host answers first and powers off a moment later, so the panel confirms with *Host is restarting.* or *Host is shutting down.* instead of an API error from the server going down mid-request.
+**Restart** and **Shut down** wait until no operation is running and no update is installing. On a development install they need passwordless `sudo`, or the host reports that it couldn't restart and stays up.
 
 #### Updates
 
-When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle (or reboots the host, when a step such as a new camera driver only takes effect at boot) — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press. While it applies, the button shows the current step (`Upgrading…`, `Installing deps…`, `Restarting…`, or `Rebooting host…`), and the panel waits for the host to come back on the new release, giving up only if it stops answering for 10 minutes. The reinstall and provisioning steps are each time-limited on the host, so a stuck step ends in an error that **Update** can retry. If the required realtime core fails to provision, the error names the failing step (`axol provision failed: Provisioning failed for: <steps>. … (see service logs)`) rather than a generic message. Optional steps that fail (Lighthouse tracking, the patched camera plugins) don't block the update; the panel shows them as a warning once it is back. Each step's full output is kept in `/var/log/almond-axol/` on the host. While the host is installing, **Restart** and **Shut down** are disabled, since cutting power mid-install can break the host's package manager.
+When a newer [release](https://github.com/almond-bot/axol/releases) is available, a banner above the tiles shows the version change and links to the release notes. Nothing updates until you press **Update**.
 
-The same banner area also warns when the **control panel UI and the host backend are running different code** — the web bundle bakes in the git commit and release version it was built from, the host reports its own via `/api/info`, and a mismatch raises the warning (a released host is compared by version, a dev checkout by commit). This catches a stale hosted tab, or an unbuilt local `web/app/dist`, silently driving a newer or older backend; clear it by updating the host to the matching release or rebuilding the local UI.
+1. Stop any running operation. **Update** is disabled while one runs.
+2. Press **Update**. The button shows each step: `Upgrading…`, `Installing packages…`, `Restarting…` or `Rebooting host…`.
+3. Wait for the panel to reconnect on the new release. Some updates reboot the host.
+
+If a required step fails, the error names it. Press **Update** to try again. Optional steps, such as Lighthouse tracking, show a warning instead of stopping the update. Each step's full output is in `/var/log/almond-axol/` on the host.
+
+The banner also warns when the panel and the host run different versions. This happens with an old browser tab or an outdated local UI build. Update the host, or rebuild the local UI.
+
+#### Axol version
+
+Axol comes in several versions with the same arms. The version sets the body the arms must stay clear of (lift column, Owl mount, head camera) and the joint limits.
+
+When Jelly is attached, Axol is **Axol × Jelly** automatically. This applies while Jelly's wheel or lift adapter is plugged in and not switched off under **Jelly settings → Wheels & lift**. Otherwise, pick what Axol is mounted on under **Choose your Axol** at the top of **Axol settings → Robot**, then press **Save**:
+
+| Version | Mount |
+|---|---|
+| **Axol Legacy** | The original model, and the default. |
+| **Axol Standalone** | The shoulder bar and head camera on their own. |
+| **Axol × Ox** | On the Ox Cart's lift column, with the lift fully raised. |
+| **Axol × Owl** | On the Owl Mount's column and foot plate. |
+
+You can preview any card by hovering it. You can pick one only while Axol is connected.
+
+Until a version is saved, the main page shows a **Which Axol is this?** card, and runs that drive the arms list *Choose your Axol* under [Before you can start](#before-you-can-start). Sim runs and runs with the arms off don't need it.
+
+On Axol × Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
 ### Axol and Mantis
 
-The panel inventories the host's CAN interfaces when it comes online and while the link is idle. A new dual-channel hub may initially appear only as anonymous `can0`/`can1` interfaces; before connecting, the root server runs the same driver/setup identification path as `axol can.setup`, safely probes the attached shoulder motor and Mantis trigger, saves the proven role, and assigns the persistent interface names. The same pass covers Jelly: a new single-channel adapter is probed for the Damiao wheel motors and the jelly_legs lift controller and pinned as the wheel bus (`can_alm_axol_b`), the chest/lift bus (`can_alm_axol_c`), or the shared wheel + lift bus — see [`can.setup`](/cli/can-setup) for the topologies. The probe is bounded and shared across browser tabs, so an unpowered or ambiguous adapter is never guessed or repeatedly reset. After any server restart (an update, a reinstall, a reboot) the saved hubs are re-checked once the same way, so an arm whose motors were off at that moment reads as unidentified. In that case, power the attached hardware and press **Connect** (which reruns the identification first) or **Retry CAN identification**; use interactive `axol can.setup` in a terminal only when the role still cannot be proven automatically. An already pinned Jelly adapter whose base is powered off keeps its assignment and does not hold up connecting the arms. Unrelated arbitrary SocketCAN interfaces are never classified as Axol, Mantis, or Jelly automatically.
+The panel finds the CAN adapters plugged into the host and connects the selected device automatically. On a new hub, it first identifies each adapter (Axol arm, Mantis rig, Jelly wheels or Jelly lift) and names it, the same way [`axol can.setup`](/cli/can-setup) does.
 
-After discovery, if only Axol or only Mantis is present, the panel connects that hardware automatically; if both are present, the profile selected on its tile wins. A present-but-down interface still qualifies because Connect brings it up. On a previously configured host, the exact USB serial saved in that profile's udev rules also qualifies before `gs_usb` has loaded or created the named interfaces; connecting then restores the driver and names. A hub that enumerates shortly after page load is picked up by the inventory poll. A failed automatic connection is retried twice with backoff; after that, the tile's **Connect** button is the manual fallback.
+If the automatic connection fails twice, press **Connect** on the tile. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
 
-A successful manual **Disconnect** pauses automatic reconnect for that exact hardware profile and saved CAN map across every open or newly opened panel. An explicit **Connect**, selecting a different detected profile on its tile, changing the saved map, or restarting `axol serve` starts a new automatic-connect intent. A successful manual **Connect** wins within the panel where it was clicked until that panel's device selection changes; another control panel can still make a later selection. This is intentionally last-writer-wins between operators, not a browser lease.
+**If an adapter isn't identified.** This happens when the hardware was off while the server started. Power on the hardware, then press **Connect** or **Retry CAN identification**. If that still fails, run `axol can.setup` in a terminal.
 
-- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when an Axol Hub adapter is used and the host has not been configured. Axol channel overrides live under **Axol settings → Robot**; Mantis channel mapping lives under **Mantis settings → CAN**. A non-hub SocketCAN adapter is brought up directly.
-- Pings the active profile once per second while idle: all 16 Axol motors, or the two Mantis grippers. Each square combines CAN reachability and motor error status; hover it for details and temperature.
+To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.
 
-**Motor faults block the active hardware profile.** The count includes only motors that are both reachable and error-free. While a required Axol motor or Mantis gripper is unreachable or faulted, that profile's hardware operation is blocked by both the panel and server. Sim teleop stays available.
+**Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the tile. Hover a square to see its status and temperature.
 
-**A cut motor supply recovers on its own.** If motor power drops mid-operation — operators use the PSU as an e-stop — the run stops with a `motor power lost` status instead of appearing to keep running, and the affected motors read **unknown** rather than a frozen pre-cut value (unknown motors are not counted as faults; unreachable ones still are). If the operation could not confirm the motors went torque-free, the server probes them itself as the run ends and releases the robot when every motor reads disabled or unpowered — the common case needs nothing from you. Only when a motor still answers under torque (or none could be read) does the panel keep the robot reserved and show a **Re-check motors** button: cut motor power and press it to re-probe the motors and release the reservation. Host restart and shutdown are never blocked by this reservation.
+| Square | Meaning |
+|---|---|
+| Green | Reachable and reporting no error. |
+| Red | Unreachable or reporting a fault. Operations on that device can't start until you fix it. Sim teleop still works. |
+| Grey | Unknown, because a running operation is using the bus. |
 
-The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
+**If motor power is cut.** If you cut motor power during a run, for example at the power supply, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If a motor still answers with torque on, the panel shows **Re-check motors**. Cut motor power, then press it.
 
-**Jelly battery.** While Jelly's lift link is connected, the **Jelly** tile's header shows the battery charge next to the pack voltage: green, amber at 25% and below, red at 10% and below, blue while charging. The lift controller measures the 24 V rail once a second, and the panel converts that resting voltage to a charge level using EVE's published LiFePO4 resting-voltage chart (per cell, times eight for Jelly's two 8S 24 V 50 Ah packs). Readings taken while the lift or wheels are moving sag, so they never override a resting reading. A reading that only exists under load is shown as `~40%`. While a task owns the bus, the tile keeps the last reading, dimmed, and hovering it shows how old it is. LiFePO4 voltage barely changes through the middle of its charge, and Jelly never fully rests (the Jetson and holding arms always draw a little), so the number can sit well below the packs' own figure there. Treat it as a band rather than a fuel gauge. The packs' Bluetooth app (LiTime) shows the BMS's own figure if you need an exact one. From Python, [`Jelly.battery`](/api/robot#jelly) and `read_battery()` return the same estimate.
+**Mantis.** Press **Select** on the Mantis tile. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
 
-For **Mantis**, press **Select** on the Mantis tile — see [Mantis Hardware](/mantis/hardware) for the rigs and hub. **Teleop needs only CAN and never tracks**: it drives the grippers straight from the rig triggers. **Collection** uses the pose source set up under **Mantis settings → Tracking** ([Mantis Tracking](/mantis/tracking) covers the Quest / Lighthouse / Ultimate setup flows and the start gesture); the panel launches and owns the selected tracker bridge and its two trigger readers, and a missing binding, incomplete channel mapping, or backend failure is a visible blocker rather than an apparently running session with no input. Teleop enables the physical grippers immediately; collection keeps them motor-disabled between takes. Mantis is not available for Collect DAgger or Run Policy.
+- **Teleoperation** drives the grippers from the rig triggers. It needs only CAN, with no tracking.
+- **Collect data** uses the pose source set under **Mantis settings → Tracking**. See [Mantis Tracking](/mantis/tracking).
+- Mantis can't run **Run policy** or **Collect DAgger**.
 
-<Warning>
-  Closing the browser tab — or disconnecting the **host** — does **not** stop anything: the robot link and any running operation live in the `serve` process and keep running. Use **Stop** to end an active operation; **Robot Disconnect** is available only once all operations and diagnostics have released the hardware. Stopping `axol serve` tears the service down.
-</Warning>
+### Jelly
+
+The **Jelly** tile has a row each for the wheels and the lift, each with a connect button. Jelly is driven together with Axol, so it isn't part of the device choice.
+
+While the lift is connected, the tile shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
+
+- A reading with `~` (for example `~40%`) was measured while Jelly was moving, so it reads low.
+- While an operation uses the bus, the last reading stays dimmed. Hover it to see its age.
+- The figure is a rough range, not an exact gauge. For an exact charge, use the batteries' LiTime Bluetooth app.
+
+From Python, [`Jelly.battery`](/api/robot#jelly) returns the same estimate.
 
 ## Settings
 
-Almost nothing you configure is actually per-run — camera assignment, arm stiffness, teleop rate, recording fps and codec, the inference server address — so it all lives in one **Settings** card directly on the page below the connection tiles, split by what it configures: **Axol settings**, **Mantis settings**, and **General settings**. Click a connection tile's title to open its scope (the host tile opens General), or switch scopes with the **Axol / Mantis / General** control in the card header.
+Settings that apply to every run live in the **Settings** card below the tiles. Switch between **Axol**, **Mantis**, **Jelly** and **General** in the card header, or click a tile's title.
 
-**Axol settings** — the arms:
-
-| Tab | What's in it |
-|---|---|
-| **Cameras** | Detected-camera previews and the separately stored Axol layout: overhead / left arm / right arm. See [Cameras](#cameras). |
-| **Robot** | **Choose your Axol**, the [robot-model picker](#axol-version) for a robot without Jelly; left/right arm stiffness sliders, CAN channels, per-gripper torque limit and max speed, gravity-comp damping and rate, the **contact-stop** thresholds (the always-on reset guard plus the opt-in teleop and policy watchdogs — each a switch that arms it at a suggested value), and the three hardware switches — **Axol arms**, **Jelly wheels**, **Jelly lift**. What a session drives is inferred from the CAN devices attached (arm hub, [Jelly](/guides/vr-interface#jelly) wheel bus, lift bus — see [Axol and Mantis](#axol-and-mantis)); these switches opt attached hardware *out*. Jelly enabled also selects the [mobile robot model](#axol-version). Arms off drives just Jelly from the headset thumbsticks with no Axol connection or motor check needed. |
-| **Teleop & VR** | Teleop control rate, position and rotation multipliers, and the **hold-to-engage** grip scheme. |
-| **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
-| **Kinematics** | The **IK solver** (`jax`, the default, or `mink`; see [Mink IK](/operations/mink)) and the JAX solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
-
-**Mantis settings** — the handheld rigs:
+**Axol settings**
 
 | Tab | What's in it |
 |---|---|
-| **Tracking** | The Quest/Lighthouse/Ultimate pose source and its step-by-step setup flow (each step gated on host-reported readiness), ending once the sides are identified. See [Mantis Tracking](/mantis/tracking). |
-| **Cameras** | The Head / Left Mantis / Right Mantis camera layout, stored separately from the Axol layout. |
-| **CAN** | The logical left/right Mantis CAN interfaces (`can_mantis_l` / `can_mantis_r` by default); swap the two values to swap sides without moving cables. |
-| **Triggers** | Per-side **trigger full squeeze** endpoints scale each rig's analog trigger to a full close command (default `1.0`); see [Testing the triggers and grippers](/mantis/hardware#testing-the-triggers-and-grippers). |
+| **Cameras** | Camera previews and the Axol camera layout. See [Cameras](#cameras). |
+| **Robot** | **Choose your Axol** ([Axol version](#axol-version)), arm stiffness, CAN channels, gripper type and limits, gravity-comp damping and rate, the contact stops, and the **Axol arms** switch. |
+| **Teleop & VR** | Teleop rate, position and rotation multipliers, **Hold grips to engage** and **Park to zero on stop**. |
+| **Rest pose** | A 3D editor with a slider per joint. The arms start from and return to this pose in teleop and data collection. |
+| **Kinematics** | The **IK solver** (`jax` by default, or `mink`, see [Mink IK](/operations/mink)) and its main weights. |
 
-**General settings** — the host, shared by both devices:
+**Contact stops.** The **Reset contact threshold** is always on: it stops a return to rest that runs into something and leaves the arms limp. The **Teleop contact stop** and **Policy contact stop** are off by default. Turn one on to stop the arms and leave them limp when they push on something during teleop or a policy run. Raise a threshold if normal motion trips it.
+
+**Axol arms.** Turn it off to drive only Jelly from the headset. Axol doesn't need to be connected then.
+
+**Mantis settings**
 
 | Tab | What's in it |
 |---|---|
-| **Quest** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
-| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
-| **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
-| **System** | Log level. (The active-device selection is also stored here, but is edited with **Select** on the Axol / Mantis tiles.) |
-| **Advanced** | Every remaining config field, organized by subsystem (*Axol*, *Teleop*, *Kinematics*, *Jelly*, *VR server*, *LeRobot robot*) with a search box across all of it. There is **one value per knob, applied to every operation** — the host translates it to each operation's config path, so there are never different per-task copies of the same setting. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter — text fields such as a joint's wire mode included, with a dropdown in the cell where the field has fixed choices), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
+| **Tracking** | The pose source (Quest, Lighthouse or Ultimate) and its setup steps. See [Mantis Tracking](/mantis/tracking). |
+| **Triggers** | **Left trigger full squeeze** and **Right trigger full squeeze**, which scale each trigger to a full close (default `1.0`). See [Testing the triggers and grippers](/mantis/hardware#testing-the-triggers-and-grippers). |
+| **Cameras** | The Head, Left Mantis and Right Mantis camera layout, kept separate from Axol's. |
+| **CAN** | The left and right Mantis CAN interfaces (`can_mantis_l` and `can_mantis_r` by default). Swap the two values to swap sides without moving cables. |
 
-Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). The same file is read by default by the [`axol` CLI commands](/cli/configuration#the-shared-settings-file) and the [SDK constructors](/api/robot#shared-settings), so a value saved here is what `axol teleop` and `Axol()` run too. Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
+**Jelly settings**
 
-Every setting on these tabs — and every field under **Advanced** — is documented with its default and meaning on each operation's **Config Parameters** page (e.g. [Teleoperation](/operations/teleop-config)). The [Settings File](/guides/control-panel-settings) page describes the file's layout — a nested tree whose `axol` / `teleop` / `kinematics` sections are the config dataclasses themselves — which is what you're editing in an exported `settings.json`.
+| Tab | What's in it |
+|---|---|
+| **Wheels & lift** | **Jelly wheels** and **Jelly lift**. Turn one off to leave that part of Jelly still, even when it is attached. |
+| **Parameters** | Drive speeds and other Jelly settings. |
+
+**General settings**
+
+| Tab | What's in it |
+|---|---|
+| **Quest** | The [Quest over USB](#quest-usb) link and **Keep awake**. |
+| **Recording** | Dataset fps, video codec, dataset root, push to the Hugging Face Hub, and the Rerun viewer address. |
+| **Inference** | Device, inference server host and port, episode length, and action chunking. |
+| **System** | Log level. |
+| **Advanced** | Every other setting, grouped by subsystem, with a search box. Per-joint gains show as one table per arm. |
+
+Recording fps above 60 raises the cameras' capture rate to match. The ZED X supports rates above 60 only at `SVGA`.
+
+**Saving.** Changes stay in your browser until you press **Save** (or **Discard**). Settings are saved on the host in `~/.almond/settings.json`, so every operation and every browser uses the same values. The [`axol` CLI](/cli/configuration#the-shared-settings-file) and the [SDK](/api/robot#shared-settings) read the same file. A field you haven't set shows its default in grey, and a changed field has a reset button.
+
+**Export** and **Import** at the bottom of the card save the whole settings file as JSON, or load one. Use them for backups or to copy settings to another robot. The [Settings File](/guides/control-panel-settings) page describes the file. Each operation's **Config Parameters** page, such as [Teleoperation](/operations/teleop-config), lists every setting with its default.
 
 ### Cameras
 
-Data collection and policy inference also need ZED cameras attached to the host. Axol cameras are assigned under **Axol settings → Cameras**; the three Mantis slots live under **Mantis settings → Cameras**.
+Data collection and policies need ZED cameras on the host. Assign Axol's cameras under **Axol settings → Cameras** (overhead, left arm, right arm). Assign Mantis cameras under **Mantis settings → Cameras** (Head, Left Mantis, Right Mantis). The two layouts are saved separately.
 
-Both camera panels **detect the cameras** plugged into the host and show each serial, automatically detected type (**stereo** ZED X / **mono** ZED-X One), model, and a **live preview frame**, so you can identify the physical view before assigning it. The Axol panel offers overhead / left arm / right arm. The Mantis panel offers Head / Left Mantis / Right Mantis and stores that mapping separately, so changing it never overwrites Axol. Press **Refresh** to re-query the device list and grab previews, or **Restart daemon** after plugging/unplugging a GMSL camera so the daemon re-scans. Previews are unavailable while an operation owns the cameras.
+Each panel lists the cameras plugged into the host, with serial number, type (stereo ZED X or mono ZED X One), model and a preview frame. Use the preview to tell which camera is which.
 
-These two hardware-layout panels are the single source of truth for camera settings. Each controls two independent branches:
+- Press **Refresh** to list the cameras again and update the previews.
+- Press **Restart camera service** after you plug in or unplug a GMSL camera.
+- Previews aren't available while an operation is using the cameras.
 
-- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop and collect-data). Run policy relays no video, so it ignores this branch entirely; collect DAgger does relay a headset view for the operator, but at the **Record** resolution below, so it too ignores this branch.
-- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream). Because **run policy** and **collect DAgger** feed the policy from what's recorded rather than from a headset stream, they capture their policy observations at this resolution — the size the dataset was recorded at and the policy was trained on — rather than grabbing a larger headset frame they'd only throw away.
+**Stream and Record.** Each layout has two outputs:
 
-Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
+| Output | Where it goes |
+|---|---|
+| **Stream** | The live video in the VR headset during teleop and data collection. |
+| **Record** | The video saved in the dataset. **Run policy** and **Collect DAgger** also feed the policy at this resolution, so it matches the training data. |
 
-An operation that records a dataset requires at least one assigned camera participating in **Record**; an assigned stream-only camera does not satisfy Start. Conversely, a camera disabled in both branches is omitted and does not create a false “not detected” blocker.
+Each output has a resolution setting (`SVGA`, `HD1080` or `HD1200`) or **Off**. Each camera has separate **Stream** and **Record** switches. A stereo camera has **L** and **R** checkboxes for each eye instead. This lets you, for example, stream both eyes of the overhead camera for depth and record only one.
 
-A stereo **overhead** (the **Head** slot in Mantis) captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. Both profiles can record these two head views alongside both wrists. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
+A stereo overhead camera with both eyes recorded is saved as two cameras, `overhead_left` and `overhead_right`. A single eye is saved under the slot name, like a mono camera.
 
-The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. A Mantis run passes its head and wrist mapping to data collection; an Axol run uses the Axol mapping. Older settings without a Mantis assignment for a wrist slot inherit that slot's Axol serial until you save a Mantis selection; the Mantis Head slot never inherits the Axol overhead camera, so it starts unassigned. Explicitly leaving a slot unassigned disables it for Mantis. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every participating camera assigned to the active hardware profile is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the matching Axol or Mantis Cameras panel. Teleop streams whatever is configured and is never blocked by this check.
+**What each operation needs.**
+
+- **Collect data**, **Run policy** and **Collect DAgger** need at least one camera with **Record** on. A camera set to stream only doesn't count.
+- They also check that every assigned camera is plugged in, and name any missing serial. Reconnect it, then press **Refresh** (or **Restart camera service**).
+- **Teleoperation** streams whatever is set up and is never blocked by cameras.
+
+The Mantis **Head** slot starts unassigned. A slot you leave unassigned is off.
 
 ### Quest USB
 
-The **Quest** tab (under **General settings**) manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. Every frame is mirrored over cable and Wi-Fi with one producer id/sequence; the first copy wins and the duplicate is discarded. A dropped cable therefore fails over immediately with no reconnect, and a restored low-latency cable naturally wins again.
+The **Quest** tab under **General settings** runs the optional [Quest over USB](/guides/quest-over-usb) link. It sends the controller poses over a USB cable for lower latency. Camera video still uses the network.
 
-The tab also carries the [headless](/guides/quest-headless) **Keep awake** / **Restore** buttons: with the headset plugged in and authorized, **Keep awake** disables its proximity sensor over adb so the VR session keeps running with the headset set down, and **Restore** brings normal sleep behavior back (a headset reboot also resets it).
+1. Plug the Quest into the robot's computer with a USB-C cable.
+2. The first time, put the headset on and accept **Allow USB debugging?**.
+3. The link connects automatically and shows *Controller over USB*. Press **Connect** to retry if it doesn't.
+
+If the cable is pulled, poses continue over Wi-Fi with no reconnect.
+
+For [headless](/guides/quest-headless) use, press **Keep awake** with the headset plugged in. The headset keeps the VR session running while it sits on a table. **Restore** turns normal sleep back on, and so does rebooting the headset.
 
 ## Operations
 
+Pick an operation from the selector, fill in its fields, and press **Start**. The panel asks only for values that change between runs, such as a dataset name or a policy path. Everything else is in [Settings](#settings).
+
+- Hover the **ⓘ** next to a field for its description.
+- Some fields offer a list to pick from, such as the datasets on the host. You can still type your own value.
+- A few fields accept only values from their list. **Start** stays disabled with *Pick &lt;field&gt; from the list* until you pick one.
+- Your browser remembers these values for next time.
+
+| Operation | Needs | What it does |
+|---|---|---|
+| **Teleoperation** | Axol, Mantis, or sim | Drive Axol from a Quest. With Jelly attached, the thumbsticks drive Jelly too. With Mantis selected, drive the rig grippers from their triggers. Turn on **sim** to drive a simulated Axol in the browser, and pick its version under **Sim robot**. See [Teleoperation](/operations/teleop#run-it). |
+| **Gravity compensation** | Axol | Hold the arms weightless so you can move them by hand. |
+| **Waypoints** | Axol or sim | Teach a path by hand and replay it. See [Waypoints](#waypoints). |
+| **Collect data** | Axol or Mantis, and cameras | Record episodes into a LeRobot dataset. Pick an existing dataset under **repo id** to add to it. See [Data collection](/operations/data-collection#run-it). |
+| **Replay dataset** | Axol | Play a recorded episode on the arms, then return to rest. Turn on **loop** to repeat until **Stop**, and **interpolate** to smooth playback. |
+| **Run policy** | Axol and cameras | Run a LeRobot policy on the robot or on an [inference server](/cli/inference-server). Choose policy type `custom` to run [your own model](/operations/custom-policy), which needs no checkpoint path. |
+| **Collect DAgger** | Axol and cameras | Run a policy and correct it from VR, recording both. A `custom` policy needs `hold_to_intervene=true`. See [`collect-dagger`](/cli/collect-dagger). |
+
 <Note>
-  Panel recordings go to the **Dataset root** setting (default: the LeRobot
-  cache, `~/.cache/huggingface/lerobot` of the account that ran the installer)
-  and are handed back to that account after every episode save, so the same
-  datasets are visible from the panel and the CLI.
+  Recordings go to the **Dataset root** setting. By default this is `~/.cache/huggingface/lerobot` of the account that ran the installer, so the panel and the CLI see the same datasets.
 </Note>
 
-Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy (policy type `custom` runs [your own model](/operations/custom-policy), and the path is then unused), the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help. Some inputs come with a pick list the host builds when the panel opens (the datasets on disk under **repo id**; a package built on `almond-axol` can declare its own, such as the deployable model ids for its policy operations) — pick an entry or keep typing, the field stays free-form; if the list can't be fetched the panel says why beneath the form and the input still works. A few fields are **strict** — their value must come from the list (a package's task catalog, say): those render as a select with no free typing, **Start** stays blocked with *Pick &lt;field&gt; from the list* until an entry is chosen, and the host refuses a start with an off-list value. If a strict field's list can't be fetched, the field can't be set until it can.
+### Waypoints
 
-Every arm-motion operation uses the [`axol-rt` Rust realtime core](/cli/rt-install). The core owns CAN at 240 Hz while the operation streams targets; there is no Python-loop backend toggle.
+1. Start **Waypoints**. The arms go into gravity compensation.
+2. Move the arms by hand and press **Record waypoint** at each pose. Use **Undo last**, **Clear all** and the gripper buttons as needed.
+3. Once you have two or more waypoints, press **Play** to replay the path as straight-line moves. **Stop playback** stops it.
 
-| Operation | Needs | Notes |
-|---|---|---|
-| **Teleoperation** | Axol, Mantis, or sim | Drive Axol from Quest, or — with Mantis selected on its tile — validate a Mantis rig by driving its grippers straight from the rig triggers over CAN (no tracking, headset, or cameras). Toggle **sim** for the browser visualizer (Axol only); a sim run's **Sim robot** roster picks which Axol version to simulate (every version unlocked, with a **Parcel gripper** switch on Axol × Jelly) for that run alone, without touching the robot's saved model. When [Jelly](/guides/vr-interface#jelly)'s wheel or lift adapter is attached the thumbsticks drive it too — nothing to enable; to drive *just* Jelly with the arms untouched (no Axol connection or motor check needed) switch **Axol arms** off in the Robot tab. See the [Mantis tab of the teleop guide](/operations/teleop#run-it). If Axol camera slots are assigned, feeds are relayed and mirrored in the [operator view](#operator-view). |
-| **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
-| **Waypoints** | Axol or sim | Teach-and-repeat: hand-guide the arms and press **Record waypoint** for each pose, then **Play** to replay the path as straight-line moves. **Undo**, **Clear**, and a gripper toggle are there while teaching; **Stop playback** interrupts a run. Toggle **sim** to preview a saved path in the browser visualizer, and drag the **Speed scale** slider down to try a new path slowly — it slows every move, rotations and the trips to and from rest included. See [`waypoints`](/cli/waypoints). |
-| **Collect data** | Axol or Mantis + cameras | Record Axol joint or Cartesian actions, or (with Mantis selected on its tile) Mantis Cartesian TCP actions. Production Mantis start is blocked without a ready source and approved factory or measured transforms. The **repo id** picker can resume host datasets; feeds and [episode controls](#episode-controls) are mirrored in the panel. See the [Mantis tab of the data-collection guide](/operations/data-collection#run-it). |
-| **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. The **repo id** field is a picker offering the datasets on the host (with episode counts), and also accepts a bare id or a filesystem path. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
-| **Run policy** | Axol + Cameras | Run a LeRobot policy locally or on a remote [inference server](/cli/inference-server), or select `custom` to connect through the [custom policy interface](/api/policy-plan). Custom policies need no checkpoint path on the robot. |
-| **Collect DAgger** | Axol + Cameras | Run a policy while correcting it from VR, recording policy segments and corrections with per-frame intervention tags. Local policies use freeze/toggle grips; `custom` requires `hold_to_intervene=true` and gives control while grips are held. The **repo id** field resumes a DAgger dataset or takes a new id. Configure custom DAgger's own endpoint settings; see [`collect-dagger`](/cli/collect-dagger). |
+Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to preview a saved path in the browser. See [`waypoints`](/cli/waypoints).
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Choose your Axol* (see [Axol version](#axol-version)), *Fix motor fault: R elbow — over temperature*, *Assign at least one camera*, *Identify left + right Lighthouse trackers*, *Fix Ultimate private shared-map AP setup*, or *Add an approved factory or measured tracker-to-TCP transform*. Fix tracker setup in **Mantis settings → Tracking** ([Mantis Tracking](/mantis/tracking)); transforms are a [file on the host](/cli/tracker#transform-file). Tracker setup only gates Mantis *collection* — Mantis teleop never tracks (it drives the grippers straight from the rig triggers) and starts on CAN alone. The panel refreshes the same readiness the operation start uses.
+**Start** stays disabled until the operation has what it needs. A **Before you can start** list says what is missing, for example:
 
-Per-run values (repo ids, task names, …) are remembered by your browser so they reappear on reload; everything else persists on the host with the shared settings.
+- *Connect Axol*
+- *Choose your Axol* (see [Axol version](#axol-version))
+- *Fix motor fault*, followed by the motor and the fault
+- *Assign a camera and enable Record in Axol settings → Cameras*
+- *Identify left + right Lighthouse trackers*
 
-### Running, logs, and stopping
+Fix tracker problems under **Mantis settings → Tracking** ([Mantis Tracking](/mantis/tracking)). Tracker-to-TCP transforms are a [file on the host](/cli/tracker#transform-file). Tracking only matters for Mantis data collection. Mantis teleop needs only CAN.
 
-Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. The console captures not just the operation's Python output but also **native-library and subprocess output** — the ZED SDK, GStreamer, and CUDA, plus the spawned video-relay and recorder processes — so a camera or ZED failure surfaces its actual reason in the UI instead of a bare "exited". The console **auto-follows** new output only while you're scrolled to the bottom; scroll up to read earlier lines and it stops yanking you back down. While you're scrolled up, a **floating arrow button** in the lower-right of the log area jumps you back to the latest line and re-engages auto-follow. The **download** button in the Logs header saves everything currently in the console to a timestamped `.log` file (disabled when there's no output) — handy for attaching to a bug report. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Robot Disconnect** likewise stops the running op and waits for it to finish tearing down before releasing the robot link; the host **Disconnect**, by contrast, is a client-side drop that leaves any running op in place server-side.
+### Logs and stopping
+
+The **Logs** console at the bottom shows the running operation's output, including messages from the ZED SDK, GStreamer and CUDA. When a camera fails, the reason appears here.
+
+- The console follows new lines while you are scrolled to the bottom. Scroll up to read, and press the arrow button to jump back.
+- The download button saves the console to a `.log` file to attach to a bug report.
+
+Press **Stop** to end an operation. The badge shows **Stopping…** until the operation has shut down, then the robot returns to idle. You can disconnect Axol only when no operation is running.
 
 ## Operator view
 
-While **teleoperation**, **collect data**, or **collect DAgger** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the active [camera layout](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** teleop run, or one with **Axol arms** switched off, shows no mirrored feeds — neither relays headset video.)
+During **Teleoperation**, **Collect data** and **Collect DAgger**, the panel shows the same camera feeds as the headset. You can watch the robot's view without wearing the headset. The [camera layout](#cameras) decides what streams. Sim runs and runs with **Axol arms** off show no feeds.
 
-The **fullscreen** toggle on the camera-feeds header expands the feeds to a full-screen operator display that fits without scrolling; **Esc** or **Exit fullscreen** leaves. If the feeds never connect, the panel offers a one-tap button to **authorize** the stream server's self-signed certificate — the same one-time step the [VR app](/guides/vr-interface) uses.
+Press the fullscreen button on the camera feeds to fill the screen. Press **Esc** or **Exit fullscreen** to leave. If the feeds never connect, press **Authorize** to accept the stream's self-signed certificate, the same one-time step as in the [VR app](/guides/vr-interface).
 
 ## Episode controls
 
-While **Run policy**, **Collect DAgger**, or **Collect data** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the episode number and saved count. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header; while the arms park before the motors are released (rest, then zero with **Park to zero on stop**), Collect data shows a **Parking** phase.
+While **Collect data**, **Run policy** or **Collect DAgger** runs, an **Episode control** box appears in the operation card. It shows the phase (Ready, Recording, Saving, Resetting and so on), the episode number and the number saved. Every connected browser sees the same state. To end the whole session, press **Stop**.
 
-An operation's episode control can also send a **brief**: an instruction card drawn above the status line with a title, a large headline (the instruction), labelled items, a note, a progress bar, and an optional top-down layout grid showing where each object, destination, keep-clear zone, reference, container, or distractor goes and how it is turned. Use it to show what to set up for the next episode, such as a scripted list of scenes. **Hide setup** / **Show setup** folds the items and grid away; the setup starts folded while recording, when only the headline matters. Operations that don't send a brief show the box as before.
+Some operations also show a setup card with an instruction, a list of items and a layout grid, for example the scene to set up next. **Hide setup** and **Show setup** fold it away.
 
-For **Run policy** and **Collect DAgger** (which share the same episode controls — collect DAgger adds the VR grip [intervention flow](/operations/dagger#intervening) on top):
+**Run policy and Collect DAgger**
 
-| Button | Effect |
+| Button | What it does |
 |---|---|
-| **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
-| **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
-| **Discard** | Drop the current episode. The arms go **limp** for hand-repositioning — a failed rollout usually leaves them somewhere they shouldn't be, so they don't drive home from that pose — then **Return to rest** before the next take. |
-| **Return to rest** | Send the limp arms home, replanning the collision-aware return from where they are. Appears whenever the arms are left limp: after a **Discard** (phase **Limp**), when the guarded between-episode return meets resistance, or (with the opt-in policy contact stop enabled) when a rollout hits something and is aborted (phase **Contact**). Clear the arms by hand first. |
+| **Start episode** | Start the next rollout once the scene is reset. |
+| **Save** | Save the episode. Then press **Start episode** for the next one. |
+| **Discard** | Drop the episode. The arms go limp so you can move them out of the way by hand. Then press **Return to rest**. |
+| **Return to rest** | Send limp arms back to rest from where they are. It appears after **Discard**, or when the arms hit something (phase **Contact**). Clear the arms by hand first. |
 
-These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
+These match the `s` and `r` keys and the Enter prompts of [`run-policy`](/cli/run-policy). To correct a policy from VR in **Collect DAgger**, see [Intervening](/operations/dagger#intervening).
 
-For **Collect data**, the buttons provide the same episode decisions for Axol and every Mantis source, so managed Lighthouse/Ultimate can collect with no headset at all. Pair them with the mirrored [camera feeds](#operator-view):
+**Collect data**
 
-| Button | Effect |
+| Button | What it does |
 |---|---|
-| **Start recording** | Begin the next take after a 3-second countdown, mirroring the in-headset one so you can pick the controllers back up. Clicking again cancels. |
-| **Save episode** | End the take and save it, like confirming **A** in the headset. Click twice to confirm — the panel's stand-in for the controller's double-press. |
-| **Discard episode** | End the take and drop it to re-record, like confirming **X**. Also click-to-confirm. |
-| **Return to rest** | During a **Contact** hold — the guarded return met resistance, or (with the opt-in teleop contact stop enabled) a take hit something and was discarded — the arms are limp. Clear them by hand, then press this (or **X** on the controller) to replan the return from where they are. |
+| **Start recording** | Start the next take after a 3-second countdown, so you can pick up the controllers. Press again to cancel. |
+| **Save episode** | End the take and save it, like **A** in the headset. Press twice to confirm. |
+| **Discard episode** | End the take and drop it, like **X** in the headset. Press twice to confirm. |
+| **Return to rest** | Appears when the arms hit something and went limp (phase **Contact**). Clear the arms by hand, then press it, or press **X** on the controller. |
 
-A take that ends without being saved (refused by the Mantis quality gate, emptied by a camera-capture failure, ended before its first row, or refused at save) leaves a red explanation in the Episode control box until the next take starts recording, so a lost take never reads as a saved one after the box returns to **Ready**.
+If a take ends without being saved, the box shows the reason in red until the next take starts.
 
-For Axol or Quest Mantis, the VR controller stays live throughout and whichever panel/headset input arrives first wins. Managed Lighthouse/Ultimate instead starts a take by squeezing both rig triggers together and releasing (this also engages tracking); while recording, either trigger x3 ends and saves, x4 ends and discards — the same outcome as **Discard episode**. The panel's **Start recording** works only while the rig is already engaged. Headset save/discard popups and countdowns are mirrored into the panel when a Quest is the active pose source.
+With Axol or Mantis on Quest, the VR controllers also work, and whichever input comes first wins. With Mantis on Lighthouse or Ultimate, no headset is needed:
+
+- Squeeze and release both rig triggers together to engage tracking and start a take. **Start recording** works only after the rig is engaged.
+- While recording, press either trigger three times to save, or four times to discard.
 
 ## Dataset preview
 
-The **Dataset preview** card below the operation panel (press **Show**) appears while **Collect data**, **Collect DAgger**, or **Run policy** is selected — the operations that record a dataset — and is hidden for every other operation. It browses the LeRobot datasets on the host — the same list the **repo id** pickers offer. Pick a dataset, then an episode (newest first, with its length and task), to play every recorded camera side by side from one play/pause and scrub bar, and to read the episode's **task** string.
+The **Dataset preview** card appears below the operation panel for **Collect data**, **Collect DAgger** and **Run policy**. Press **Show**, then pick a dataset and an episode. All of the episode's cameras play side by side with one play button and scrub bar.
 
-The quality menu next to the scrub bar picks the playback rate: **15 fps** (the default), **30 fps**, or the full recorded rate. Axol records every dataset frame as a keyframe at about 21 Mbps per camera at 60 fps, so four cameras at full rate need around 85 Mbps — more than most Wi-Fi or Tailscale links carry. The lighter rates keep every 2nd or 4th frame, so they need a half or a quarter of that. They are cut on the host by copying frames, not re-encoding, so they cost almost no CPU there, and they are cached. Every rate is served with the video's index first, so playback starts before the file has finished downloading. If one camera falls behind, all of them pause until it catches up, and they resume together. Nothing is downloaded until you press play, so selecting an episode (or the card selecting each newly saved one during a session) costs nothing on the host or the network.
+The menu next to the scrub bar sets the playback rate: **15 fps** (the default), **30 fps** or the full recorded rate. Full rate with four cameras needs about 85 Mbps, more than most Wi-Fi or Tailscale links carry. Nothing downloads until you press play.
 
-The task can be changed there too: type the new text (or pick one of the dataset's existing tasks) and **Save task**. The rename rewrites the episode's task in the dataset itself — `meta/tasks.parquet`, the episode's rows and its `meta/episodes` entry — so replay, training and anything else reading the dataset see the new text. A new string is appended to the task table; the old one stays in it even when no episode uses it any more.
+**Rename a task.** Type the new task text, or pick one of the dataset's tasks, and press **Save task**. The change is written into the dataset, so replay and training see the new text.
 
-While an operation that records is running, the card follows the dataset it records into (marked *recording*) and refreshes after every save, selecting the take just saved, so earlier takes can be reviewed — and a mistyped task fixed — without stopping the session. The take in progress appears once it is saved. A rename and a save never interleave: if the recorder is mid-save the rename waits for it, and after a long save the panel asks you to try again.
+During a recording session, the card follows the dataset being recorded and selects each take once it is saved. You can review earlier takes and fix a mistyped task without stopping the session.
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Diagnostics dashboard" icon="chart-line" href="/guides/diagnostics-dashboard">
-    Live motor telemetry, health tiles, and diagnostics scripts — the sibling `/diagnostics` page.
+    Live motor telemetry, health tiles and diagnostic scripts on the `/diagnostics` page.
   </Card>
   <Card title="serve reference" icon="terminal" href="/cli/serve">
     Flags, TLS, and what the server exposes.
   </Card>
   <Card title="VR interface" icon="vr-cardboard" href="/guides/vr-interface">
-    The in-repo WebXR app that drives teleop and recording.
+    The WebXR app that drives teleop and recording.
   </Card>
 </CardGroup>

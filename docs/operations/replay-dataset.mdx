@@ -1,37 +1,36 @@
 ---
 title: "Replay Dataset"
-description: "Replay a recorded LeRobot dataset episode on the arms — from the web control panel or the CLI."
+description: "Play a recorded LeRobot dataset episode back on Axol's arms."
 ---
 
-Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight back onto the arms: the episode's recorded `action` column is streamed to the motors frame by frame, then the robot returns to its rest pose. It's the inverse of [data collection](/operations/data-collection) — instead of recording teleop actions it reproduces an already-recorded take on the hardware. You can launch it from the **web control panel** or the **CLI** (`axol replay-dataset`).
+Replay plays one episode of a recorded [LeRobot](/api/lerobot) dataset back on the arms. Axol moves to the rest pose, sends the episode's recorded actions to the motors frame by frame, then returns to rest. Episodes are recorded from rest, so playback starts without a jump. Start it from the web control panel or with `axol replay-dataset`.
+
+Replay drives only the arms. It uses no headset, cameras or policy server.
 
 <Warning>
-  Cartesian datasets recorded with axol v0.1.31 or earlier use the world frame
-  from the old URDF and replay about 90° off on current releases. Run
-  [`axol migrate-dataset`](/cli/migrate-dataset) once before replaying them.
-  Joint-space datasets are unaffected.
+  Replay doesn't watch the scene. It plays the recorded actions as they are.
 
-  **Mantis** datasets recorded with axol 0.2.4 or earlier used a Vive
-  tracker→gripper rotation that pitched every recorded gripper ~90° away from
-  the operator's hold; the arms barely move on replay. Run
-  [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation)
-  once before replaying them.
+  - Clear the workspace and set it up like it was when you recorded the episode.
+  - Keep **Stop** or `Ctrl+C` within reach.
+  - Use the same arm stiffness you recorded with, so the arms follow the actions the same way.
 </Warning>
-
-No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.
-
-<Warning>
-  Replay drives the arms **open-loop** from the recorded actions — it does not watch the scene (though an opt-in contact stop, below, can halt playback if a joint pushes hard against something unexpected). Make sure the workspace is clear and roughly matches what the episode was recorded in before starting, and keep **Stop** (or `Ctrl+C`) within reach. Match the stiffness used at collection time so the arm tracks the same way it did when recorded.
-</Warning>
-
-<Note>
-  **Contact stop (opt-in).** Off by default. Set the **Teleop contact stop** in the control panel's **Axol settings → Robot** (`--teleop_torque_threshold` on the CLI; the panel suggests `16` Nm) and a sustained torque past the threshold **stops playback** and drops the arms into a limp gravity-comp hold until you stop the run — replay has no interactive retry. The between-takes return to rest is always guarded separately.
-</Note>
 
 ## Before you start
 
-- **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **A trusted recorded dataset** that you created or obtained from a source you trust — a local one under `--root` (`$HF_LEROBOT_HOME` by default), a **filesystem path** to a dataset directory anywhere on disk, or one pullable from the HuggingFace Hub by its `repo_id`. Upstream dataset loaders are not a sandbox for arbitrary repositories or directories. See [Data Collection](/operations/data-collection) to record one.
+- Install Axol with the [one-command install](/installation). Bring up CAN and check the motors.
+- Have a recorded dataset that you made or got from a source you trust. Dataset loading is not sandboxed. The dataset can be:
+  - a local dataset under `--root` (`$HF_LEROBOT_HOME` by default),
+  - a path to a dataset folder anywhere on disk, or
+  - a dataset on the HuggingFace Hub, by its repo ID.
+
+See [Data Collection](/operations/data-collection) to record one.
+
+<Warning>
+  Datasets recorded with these versions need converting once before you replay them:
+
+  - Cartesian datasets recorded with axol 0.1.31 or earlier replay about 90° off. Run [`axol migrate-dataset`](/cli/migrate-dataset). Joint-space datasets don't need this.
+  - **Mantis** datasets recorded with axol 0.2.4 or earlier barely move the arms. Run [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation).
+</Warning>
 
 ## Run it
 
@@ -39,30 +38,51 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot">
-        Connect the **Axol Host** and **Axol**. No cameras are needed for replay.
+        Connect the **Axol Host** and **Axol**. No cameras are needed.
       </Step>
 
-      <Step title="Select Replay Dataset and fill the fields">
-        Pick **Replay Dataset**. Set the dataset **repo&nbsp;id** — pick one from the dropdown of datasets found on the host (each shown with its episode count), or type a repo id or a filesystem path — the **episode** index (0-indexed), the **loop** toggle, and optionally **interpolate** (smooths playback by upsampling the recorded actions to ~120&nbsp;Hz commands; timing is unchanged) — the per-run inputs. Playback fps and stiffness live in the [Settings](/guides/control-panel#settings) tabs.
+      <Step title="Select Replay dataset and fill in the fields">
+        Pick **Replay dataset** and fill in:
+
+        - **Repo ID**: pick a dataset found on the host from the list, which shows each one's episode count. You can also type a repo ID or a folder path.
+        - **Episode**: the episode number, counting from 0.
+        - **Loop**: repeat the episode until you press **Stop**.
+        - **Interpolate** (optional): smooth playback by filling in commands at about 120 Hz. Timing stays the same.
+
+        Playback rate and stiffness are in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
 
       <Step title="Start">
-        Clear the workspace, then press **Start**. The arm moves to rest, replays the episode at the recorded timing, and returns to rest. With **loop** on it repeats (returning to rest between takes) until you press **Stop**.
+        Clear the workspace, then press **Start**. The arms move to rest, play the episode at its recorded speed, and return to rest. With **Loop** on, they return to rest between takes and repeat until you press **Stop**.
       </Step>
     </Steps>
   </Tab>
 
   <Tab title="CLI">
-    On the robot machine:
+    On the robot's computer:
 
     ```bash
     axol replay-dataset --repo_id myorg/pick-place --episode 0
     axol replay-dataset --repo_id myorg/pick-place --episode 0 --loop true   # loop until Ctrl+C
     ```
 
-    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. `--repo_id` also accepts a filesystem path to a dataset directory, and lists the datasets it can find if the one you name isn't there. Press `Ctrl+C` to stop — the arm returns to rest before exiting. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
+    Press `Ctrl+C` to stop. The arms return to rest before the command exits.
+
+    - `--fps 0`, the default, plays at the dataset's recorded rate. Set a positive value to change it.
+    - Set the stiffness you recorded with using `--robot_config.axol_config.left_stiffness` and `right_stiffness`.
+    - `--repo_id` also takes a path to a dataset folder. If it can't find the dataset, it lists the ones it can find.
+
+    See [`replay-dataset`](/cli/replay-dataset) for every field and [Command configuration](/cli/configuration) for the flag syntax.
   </Tab>
 </Tabs>
+
+## Contact stops
+
+Every return to rest is guarded. If an arm meets resistance, the move stops and the arms go limp.
+
+You can also stop playback when a joint pushes hard against something. This check is off by default. Set **Teleop contact stop** in **Axol settings → Robot** (`--teleop_torque_threshold` on the CLI). The panel suggests `16` Nm.
+
+When it trips, playback stops and the arms go limp until you stop the run. Replay can't resume after a contact stop.
 
 ## Next steps
 
@@ -74,6 +94,6 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
     Record the episodes you replay here.
   </Card>
   <Card title="replay-dataset reference" icon="terminal" href="/cli/replay-dataset">
-    Every flag and the replay internals.
+    Every flag for replay.
   </Card>
 </CardGroup>

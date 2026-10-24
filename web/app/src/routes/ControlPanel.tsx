@@ -902,11 +902,11 @@ export default function ControlPanel() {
           ? "CAN mappings"
           : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN mapping`
       if (!changedDesiredProfile) {
-        toast.info(`${label} saved. It will apply the next time that hardware connects.`)
+        toast.info(`${label} saved. It applies the next time that hardware connects.`)
       } else if (isLive || robot?.state === "busy") {
-        toast.info(`${label} saved. The link will reconnect when this run stops.`)
+        toast.info(`${label} saved. The robot reconnects when this run stops.`)
       } else {
-        toast.info(`${label} saved. Reconnecting the link when its configured bus is detected…`)
+        toast.info(`${label} saved. Reconnecting when the CAN bus is detected…`)
       }
     }
   }
@@ -1024,7 +1024,9 @@ export default function ControlPanel() {
           return null
         setRobot(status)
         if (!status.connected) {
-          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+          throw new Error(
+            status.error ?? `Could not connect to ${profile === "mantis" ? "Mantis" : "Axol"}.`
+          )
         }
         if (!automatic) manualRobotOverrideRef.current = true
         return true
@@ -1054,7 +1056,7 @@ export default function ControlPanel() {
       if (generation !== connectionGenerationRef.current) return
       setRobot(status)
       if (status.state !== "disconnected") {
-        throw new Error(status.error ?? "Could not disconnect the robot CAN link")
+        throw new Error(status.error ?? "Could not disconnect the robot.")
       }
       manualRobotOverrideRef.current = true
     } catch (e) {
@@ -1077,7 +1079,7 @@ export default function ControlPanel() {
         setJelly(status)
         if (!status[device].connected) {
           throw new Error(
-            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not connect to ${JELLY_DEVICE_LABELS[device]}.`
           )
         }
         return true
@@ -1104,7 +1106,7 @@ export default function ControlPanel() {
         setJelly(status)
         if (status[device].state !== "disconnected") {
           throw new Error(
-            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not disconnect from ${JELLY_DEVICE_LABELS[device]}.`
           )
         }
       } catch (e) {
@@ -1165,7 +1167,7 @@ export default function ControlPanel() {
   // Shared by the update banner and the host tile's power confirmations.
   const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
-  const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
+  const updateBusyReason = isLive ? "Stop the running operation" : "The host is busy"
   const canDiscoveryNeedsRetry =
     canDiscovery?.status === "partial" ||
     canDiscovery?.status === "unidentified" ||
@@ -1226,7 +1228,7 @@ export default function ControlPanel() {
       if (result?.status === "configured" || result?.status === "ready") {
         toast.success("CAN hardware identified")
       } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware still needs identification")
+        toast.warning(result.message ?? "Some CAN hardware is not identified yet")
       } else {
         toast.error(result?.message ?? "CAN hardware could not be identified")
       }
@@ -1324,8 +1326,8 @@ export default function ControlPanel() {
     canDiscoveryNoticesRef.current.add(noticeKey)
     const fallback =
       canDiscovery.status === "unidentified"
-        ? "Power the attached hardware, then use Retry CAN identification below."
-        : "Run axol can.setup in a terminal if the problem continues."
+        ? "Power on the attached hardware, then press Retry CAN identification."
+        : "If the problem continues, run axol can.setup in a terminal."
     if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
     else toast.error(canDiscovery.message ?? fallback)
   }, [canDiscovery, canServerInstanceId, conn.state, currentCanServerEpoch, toast])
@@ -1610,7 +1612,9 @@ export default function ControlPanel() {
           setUpdateAbandoned(true)
           setStartingUpdate(false)
           setUpdatePhase(null)
-          toast.error("The robot has not come back from the update. Reload to retry.")
+          toast.error(
+            "The robot did not come back online after the update. Reload the page to try again."
+          )
         }
         return
       }
@@ -1700,7 +1704,7 @@ export default function ControlPanel() {
       // never be blocked by camera detection, and sim never touches hardware.
       const mantisSelected = mantisMode
       if (hardwareProfile === "mantis" && !meta.supportsMantis) {
-        toast.error(`${meta.label} runs on Axol only — select the Axol tile first.`)
+        toast.error(`${meta.label} runs on Axol only. Select the Axol tile first.`)
         return
       }
       // Sim is an Axol run mode; it is hidden (and ignored) on Mantis, so only
@@ -1724,7 +1728,7 @@ export default function ControlPanel() {
           detErr = detect.error
         }
         if (detErr) {
-          toast.error(`Can't verify cameras: ${detErr}`)
+          toast.error(`Could not check the cameras: ${detErr}`)
           return
         }
         const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected, {
@@ -1735,7 +1739,7 @@ export default function ControlPanel() {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
               ", "
-            )}. Reconnect, then Refresh (or Restart daemon) in the Cameras dialog.`
+            )}. Reconnect the camera, then restart the camera service in Cameras settings.`
           )
           return
         }
@@ -1820,7 +1824,7 @@ export default function ControlPanel() {
       await clearOperationLockout()
       if (generation !== connectionGenerationRef.current) return
       setLockout(false)
-      toast.success("Motors read torque-free — the robot is available again.")
+      toast.success("The motors are off. The robot is available again.")
       fetchRobotStatus()
         .then((value) => {
           if (generation === connectionGenerationRef.current) setRobot(value)
@@ -1856,7 +1860,7 @@ export default function ControlPanel() {
       if (generation !== connectionGenerationRef.current) return
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
-      toast.error(`Update failed to start: ${e}`)
+      toast.error(`Could not start the update: ${e}`)
       setStartingUpdate(false)
       setUpdatePhase(null)
       return
@@ -1939,9 +1943,9 @@ export default function ControlPanel() {
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
             <p className="min-w-0 flex-1 text-xs text-amber-100/80">
               {canDiscovery?.message ??
-                "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
-              Power the hardware, then connect it or retry identification. An idle robot link may
-              disconnect briefly while it is probed.
+                "CAN hardware is attached but not yet identified as Axol, Mantis or Jelly."}{" "}
+              Power on the hardware, then connect it or press Retry CAN identification. An idle
+              robot may disconnect briefly while it is checked.
             </p>
             <Button
               variant="outline"
@@ -1965,7 +1969,9 @@ export default function ControlPanel() {
                 { values: { "kinematics.mount": mount } },
                 renderedConnectionGeneration
               )
-              toast.success("Robot model saved. Change it any time in Settings → Robot.")
+              toast.success(
+                "Robot model saved. You can change it in the Robot tab of Axol settings."
+              )
             }}
           />
         )}
@@ -2014,18 +2020,16 @@ export default function ControlPanel() {
 
         {isLive && !selectedLive && (
           <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-            <span className="font-mono text-amber-200">{runningOp}</span> is currently running. Stop
-            it before starting another operation.
+            <span className="font-mono text-amber-200">{runningOp}</span> is running. Stop it before
+            you start another operation.
           </p>
         )}
 
         {lockout && (
           <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
             <p>
-              The last operation could not confirm it disabled the motors, and a probe afterwards
-              found at least one still answering under torque (or could not read them), so the robot
-              stays reserved. Cut motor power (the PSU e-stop), then re-check the motors to release
-              it.
+              The robot is locked because the last operation could not confirm that the motors are
+              off. Cut motor power with the E-Stop, then press Re-check motors.
             </p>
             <Button
               variant="outline"
@@ -2064,7 +2068,7 @@ export default function ControlPanel() {
           startPhase={startPhase}
           hostBlocker={
             activeCommandSession
-              ? `${activeCommandSession.command} setup/diagnostic is running`
+              ? `${activeCommandSession.command} is running`
               : isLive && !selectedLive
                 ? `${runningOp ?? "Another operation"} is running`
                 : null

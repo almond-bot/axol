@@ -1,15 +1,25 @@
 ---
 title: "Replay Dataset Config Parameters"
 sidebarTitle: "Config Parameters"
-description: "Every setting for axol replay-dataset — what it does and its default."
+description: "Every setting for axol replay-dataset, what it does and its default."
 ---
 
 import Robot from "/snippets/config/robot.mdx";
 import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
 
-Every setting for `axol replay-dataset`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+Every setting for `axol replay-dataset`. Add any flag below to the command, or set it once in the control panel. See [Command configuration](/cli/configuration) for config files and syntax.
 
-In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) `robot_config.axol_config.*` is the file's `axol` section, the other `robot_config.*` fields are `lerobot`, the channels live under `robot`, `--root` under `recording.root`, and this command's `--fps` is `recording.replay_fps` (data collection's recording rate is a different knob).
+The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`) is read by default. It stores these flags in the sections below.
+
+| Flag | Section in the settings file |
+|---|---|
+| `robot_config.axol_config.*` | `axol` |
+| `robot_config.left_channel`, `robot_config.right_channel` | `robot` |
+| Other `robot_config.*` fields | `lerobot` |
+| `--root` | `recording.root` |
+| `--fps` | `recording.replay_fps` |
+
+Replay's `--fps` is separate from the recording rate that data collection uses.
 
 ```bash
 axol replay-dataset --repo_id myorg/pick --episode 3 --interpolate true
@@ -19,35 +29,35 @@ axol replay-dataset --repo_id myorg/pick --episode 3 --interpolate true
 
 | Flag | Default | Description |
 |---|---|---|
-| `--repo_id` | required | Dataset id (`<user>/<dataset>`) or a path to a dataset directory. |
+| `--repo_id` | required | Dataset ID (`<user>/<dataset>`) or a path to a dataset folder. |
 | `--episode` | required | Episode index to replay. |
 | `--fps` | `0` | Playback rate. `0` uses the dataset's recorded rate. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
 | `--interpolate` | `false` | Smooth playback by interpolating between recorded actions at ~120 Hz. |
 | `--loop` | `false` | Replay the episode until stopped, returning to rest between takes. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
-| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
+| `--config_path` | none | Load a JSON or YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. The config file and flags override it. |
 
 ## Contact safety
 
-A contact stop trips when a joint's torque is higher than the gravity model expects — the arm hit something. The arms then go limp instead of pushing through.
+A contact stop trips when a joint pushes harder than the arm's weight explains, which means the arm hit something. The arms then go limp instead of pushing through.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--reset_torque_threshold` | `6.0` | Contact stop during return-to-rest (Nm). `0` disables. |
-| `--teleop_torque_threshold` | `0` (off) | Contact stop during playback (Nm). A trip stops playback. The control panel arms it at `16`. |
+| `--reset_torque_threshold` | `6.0` | Contact stop during a return to rest (Nm). `0` turns it off. |
+| `--teleop_torque_threshold` | `0` (off) | Contact stop during playback (Nm). A trip stops playback. The control panel suggests `16`. |
 | `--reset_gravity_comp_kd` | `0.25` | Damping (Nm·s/rad) of the limp hold. |
-| `--park_to_zero` | `true` | Park rest, then zero (holding the grasp) before the motors are released. `false` stops at rest. |
+| `--park_to_zero` | `true` | On stop, move to rest and then to zero, holding the grasp, before the motors turn off. `false` stops at rest. |
 
 ## Robot {#robot-config}
 
-Replay uses the arms only; camera and observation settings have no effect.
+Replay uses the arms only. Camera and observation settings have no effect.
 
 <LeRobotRobot prefix="robot_config." />
 
 ### Arm gains {#robot}
 
-Arm stiffness, gripper limits, and per-joint gains.
+Arm stiffness, gripper limits and per-joint gains.
 
 <Robot prefix="robot_config.axol_config." />

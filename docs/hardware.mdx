@@ -1,18 +1,18 @@
 ---
 title: "Hardware Overview"
-description: "Overview of the Axol dual-arm robot, its mounting options, the Camera Kit, and the Compute Kit."
+description: "Learn what comes with Axol, its mounts, the Camera Kit and the Compute Kit."
 ---
 
-Axol is configured at order time from these choices:
+You choose your Axol setup when you order. Every setup has these parts:
 
 - **Axol**: the dual-arm robot. Every configuration starts here.
-- **Mounting**: one of the following.
+- **Mount**: one of the following.
   - **Standalone**: bolt Axol to your own table or fixture.
-  - **Owl Mount**: rigid table/fixture column.
+  - **Owl Mount**: a rigid column that bolts to a table or fixture.
   - **Ox Cart**: height-adjustable mobile cart with a manual lift and leveling casters.
   - **Jelly Mobile**: powered mobile base with a battery and telescoping lift.
-- **Camera Kit**: 2× ZED X One S Fisheye wrist cameras and 1× ZED X Mini stereo head camera, with mounts and GMSL2 cabling.
-- **Compute Kit**: the onboard Jetson that runs Axol, one of the following.
+- **Camera Kit** (optional): two ZED X One S Fisheye wrist cameras and one ZED X Mini stereo head camera, with mounts and GMSL2 cables.
+- **Compute Kit**: the NVIDIA Jetson computer that runs Axol. It comes in three sizes:
   - **ZED Box Orin**: Jetson Orin NX 16GB in the industrial ZED Box.
   - **Jetson AGX Orin**: 64GB, for running the full Camera Kit.
   - **Jetson Thor**: 128GB Blackwell, for VLA policies and the full Camera Kit on one box.
@@ -23,15 +23,20 @@ Axol is configured at order time from these choices:
   <img src="/assets/axol.png" alt="Almond Axol dual-arm robot" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bolts** that thread in from the bottom. See the [mounting holes diagram](#reference-diagrams) below.
+Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bolts** that thread in from below. The hole positions are in the [mounting holes diagram](#reference-diagrams).
 
-The back of the robot exposes the connectors used for power and camera control:
+The back of the robot has these connectors:
 
 - **2× GMSL2 ports** for the wrist cameras.
 - **1× XT90 connector** for power (**24V DC, 60A peak**).
-- **1× Locking USB-C connector** for control.
+- **1× locking USB-C connector** for control.
 
-Two grippers are supported: the stock two-finger **parallel** gripper and the hinged-plate **parcel** gripper used by [box mode](/guides/vr-interface#box-mode). Tell the software which one is fitted with the control panel's **Robot → Gripper** setting or `--axol.gripper parallel|parcel` ([`AxolConfig.gripper`](/api/robot)); the gripper's stroke is calibrated against its end stops on every cold enable.
+Axol works with two grippers:
+
+- **Parallel**: the standard two-finger gripper.
+- **Parcel**: a gripper with hinged plates, used by [box mode](/guides/vr-interface#box-mode).
+
+Tell the software which gripper is fitted. Use the **Gripper** setting under **Axol settings → Robot** in the control panel, or pass `--axol.gripper parallel` or `--axol.gripper parcel` on the command line (see [`AxolConfig.gripper`](/api/robot)). When the arms first enable after power-up, Axol measures each gripper's travel against its end stops.
 
 ### Reference diagrams
 
@@ -46,7 +51,9 @@ Two grippers are supported: the stock two-finger **parallel** gripper and the hi
   <img src="/assets/owl_mount.png" alt="Almond Axol on the Owl Mount" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Owl Mount is a rigid **400mm 8080 aluminum T-slot extrusion column** that bolts Axol to a table, workbench, or fixture. Its base brackets include clearance holes for **2020, 4040, and 4545** extrusion patterns, so it drops onto most T-slot tables without drilling, and the column's T-slots stay free for cable management and accessories. An Axol mounting plate and all table/fixture hardware are included.
+The Owl Mount is a rigid **400mm 8080 aluminum T-slot column** that holds Axol on a table, workbench or fixture. Its base brackets have holes for **2020, 4040 and 4545** extrusion patterns, so it fits most T-slot tables without drilling. The slots on the column stay free for cables and accessories.
+
+The Owl Mount comes with an Axol mounting plate and all the bolts you need to fix it to your table.
 
 ### Reference diagrams
 
@@ -59,7 +66,9 @@ The Owl Mount is a rigid **400mm 8080 aluminum T-slot extrusion column** that bo
   <img src="/assets/ox_cart.png" alt="Almond Axol on the height-adjustable Ox Cart" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Ox Cart is a rugged, height-adjustable mobile cart with **four leveling casters** and a **manual crank lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height, from sitting to standing. Its **60x60cm footprint** fits through standard doors, the **powder-coated steel** frame stays stable under demanding workloads, and T-slot mounting keeps it easy to customize. The cart ships with its crank handle and casters.
+The Ox Cart is a sturdy mobile cart with **four leveling casters** and a **manual crank lift**. Roll Axol between workstations, lock the casters, and crank it to a working height anywhere from sitting to standing.
+
+The **60 × 60 cm** footprint fits through standard doors. The frame is **powder-coated steel** with T-slots, so you can add your own fixtures. The cart ships with its crank handle and casters.
 
 | | |
 |---|---|
@@ -79,9 +88,9 @@ The Ox Cart is a rugged, height-adjustable mobile cart with **four leveling cast
   <img src="/assets/axol_mount_jelly.png" alt="Almond Axol on the Jelly Mobile base" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-Jelly Mobile is a **powered mobile base** with a **holonomic (x-drive omni-wheel) drive**, an integrated **telescoping lift**, and a **2.4 kWh battery** for all-day, untethered operation. It is built for Axol but carries any robot on its universal mounting plate. Its **600 × 600 mm footprint** fits through standard doors.
+Jelly Mobile is a **powered mobile base** for Axol. It has omni-wheels that drive in any direction, a **telescoping lift**, and a **2.4 kWh battery**, so Axol can work all day without a power cable. Its universal mounting plate also fits other robots, and its **600 × 600 mm** footprint fits through standard doors.
 
-In teleop the headset thumbsticks drive Jelly's base and lift, and the SDK detects Jelly automatically from the CAN devices attached. See [Jelly in the VR interface guide](/guides/vr-interface#jelly) and [`can.setup`](/cli/can-setup).
+During teleoperation you drive the base and the lift with the headset thumbsticks. Axol detects Jelly on its own when Jelly is connected. See [Jelly in the VR interface guide](/guides/vr-interface#jelly).
 
 | | |
 |---|---|
@@ -103,13 +112,13 @@ In teleop the headset thumbsticks drive Jelly's base and lift, and the SDK detec
   <img src="/assets/axol_perception_kit.png" alt="Almond Axol with the Camera Kit cameras and head mount" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Camera Kit adds the wrist and head cameras for data collection and policy inference:
+The Camera Kit adds wrist and head cameras. You need cameras to collect data and to run policies. The kit contains:
 
-- **2× ZED X One S Fisheye** wrist cameras (global shutter, 204° FOV) with wrist mounts.
+- **2× ZED X One S Fisheye** wrist cameras (global shutter, 204° field of view) with wrist mounts.
 - **1× ZED X Mini** stereo head camera (global shutter) with a head mount.
-- **FAKRA GMSL2 cabling**: three 1.5 m cables plus two 0.3 m right-angle cables.
+- **FAKRA GMSL2 cables**: three 1.5 m cables and two 0.3 m right-angle cables.
 
-The cameras connect to the Compute Kit's GMSL2 inputs.
+The cameras plug into the GMSL2 inputs on the Compute Kit.
 
 ### Reference
 
@@ -119,7 +128,7 @@ The cameras connect to the Compute Kit's GMSL2 inputs.
 
 ## Compute Kit Overview
 
-The Compute Kit is the onboard NVIDIA Jetson that runs Axol, captures the cameras, and runs policies. Three tiers are offered:
+The Compute Kit is the NVIDIA Jetson computer that runs Axol, records the cameras and runs policies. It comes in three sizes:
 
 | | ZED Box Orin | Jetson AGX Orin | Jetson Thor |
 |---|---|---|---|
@@ -128,7 +137,7 @@ The Compute Kit is the onboard NVIDIA Jetson that runs Axol, captures the camera
 | **Storage** | 256 GB SSD | 500 GB SSD | See product page |
 | **Camera inputs** | 4× GMSL2 | 4× GMSL2 | 8× GMSL2 |
 | **Axol control** | USB-to-CAN | USB-to-CAN | Direct CAN |
-| **Best for** | Runs the full Camera Kit at reduced frame rate | Runs the full Camera Kit at full frame rate | Runs the full Camera Kit at full frame rate + policy inference |
+| **Best for** | The full Camera Kit at a reduced frame rate | The full Camera Kit at full frame rate | The full Camera Kit at full frame rate, plus running policies |
 
 ### Reference
 
@@ -138,12 +147,12 @@ The Compute Kit is the onboard NVIDIA Jetson that runs Axol, captures the camera
 
 <CardGroup cols={2}>
   <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
-    Step-by-step setup for each configuration: standalone, Owl Mount, Ox Cart, or Jelly.
+    Step-by-step setup for each mount: Standalone, Owl Mount, Ox Cart or Jelly Mobile.
   </Card>
   <Card title="Installation" icon="download" href="/installation">
-    Install Axol on the robot machine and open the web control panel.
+    Install the software on the robot's computer and open the control panel.
   </Card>
   <Card title="Mantis Hardware" icon="hand" href="/mantis/hardware">
-    Set up the handheld Mantis rigs for collecting demonstrations without moving the robot.
+    Set up the handheld Mantis rigs that record demonstrations without the robot.
   </Card>
 </CardGroup>

@@ -1,26 +1,33 @@
 ---
 title: "motor.flash"
-description: "Flash a firmware image to a MyActuator motor over CAN."
+description: "Install a firmware image on a MyActuator motor over CAN."
 ---
 
-Flashes a firmware image to a single MyActuator motor over CAN. The motor reboots into its bootloader and the image is streamed to it as a YMODEM-1K transfer — the same transfer the vendor setup software performs — so no Windows tooling is needed to update a motor in the field. Nothing else may talk to the motor while this runs, so power the arm but leave it idle.
+Installs a firmware image on one MyActuator motor over CAN. The motor restarts into its bootloader and receives the image. You don't need the vendor's Windows software.
+
+Power the arm but leave it idle. Nothing else may talk to the motor while the flash runs.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
-| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
-| `firmware` | Path to the firmware image (`.bin`, positional, required) |
+| `--channel IFACE` | Use this SocketCAN interface instead of the arm's Axol Hub interface, such as `can0` |
+| `firmware` | Path to the firmware image (`.bin`, positional, required). The file name can be at most 120 bytes |
 | `--id ID` | CAN ID of the motor to flash, hex or decimal (required) |
-| `--frame-delay SECONDS` | Pause between CAN frames; raise if the adapter's TX queue overruns (default: `0`, matching the vendor tool) |
+| `--frame-delay SECONDS` | Pause between CAN frames. Raise it if the adapter's TX queue overruns (default: `0`) |
 | `--yes` | Skip the confirmation prompt |
-
-Failures are handled the way the vendor tool handles them: a rejected block aborts the flash rather than being resent, and the bootloader's own failure replies stop it with the vendor tool's explanation — a firmware version mismatch (the image isn't for this motor), the first packet not received, a frame header error, or a flash write failure. The firmware file name may be at most 120 bytes, the vendor tool's limit.
 
 ```bash
 axol motor.flash --l --id 0x01 ./RMD-X6-V4.4.bin
 axol motor.flash --r --id 0x03 ./firmware.bin --yes
 ```
 
+The flash stops if the motor rejects a block or the bootloader reports an error. The error says what went wrong:
+
+- the image isn't for this motor (firmware version mismatch)
+- the first packet wasn't received
+- a frame header error
+- a flash write failure
+
 <Warning>
-  This overwrites the motor's firmware. Interrupting a flash leaves the motor sitting in its bootloader with a partially written image — it will not answer normal commands, but re-running this command recovers it. Do **not** power-cycle and assume the motor is lost.
+  This overwrites the motor's firmware. If a flash is interrupted, the motor stays in its bootloader and won't answer normal commands. Run this command again to recover it. The motor is not lost, so don't give up on it after a power cycle.
 </Warning>

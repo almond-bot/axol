@@ -22,7 +22,7 @@ export const ROSTER: Record<AxolModel, Character> = {
     model: "classic",
     name: "Axol Legacy",
     kind: "Original model",
-    pitch: "The original Axol model. Keep it if this robot was set up before the new mounts.",
+    pitch: "The original Axol model, and the default.",
     stats: [
       { label: "Lift", value: 0, reading: "None" },
       { label: "Mobility", value: 0.12, reading: "Fixed" },
@@ -31,8 +31,8 @@ export const ROSTER: Record<AxolModel, Character> = {
   standalone: {
     model: "standalone",
     name: "Axol Standalone",
-    kind: "Just Axol",
-    pitch: "Shoulders, head camera and arms, bolted wherever the work is.",
+    kind: "Axol only",
+    pitch: "Shoulders, head camera and arms. Bolt it where you need it.",
     stats: [
       { label: "Lift", value: 0, reading: "None" },
       { label: "Mobility", value: 0.12, reading: "Fixed" },
@@ -42,7 +42,7 @@ export const ROSTER: Record<AxolModel, Character> = {
     model: "ox_cart",
     name: "Axol × Ox",
     kind: "Lift cart",
-    pitch: "Rides a rolling cart with a 457 mm lift: wheel it to the job, raise it to the work.",
+    pitch: "Axol on a rolling cart with a 457 mm lift.",
     stats: [
       { label: "Lift", value: 457 / LIFT_MAX_MM, reading: "457 mm" },
       { label: "Mobility", value: 0.55, reading: "Rolls" },
@@ -52,7 +52,7 @@ export const ROSTER: Record<AxolModel, Character> = {
     model: "owl",
     name: "Axol × Owl",
     kind: "Column mount",
-    pitch: "A compact column on a foot plate: a steady, fixed station.",
+    pitch: "Axol on a compact column and foot plate, for a fixed station.",
     stats: [
       { label: "Lift", value: 0, reading: "None" },
       { label: "Mobility", value: 0.12, reading: "Fixed" },
@@ -63,7 +63,7 @@ export const ROSTER: Record<AxolModel, Character> = {
     name: "Axol × Jelly",
     kind: "Mobile base",
     pitch:
-      "The mobile Axol: a self-driving base and a 680 mm two-stage lift. It takes over the moment Jelly is attached.",
+      "Axol on Jelly, a powered mobile base with a 680 mm two-stage lift. Axol uses this model whenever Jelly is attached.",
     stats: [
       { label: "Lift", value: 1, reading: "680 mm" },
       { label: "Mobility", value: 1, reading: "Drives" },

@@ -73,7 +73,7 @@ export function parseSettingsFile(data: unknown): {
   values: Record<string, SettingsLeaf>
   cameras: unknown
 } {
-  if (!isTree(data)) throw new Error("invalid settings file")
+  if (!isTree(data)) throw new Error("Not a valid settings file")
   if ("values" in data || "advanced" in data) {
     const values = isTree(data.values) ? data.values : {}
     const advanced = isTree(data.advanced) ? data.advanced : {}

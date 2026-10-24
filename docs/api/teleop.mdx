@@ -3,7 +3,12 @@ title: "almond_axol.teleop"
 description: "Connect a VR headset to the robot (or simulator) for teleoperation."
 ---
 
-Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → lag-compensated low-pass filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
+Connects a VR headset to Axol, or to the simulator, for teleoperation. Each VR frame goes through four stages before it reaches `motion_control()`:
+
+1. A lag-compensated low-pass filter on the raw poses.
+2. An IK solve, in a separate process so it never blocks the asyncio event loop.
+3. Exponential smoothing of the IK output.
+4. A trapezoidal velocity and acceleration limit.
 
 ```python
 from almond_axol.teleop import VRTeleop, VRTeleopConfig
@@ -25,16 +30,16 @@ asyncio.run(main())
 VRTeleop(
     robot: RobotBase,
     *,
-    config: VRTeleopConfig | None = None,             # None → teleop.* shared settings
-    kinematics_config: KinematicsConfig | None = None, # None → kinematics.* shared settings
-    vr_server_config: VRServerConfig | None = None,    # None → vr_server.* shared settings
+    config: VRTeleopConfig | None = None,             # None: teleop.* shared settings
+    kinematics_config: KinematicsConfig | None = None, # None: kinematics.* shared settings
+    vr_server_config: VRServerConfig | None = None,    # None: vr_server.* shared settings
     jelly: Jelly | None = None,
 )
 ```
 
-Each config left `None` is built from the robot's shared settings file (`~/.almond/settings.json` — the one the [control panel](/guides/control-panel-settings) edits and `axol teleop` reads) over the built-in defaults, so an SDK session runs the same rest poses, multipliers, IK weights and VR port as the panel. Pass a config explicitly to override it; see [Shared settings](/api/robot#shared-settings).
+Each config you leave as `None` is loaded from the shared settings file, `~/.almond/settings.json`, over the built-in defaults. The [control panel](/guides/control-panel-settings) edits this file and `axol teleop` reads it, so an SDK session uses the same rest poses, multipliers, IK weights and VR port. Pass a config to override it. See [Shared settings](/api/robot#shared-settings).
 
-Use `step()` instead of `run()` to integrate teleoperation into your own control loop:
+Use `step()` instead of `run()` to run teleoperation inside your own control loop:
 
 ```python
 async with VRTeleop(axol) as teleop:
@@ -44,7 +49,7 @@ async with VRTeleop(axol) as teleop:
         await asyncio.sleep(1 / 120)
 ```
 
-To show camera feeds in the headset, register frame sources after the session is enabled — `VRTeleop.set_video_sources()` forwards them to the VR server's WebRTC relay (requires the GStreamer NVENC stack, installed by [`axol gst.install`](/cli/gst-install); see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset)). Each value is a connected `ZedCamera` (registered directly) or any object exposing `width` / `height` / `fps` + `wait_next`:
+To show camera feeds in the headset, call `VRTeleop.set_video_sources()` inside the session. It forwards the sources to the VR server's WebRTC relay, which needs the GStreamer NVENC stack from [`axol gst.install`](/cli/gst-install). Each value is a connected `ZedCamera`, or any object with `width`, `height`, `fps` and `wait_next()`. See [`almond_axol.vr`](/api/vr#camera-video-to-the-headset).
 
 ```python
 async with VRTeleop(axol) as teleop:
@@ -52,62 +57,126 @@ async with VRTeleop(axol) as teleop:
     await teleop.run()
 ```
 
-See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entry point (`--cameras` wires the ZED cameras up automatically).
+The [`teleop`](/cli/teleop) CLI command is the command-line equivalent. Its `--cameras` flag sets up the ZED cameras for you.
 
 <Note>
-  `set_video_sources()` runs the WebRTC relay in-process. The CLI instead prefers `VRTeleop.set_video_manager()`, which hands the camera grab/encode and WebRTC off to a dedicated subprocess (`almond_axol.video.video_proc.VideoRelayProcess`) so it can't perturb the control loops. Both deliver the same headset video — see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset).
+  `set_video_sources()` runs the WebRTC relay in the teleop process. `VRTeleop.set_video_manager()` instead runs camera capture, encoding and WebRTC in a separate process (`almond_axol.video.video_proc.VideoRelayProcess`), so video work can't slow the control loops. The CLI uses `set_video_manager()`. Both send the same video to the headset.
 </Note>
 
 ## `VRTeleopConfig` fields
 
+Joint velocities and accelerations are set in rad/s and rad/s². The defaults below also give them in rev/s, the unit the control panel and headset show.
+
+### Control loop and filtering
+
 | Field | Default | Description |
 |---|---|---|
-| `frequency` | `240` Hz | Control loop rate used by `run()` and reset trajectory density |
-| `ik_frequency` | `120` Hz | VR-frame ingest / IK dispatch cadence (decoupled from the faster control loop) |
-| `teleop_max_vel` | `1.0 rev/s` | Trapezoidal filter velocity cap during normal teleoperation |
-| `teleop_max_accel` | `1.5 rev/s²` | Trapezoidal filter acceleration cap |
-| `engage_max_vel` | `0.1 rev/s` | Starting velocity cap when teleop is first engaged after a reset; smoothsteps up to `teleop_max_vel` over `engage_duration` |
-| `engage_duration` | `1.0` s | Seconds over which the velocity cap ramps (smoothstep) from `engage_max_vel` up to `teleop_max_vel` after engaging |
-| `ik_alpha` | `0.3` | EMA blend factor on IK output; `1.0` disables smoothing |
-| `pose_cutoff` | `2.5` Hz | Pole of the lag-compensated low-pass on raw VR poses (tremor rejection before IK) |
-| `record` | `None` | File prefix for the teleop flight recorder; captures every pipeline stage to `<prefix>_{ik,cmd,meas,rt}.npz` for `axol diag.teleop-jitter`. The compact `rt` stage contains the Rust core's actual 240 Hz motor command, derivative/feedforward/damping terms, timing, and feedback. All stages retain the latest engage→disengage segment; Python stages write at disengage and the Rust stage finalizes when the core disarms. |
-| `position_multiplier` | `1.0` | Scale on hand **position** (not orientation): the EE target moves this many times as far as the hand. `>1` extends reach when the arm is longer than the operator's |
-| `rotation_multiplier` | `1.0` | Scale on hand **orientation** (not position): the EE target rotates this many times as far as the hand. `>1` rotates the arm further than the wrist |
-| `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
-| `reset_min_duration` | `1.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
-| `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
-| `reengage` | `"clutch"` | What a grip does when an arm [re-engages](/guides/vr-interface#re-engaging) after a freeze / pause. `"clutch"`: the arm stays put and the controller's current pose becomes its origin (you match the arm). `"ramp"`: the arm eases out to where the controller is under the mapping from its previous engage (the arm matches you), then tracks 1:1. Switched live from the headset's **Ramp** button or the control panel's session settings via `VRTeleopCore.set_reengage()` (a [live setting](/api/vr#live-session-settings)); a reset drops the anchor; engages within box mode ignore it, but leaving box mode in `"ramp"` blends both arms back out to the mapping from before box mode |
-| `reengage_ramp_speed` | `0.15` m/s | Pace of the `"ramp"` blend: a 30 cm gap takes at least 2 s |
-| `reengage_ramp_min_s` | `0.75` s | Floor on the `"ramp"` blend so a small correction is eased, not stepped |
-| `box_mode` | `False` | Start in [box mode](/guides/vr-interface#box-mode): grippers held as a level parallel pair clamping the box between their sides (the fitted tool's flat contact face against each side) and one grip driving both arms by **position and heading** — the pair follows the hand's translation and its turn about vertical (about the pair's centre) and stays level whatever the hand's pitch and roll (the other grip hands over the lead). Switched live from the headset's **Box** button, both thumbstick clicks together, or the control panel via `VRTeleopCore.set_box_mode()` (a [live setting](/api/vr#live-session-settings)); the sticks set the grip width and tilt while a grip leads it and drive Jelly once it's frozen. A switch engages at once: into box mode led by `box_lead_hand`, out of it with both arms (in ramp re-engage both blend back out to the session's controller↔arm mapping, which box mode leaves untouched), unless the first frame comes more than a second later (switched with nobody in the headset) — a return to rest that leaves box mode never engages |
-| `box_lead_hand` | `"right"` | Which controller leads the pair when box mode is switched on (`"left"` / `"right"`); the other grip can still take the lead over. Live setting |
-| `box_grasp` | `"straight"` | Which of the two grasps a session starts in: `"straight"` — fingers straight forward (0°), the tool's flat face on the box (the parcel gripper's folded plate), the blade opening to its stop like everywhere else; `"flush"` — each gripper turned `box_flush_deg` (39°) inward from the parallel grasp about the parcel plate's front edge, so the contact and the width stay put; the blade stays at its stop, width between the contact faces in both. A switch blends each gripper about that edge, so a box already held stays held. Toggled live by clicking (and releasing) either thumbstick while a grip leads, or as a live setting; a live pair blends into the new grasp over `box_align_duration`. The worker reports the current grasp as `pair.grasp` and the core mirrors a stick toggle back into this field |
-| `gripper` | `None` | Which gripper is fitted. `None` follows the robot's `AxolConfig.gripper`, which the CLIs and `VRTeleop` adopt (set `--axol.gripper`, not this); a value here that disagrees with the robot's is overridden with a warning, and with no robot to follow (`Sim`) `None` means `"parallel"`. Box mode exists only with `"parcel"`, the hinged-plate [parcel gripper](/guides/vr-interface#box-tool): with `"parallel"` every `box_*` live setting is hidden, `box_mode` starts off (with a warning) and `set_box_mode(True)` raises `ValueError`. With the parcel gripper box mode places its contact geometry (`almond_axol.teleop.box.ToolGeometry`) — its plate folded back along the wrist at its stop in every grasp; `"straight"` clamps with the plate's face, `"flush"` rolls each gripper `box_flush_deg` inward about the plate's front edge onto its 39.2° chamfer facet and the fixed blade's tip, and `width` is the distance between the contact faces in both |
-| `box_flush_deg` | `39` ° | How far the angled (`"flush"`) grasp turns each gripper inward from the parallel grasp, about the parcel plate's front edge (the chamfer is 39.2°, so 39° lays the facet and the fixed tip on the box together). The blade opens to its calibrated stop in every grasp; the stop's angle is never assumed. Live setting (**Angled yaw**); read at each engage or grasp switch |
-| `box_face_left` / `box_face_right` | `"auto"` | Which flat side of each gripper (mount `"+x"` / `"-x"`) is turned toward the box. `"auto"` picks the one needing the smaller wrist turn at the engage — pin it for the parcel gripper if it engages with the fixed blade toward the box or the motor cap down. Live settings |
-| `box_grip_tilt` | `0` ° | Fixed inward yaw *trim* of each gripper on top of the grasp's yaw: `0` holds the contact face parallel to the box side; positive turns the fingertips toward the box centre, negative splays them outward, pivoting about the contact face. A calibration constant (e.g. a few degrees negative to land the parcel gripper's proud tip on the face plane), not a live control
-| `box_width_speed` | `0.08` m/s | Rate either stick's left/right changes the grip width — the lateral distance between the two contact faces (the mounts, for the URDF gripper) — push right = wider. Only a stick's dominant axis counts, so width and tilt never change together |
-| `box_width_min` / `box_width_max` | `0.02` / `0.70` m | Clamp on that width. The floor is raised, per grasp, to where the fitted tool's bodies would meet a centimetre apart (`ToolGeometry.min_width`): the parcel gripper's contact faces are proud of its body in both grasps and close to `box_width_min`; the stock gripper (face on the mount axis) stops at ~`0.077` |
-| `box_align_duration` | `1.5` s | Smoothstep blend from the arms' actual poses into the parallel pair when engaging in box mode |
-| `box_elbow_out` | `30` ° | How far out box mode holds the elbows: degrees from straight down, toward the arm's side, that an IK elbow hint steers each elbow's free swivel to (`0` under the arm, `90` level). Either thumbstick's forward/back jogs it live (forward = further apart) and the worker reports the value back through `pair_status` (`"elbow"`), which the core mirrors into the config — so it outlasts the pair and shows in the panel |
-| `box_elbow_weight` | `10` | IK weight on that hint (box mode solves the grippers at 2× `pos_weight` and 4× `ori_weight`, 100 and 40 by default). The hint steps each elbow only along the arm's own swivel (`KinematicsSolver.elbow_swivel`), so it doesn't pull a gripper off its target. `0` disables it — the elbow swivel is then left alone, kept off the base by the arm↔torso collision model (`KinematicsConfig.self_collision`) — and the sticks' elbow control does nothing |
-| `box_elbow_speed` | `30` °/s | Rate the sticks change `box_elbow_out` at full forward/back deflection |
-| `box_wrist_torque` | `5` Nm | Spring-torque cap on `wrist_2` and `wrist_3` on each arm while box mode is on (and no return-to-rest is playing), through the same `spring_caps()` → `set_spring_caps` path as `box_squeeze_torque`; plain teleop runs the wrists uncapped. The wrists carry the clamp's moment at the tool and the small wrist motors overheat pressing hard; 5 Nm is ~2.2° of error at `kp` 130. Box mode's automatic clamp-force limit is derived from it (~39 N a side). `0` = off. Not a live setting; realtime-core hardware only |
-| `box_squeeze_torque` | `0` Nm (off) | Box mode's opt-in hard per-joint squeeze cap: while box mode is on (and no return-to-rest is playing) the impedance spring torque of `shoulder_2` and `shoulder_3` on each arm — the joints a lateral force at the gripper loads, and not the ones that lift the box — is capped here. `VRTeleopCore.spring_caps()` reports the caps in force; the adapter hands them to the robot (`set_spring_caps`), which backs each whole-arm command off toward the measured pose until the capped joints are within their caps and also sends them with each command for the realtime core's per-joint clamp. A backstop under `box_squeeze_force` — but a per-joint torque cap cannot tell a squeeze from a move (the shoulders' servo lag during a carry exceeds any useful cap), so with it on the arm moving toward the other trails and the pair skews; off by default. Live setting; realtime-core hardware only |
-| `box_squeeze_lean` | `1` (×) | Box mode's squeeze lean, scaled (`0` = off). A plain lateral run-ahead into the box is a force at the gripper mount plus the moment it takes to hold the mount's orientation against the arm's stiffness coupling, which the tool's contacts can only carry by loading unevenly (the face digs in, the tip lifts). From each arm's Jacobian at its commanded pose (`GravityCompensator.mount_jacobian`) and its joint stiffness (`AxolArm.kp`), `almond_axol.teleop.box.squeeze_lean` gives the target offset — an inward yaw of ~1.3° per cm of clamp depth, a touch of roll, a millimetre of translation — that makes the run-ahead a pure force through the contacts' centroid (`ToolGeometry.contacts`: in the angled grasp the parcel plate's chamfer facet and the fixed blade's tip, top and bottom of each — half the force each), which they share evenly. The IK worker adds it to each gripper target in proportion to the measured clamp depth: the raw targets' run-ahead past the measured mounts along the pair's inward normals, averaged over both arms (a carry adds nothing) and low-passed 0.2 s. The core forwards the arms' measured joints and `kp` before every box-mode frame (`VRTeleopCore.run_ik_loop(get_measured=measured_arms)` → `IKWorker.note_measured`). Target-side only: nothing on the command path changes, and no arm is held back. `pair_status["squeeze"]` reports the force. Live setting; realtime-core hardware only |
-| `box_squeeze_trim` | `5` (°) | Bound on box mode's squeeze trim (`0` = off). The lean is open loop and the arm is not quite its model (gear backlash, wrist give, the gripper flexing under load), so a heavy box — more depth for the friction to carry it — still pinched. The worker measures the toe-out the encoders do see — the yaw between each gripper's measured mount rotation and its parallel slot (`almond_axol.teleop.box.toe_out_sides`), signed tip-out, per arm — and while the grippers press and the pair's commanded motion has been still 0.3 s (a turn's servo lag reads as toe-out on one side, toe-in on the other) integrates each arm's (1°/s per degree) into an extra inward yaw of its own target, never more than this, bleeding off over a second once they don't. `pair_status["trim"]` reports the mean and `pair_status["trims"]` the pair (`[left, right]`), in degrees; a `box clamp:` log line once a second while pressing carries each arm's depth, force, toe-out and trim. Live setting; realtime-core hardware only |
-| `box_squeeze_force` | `0` N (off) | Cap on box mode's clamp force per arm (the clamp is held under 80% of the force at which a torque-capped joint — `wrist_2`, ~39 N of even clamp at `box_wrist_torque`'s 5 Nm — would saturate and unload the tip, whatever this is set to; `box.joint_force_limit`). The lean knows the force the depth produces (~6 N per cm); past the cap the worker pulls the targets back out along the normals to the cap's depth, by the same amount on both arms, so the pair presses with the cap however far the width is jogged, at any pose. Live setting; realtime-core hardware only |
-| `absolute_mode` | `False` | Mantis mapping: fit one gravity-aligned world→robot-base transform at the deliberate two-control engage gesture, then map live poses 1:1 in that fixed frame |
-| `base_height` | `None` | Optional robot-base height in the pose producer's world; `None` derives it from the two held start poses |
-| `tcp_transform_left` / `tcp_transform_right` | `None` | Tracker→gripper TCP transform `[x, y, z, qx, qy, qz, qw]`. Explicit and file-loaded values must contain seven finite numbers, a translation no farther than 1 metre (values are metres, not millimetres), and a nonzero quaternion. Explicit values are useful for bring-up captures; production Mantis collection also requires each final value to match the active device/profile-keyed entry in `~/.almond/mantis/tcp_transform.json` (or a verified factory constant), so a stale value cannot survive a tracker-source swap |
-| `tracker_key` | `None` | Quest's exact `quest:<WebXR-profile>:grip` transform identity. Lighthouse and Ultimate ignore this singular field and resolve their distinct left/right `survive:<id>` / `ultimate:<mac>` bindings from tracker config. Saved Ultimate entries also carry the quaternion-order/up-axis pose convention and become non-authoritative if it changes |
-| `quest_controller_profile` / `quest_pose_space` | `None` | Expected live Quest controller datum, normally derived from `tracker_key`; a mismatch makes that side untracked and forces recovery instead of applying the wrong mount transform |
-| `urdf_viewer_world_aligned` | `None` | Spatial-overlay policy. Mantis setup resolves `None` to true for Quest and false for Lighthouse/Ultimate, whose world is unrelated to a view-only Quest. Set true for an external source only after an out-of-band origin/yaw co-registration |
+| `frequency` | `120` Hz | Control loop rate of `run()`. Also sets the waypoint density of return-to-rest moves. |
+| `ik_frequency` | `120` Hz | Rate at which VR frames are sent to the IK solver. The control loop interpolates between solutions. |
+| `teleop_max_vel` | `2π` rad/s (1 rev/s) | Joint velocity cap while tracking. Live setting (**Arm speed**). |
+| `teleop_max_accel` | `3π` rad/s² (1.5 rev/s²) | Joint acceleration cap while tracking. |
+| `engage_max_vel` | `0.2π` rad/s (0.1 rev/s) | Velocity cap at the first engage after a reset. It ramps up to `teleop_max_vel` over `engage_duration`. |
+| `engage_duration` | `1.0` s | Time for the velocity cap to ramp from `engage_max_vel` to `teleop_max_vel`. |
+| `ik_alpha` | `0.3` | Smoothing factor on the IK output. `1.0` turns smoothing off. |
+| `pose_cutoff` | `2.5` Hz | Cutoff of the low-pass filter on raw VR poses, which rejects hand tremor before IK. |
+| `position_multiplier` | `1.0` | Scale from hand position to end-effector position. Above `1` extends reach. Live setting (**Reach scale**). |
+| `rotation_multiplier` | `1.0` | Scale from hand rotation to end-effector rotation. Above `1` turns the arm further than your wrist. |
+| `record` | `None` | File prefix for the teleop flight recorder, which `axol diag.teleop-jitter` reads. |
 
-<Note>
-  **Engage behaviour.** From rest, both grip buttons together engage both arms. Once engaged, each grip acts **per arm** — a click toggles that arm between tracking and frozen (a frozen arm holds its pose and grasp while the other keeps tracking). Set `hold_to_engage` for a per-arm dead-man scheme instead: each arm tracks exactly while its own grip is held (either grip alone engages its arm, from rest too), release freezes that arm, and a grip still held through a forced disengage must be released once before it engages again. A rising edge on the reset button triggers a trajectory back to the rest pose (collision-aware when `KinematicsConfig.self_collision` is on; joint-space with limits otherwise). In **box mode** the pair engages on the switch itself, led by `box_lead_hand`; from a frozen pair a single grip engages both arms again, blending them into the parallel pair first, and the pressed controller leads.
+`record` writes each pipeline stage to its own file: `<prefix>_ik.npz`, `<prefix>_cmd.npz`, `<prefix>_meas.npz` and `<prefix>_rt.npz`. The `rt` file holds the realtime core's 240 Hz motor commands, control terms, timing and feedback. Each file keeps the most recent engage-to-disengage segment.
 
-  **Re-engaging.** When a grip re-engages an arm (after a freeze, a disengage, or the arm being moved by hand), `reengage` decides who moves: with `"clutch"` nothing does — the controller's current pose becomes the new origin — while with `"ramp"` the IK worker keeps the controller↔arm mapping from the arm's previous engage and blends the arm's target from its current pose to where that mapping places the controller (smoothstep, paced by `reengage_ramp_speed` with a `reengage_ramp_min_s` floor; the goal is live, so a moving hand is followed). The engage-edge frame itself never moves the arm in either mode. The mapping is dropped by `IKWorker.reset()` / `clear_engage()` (return to rest, DAgger sync), so the first engage after those snaps fresh regardless of mode.
+### Engage and reset
 
-  **Live settings.** `box_mode`, `reengage`, `hold_to_engage`, `position_multiplier` and `teleop_max_vel` (plus the grippers' torque limit on hardware) can change while a session runs — from the headset HUD or the control panel — through `almond_axol.teleop.live.LiveSettings`, which validates a request and hands it to `VRTeleopCore.set_live(key, value)`. Requests are queued and applied on the IK thread before the next frame (or while idle), and fields the IK worker reads are mirrored to it as `("set", key, value)` messages, so the two processes' copies of the config never disagree mid-step. See the [VR server API](/api/vr#live-session-settings) for the wire protocol.
-</Note>
+| Field | Default | Description |
+|---|---|---|
+| `hold_to_engage` | `False` | `True` makes each grip a dead-man switch: its arm tracks only while the grip is held. Live setting (**Hold to engage**). |
+| `reengage` | `"clutch"` | What a grip does when it re-engages an arm: `"clutch"` or `"ramp"`. See [Re-engaging](#re-engaging). Live setting (**Re-engage**). |
+| `reengage_ramp_speed` | `0.15` m/s | Speed of the `"ramp"` blend. A 30 cm gap takes at least 2 s. |
+| `reengage_ramp_min_s` | `0.75` s | Shortest `"ramp"` blend, so a small correction is eased rather than stepped. |
+| `reset_speed` | `0.2π` rad/s (0.1 rev/s) | Average velocity of the joint that moves farthest during return-to-rest. The peak is 1.5 times this with the default IK solver. |
+| `reset_min_duration` | `1.5` s | Shortest return-to-rest move, so an arm near rest doesn't snap home. |
+| `rest_pose_left` / `rest_pose_right` | near zero | Return-to-rest target for each arm, shape `(7,)` in `ARM_JOINTS` order. |
+
+### Box mode
+
+| Field | Default | Description |
+|---|---|---|
+| `gripper` | `None` | Which gripper is fitted: `"parallel"` or `"parcel"`. `None` follows the robot's `AxolConfig.gripper`. |
+| `box_mode` | `False` | Start in [box mode](/guides/vr-interface#box-mode). Live setting (**Box mode**). |
+| `box_lead_hand` | `"right"` | Which controller leads the pair when box mode turns on. The other grip can take over the lead. Live setting. |
+| `box_grasp` | `"straight"` | Starting grasp. `"straight"` points the fingers forward, and `"flush"` turns each gripper inward by `box_flush_deg`. Live setting (**Box grasp**). |
+| `box_flush_deg` | `39`° | How far the `"flush"` grasp turns each gripper inward, about the front edge of the parcel plate. Live setting (**Angled yaw**). |
+| `box_face_left` / `box_face_right` | `"auto"` | Which side of each gripper (`"+x"` or `"-x"`) faces the box. `"auto"` picks the side that needs the smaller wrist turn. Live settings (**Left face**, **Right face**). |
+| `box_grip_tilt` | `0`° | Fixed inward yaw trim of each gripper. Positive turns the fingertips toward the box, negative splays them out. |
+| `box_width_speed` | `0.08` m/s | Rate at which a thumbstick changes the grip width at full deflection. |
+| `box_width_min` / `box_width_max` | `0.02` / `0.70` m | Limits on the grip width, measured between the contact faces. The minimum is raised where needed so the two grippers never touch. |
+| `box_align_duration` | `1.5` s | Time to blend the grippers into the parallel pair when box mode engages or the grasp changes. |
+| `box_elbow_out` | `30`° | How far out the elbows are held, from `0` (straight down) to `90` (level). Live setting (**Elbows out**). |
+| `box_elbow_weight` | `10` | IK weight that holds the elbows at `box_elbow_out`. `0` turns it off, and the thumbsticks then don't move the elbows. |
+| `box_elbow_speed` | `30` °/s | Rate at which a thumbstick changes `box_elbow_out` at full deflection. |
+| `box_wrist_torque` | `5` Nm | Cap on the spring torque of `wrist_2` and `wrist_3` in box mode, which keeps the wrist motors from overheating. `0` turns it off. |
+| `box_squeeze_force` | `0` N (off) | Cap on how hard each arm clamps the box. Live setting (**Squeeze force**). |
+| `box_squeeze_lean` | `1` | Scale on the squeeze lean, which angles each gripper into the box as the clamp builds. `0` turns it off. Live setting (**Squeeze lean**). |
+| `box_squeeze_trim` | `5`° | Most inward yaw the squeeze trim may add while the grippers press. `0` turns it off. Live setting (**Squeeze trim**). |
+| `box_squeeze_torque` | `0` Nm (off) | Hard cap on the spring torque of `shoulder_2` and `shoulder_3` in box mode. Live setting (**Squeeze cap**). |
+
+Box mode needs the [parcel gripper](/guides/vr-interface#box-tool). Set the gripper on the robot with `--axol.gripper`, not with this config. A `gripper` value that disagrees with the robot's is overridden with a warning, and with no robot to follow (`Sim`), `None` means `"parallel"`. With the parallel gripper:
+
+- every `box_*` live setting is hidden,
+- `box_mode` starts off, with a warning,
+- `VRTeleopCore.set_box_mode(True)` raises `ValueError`.
+
+In box mode one grip drives both arms by position and heading. The pair follows the hand's movement and its turn about vertical, and stays level whatever the hand's pitch and roll. While a grip leads, either thumbstick shapes the grasp:
+
+- Left and right change the grip width. Right is wider.
+- Forward and back move the elbows. Forward is farther apart.
+- A click toggles between the two grasps.
+
+Freeze the pair and the thumbsticks drive [Jelly](/guides/vr-interface#jelly) instead. Box mode switches from the headset's **Box** button, both thumbstick clicks together, the control panel, or `VRTeleopCore.set_box_mode()`. The switch engages right away: into box mode led by `box_lead_hand`, or out of it with both arms. If no VR frame arrives within a second of the switch, or a return to rest ends box mode, nothing engages.
+
+#### The squeeze
+
+When you jog the grip width past the box, the arms' joint springs turn the extra distance into clamp force, about 6 N per centimetre. These settings shape the clamp:
+
+- **Squeeze force** (`box_squeeze_force`) caps the clamp force per arm, at any pose. Try `8` N. Whatever it is set to, the clamp stays under about 31 N a side, the most the wrists can press evenly at the default `box_wrist_torque`.
+- **Squeeze lean** (`box_squeeze_lean`) yaws each gripper inward about 1.3° per centimetre of clamp depth, so the tip and root of the gripper press evenly. Raise it if the tip lifts as you squeeze. Lower it if the face near the wrist lifts.
+- **Squeeze trim** (`box_squeeze_trim`) adds inward yaw from the measured gripper angle until each face sits parallel to the box. It corrects for backlash and flex that the lean doesn't model, and acts only once the pair has held still for 0.3 s.
+- **Squeeze cap** (`box_squeeze_torque`) is a hard torque cap on the two shoulder joints. It also slows any move toward the other arm, so the pair can skew. Leave it at `0` unless you need it.
+
+The squeeze settings and `box_wrist_torque` work on hardware only. The IK worker reports the clamp force and trims in `IKWorker.pair_status()` as `squeeze`, `trim` (mean) and `trims` (`[left, right]`). While the grippers press, the teleop log prints a `box clamp:` line once a second.
+
+### Mantis
+
+| Field | Default | Description |
+|---|---|---|
+| `absolute_mode` | `False` | Mantis mapping. Fits one fixed world-to-robot-base transform at the two-control engage gesture, then maps poses 1:1 in that frame. |
+| `base_height` | `None` | Robot base height in the tracker's world. `None` derives it from the two held start poses. |
+| `tcp_transform_left` / `tcp_transform_right` | `None` | Tracker-to-gripper transform `[x, y, z, qx, qy, qz, qw]`, in metres. |
+| `tracker_key` | `None` | Quest controller transform key, `quest:<WebXR-profile>:grip`. Lighthouse and Ultimate trackers ignore it. |
+| `quest_controller_profile` / `quest_pose_space` | `None` | Expected Quest controller profile and pose space, normally derived from `tracker_key`. On a mismatch, that side stops tracking until you recover it. |
+| `urdf_viewer_world_aligned` | `None` | Whether the headset shows the robot overlay in the tracker's world. `None` means true for Quest and false for Lighthouse and Ultimate. |
+
+A TCP transform must have seven finite numbers, a translation of at most 1 metre, and a nonzero quaternion. Production Mantis collection also requires it to match the active tracker's entry in `~/.almond/mantis/tcp_transform.json`, or a verified factory constant. Lighthouse and Ultimate trackers take their left and right bindings (`survive:<id>`, `ultimate:<mac>`) from the tracker config instead of `tracker_key`. A saved Ultimate entry stops counting if its pose convention changes.
+
+Set `urdf_viewer_world_aligned` to true for a Lighthouse or Ultimate tracker only after you have registered its origin and heading to the Quest's world.
+
+## Engage behavior
+
+- From rest, press both grips together to engage both arms.
+- Once engaged, a grip click toggles its arm between tracking and frozen. A frozen arm holds its pose and grasp while the other keeps tracking.
+- With `hold_to_engage`, an arm tracks only while its grip is held, from rest too. Releasing the grip freezes that arm. If tracking stops while a grip is held, release it once before it engages again.
+- The reset button moves both arms back to the rest pose. The move avoids self-collision when `KinematicsConfig.self_collision` is on, and otherwise stays within joint limits.
+- In box mode, turning box mode on engages the pair, led by `box_lead_hand`. From a frozen pair, a single grip engages both arms again, and that controller leads.
+
+### Re-engaging
+
+When a grip re-engages an arm after a freeze, a disengage, or someone moving the arm by hand, `reengage` decides which side moves:
+
+- `"clutch"`: the arm stays put, and the controller's current pose becomes the new origin.
+- `"ramp"`: the arm keeps the controller-to-arm mapping from its previous engage and blends to where that mapping puts the controller. The blend is paced by `reengage_ramp_speed`, takes at least `reengage_ramp_min_s`, and follows a moving hand.
+
+The arm never moves on the engage frame itself. A return to rest or a DAgger sync drops the mapping (`IKWorker.reset()`, `clear_engage()`), so the next engage starts fresh in either mode. Engages inside box mode ignore `reengage`. Leaving box mode with `"ramp"` blends both arms back to the mapping from before box mode.
+
+## Live settings
+
+Some settings can change while a session runs, from the headset or the control panel: `box_mode`, the other box-mode settings marked live above, `reengage`, `hold_to_engage`, `position_multiplier`, `teleop_max_vel`, and the gripper torque limit on hardware. `almond_axol.teleop.live.LiveSettings` validates each request and passes it to `VRTeleopCore.set_live(key, value)`. Changes apply on the IK thread before the next frame, or while the session is idle, so the control panel can change them with no headset connected. See [Live session settings](/api/vr#live-session-settings) for the full list and the wire protocol.

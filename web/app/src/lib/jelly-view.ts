@@ -28,7 +28,7 @@ export function wheelName(m: WheelMotorHealth): string {
 /** The lift's one-line state: height and homed state, or why it is silent. */
 export function liftSummaryText(status: JellyLiftStatus): string {
   const board = status.status
-  if (status.reachable == null) return "unknown (a task owns the bus)"
+  if (status.reachable == null) return "unknown (in use by a task)"
   if (status.reachable === false) return "board not answering"
   if (board == null) return "waiting for status…"
   return [
@@ -97,7 +97,7 @@ export function batteryTooltip(battery: JellyBattery): string {
   if (!battery.live) lines.push(`Last reading ${formatAge(battery.ageSeconds)} ago`)
   if (battery.underLoad)
     lines.push("Measured while the lift or wheels were moving, so it reads low")
-  lines.push("Estimated from the lift board's 24 V rail (2× LiFePO4, 100 Ah)")
+  lines.push("Estimated from the 24 V battery voltage")
   return lines.join("\n")
 }
 

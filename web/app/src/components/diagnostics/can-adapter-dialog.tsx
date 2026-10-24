@@ -143,9 +143,9 @@ export function CanAdapterDialog({
     profile !== "mantis"
       ? null
       : !leftChannel || !rightChannel
-        ? "Mantis requires a CAN interface for both grippers."
+        ? "Mantis needs a CAN interface for each gripper."
         : leftChannel === rightChannel
-          ? "Mantis left and right must use two distinct CAN interfaces."
+          ? "Mantis left and right need different CAN interfaces."
           : null
   const valid =
     !mappingsLoading &&
@@ -181,9 +181,9 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              Choose Axol or Mantis, then the SocketCAN interface for each side. Axol mappings are
-              shared with robot operations; Mantis selection drives the diagnostics link without
-              changing the robot&apos;s saved channels.
+              Choose Axol or Mantis, then the SocketCAN interface for each side. Robot operations
+              use the same Axol mapping. Choosing Mantis here does not change the robot&apos;s saved
+              channels.
             </p>
           </div>
           <Button
@@ -237,7 +237,7 @@ export function CanAdapterDialog({
           </div>
         ) : (
           <p className="text-xs leading-relaxed text-white/45">
-            Mantis always connects both grippers over two distinct CAN interfaces.
+            Mantis always connects both grippers on separate CAN interfaces.
           </p>
         )}
 
@@ -250,11 +250,11 @@ export function CanAdapterDialog({
         {detected != null && detected.length === 0 && (
           <p className="rounded-md border border-amber-400/25 bg-amber-400/[0.05] p-2.5 text-xs leading-relaxed text-amber-100/90">
             {detectFailed
-              ? "Couldn't list the host's CAN interfaces — the axol serve release on " +
-                "the host may be too old for this dashboard (update it), or the host " +
-                "is unreachable. You can still type an interface name."
-              : "No CAN interfaces were detected on the host — plug in a CAN adapter, " +
-                "or type the interface name it will have."}
+              ? "Couldn't list the host's CAN interfaces. The host may be offline, or " +
+                "its axol serve may be too old for this page, so update it. You can " +
+                "still type an interface name."
+              : "No CAN interfaces found on the host. Plug in a CAN adapter, or type " +
+                "the interface name it will have."}
           </p>
         )}
 
@@ -328,7 +328,7 @@ function ChannelField({
               type="button"
               disabled={disabled}
               onClick={() => onChange(iface.name)}
-              title={iface.up ? "interface is up" : "interface is down"}
+              title={iface.up ? "Interface is up" : "Interface is down"}
               className={cn(
                 "rounded-md border px-2 py-0.5 font-mono text-xs transition-colors",
                 value === iface.name

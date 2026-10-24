@@ -1,21 +1,28 @@
 ---
 title: "motor.dump-config"
-description: "Read every configuration parameter from one or all motors and save a snapshot."
+description: "Save every configuration parameter of one motor, or all motors on a bus, to a file."
 ---
 
-Reads every configuration parameter from one motor (or all motors on the bus when `--id` is omitted) and prints them, optionally saving a JSON snapshot. Works for both motor families — MyActuator's `0xC0` parameters and Damiao's `0x7FF` registers — with the type inferred from the CAN ID. This is the first thing to capture when a motor is misbehaving: the saved snapshot is exactly what [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) consumes to return the motor to a known-good state.
+Reads every configuration parameter from one motor, or from every motor on the bus when you omit `--id`, and prints them. With `--out` it also saves a JSON snapshot that [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) can write back. It works with both MyActuator and Damiao motors and picks the motor type from the CAN ID.
+
+Run it first when a motor misbehaves, so you have a record of its configuration.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
 | `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
-| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
-| `--id ID` | Motor CAN ID, hex or decimal. Omit to dump IDs 1–8 on Axol or ID 8 on Mantis |
-| `--type {myactuator,damiao}` | Motor type (inferred from the ID if omitted) |
-| `--out FILE` | Write a JSON snapshot for `motor.restore-config` |
-| `--raw` | Sweep raw parameter indices instead of the known table, to surface indices not yet named (MyActuator only — Damiao's register table is complete) |
+| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
+| `--id ID` | Motor CAN ID, hex or decimal. Omit to dump IDs 1 to 8 on Axol, or ID 8 on Mantis |
+| `--type {myactuator,damiao}` | Motor type. Inferred from the ID if omitted |
+| `--out FILE` | Save a JSON snapshot for `motor.restore-config` |
+| `--raw` | Read every raw parameter index, including ones without a name. MyActuator only |
 
-Each parameter is printed with its value, unit, and an access tag: `(read-only)` for values the motor reports but won't accept (firmware versions, measured winding constants) and `(protected)` for factory calibration and identity, CAN IDs, and baud rate. MyActuator parameters the motor's firmware doesn't implement (the `0x46`–`0x4A` group, which only `2026042402` firmware has) are left out of the dump rather than reported with junk values. A `--raw` snapshot cannot be restored — its keys are bare indices with no known meaning — so it's for identification only.
+Each parameter is printed with its value and unit. Some carry a tag:
+
+- `(read-only)`: the motor reports the value but won't accept a new one, such as firmware versions and measured winding constants.
+- `(protected)`: factory calibration, identity, CAN IDs and baud rate.
+
+Parameters that the motor's firmware doesn't support are left out. A `--raw` snapshot can't be restored, because its indices have no known meaning. Use it only to identify parameters.
 
 ```bash
 axol motor.dump-config --l --id 0x01              # one motor
@@ -26,5 +33,5 @@ axol motor.dump-config --target mantis --l --out mantis-left.json
 ```
 
 <Note>
-  Attach the printed output (or the saved snapshot) to a support thread — it's a complete picture of how a motor is configured, and restoring it later writes back only the parameters that actually differ.
+  Attach the printed output or the saved snapshot when you contact support. It shows the motor's full configuration.
 </Note>
