@@ -17,7 +17,7 @@ Each motor has a card with its status, temperature, bus voltage and position, up
 
 ### Change a motor's parameters
 
-For a MyActuator motor, the card's dialog has a **Parameters** tab next to **Details**. It shows the motor's configuration in groups: **Protect parameters**, **Plan parameters**, **Motor parameters** and **Motor information**.
+For a MyActuator motor, the card's dialog has a **Parameters** tab next to **Details**. It shows the motor's configuration in groups: **Protection parameters**, **Motion planning parameters**, **Motor parameters** and **Motor information**.
 
 1. Type a new value, or pick one from the list.
 2. Press **Set** or Enter. The value is saved to the motor's flash, and the table reloads.
@@ -181,7 +181,7 @@ On the **Factory** tab, leave **Velocities** empty to use the default slow speed
 
 ### Recorded motion
 
-- **Gains:** the table shows each joint's current gains. Edit a cell to change it for this run only, on both arms. Clear a cell to go back to the configured value, or press **Reset overrides** to clear them all.
+- **Gains:** the table shows each joint's current gains. Edit a cell to change it for this run only, on both arms. Clear a cell to go back to the configured value. To clear every override, press **Reset _N_ overrides** below the table.
 - **Controller:** **impedance** runs the normal teleop controller at 240 Hz. **position** runs every joint on its motor's own position loop at 400 Hz.
 - **Controller per joint:** with impedance, click a cell to put that joint on its motor's position loop for this run. A joint already set to the motor loop in the configuration can't be switched back here.
 - **Run as IK:** solves the motion through the IK solver, as teleop does, instead of replaying joint angles. The score then includes both IK and tracking error.
