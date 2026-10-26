@@ -47,6 +47,13 @@ describe("validateDataCollectionRequest", () => {
     expect(result).toEqual({ ok: true, value: { ...valid, task: "Fold the towel." } })
   })
 
+  it("takes a request without an example", () => {
+    for (const example of [undefined, {}, { kind: "video", value: "  " }]) {
+      const result = validateDataCollectionRequest({ ...valid, example })
+      expect(result).toEqual({ ok: true, value: { ...valid, example: null } })
+    }
+  })
+
   it("normalizes a dataset link to its id", () => {
     const result = validateDataCollectionRequest({
       ...valid,
@@ -63,7 +70,7 @@ describe("validateDataCollectionRequest", () => {
     [{ task: "x".repeat(501) }, "500 characters"],
     [{ example: { kind: "video", value: "ftp://x" } }, "link to a video"],
     [{ example: { kind: "dataset", value: "towels" } }, "owner/name"],
-    [{ example: {} }, "video or a Hugging Face dataset"],
+    [{ example: { kind: "audio", value: "x" } }, "video link or a Hugging Face dataset"],
     [{ operation: "run-policy" }, "Unknown page"],
     [{ returnUrl: "javascript:alert(1)" }, "Unknown return page"],
   ])("rejects %j", (patch, message) => {

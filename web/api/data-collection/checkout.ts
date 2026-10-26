@@ -39,8 +39,8 @@ export async function POST(request: Request): Promise<Response> {
     service: "data_collection",
     hours: String(req.hours),
     task: req.task,
-    example_kind: req.example.kind,
-    example: req.example.value,
+    example_kind: req.example?.kind ?? "",
+    example: req.example?.value ?? "",
     operation: req.operation,
   }
 

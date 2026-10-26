@@ -26,7 +26,7 @@ function returnUrl(): string {
 }
 
 const STEPS = [
-  "Describe the task and add an example of it.",
+  "Describe the task. An example of it helps, but is optional.",
   "Choose the hours of usable data you need, and pay on Stripe's checkout page.",
   "Almond emails you to plan the collection.",
   "Almond records the episodes and delivers them as a LeRobot dataset.",
@@ -179,7 +179,10 @@ function RequestForm({
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <Label htmlFor="dc-example">Example of the task</Label>
+          <Label htmlFor="dc-example">
+            Example of the task
+            <span className="ml-1.5 font-normal text-white/40">Optional</span>
+          </Label>
           <div
             role="tablist"
             aria-label="Example type"

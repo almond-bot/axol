@@ -2021,7 +2021,8 @@ export default function ControlPanel() {
     ) : null
 
   // Alerts that apply wherever the operator is: an update, a version skew, a
-  // robot held after a failed shutdown, and hardware still to identify.
+  // robot held after a failed shutdown, and hardware still to identify. Not on
+  // Request data, which works without the robot.
   const notices = (
     <>
       {(conn.state === "idle" || conn.state === "err") && (
@@ -2143,7 +2144,7 @@ export default function ControlPanel() {
         title={page[view].title}
         description={page[view].description}
         actions={runningChip}
-        notices={notices}
+        notices={view === "request-data" ? undefined : notices}
         badges={badges}
         host={host}
       >

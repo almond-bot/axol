@@ -73,6 +73,14 @@ describe("POST /api/data-collection/checkout", () => {
     expect(params.payment_intent_data.metadata).toEqual(params.metadata)
   })
 
+  it("sends an empty example when there is none", async () => {
+    create.mockResolvedValue({ id: "cs_2", url: "https://checkout.stripe.com/c/pay/cs_2" })
+    expect((await post({ ...request, example: { kind: "video", value: "" } })).status).toBe(200)
+    const { metadata } = create.mock.calls[0][0]
+    expect(metadata.example_kind).toBe("")
+    expect(metadata.example).toBe("")
+  })
+
   it("rejects an invalid request without calling Stripe", async () => {
     const response = await post({ ...request, hours: 0 })
     expect(response.status).toBe(400)

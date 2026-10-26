@@ -41,7 +41,8 @@ export function requestSource(from: string | null): DataCollectionOperation {
 export interface DataCollectionRequest {
   hours: number
   task: string
-  example: { kind: ExampleKind; value: string }
+  /** A video or sample dataset of the task; optional. */
+  example: { kind: ExampleKind; value: string } | null
   /** The page the request came from, for Almond's records. */
   operation: DataCollectionOperation
   /** Where Stripe sends the customer back to, after paying or cancelling. */
@@ -104,25 +105,31 @@ export function validateDataCollectionRequest(raw: unknown): Validation<DataColl
     return { ok: false, error: `Keep the task description to ${MAX_TASK_LENGTH} characters.` }
   }
 
+  // The example is optional: an empty field sends none. One that is filled in
+  // must be a link or a dataset that opens.
   const kind = example.kind
-  const exampleText = typeof example.value === "string" ? example.value : ""
-  let value: string | null
-  if (kind === "video") {
-    value = parseVideoUrl(exampleText)
-    if (!value) return { ok: false, error: "Enter a link to a video of the task." }
-  } else if (kind === "dataset") {
-    value = parseHuggingFaceDataset(exampleText)
-    if (!value) {
-      return {
-        ok: false,
-        error: "Enter a Hugging Face dataset as owner/name, or paste its link.",
+  const exampleText = typeof example.value === "string" ? example.value.trim() : ""
+  let parsedExample: DataCollectionRequest["example"] = null
+  if (exampleText) {
+    let value: string | null
+    if (kind === "video") {
+      value = parseVideoUrl(exampleText)
+      if (!value) return { ok: false, error: "Enter a link to a video of the task." }
+    } else if (kind === "dataset") {
+      value = parseHuggingFaceDataset(exampleText)
+      if (!value) {
+        return {
+          ok: false,
+          error: "Enter a Hugging Face dataset as owner/name, or paste its link.",
+        }
       }
+    } else {
+      return { ok: false, error: "Choose a video link or a Hugging Face dataset." }
     }
-  } else {
-    return { ok: false, error: "Add a video or a Hugging Face dataset of the task." }
-  }
-  if (value.length > MAX_LINK_LENGTH) {
-    return { ok: false, error: `Use a link of ${MAX_LINK_LENGTH} characters or fewer.` }
+    if (value.length > MAX_LINK_LENGTH) {
+      return { ok: false, error: `Use a link of ${MAX_LINK_LENGTH} characters or fewer.` }
+    }
+    parsedExample = { kind, value }
   }
 
   const operation = body.operation
@@ -131,7 +138,7 @@ export function validateDataCollectionRequest(raw: unknown): Validation<DataColl
   const returnUrl = parseVideoUrl(typeof body.returnUrl === "string" ? body.returnUrl : "")
   if (!returnUrl) return { ok: false, error: "Unknown return page." }
 
-  return { ok: true, value: { hours, task, example: { kind, value }, operation, returnUrl } }
+  return { ok: true, value: { hours, task, example: parsedExample, operation, returnUrl } }
 }
 
 /** "$50" for 5000 USD cents; whole amounts drop the decimals. */
