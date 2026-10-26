@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ChevronDown,
   Download,
@@ -108,7 +108,7 @@ function cameraProfilesAfterEdit(
 }
 
 /**
- * The shared settings, directly on the control panel page, split by device:
+ * The shared settings on the control panel's Settings page, split by device:
  * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
  * **Mantis** (tracking source and setup, trigger calibration, head and wrist cameras, CAN), and
  * **General** (Quest, recording, inference, system, Advanced). Each
@@ -136,9 +136,16 @@ export function SettingsSection({
   activeCommandSession,
   onCommandSessionChange,
   axolConnected = false,
+  embedded = false,
+  onDirtyChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Rendered as the body of the Settings page: no collapsible header or
+   *  scope switcher (the page owns those), and nothing while closed. */
+  embedded?: boolean
+  /** Reports whether staged edits are waiting for Save. */
+  onDirtyChange?: (dirty: boolean) => void
   tab: SettingsTab
   onTabChange: (tab: SettingsTab) => void
   /** Server-stored settings + schema; null while loading or on an old host. */
@@ -176,6 +183,9 @@ export function SettingsSection({
     [draft, cameras, devices]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
 
   // Seed / reseed the draft from the stored state ("adjust state when props
   // change" — set during render, not in an effect). Do not seed while the
@@ -396,12 +406,15 @@ export function SettingsSection({
     mantisSourceSaved &&
     (draftMantisSource !== "quest" || draftQuestTrackerKey === storedQuestTrackerKey)
 
+  if (embedded && !open) return null
+
   return (
     <Card className="gap-0 p-0">
       <div
         className={cn(
           "flex w-full items-center gap-3 px-5 py-3.5",
-          open && "border-b border-white/10"
+          open && "border-b border-white/10",
+          embedded && "hidden"
         )}
       >
         <button

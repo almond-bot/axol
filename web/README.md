@@ -6,7 +6,7 @@ The browser front-ends for the Almond Axol robot. This directory lives inside th
 - **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
 - **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles (with a MyActuator parameter editor), and diagnostics / calibration script runners with run history. Also served by `axol serve`.
 
-The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control` (the diagnostics dashboard is reached from the control panel's nav bar).
+The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`. The control panel and diagnostics dashboard share one app shell (`app/src/components/app-shell.tsx`): a sidebar with client-side routes for `/control` (overview), `/control/operations`, `/control/datasets`, `/control/settings/<tab>`, `/control/logs`, and `/diagnostics` with its `tests`, `tuning` and `history` sub-pages.
 
 > Docs: [Web Control Panel](https://docs.almond.bot/guides/control-panel) · [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) · [VR Interface](https://docs.almond.bot/guides/vr-interface). The `serve` backend (FastAPI) that the control panel and diagnostics dashboard talk to lives in `almond_axol/serve/`.
 

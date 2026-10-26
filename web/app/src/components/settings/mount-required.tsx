@@ -1,6 +1,6 @@
 /**
- * The robot-model pick a host needs before its first Axol run, shown above the
- * settings on the main page until one is saved. After that the picker lives in
+ * The robot-model pick a host needs before its first Axol run, shown on the
+ * control panel's Overview until one is saved. After that the picker lives in
  * Settings → Robot (see mount-picker.tsx).
  */
 

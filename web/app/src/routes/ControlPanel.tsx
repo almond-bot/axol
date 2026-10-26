@@ -1,5 +1,15 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, RefreshCw } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
+import {
+  ArrowRight,
+  Camera,
+  CircleAlert,
+  Loader2,
+  Plug,
+  RefreshCw,
+  ScrollText,
+  Square,
+} from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   HARDWARE_PROFILE_ARG,
@@ -97,14 +107,38 @@ import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { MountRequired } from "@/components/settings/mount-required"
-import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
+import {
+  SETTINGS_SCOPES,
+  defaultSettingsTab,
+  settingsScopeForTab,
+  type SettingsScope,
+  type SettingsTab,
+} from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
-import { SiteNav } from "@/components/site-nav"
+import { AppShell, PageSection, type HostSummary, type NavBadges } from "@/components/app-shell"
+import type { StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
 import type { SimRobot } from "@/components/sim-robot-picker"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
+
+/** The pages of the control panel, one per sidebar item. */
+type ControlView = "overview" | "operations" | "datasets" | "settings" | "logs"
+
+const CONTROL_VIEWS: Record<string, ControlView> = {
+  "": "overview",
+  operations: "operations",
+  datasets: "datasets",
+  settings: "settings",
+  logs: "logs",
+}
+
+/** `/control/settings/cameras` → `{ view: "settings", rest: "cameras" }`. */
+function parseControlPath(pathname: string): { view: ControlView | null; rest: string | null } {
+  const [section = "", rest] = pathname.replace(/^\/control\/?/, "").split("/")
+  return { view: CONTROL_VIEWS[section] ?? null, rest: rest ? decodeURIComponent(rest) : null }
+}
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
@@ -164,6 +198,9 @@ function loadSimRobot(): SimRobot | null {
 
 export default function ControlPanel() {
   const toast = useToast()
+  const location = useLocation()
+  const navigate = useNavigate()
+  const { view, rest: pathRest } = parseControlPath(location.pathname)
   const [commands, setCommands] = useState<CommandSpec[]>([])
   const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
@@ -256,7 +293,6 @@ export default function ControlPanel() {
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
-  const [settingsOpen, setSettingsOpen] = useState(() => cameraCount(loadCameras()) === 0)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
   // until fetched. settingsError marks a host too old for the settings API —
   // cameras then fall back to the legacy localStorage flow.
@@ -306,10 +342,18 @@ export default function ControlPanel() {
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("cameras")
-  // Anchor for the on-page settings card, so "…live in Settings" links can
-  // scroll to it.
-  const settingsRef = useRef<HTMLDivElement>(null)
+  // The settings tab lives in the URL (/control/settings/<tab>) so it can be
+  // linked and survives a reload; the last one seen reopens from the sidebar.
+  const urlSettingsTab = view === "settings" ? pathRest : null
+  const [lastSettingsTab, setLastSettingsTab] = useState<SettingsTab>("cameras")
+  const settingsTab = urlSettingsTab ?? lastSettingsTab
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (urlSettingsTab) setLastSettingsTab(urlSettingsTab)
+  }, [urlSettingsTab])
+  // Staged, unsaved settings edits: flagged on the sidebar so they aren't lost
+  // track of on another page (the draft itself survives page changes).
+  const [settingsDirty, setSettingsDirty] = useState(false)
   // Every API helper targets the module-level server base. A slow response
   // from the previous host must therefore never update this host's UI (or
   // trigger the legacy camera-settings migration against the new host).
@@ -319,12 +363,6 @@ export default function ControlPanel() {
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
   const hasConfiguredCamera = cameraCount(cameras) > 0
-  useEffect(() => {
-    // Keep setup in view until the first camera is assigned. Later camera
-    // presence changes drive the default state, but manual toggles stay put.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSettingsOpen(!hasConfiguredCamera)
-  }, [hasConfiguredCamera])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -804,9 +842,12 @@ export default function ControlPanel() {
   }
 
   function openSettings(tab: SettingsTab = "cameras") {
-    setSettingsTab(tab)
-    setSettingsOpen(true)
-    settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    navigate(`/control/settings/${encodeURIComponent(tab)}`)
+  }
+
+  function openOperation(op: OperationId) {
+    selectOp(op)
+    navigate("/control/operations")
   }
 
   // A connection tile opens its own settings scope on that scope's first tab.
@@ -1896,95 +1937,402 @@ export default function ControlPanel() {
     [conn.state, hostInfo]
   )
 
-  return (
-    <div className="min-h-screen">
-      <SiteNav current="control" />
-      <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        {update?.updateAvailable && (
-          <UpdateBanner
-            update={update}
-            updating={updating}
-            phase={updatePhase}
-            blocked={hostBusy}
-            busyReason={updateBusyReason}
-            onUpdate={handleUpdate}
-          />
-        )}
+  // An unknown /control/... path lands on the overview instead of a blank page.
+  if (view === null) return <Navigate to="/control" replace />
 
-        {mismatch && !updating && !update?.updateAvailable && (
-          <VersionMismatchBanner mismatch={mismatch} />
-        )}
+  const connected = conn.state === "ok"
 
-        <ConnectionsBar
-          conn={conn.state}
-          host={serverHost}
-          hostName={hostInfo?.hostname}
-          version={update?.version ?? hostInfo?.version ?? null}
-          onOpenSetup={() => setSetupOpen(true)}
-          onHostDisconnect={hostDisconnectClick}
-          opRunning={hostBusy}
-          hostInstalling={update?.installing ?? false}
-          robot={robot}
-          robotBusy={robotBusy}
-          canProfiles={canProfiles}
-          onRobotConnect={robotConnectClick}
-          onRobotDisconnect={robotDisconnectClick}
-          jelly={jelly}
-          jellySupported={jellySupported}
-          jellyBusy={jellyBusy}
-          canDevices={canDevices}
-          onJellyConnect={(device) => void jellyConnectClick(device)}
-          onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
-          selectedProfile={hardwareProfile}
-          onSelectProfile={(profile) => void selectHardwareProfile(profile)}
-          selectDisabled={isLive || hardwareProfileSaving}
-          selectDisabledReason={isLive ? "Stop the running operation to change the device." : null}
-          selectSaving={hardwareProfileSaving}
-          onOpenSettings={openSettingsScope}
+  const hostDot: StatusDot =
+    conn.state === "ok"
+      ? "ok"
+      : conn.state === "err"
+        ? "err"
+        : conn.state === "idle"
+          ? "idle"
+          : "warn"
+  const host: HostSummary = {
+    dot: hostDot,
+    label:
+      conn.state === "ok"
+        ? hostInfo?.hostname || serverHost || "Connected"
+        : conn.state === "err"
+          ? "Can't reach the host"
+          : conn.state === "idle"
+            ? "Not connected"
+            : "Connecting…",
+    version: connected ? (update?.version ?? hostInfo?.version ?? null) : null,
+    onClick: () => setSetupOpen(true),
+  }
+
+  const badges: NavBadges = {
+    "/control": needsMount || lockout || canDiscoveryNeedsRetry ? "attention" : undefined,
+    "/control/operations": isLive ? "running" : undefined,
+    "/control/settings": settingsDirty ? "attention" : undefined,
+  }
+
+  // A live run follows the operator around the app: every other page shows
+  // what is running, with a way back to it.
+  const runningChip =
+    isLive && view !== "operations" ? (
+      <Link
+        to="/control/operations"
+        className="flex h-8 items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-400/[0.08] px-3 text-xs text-emerald-200 transition-colors hover:bg-emerald-400/[0.14]"
+      >
+        <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+        <span className="max-w-40 truncate">
+          {isStopping ? "Stopping" : "Running"}: {runningLabel}
+        </span>
+      </Link>
+    ) : null
+
+  // Alerts that apply wherever the operator is: an update, a version skew, a
+  // robot held after a failed shutdown, and hardware still to identify.
+  const notices = (
+    <>
+      {(conn.state === "idle" || conn.state === "err") && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3">
+          <p className="min-w-0 flex-1 text-sm text-white/65">
+            {conn.state === "err"
+              ? "Can't reach the robot's computer. Check that it is on and on this network."
+              : "Connect to the robot's computer to get started."}
+          </p>
+          <Button size="sm" onClick={() => setSetupOpen(true)}>
+            <Plug />
+            Connect
+          </Button>
+        </div>
+      )}
+
+      {update?.updateAvailable && (
+        <UpdateBanner
+          update={update}
+          updating={updating}
+          phase={updatePhase}
+          blocked={hostBusy}
+          busyReason={updateBusyReason}
+          onUpdate={handleUpdate}
         />
+      )}
 
-        {conn.state === "ok" && canDiscoveryNeedsRetry && (
-          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
-            <p className="min-w-0 flex-1 text-xs text-amber-100/80">
-              {canDiscovery?.message ??
-                "CAN hardware is attached but not yet identified as Axol, Mantis or Jelly."}{" "}
-              Power on the hardware, then connect it or press Retry CAN identification. An idle
-              robot may disconnect briefly while it is checked.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void retryCanIdentification()}
-              disabled={
-                canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
-              }
+      {mismatch && !updating && !update?.updateAvailable && (
+        <VersionMismatchBanner mismatch={mismatch} />
+      )}
+
+      {lockout && (
+        <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
+          <p>
+            The robot is locked because the last operation could not confirm that the motors are
+            off. Cut motor power with the E-Stop, then press Re-check motors.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={lockoutBusy}
+            onClick={handleClearLockout}
+          >
+            {lockoutBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            Re-check motors
+          </Button>
+        </div>
+      )}
+
+      {connected && canDiscoveryNeedsRetry && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
+          <p className="min-w-0 flex-1 text-xs text-amber-100/80">
+            {canDiscovery?.message ??
+              "CAN hardware is attached but not yet identified as Axol, Mantis or Jelly."}{" "}
+            Power on the hardware, then connect it or press Retry CAN identification. An idle robot
+            may disconnect briefly while it is checked.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void retryCanIdentification()}
+            disabled={
+              canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
+            }
+          >
+            {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            Retry CAN identification
+          </Button>
+        </div>
+      )}
+    </>
+  )
+
+  const mountCard = needsMount && (
+    <MountRequired
+      locked={!axolConnected}
+      onSave={async (mount) => {
+        await handleSettingsSave(
+          { values: { "kinematics.mount": mount } },
+          renderedConnectionGeneration
+        )
+        toast.success("Mount saved. You can change it in Axol settings → Robot.")
+      }}
+    />
+  )
+
+  const page: Record<ControlView, { title: string; description?: string }> = {
+    overview: { title: "Overview" },
+    operations: { title: "Operations" },
+    datasets: {
+      title: "Datasets",
+      description: "Watch recorded episodes and fix their task text.",
+    },
+    settings: {
+      title: "Settings",
+      description: "Settings here apply to every operation on this robot and to every browser.",
+    },
+    logs: { title: "Logs" },
+  }
+
+  const settingsScope = settingsScopeForTab(settingsTab)
+
+  // The newest run's error, if its output reported one after it started. The
+  // log isn't on screen by default, so the operation page surfaces it.
+  const lastStart = lastLineIndex(lines, "[serve] starting")
+  const lastErrorAt = lastLineIndex(lines, "[serve] error:")
+  const runError =
+    lastErrorAt > lastStart ? lines[lastErrorAt].replace(/^\[serve\] error:\s*/, "") : null
+
+  return (
+    <>
+      <AppShell
+        title={page[view].title}
+        description={page[view].description}
+        actions={runningChip}
+        notices={notices}
+        badges={badges}
+        host={host}
+      >
+        {view === "overview" && (
+          <>
+            {isLive && (
+              <RunningCard
+                label={runningLabel ?? "An operation"}
+                stopping={isStopping}
+                busy={busy}
+                onOpen={() => navigate("/control/operations")}
+                onStop={() => void handleStop()}
+              />
+            )}
+
+            <PageSection title="Devices">
+              <ConnectionsBar
+                conn={conn.state}
+                host={serverHost}
+                hostName={hostInfo?.hostname}
+                version={update?.version ?? hostInfo?.version ?? null}
+                onOpenSetup={() => setSetupOpen(true)}
+                onHostDisconnect={hostDisconnectClick}
+                opRunning={hostBusy}
+                hostInstalling={update?.installing ?? false}
+                robot={robot}
+                robotBusy={robotBusy}
+                canProfiles={canProfiles}
+                onRobotConnect={robotConnectClick}
+                onRobotDisconnect={robotDisconnectClick}
+                jelly={jelly}
+                jellySupported={jellySupported}
+                jellyBusy={jellyBusy}
+                canDevices={canDevices}
+                onJellyConnect={(device) => void jellyConnectClick(device)}
+                onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
+                selectedProfile={hardwareProfile}
+                onSelectProfile={(profile) => void selectHardwareProfile(profile)}
+                selectDisabled={isLive || hardwareProfileSaving}
+                selectDisabledReason={
+                  isLive ? "Stop the running operation to change the device." : null
+                }
+                selectSaving={hardwareProfileSaving}
+                onOpenSettings={openSettingsScope}
+              />
+            </PageSection>
+
+            {mountCard}
+
+            {connected && !hasConfiguredCamera && settingsSnap !== null && (
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+                <Camera className="size-4 shrink-0 text-white/40" />
+                <p className="min-w-0 flex-1 text-sm text-white/60">
+                  No cameras are assigned. Collect data and Run policy need at least one.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => openSettings(defaultSettingsTab(hardwareProfile))}
+                >
+                  Assign cameras
+                </Button>
+              </div>
+            )}
+
+            <PageSection
+              title="Operations"
+              description={`Operations run on ${hardwareProfile === "mantis" ? "Mantis" : "Axol"}, the selected device.`}
             >
-              {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              Retry CAN identification
-            </Button>
+              <OperationGrid operations={operations} runningOp={runningOp} onOpen={openOperation} />
+            </PageSection>
+          </>
+        )}
+
+        {view === "operations" && (
+          <div className="grid items-start gap-6 xl:grid-cols-[12rem_minmax(0,1fr)]">
+            <OperationSelector
+              operations={operations}
+              selected={opId}
+              runningOp={runningOp}
+              onSelect={selectOp}
+            />
+            <div className="flex min-w-0 flex-col gap-4">
+              {isLive && !selectedLive && (
+                <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
+                  <span className="text-amber-200">{runningLabel}</span> is running. Stop it before
+                  you start another operation.
+                </p>
+              )}
+
+              {needsMount && (
+                <div className="flex flex-wrap items-center gap-3 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
+                  <p className="min-w-0 flex-1 text-sm text-white/70">
+                    Choose what Axol is mounted on before you run on the arms.
+                  </p>
+                  <Button variant="outline" size="sm" onClick={() => navigate("/control")}>
+                    Choose mount
+                  </Button>
+                </div>
+              )}
+
+              <OperationPanel
+                key={renderedConnectionGeneration}
+                meta={meta}
+                spec={spec}
+                settings={settings}
+                hardwareProfile={hardwareProfile}
+                mantisSource={mantisSource}
+                sharedValues={settingsSnap?.values ?? null}
+                onChange={setSetting}
+                onReset={resetSetting}
+                onResetAll={resetAll}
+                onOpenSettings={() => openSettingsScope(hardwareProfile)}
+                cameras={cameras}
+                robot={robot}
+                live={selectedLive}
+                stopping={selectedStopping}
+                busy={busy}
+                session={selectedLive ? effectiveStatus : null}
+                host={viewerHost}
+                viewerPort={viewerPort}
+                vrPort={hostInfo?.vrPort ?? 8000}
+                startPhase={startPhase}
+                hostBlocker={
+                  activeCommandSession
+                    ? `${commandLabel(activeCommandSession.command)} is running`
+                    : isLive && !selectedLive
+                      ? `${runningLabel ?? "Another operation"} is running`
+                      : null
+                }
+                needsMount={needsMount}
+                simRobot={simRobot}
+                onSimRobotChange={(next) => {
+                  setSimRobotChoice(next)
+                  try {
+                    localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
+                  } catch {
+                    // Private mode / storage off: the choice lasts this page view.
+                  }
+                }}
+                connected={connected}
+                policy={selectedLive ? policy : null}
+                onStart={handleStart}
+                onStop={handleStop}
+                onEpisode={handleEpisode}
+              />
+
+              {lines.length > 0 && (
+                <LogPeek
+                  line={lines[lines.length - 1]}
+                  failure={
+                    runError && effectiveStatus?.command === opId
+                      ? `${commandLabel(opId)} stopped with an error: ${runError}`
+                      : null
+                  }
+                />
+              )}
+
+              {showsDatasetPreview(meta.id) && connected && (
+                <Link
+                  to="/control/datasets"
+                  className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
+                >
+                  Review recorded episodes in Datasets
+                  <ArrowRight className="size-3.5" />
+                </Link>
+              )}
+            </div>
           </div>
         )}
 
-        {needsMount && (
-          <MountRequired
-            locked={!axolConnected}
-            onSave={async (mount) => {
-              await handleSettingsSave(
-                { values: { "kinematics.mount": mount } },
-                renderedConnectionGeneration
-              )
-              toast.success("Mount saved. You can change it in Axol settings → Robot.")
-            }}
-          />
+        {view === "datasets" &&
+          (connected ? (
+            <DatasetPreview
+              key={`datasets-${renderedConnectionGeneration}`}
+              connected
+              embedded
+              liveDataset={policy?.dataset ?? null}
+              episodesRecorded={policy?.episodesRecorded ?? null}
+            />
+          ) : (
+            <EmptyState>Connect to the robot's computer to see its datasets.</EmptyState>
+          ))}
+
+        {view === "settings" && !connected && (
+          <EmptyState>Connect to the robot's computer to see its settings.</EmptyState>
         )}
 
-        {conn.state === "ok" && (
-          <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
+        {view === "settings" && connected && (
+          <div
+            role="tablist"
+            aria-label="Settings for"
+            className="flex w-full gap-1 overflow-x-auto rounded-xl border border-white/10 bg-white/[0.02] p-1 sm:w-fit"
+          >
+            {SETTINGS_SCOPES.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                role="tab"
+                aria-selected={s.key === settingsScope}
+                onClick={() => {
+                  if (s.key !== settingsScope) openSettings(defaultSettingsTab(s.key))
+                }}
+                className={cn(
+                  "flex-1 rounded-lg px-4 py-1.5 text-sm whitespace-nowrap transition-colors sm:flex-none",
+                  s.key === settingsScope
+                    ? "bg-[#eff483]/10 text-[#eff483]"
+                    : "text-white/55 hover:bg-white/[0.05] hover:text-white/85"
+                )}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Mounted on every page so staged edits survive a trip elsewhere;
+            only its body is dropped while another page shows. */}
+        {connected && (
+          <div hidden={view !== "settings"}>
             <SettingsSection
-              open={settingsOpen}
-              onOpenChange={setSettingsOpen}
+              open={view === "settings"}
+              embedded
+              onOpenChange={() => {}}
               tab={settingsTab}
-              onTabChange={setSettingsTab}
+              onTabChange={(tab) =>
+                navigate(`/control/settings/${encodeURIComponent(tab)}`, { replace: true })
+              }
+              onDirtyChange={setSettingsDirty}
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
@@ -2013,96 +2361,17 @@ export default function ControlPanel() {
           </div>
         )}
 
-        <OperationSelector
-          operations={operations}
-          selected={opId}
-          runningOp={runningOp}
-          onSelect={selectOp}
-        />
-
-        {isLive && !selectedLive && (
-          <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-            <span className="text-amber-200">{runningLabel}</span> is running. Stop it before you
-            start another operation.
-          </p>
-        )}
-
-        {lockout && (
-          <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
-            <p>
-              The robot is locked because the last operation could not confirm that the motors are
-              off. Cut motor power with the E-Stop, then press Re-check motors.
+        {view === "logs" && (
+          <>
+            <p className="-mt-1 text-sm text-white/50">
+              {effectiveStatus
+                ? `Output from ${commandLabel(effectiveStatus.command)}${isLive ? ", which is running" : ""}.`
+                : "Output from the next operation you start shows here."}
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="shrink-0"
-              disabled={lockoutBusy}
-              onClick={handleClearLockout}
-            >
-              {lockoutBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              Re-check motors
-            </Button>
-          </div>
+            <LogConsole lines={lines} fill />
+          </>
         )}
-
-        <OperationPanel
-          key={renderedConnectionGeneration}
-          meta={meta}
-          spec={spec}
-          settings={settings}
-          hardwareProfile={hardwareProfile}
-          mantisSource={mantisSource}
-          sharedValues={settingsSnap?.values ?? null}
-          onChange={setSetting}
-          onReset={resetSetting}
-          onResetAll={resetAll}
-          onOpenSettings={() => openSettingsScope(hardwareProfile)}
-          cameras={cameras}
-          robot={robot}
-          live={selectedLive}
-          stopping={selectedStopping}
-          busy={busy}
-          session={selectedLive ? effectiveStatus : null}
-          host={viewerHost}
-          viewerPort={viewerPort}
-          vrPort={hostInfo?.vrPort ?? 8000}
-          startPhase={startPhase}
-          hostBlocker={
-            activeCommandSession
-              ? `${commandLabel(activeCommandSession.command)} is running`
-              : isLive && !selectedLive
-                ? `${runningLabel ?? "Another operation"} is running`
-                : null
-          }
-          needsMount={needsMount}
-          simRobot={simRobot}
-          onSimRobotChange={(next) => {
-            setSimRobotChoice(next)
-            try {
-              localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
-            } catch {
-              // Private mode / storage off: the choice lasts this page view.
-            }
-          }}
-          connected={conn.state === "ok"}
-          policy={selectedLive ? policy : null}
-          onStart={handleStart}
-          onStop={handleStop}
-          onEpisode={handleEpisode}
-        />
-
-        {showsDatasetPreview(meta.id) && (
-          <DatasetPreview
-            key={`datasets-${renderedConnectionGeneration}`}
-            connected={conn.state === "ok"}
-            liveDataset={policy?.dataset ?? null}
-            episodesRecorded={policy?.episodesRecorded ?? null}
-          />
-        )}
-
-        <LogConsole lines={lines} />
-      </main>
+      </AppShell>
 
       <SetupDialog
         open={setupOpen}
@@ -2113,20 +2382,130 @@ export default function ControlPanel() {
         conn={conn}
         onConnect={() => loadServer(serverHost)}
       />
+    </>
+  )
+}
+
+/** Index of the last line starting with `prefix`, or -1. */
+function lastLineIndex(lines: string[], prefix: string): number {
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].startsWith(prefix)) return i
+  return -1
+}
+
+function EmptyState({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-white/45">
+      {children}
     </div>
   )
 }
 
-/** One column per operation on wide screens, spelled out so Tailwind emits the
- *  classes; a host offering more than five wraps rather than shrinking. */
-const WIDE_COLUMNS: Record<number, string> = {
-  1: "lg:grid-cols-1",
-  2: "lg:grid-cols-2",
-  3: "lg:grid-cols-3",
-  4: "lg:grid-cols-4",
-  5: "lg:grid-cols-5",
+/** The operation in progress, at the top of the overview. */
+function RunningCard({
+  label,
+  stopping,
+  busy,
+  onOpen,
+  onStop,
+}: {
+  label: string
+  stopping: boolean
+  busy: boolean
+  onOpen: () => void
+  onStop: () => void
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-emerald-400/25 bg-emerald-400/[0.05] p-4">
+      <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-white">{label}</p>
+        <p className="text-xs text-white/50">{stopping ? "Stopping…" : "Running"}</p>
+      </div>
+      <div className="flex items-center gap-2">
+        <Button variant="outline" size="sm" onClick={onOpen}>
+          Open
+        </Button>
+        <Button variant="destructive" size="sm" onClick={onStop} disabled={busy || stopping}>
+          {stopping ? <Loader2 className="animate-spin" /> : <Square />}
+          {stopping ? "Stopping…" : "Stop"}
+        </Button>
+      </div>
+    </div>
+  )
 }
 
+/** The newest log line under the operation, linking to the full log. A run
+ *  that failed shows its error instead, so it is seen without the log open. */
+function LogPeek({ line, failure }: { line: string; failure: string | null }) {
+  return (
+    <Link
+      to="/control/logs"
+      className={cn(
+        "group flex min-w-0 items-center gap-3 rounded-lg border px-3 py-2 transition-colors",
+        failure
+          ? "border-red-400/25 bg-red-400/[0.05] hover:border-red-400/40"
+          : "border-white/10 bg-white/[0.02] hover:border-white/20"
+      )}
+    >
+      {failure ? (
+        <CircleAlert className="size-4 shrink-0 text-red-300" />
+      ) : (
+        <ScrollText className="size-4 shrink-0 text-white/35" />
+      )}
+      {failure ? (
+        <span className="line-clamp-2 min-w-0 flex-1 text-xs text-red-200/85" title={failure}>
+          {failure}
+        </span>
+      ) : (
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-white/50" title={line}>
+          {line}
+        </span>
+      )}
+      <span className="flex shrink-0 items-center gap-1 text-xs text-white/45 group-hover:text-white/80">
+        View logs
+        <ArrowRight className="size-3.5" />
+      </span>
+    </Link>
+  )
+}
+
+/** Every operation as a card on the overview; a card opens its page. */
+function OperationGrid({
+  operations,
+  runningOp,
+  onOpen,
+}: {
+  operations: OperationMeta[]
+  runningOp: OperationId | null
+  onOpen: (op: OperationId) => void
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      {operations.map((op) => (
+        <button
+          key={op.id}
+          type="button"
+          onClick={() => onOpen(op.id)}
+          className="group flex flex-col gap-1.5 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-left transition-colors hover:border-white/25 hover:bg-white/[0.04]"
+        >
+          <span className="flex items-center gap-2">
+            <span className="text-sm font-medium text-white/90">{op.label}</span>
+            {op.id === runningOp && (
+              <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+            )}
+            <ArrowRight className="ml-auto size-4 text-white/20 transition-colors group-hover:text-white/60" />
+          </span>
+          <span className="line-clamp-2 text-xs leading-relaxed text-white/45">
+            {op.description}
+          </span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** The operation list: a column beside the panel on wide screens, a
+ *  scrolling row of tabs above it otherwise. */
 function OperationSelector({
   operations,
   selected,
@@ -2139,11 +2518,9 @@ function OperationSelector({
   onSelect: (op: OperationId) => void
 }) {
   return (
-    <div
-      className={cn(
-        "grid grid-cols-2 gap-3 sm:grid-cols-3",
-        WIDE_COLUMNS[Math.min(operations.length, 5)]
-      )}
+    <nav
+      aria-label="Operations"
+      className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 xl:sticky xl:top-24 xl:mx-0 xl:flex-col xl:overflow-visible xl:px-0"
     >
       {operations.map((op) => {
         const active = op.id === selected
@@ -2153,22 +2530,21 @@ function OperationSelector({
             key={op.id}
             type="button"
             onClick={() => onSelect(op.id)}
+            aria-current={active ? "page" : undefined}
             className={cn(
-              "rounded-xl border p-3 text-left transition-all",
+              "flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-sm whitespace-nowrap transition-colors",
               active
-                ? "border-[#eff483]/40 bg-[#eff483]/10"
-                : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
+                ? "bg-[#eff483]/10 text-[#eff483]"
+                : "text-white/60 hover:bg-white/[0.05] hover:text-white/90"
             )}
           >
-            <div className="flex items-center gap-2">
-              <span className={cn("text-sm font-medium", !active && "text-white/85")}>
-                {op.label}
-              </span>
-              {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
-            </div>
+            <span className="min-w-0 flex-1 truncate">{op.label}</span>
+            {running && (
+              <span className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-400" />
+            )}
           </button>
         )
       })}
-    </div>
+    </nav>
   )
 }

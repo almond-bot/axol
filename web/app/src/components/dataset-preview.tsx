@@ -87,15 +87,19 @@ export function DatasetPreview({
   connected,
   liveDataset,
   episodesRecorded,
+  embedded = false,
 }: {
   connected: boolean
+  /** The body of the Datasets page: always open, with no card header. */
+  embedded?: boolean
   /** The running operation's dataset, if it records one. */
   liveDataset: { repoId: string; root: string } | null
   /** Bumps after every save of the running operation (triggers a refresh). */
   episodesRecorded: number | null
 }) {
   const toast = useToast()
-  const [open, setOpen] = useState(readOpen)
+  const [storedOpen, setOpen] = useState(readOpen)
+  const open = embedded || storedOpen
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   // The operator's explicit pick; null follows the live session (else newest).
   const [chosen, setChosen] = useState<string | null>(null)
@@ -190,7 +194,7 @@ export function DatasetPreview({
 
   return (
     <Card>
-      <div className="flex items-start justify-between gap-3">
+      <div className={cn("flex items-start justify-between gap-3", embedded && "hidden")}>
         <CardHeader>
           <CardTitle>Dataset preview</CardTitle>
           <CardDescription>

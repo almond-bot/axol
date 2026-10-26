@@ -3,9 +3,18 @@ title: "Diagnostics Dashboard"
 description: "Check motor health, watch live telemetry, and run tests and tuning from the browser."
 ---
 
-The diagnostics dashboard is a page of the [control panel](/guides/control-panel). With `axol serve` running, open [axol.almond.bot/diagnostics](https://axol.almond.bot/diagnostics), or `https://<axol-host>:8001/diagnostics` on your network. It also works on a phone or tablet.
+The diagnostics dashboard is part of the [control panel](/guides/control-panel). Click **Diagnostics** in the sidebar, or open [axol.almond.bot/diagnostics](https://axol.almond.bot/diagnostics) (`https://<axol-host>:8001/diagnostics` on your network). It also works on a phone or tablet.
 
-The **Hardware** section at the top lists each device on CAN (Axol or Mantis, and Jelly's wheels and lift), and lets you connect or disconnect each one.
+The dashboard has four pages, listed under **Diagnostics** in the sidebar:
+
+| Page | What's on it |
+|---|---|
+| **Live** | The CAN devices, [motor status](#motor-status), [control loop timing](#control-loop-and-can-timing) and [live telemetry](#live-telemetry). |
+| **Tests and helpers** | [Tests](#tests) and [helpers](#helpers). |
+| **Tuning** | The [tuning](#tuning) workbench. |
+| **Run history** | Past runs and their output. See [Run history](#run-history). |
+
+The **Hardware** section at the top of **Live** lists each device on CAN (Axol or Mantis, and Jelly's wheels and lift), and lets you connect or disconnect each one.
 
 ## Motor status
 
