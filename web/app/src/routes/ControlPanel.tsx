@@ -103,6 +103,7 @@ import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
+import { DataCollectionOffer } from "@/components/data-collection-offer"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
@@ -202,6 +203,27 @@ export default function ControlPanel() {
   const navigate = useNavigate()
   const { view, rest: pathRest } = parseControlPath(location.pathname)
   const [commands, setCommands] = useState<CommandSpec[]>([])
+
+  // Back from Stripe's checkout page for a Data Collection request: confirm
+  // the outcome once, then drop the marker from the address.
+  const handledCheckoutRef = useRef<string | null>(null)
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const outcome = params.get("data_collection")
+    if (!outcome || handledCheckoutRef.current === location.search) return
+    handledCheckoutRef.current = location.search
+    if (outcome === "paid") {
+      toast.success(
+        "Payment received. Almond will contact you by email to plan the data collection.",
+        12000
+      )
+    } else if (outcome === "cancelled") {
+      toast.info("Data collection request cancelled. You weren't charged.")
+    }
+    params.delete("data_collection")
+    const search = params.toString()
+    navigate({ pathname: location.pathname, search: search ? `?${search}` : "" }, { replace: true })
+  }, [location.pathname, location.search, navigate, toast])
   const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
     () => localStorage.getItem("axolServerHost") ?? ""
@@ -2260,6 +2282,10 @@ export default function ControlPanel() {
                       : null
                   }
                 />
+              )}
+
+              {(meta.id === "teleop" || meta.id === "collect-data") && !isLive && (
+                <DataCollectionOffer operation={meta.id} />
               )}
 
               {showsDatasetPreview(meta.id) && connected && (

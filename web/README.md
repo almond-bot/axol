@@ -296,3 +296,33 @@ The server additionally **relays a HUD message between clients**: the headset pu
 When the server has video sources registered (`VRServer.set_video_sources`, see `almond_axol/video/video.py`), the headset negotiates a WebRTC connection over the same WebSocket: it sends `{ "type": "webrtc-request" }`, the server replies with `{ "type": "webrtc-offer", "sdp": ..., "tracks": { mid: cameraName } }`, and the client answers with `{ "type": "webrtc-answer", "sdp": ... }`. A request that arrives while the robot's cameras are still starting (they can take a while after the server begins accepting connections) is answered with `{ "type": "webrtc-pending" }` and the offer is pushed automatically once video comes up; a server with no video answers `{ "type": "webrtc-unavailable" }`. The `useAxolVideo` hook implements the client side — re-sending the request until an offer lands, so it also recovers against servers that predate `webrtc-pending` — and returns the labelled video tracks. A stereo overhead arrives as a single side-by-side track, `overhead_sbs` (both eyes packed into one stream — one decoder session on the headset), which the app renders per-lens through a WebXR media layer; the SDK-fallback path (no gst) instead sends the two per-eye tracks `overhead_left` / `overhead_right`.
 
 The **control panel** joins the same `/ws` as one more **view-only** WebRTC client (`app/src/components/camera-feeds.tsx`, via `useAxolVideo`) to mirror these feeds in the panel — a headset-off operator view for headset-driven operations, with an optional fullscreen layout. There's no extra backend video path; the relay's encoders are shared. A side-by-side track is displayed cropped to its left eye, and a repeatedly-failing connection offers the same certificate-authorize flow the VR app uses.
+
+## Data Collection checkout (`api/`)
+
+The **Request data collection** card on the Teleoperation and Collect data pages pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
+
+| Route | What it does |
+|---|---|
+| `GET /api/data-collection/price` | The hourly price, read from Stripe. The panel shows this amount, so the price changes in Stripe, not in code. |
+| `POST /api/data-collection/checkout` | Validates the request (`app/src/lib/data-collection.ts`) and creates a Checkout Session for hours × the price. The task and example ride along as session and payment metadata. |
+| `POST /api/stripe/webhook` | Verifies the signature and announces each paid request (and failed delayed payments). This is the fulfillment step: it must be configured. |
+
+Set these as Vercel **sensitive** environment variables, with test values on Preview and live values on Production:
+
+| Variable | Value |
+|---|---|
+| `STRIPE_SECRET_KEY` | A restricted key (`rk_…`) with **Checkout Sessions: Write** and **Prices: Read**. |
+| `STRIPE_DATA_COLLECTION_PRICE_ID` | The hourly Price (`price_…`) of the Data Collection product. |
+| `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://axol.almond.bot/api/stripe/webhook`, subscribed to `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`. |
+| `DATA_COLLECTION_NOTIFY_URL` | Optional. A Slack-compatible incoming webhook that gets one message per request. Without it, requests are only in the Stripe Dashboard and the function logs. |
+
+Create the product and price once per Stripe environment, for example with the Stripe CLI:
+
+```bash
+stripe products create --name="Data Collection" \
+  --description="Labeled manipulation data for your task, per hour of usable data"
+stripe prices create --product=<prod_id> --currency=usd --unit-amount=<cents per hour>
+```
+
+To try it locally, point a dev build at a deployment with `VITE_ALMOND_API_ORIGIN=https://<preview>.vercel.app npm run dev`, and forward webhooks with `stripe listen --forward-to <preview>/api/stripe/webhook`.
+
