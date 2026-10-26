@@ -1,6 +1,7 @@
 {
   "name": "almond-axol-vr",
   "private": true,
+  "type": "module",
   "workspaces": [
     "app",
     "packages/*"

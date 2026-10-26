@@ -1,5 +1,5 @@
-import { validateDataCollectionRequest } from "../../app/src/lib/data-collection"
-import { returnTo } from "../_lib/requests"
+import { validateDataCollectionRequest } from "../../app/src/lib/data-collection.js"
+import { returnTo } from "../_lib/requests.js"
 import {
   PAYMENT_UNAVAILABLE,
   errorMessage,
@@ -7,7 +7,7 @@ import {
   preflight,
   requiredEnv,
   stripeClient,
-} from "../_lib/stripe"
+} from "../_lib/stripe.js"
 
 /** Tags these sessions in the Stripe Dashboard. */
 const INTEGRATION_ID = "axol-data-collection-rkqzmwtb"

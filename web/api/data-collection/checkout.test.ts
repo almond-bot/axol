@@ -3,16 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const create = vi.fn()
 const retrieve = vi.fn()
-vi.mock("../_lib/stripe", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../_lib/stripe")>()
+vi.mock("../_lib/stripe.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../_lib/stripe.js")>()
   return {
     ...actual,
     stripeClient: () => ({ checkout: { sessions: { create } }, prices: { retrieve } }),
   }
 })
 
-const { POST, OPTIONS } = await import("./checkout")
-const { GET } = await import("./price")
+const { POST, OPTIONS } = await import("./checkout.js")
+const { GET } = await import("./price.js")
 
 const request = {
   hours: 12,

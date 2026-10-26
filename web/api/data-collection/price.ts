@@ -1,4 +1,4 @@
-import type { DataCollectionPrice } from "../../app/src/lib/data-collection"
+import type { DataCollectionPrice } from "../../app/src/lib/data-collection.js"
 import {
   PAYMENT_UNAVAILABLE,
   errorMessage,
@@ -6,7 +6,7 @@ import {
   preflight,
   requiredEnv,
   stripeClient,
-} from "../_lib/stripe"
+} from "../_lib/stripe.js"
 
 /** GET /api/data-collection/price: the hourly price the panel shows. */
 export async function GET(): Promise<Response> {
