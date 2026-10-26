@@ -54,3 +54,8 @@ export function defaultSettingsTab(scope: SettingsScope): SettingsTab {
       return "usb"
   }
 }
+
+/** The tab where a device's cameras are assigned. */
+export function camerasSettingsTab(device: "axol" | "mantis"): SettingsTab {
+  return device === "mantis" ? "mantis-cameras" : "cameras"
+}

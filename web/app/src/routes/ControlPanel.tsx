@@ -110,6 +110,7 @@ import { SettingsSection } from "@/components/settings/settings-section"
 import { MountRequired } from "@/components/settings/mount-required"
 import {
   SETTINGS_SCOPES,
+  camerasSettingsTab,
   defaultSettingsTab,
   settingsScopeForTab,
   type SettingsScope,
@@ -383,8 +384,6 @@ export default function ControlPanel() {
   const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
-
-  const hasConfiguredCamera = cameraCount(cameras) > 0
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -872,6 +871,13 @@ export default function ControlPanel() {
     navigate("/control/operations")
   }
 
+  // Back to the live run: its own panel, with its episode controls and Stop,
+  // whatever operation was selected before.
+  function openRunningOperation() {
+    if (runningOp) openOperation(runningOp)
+    else navigate("/control/operations")
+  }
+
   // A connection tile opens its own settings scope on that scope's first tab.
   function openSettingsScope(scope: SettingsScope) {
     openSettings(defaultSettingsTab(scope))
@@ -888,6 +894,9 @@ export default function ControlPanel() {
   const hardwareProfile: HardwareProfile = hostStoresHardwareProfile
     ? (parseHardwareProfile(settingsSnap?.values[HARDWARE_PROFILE_SETTING]) ?? "axol")
     : localHardwareProfile
+  // Axol and Mantis keep separate camera layouts: the prompt to assign cameras
+  // is about the selected device's.
+  const selectedHasCamera = cameraCount(cameras, hardwareProfile === "mantis") > 0
 
   // Resolves false only when the host rejected the save (the optimistic
   // selection was reverted), so the automatic selection can retry it.
@@ -1998,6 +2007,7 @@ export default function ControlPanel() {
     isLive && view !== "operations" ? (
       <Link
         to="/control/operations"
+        onClick={() => runningOp && selectOp(runningOp)}
         className="flex h-8 items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-400/[0.08] px-3 text-xs text-emerald-200 transition-colors hover:bg-emerald-400/[0.14]"
       >
         <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
@@ -2136,7 +2146,7 @@ export default function ControlPanel() {
                 label={runningLabel ?? "An operation"}
                 stopping={isStopping}
                 busy={busy}
-                onOpen={() => navigate("/control/operations")}
+                onOpen={openRunningOperation}
                 onStop={() => void handleStop()}
               />
             )}
@@ -2175,7 +2185,7 @@ export default function ControlPanel() {
 
             {mountCard}
 
-            {connected && !hasConfiguredCamera && settingsSnap !== null && (
+            {connected && !selectedHasCamera && settingsSnap !== null && (
               <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
                 <Camera className="size-4 shrink-0 text-white/40" />
                 <p className="min-w-0 flex-1 text-sm text-white/60">
@@ -2184,7 +2194,7 @@ export default function ControlPanel() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={() => openSettings(defaultSettingsTab(hardwareProfile))}
+                  onClick={() => openSettings(camerasSettingsTab(hardwareProfile))}
                 >
                   Assign cameras
                 </Button>
