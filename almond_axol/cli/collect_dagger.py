@@ -1291,6 +1291,11 @@ def _run(
     # package may hand in its own control without this hook.
     if (note_dataset := getattr(control, "note_dataset", None)) is not None:
         note_dataset(repo_id, dataset_root)
+    # The upload runs when the session ends; check the login now, not then.
+    if cfg.push_to_hub:
+        from ..recording.hub_auth import require_hub_login
+
+        require_hub_login()
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (
