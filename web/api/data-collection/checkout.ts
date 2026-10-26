@@ -19,7 +19,7 @@ const REFUND_NOTE =
 
 /**
  * POST /api/data-collection/checkout: start a Stripe Checkout session for a
- * Data Collection request. The customer pays hours × the hourly price up
+ * Teleop Data Collection request. The customer pays hours × the hourly price up
  * front. The request itself (task, example) travels as session and payment
  * metadata, and the webhook announces it once the payment succeeds.
  */
@@ -52,7 +52,7 @@ export async function POST(request: Request): Promise<Response> {
       customer_creation: "always",
       metadata,
       payment_intent_data: {
-        description: `Data Collection, ${req.hours} h`,
+        description: `Teleop Data Collection, ${req.hours} h`,
         metadata,
       },
       custom_text: { submit: { message: REFUND_NOTE } },

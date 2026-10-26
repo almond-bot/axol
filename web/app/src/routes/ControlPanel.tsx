@@ -204,7 +204,7 @@ export default function ControlPanel() {
   const { view, rest: pathRest } = parseControlPath(location.pathname)
   const [commands, setCommands] = useState<CommandSpec[]>([])
 
-  // Back from Stripe's checkout page for a Data Collection request: confirm
+  // Back from Stripe's checkout page for a Teleop Data Collection request: confirm
   // the outcome once, then drop the marker from the address.
   const handledCheckoutRef = useRef<string | null>(null)
   useEffect(() => {
@@ -214,11 +214,11 @@ export default function ControlPanel() {
     handledCheckoutRef.current = location.search
     if (outcome === "paid") {
       toast.success(
-        "Payment received. Almond will contact you by email to plan the data collection.",
+        "Payment received. Almond will contact you by email to plan your Teleop Data Collection.",
         12000
       )
     } else if (outcome === "cancelled") {
-      toast.info("Data collection request cancelled. You weren't charged.")
+      toast.info("Teleop Data Collection request cancelled. You weren't charged.")
     }
     params.delete("data_collection")
     const search = params.toString()

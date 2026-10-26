@@ -18,7 +18,7 @@ async function announce(session: Stripe.Checkout.Session, outcome: "paid" | "fai
 }
 
 /**
- * POST /api/stripe/webhook: Stripe's events for Data Collection checkouts.
+ * POST /api/stripe/webhook: Stripe's events for Teleop Data Collection checkouts.
  * This is where a request is fulfilled (announced to the team), not on the
  * customer's return page, which they may never reach.
  *

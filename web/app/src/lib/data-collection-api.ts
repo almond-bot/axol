@@ -1,7 +1,7 @@
 import type { DataCollectionPrice, DataCollectionRequest } from "@/lib/data-collection"
 
 /**
- * Calls to Almond's Data Collection functions (web/api), which hold the
+ * Calls to Almond's Teleop Data Collection functions (web/api), which hold the
  * Stripe key. They always run on axol.almond.bot, even when this panel is
  * served by `axol serve` from the robot. A Vercel deployment (production or
  * preview) calls its own functions so a preview can be tested end to end.

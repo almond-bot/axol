@@ -297,9 +297,9 @@ When the server has video sources registered (`VRServer.set_video_sources`, see 
 
 The **control panel** joins the same `/ws` as one more **view-only** WebRTC client (`app/src/components/camera-feeds.tsx`, via `useAxolVideo`) to mirror these feeds in the panel — a headset-off operator view for headset-driven operations, with an optional fullscreen layout. There's no extra backend video path; the relay's encoders are shared. A side-by-side track is displayed cropped to its left eye, and a repeatedly-failing connection offers the same certificate-authorize flow the VR app uses.
 
-## Data Collection checkout (`api/`)
+## Teleop Data Collection checkout (`api/`)
 
-The **Request data collection** card on the Teleoperation and Collect data pages pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
+The **Request Teleop Data Collection** card on the Teleoperation and Collect data pages pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
 
 | Route | What it does |
 |---|---|
@@ -312,14 +312,14 @@ Set these as Vercel **sensitive** environment variables, with test values on Pre
 | Variable | Value |
 |---|---|
 | `STRIPE_SECRET_KEY` | A restricted key (`rk_…`) with **Checkout Sessions: Write** and **Prices: Read**. |
-| `STRIPE_DATA_COLLECTION_PRICE_ID` | The hourly Price (`price_…`) of the Data Collection product. |
+| `STRIPE_DATA_COLLECTION_PRICE_ID` | The hourly Price (`price_…`) of the Teleop Data Collection product. |
 | `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://axol.almond.bot/api/stripe/webhook`, subscribed to `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`. |
 | `DATA_COLLECTION_NOTIFY_URL` | Optional. A Slack-compatible incoming webhook that gets one message per request. Without it, requests are only in the Stripe Dashboard and the function logs. |
 
 Create the product and price once per Stripe environment, for example with the Stripe CLI:
 
 ```bash
-stripe products create --name="Data Collection" \
+stripe products create --name="Teleop Data Collection" \
   --description="Labeled manipulation data for your task, per hour of usable data"
 stripe prices create --product=<prod_id> --currency=usd --unit-amount=<cents per hour>
 ```

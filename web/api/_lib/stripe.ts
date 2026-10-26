@@ -1,14 +1,14 @@
 import Stripe from "stripe"
 
 /**
- * Shared plumbing for the Data Collection functions. They run on Vercel with
+ * Shared plumbing for the Teleop Data Collection functions. They run on Vercel with
  * axol.almond.bot, never on a customer's robot: the Stripe key must stay on
  * Almond's side. Files under `_lib` are not routes.
  *
  * Environment (set as Vercel sensitive variables, per environment):
  * - STRIPE_SECRET_KEY: a restricted key (`rk_…`) with write access to
  *   Checkout Sessions and read access to Prices.
- * - STRIPE_DATA_COLLECTION_PRICE_ID: the hourly Price of the Data Collection
+ * - STRIPE_DATA_COLLECTION_PRICE_ID: the hourly Price of the Teleop Data Collection
  *   product. The panel shows whatever amount it has.
  * - STRIPE_WEBHOOK_SECRET: the signing secret of the webhook endpoint
  *   /api/stripe/webhook.

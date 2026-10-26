@@ -1,7 +1,7 @@
 import type Stripe from "stripe"
 import { formatMoney } from "../../app/src/lib/data-collection"
 
-/** Helpers for the Data Collection routes, kept out of the route files so
+/** Helpers for the Teleop Data Collection routes, kept out of the route files so
  *  each route exports only its HTTP handlers. */
 
 /** `returnUrl` with `data_collection=<outcome>`, replacing an earlier one. */
@@ -16,7 +16,7 @@ const OPERATION_LABELS: Record<string, string> = {
   "collect-data": "Collect data",
 }
 
-/** The message Almond's team receives for one Data Collection request. */
+/** The message Almond's team receives for one Teleop Data Collection request. */
 export function requestSummary(
   session: Stripe.Checkout.Session,
   outcome: "paid" | "failed"
@@ -33,8 +33,8 @@ export function requestSummary(
     : `checkout session ${session.id}`
   return [
     outcome === "paid"
-      ? `New Data Collection request: ${m.hours} h, ${total} paid`
-      : `Data Collection payment failed: ${m.hours} h, ${total}`,
+      ? `New Teleop Data Collection request: ${m.hours} h, ${total} paid`
+      : `Teleop Data Collection payment failed: ${m.hours} h, ${total}`,
     `Customer: ${session.customer_details?.email ?? "no email"}`,
     `Task: ${m.task}`,
     `Example (${m.example_kind === "dataset" ? "Hugging Face dataset" : "video"}): ${m.example}`,

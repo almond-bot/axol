@@ -68,7 +68,7 @@ describe("POST /api/stripe/webhook", () => {
     expect(response.status).toBe(200)
     expect(notify).toHaveBeenCalledWith("https://hooks.example.com/notify", expect.anything())
     const text = notified()
-    expect(text).toContain("New Data Collection request: 10 h, $500 paid")
+    expect(text).toContain("New Teleop Data Collection request: 10 h, $500 paid")
     expect(text).toContain("lab@example.com")
     expect(text).toContain("Task: Fold the towel.")
     expect(text).toContain("Example (video): https://youtu.be/abc")
@@ -85,7 +85,7 @@ describe("POST /api/stripe/webhook", () => {
 
   it("reports a failed delayed payment", async () => {
     await deliver("checkout.session.async_payment_failed", session({ payment_status: "unpaid" }))
-    expect(notified()).toContain("Data Collection payment failed")
+    expect(notified()).toContain("Teleop Data Collection payment failed")
   })
 
   it("ignores other checkouts on the account", async () => {

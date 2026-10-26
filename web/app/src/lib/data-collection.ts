@@ -1,5 +1,5 @@
 /**
- * The Data Collection request a customer sends from the control panel, and
+ * The Teleop Data Collection request a customer sends from the control panel, and
  * the rules it must meet. Shared by the panel's form and the checkout
  * function in web/api, so both reject the same input with the same message.
  * Keep it free of browser APIs and `@/` imports: the serverless bundle
@@ -17,7 +17,7 @@ export const MAX_LINK_LENGTH = 500
 
 export type ExampleKind = "video" | "dataset"
 
-/** The operations whose pages offer Data Collection. */
+/** The operations whose pages offer Teleop Data Collection. */
 export const DATA_COLLECTION_OPERATIONS = ["teleop", "collect-data"] as const
 export type DataCollectionOperation = (typeof DATA_COLLECTION_OPERATIONS)[number]
 

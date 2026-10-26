@@ -41,7 +41,7 @@ function returnUrl(): string {
 }
 
 /**
- * The Data Collection offer on the Teleoperation and Collect data pages: a
+ * The Teleop Data Collection offer on the Teleoperation and Collect data pages: a
  * short card that opens the request form, which hands off to Stripe's
  * checkout page. The hourly price comes from Stripe; without a connection to
  * almond.bot the card still shows, without a number.
@@ -100,7 +100,7 @@ export function DataCollectionOffer({ operation }: { operation: DataCollectionOp
           className="shrink-0 self-start sm:self-auto"
           onClick={() => setOpen(true)}
         >
-          Request data collection
+          Request Teleop Data Collection
           <ArrowRight />
         </Button>
         <button
@@ -190,7 +190,7 @@ export function RequestDialog({
           <div className="flex items-center gap-2">
             <Database className="size-4 text-[#eff483]" />
             <span id="data-collection-title" className="font-heading text-base font-semibold">
-              Request data collection
+              Request Teleop Data Collection
             </span>
           </div>
           <button
