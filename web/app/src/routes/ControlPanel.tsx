@@ -104,6 +104,8 @@ import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
 import { DataCollectionOffer } from "@/components/data-collection-offer"
+import { RequestDataPage } from "@/components/request-data"
+import { requestSource } from "@/lib/data-collection"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
@@ -126,12 +128,13 @@ import type { SimRobot } from "@/components/sim-robot-picker"
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 /** The pages of the control panel, one per sidebar item. */
-type ControlView = "overview" | "operations" | "datasets" | "settings" | "logs"
+type ControlView = "overview" | "operations" | "datasets" | "request-data" | "settings" | "logs"
 
 const CONTROL_VIEWS: Record<string, ControlView> = {
   "": "overview",
   operations: "operations",
   datasets: "datasets",
+  "request-data": "request-data",
   settings: "settings",
   logs: "logs",
 }
@@ -2113,6 +2116,11 @@ export default function ControlPanel() {
       title: "Datasets",
       description: "Watch recorded episodes and fix their task text.",
     },
+    "request-data": {
+      title: "Request data",
+      description:
+        "With Teleop Data Collection, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training.",
+    },
     settings: {
       title: "Settings",
       description: "Settings here apply to every operation on this robot and to every browser.",
@@ -2323,6 +2331,12 @@ export default function ControlPanel() {
           ) : (
             <EmptyState>Connect to the robot's computer to see its datasets.</EmptyState>
           ))}
+
+        {view === "request-data" && (
+          <RequestDataPage
+            source={requestSource(new URLSearchParams(location.search).get("from"))}
+          />
+        )}
 
         {view === "settings" && !connected && (
           <EmptyState>Connect to the robot's computer to see its settings.</EmptyState>

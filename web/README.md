@@ -299,7 +299,7 @@ The **control panel** joins the same `/ws` as one more **view-only** WebRTC clie
 
 ## Teleop Data Collection checkout (`api/`)
 
-The **Request Teleop Data Collection** card on the Teleoperation and Collect data pages pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
+The **Request data** page (`/control/request-data`, with a card leading to it on the Teleoperation and Collect data pages) pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
 
 | Route | What it does |
 |---|---|

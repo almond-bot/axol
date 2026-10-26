@@ -47,6 +47,7 @@ describe("AppShell", () => {
       "Overview",
       "Operations",
       "Datasets",
+      "Request data",
       "Settings",
       "Diagnostics",
       "Logs",

@@ -12,6 +12,7 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | **Overview** | The robot's computer, Axol, Mantis and Jelly, and a card for each operation. |
 | **Operations** | Pick an operation, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes and fix their task text. |
+| **Request data** | Pay Almond to collect training data for your task. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
@@ -260,20 +261,6 @@ Open the **Operations** page, or click an operation's card on the **Overview**. 
   Recordings go to the **Dataset root** setting. By default this is `~/.cache/huggingface/lerobot` of the account that ran the installer, so the panel and the CLI see the same datasets.
 </Note>
 
-### Request Teleop Data Collection
-
-With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format. The **Teleoperation** and **Collect data** pages have a card for it.
-
-1. Press **Request Teleop Data Collection**.
-2. Enter the hours of usable data you want. The form shows the hourly price and the total.
-3. Describe the task: what the robot should do, with which objects, and what counts as done.
-4. Add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
-5. Press **Continue to payment** and pay on Stripe's checkout page.
-
-You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
-
-The request needs an internet connection on the computer running the browser. To hide the card, press **×** on it.
-
 ### Waypoints
 
 1. Start **Waypoints**. The arms go into gravity compensation.
@@ -353,6 +340,19 @@ The menu next to the scrub bar sets the playback rate: **15 fps** (the default),
 **Rename a task.** Type the new task text, or pick one of the dataset's tasks, and press **Save task**. The change is written into the dataset, so replay and training see the new text.
 
 During a recording session, the page follows the dataset being recorded and selects each take once it is saved. You can review earlier takes and fix a mistyped task without stopping the session.
+
+## Request data
+
+With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Teleoperation** and **Collect data** pages also have a card that leads there.
+
+1. Enter the hours of usable data you want. The form shows the hourly price and the total.
+2. Describe the task: what the robot should do, with which objects, and what counts as done.
+3. Add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
+4. Press **Continue to payment** and pay on Stripe's checkout page.
+
+You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
+
+The request needs an internet connection on the computer running the browser. To hide the card on the operation pages, press **×** on it. **Request data** stays in the sidebar.
 
 ## Next steps
 

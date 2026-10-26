@@ -4,6 +4,7 @@ import {
   formatMoney,
   parseHuggingFaceDataset,
   parseVideoUrl,
+  requestSource,
   validateDataCollectionRequest,
 } from "./data-collection"
 
@@ -69,6 +70,20 @@ describe("validateDataCollectionRequest", () => {
     const result = validateDataCollectionRequest({ ...valid, ...patch })
     expect(result.ok).toBe(false)
     expect(!result.ok && result.error).toContain(message)
+  })
+})
+
+describe("requestSource", () => {
+  it("keeps the operation page a card linked from, else names the page itself", () => {
+    expect(requestSource("teleop")).toBe("teleop")
+    expect(requestSource("collect-data")).toBe("collect-data")
+    expect(requestSource(null)).toBe("request-data")
+    expect(requestSource("run-policy")).toBe("request-data")
+  })
+
+  it("is a page the checkout accepts", () => {
+    const result = validateDataCollectionRequest({ ...valid, operation: requestSource(null) })
+    expect(result.ok).toBe(true)
   })
 })
 

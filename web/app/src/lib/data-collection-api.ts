@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react"
 import type { DataCollectionPrice, DataCollectionRequest } from "@/lib/data-collection"
 
 /**
@@ -39,4 +40,23 @@ export async function startDataCollectionCheckout(request: DataCollectionRequest
     body: JSON.stringify(request),
   })
   return url
+}
+
+/** The hourly price from Stripe, or null until it arrives (or when almond.bot
+ *  can't be reached: the price is then left out rather than guessed). */
+export function useDataCollectionPrice(enabled = true): DataCollectionPrice | null {
+  const [price, setPrice] = useState<DataCollectionPrice | null>(null)
+  useEffect(() => {
+    if (!enabled) return
+    let active = true
+    fetchDataCollectionPrice()
+      .then((p) => {
+        if (active) setPrice(p)
+      })
+      .catch(() => {})
+    return () => {
+      active = false
+    }
+  }, [enabled])
+  return price
 }

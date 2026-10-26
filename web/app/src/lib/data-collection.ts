@@ -17,9 +17,26 @@ export const MAX_LINK_LENGTH = 500
 
 export type ExampleKind = "video" | "dataset"
 
-/** The operations whose pages offer Teleop Data Collection. */
-export const DATA_COLLECTION_OPERATIONS = ["teleop", "collect-data"] as const
+/** The operation pages that show the Teleop Data Collection card. */
+export const DATA_COLLECTION_OFFER_OPERATIONS = ["teleop", "collect-data"] as const
+export type DataCollectionOfferOperation = (typeof DATA_COLLECTION_OFFER_OPERATIONS)[number]
+
+/** Where a request was made from: the Request data page itself, or the page
+ *  whose card led there. Sent as the checkout's `operation` metadata, which
+ *  Beaver shows with the request. */
+export const DATA_COLLECTION_OPERATIONS = [
+  "request-data",
+  ...DATA_COLLECTION_OFFER_OPERATIONS,
+] as const
 export type DataCollectionOperation = (typeof DATA_COLLECTION_OPERATIONS)[number]
+
+/** The `?from=` of a Request data link, or the page itself when it names no
+ *  operation page. */
+export function requestSource(from: string | null): DataCollectionOperation {
+  return (DATA_COLLECTION_OFFER_OPERATIONS as readonly (string | null)[]).includes(from)
+    ? (from as DataCollectionOfferOperation)
+    : "request-data"
+}
 
 export interface DataCollectionRequest {
   hours: number
