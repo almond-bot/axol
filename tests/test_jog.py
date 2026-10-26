@@ -243,6 +243,10 @@ class _FakePlanner:
         pose = (np.zeros(3, np.float32), np.eye(3, dtype=np.float32))
         return pose, pose
 
+    def joint_trajectory(self, q_from: np.ndarray, q_to: np.ndarray, **kw: Any) -> list:
+        steps = 50
+        return [q_from + (q_to - q_from) * (i + 1) / steps for i in range(steps)]
+
     def plan(self, q_now: np.ndarray, arm: str, target: Any, **kw: Any) -> Any:
         self.calls += 1
         q_to = q_now.copy()
@@ -368,6 +372,19 @@ class JogSessionTest(unittest.TestCase):
         while time.monotonic() < end:
             self.session.hold(vx, 0.0, 0.0, lift)
             time.sleep(0.05)
+
+    def test_stopping_returns_moved_arms_to_rest(self) -> None:
+        plan = self.session.plan("left", [0.3, 0.2, 0.1], QUAT)
+        self.session.execute(plan["id"])
+        self.assertTrue(
+            _wait(lambda: self.session.state()["lastExecution"] is not None)
+        )
+        self.stop.set()
+        self.thread.join(5)
+        left, right = asyncio.run(self.backend.arm_positions())
+        np.testing.assert_allclose(
+            np.concatenate([left[:7], right[:7]]), rest_q(), atol=1e-6
+        )
 
     def test_lift_moves_only_while_held(self) -> None:
         self._hold_for(1.0, lift=-1)
@@ -536,6 +553,24 @@ class HardwareBackendTest(unittest.TestCase):
             stop.set()
             thread.join(5)
         self.assertTrue(axol.exited and jelly.disabled)
+
+    def test_stop_drives_the_arms_to_rest_before_disabling(self) -> None:
+        axol = _FakeAxol()
+        # Start away from rest, as an arm left somewhere by a jog would be.
+        axol.left.positions = axol.left.positions + np.array(
+            [0.3] * 7 + [0.0], np.float32
+        )
+        session = JogSession(HardwareBackend(axol, None), _FakePlanner, rate=200.0)
+        thread, stop = _start(session)
+        self.assertTrue(_wait(lambda: session.state()["ready"]))
+        stop.set()
+        thread.join(5)
+        self.assertTrue(axol.exited)
+        left, right = axol.sent[-1]
+        np.testing.assert_allclose(
+            np.concatenate([left[:7], right[:7]]), rest_q(), atol=1e-6
+        )
+        self.assertAlmostEqual(float(left[7]), 0.3, places=6)  # grip kept
 
     def test_absent_arm_is_never_commanded(self) -> None:
         axol = _FakeAxol()

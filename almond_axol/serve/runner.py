@@ -74,7 +74,8 @@ _STOP_GRACE_S = 6.0
 # The teleop and collect-data ops park the arms on Stop — rest, then zero
 # (``almond_axol.teleop.shutdown``) — before the torque comes off, and the
 # second leg needs the IK worker alive for its plan. Give those ops the two
-# park caps plus the hardware disconnect before any child is killed.
+# park caps plus the hardware disconnect before any child is killed. Jog
+# returns the arms to rest on Stop too.
 _PARK_STOP_GRACE_S = PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 4.0
 _FORCE_GRACE_S = 5.0
 
@@ -1087,7 +1088,7 @@ class OperationRunner:
             return
         grace = (
             _PARK_STOP_GRACE_S
-            if session.command_id in ("teleop", "collect-data")
+            if session.command_id in ("teleop", "collect-data", "jog")
             else _STOP_GRACE_S
         )
         thread.join(timeout=grace)

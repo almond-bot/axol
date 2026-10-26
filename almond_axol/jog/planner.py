@@ -183,6 +183,29 @@ class JogPlanner:
             orientation_error=ori_err,
         )
 
+    def joint_trajectory(
+        self,
+        q_from: np.ndarray,
+        q_to: np.ndarray,
+        *,
+        speed: float,
+        rate: float,
+        min_duration: float,
+    ) -> list[np.ndarray]:
+        """Collision-aware joint-space trajectory between two configurations."""
+        from ..teleop.trajectory import plan_collision_aware_trajectory
+
+        with self._lock:
+            trajectory = plan_collision_aware_trajectory(
+                self._solver,
+                np.asarray(q_from, dtype=np.float32),
+                np.asarray(q_to, dtype=np.float32),
+                speed=speed,
+                rate=rate,
+                min_duration=min_duration,
+            )
+        return [np.asarray(q, dtype=np.float32) for q in trajectory]
+
     def plan(
         self,
         q_now: np.ndarray,
@@ -195,19 +218,11 @@ class JogPlanner:
         lift_raised: float | None = None,
     ) -> JogPlan:
         """IK to the closest pose, then a collision-aware trajectory to it."""
-        from ..teleop.trajectory import plan_collision_aware_trajectory
-
         q_now = np.asarray(q_now, dtype=np.float32)
         solution = self.solve(q_now, arm, target, lift_raised)
-        with self._lock:
-            trajectory = plan_collision_aware_trajectory(
-                self._solver,
-                q_now,
-                solution.q,
-                speed=speed,
-                rate=rate,
-                min_duration=min_duration,
-            )
+        trajectory = self.joint_trajectory(
+            q_now, solution.q, speed=speed, rate=rate, min_duration=min_duration
+        )
         own = self.indices(arm)
         other = [i for i in range(len(q_now)) if i not in own]
         pinned = []
