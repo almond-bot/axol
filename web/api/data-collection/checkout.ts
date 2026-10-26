@@ -21,7 +21,8 @@ const REFUND_NOTE =
  * POST /api/data-collection/checkout: start a Stripe Checkout session for a
  * Teleop Data Collection request. The customer pays hours × the hourly price up
  * front. The request itself (task, example) travels as session and payment
- * metadata, and the webhook announces it once the payment succeeds.
+ * metadata. Beaver's Stripe webhook reads it from there once the payment
+ * succeeds, records the request and tells #sales.
  */
 export async function POST(request: Request): Promise<Response> {
   let body: unknown

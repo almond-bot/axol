@@ -10,10 +10,11 @@ import Stripe from "stripe"
  *   Checkout Sessions and read access to Prices.
  * - STRIPE_DATA_COLLECTION_PRICE_ID: the hourly Price of the Teleop Data Collection
  *   product. The panel shows whatever amount it has.
- * - STRIPE_WEBHOOK_SECRET: the signing secret of the webhook endpoint
- *   /api/stripe/webhook.
- * - DATA_COLLECTION_NOTIFY_URL (optional): a Slack-compatible incoming
- *   webhook that receives one message per paid request.
+ *
+ * Fulfillment is not here: Beaver (beaver.almond.bot) already receives every
+ * checkout on the account through its own Stripe webhook, and opens a Teleop
+ * Data Collection request for a session tagged `metadata.service =
+ * "data_collection"`.
  */
 
 export class MissingConfigError extends Error {

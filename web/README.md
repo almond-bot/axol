@@ -304,17 +304,16 @@ The **Request Teleop Data Collection** card on the Teleoperation and Collect dat
 | Route | What it does |
 |---|---|
 | `GET /api/data-collection/price` | The hourly price, read from Stripe. The panel shows this amount, so the price changes in Stripe, not in code. |
-| `POST /api/data-collection/checkout` | Validates the request (`app/src/lib/data-collection.ts`) and creates a Checkout Session for hours × the price. The task and example ride along as session and payment metadata. |
-| `POST /api/stripe/webhook` | Verifies the signature and announces each paid request (and failed delayed payments). This is the fulfillment step: it must be configured. |
+| `POST /api/data-collection/checkout` | Validates the request (`app/src/lib/data-collection.ts`) and creates a Checkout Session for hours × the price. The task and example ride along as session and payment metadata, with `service: "data_collection"`. |
 
-Set these as Vercel **sensitive** environment variables, with test values on Preview and live values on Production:
+There is no webhook here. Beaver's Stripe webhook already receives every checkout on the account: for a paid session tagged `service: "data_collection"` it opens a request under **Sales → Data collection** at beaver.almond.bot and posts it in #sales. Keep the metadata keys (`service`, `hours`, `task`, `example_kind`, `example`, `operation`) in step with Beaver's `lib/data-collection-math.ts`.
+
+Set these as Vercel environment variables (the key as **sensitive**), with test values on Preview and live values on Production:
 
 | Variable | Value |
 |---|---|
 | `STRIPE_SECRET_KEY` | A restricted key (`rk_…`) with **Checkout Sessions: Write** and **Prices: Read**. |
 | `STRIPE_DATA_COLLECTION_PRICE_ID` | The hourly Price (`price_…`) of the Teleop Data Collection product. |
-| `STRIPE_WEBHOOK_SECRET` | The signing secret (`whsec_…`) of a webhook endpoint at `https://axol.almond.bot/api/stripe/webhook`, subscribed to `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`. |
-| `DATA_COLLECTION_NOTIFY_URL` | Optional. A Slack-compatible incoming webhook that gets one message per request. Without it, requests are only in the Stripe Dashboard and the function logs. |
 
 Create the product and price once per Stripe environment, for example with the Stripe CLI:
 
@@ -324,5 +323,5 @@ stripe products create --name="Teleop Data Collection" \
 stripe prices create --product=<prod_id> --currency=usd --unit-amount=<cents per hour>
 ```
 
-To try it locally, point a dev build at a deployment with `VITE_ALMOND_API_ORIGIN=https://<preview>.vercel.app npm run dev`, and forward webhooks with `stripe listen --forward-to <preview>/api/stripe/webhook`.
+To try it locally, point a dev build at a deployment with `VITE_ALMOND_API_ORIGIN=https://<preview>.vercel.app npm run dev`.
 
