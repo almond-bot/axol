@@ -44,6 +44,8 @@ HOLD_TIMEOUT_S = 0.25
 # A plan is refused at execute time if any arm joint has moved further than
 # this from where the plan starts.
 PLAN_START_TOLERANCE_RAD = 0.02
+# Arms closer than this to the rest pose skip the return to rest on stop.
+PARK_TOLERANCE_RAD = 0.01
 # Number of joints per arm (the gripper is the 8th entry of a motion command).
 ARM_DOF = 7
 
@@ -427,7 +429,51 @@ class JogSession:
         finally:
             _set_active(None)
             backend.drive(None, 0.0)
-            await backend.stop()
+            try:
+                await self._park()
+            finally:
+                await backend.stop()
+
+    async def _park(self) -> None:
+        """Drive the arms back to rest before the torque comes off.
+
+        Stopping disables the arms, and a disabled arm falls, so the session
+        ends the way teleop and waypoints do: a collision-aware move to the
+        rest pose. Skipped when the arms never moved under this session (the
+        IK solver never came up) or are already at rest.
+        """
+        from ..teleop.config import VRTeleopConfig
+        from .backends import rest_q
+
+        planner = self._planner
+        with self._lock:
+            self._execution = None
+            command = None if self._command is None else self._command.copy()
+            grip = self._grip
+        if planner is None or command is None or not self._backend.has_arms:
+            return
+        rest = rest_q()
+        if float(np.max(np.abs(command - rest))) <= PARK_TOLERANCE_RAD:
+            return
+        config = VRTeleopConfig()
+        _logger.info("jog: returning the arms to rest before stopping")
+        trajectory = await asyncio.to_thread(
+            planner.joint_trajectory,
+            command,
+            rest,
+            speed=config.reset_speed,
+            rate=self._rate,
+            min_duration=config.reset_min_duration,
+        )
+        dt = 1.0 / self._rate
+        for q in trajectory:
+            started = time.monotonic()
+            with self._lock:
+                self._command = q.copy()
+            left = np.append(q[:ARM_DOF], grip[0]).astype(np.float32)
+            right = np.append(q[ARM_DOF:], grip[1]).astype(np.float32)
+            await self._backend.send_arms(left, right)
+            await asyncio.sleep(max(0.0, dt - (time.monotonic() - started)))
 
     async def _step_arms(self) -> None:
         backend = self._backend
