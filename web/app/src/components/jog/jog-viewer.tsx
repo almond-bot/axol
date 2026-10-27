@@ -1,7 +1,8 @@
 /**
  * 3D view for the Jog page: the robot's URDF at its live pose, a transform
- * gizmo on the target gripper pose, and the planned move as an orange ghost
- * of the arm at its solution with a dashed path from the gripper.
+ * gizmo on the target gripper pose, and an orange ghost of the arm: the
+ * planned move's solution with a dashed path from the gripper, or, before a
+ * plan, the live IK preview of the target being dragged.
  *
  * Every pose the page exchanges with the jog session is in Axol's torso frame
  * (the URDF's `root` link). The overlay group below follows that link, so
@@ -32,7 +33,14 @@ import {
 import URDFLoader, { type URDFRobot } from "urdf-loader"
 import { Loader2 } from "lucide-react"
 import { apiUrl, urdfUrl, type AxolModel, type GripperType } from "@/lib/supervisor"
-import { jointValuesFor, type JogArm, type JogPlan, type JogPose, type JogState } from "@/lib/jog"
+import {
+  jointValuesFor,
+  type JogArm,
+  type JogPlan,
+  type JogPose,
+  type JogPreview,
+  type JogState,
+} from "@/lib/jog"
 
 const PLAN_COLOR = "#ff9a3c"
 const PATH_COLOR = "#eff483"
@@ -40,6 +48,8 @@ const EDGE_COLOR = "#0d0f12"
 
 export type GizmoMode = "translate" | "rotate"
 export type GizmoSpace = "world" | "local"
+/** What the orange ghost shows: one arm at a solution, and where its tip lands. */
+type Ghost = Pick<JogPreview, "arm" | "joints" | "reached">
 
 interface LoadedRobot {
   /** Z-up URDF wrapped in a Y-up group. */
@@ -234,6 +244,7 @@ function Overlay({
   robot,
   state,
   plan,
+  ghost,
   activeArm,
   target,
   gizmoMode,
@@ -245,6 +256,7 @@ function Overlay({
   robot: URDFRobot
   state: JogState | null
   plan: JogPlan | null
+  ghost: Ghost | null
   activeArm: JogArm
   target: JogPose | null
   gizmoMode: GizmoMode
@@ -302,10 +314,10 @@ function Overlay({
             renderOrder={6}
           />
         )}
-        {plan && (
+        {ghost && (
           <group
-            position={plan.reached.position}
-            quaternion={new Quaternion(...plan.reached.quaternion)}
+            position={ghost.reached.position}
+            quaternion={new Quaternion(...ghost.reached.quaternion)}
           >
             <Triad size={0.045} opacity={0.9} />
             <mesh renderOrder={6}>
@@ -380,6 +392,7 @@ export default function JogViewer({
   gripper,
   state,
   plan,
+  preview = null,
   activeArm,
   target,
   gizmoMode,
@@ -392,6 +405,8 @@ export default function JogViewer({
   gripper: GripperType
   state: JogState | null
   plan: JogPlan | null
+  /** The live IK preview of the target, shown as the ghost until there is a plan. */
+  preview?: Ghost | null
   activeArm: JogArm
   target: JogPose | null
   gizmoMode: GizmoMode
@@ -431,11 +446,12 @@ export default function JogViewer({
   useEffect(() => {
     if (live) applyJoints(live.robot, values)
   }, [live, values])
+  const shown: Ghost | null = plan ?? preview
   useEffect(() => {
-    if (!ghost || !plan) return
-    showArmOnly(ghost.robot, plan.arm)
-    applyJoints(ghost.robot, jointValuesFor(state, liftTravel, plan))
-  }, [ghost, plan, state, liftTravel])
+    if (!ghost || !shown) return
+    showArmOnly(ghost.robot, shown.arm)
+    applyJoints(ghost.robot, jointValuesFor(state, liftTravel, shown))
+  }, [ghost, shown, state, liftTravel])
 
   // Frame the whole robot once per model.
   const view = useMemo(() => (live ? framing(live.scene, FOV) : null), [live])
@@ -471,11 +487,12 @@ export default function JogViewer({
       <directionalLight position={[3, 5, 2]} intensity={1.5} />
       <directionalLight position={[-3, 2.5, -2]} intensity={0.45} />
       <primitive object={live.scene} />
-      <primitive object={ghost.scene} visible={Boolean(plan)} />
+      <primitive object={ghost.scene} visible={Boolean(shown)} />
       <Overlay
         robot={live.robot}
         state={state}
         plan={plan}
+        ghost={shown}
         activeArm={activeArm}
         target={target}
         gizmoMode={gizmoMode}

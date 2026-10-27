@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNod
 import {
   ArrowDown,
   ArrowUp,
+  Hand,
   Loader2,
   Move3d,
   Play,
@@ -26,13 +27,17 @@ import {
   describePlanError,
   executeJogPlan,
   IDLE_HOLD,
+  NO_TWIST,
   padCommand,
   planJogMove,
   useJogLink,
+  withArmJog,
   type JogArm,
+  type JogFrame,
   type JogHold,
   type JogPlan,
   type JogPose,
+  type JogTwist,
   type Vec3,
 } from "@/lib/jog"
 import { nudgePose } from "@/lib/jog-pose"
@@ -69,6 +74,10 @@ const MODEL_LABELS: Record<AxolModel, string> = {
 }
 const STEPS_MM = [1, 5, 10, 25, 50]
 const STEPS_DEG = [1, 5, 15, 45]
+const JOG_AXES = [
+  ["X", "Y", "Z"],
+  ["Roll", "Pitch", "Yaw"],
+] as const
 
 type Mode = "sim" | "hardware"
 type Edits = { epoch: string; poses: Partial<Record<JogArm, JogPose>> }
@@ -90,12 +99,14 @@ function HoldButton({
   disabled,
   onHold,
   className,
+  "aria-label": ariaLabel,
 }: {
   label: string
-  icon: ReactNode
+  icon?: ReactNode
   disabled?: boolean
   onHold: (held: boolean) => void
   className?: string
+  "aria-label"?: string
 }) {
   const [held, setHeld] = useState(false)
   const set = (value: boolean) => {
@@ -108,6 +119,7 @@ function HoldButton({
       variant="outline"
       disabled={disabled}
       aria-pressed={held}
+      aria-label={ariaLabel}
       className={cn(
         "h-11 flex-1 touch-none select-none",
         held && "border-[#eff483]/60 bg-[#eff483]/15",
@@ -209,6 +221,32 @@ function DrivePad({
   )
 }
 
+/** Hold buttons for a gripper jog: move along and turn about x, y and z. */
+function JogButtons({
+  disabled,
+  onJog,
+}: {
+  disabled: boolean
+  onJog: (axis: number, sign: 1 | -1, held: boolean) => void
+}) {
+  return JOG_AXES.map((names, group) => (
+    <div key={group} className="grid grid-cols-3 gap-1.5">
+      {names.map((name, i) =>
+        ([1, -1] as const).map((sign) => (
+          <HoldButton
+            key={`${name}${sign}`}
+            label={`${name} ${sign > 0 ? "+" : "−"}`}
+            aria-label={`Jog ${name} ${sign > 0 ? "plus" : "minus"}`}
+            className="h-9 flex-none text-sm"
+            disabled={disabled}
+            onHold={(held) => onJog(group * 3 + i, sign, held)}
+          />
+        ))
+      )}
+    </div>
+  ))
+}
+
 function Readout({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2">
@@ -237,25 +275,32 @@ export default function Jogging() {
   const [stepMm, setStepMm] = useState(10)
   const [stepDeg, setStepDeg] = useState(15)
   const [driveSpeed, setDriveSpeed] = useState(0.5)
+  const [jogFrame, setJogFrame] = useState<JogFrame>("torso")
+  const [jogSpeed, setJogSpeed] = useState(0.5)
+  // The arm and epoch the shown preview was asked for.
+  const [previewFor, setPreviewFor] = useState<{ epoch: string; arm: JogArm } | null>(null)
 
   const holdRef = useRef<JogHold>({ ...IDLE_HOLD })
   const pad = useRef<Vec3>([0, 0, 0])
   const turn = useRef<-1 | 0 | 1>(0)
   const lift = useRef<-1 | 0 | 1>(0)
+  const armJog = useRef<JogTwist>([...NO_TWIST])
   const pushHold = useCallback(() => {
-    holdRef.current = combineHold(pad.current, turn.current, lift.current, driveSpeed)
-  }, [driveSpeed])
+    const base = combineHold(pad.current, turn.current, lift.current, driveSpeed)
+    holdRef.current = withArmJog(base, arm, armJog.current, jogFrame, jogSpeed)
+  }, [driveSpeed, arm, jogFrame, jogSpeed])
   useEffect(() => pushHold(), [pushHold])
 
-  const { state, connected, error: linkError } = useJogLink(true, holdRef)
+  const { state, connected, error: linkError, preview, requestPreview } = useJogLink(true, holdRef)
 
   // Let go of everything when the window loses focus: a missed pointer-up
-  // must never leave the base or lift running.
+  // must never leave the base, lift or an arm running.
   useEffect(() => {
     const releaseAll = () => {
       pad.current = [0, 0, 0]
       turn.current = 0
       lift.current = 0
+      armJog.current = [...NO_TWIST]
       holdRef.current = { ...IDLE_HOLD }
     }
     window.addEventListener("blur", releaseAll)
@@ -315,24 +360,66 @@ export default function Jogging() {
   // session or finishing a move puts the targets back on the grippers.
   const epoch = `${jogSession?.id ?? ""}:${state?.lastExecution?.id ?? ""}`
   const tips = running ? state?.tips : null
-  const target = (edits.epoch === epoch ? edits.poses[arm] : undefined) ?? tips?.[arm] ?? null
+  const edited = edits.epoch === epoch ? edits.poses[arm] : undefined
+  const target = edited ?? tips?.[arm] ?? null
   const plan = running && planned?.epoch === epoch ? planned.plan : null
   const setPlan = (next: JogPlan | null) => setPlanned(next ? { epoch, plan: next } : null)
+  // The live preview belongs to an edited target of this arm and session.
+  const shownPreview =
+    running &&
+    edited &&
+    preview?.arm === arm &&
+    previewFor?.arm === arm &&
+    previewFor.epoch === epoch
+      ? preview
+      : null
 
+  const askPreview = (pose: JogPose) => {
+    if (!running || !state?.ready) return
+    requestPreview(arm, pose)
+    setPreviewFor((current) =>
+      current?.epoch === epoch && current.arm === arm ? current : { epoch, arm }
+    )
+  }
   const changeTarget = (pose: JogPose) => {
     setEdits((current) => ({
       epoch,
       poses: { ...(current.epoch === epoch ? current.poses : {}), [arm]: pose },
     }))
     setPlan(null)
+    askPreview(pose)
+  }
+  const releaseArmJog = () => {
+    armJog.current = [...NO_TWIST]
+    pushHold()
   }
   const selectArm = (next: JogArm) => {
+    releaseArmJog()
     setArm(next)
     setPlan(null)
   }
+  const jogArm = (axis: number, sign: 1 | -1, held: boolean) => {
+    const twist = [...armJog.current] as JogTwist
+    twist[axis] = held ? sign : twist[axis] === sign ? 0 : twist[axis]
+    armJog.current = twist
+    pushHold()
+    // Moving the arm makes a plan stale; a preview is solved again from
+    // where the arm stops.
+    if (held) {
+      setPlan(null)
+      setPreviewFor(null)
+    } else if (edited && !armJog.current.some((v) => v !== 0)) {
+      askPreview(edited)
+    }
+  }
+  // Back on the gripper: the target follows it again, jogs included.
   const resetTarget = () => {
-    const tip = tips?.[arm]
-    if (tip) changeTarget(tip)
+    setEdits((current) => {
+      const poses = { ...(current.epoch === epoch ? current.poses : {}) }
+      delete poses[arm]
+      return { epoch, poses }
+    })
+    setPlan(null)
   }
 
   const run = async (label: string, action: () => Promise<unknown>) => {
@@ -380,10 +467,12 @@ export default function Jogging() {
   }
 
   const planError = plan ? describePlanError(plan) : null
+  const previewError = shownPreview ? describePlanError(shownPreview) : null
   const liftState = state?.lift ?? null
   const baseState = state?.base ?? null
   const armJoints = state?.arms?.[arm] ?? null
   const canMoveArm = ready && Boolean(state?.hasArms) && !executing
+  const armLimited = Boolean(state?.armJog?.[arm]?.limited)
   const status = !connected
     ? { variant: "neutral" as const, text: "Offline" }
     : running
@@ -501,6 +590,7 @@ export default function Jogging() {
                   gripper={gripper}
                   state={running ? (state ?? null) : null}
                   plan={plan}
+                  preview={shownPreview}
                   activeArm={arm}
                   target={canMoveArm || plan ? target : null}
                   gizmoMode={gizmoMode}
@@ -539,6 +629,19 @@ export default function Jogging() {
                   {plan.reachable
                     ? `Reaches the target in ${plan.duration.toFixed(1)} s`
                     : `Closest reachable pose: ${planError.mm.toFixed(0)} mm and ${planError.degrees.toFixed(0)}° from the target`}
+                </span>
+              )}
+              {!plan && shownPreview && previewError && (
+                <span
+                  data-testid="jog-preview"
+                  className={cn(
+                    "ml-auto",
+                    shownPreview.reachable ? "text-emerald-300" : "text-amber-300"
+                  )}
+                >
+                  {shownPreview.reachable
+                    ? "Preview: the gripper reaches the target"
+                    : `Preview: closest pose is ${previewError.mm.toFixed(0)} mm and ${previewError.degrees.toFixed(0)}° away`}
                 </span>
               )}
             </div>
@@ -678,6 +781,53 @@ export default function Jogging() {
                   X is forward, Y is left and Z is up. Turns are about the gripper.
                 </p>
               </div>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Jog gripper</CardTitle>
+                <CardDescription>
+                  Hold a button to move the {arm} gripper. It stops when you let go.
+                </CardDescription>
+              </CardHeader>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="flex flex-col gap-1 text-xs text-white/55">
+                  Axes
+                  <Select
+                    aria-label="Jog axes"
+                    value={jogFrame}
+                    onChange={(event) => setJogFrame(event.target.value as JogFrame)}
+                  >
+                    <SelectOption value="torso" label="Robot" />
+                    <SelectOption value="gripper" label="Gripper" />
+                  </Select>
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-white/55">
+                  Speed
+                  <Slider
+                    aria-label="Jog speed"
+                    className="h-9"
+                    value={jogSpeed}
+                    min={0.1}
+                    max={1}
+                    step={0.05}
+                    onChange={setJogSpeed}
+                    format={(v) => `${Math.round(v * 100)} %`}
+                  />
+                </label>
+              </div>
+              <JogButtons disabled={!canMoveArm} onJog={jogArm} />
+              {armLimited && (
+                <p className="text-xs text-amber-300" role="status">
+                  <Hand className="mr-1 inline size-3.5" />
+                  The {arm} gripper can't move further this way.
+                </p>
+              )}
+              <p className="text-[11px] text-white/40">
+                {jogFrame === "torso"
+                  ? "X is forward, Y is left and Z is up. Turns are about the gripper tip."
+                  : "The axes turn with the gripper. The fingers point along Z −."}
+              </p>
             </Card>
 
             <Card>

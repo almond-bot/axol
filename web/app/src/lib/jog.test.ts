@@ -5,10 +5,15 @@ import {
   combineHold,
   describePlanError,
   executeJogPlan,
+  holdMessage,
+  IDLE_HOLD,
   jointValuesFor,
   liftJointValue,
   padCommand,
   planJogMove,
+  PreviewQueue,
+  withArmJog,
+  type JogPose,
   type JogState,
 } from "./jog"
 import { nudgePose } from "./jog-pose"
@@ -37,6 +42,85 @@ describe("combineHold", () => {
   it("carries the pad, a scaled turn and the lift direction", () => {
     expect(combineHold([0.4, -0.2, 0], 1, -1, 0.5)).toEqual({ drive: [0.4, -0.2, 0.5], lift: -1 })
     expect(combineHold([0, 0, 0], 0, 0)).toEqual({ drive: [0, 0, 0], lift: 0 })
+  })
+})
+
+describe("withArmJog", () => {
+  it("adds one arm's twist, frame and speed to the held command", () => {
+    const hold = withArmJog(
+      combineHold([0.2, 0, 0], 0, 1),
+      "right",
+      [0, 0, 1, 0, 0, -1],
+      "gripper",
+      0.5
+    )
+    expect(hold).toEqual({
+      drive: [0.2, 0, 0],
+      lift: 1,
+      arms: { right: [0, 0, 1, 0, 0, -1] },
+      armFrame: "gripper",
+      armSpeed: 0.5,
+    })
+  })
+
+  it("clips the twist and speed and fills missing axes", () => {
+    const hold = withArmJog(IDLE_HOLD, "left", [3, -3, Number.NaN], "torso", 7)
+    expect(hold.arms?.left).toEqual([1, -1, 0, 0, 0, 0])
+    expect(hold.armSpeed).toBe(1)
+    expect(withArmJog(IDLE_HOLD, "left", [], "torso", -1).armSpeed).toBe(0)
+  })
+
+  it("goes out on the hold message, and a plain hold stays as it was", () => {
+    const hold = withArmJog(IDLE_HOLD, "left", [0, 1, 0, 0, 0, 0], "torso", 0.3)
+    expect(holdMessage(hold)).toEqual({
+      type: "hold",
+      drive: [0, 0, 0],
+      lift: 0,
+      arms: { left: [0, 1, 0, 0, 0, 0] },
+      armFrame: "torso",
+      armSpeed: 0.3,
+    })
+    expect(holdMessage(IDLE_HOLD)).toEqual({ type: "hold", drive: [0, 0, 0], lift: 0 })
+  })
+})
+
+describe("PreviewQueue", () => {
+  const pose = (x: number): JogPose => ({ position: [x, 0, 0], quaternion: [0, 0, 0, 1] })
+
+  it("keeps one request on the wire and sends only the latest target next", () => {
+    const queue = new PreviewQueue(1000)
+    expect(queue.next(0)).toBeNull()
+    queue.request("left", pose(1))
+    expect(queue.next(0)).toMatchObject({ type: "preview", seq: 1, position: [1, 0, 0] })
+    queue.request("left", pose(2))
+    queue.request("left", pose(3))
+    expect(queue.next(10)).toBeNull() // still waiting for seq 1
+    expect(queue.answer(1)).toBe(true)
+    expect(queue.next(20)).toMatchObject({ seq: 3, position: [3, 0, 0] })
+    expect(queue.next(30)).toBeNull()
+  })
+
+  it("never shows an older answer over a newer one, nor a failed one", () => {
+    const queue = new PreviewQueue(1000)
+    queue.request("left", pose(1))
+    queue.next(0)
+    queue.request("left", pose(2))
+    expect(queue.answer(1, true)).toBe(false)
+    queue.next(1)
+    expect(queue.answer(2)).toBe(true)
+    expect(queue.answer(1)).toBe(false)
+  })
+
+  it("gives up on a lost answer after the timeout, and on a dropped link", () => {
+    const queue = new PreviewQueue(100)
+    queue.request("right", pose(1))
+    queue.next(0)
+    queue.request("right", pose(2))
+    expect(queue.next(50)).toBeNull()
+    expect(queue.next(150)).toMatchObject({ seq: 2, arm: "right" })
+    queue.request("right", pose(3))
+    queue.reconnected()
+    expect(queue.next(160)).toMatchObject({ seq: 3 })
   })
 })
 
