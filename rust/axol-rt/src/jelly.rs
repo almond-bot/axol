@@ -30,6 +30,22 @@
 //!   enable → VELOCITY, so nothing stale replays) and the ramp restarts from
 //!   rest. Other faults (over-current, thermal, under-voltage) are reported
 //!   but never cleared blindly.
+//!
+//! # The park hold must target where the wheel really is
+//!
+//! The hold streams the alarm forever, so a wrong hold target is a runaway
+//! the CAN timeout never catches. Feedback positions are folded into ±PMAX,
+//! but the motor servos the MIT target against its own multi-turn position,
+//! which keeps counting past ±PMAX until power-off. Once a wheel has turned
+//! past the range (a few minutes of driving one way), anchoring at the
+//! folded value puts the target a multiple of 2·PMAX away and the hold
+//! drives the base there at full torque. So:
+//!
+//! - Every anchor is checked against the motor's own position register
+//!   (`DM_REG_POSITION`) and refused, for the rest of the session, when the
+//!   wheel is near the range or the two disagree (`anchor_problem`).
+//! - A parked wheel that moves more than `PARK_SLIP_MAX` off its anchor is
+//!   treated as a runaway: the wheels are disabled and parking stays off.
 
 use crate::bringup;
 use crate::can::CanSock;
@@ -46,6 +62,18 @@ use std::time::{Duration, Instant};
 const IDS: [u8; 4] = [1, 2, 3, 4];
 const PMAX: f64 = 400.0;
 const PARK_MAX_SPEED: f64 = 0.5;
+/// Damiao register holding the motor's own multi-turn position (float, rad).
+/// Unlike the feedback frame it is not folded into ±PMAX, and it is what the
+/// MIT loop servos the hold target against.
+const DM_REG_POSITION: u8 = 80;
+/// Largest gap between the feedback position and `DM_REG_POSITION` an anchor
+/// accepts (rad). Covers the few ms between the two reads on a wheel still
+/// creeping under `PARK_MAX_SPEED`; a fold is 2·PMAX.
+const ANCHOR_TOLERANCE: f64 = 0.5;
+/// How far a parked wheel may move off its anchor before the hold is treated
+/// as a runaway (rad, about a third of a turn). A working hold saturates at
+/// TMAX well inside this (10 Nm / kp 60 ≈ 0.2 rad).
+const PARK_SLIP_MAX: f64 = 2.0;
 const DM_REG_WRITE: u8 = 0x55;
 /// Damiao loss-of-comms alarm register: uint32, 50 µs ticks, 0 disables.
 const DM_REG_TIMEOUT: u8 = 9;
@@ -559,8 +587,9 @@ impl Wheels {
 /// Switch the wheels to the MIT position hold at their current positions.
 ///
 /// Returns the per-wheel anchors, or `None` when parking is not currently
-/// safe: a wheel is still measurably moving (retried), or a position is too
-/// close to the widened ±PMAX mapping limit (sets `park_failed`, not retried).
+/// safe: a wheel is still measurably moving (retried), or the anchor fails
+/// `anchor_problem` against the motors' own positions — near the widened
+/// ±PMAX range, folded, or unreadable (sets `park_failed`, not retried).
 ///
 /// With `reenable` the wheels are expected to be torqued off (their CAN
 /// timeout tripped after the source went away): they are polled for fresh
@@ -595,11 +624,15 @@ fn park(
     if wheels.vel.iter().any(|v| v.abs() > PARK_MAX_SPEED) {
         return Ok(None);
     }
-    if wheels.pos.iter().any(|p| p.abs() > 0.9 * PMAX) {
+    let problem = match read_positions(sock) {
+        Ok(internal) => anchor_problem(&wheels.pos, &internal),
+        Err(err) => Some(err.to_string()),
+    };
+    if let Some(problem) = problem {
         if !*park_failed {
             eprintln!(
-                "{iface}: Jelly wheel position near the ±PMAX mapping limit — parking \
-                 disabled. Power-cycle the base to reset wheel positions."
+                "{iface}: Jelly park hold refused ({problem}) — parking is off for this \
+                 session. Power-cycle the base to reset wheel positions."
             );
         }
         *park_failed = true;
@@ -634,6 +667,54 @@ fn park(
         }
     }
     Ok(Some(wheels.pos))
+}
+
+/// Read every wheel's own multi-turn position (`DM_REG_POSITION`).
+///
+/// Short per-wheel budget: this runs inside a control tick, and a wheel that
+/// does not answer simply means the hold is not anchored.
+fn read_positions(sock: &CanSock) -> io::Result<[f64; 4]> {
+    let mut out = [0.0; 4];
+    'wheels: for (i, id) in IDS.into_iter().enumerate() {
+        for _ in 0..3 {
+            if let Some((value, _)) =
+                txn::dm_read_register(sock, id as u16, DM_REG_POSITION, POLL_TIMEOUT)?
+            {
+                out[i] = value;
+                continue 'wheels;
+            }
+        }
+        return Err(io::Error::other(format!(
+            "wheel {id} position register did not answer"
+        )));
+    }
+    Ok(out)
+}
+
+/// Why a hold anchored at the `reported` (feedback) positions would not hold
+/// the wheels still, or `None` when it would. `internal` is each motor's own
+/// multi-turn position, the one its MIT loop compares the target against.
+fn anchor_problem(reported: &[f64; 4], internal: &[f64; 4]) -> Option<String> {
+    for i in 0..4 {
+        if !internal[i].is_finite() || internal[i].abs() > 0.9 * PMAX {
+            return Some(format!(
+                "wheel {} is at {:.0} rad, near the ±{PMAX:.0} rad position range",
+                IDS[i], internal[i]
+            ));
+        }
+        if (internal[i] - reported[i]).abs() > ANCHOR_TOLERANCE {
+            return Some(format!(
+                "wheel {} reports {:.2} rad but is at {:.2} rad",
+                IDS[i], reported[i], internal[i]
+            ));
+        }
+    }
+    None
+}
+
+/// The first parked wheel more than `PARK_SLIP_MAX` off its anchor.
+fn slipped_wheel(pos: &[f64; 4], anchor: &[f64; 4]) -> Option<usize> {
+    (0..4).find(|&i| (pos[i] - anchor[i]).abs() > PARK_SLIP_MAX)
 }
 
 /// Clear and re-enable wheels the CAN timeout (or a torque-off) left faulted,
@@ -1065,6 +1146,32 @@ fn control_loop(
                     &mut wheels.status,
                     now + period.mul_f64(0.8),
                 )?;
+                if let Some(anchor) = hold {
+                    if let Some(i) = slipped_wheel(&wheels.pos, &anchor) {
+                        // A hold that moves the base is a runaway the CAN
+                        // timeout never catches (the hold keeps it fed): drop
+                        // it, torque off, and never re-anchor this session.
+                        eprintln!(
+                            "{iface}: Jelly wheel {} moved {:.1} rad off its park hold — \
+                             torquing the wheels off; parking is off for this session",
+                            IDS[i],
+                            wheels.pos[i] - anchor[i]
+                        );
+                        hold = None;
+                        park_failed = true;
+                        wheels_ok = false;
+                        next_recover = now;
+                        for id in IDS {
+                            for _ in 0..3 {
+                                // Best effort: if these are lost, an unlinked
+                                // loop streams nothing more and the CAN timeout
+                                // trips; a live source re-enables the wheels
+                                // into VELOCITY before commanding them.
+                                let _ = sock.send(id as u16, &proto::DM_DISABLE);
+                            }
+                        }
+                    }
+                }
             }
             if now >= next_status {
                 next_status = now + Duration::from_millis(50);
@@ -1244,7 +1351,11 @@ mod tests {
     /// feedback frame — including clear-errors (whose echo still carries the
     /// pre-enable status) and enable — and answer 0x7FF register writes and
     /// feedback requests on their MST_ID.
-    fn fake_wheels(iface: &str, ready: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
+    ///
+    /// `position` is each motor's own multi-turn position, answered on
+    /// `DM_REG_POSITION` reads; the feedback frames always report zero, so a
+    /// non-zero value models a wheel whose position has folded past ±PMAX.
+    fn fake_wheels(iface: &str, position: f32, ready: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
         let sock = CanSock::open(iface).unwrap();
         ready.store(true, Ordering::Release);
         let mut enabled = [false; 4];
@@ -1296,6 +1407,9 @@ mod tests {
                         0x55 | 0x33 => {
                             let mut echo = f.data;
                             echo[1] = 0;
+                            if f.data[2] == 0x33 && f.data[3] == DM_REG_POSITION {
+                                echo[4..].copy_from_slice(&position.to_le_bytes());
+                            }
                             sock.send(0x10 + id as u16, &echo).unwrap();
                         }
                         _ => {}
@@ -1329,7 +1443,7 @@ mod tests {
             let ready = Arc::clone(&ready);
             let stop = Arc::clone(&stop);
             let iface = iface.to_owned();
-            move || fake_wheels(&iface, ready, stop)
+            move || fake_wheels(&iface, 0.0, ready, stop)
         });
         // Frames sent before the wheel socket is bound are not delivered.
         while !ready.load(Ordering::Acquire) {
@@ -1383,6 +1497,104 @@ mod tests {
         assert!(
             !wheels.any_tripped(),
             "a stale pre-enable echo would drop the hold"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        motors.join().unwrap();
+    }
+
+    /// Positions read off a customer's base after about four minutes of
+    /// driving forward: the feedback had folded past +PMAX to the far end of
+    /// the range while the motors' own positions kept counting. A hold at the
+    /// folded values sat 800 rad from the wheels and drove the base backwards
+    /// at full torque.
+    #[test]
+    fn folded_feedback_positions_are_refused() {
+        let reported = [-381.96, 390.98, -383.42, 388.71];
+        let internal = [418.19, -408.95, 416.64, -411.31];
+        let problem = anchor_problem(&reported, &internal).expect("folded wheels refused");
+        assert!(problem.contains("wheel 1"), "{problem}");
+    }
+
+    #[test]
+    fn folded_positions_back_inside_the_range_are_still_refused() {
+        // Driving on past the fold brings the feedback back under 0.9·PMAX,
+        // which is what slipped past the old feedback-only check.
+        let reported = [-300.0, 300.0, -300.0, 300.0];
+        let internal = [500.0, -500.0, 500.0, -500.0];
+        assert!(anchor_problem(&reported, &internal).is_some());
+    }
+
+    #[test]
+    fn mismatched_or_unreadable_positions_are_refused() {
+        let reported = [1.0, 2.0, 3.0, 4.0];
+        assert!(
+            anchor_problem(&reported, &[1.0, 2.0, 3.0, 4.0 + 2.0 * ANCHOR_TOLERANCE]).is_some()
+        );
+        assert!(anchor_problem(&reported, &[1.0, f64::NAN, 3.0, 4.0]).is_some());
+    }
+
+    #[test]
+    fn matching_positions_anchor() {
+        // The values a freshly powered base reported, with read jitter.
+        let reported = [0.2798, 0.9005, 2.2024, 1.9274];
+        let internal = [0.2800, 0.9007, 2.2025, 1.9275];
+        assert_eq!(anchor_problem(&reported, &internal), None);
+    }
+
+    #[test]
+    fn a_hold_that_moves_the_base_is_a_runaway() {
+        let anchor = [0.27, 0.90, 2.19, 1.92];
+        // A hold saturated against a push stays well inside the slip limit.
+        assert_eq!(slipped_wheel(&[0.45, 0.72, 2.19, 1.92], &anchor), None);
+        assert_eq!(
+            slipped_wheel(&[0.27, 0.90, 2.19 - 2.5, 1.92], &anchor),
+            Some(2)
+        );
+    }
+
+    /// Needs a virtual CAN interface; skips when there is none (see
+    /// `reanchor_reads_post_enable_status_not_stale_echoes`).
+    #[test]
+    fn park_refuses_wheels_whose_position_has_folded() {
+        let iface = "vcan0";
+        let Ok(sock) = CanSock::open(iface) else {
+            eprintln!("skipping: no {iface} interface");
+            return;
+        };
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let motors = std::thread::spawn({
+            let ready = Arc::clone(&ready);
+            let stop = Arc::clone(&stop);
+            let iface = iface.to_owned();
+            // Feedback reads 0 rad; the motor is really one fold (800 rad) on.
+            move || fake_wheels(&iface, (2.0 * PMAX) as f32, ready, stop)
+        });
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let mut wheels = Wheels {
+            ranges: [MitRanges {
+                p_max: PMAX,
+                v_max: 45.0,
+                kp_max: 500.0,
+                kd_max: 5.0,
+                t_max: 18.0,
+            }; 4],
+            pos: [0.0; 4],
+            vel: [0.0; 4],
+            status: [STATUS_LOST_COMM; 4],
+            answered: [false; 4],
+        };
+        let mut park_failed = false;
+
+        let anchor = park(&sock, iface, &mut wheels, &mut park_failed, true).unwrap();
+        assert!(anchor.is_none(), "a folded wheel must not be anchored");
+        assert!(park_failed, "and parking stays off for the session");
+        assert!(
+            wheels.status.iter().all(|s| *s != STATUS_ENABLED),
+            "the refused wheels are never re-enabled"
         );
 
         stop.store(true, Ordering::Relaxed);

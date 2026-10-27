@@ -46,9 +46,11 @@ immediately; anchoring at the reported position then means a phantom error
 of several radians and instant overcurrent. Re-zeroing at park time doesn't
 help either: on this firmware the 0xFE zero command only applies after a
 power cycle. So at startup the PMAX register is raised (RAM only, reverts
-on power-off) to keep multi-turn positions valid for a whole session, and
-parking refuses (with a warning) if a wheel ever approaches the widened
-limit.
+on power-off) to keep multi-turn positions valid for a whole session.
+Past ±PMAX the feedback folds while the motor's own position keeps
+counting, so the Rust core checks every anchor against the motor's position
+register and refuses to park (with a warning) near the limit or on any
+mismatch, and torques the wheels off if a parked wheel moves off its anchor.
 
 Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
