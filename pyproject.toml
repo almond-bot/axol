@@ -109,11 +109,13 @@ include = [
 ]
 
 [tool.uv.sources]
-# marionette-sdk is not on PyPI yet. Development uses a Marionette checkout
-# next to this one; PyPI metadata keeps the plain requirement above, so the
-# published package stays installable. Switch this to a git rev (or drop it
-# once the SDK is published) before a robot installs the extra.
-marionette-sdk = { path = "../../../Marionette/sdk/python", editable = true }
+# marionette-sdk is not on PyPI yet, so it comes from a pinned commit of the
+# Marionette repository. PyPI metadata keeps the plain requirement above, so
+# the published package stays installable. Drop this once the SDK is
+# published. To work on the SDK beside Axol, install a Marionette checkout
+# over it:
+#   uv pip install -e "../marionette/sdk/python[video,gateway]"
+marionette-sdk = { git = "https://github.com/theinstancelabs/marionette", subdirectory = "sdk/python", rev = "859f67c24f88f96d68d454584144e18d1f931dca" }
 
 [dependency-groups]
 dev = [

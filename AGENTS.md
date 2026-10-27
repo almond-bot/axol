@@ -82,7 +82,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 | Extra | Purpose |
 |-------|---------|
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
-| `marionette` | Marionette iPhone teleoperation (`axol marionette`, `axol marionette.gateway`): the Marionette SDK, its WebRTC video and its bundled gateway. Comes from a Marionette checkout beside this one until the SDK is published (see `[tool.uv.sources]` in `pyproject.toml`); `tests/test_marionette.py` needs it |
+| `marionette` | Marionette iPhone teleoperation (`axol marionette`, `axol marionette.gateway`): the Marionette SDK, its WebRTC video and its bundled gateway. Until the SDK is published it comes from a pinned commit of the Marionette repository (see `[tool.uv.sources]` in `pyproject.toml`); `tests/test_marionette.py` needs it |
 | `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras. Not needed for teleop camera streaming: the ZED SDK cameras live in `almond_axol/video/zed_sdk.py` and `almond_axol/lerobot/camera` only wraps them in LeRobot's `Camera`/`CameraConfig` |
 
 For cloud development: `uv sync --extra sim --extra lerobot` (the `lerobot` extra is import-time required by part of the test suite; `--extra sim` alone is enough to run sim teleop).
