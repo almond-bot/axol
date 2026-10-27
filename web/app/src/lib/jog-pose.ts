@@ -1,5 +1,5 @@
 /** Pose arithmetic for the Jog page's nudge buttons. */
-import { Quaternion, Vector3 } from "three"
+import { Euler, Quaternion, Vector3 } from "three"
 import type { JogPose } from "@/lib/jog"
 
 const AXES = [new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1)] as const
@@ -29,4 +29,10 @@ export function nudgePose(
     position: [...pose.position] as JogPose["position"],
     quaternion: [next.x, next.y, next.z, next.w],
   }
+}
+
+/** Roll, pitch and yaw of a pose's orientation in degrees (yaw applied first). */
+export function rpyDegrees(quaternion: JogPose["quaternion"]): [number, number, number] {
+  const e = new Euler().setFromQuaternion(new Quaternion(...quaternion), "ZYX")
+  return [e.x, e.y, e.z].map((r) => (r * 180) / Math.PI) as [number, number, number]
 }

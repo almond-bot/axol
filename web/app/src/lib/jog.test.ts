@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { Quaternion, Vector3 } from "three"
+import { Euler, Quaternion, Vector3 } from "three"
 import {
   cancelJogMove,
   combineHold,
@@ -16,7 +16,7 @@ import {
   type JogPose,
   type JogState,
 } from "./jog"
-import { nudgePose } from "./jog-pose"
+import { nudgePose, rpyDegrees } from "./jog-pose"
 
 describe("padCommand", () => {
   it("maps screen up to forward and screen left to +y", () => {
@@ -179,6 +179,16 @@ describe("describePlanError", () => {
     })
     expect(mm).toBeCloseTo(12.3)
     expect(degrees).toBeCloseTo(10)
+  })
+})
+
+describe("rpyDegrees", () => {
+  it("reads roll, pitch and yaw back from a quaternion", () => {
+    const q = new Quaternion().setFromEuler(new Euler(0.2, -0.4, 1.1, "ZYX"))
+    const [roll, pitch, yaw] = rpyDegrees([q.x, q.y, q.z, q.w])
+    expect(roll).toBeCloseTo((0.2 * 180) / Math.PI)
+    expect(pitch).toBeCloseTo((-0.4 * 180) / Math.PI)
+    expect(yaw).toBeCloseTo((1.1 * 180) / Math.PI)
   })
 })
 

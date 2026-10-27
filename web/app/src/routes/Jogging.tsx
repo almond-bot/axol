@@ -19,7 +19,6 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { SiteNav } from "@/components/site-nav"
-import type { GizmoMode, GizmoSpace } from "@/components/jog/jog-viewer"
 import { cn } from "@/lib/utils"
 import {
   cancelJogMove,
@@ -37,10 +36,11 @@ import {
   type JogHold,
   type JogPlan,
   type JogPose,
+  type JogState,
   type JogTwist,
   type Vec3,
 } from "@/lib/jog"
-import { nudgePose } from "@/lib/jog-pose"
+import { nudgePose, rpyDegrees } from "@/lib/jog-pose"
 import {
   fetchOpStatus,
   fetchSettings,
@@ -256,6 +256,95 @@ function Readout({ label, value }: { label: string; value: string }) {
   )
 }
 
+const deg = (rad: number, digits = 1) => `${((rad * 180) / Math.PI).toFixed(digits)}°`
+
+/** One condensed table of everything moving: both arms, the lift and the base. */
+function RobotStatus({
+  state,
+  activeArm,
+  plan,
+}: {
+  state: JogState | null
+  activeArm: JogArm
+  plan: JogPlan | null
+}) {
+  const arms = state?.arms
+  const lift = state?.lift
+  const base = state?.base
+  const row = "contents"
+  const name = "text-white/50"
+  const value = "text-right font-mono text-white/80 tabular-nums"
+  const armHeader = (side: JogArm) =>
+    cn("text-right font-medium", side === activeArm ? "text-[#eff483]" : "text-white/50")
+  return (
+    <Card data-testid="jog-status">
+      <CardHeader>
+        <CardTitle>Robot state</CardTitle>
+      </CardHeader>
+      <div
+        className={cn(
+          "grid gap-x-3 gap-y-1 text-xs",
+          plan ? "grid-cols-[1fr_auto_auto_auto]" : "grid-cols-[1fr_auto_auto]"
+        )}
+      >
+        <span className={name}>Joint</span>
+        <span className={armHeader("left")}>Left</span>
+        <span className={armHeader("right")}>Right</span>
+        {plan && (
+          <span className="text-right font-medium text-[#ff9a3c]">
+            Plan {plan.arm === "left" ? "L" : "R"}
+          </span>
+        )}
+        {JOINT_LABELS.map((label, i) => (
+          <div key={label} className={row}>
+            <span className={name}>{label}</span>
+            <span data-testid={`joint-left-${i}`} className={value}>
+              {arms ? deg(arms.left[i]) : "–"}
+            </span>
+            <span data-testid={`joint-right-${i}`} className={value}>
+              {arms ? deg(arms.right[i]) : "–"}
+            </span>
+            {plan && (
+              <span className="text-right font-mono text-[#ff9a3c] tabular-nums">
+                {deg(plan.joints[i])}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+      <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 border-t border-white/10 pt-3 text-xs">
+        <span className={name}>Lift</span>
+        <span data-testid="status-lift" className={value}>
+          {lift?.raised != null
+            ? `${(lift.raised * 100).toFixed(1)} % · ${(lift.velocity * 100).toFixed(2)} %/s`
+            : lift
+              ? "Not homed"
+              : "–"}
+        </span>
+        <span className={name}>Base position{base?.estimated ? " (est.)" : ""}</span>
+        <span data-testid="status-odometry" className={value}>
+          {base ? `${base.x.toFixed(2)}, ${base.y.toFixed(2)} m · ${deg(base.yaw, 0)}` : "–"}
+        </span>
+        <span className={name}>Base speed</span>
+        <span className={value}>
+          {base
+            ? `${Math.hypot(base.velocity[0], base.velocity[1]).toFixed(2)} m/s · ${deg(base.velocity[2], 0)}/s`
+            : "–"}
+        </span>
+        <span className={name}>Wheel command</span>
+        <span className={value}>
+          {base ? base.command.map((c) => `${Math.round(c * 100)}`).join(" / ") + " %" : "–"}
+        </span>
+        {base?.fault && (
+          <span className="col-span-2 text-amber-300">
+            <Zap className="mr-1 inline size-3.5" />A wheel is faulted.
+          </span>
+        )}
+      </div>
+    </Card>
+  )
+}
+
 export default function Jogging() {
   const [simPick] = useState(storedSimRobot)
   const [mode, setMode] = useState<Mode>("sim")
@@ -270,8 +359,6 @@ export default function Jogging() {
   const [arm, setArm] = useState<JogArm>("left")
   const [edits, setEdits] = useState<Edits>({ epoch: "", poses: {} })
   const [planned, setPlanned] = useState<{ epoch: string; plan: JogPlan } | null>(null)
-  const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate")
-  const [gizmoSpace, setGizmoSpace] = useState<GizmoSpace>("world")
   const [stepMm, setStepMm] = useState(10)
   const [stepDeg, setStepDeg] = useState(15)
   const [driveSpeed, setDriveSpeed] = useState(0.5)
@@ -470,7 +557,6 @@ export default function Jogging() {
   const previewError = shownPreview ? describePlanError(shownPreview) : null
   const liftState = state?.lift ?? null
   const baseState = state?.base ?? null
-  const armJoints = state?.arms?.[arm] ?? null
   const canMoveArm = ready && Boolean(state?.hasArms) && !executing
   const armLimited = Boolean(state?.armJog?.[arm]?.limited)
   const status = !connected
@@ -593,8 +679,6 @@ export default function Jogging() {
                   preview={shownPreview}
                   activeArm={arm}
                   target={canMoveArm || plan ? target : null}
-                  gizmoMode={gizmoMode}
-                  gizmoSpace={gizmoSpace}
                   onTargetChange={changeTarget}
                   onSelectArm={selectArm}
                 />
@@ -616,11 +700,24 @@ export default function Jogging() {
             </div>
             <div className="flex flex-wrap items-center gap-2 border-t border-white/10 px-4 py-3 text-xs text-white/50">
               <Move3d className="size-4" />
-              Drag the target gizmo. Drag empty space to orbit, scroll to zoom.
+              Drag the gizmo arrows to move the target and its rings to turn it. Drag empty space to
+              orbit, scroll to zoom.
               {target && (
-                <span data-testid="jog-target" className="font-mono text-white/70 tabular-nums">
-                  Target {target.position.map((v) => (v * 1000).toFixed(0)).join(", ")} mm
-                </span>
+                <>
+                  <span data-testid="jog-target" className="font-mono text-white/70 tabular-nums">
+                    Target {target.position.map((v) => (v * 1000).toFixed(0)).join(", ")} mm
+                  </span>
+                  <span
+                    data-testid="jog-target-rpy"
+                    className="font-mono text-white/70 tabular-nums"
+                    title="Roll, pitch and yaw in the robot's axes"
+                  >
+                    {rpyDegrees(target.quaternion)
+                      .map((v) => v.toFixed(0))
+                      .join(", ")}
+                    °
+                  </span>
+                </>
               )}
               {plan && planError && (
                 <span
@@ -655,35 +752,17 @@ export default function Jogging() {
                   Plan a move of one gripper to the target, then execute it.
                 </CardDescription>
               </CardHeader>
-              <div className="grid grid-cols-2 gap-2">
-                <label className="flex flex-col gap-1 text-xs text-white/55">
-                  Arm
-                  <Select
-                    aria-label="Arm"
-                    value={arm}
-                    onChange={(event) => selectArm(event.target.value as JogArm)}
-                  >
-                    <SelectOption value="left" label="Left" />
-                    <SelectOption value="right" label="Right" />
-                  </Select>
-                </label>
-                <label className="flex flex-col gap-1 text-xs text-white/55">
-                  Gizmo
-                  <Select
-                    aria-label="Gizmo"
-                    value={`${gizmoMode}:${gizmoSpace}`}
-                    onChange={(event) => {
-                      const [m, s] = event.target.value.split(":")
-                      setGizmoMode(m as GizmoMode)
-                      setGizmoSpace(s as GizmoSpace)
-                    }}
-                  >
-                    <SelectOption value="translate:world" label="Move" />
-                    <SelectOption value="rotate:local" label="Rotate" />
-                    <SelectOption value="translate:local" label="Move along gripper" />
-                  </Select>
-                </label>
-              </div>
+              <label className="flex flex-col gap-1 text-xs text-white/55">
+                Arm
+                <Select
+                  aria-label="Arm"
+                  value={arm}
+                  onChange={(event) => selectArm(event.target.value as JogArm)}
+                >
+                  <SelectOption value="left" label="Left" />
+                  <SelectOption value="right" label="Right" />
+                </Select>
+              </label>
               <div className="flex gap-2">
                 <Button
                   className="flex-1"
@@ -830,29 +909,7 @@ export default function Jogging() {
               </p>
             </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>{arm === "left" ? "Left" : "Right"} arm joints</CardTitle>
-              </CardHeader>
-              <div className="grid grid-cols-[1fr_auto_auto] gap-x-3 gap-y-1 text-xs">
-                {JOINT_LABELS.map((label, i) => (
-                  <div key={label} className="contents">
-                    <span className="text-white/55">{label}</span>
-                    <span className="text-right font-mono text-white/80 tabular-nums">
-                      {armJoints ? `${((armJoints[i] * 180) / Math.PI).toFixed(1)}°` : "–"}
-                    </span>
-                    <span className="w-14 text-right font-mono text-[#ff9a3c] tabular-nums">
-                      {plan && plan.arm === arm
-                        ? `${((plan.joints[i] * 180) / Math.PI).toFixed(1)}°`
-                        : ""}
-                    </span>
-                  </div>
-                ))}
-              </div>
-              {plan && plan.arm === arm && (
-                <p className="text-[11px] text-white/40">Orange values are the planned pose.</p>
-              )}
-            </Card>
+            <RobotStatus state={running ? (state ?? null) : null} activeArm={arm} plan={plan} />
           </div>
         </div>
 
