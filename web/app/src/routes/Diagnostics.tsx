@@ -1311,7 +1311,7 @@ export default function Diagnostics() {
                     {robot.reachableCount}/{robot.motorCount} reachable
                   </span>
                 )}
-                <div className="ml-auto flex flex-wrap items-center gap-2">
+                <div className="flex basis-full flex-wrap items-center gap-2">
                   {(["can.setup", "can.enable"] as const).map((id) => {
                     const cmd = canCommand(id)
                     if (!cmd) return null
