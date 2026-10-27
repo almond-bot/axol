@@ -226,15 +226,13 @@ def main(argv: list[str] | None = None) -> None:
         "--hold-kp",
         type=float,
         default=60.0,
-        help="Position stiffness (Nm/rad) of the parked MIT hold; "
-        "0 disables parking (default: 60)",
+        help="Unused: the park hold is damping only (default: 60)",
     )
     parser.add_argument(
         "--hold-kd",
         type=float,
         default=1.5,
-        help="Damping (Nm·s/rad) of the parked MIT hold; must be > 0 "
-        "when hold-kp > 0 (default: 1.5)",
+        help="Damping (Nm·s/rad) of the park hold; 0 disables parking (default: 1.5)",
     )
     parser.add_argument(
         "--joystick",
