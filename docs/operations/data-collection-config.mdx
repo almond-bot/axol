@@ -48,7 +48,7 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. The headset stream keeps the capture resolution. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
-| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
 | `--qa_gate` | `true` | Don't save Mantis episodes that fail the quality check. `false` saves them anyway, except takes with a tracking fault under the [strict Lighthouse policy](/cli/tracker#lighthouse-tracking-policy). |
 | `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
 | `--rerun_port` | `9876` | Rerun viewer port. |
