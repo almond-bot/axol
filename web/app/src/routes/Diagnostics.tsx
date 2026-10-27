@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Navigate, useLocation } from "react-router-dom"
+import { Navigate, useLocation, useNavigate } from "react-router-dom"
 import {
   Cable,
   Crosshair,
@@ -193,6 +193,7 @@ type DiagnosticsTab = (typeof DIAGNOSTICS_TABS)[number]["key"]
 export default function Diagnostics() {
   const toast = useToast()
   const location = useLocation()
+  const navigate = useNavigate()
   const tabKey = location.pathname.replace(/^\/diagnostics\/?/, "").split("/")[0] ?? ""
   const tab = DIAGNOSTICS_TABS.find((t) => t.key === tabKey)?.key as DiagnosticsTab | undefined
   const [serverOk, setServerOk] = useState(false)
@@ -1215,7 +1216,8 @@ export default function Diagnostics() {
         actions={<Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>}
         host={{
           dot: serverOk ? "ok" : "err",
-          label: serverOk ? storedHost || "Connected" : "Can't reach the host",
+          label: serverOk ? storedHost || "Connected" : "Can't reach the robot",
+          onClick: () => navigate("/control/devices"),
         }}
         subNav={{
           under: "/diagnostics",

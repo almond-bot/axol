@@ -9,15 +9,16 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 
 | Page | What it is for |
 |---|---|
-| **Overview** | The robot's computer, Axol, Mantis and Jelly, and a card for each operation. |
-| **Operations** | Pick an operation, fill in its fields and press **Start**. |
+| **Overview** | What is running, what to set up next, quick start and recent datasets. |
+| **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes and fix their task text. |
 | **Request data** | Pay Almond to collect training data for your task. |
+| **Devices** | The robot's computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
 
-The robot's computer you are connected to shows at the bottom of the sidebar. Click it to connect to a different one.
+The robot's computer you are connected to, and whether the selected device is connected, show at the top right of every page. Click it to open **Devices**. Before you connect, the **Overview** shows a **Connect** button.
 
 ## Open the control panel
 
@@ -49,7 +50,7 @@ Open the **Local** URL on the robot's computer, or the **LAN** URL from another 
 
 ## Connections
 
-The **Overview** page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
+The **Devices** page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
 
 **Choose the device.** Every operation runs on either Axol or Mantis. The chosen tile shows **selected**, and the other shows **Select**.
 
@@ -105,7 +106,7 @@ When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies 
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, the **Overview** page shows a **What is Axol mounted on?** card, and runs that drive the arms list *Choose what Axol is mounted on* under [Before you can start](#before-you-can-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, the **Devices** page shows a **What is Axol mounted on?** card, and runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
 
 On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
@@ -149,7 +150,7 @@ From Python, [`Jelly.battery`](/api/robot#jelly) returns the same estimate.
 
 ## Settings
 
-Settings that apply to every run live on the **Settings** page. Switch between **Axol**, **Mantis**, **Jelly** and **General** at the top of the page, or click a tile's title on the **Overview**.
+Settings that apply to every run live on the **Settings** page. Switch between **Axol**, **Mantis**, **Jelly** and **General** at the top of the page, or click a tile's title on **Devices**.
 
 **Axol settings**
 
@@ -240,7 +241,9 @@ For [headless](/guides/quest-headless) use, press **Keep awake** with the headse
 
 ## Operations
 
-Open the **Operations** page, or click an operation's card on the **Overview**. Pick an operation from the list, fill in its fields, and press **Start**. The panel asks only for values that change between runs, such as a dataset name or a policy path. Everything else is in [Settings](#settings).
+The **Operations** page shows every operation as a card, grouped into **Drive**, **Record** and **Play back**. Each card says what the operation needs, or what is in the way. **Quick start** on the **Overview** offers the ones you used last.
+
+Click a card to open the operation. Fill in its fields under **Run details** and press **Start**. The panel asks only for values that change between runs, such as a dataset name or a policy path. Everything else is in [Settings](#settings).
 
 - Hover the **ⓘ** next to a field for its description.
 - Some fields offer a list to pick from, such as the datasets on the host. You can still type your own value.
@@ -269,9 +272,9 @@ Open the **Operations** page, or click an operation's card on the **Overview**. 
 
 Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to preview a saved path in the browser. See [`waypoints`](/cli/waypoints).
 
-### Before you can start
+### Before you start
 
-**Start** stays disabled until the operation has what it needs. A **Before you can start** list says what is missing, for example:
+**Start** stays disabled until the operation has what it needs. A **Before you start** list says what is missing, with a button that opens the place to fix it, for example:
 
 - *Connect Axol*
 - *Choose what Axol is mounted on* (see [Axol version](#axol-version))
@@ -288,7 +291,7 @@ The newest line of output shows below the operation. If the operation stops with
 - The log follows new lines while you are scrolled to the bottom. Scroll up to read, and press the arrow button to jump back.
 - The download button saves the log to a `.log` file to attach to a bug report.
 
-While an operation runs, every other page shows its name at the top right, and **Operations** in the sidebar has a green dot. The **Overview** also shows it with a **Stop** button.
+While an operation runs, its page shows how long it has run. Every other page shows its name at the top right, and **Operations** in the sidebar has a green dot. The **Overview** also shows it with **Open** and **Stop** buttons.
 
 Press **Stop** to end an operation. The badge shows **Stopping…** until the operation has shut down, then the robot returns to idle. You can disconnect Axol only when no operation is running.
 

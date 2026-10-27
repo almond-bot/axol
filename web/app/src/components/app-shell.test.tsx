@@ -48,6 +48,7 @@ describe("AppShell", () => {
       "Operations",
       "Datasets",
       "Request data",
+      "Devices",
       "Settings",
       "Diagnostics",
       "Logs",
@@ -63,15 +64,19 @@ describe("AppShell", () => {
     expect(link("Overview").querySelector('[title="Running"]')).toBeNull()
   })
 
-  it("opens the host dialog from the sidebar footer", () => {
+  it("shows the connection in the header, and opens its details", () => {
     const onClick = vi.fn()
-    render("/control", { host: { dot: "ok", label: "robot-1", version: "1.2.0", onClick } })
-    const footer = [...container.querySelectorAll("aside button")].find((b) =>
+    render("/control", {
+      host: { dot: "ok", label: "robot-1", detail: "Axol ready", version: "1.2.0", onClick },
+    })
+    const pill = [...container.querySelectorAll("header button")].find((b) =>
       b.textContent?.includes("robot-1")
     )!
-    expect(footer.textContent).toContain("axol v1.2.0")
-    act(() => (footer as HTMLButtonElement).click())
+    expect(pill.textContent).toContain("Axol ready")
+    expect(pill.getAttribute("title")).toBe("axol v1.2.0")
+    act(() => (pill as HTMLButtonElement).click())
     expect(onClick).toHaveBeenCalledTimes(1)
+    expect(container.querySelector("aside")?.textContent).not.toContain("robot-1")
   })
 
   it("lists a section's sub-pages under it", () => {

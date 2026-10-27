@@ -1,15 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
-import {
-  ArrowRight,
-  Camera,
-  CircleAlert,
-  Loader2,
-  Plug,
-  RefreshCw,
-  ScrollText,
-  Square,
-} from "lucide-react"
+import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   HARDWARE_PROFILE_ARG,
@@ -19,6 +10,7 @@ import {
   JELLY_DEVICES,
   JELLY_DEVICE_LABELS,
   OPERATIONS,
+  fetchDatasets,
   cameraCount,
   cameraSerials,
   canDiscoveryRequestCanRetry,
@@ -63,12 +55,12 @@ import {
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
+  type DatasetInfo,
   type FormValue,
   type HardwareProfile,
   type JellyDevice,
   type JellyStatus,
   type OperationId,
-  type OperationMeta,
   type PolicyState,
   type RobotStatus,
   type ServerInfo,
@@ -100,7 +92,25 @@ import { UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
 import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
-import { OperationPanel } from "@/components/operation-panel"
+import { OperationPanel, type BlockerFix } from "@/components/operation-panel"
+import { OperationLauncher, type LauncherItem } from "@/components/operation-launcher"
+import {
+  AttentionList,
+  ConnectHero,
+  QuickStart,
+  RecentDatasets,
+  RunningCard,
+  type AttentionItem,
+} from "@/components/control-home"
+import {
+  catalogEntry,
+  catalogMeta,
+  launcherEntries,
+  operationStatus,
+  quickStartOperations,
+  recentOperations,
+  rememberOperation,
+} from "@/lib/operation-catalog"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
 import { DataCollectionOffer } from "@/components/data-collection-offer"
@@ -119,7 +129,7 @@ import {
   type SettingsTab,
 } from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
-import { AppShell, PageSection, type HostSummary, type NavBadges } from "@/components/app-shell"
+import { AppShell, type HostSummary, type NavBadges } from "@/components/app-shell"
 import type { StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
@@ -128,13 +138,21 @@ import type { SimRobot } from "@/components/sim-robot-picker"
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 /** The pages of the control panel, one per sidebar item. */
-type ControlView = "overview" | "operations" | "datasets" | "request-data" | "settings" | "logs"
+type ControlView =
+  | "overview"
+  | "operations"
+  | "datasets"
+  | "request-data"
+  | "devices"
+  | "settings"
+  | "logs"
 
 const CONTROL_VIEWS: Record<string, ControlView> = {
   "": "overview",
   operations: "operations",
   datasets: "datasets",
   "request-data": "request-data",
+  devices: "devices",
   settings: "settings",
   logs: "logs",
 }
@@ -871,7 +889,7 @@ export default function ControlPanel() {
 
   function openOperation(op: OperationId) {
     selectOp(op)
-    navigate("/control/operations")
+    navigate(`/control/operations/${encodeURIComponent(op)}`)
   }
 
   // Back to the live run: its own panel, with its episode controls and Stop,
@@ -1000,11 +1018,40 @@ export default function ControlPanel() {
       ? all.filter((o) => o.supportsMantis || o.id === liveCommand)
       : all
   }, [commands, hardwareProfile, liveCommand])
+  // An operation's own screen (/control/operations/<id>) decides which
+  // operation is selected; the launcher and other pages keep the last one.
+  const routeOp = view === "operations" ? pathRest : null
+  const currentOp = routeOp ?? selectedOp
   const meta = useMemo(
-    () => operations.find((o) => o.id === selectedOp) ?? operations[0],
-    [operations, selectedOp]
+    () => operations.find((o) => o.id === currentOp) ?? catalogMeta(currentOp) ?? operations[0],
+    [operations, currentOp]
   )
   const opId = meta.id
+  // The host's own description of this operation, when it has one: the app's
+  // catalog name and icon otherwise.
+  const hostOffersOp = operations.some((o) => o.id === opId)
+  useEffect(() => {
+    if (!routeOp) return
+    localStorage.setItem("axolOp", routeOp)
+    rememberOperation(routeOp)
+  }, [routeOp])
+
+  // The newest datasets on the host, for Home; read again on each visit.
+  const [recentDatasets, setRecentDatasets] = useState<DatasetInfo[] | null>(null)
+  useEffect(() => {
+    if (conn.state !== "ok" || view !== "overview") return
+    let active = true
+    fetchDatasets()
+      .then((found) => {
+        if (active) setRecentDatasets(found.slice(0, 4))
+      })
+      .catch(() => {
+        if (active) setRecentDatasets(null)
+      })
+    return () => {
+      active = false
+    }
+  }, [conn.state, view, connectionGeneration])
 
   function selectOp(op: OperationId) {
     setSelectedOp(op)
@@ -1740,7 +1787,12 @@ export default function ControlPanel() {
     toast.warning(updateWarning)
   }, [canServerInstanceId, conn.state, connectionGeneration, toast, updateWarning])
 
-  const spec = useMemo(() => commands.find((c) => c.id === opId) ?? null, [commands, opId])
+  // Only an operation the host offers on the selected device can run: a
+  // Mantis host's Axol-only operation opened by its address stays off.
+  const spec = useMemo(
+    () => (hostOffersOp ? (commands.find((c) => c.id === opId) ?? null) : null),
+    [commands, opId, hostOffersOp]
+  )
 
   // Stop the running task (if any) and wait for it to actually exit before
   // returning, so a disconnect never tears the host/robot link down mid-cleanup.
@@ -1984,22 +2036,26 @@ export default function ControlPanel() {
         : conn.state === "idle"
           ? "idle"
           : "warn"
+  const deviceLabel = hardwareProfile === "mantis" ? "Mantis" : "Axol"
+  const robotUp = robot?.state === "connected" || robot?.state === "busy"
   const host: HostSummary = {
     dot: hostDot,
     label:
       conn.state === "ok"
         ? hostInfo?.hostname || serverHost || "Connected"
         : conn.state === "err"
-          ? "Can't reach the host"
+          ? "Can't reach the robot"
           : conn.state === "idle"
             ? "Not connected"
             : "Connecting…",
+    detail: connected ? `${deviceLabel} ${robotUp ? "connected" : "not connected"}` : null,
     version: connected ? (update?.version ?? hostInfo?.version ?? null) : null,
-    onClick: () => setSetupOpen(true),
+    // Before a host answers, the pill connects; after, it opens the devices.
+    onClick: connected ? () => navigate("/control/devices") : () => setSetupOpen(true),
   }
 
   const badges: NavBadges = {
-    "/control": needsMount || lockout || canDiscoveryNeedsRetry ? "attention" : undefined,
+    "/control/devices": needsMount || lockout || canDiscoveryNeedsRetry ? "attention" : undefined,
     "/control/operations": isLive ? "running" : undefined,
     "/control/settings": settingsDirty ? "attention" : undefined,
   }
@@ -2007,10 +2063,11 @@ export default function ControlPanel() {
   // A live run follows the operator around the app: every other page shows
   // what is running, with a way back to it.
   const runningChip =
-    isLive && view !== "operations" ? (
+    isLive && !(view === "operations" && routeOp === runningOp) ? (
       <Link
-        to="/control/operations"
-        onClick={() => runningOp && selectOp(runningOp)}
+        to={
+          runningOp ? `/control/operations/${encodeURIComponent(runningOp)}` : "/control/operations"
+        }
         className="flex h-8 items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-400/[0.08] px-3 text-xs text-emerald-200 transition-colors hover:bg-emerald-400/[0.14]"
       >
         <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
@@ -2022,23 +2079,10 @@ export default function ControlPanel() {
 
   // Alerts that apply wherever the operator is: an update, a version skew, a
   // robot held after a failed shutdown, and hardware still to identify. Not on
-  // Request data, which works without the robot.
+  // Request data, which works without the robot. The connection itself shows
+  // in the header pill, and on the pages that need it.
   const notices = (
     <>
-      {(conn.state === "idle" || conn.state === "err") && (
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.03] p-3">
-          <p className="min-w-0 flex-1 text-sm text-white/65">
-            {conn.state === "err"
-              ? "Can't reach the robot's computer. Check that it is on and on this network."
-              : "Connect to the robot's computer to get started."}
-          </p>
-          <Button size="sm" onClick={() => setSetupOpen(true)}>
-            <Plug />
-            Connect
-          </Button>
-        </div>
-      )}
-
       {update?.updateAvailable && (
         <UpdateBanner
           update={update}
@@ -2122,6 +2166,10 @@ export default function ControlPanel() {
       description:
         "With Teleop Data Collection, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training.",
     },
+    devices: {
+      title: "Devices",
+      description: "The robot's computer and the hardware connected to it.",
+    },
     settings: {
       title: "Settings",
       description: "Settings here apply to every operation on this robot and to every browser.",
@@ -2130,6 +2178,101 @@ export default function ControlPanel() {
   }
 
   const settingsScope = settingsScopeForTab(settingsTab)
+
+  // The operations as tiles: the app's catalog, with what the host says.
+  const launcherItems: LauncherItem[] = launcherEntries({
+    hostOperations: operations,
+    connected,
+    mantis: hardwareProfile === "mantis",
+  }).map((entry) => {
+    const hostMeta = operations.find((o) => o.id === entry.id) ?? null
+    return {
+      entry,
+      status: operationStatus({
+        entry,
+        hostMeta,
+        available: commands.find((c) => c.id === entry.id)?.available ?? false,
+        connected,
+        running: runningOp === entry.id,
+        otherRunning: isLive && runningOp !== entry.id,
+        needsMount,
+        hasCameras: selectedHasCamera,
+      }),
+    }
+  })
+  const quickEntries = quickStartOperations(
+    launcherItems.map((i) => i.entry),
+    recentOperations()
+  )
+  const currentEntry = catalogEntry(opId, meta)
+  // The app's own one-line summary leads the operation's screen; the host's
+  // wording only for an operation the app doesn't know.
+  const displayMeta =
+    currentEntry.summary && currentEntry.summary !== meta.description
+      ? { ...meta, description: currentEntry.summary }
+      : meta
+  const runningEntry = runningOp
+    ? catalogEntry(
+        runningOp,
+        operations.find((o) => o.id === runningOp)
+      )
+    : null
+
+  // What Home asks the operator to sort out, each with the page that fixes it.
+  const attention: AttentionItem[] = []
+  if (needsMount) {
+    attention.push({
+      key: "mount",
+      text: "Choose what Axol is mounted on.",
+      action: "Choose mount",
+      onAction: () => navigate("/control/devices"),
+    })
+  }
+  if (connected && !isLive && robot && !robotUp) {
+    attention.push({
+      key: "robot",
+      text: `${deviceLabel} isn't connected.`,
+      action: "Open Devices",
+      onAction: () => navigate("/control/devices"),
+    })
+  }
+  if (connected && !selectedHasCamera && settingsSnap !== null) {
+    attention.push({
+      key: "cameras",
+      text: "No cameras are assigned. Collect data and Run policy need at least one.",
+      action: "Assign cameras",
+      onAction: () => openSettings(camerasSettingsTab(hardwareProfile)),
+    })
+  }
+
+  // The button beside each "before you start" item on an operation's screen.
+  function fixFor(blocker: string): BlockerFix | null {
+    if (blocker === "Choose what Axol is mounted on") {
+      return { label: "Choose mount", onClick: () => navigate("/control/devices") }
+    }
+    if (/^Connect (Axol|Mantis)/.test(blocker)) {
+      return { label: "Open Devices", onClick: () => navigate("/control/devices") }
+    }
+    if (blocker.startsWith("Wait:") && runningOp && runningOp !== opId) {
+      return { label: "Open it", onClick: openRunningOperation }
+    }
+    if (blocker.includes("Cameras tab of Mantis settings")) {
+      return { label: "Assign cameras", onClick: () => openSettings("mantis-cameras") }
+    }
+    if (blocker.includes("Cameras tab of Axol settings")) {
+      return { label: "Assign cameras", onClick: () => openSettings("cameras") }
+    }
+    if (blocker.includes("Robot tab of Axol settings")) {
+      return { label: "Open Axol settings", onClick: () => openSettings("robot") }
+    }
+    if (blocker.includes("Mantis settings") || blocker.includes("Mantis trackers")) {
+      return { label: "Open Mantis settings", onClick: () => openSettings("mantis-tracking") }
+    }
+    if (blocker.startsWith("Fix the motor fault")) {
+      return { label: "Open Diagnostics", onClick: () => navigate("/diagnostics") }
+    }
+    return null
+  }
 
   // The newest run's error, if its output reported one after it started. The
   // log isn't on screen by default, so the operation page surfaces it.
@@ -2142,6 +2285,7 @@ export default function ControlPanel() {
     <>
       <AppShell
         title={page[view].title}
+        back={routeOp ? "/control/operations" : undefined}
         description={page[view].description}
         actions={runningChip}
         notices={view === "request-data" ? undefined : notices}
@@ -2150,9 +2294,14 @@ export default function ControlPanel() {
       >
         {view === "overview" && (
           <>
-            {isLive && (
+            {(conn.state === "idle" || conn.state === "err") && (
+              <ConnectHero failed={conn.state === "err"} onConnect={() => setSetupOpen(true)} />
+            )}
+
+            {isLive && runningEntry && (
               <RunningCard
-                label={runningLabel ?? "An operation"}
+                entry={runningEntry}
+                startedAt={effectiveStatus?.status === "running" ? effectiveStatus.startedAt : null}
                 stopping={isStopping}
                 busy={busy}
                 onOpen={openRunningOperation}
@@ -2160,42 +2309,50 @@ export default function ControlPanel() {
               />
             )}
 
-            <PageSection title="Devices">
-              <ConnectionsBar
-                conn={conn.state}
-                host={serverHost}
-                hostName={hostInfo?.hostname}
-                version={update?.version ?? hostInfo?.version ?? null}
-                onOpenSetup={() => setSetupOpen(true)}
-                onHostDisconnect={hostDisconnectClick}
-                opRunning={hostBusy}
-                hostInstalling={update?.installing ?? false}
-                robot={robot}
-                robotBusy={robotBusy}
-                canProfiles={canProfiles}
-                onRobotConnect={robotConnectClick}
-                onRobotDisconnect={robotDisconnectClick}
-                jelly={jelly}
-                jellySupported={jellySupported}
-                jellyBusy={jellyBusy}
-                canDevices={canDevices}
-                onJellyConnect={(device) => void jellyConnectClick(device)}
-                onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
-                selectedProfile={hardwareProfile}
-                onSelectProfile={(profile) => void selectHardwareProfile(profile)}
-                selectDisabled={isLive || hardwareProfileSaving}
-                selectDisabledReason={
-                  isLive ? "Stop the running operation to change the device." : null
-                }
-                selectSaving={hardwareProfileSaving}
-                onOpenSettings={openSettingsScope}
-              />
-            </PageSection>
+            <AttentionList items={attention} />
+
+            <QuickStart entries={quickEntries} onOpen={openOperation} />
+
+            {connected && recentDatasets && <RecentDatasets datasets={recentDatasets} />}
+          </>
+        )}
+
+        {view === "devices" && (
+          <>
+            <ConnectionsBar
+              conn={conn.state}
+              host={serverHost}
+              hostName={hostInfo?.hostname}
+              version={update?.version ?? hostInfo?.version ?? null}
+              onOpenSetup={() => setSetupOpen(true)}
+              onHostDisconnect={hostDisconnectClick}
+              opRunning={hostBusy}
+              hostInstalling={update?.installing ?? false}
+              robot={robot}
+              robotBusy={robotBusy}
+              canProfiles={canProfiles}
+              onRobotConnect={robotConnectClick}
+              onRobotDisconnect={robotDisconnectClick}
+              jelly={jelly}
+              jellySupported={jellySupported}
+              jellyBusy={jellyBusy}
+              canDevices={canDevices}
+              onJellyConnect={(device) => void jellyConnectClick(device)}
+              onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
+              selectedProfile={hardwareProfile}
+              onSelectProfile={(profile) => void selectHardwareProfile(profile)}
+              selectDisabled={isLive || hardwareProfileSaving}
+              selectDisabledReason={
+                isLive ? "Stop the running operation to change the device." : null
+              }
+              selectSaving={hardwareProfileSaving}
+              onOpenSettings={openSettingsScope}
+            />
 
             {mountCard}
 
             {connected && !selectedHasCamera && settingsSnap !== null && (
-              <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+              <div className="flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
                 <Camera className="size-4 shrink-0 text-white/40" />
                 <p className="min-w-0 flex-1 text-sm text-white/60">
                   No cameras are assigned. Collect data and Run policy need at least one.
@@ -2209,114 +2366,88 @@ export default function ControlPanel() {
                 </Button>
               </div>
             )}
-
-            <PageSection
-              title="Operations"
-              description={`Operations run on ${hardwareProfile === "mantis" ? "Mantis" : "Axol"}, the selected device.`}
-            >
-              <OperationGrid operations={operations} runningOp={runningOp} onOpen={openOperation} />
-            </PageSection>
           </>
         )}
 
-        {view === "operations" && (
-          <div className="grid items-start gap-6 xl:grid-cols-[12rem_minmax(0,1fr)]">
-            <OperationSelector
-              operations={operations}
-              selected={opId}
-              runningOp={runningOp}
-              onSelect={selectOp}
-            />
-            <div className="flex min-w-0 flex-col gap-4">
-              {isLive && !selectedLive && (
-                <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-                  <span className="text-amber-200">{runningLabel}</span> is running. Stop it before
-                  you start another operation.
-                </p>
-              )}
+        {view === "operations" && !routeOp && (
+          <OperationLauncher items={launcherItems} onOpen={openOperation} />
+        )}
 
-              {needsMount && (
-                <div className="flex flex-wrap items-center gap-3 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
-                  <p className="min-w-0 flex-1 text-sm text-white/70">
-                    Choose what Axol is mounted on before you run on the arms.
-                  </p>
-                  <Button variant="outline" size="sm" onClick={() => navigate("/control")}>
-                    Choose mount
-                  </Button>
-                </div>
-              )}
-
-              <OperationPanel
-                key={renderedConnectionGeneration}
-                meta={meta}
-                spec={spec}
-                settings={settings}
-                hardwareProfile={hardwareProfile}
-                mantisSource={mantisSource}
-                sharedValues={settingsSnap?.values ?? null}
-                onChange={setSetting}
-                onReset={resetSetting}
-                onResetAll={resetAll}
-                onOpenSettings={() => openSettingsScope(hardwareProfile)}
-                cameras={cameras}
-                robot={robot}
-                live={selectedLive}
-                stopping={selectedStopping}
-                busy={busy}
-                session={selectedLive ? effectiveStatus : null}
-                host={viewerHost}
-                viewerPort={viewerPort}
-                vrPort={hostInfo?.vrPort ?? 8000}
-                startPhase={startPhase}
-                hostBlocker={
-                  activeCommandSession
-                    ? `${commandLabel(activeCommandSession.command)} is running`
-                    : isLive && !selectedLive
-                      ? `${runningLabel ?? "Another operation"} is running`
-                      : null
+        {view === "operations" && routeOp && (
+          <div className="flex min-w-0 flex-col gap-4">
+            <OperationPanel
+              key={renderedConnectionGeneration}
+              entry={currentEntry}
+              fixFor={fixFor}
+              onConnect={() => setSetupOpen(true)}
+              meta={displayMeta}
+              spec={spec}
+              settings={settings}
+              hardwareProfile={hardwareProfile}
+              mantisSource={mantisSource}
+              sharedValues={settingsSnap?.values ?? null}
+              onChange={setSetting}
+              onReset={resetSetting}
+              onResetAll={resetAll}
+              onOpenSettings={() => openSettingsScope(hardwareProfile)}
+              cameras={cameras}
+              robot={robot}
+              live={selectedLive}
+              stopping={selectedStopping}
+              busy={busy}
+              session={selectedLive ? effectiveStatus : null}
+              host={viewerHost}
+              viewerPort={viewerPort}
+              vrPort={hostInfo?.vrPort ?? 8000}
+              startPhase={startPhase}
+              hostBlocker={
+                activeCommandSession
+                  ? `${commandLabel(activeCommandSession.command)} is running`
+                  : isLive && !selectedLive
+                    ? `${runningLabel ?? "Another operation"} is running`
+                    : null
+              }
+              needsMount={needsMount}
+              simRobot={simRobot}
+              onSimRobotChange={(next) => {
+                setSimRobotChoice(next)
+                try {
+                  localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
+                } catch {
+                  // Private mode / storage off: the choice lasts this page view.
                 }
-                needsMount={needsMount}
-                simRobot={simRobot}
-                onSimRobotChange={(next) => {
-                  setSimRobotChoice(next)
-                  try {
-                    localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
-                  } catch {
-                    // Private mode / storage off: the choice lasts this page view.
-                  }
-                }}
-                connected={connected}
-                policy={selectedLive ? policy : null}
-                onStart={handleStart}
-                onStop={handleStop}
-                onEpisode={handleEpisode}
+              }}
+              connected={connected}
+              policy={selectedLive ? policy : null}
+              onStart={handleStart}
+              onStop={handleStop}
+              onEpisode={handleEpisode}
+            />
+
+            {lines.length > 0 && (
+              <LogPeek
+                line={lines[lines.length - 1]}
+                failure={
+                  runError && effectiveStatus?.command === opId
+                    ? `${commandLabel(opId)} stopped with an error: ${runError}`
+                    : null
+                }
               />
+            )}
 
-              {lines.length > 0 && (
-                <LogPeek
-                  line={lines[lines.length - 1]}
-                  failure={
-                    runError && effectiveStatus?.command === opId
-                      ? `${commandLabel(opId)} stopped with an error: ${runError}`
-                      : null
-                  }
-                />
-              )}
+            {(meta.id === "teleop" || meta.id === "collect-data") && !isLive && (
+              <DataCollectionOffer operation={meta.id} />
+            )}
 
-              {(meta.id === "teleop" || meta.id === "collect-data") && !isLive && (
-                <DataCollectionOffer operation={meta.id} />
-              )}
-
-              {showsDatasetPreview(meta.id) && connected && (
-                <Link
-                  to="/control/datasets"
-                  className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
-                >
-                  Review recorded episodes in Datasets
-                  <ArrowRight className="size-3.5" />
-                </Link>
-              )}
-            </div>
+            {showsDatasetPreview(meta.id) && connected && (
+              <Link
+                to="/control/datasets"
+                className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
+              >
+                Review recorded episodes in Datasets
+                <ArrowRight className="size-3.5" />
+              </Link>
+            )}
           </div>
         )}
 
@@ -2330,7 +2461,9 @@ export default function ControlPanel() {
               episodesRecorded={policy?.episodesRecorded ?? null}
             />
           ) : (
-            <EmptyState>Connect to the robot's computer to see its datasets.</EmptyState>
+            <EmptyState onConnect={() => setSetupOpen(true)}>
+              Connect to the robot&apos;s computer to see its datasets.
+            </EmptyState>
           ))}
 
         {view === "request-data" && (
@@ -2340,7 +2473,9 @@ export default function ControlPanel() {
         )}
 
         {view === "settings" && !connected && (
-          <EmptyState>Connect to the robot's computer to see its settings.</EmptyState>
+          <EmptyState onConnect={() => setSetupOpen(true)}>
+            Connect to the robot&apos;s computer to see its settings.
+          </EmptyState>
         )}
 
         {view === "settings" && connected && (
@@ -2443,44 +2578,15 @@ function lastLineIndex(lines: string[], prefix: string): number {
   return -1
 }
 
-function EmptyState({ children }: { children: ReactNode }) {
+/** A page that needs the robot's computer, before one is connected. */
+function EmptyState({ children, onConnect }: { children: ReactNode; onConnect?: () => void }) {
   return (
-    <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-white/45">
-      {children}
-    </div>
-  )
-}
-
-/** The operation in progress, at the top of the overview. */
-function RunningCard({
-  label,
-  stopping,
-  busy,
-  onOpen,
-  onStop,
-}: {
-  label: string
-  stopping: boolean
-  busy: boolean
-  onOpen: () => void
-  onStop: () => void
-}) {
-  return (
-    <div className="flex flex-wrap items-center gap-3 rounded-xl border border-emerald-400/25 bg-emerald-400/[0.05] p-4">
-      <span className="size-2.5 shrink-0 animate-pulse rounded-full bg-emerald-400" />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-white">{label}</p>
-        <p className="text-xs text-white/50">{stopping ? "Stopping…" : "Running"}</p>
-      </div>
-      <div className="flex items-center gap-2">
-        <Button variant="outline" size="sm" onClick={onOpen}>
-          Open
-        </Button>
-        <Button variant="destructive" size="sm" onClick={onStop} disabled={busy || stopping}>
-          {stopping ? <Loader2 className="animate-spin" /> : <Square />}
-          {stopping ? "Stopping…" : "Stop"}
-        </Button>
-      </div>
+    <div className="flex min-h-56 flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-white/10 p-6 text-center">
+      <span className="flex size-11 items-center justify-center rounded-2xl bg-white/[0.04] text-white/40">
+        <Plug className="size-5" />
+      </span>
+      <p className="max-w-sm text-sm text-white/55">{children}</p>
+      {onConnect && <Button onClick={onConnect}>Connect</Button>}
     </div>
   )
 }
@@ -2517,85 +2623,5 @@ function LogPeek({ line, failure }: { line: string; failure: string | null }) {
         <ArrowRight className="size-3.5" />
       </span>
     </Link>
-  )
-}
-
-/** Every operation as a card on the overview; a card opens its page. */
-function OperationGrid({
-  operations,
-  runningOp,
-  onOpen,
-}: {
-  operations: OperationMeta[]
-  runningOp: OperationId | null
-  onOpen: (op: OperationId) => void
-}) {
-  return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {operations.map((op) => (
-        <button
-          key={op.id}
-          type="button"
-          onClick={() => onOpen(op.id)}
-          className="group flex flex-col gap-1.5 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-left transition-colors hover:border-white/25 hover:bg-white/[0.04]"
-        >
-          <span className="flex items-center gap-2">
-            <span className="text-sm font-medium text-white/90">{op.label}</span>
-            {op.id === runningOp && (
-              <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
-            )}
-            <ArrowRight className="ml-auto size-4 text-white/20 transition-colors group-hover:text-white/60" />
-          </span>
-          <span className="line-clamp-2 text-xs leading-relaxed text-white/45">
-            {op.description}
-          </span>
-        </button>
-      ))}
-    </div>
-  )
-}
-
-/** The operation list: a column beside the panel on wide screens, a
- *  scrolling row of tabs above it otherwise. */
-function OperationSelector({
-  operations,
-  selected,
-  runningOp,
-  onSelect,
-}: {
-  operations: OperationMeta[]
-  selected: OperationId
-  runningOp: OperationId | null
-  onSelect: (op: OperationId) => void
-}) {
-  return (
-    <nav
-      aria-label="Operations"
-      className="-mx-1 flex gap-1 overflow-x-auto px-1 pb-1 xl:sticky xl:top-24 xl:mx-0 xl:flex-col xl:overflow-visible xl:px-0"
-    >
-      {operations.map((op) => {
-        const active = op.id === selected
-        const running = op.id === runningOp
-        return (
-          <button
-            key={op.id}
-            type="button"
-            onClick={() => onSelect(op.id)}
-            aria-current={active ? "page" : undefined}
-            className={cn(
-              "flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-sm whitespace-nowrap transition-colors",
-              active
-                ? "bg-[#eff483]/10 text-[#eff483]"
-                : "text-white/60 hover:bg-white/[0.05] hover:text-white/90"
-            )}
-          >
-            <span className="min-w-0 flex-1 truncate">{op.label}</span>
-            {running && (
-              <span className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-400" />
-            )}
-          </button>
-        )
-      })}
-    </nav>
   )
 }

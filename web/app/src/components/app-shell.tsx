@@ -3,6 +3,8 @@ import { Link, NavLink, useLocation } from "react-router-dom"
 import {
   Activity,
   BookOpen,
+  ChevronLeft,
+  Cpu,
   Database,
   DatabaseZap,
   Glasses,
@@ -20,8 +22,8 @@ import { cn } from "@/lib/utils"
 
 /**
  * The app frame shared by the control panel and the diagnostics dashboard:
- * a sidebar with the main sections (a slide-out drawer below `lg`), the
- * connected host in its footer, and a page header with a title and actions.
+ * a sidebar with the main sections (a slide-out drawer below `lg`), and a
+ * page header with a title, actions and the connection status.
  *
  * Navigation between sections is client-side, so the control panel's state
  * (connections, the running operation, its logs) survives moving between
@@ -41,6 +43,7 @@ const MAIN_NAV: NavItem[] = [
   { to: "/control/operations", label: "Operations", icon: Play },
   { to: "/control/datasets", label: "Datasets", icon: Database },
   { to: "/control/request-data", label: "Request data", icon: DatabaseZap },
+  { to: "/control/devices", label: "Devices", icon: Cpu },
   { to: "/control/settings", label: "Settings", icon: Settings2 },
 ]
 
@@ -55,8 +58,10 @@ export type NavBadges = Partial<Record<string, "running" | "attention">>
 export type HostSummary = {
   dot: StatusDot
   label: string
+  /** What the robot side looks like, after the host ("Axol ready"). */
+  detail?: string | null
   version?: string | null
-  /** Opens the host connection dialog; the footer is a plain status otherwise. */
+  /** Opens the connection details; the pill is a plain status otherwise. */
   onClick?: () => void
 }
 
@@ -136,13 +141,11 @@ function SubNav({ items, onNavigate }: { items: SubNavItem[]; onNavigate?: () =>
 
 function SidebarContents({
   badges,
-  host,
   subNav,
   onNavigate,
   onQuickstart,
 }: {
   badges?: NavBadges
-  host?: HostSummary
   subNav?: { under: string; items: SubNavItem[] }
   onNavigate?: () => void
   onQuickstart: () => void
@@ -196,35 +199,31 @@ function SidebarContents({
           <BookOpen className="size-4 shrink-0" />
           Docs
         </a>
-        {host && <HostFooter host={host} onNavigate={onNavigate} />}
       </div>
     </div>
   )
 }
 
-function HostFooter({ host, onNavigate }: { host: HostSummary; onNavigate?: () => void }) {
+/** The connection at a glance, at the top right of every page: the robot's
+ *  computer and the selected device. Opens the connection details. */
+function HostPill({ host }: { host: HostSummary }) {
   const body = (
     <>
       <span className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[host.dot])} />
-      <span className="min-w-0 flex-1 text-left">
-        <span className="block truncate text-[0.8rem] text-white/80">{host.label}</span>
-        {host.version && (
-          <span className="block font-mono text-[0.65rem] text-white/35">axol v{host.version}</span>
-        )}
-      </span>
+      <span className="max-w-32 truncate sm:max-w-48">{host.label}</span>
+      {host.detail && (
+        <span className="hidden max-w-40 truncate text-white/45 md:inline">· {host.detail}</span>
+      )}
     </>
   )
   const className =
-    "mt-2 flex min-h-11 w-full items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2"
+    "flex h-8 min-w-0 items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3 text-xs text-white/80"
   return host.onClick ? (
     <button
       type="button"
-      onClick={() => {
-        onNavigate?.()
-        host.onClick?.()
-      }}
-      title="Change the host"
-      className={cn(className, "transition-colors hover:border-white/20 hover:bg-white/[0.04]")}
+      onClick={host.onClick}
+      title={host.version ? `axol v${host.version}` : undefined}
+      className={cn(className, "transition-colors hover:border-white/25 hover:bg-white/[0.06]")}
     >
       {body}
     </button>
@@ -235,6 +234,7 @@ function HostFooter({ host, onNavigate }: { host: HostSummary; onNavigate?: () =
 
 export function AppShell({
   title,
+  back,
   description,
   actions,
   notices,
@@ -245,6 +245,8 @@ export function AppShell({
   children,
 }: {
   title: string
+  /** A page inside a section: the header leads back to the section's page. */
+  back?: string
   description?: ReactNode
   /** Page-level controls on the right of the header. */
   actions?: ReactNode
@@ -280,7 +282,6 @@ export function AppShell({
 
   const sidebarProps = {
     badges,
-    host,
     subNav,
     onQuickstart: () => setQuickstartOpen(true),
   }
@@ -329,10 +330,23 @@ export function AppShell({
           >
             <Menu className="size-5" />
           </button>
-          <h1 className="min-w-0 flex-1 truncate font-heading text-lg font-semibold tracking-tight">
-            {title}
-          </h1>
+          {back ? (
+            <Link
+              to={back}
+              className="-ml-2 flex min-w-0 flex-1 items-center gap-1 rounded-md py-1 pr-2 pl-1 text-white/85 transition-colors hover:text-white"
+            >
+              <ChevronLeft className="size-5 shrink-0 text-white/50" />
+              <h1 className="truncate font-heading text-lg font-semibold tracking-tight">
+                {title}
+              </h1>
+            </Link>
+          ) : (
+            <h1 className="min-w-0 flex-1 truncate font-heading text-lg font-semibold tracking-tight">
+              {title}
+            </h1>
+          )}
           {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+          {host && <HostPill host={host} />}
         </div>
       </header>
 
