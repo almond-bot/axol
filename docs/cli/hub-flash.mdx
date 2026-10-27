@@ -28,10 +28,14 @@ axol hub.flash --force
   If `hub.flash` says the hub's firmware is too old to update over USB, flash it once by hand:
 
   1. Unplug the hub.
-  2. Hold its **BOOTSEL** button while you plug it back in.
-  3. Run `axol hub.flash`.
+  2. Flip the **BOOTSEL** switch next to the hub's USB port.
+  3. Plug the hub back in. It starts in its bootloader.
+  4. Run `axol hub.flash`. It reports that the hub restarted into its bootloader.
+  5. Flip the **BOOTSEL** switch back, then unplug the hub and plug it back in. The hub starts the new firmware.
 
-  After that, updates are automatic. The same steps recover a hub whose LED is on but that never shows a CAN interface in `ip link show`. If a flash was interrupted and the hub is stuck in its bootloader, arm bring-up fails. Run `hub.flash` again to recover it.
+  The hub reads the switch only when it powers on, so replug the hub after each flip. After this manual flash, updates are automatic.
+
+  The same steps recover a hub whose LED is on but that never shows a CAN interface in `ip link show`. If a flash was interrupted and the hub is stuck in its bootloader, arm bring-up fails. Run `hub.flash` again to recover it.
 </Warning>
 
 A bootloader doesn't identify itself, so it could belong to any RP2350 board. `hub.flash` asks before it flashes one. Without a terminal it prints the `--port` command instead. Pass `--port` to flash it without asking.

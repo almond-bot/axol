@@ -229,14 +229,14 @@ class EnsureFirmwareTest(unittest.TestCase):
 
     def test_a_sudo_flash_reports_the_real_failure(self) -> None:
         # Not root: the flash runs through sudo, and its own error (here the
-        # manual-BOOTSEL instructions) must reach the log, not a generic
+        # BOOTSEL switch instructions) must reach the log, not a generic
         # "could not escalate".
         self._hub(0x0100)
         failed = subprocess.CompletedProcess(
             [],
             1,
             stdout="Flashing Axol hub firmware 2.00 at USB 1-3...\n",
-            stderr="ERROR: firmware too old to update over USB; hold its BOOTSEL\n",
+            stderr="ERROR: firmware too old to update over USB. Flip the BOOTSEL\n",
         )
         with (
             patch.object(hub_fw.os, "geteuid", return_value=1000),
@@ -245,7 +245,7 @@ class EnsureFirmwareTest(unittest.TestCase):
         ):
             hub_fw.ensure_hub_firmware([CAN_LEFT], sysfs=self.sysfs.root)
         output = "\n".join(logs.output)
-        self.assertIn("hold its BOOTSEL", output)
+        self.assertIn("Flip the BOOTSEL", output)
         self.assertNotIn("ERROR: firmware", output)
 
     def test_opt_out(self) -> None:

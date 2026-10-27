@@ -18,4 +18,4 @@ The reset cause tells you whether the hub restarted when an arm bus dropped out.
 
 `hub.info` finds hubs on USB, so it also lists a hub whose CAN interfaces never came up. A hub in its bootloader is listed with the `hub.flash --port` command that recovers it.
 
-If no running hub is attached, it prints `No Axol hub found on USB.` and exits with an error. If the hub's LED is on but it isn't listed, it may have no working firmware. Hold its **BOOTSEL** button while you plug it in, then run [`axol hub.flash`](/cli/hub-flash).
+If no running hub is attached, it prints `No Axol hub found on USB.` and exits with an error. If the hub's LED is on but it isn't listed, it may have no working firmware. Follow the manual flash steps in [`axol hub.flash`](/cli/hub-flash). They use the **BOOTSEL** switch next to the hub's USB port.

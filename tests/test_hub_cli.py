@@ -90,7 +90,7 @@ class HubCliTest(unittest.TestCase):
         self.flash.assert_not_called()
 
     def test_flash_takes_a_confirmed_bootloader(self) -> None:
-        # The Mantis hub that never enumerated, replugged with BOOTSEL held.
+        # The Mantis hub that never enumerated, replugged with its BOOTSEL switch on.
         self.bootloaders.return_value = ["1-5"]
         with self._hubs(), self._stdin(tty=True, answer="y"):
             self._run("hub.flash")
@@ -145,7 +145,7 @@ class HubCliTest(unittest.TestCase):
         self.assertIn("Done", out)
 
     def test_flash_failure_exits_nonzero(self) -> None:
-        self.flash.side_effect = hub_fw.HubFirmwareError("hold BOOTSEL")
+        self.flash.side_effect = hub_fw.HubFirmwareError("flip the BOOTSEL switch")
         with self.assertRaises(SystemExit) as cm:
             self._run("hub.flash", "--port", "2-1")
         self.assertEqual(cm.exception.code, 1)
