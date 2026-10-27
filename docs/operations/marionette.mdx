@@ -10,25 +10,27 @@ The control panel's **Marionette** page fills the window with the cameras: one l
 ## Before you start
 
 - Build the Marionette app onto each iPhone from a current copy of the Marionette repository. See its README.
-- Install Node 22 or newer on Axol's computer and clone the Marionette repository there. The phones then talk to the robot directly, which gives the least delay. Any other computer that the phones and the robot can both reach also works, such as a laptop on the same Wi-Fi or a machine on the same Tailscale network.
 - For cameras, assign the ZED cameras in **Axol settings → Cameras**. In sim, rendered head and wrist views are used instead.
 
 ## Start the gateway
 
-In the Marionette repository, run:
+The phones and Axol meet at a Marionette gateway. Run it on Axol's computer, so the phones talk to the robot directly with the least delay:
 
 ```bash
-npm install
-npm run dev:axol
+axol marionette.gateway
 ```
 
-It listens on port 8787 and serves the Axol phone screen. Note the computer's address (for example `ipconfig getifaddr en0` on a Mac, `hostname -I` on Linux, or `tailscale ip -4`).
+- It listens on port 8787. Pick another with `--port`.
+- When it starts it prints its pairing code (such as `K7Q2-M9XD`), a pairing link and a QR code. The code stays the same when the gateway restarts.
+- Keep it running while you use Marionette. Axol sends the phones its own screen when Marionette starts.
+
+Any other computer that the phones and the robot can both reach also works, such as a laptop on the same Wi-Fi or a machine on the same Tailscale network. Install the Marionette SDK there and run `marionette-gateway`, as the Marionette README describes.
 
 ## Run it
 
 <Steps>
   <Step title="Open the Marionette page">
-    In the control panel, open **Marionette**. In **Gateway**, keep `localhost` when the gateway runs on Axol's computer. Otherwise type its address, for example `192.168.1.20`.
+    In the control panel, open **Marionette**. In **Gateway**, keep `localhost` when the gateway runs on Axol's computer. For a gateway on another computer, enter the pairing link it prints (it starts with `marionette://`), so that Axol has its pairing code.
   </Step>
 
   <Step title="Start">
@@ -36,7 +38,7 @@ It listens on port 8787 and serves the Axol phone screen. Note the computer's ad
   </Step>
 
   <Step title="Connect the phones">
-    On each iPhone, open Marionette, type the address shown in the page's **Phones** panel and tap **Connect**. Each phone appears on the page with its name and color.
+    On each iPhone, scan the gateway's QR code (with the Camera app, or **Scan QR code** in Marionette), or pick the gateway under **Nearby** in Marionette. You can also type the address shown in the page's **Phones** panel and tap **Connect**. The first time, enter the gateway's pairing code when the app asks for it. Each phone shows Axol's screen and appears on the page with its name and color.
   </Step>
 
   <Step title="Calibrate each phone">
@@ -114,4 +116,5 @@ On the **Marionette** page, these keys drive Jelly and the lift:
 - If two phones pick the same arm, the phone that moved it last keeps it. The other phone shows which phone has it.
 - A reset moves an arm without a pad held. **Stop** halts it.
 - Jelly and the lift stop at once if the drive stick, a held button or the page stops sending.
+- Only one Axol can use a gateway at a time. If another one is connected, such as a sim and the robot on the same gateway, the page shows **Gateway not connected** and says why. Stop the other one, and this one takes over.
 - Press **Stop Marionette** to end the session. The arms return to rest before their motors turn off.
