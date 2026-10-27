@@ -131,7 +131,7 @@ import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { useStartupView } from "@/lib/operation-progress"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
-import { MountQuickPick, MountRequired } from "@/components/settings/mount-required"
+import { MountChooser, MountRequired } from "@/components/settings/mount-required"
 import {
   SETTINGS_SCOPES,
   camerasSettingsTab,
@@ -2221,7 +2221,7 @@ export default function ControlPanel() {
         ? {
             key: "mount",
             text: "Choose what Axol is mounted on, so the arms don't hit it.",
-            content: <MountQuickPick onSave={saveMount} />,
+            content: <MountChooser onSave={saveMount} />,
           }
         : {
             key: "mount",
