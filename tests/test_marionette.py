@@ -319,6 +319,40 @@ class PhoneTrackerTest(unittest.TestCase):
         )
         self.assertTrue(robot.snapshot()["phone-1"].stop)
 
+    def test_a_restarted_gateway_forgets_its_old_phones_but_not_a_stop(self) -> None:
+        self.tracker.apply(
+            {
+                "type": "config",
+                "sessionId": "gw-1",
+                "phones": [
+                    {"id": "phone-1", "connected": True},
+                    {"id": "phone-2", "name": "Phone 2", "connected": True},
+                ],
+            }
+        )
+        self.tracker.apply(
+            {
+                "type": "input",
+                "phoneId": "phone-2",
+                "action": "safety.estop",
+                "value": True,
+            }
+        )
+        self.tracker.lost_gateway()
+        self.tracker.apply(
+            {
+                "type": "config",
+                "sessionId": "gw-2",
+                "phones": [{"id": "phone-1", "name": "Phone 1", "connected": True}],
+            }
+        )
+        phones = self.tracker.snapshot()
+        self.assertEqual(sorted(phones), ["phone-1", "phone-2@gw-1"])
+        self.assertTrue(phones["phone-2@gw-1"].stop)
+        self.assertFalse(phones["phone-1"].stop)
+        self.tracker.clear_offline_stops()
+        self.assertEqual(sorted(self.tracker.snapshot()), ["phone-1"])
+
     def test_disconnect_and_lost_gateway_release_everything(self) -> None:
         self.input("teleop.deadman", True)
         self.input("base.drive", {"x": 1, "y": 0}, live=True)

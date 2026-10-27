@@ -255,6 +255,7 @@ class PhoneTracker:
         self._allow_mirror = allow_mirror
         self._lock = threading.Lock()
         self._phones: dict[str, Phone] = {}
+        self._gateway: str | None = None  # the gateway's session id
 
     def snapshot(self) -> dict[str, Phone]:
         """A copy of every phone, safe to read without the lock."""
@@ -264,8 +265,10 @@ class PhoneTracker:
     def clear_offline_stops(self) -> None:
         """Forget Stop on phones that are offline (the desktop clears them)."""
         with self._lock:
-            for phone in self._phones.values():
-                if not phone.connected:
+            for pid, phone in list(self._phones.items()):
+                if "@" in pid:
+                    del self._phones[pid]  # kept from a restarted gateway for its Stop
+                elif not phone.connected:
                     phone.values[ESTOP] = False
 
     def lost_gateway(self) -> None:
@@ -308,6 +311,23 @@ class PhoneTracker:
         return phone
 
     def _config(self, message: dict[str, Any]) -> None:
+        gateway = message.get("sessionId")
+        if isinstance(gateway, str) and gateway != self._gateway:
+            if self._gateway is not None:
+                # A restarted gateway names phones afresh. Forget the old
+                # roster, except a phone that left Stop on: the robot stays
+                # stopped until the desktop page clears it.
+                self._phones = {
+                    pid: p
+                    for pid, p in self._phones.items()
+                    if p.stop and not p.connected
+                }
+                for pid, phone in list(self._phones.items()):
+                    del self._phones[pid]
+                    stale = f"{pid}@{self._gateway}"
+                    phone.id = stale
+                    self._phones[stale] = phone
+            self._gateway = gateway
         for info in message.get("phones") or []:
             self._phone(info)
         phone = self._phone(message.get("phone"))
