@@ -843,8 +843,9 @@ def _parse_axol_command(argv: list[str], scratch: Path) -> Any:
 
     real_parse_args = argparse.ArgumentParser.parse_args
     rest = _materialize_files(rest, scratch, None)
-    if command in cli._DIAG_COMMANDS:
-        module_name, _ = cli._DIAG_COMMANDS[command]
+    lazy = {**cli._DIAG_COMMANDS, **cli._TOOL_COMMANDS}
+    if command in lazy:
+        module_name, _ = lazy[command]
         module = importlib.import_module(module_name)
         with patch.object(argparse.ArgumentParser, "parse_args", parse_then_stop):
             try:
