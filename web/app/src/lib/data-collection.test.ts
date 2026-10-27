@@ -3,12 +3,15 @@ import { describe, expect, it } from "vitest"
 import {
   formatMoney,
   parseHuggingFaceDataset,
+  priceKey,
   parseVideoUrl,
   requestSource,
   validateDataCollectionRequest,
 } from "./data-collection"
 
 const valid = {
+  service: "task",
+  method: null,
   hours: 10,
   task: "Fold the towel in half twice.",
   example: { kind: "video", value: "https://youtu.be/abc" },
@@ -62,7 +65,21 @@ describe("validateDataCollectionRequest", () => {
     expect(result.ok && result.value.example).toEqual({ kind: "dataset", value: "org/set" })
   })
 
+  it("accepts both services", () => {
+    const task = validateDataCollectionRequest({ ...valid, method: "your_axol" })
+    expect(task.ok && task.value).toMatchObject({ service: "task", method: null })
+    for (const method of ["almond_axol", "your_axol"]) {
+      const result = validateDataCollectionRequest({ ...valid, service: "dataset", method })
+      expect(result.ok && result.value).toMatchObject({ service: "dataset", method })
+    }
+  })
+
   it.each([
+    [{ service: undefined }, "one-off task or a training dataset"],
+    [{ service: "policy" }, "one-off task or a training dataset"],
+    [{ service: "dataset", method: undefined }, "how Almond collects"],
+    [{ service: "dataset", method: "drone" }, "how Almond collects"],
+    [{ service: "dataset", method: "mantis_umi" }, "how Almond collects"],
     [{ hours: 0 }, "whole number of hours"],
     [{ hours: 2.5 }, "whole number of hours"],
     [{ hours: "lots" }, "whole number of hours"],
@@ -81,17 +98,31 @@ describe("validateDataCollectionRequest", () => {
 })
 
 describe("requestSource", () => {
-  it("keeps the operation page a card linked from, else names the page itself", () => {
-    expect(requestSource("teleop")).toBe("teleop")
-    expect(requestSource("collect-data")).toBe("collect-data")
-    expect(requestSource("overview")).toBe("overview")
-    expect(requestSource(null)).toBe("request-data")
-    expect(requestSource("run-policy")).toBe("request-data")
+  it("keeps the operation page a card linked from, else names the request page", () => {
+    expect(requestSource("teleop", "task")).toBe("teleop")
+    expect(requestSource("collect-data", "dataset")).toBe("collect-data")
+    expect(requestSource("overview", "task")).toBe("overview")
+    expect(requestSource(null, "dataset")).toBe("request-data")
+    expect(requestSource(null, "task")).toBe("request-teleoperator")
+    expect(requestSource("run-policy", "dataset")).toBe("request-data")
   })
 
   it("is a page the checkout accepts", () => {
-    const result = validateDataCollectionRequest({ ...valid, operation: requestSource(null) })
-    expect(result.ok).toBe(true)
+    for (const service of ["task", "dataset"] as const) {
+      const result = validateDataCollectionRequest({
+        ...valid,
+        operation: requestSource(null, service),
+      })
+      expect(result.ok).toBe(true)
+    }
+  })
+})
+
+describe("priceKey", () => {
+  it("charges a task at the teleoperator price and a dataset by its method", () => {
+    expect(priceKey("task", null)).toBe("teleoperator")
+    expect(priceKey("dataset", "almond_axol")).toBe("almond_axol")
+    expect(priceKey("dataset", "your_axol")).toBe("your_axol")
   })
 })
 

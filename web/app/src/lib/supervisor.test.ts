@@ -39,6 +39,7 @@ import {
   type SchemaField,
   type SchemaNode,
   type SettingsCategory,
+  motorFaultBlockers,
 } from "./supervisor"
 
 const required: SchemaField = {
@@ -437,5 +438,47 @@ describe("showWhen gates", () => {
       "teleop.frequency",
       "teleop.box_flush_deg",
     ])
+  })
+})
+
+describe("motorFaultBlockers", () => {
+  const joints = ["shoulder_1", "elbow", "gripper"]
+  const motors = ["left", "right"].flatMap((arm) =>
+    joints.map((joint) => ({
+      arm,
+      joint,
+      reachable: false,
+      status: null,
+      temperature: null,
+      voltage: null,
+    }))
+  )
+  const fault = (arm: string, joint: string, problem = "unreachable") => ({
+    arm,
+    joint,
+    problem,
+    temperature: null,
+  })
+
+  it("names the whole robot when no motor answers", () => {
+    const faults = motors.map((m) => fault(m.arm, m.joint))
+    expect(motorFaultBlockers(faults, motors, "Axol")).toEqual([
+      "Axol isn't answering. Turn on its power.",
+    ])
+  })
+
+  it("names one arm when only its motors are unreachable", () => {
+    const faults = [...joints.map((j) => fault("left", j)), fault("right", "elbow", "overheat")]
+    expect(motorFaultBlockers(faults, motors, "Axol")).toEqual([
+      "Left arm isn't answering. Check its power and cable.",
+      "Fix the motor fault on R elbow: overheat",
+    ])
+  })
+
+  it("lists single faults per motor", () => {
+    expect(motorFaultBlockers([fault("right", "gripper")], motors, "Mantis")).toEqual([
+      "Fix the motor fault on R gripper: unreachable",
+    ])
+    expect(motorFaultBlockers([], motors, "Axol")).toEqual([])
   })
 })

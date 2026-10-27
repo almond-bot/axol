@@ -359,18 +359,32 @@ Under the videos, **Robot data** shows what the episode recorded, so you can che
 
 Gripper poses are in the robot's frame, at the gripper mount. For a joint episode, the panel works them out from the recorded joints. The 3D view uses the Axol version set under **Axol settings → Robot**.
 
-## Request data
+## Request teleoperator
 
-With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Overview**, **Teleoperation** and **Collect data** pages also have a card that leads there.
+Have an Almond operator control your Axol remotely to finish a one-off task for you. Open **Request teleoperator** in the sidebar. The **Overview** and **Teleoperation** pages also have a card that leads there.
 
-1. Enter the hours of usable data you want. The form shows the hourly price and the total.
+1. Enter the hours you expect the task to take. The form shows the hourly price and the total.
 2. Describe the task: what the robot should do, with which objects, and what counts as done.
 3. Optionally, add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
 4. Press **Continue to payment** and pay on Stripe's checkout page.
 
-You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
+You prepay the hours. Almond bills by the minute and refunds the time you don't use. After you pay, Almond emails you to schedule the session.
 
-The request needs an internet connection on the computer running the browser. To hide the card, press **×** on it. **Request data** stays in the sidebar.
+## Request data
+
+Get a LeRobot dataset of your task, ready for training. Open **Request data** in the sidebar. The **Collect data** page also has a card that leads there.
+
+1. Choose how Almond collects the data under **How Almond collects it**:
+   - **Almond's Axol**: Almond builds your setup and records the task with teleop on its own Axol.
+   - **Your Axol**: an Almond operator controls your Axol remotely and records the task in your space.
+2. Enter the hours of usable data you want. The form shows the hourly price for the method you chose, and the total.
+3. Describe the task: what the robot should do, with which objects, and what counts as done.
+4. Optionally, add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
+5. Press **Continue to payment** and pay on Stripe's checkout page.
+
+You pay per hour of usable data, however long recording takes. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond emails you to plan the collection.
+
+Both requests need an internet connection on the computer running the browser. To hide a card, press **×** on it. **Request teleoperator** and **Request data** stay in the sidebar.
 
 ## Next steps
 
