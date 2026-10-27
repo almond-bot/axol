@@ -16,7 +16,7 @@ Jelly is detected from the CAN devices present, so you never enable it by hand.
 | <F>--{prefix}yaw_hold_max</F> | `0.3` | Maximum heading-hold correction. |
 | <F>--{prefix}yaw_log</F> | `false` | Log heading-hold data at 10 Hz, for diagnosing drift. |
 | <F>--{prefix}hold_kp</F> | `60.0` | Not used. |
-| <F>--{prefix}hold_kd</F> | `1.5` | How strongly parked wheels resist rolling (Nm·s/rad). `0` leaves them idle. |
+| <F>--{prefix}hold_kd</F> | `5.0` | How strongly parked wheels resist rolling (Nm·s/rad), up to `5`. `0` leaves them idle. |
 | <F>--{prefix}frequency</F> | `50.0` | Wheel command rate (Hz). |
 | <F>--{prefix}command_timeout</F> | `0.2` | Seconds without a stick command before Jelly stops. |
 | <F>--{prefix}can_timeout_ms</F> | `200.0` | Motor-side loss-of-comms timeout (ms). Stops the wheels even if the host hangs. |

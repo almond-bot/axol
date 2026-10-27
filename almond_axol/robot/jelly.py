@@ -212,7 +212,8 @@ class JellyConfig:
         hold_kp:         Unused: the park hold has no position stiffness (see
                          the module docs). Kept so saved settings still load.
         hold_kd:         Damping (Nm·s/rad) of the park hold; 0 disables
-                         parking (wheels just idle in velocity mode).
+                         parking (wheels just idle in velocity mode). 5 is the
+                         motor's maximum; higher values are clamped to it.
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
                          before the command source is considered dead. On
@@ -261,7 +262,7 @@ class JellyConfig:
     yaw_log: bool = False
     deadzone: float = 0.15
     hold_kp: float = 60.0
-    hold_kd: float = 1.5
+    hold_kd: float = 5.0
     frequency: float = 50.0
     command_timeout: float = 0.2
     can_timeout_ms: float = 200.0

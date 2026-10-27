@@ -231,8 +231,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--hold-kd",
         type=float,
-        default=1.5,
-        help="Damping (Nm·s/rad) of the park hold; 0 disables parking (default: 1.5)",
+        default=5.0,
+        help="Damping (Nm·s/rad) of the park hold, at most 5; 0 disables parking "
+        "(default: 5)",
     )
     parser.add_argument(
         "--joystick",

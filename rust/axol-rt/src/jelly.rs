@@ -1162,7 +1162,7 @@ mod tests {
         values.into_iter().flat_map(f64::to_le_bytes).collect()
     }
 
-    const PY_CONFIG: [f64; 11] = [20.0, 1.0, 0.5, 15.0, 2.0, 0.3, 60.0, 1.5, 50.0, 0.2, 200.0];
+    const PY_CONFIG: [f64; 11] = [20.0, 1.0, 0.5, 15.0, 2.0, 0.3, 60.0, 5.0, 50.0, 0.2, 200.0];
 
     #[test]
     fn python_config_layout_roundtrips() {
