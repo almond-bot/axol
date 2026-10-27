@@ -50,6 +50,8 @@ Open the **Local** URL on the robot's computer, or the **LAN** URL from another 
 
 ## Connections
 
+The **Overview** lists your devices on one line each, with a **Connect** button for one that is plugged in but not connected. Mantis and Jelly show once they are plugged in.
+
 The **Devices** page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
 
 **Choose the device.** Every operation runs on either Axol or Mantis. The chosen tile shows **selected**, and the other shows **Select**.
@@ -116,7 +118,7 @@ The panel finds the CAN adapters plugged into the host and connects the selected
 
 If the automatic connection fails twice, press **Connect** on the tile. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
 
-**If an adapter isn't identified.** This happens when the hardware was off while the server started. Power on the hardware, then press **Connect** or **Retry CAN identification**. If that still fails, run `axol can.setup` in a terminal.
+**If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
 To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.
 

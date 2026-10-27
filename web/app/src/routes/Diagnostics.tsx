@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { discoveryNeedsRecheck, discoveryNotice } from "@/lib/hardware-status"
 import { Navigate, useLocation, useNavigate } from "react-router-dom"
 import {
   Cable,
@@ -226,7 +227,6 @@ export default function Diagnostics() {
     []
   )
   const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
-  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries (or a 404) identifies an
   // older host. It cannot distinguish attached roles, so only retain the
   // historical profile already reported by that host's robot status.
@@ -566,7 +566,6 @@ export default function Diagnostics() {
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     autoJellyAttemptsRef.current.clear()
     manualJellyOverrideRef.current.clear()
   }, [canServerInstanceId, resetAutoRobotRetry])
@@ -694,10 +693,8 @@ export default function Diagnostics() {
     [toast]
   )
 
-  const canDiscoveryNeedsRetry =
-    canDiscovery?.status === "partial" ||
-    canDiscovery?.status === "unidentified" ||
-    canDiscovery?.status === "error"
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(canDiscovery)
+  const hardwareNotice = discoveryNotice(canDiscovery)
   const retryCanIdentification = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
     setCanDiscoveryRetryBusy(true)
@@ -706,18 +703,11 @@ export default function Diagnostics() {
       if (!autoRobotMountedRef.current) return
       canInventoryKnownRef.current = true
       installCanInventory(inventory)
-      const result = inventory.discovery
-      if (result?.status === "configured" || result?.status === "ready") {
-        toast.success("CAN hardware identified")
-      } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware is still unidentified.")
-      } else {
-        toast.error(result?.message ?? "CAN hardware could not be identified.")
+      if (inventory.discovery?.status === "configured" || inventory.discovery?.status === "ready") {
+        toast.success("Hardware found")
       }
-    } catch (error) {
-      if (autoRobotMountedRef.current) {
-        toast.error(`CAN identification failed: ${String(error)}`)
-      }
+    } catch {
+      // Busy or rate-limited: the notice stays until the hardware answers.
     } finally {
       if (autoRobotMountedRef.current) setCanDiscoveryRetryBusy(false)
     }
@@ -730,7 +720,6 @@ export default function Diagnostics() {
   useEffect(() => {
     if (!serverOk) {
       automaticCanDiscoveryAttemptsRef.current.clear()
-      canDiscoveryNoticesRef.current.clear()
       return
     }
     if (!canDiscovery) return
@@ -761,10 +750,6 @@ export default function Diagnostics() {
         if (canDiscoveryRequestCanRetry(error)) {
           automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
         }
-        const noticeKey = `request:${attemptKey}`
-        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-        canDiscoveryNoticesRef.current.add(noticeKey)
-        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
       })
   }, [
     activeRun,
@@ -780,26 +765,6 @@ export default function Diagnostics() {
     serverOk,
     toast,
   ])
-
-  useEffect(() => {
-    if (
-      !serverOk ||
-      !canDiscovery ||
-      (canDiscovery.status !== "partial" &&
-        canDiscovery.status !== "unidentified" &&
-        canDiscovery.status !== "error")
-    )
-      return
-    const noticeKey = `${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
-    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-    canDiscoveryNoticesRef.current.add(noticeKey)
-    const fallback =
-      canDiscovery.status === "unidentified"
-        ? "Power on the attached hardware, then press Retry CAN identification."
-        : "Run axol can.setup in a terminal if the problem continues."
-    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
-    else toast.error(canDiscovery.message ?? fallback)
-  }, [canDiscovery, canServerInstanceId, currentCanServerEpoch, serverOk, toast])
 
   // Direct navigation to Diagnostics still brings up an unambiguous host, but
   // this route is never a second profile-policy authority. With both profiles
@@ -1228,13 +1193,13 @@ export default function Diagnostics() {
         }}
         notices={
           <>
-            {serverOk && canDiscoveryNeedsRetry && (
+            {serverOk && canDiscoveryNeedsRetry && hardwareNotice && (
               <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
-                <p className="min-w-0 flex-1 text-xs text-amber-100/80">
-                  {canDiscovery?.message ??
-                    "CAN hardware is attached but not yet identified as Axol, Mantis, or Jelly."}{" "}
-                  Power on the hardware, then retry. The robot link may drop briefly during the
-                  check.
+                <p
+                  className="min-w-0 flex-1 text-sm text-amber-100/80"
+                  title={canDiscovery?.message ?? undefined}
+                >
+                  {hardwareNotice.text}
                 </p>
                 <Button
                   variant="outline"
@@ -1249,7 +1214,7 @@ export default function Diagnostics() {
                   }
                 >
                   {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-                  Retry CAN identification
+                  Check again
                 </Button>
               </div>
             )}

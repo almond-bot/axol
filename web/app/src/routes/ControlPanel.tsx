@@ -97,6 +97,9 @@ import { OperationLauncher, type LauncherItem } from "@/components/operation-lau
 import {
   AttentionList,
   ConnectHero,
+  DevicesRow,
+  HardwareNoticeCard,
+  type DeviceSummary,
   QuickStart,
   RecentDatasets,
   RunningCard,
@@ -116,6 +119,12 @@ import { DatasetPreview } from "@/components/dataset-preview"
 import { DataCollectionOffer } from "@/components/data-collection-offer"
 import { RequestDataPage } from "@/components/request-data"
 import { requestSource } from "@/lib/data-collection"
+import {
+  deviceErrorText,
+  discoveryNeedsRecheck,
+  discoveryNotice,
+  nextRecheckDelay,
+} from "@/lib/hardware-status"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
@@ -130,7 +139,7 @@ import {
 } from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { AppShell, type HostSummary, type NavBadges } from "@/components/app-shell"
-import type { StatusDot } from "@/lib/jelly-view"
+import { jellyDeviceView, type StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
 import type { SimRobot } from "@/components/sim-robot-picker"
@@ -316,7 +325,6 @@ export default function ControlPanel() {
   // The backend owns the real single-flight. This per-tab latch prevents the
   // 2s inventory poll from sending duplicate requests for one hardware epoch.
   const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
-  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries identifies an older host;
   // retain its historical selected-profile auto-connect behavior.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
@@ -495,7 +503,6 @@ export default function ControlPanel() {
       voidCanInventoryPolls(canInventoryPollRef.current)
       setLegacyCanInventory(false)
       automaticCanDiscoveryAttemptsRef.current.clear()
-      canDiscoveryNoticesRef.current.clear()
       setUsb(null)
       setUsbBusy(false)
       setSession(null)
@@ -772,7 +779,6 @@ export default function ControlPanel() {
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     // The Jelly links restart disconnected with their manual-disconnect pause
     // forgotten too, so this tab's latches must not outlive the process.
     autoJellyAttemptsRef.current.clear()
@@ -871,7 +877,6 @@ export default function ControlPanel() {
     canInventoryKnownRef.current = false
     sessionInventoryKnownRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     previousDesiredProfileRef.current = null
@@ -1155,7 +1160,9 @@ export default function ControlPanel() {
       } catch (e) {
         if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
           return null
-        if (!automatic) toast.error(String(e))
+        if (!automatic) {
+          toast.error(deviceErrorText(String(e), profile === "mantis" ? "Mantis" : "Axol"))
+        }
         return false
       } finally {
         if (autoRobotMountedRef.current && generation === connectionGenerationRef.current)
@@ -1294,10 +1301,7 @@ export default function ControlPanel() {
   const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The host is busy"
-  const canDiscoveryNeedsRetry =
-    canDiscovery?.status === "partial" ||
-    canDiscovery?.status === "unidentified" ||
-    canDiscovery?.status === "error"
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(canDiscovery)
 
   // Bring up each detected Jelly device once per (device, interface, server
   // epoch), the way the Axol/Mantis link auto-connects: only from an idle
@@ -1341,7 +1345,11 @@ export default function ControlPanel() {
     sessionInventoryReady,
   ])
 
-  const retryCanIdentification = useCallback(async () => {
+  // Check plugged-in hardware that hasn't answered again. Quiet: the notice
+  // on Overview and Devices says what is wrong until it answers, so neither
+  // a pass that still finds it silent nor a refused request is news.
+  const [recheckTick, setRecheckTick] = useState(0)
+  const recheckCanHardware = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
     const hostGeneration = connectionGenerationRef.current
     setCanDiscoveryRetryBusy(true)
@@ -1350,24 +1358,43 @@ export default function ControlPanel() {
       if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current) return
       canInventoryKnownRef.current = true
       installCanInventory(inventory)
-      const result = inventory.discovery
-      if (result?.status === "configured" || result?.status === "ready") {
-        toast.success("CAN hardware identified")
-      } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware is not identified yet")
-      } else {
-        toast.error(result?.message ?? "CAN hardware could not be identified")
-      }
-    } catch (error) {
-      if (hostGeneration === connectionGenerationRef.current) {
-        toast.error(`CAN identification failed: ${String(error)}`)
-      }
+    } catch {
+      // Busy, rate-limited or unreachable: the next check tries again.
     } finally {
       if (hostGeneration === connectionGenerationRef.current) {
         setCanDiscoveryRetryBusy(false)
+        setRecheckTick((n) => n + 1)
       }
     }
-  }, [canDiscoveryRetryBusy, installCanInventory, toast])
+  }, [canDiscoveryRetryBusy, installCanInventory])
+
+  // Hardware that is plugged in but silent is nearly always switched off, and
+  // turning it on changes nothing the host can see. So check it again on its
+  // own, backing off from 5 s to a minute, while nothing could be disturbed:
+  // the host idle and neither Axol nor Mantis connected (a check may briefly
+  // take an idle link down). With a link up, "Check again" does it by hand.
+  const recheckDelayRef = useRef<number | null>(null)
+  const robotLinkFree = !robot || robot.state === "disconnected" || robot.state === "error"
+  const canRecheckOnItsOwn =
+    conn.state === "ok" &&
+    canDiscoveryNeedsRetry &&
+    robotLinkFree &&
+    !hostBusy &&
+    !activeCommandSession &&
+    !robotBusy &&
+    !canDiscoveryRetryBusy
+  useEffect(() => {
+    if (!canDiscoveryNeedsRetry) recheckDelayRef.current = null
+  }, [canDiscoveryNeedsRetry])
+  useEffect(() => {
+    if (!canRecheckOnItsOwn) return
+    const delay = nextRecheckDelay(recheckDelayRef.current)
+    const timer = window.setTimeout(() => {
+      recheckDelayRef.current = delay
+      void recheckCanHardware()
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [canRecheckOnItsOwn, recheckTick, recheckCanHardware])
 
   // A fresh Axol/Mantis hub or Jelly base/lift adapter initially appears only
   // as anonymous canX devices. Ask the server to probe and persist its role
@@ -1416,10 +1443,8 @@ export default function ControlPanel() {
           // the cross-tab single-flight and per-hardware rate-limit authority.
           automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
         }
-        const noticeKey = `request:${attemptKey}`
-        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-        canDiscoveryNoticesRef.current.add(noticeKey)
-        toast.error(`Automatic CAN identification failed: ${String(error)}`)
+        // Otherwise the result stands as the discovery state, which the
+        // hardware notice turns into what to do.
       })
   }, [
     activeCommandSession,
@@ -1434,29 +1459,6 @@ export default function ControlPanel() {
     robotBusy,
     toast,
   ])
-
-  // Silent, ambiguous, or only partially identified hardware requires an
-  // operator decision. Surface the server's actionable result once per
-  // hardware generation, not every poll.
-  useEffect(() => {
-    if (
-      conn.state !== "ok" ||
-      !canDiscovery ||
-      (canDiscovery.status !== "partial" &&
-        canDiscovery.status !== "unidentified" &&
-        canDiscovery.status !== "error")
-    )
-      return
-    const noticeKey = `${connectionGenerationRef.current}:${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
-    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-    canDiscoveryNoticesRef.current.add(noticeKey)
-    const fallback =
-      canDiscovery.status === "unidentified"
-        ? "Power on the attached hardware, then press Retry CAN identification."
-        : "If the problem continues, run axol can.setup in a terminal."
-    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
-    else toast.error(canDiscovery.message ?? fallback)
-  }, [canDiscovery, canServerInstanceId, conn.state, currentCanServerEpoch, toast])
 
   // Pick from hardware actually present on the host. If only one configured
   // profile exists, connect it; if both exist, the selected operation wins.
@@ -2116,28 +2118,6 @@ export default function ControlPanel() {
           </Button>
         </div>
       )}
-
-      {connected && canDiscoveryNeedsRetry && (
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
-          <p className="min-w-0 flex-1 text-xs text-amber-100/80">
-            {canDiscovery?.message ??
-              "CAN hardware is attached but not yet identified as Axol, Mantis or Jelly."}{" "}
-            Power on the hardware, then connect it or press Retry CAN identification. An idle robot
-            may disconnect briefly while it is checked.
-          </p>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void retryCanIdentification()}
-            disabled={
-              canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
-            }
-          >
-            {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-            Retry CAN identification
-          </Button>
-        </div>
-      )}
     </>
   )
 
@@ -2228,14 +2208,6 @@ export default function ControlPanel() {
       onAction: () => navigate("/control/devices"),
     })
   }
-  if (connected && !isLive && robot && !robotUp) {
-    attention.push({
-      key: "robot",
-      text: `${deviceLabel} isn't connected.`,
-      action: "Open Devices",
-      onAction: () => navigate("/control/devices"),
-    })
-  }
   if (connected && !selectedHasCamera && settingsSnap !== null) {
     attention.push({
       key: "cameras",
@@ -2244,6 +2216,123 @@ export default function ControlPanel() {
       onAction: () => openSettings(camerasSettingsTab(hardwareProfile)),
     })
   }
+
+  // The devices at a glance on Home. Mantis and Jelly show once they are
+  // plugged in (or selected), so an Axol-only setup sees just Axol.
+  const hardwareNotice = connected ? discoveryNotice(canDiscovery) : null
+  const deviceSummaries: DeviceSummary[] = [
+    {
+      key: "host",
+      name: "Robot's computer",
+      dot: hostDot,
+      status: connected
+        ? `${hostInfo?.hostname || serverHost || "Connected"}`
+        : conn.state === "err"
+          ? "Can't reach it"
+          : conn.state === "idle"
+            ? "Not connected"
+            : "Connecting…",
+      connectable: !connected,
+    },
+  ]
+  if (connected) {
+    const linkProfile = robot?.profile ?? "axol"
+    for (const profile of ["axol", "mantis"] as const) {
+      const name = profile === "mantis" ? "Mantis" : "Axol"
+      const present = canProfiles?.[profile].present ?? false
+      const active = linkProfile === profile
+      const state = active ? (robot?.state ?? "disconnected") : "disconnected"
+      if (profile === "mantis" && !present && !active && hardwareProfile !== "mantis") continue
+      const faults = active ? (robot?.faults ?? []) : []
+      const canConnect = (state === "disconnected" || state === "error") && present && !isLive
+      deviceSummaries.push({
+        key: profile,
+        name,
+        dot:
+          state === "connected"
+            ? faults.length
+              ? "err"
+              : "ok"
+            : state === "busy"
+              ? "busy"
+              : state === "connecting"
+                ? "warn"
+                : state === "error"
+                  ? "err"
+                  : present
+                    ? "warn"
+                    : "idle",
+        status:
+          state === "connected"
+            ? faults.length
+              ? "Motor fault"
+              : "Connected"
+            : state === "busy"
+              ? "In use"
+              : state === "connecting"
+                ? "Connecting…"
+                : state === "error"
+                  ? deviceErrorText(robot?.error, name)
+                  : present
+                    ? "Plugged in"
+                    : "Not plugged in",
+        detail: state === "error" ? robot?.error : null,
+        connectable: canConnect,
+        connectBusy: robotBusy,
+      })
+    }
+    if (jellySupported) {
+      const views = JELLY_DEVICES.map((device) => ({
+        device,
+        view: jellyDeviceView(device, jelly, canDevices?.[device], jellySupported),
+        present: canDevices?.[device]?.present ?? false,
+      }))
+      const live = views.filter((v) => v.view.state === "connected" || v.view.state === "busy")
+      const plugged = views.filter(
+        (v) => v.present && (v.view.state === "disconnected" || v.view.state === "error")
+      )
+      if (live.length || views.some((v) => v.present)) {
+        deviceSummaries.push({
+          key: "jelly",
+          name: "Jelly",
+          dot: views.some((v) => v.view.dot === "err") ? "err" : live.length ? "ok" : "warn",
+          status:
+            live.length === views.length
+              ? "Wheels and lift connected"
+              : live.length
+                ? `${live[0].device === "wheels" ? "Wheels" : "Lift"} connected`
+                : "Plugged in",
+          connectable: plugged.length > 0 && !isLive,
+          connectBusy: plugged.some((v) => jellyBusy[v.device]),
+        })
+      }
+    }
+  }
+  // A row's Connect: the host dialog, the Axol/Mantis link, or every Jelly
+  // device that is plugged in but not connected.
+  function connectDevice(key: string) {
+    if (key === "host") setSetupOpen(true)
+    else if (key === "axol" || key === "mantis") void robotConnectClick(key)
+    else if (key === "jelly") {
+      for (const device of JELLY_DEVICES) {
+        const state = jelly?.[device]?.state ?? "disconnected"
+        if (canDevices?.[device]?.present && (state === "disconnected" || state === "error")) {
+          void jellyConnectClick(device)
+        }
+      }
+    }
+  }
+
+  // Checking by hand is only offered where the panel won't check on its own.
+  const hardwareCheck =
+    hardwareNotice && !robotLinkFree && !isLive ? () => void recheckCanHardware() : undefined
+  const hardwareNoticeCard = hardwareNotice && (
+    <HardwareNoticeCard
+      notice={hardwareNotice}
+      onCheckAgain={hardwareCheck}
+      checking={canDiscoveryRetryBusy}
+    />
+  )
 
   // The button beside each "before you start" item on an operation's screen.
   function fixFor(blocker: string): BlockerFix | null {
@@ -2309,6 +2398,10 @@ export default function ControlPanel() {
               />
             )}
 
+            {connected && <DevicesRow devices={deviceSummaries} onConnect={connectDevice} />}
+
+            {hardwareNoticeCard}
+
             <AttentionList items={attention} />
 
             <QuickStart entries={quickEntries} onOpen={openOperation} />
@@ -2319,6 +2412,8 @@ export default function ControlPanel() {
 
         {view === "devices" && (
           <>
+            {hardwareNoticeCard}
+
             <ConnectionsBar
               conn={conn.state}
               host={serverHost}

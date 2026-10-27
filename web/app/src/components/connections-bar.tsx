@@ -10,6 +10,7 @@ import {
   Settings2,
   Unplug,
 } from "lucide-react"
+import { deviceErrorText } from "@/lib/hardware-status"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
 import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
@@ -341,7 +342,7 @@ export function ConnectionsBar({
           : state === "connecting"
             ? "Connecting…"
             : state === "error"
-              ? robot?.error || "Error"
+              ? deviceErrorText(robot?.error, title)
               : detected
                 ? "Detected"
                 : canProfiles

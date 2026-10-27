@@ -95,7 +95,7 @@ Set up Mantis in this order:
     Plug the hub's USB cable into the computer, then power both rigs. The computer finds the hub and works out which rig is left and which is right. If you unplug the hub and plug it back in, it reconnects on its own.
   </Step>
   <Step title="Let the control panel identify it">
-    Open the [control panel](/guides/control-panel#connections) and connect to the **Axol Host**. The panel identifies a new hub on its own while both rigs are powered. If it can't, power the rigs and press **Connect** or **Retry CAN identification**. You can also run [`axol can.setup`](/cli/can-setup) in a terminal.
+    Open the [control panel](/guides/control-panel#connections) and connect to the **Axol Host**. The panel identifies a new hub on its own while both rigs are powered. If it can't, power the rigs: the panel checks again on its own and connects them. You can also run [`axol can.setup`](/cli/can-setup) in a terminal.
   </Step>
 </Steps>
 

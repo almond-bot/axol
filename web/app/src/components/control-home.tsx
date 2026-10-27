@@ -2,8 +2,11 @@ import { Link } from "react-router-dom"
 import { ArrowRight, CircleAlert, Database, Loader2, Plug, Square } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ElapsedTime, OperationIcon } from "@/components/operation-launcher"
+import type { HardwareNotice } from "@/lib/hardware-status"
+import { STATUS_DOT_CLASS, type StatusDot } from "@/lib/jelly-view"
 import type { CatalogEntry } from "@/lib/operation-catalog"
 import type { DatasetInfo, OperationId } from "@/lib/supervisor"
+import { cn } from "@/lib/utils"
 
 /** The first thing on Home until a robot's computer is connected. */
 export function ConnectHero({ failed, onConnect }: { failed: boolean; onConnect: () => void }) {
@@ -188,5 +191,116 @@ export function RecentDatasets({ datasets }: { datasets: DatasetInfo[] }) {
         </ul>
       )}
     </section>
+  )
+}
+
+export interface DeviceSummary {
+  key: string
+  name: string
+  dot: StatusDot
+  status: string
+  /** The host's own words, for the tooltip. */
+  detail?: string | null
+  /** Offer Connect: the device is plugged in but not connected. */
+  connectable?: boolean
+  connectBusy?: boolean
+}
+
+/** The devices at a glance on Home: one line each, a Connect button where
+ *  one is needed, and the whole row opening the Devices page. */
+export function DevicesRow({
+  devices,
+  onConnect,
+}: {
+  devices: DeviceSummary[]
+  onConnect: (key: string) => void
+}) {
+  return (
+    <section className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="font-heading text-sm font-semibold text-white/60">Devices</h2>
+        <Link
+          to="/control/devices"
+          className="flex items-center gap-1 text-xs text-white/45 transition-colors hover:text-white/80"
+        >
+          Manage devices
+          <ArrowRight className="size-3.5" />
+        </Link>
+      </div>
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        {devices.map((d) => (
+          <div
+            key={d.key}
+            title={d.detail ?? undefined}
+            className="flex min-w-0 items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] px-3.5 py-3"
+          >
+            <span className={cn("size-2 shrink-0 rounded-full", STATUS_DOT_CLASS[d.dot])} />
+            <Link to="/control/devices" className="min-w-0 flex-1">
+              <span className="block truncate text-sm font-medium text-white/90">{d.name}</span>
+              <span
+                className={cn(
+                  "block truncate text-xs",
+                  d.dot === "err" ? "text-red-300/90" : "text-white/45"
+                )}
+              >
+                {d.status}
+              </span>
+            </Link>
+            {d.connectable && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onConnect(d.key)}
+                disabled={d.connectBusy}
+                className="shrink-0"
+              >
+                {d.connectBusy ? <Loader2 className="animate-spin" /> : null}
+                Connect
+              </Button>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  )
+}
+
+/** A hardware problem in plain words, with "Check again" only where the
+ *  panel can't check on its own without disturbing a connected robot. */
+export function HardwareNoticeCard({
+  notice,
+  onCheckAgain,
+  checking,
+}: {
+  notice: HardwareNotice
+  onCheckAgain?: () => void
+  checking: boolean
+}) {
+  return (
+    <div
+      className={cn(
+        "flex flex-wrap items-center gap-3 rounded-xl border px-4 py-3",
+        notice.tone === "error"
+          ? "border-red-400/25 bg-red-400/[0.04]"
+          : "border-amber-400/20 bg-amber-400/[0.03]"
+      )}
+    >
+      {checking ? (
+        <Loader2 className="size-4 shrink-0 animate-spin text-white/45" />
+      ) : (
+        <CircleAlert
+          className={cn(
+            "size-4 shrink-0",
+            notice.tone === "error" ? "text-red-300" : "text-amber-300/80"
+          )}
+        />
+      )}
+      <p className="min-w-0 flex-1 text-sm text-white/75">{notice.text}</p>
+      {onCheckAgain && (
+        <Button variant="outline" size="sm" onClick={onCheckAgain} disabled={checking}>
+          Check again
+        </Button>
+      )}
+    </div>
   )
 }
