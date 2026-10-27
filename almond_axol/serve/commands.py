@@ -332,6 +332,18 @@ def _jog_run() -> Callable[..., Any]:
     return _run
 
 
+def _marionette() -> type:
+    from ..cli.marionette import MarionetteCmdConfig
+
+    return MarionetteCmdConfig
+
+
+def _marionette_run() -> Callable[..., Any]:
+    from ..cli.marionette import _run
+
+    return _run
+
+
 def _waypoints_control() -> Callable[..., Any]:
     from ..cli.waypoints import _QueueWaypointControl
 
@@ -472,6 +484,25 @@ COMMANDS: dict[str, CommandDef] = {
         # ones gravity compensation and waypoints use.
         settings_like="gravity-comp",
         per_run_fields=("sim",),
+    ),
+    "marionette": CommandDef(
+        "marionette",
+        "marionette",
+        "Marionette",
+        "Drive the arms, grippers, lift and Jelly from one or two iPhones running "
+        "Marionette, and watch the robot and its cameras on the Marionette page. "
+        "Turn on sim to drive a simulated Axol.",
+        "Operate",
+        "draccus",
+        _marionette,
+        sim_capable=True,
+        entrypoint=_marionette_run,
+        sim_flag="sim",
+        # The control panel's camera assignments, as teleop gets them.
+        camera_mode="teleop",
+        # Arm gains and channels are the robot's shared settings, like jog.
+        settings_like="gravity-comp",
+        per_run_fields=("sim", "gateway"),
     ),
     "collect-data": CommandDef(
         "collect-data",

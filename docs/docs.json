@@ -45,6 +45,7 @@
               "operations/teleop-config"
             ]
           },
+          "operations/marionette",
           {
             "group": "Gravity Compensation",
             "root": "operations/gravity-comp",

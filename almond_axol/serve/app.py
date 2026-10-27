@@ -134,6 +134,10 @@ class JogExecuteRequest(BaseModel):
     id: int
 
 
+class MarionetteStopRequest(BaseModel):
+    on: bool
+
+
 class RobotConnectRequest(BaseModel):
     """Optional CAN interface selection for a robot-link connect.
 
@@ -3136,6 +3140,96 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             session = _jog_session()
             for candidate in {id(s): s for s in (session, last_session) if s}.values():
                 candidate.disconnect(source)
+
+    # -- Marionette (iPhone teleoperation; the session is a jog session) ----
+
+    def _marionette_session() -> Any:
+        from ..marionette.session import MarionetteSession
+
+        session = _jog_session()
+        return session if isinstance(session, MarionetteSession) else None
+
+    @app.post("/api/marionette/stop", response_model=None)
+    async def marionette_stop(
+        req: MarionetteStopRequest,
+    ) -> dict[str, Any] | JSONResponse:
+        session = _marionette_session()
+        if session is None:
+            return JSONResponse(
+                {
+                    "error": "Marionette is not running. Start it from the Marionette page."
+                },
+                status_code=409,
+            )
+        return session.set_stop(req.on)
+
+    @app.websocket("/api/marionette/cameras")
+    async def marionette_cameras(ws: WebSocket) -> None:
+        """JPEG camera frames for the Marionette page.
+
+        Query ``streams`` (comma-separated: head, left, right) and ``fps``.
+        Each frame is a binary message: the stream id, a newline, then the
+        JPEG. A text message ``{"type": "cameras", "available": [...],
+        "error": ...}`` is sent on connect and whenever it changes. The same
+        compressed frames go to the phones, so watching costs no extra
+        encoding.
+        """
+        from ..marionette.cameras import STREAMS
+
+        await ws.accept()
+        wanted = [
+            s
+            for s in (ws.query_params.get("streams") or "head,left,right").split(",")
+            if s in STREAMS
+        ]
+        try:
+            fps = float(ws.query_params.get("fps") or 10)
+        except ValueError:
+            fps = 10.0
+        fps = min(max(fps, 1.0), 30.0) if math.isfinite(fps) else 10.0
+        watcher = f"page-{id(ws):x}"
+        sent: dict[str, int] = {}
+        described: dict[str, Any] | None = None
+        hub: Any = None
+
+        async def drain() -> None:
+            # Nothing is expected from the page; this only notices it leave.
+            while True:
+                await ws.receive_bytes()
+
+        reader = asyncio.create_task(drain())
+        try:
+            while not reader.done():
+                session = _marionette_session()
+                current = None if session is None else session.cameras
+                if current is not hub:
+                    if hub is not None:
+                        hub.drop(watcher)
+                    hub, sent = current, {}
+                description = (
+                    hub.describe()
+                    if hub is not None
+                    else {"available": [], "source": None, "error": None}
+                )
+                if description != described:
+                    described = description
+                    await ws.send_json({"type": "cameras", **description})
+                if hub is not None:
+                    hub.want(watcher, wanted)
+                    for stream in wanted:
+                        frame = hub.latest(stream)
+                        if frame is not None and sent.get(stream) != frame.seq:
+                            sent[stream] = frame.seq
+                            await ws.send_bytes(stream.encode() + b"\n" + frame.jpeg)
+                await asyncio.sleep(1.0 / fps)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            reader.cancel()
+            with contextlib.suppress(BaseException):
+                await reader
+            if hub is not None:
+                hub.drop(watcher)
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 

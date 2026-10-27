@@ -8,7 +8,15 @@
  * the gripper tips.
  */
 import { useCallback, useEffect, useRef, useState } from "react"
-import { apiUrl, wsBaseUrl } from "@/lib/supervisor"
+import type { MarionetteState } from "@/lib/marionette"
+import {
+  apiUrl,
+  parseAxolModel,
+  parseGripper,
+  wsBaseUrl,
+  type AxolModel,
+  type GripperType,
+} from "@/lib/supervisor"
 
 export type JogArm = "left" | "right"
 /** Axes a gripper jog moves along: the torso's, or the gripper's own. */
@@ -61,6 +69,8 @@ export interface JogState {
   armJog?: Record<JogArm, { moving: boolean; limited: boolean }> | null
   execution?: { id: number; arm: JogArm; progress: number } | null
   lastExecution?: { id: number; arm: JogArm; status: "done" | "stopped" } | null
+  /** Phones, arms, Stop and cameras, while the Marionette operation runs. */
+  marionette?: MarionetteState
 }
 
 export interface JogPlan {
@@ -105,6 +115,24 @@ export const NO_TWIST: JogTwist = [0, 0, 0, 0, 0, 0]
 export const HOLD_PERIOD_MS = 50
 /** A preview that hasn't come back in this long is given up on. */
 export const PREVIEW_TIMEOUT_MS = 1000
+
+const SIM_ROBOT_KEY = "axolSimRobot"
+
+/** The sim robot this browser last picked, if it is still a valid one. */
+export function storedSimRobot(): { model: AxolModel; gripper: GripperType } | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SIM_ROBOT_KEY) ?? "null")
+    const model = parseAxolModel(raw?.model)
+    return model ? { model, gripper: parseGripper(raw?.gripper) } : null
+  } catch {
+    return null
+  }
+}
+
+/** Remember the sim robot picked for the next visit. */
+export function storeSimRobot(robot: { model: AxolModel; gripper: GripperType }) {
+  localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(robot))
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(apiUrl(path), init)

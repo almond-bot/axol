@@ -61,16 +61,10 @@ class JogCmdConfig:
     log_level: LogLevel = "INFO"
 
 
-def build_session(cfg: JogCmdConfig) -> Any:
-    """The :class:`~almond_axol.jog.session.JogSession` this config describes."""
-    from ..jog.backends import HardwareBackend, SimBackend
+def planner_factory(kinematics: KinematicsConfig) -> Any:
+    """A zero-argument builder of the :class:`~almond_axol.jog.planner.JogPlanner`."""
     from ..jog.planner import JogPlanner
-    from ..jog.servo import JogLimits
-    from ..robot.jelly import JellyConfig
-    from ..settings import shared_config
 
-    jelly_cfg = shared_config(JellyConfig, "teleop", "jelly")
-    kinematics = cfg.kinematics
     apply_mantis_kinematics_profile(kinematics)
 
     def planner() -> JogPlanner:
@@ -89,31 +83,56 @@ def build_session(cfg: JogCmdConfig) -> Any:
             )
         )
 
+    return planner
+
+
+def build_backend(
+    cfg: Any,
+    *,
+    left_channel: str | None,
+    right_channel: str | None,
+) -> Any:
+    """The sim or hardware jog backend for a config with ``sim``, ``axol`` and
+    ``kinematics`` (the jog and Marionette operations share it)."""
+    from ..jog.backends import HardwareBackend, SimBackend
+    from ..robot.jelly import JellyConfig
+    from ..settings import shared_config
+
+    jelly_cfg = shared_config(JellyConfig, "teleop", "jelly")
+    kinematics = cfg.kinematics
     if cfg.sim:
         model = resolve_robot_model(kinematics.robot_model, mount=kinematics.mount)
-        backend: Any = SimBackend(model, jelly_cfg)
-    else:
-        from ..robot import Axol
-        from ..robot.jelly import Jelly, detect_jelly
+        return SimBackend(model, jelly_cfg)
 
-        axol = None
-        if cfg.left_channel is not None or cfg.right_channel is not None:
-            axol = Axol(
-                config=cfg.axol,
-                left_channel=cfg.left_channel,
-                right_channel=cfg.right_channel,
-            )
-        detected = detect_jelly(jelly_cfg)
-        jelly = Jelly(detected) if detected is not None else None
-        if axol is None and jelly is None:
-            raise ValueError(
-                "Both arms are turned off and no Jelly is attached, so there is "
-                "nothing to jog."
-            )
-        backend = HardwareBackend(axol, jelly)
+    from ..robot import Axol
+    from ..robot.jelly import Jelly, detect_jelly
 
+    axol = None
+    if left_channel is not None or right_channel is not None:
+        axol = Axol(
+            config=cfg.axol,
+            left_channel=left_channel,
+            right_channel=right_channel,
+        )
+    detected = detect_jelly(jelly_cfg)
+    jelly = Jelly(detected) if detected is not None else None
+    if axol is None and jelly is None:
+        raise ValueError(
+            "Both arms are turned off and no Jelly is attached, so there is "
+            "nothing to jog."
+        )
+    return HardwareBackend(axol, jelly)
+
+
+def build_session(cfg: JogCmdConfig) -> Any:
+    """The :class:`~almond_axol.jog.session.JogSession` this config describes."""
+    from ..jog.servo import JogLimits
     from ..jog.session import JogSession
 
+    planner = planner_factory(cfg.kinematics)
+    backend = build_backend(
+        cfg, left_channel=cfg.left_channel, right_channel=cfg.right_channel
+    )
     return JogSession(
         backend,
         planner,
