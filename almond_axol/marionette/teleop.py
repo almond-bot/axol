@@ -10,16 +10,22 @@ here (see the plan in the module docstring of
 - **Clutch.** A press of the phone's hold-to-move pad engages the arm: the
   phone pose ``P0`` and the gripper tip pose ``E0`` are recorded, and
   nothing moves. While engaged the tip target is ``E0`` moved by the
-  phone's motion since ``P0``, in the torso frame (the phone's operator
-  frame and the torso frame are both +x forward, +y left, +z up):
+  phone's motion since ``P0``, turned into the torso frame by ``F``:
 
-      p = E0.p + s * (P.p - P0.p)
-      R = rot(r * angle(P.R @ P0.R^T)) @ E0.R
+      p = E0.p + s * F @ (P.p - P0.p)
+      R = rot(r * s * F @ angle(P.R @ P0.R^T)) @ E0.R
 
-  ``s`` is the phone's motion scale and ``r`` the rotation scale. The
-  target is smoothed with the VR teleop's lag-compensated low-pass and
-  then rate limited, so a fast hand or a tracking jump becomes a bounded
-  gripper speed.
+  ``s`` is the phone's motion scale, which scales turns as well as moves,
+  and ``r`` the rotation scale. The phone's operator frame and the torso
+  frame are both +x forward, +y left, +z up, so in Axol's frame ``F`` is
+  the identity. In a camera's frame (the phone's Frame choice) ``F``
+  sends the phone's forward along the camera's view and its left and up
+  to the image's (:func:`camera_frame`), as the camera sat when the pad
+  was pressed. The turn is followed continuously past half a turn
+  (:func:`unwrap_turn`), so a scaled turn never jumps. The target is
+  smoothed with the VR teleop's lag-compensated low-pass and then rate
+  limited, so a fast hand or a tracking jump becomes a bounded gripper
+  speed.
 - **Gates.** The arm stops and drops its anchor on any failure: the pad
   released or its renewals stopped, a stale or degraded pose, a new ARKit
   session or calibration, Stop, or another phone taking the arm. Only a
@@ -54,7 +60,8 @@ class TeleopLimits:
     joint_speed: float = 2.0
     """Fastest any arm joint turns (rad/s)."""
     rotation_scale: float = 1.0
-    """Phone rotation to gripper rotation (1 = the same angle)."""
+    """Phone rotation to gripper rotation at motion scale 1 (1 = the same
+    angle). The phone's motion scale multiplies it."""
     pose_cutoff: float = 4.0
     """Low-pass cutoff (Hz) on the gripper target."""
     pose_timeout: float = 0.25
@@ -90,17 +97,60 @@ def _matrix(quat: np.ndarray) -> np.ndarray:
     return Rotation.from_quat(q / np.linalg.norm(q)).as_matrix()
 
 
+# The phone's axes (+x forward, +y left, +z up) in a camera's ROS optical
+# frame (+z along the view, +x to the image's right, +y down it): forward
+# is along the view, left and up are the image's.
+_PHONE_IN_OPTICAL = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+
+
+def camera_frame(optical: np.ndarray) -> np.ndarray:
+    """``F`` for moving in a camera's frame, from the rotation of its optical
+    frame in the torso frame (:meth:`ArmKinematics.camera`)."""
+    return np.asarray(optical, dtype=np.float64) @ _PHONE_IN_OPTICAL
+
+
+def unwrap_turn(turn: np.ndarray, previous: np.ndarray) -> np.ndarray:
+    """The rotation vector for ``turn``'s rotation closest to ``previous``.
+
+    A rotation vector is unique only up to whole turns about its axis, and
+    past half a turn the axis flips. Scaled, that flip would jump the
+    gripper; picking the vector nearest the last one follows a turn of any
+    size smoothly.
+    """
+    angle = float(np.linalg.norm(turn))
+    if angle > 1e-9:
+        axis = turn / angle
+    else:
+        size = float(np.linalg.norm(previous))
+        if size < 1e-9:
+            return turn
+        axis, angle = previous / size, 0.0
+    whole = round((float(np.dot(previous, axis)) - angle) / (2.0 * math.pi))
+    return (angle + 2.0 * math.pi * whole) * axis
+
+
 def map_target(
     phone: PhonePose,
     anchor_phone: PhonePose,
     anchor_tip: Pose,
     scale: float,
     rotation_scale: float = 1.0,
+    frame: np.ndarray | None = None,
+    turn: np.ndarray | None = None,
 ) -> Pose:
-    """The tip target for a phone pose, relative to the engage anchor."""
-    position = anchor_tip[0] + scale * (phone.position - anchor_phone.position)
-    turn = rotation_vector(phone.rotation @ anchor_phone.rotation.T)
-    rotation = exp_rotation(rotation_scale * turn) @ anchor_tip[1]
+    """The tip target for a phone pose, relative to the engage anchor.
+
+    ``frame`` is ``F`` (None: Axol's frame). ``turn`` is the phone's turn
+    since the anchor as a rotation vector, followed with
+    :func:`unwrap_turn`; by default it is read from the two poses.
+    """
+    to_torso = np.eye(3) if frame is None else frame
+    if turn is None:
+        turn = rotation_vector(phone.rotation @ anchor_phone.rotation.T)
+    position = anchor_tip[0] + scale * (
+        to_torso @ (phone.position - anchor_phone.position)
+    )
+    rotation = exp_rotation(rotation_scale * scale * (to_torso @ turn)) @ anchor_tip[1]
     return position, rotation
 
 
@@ -204,6 +254,9 @@ class ArmTeleop:
         self._presses: dict[str, int] = {}  # phone id -> press count seen
         self._anchor: tuple[PhonePose, Pose] | None = None
         self._scale = 1.0
+        self.frame = "axol"  # the owner's Frame choice when it engaged
+        self._to_torso: np.ndarray | None = None  # F; None in Axol's frame
+        self._turn = np.zeros(3)  # the phone's turn since the anchor
         self._last_pose: PhonePose | None = None
         self._commanded: Pose | None = None
         self._velocity = np.zeros(6)  # target velocity: m/s, then rad/s
@@ -230,8 +283,14 @@ class ArmTeleop:
         """Mark ``phone``'s presses as seen without acting on them."""
         self._presses[phone.id] = phone.deadman_presses
 
-    def engage(self, phone: Phone, tip: Pose) -> None:
-        """Anchor the phone's current pose to the tip's current pose."""
+    def engage(
+        self, phone: Phone, tip: Pose, to_torso: np.ndarray | None = None
+    ) -> None:
+        """Anchor the phone's current pose to the tip's current pose.
+
+        ``to_torso`` is ``F`` for the phone's Frame choice (None: Axol's
+        frame), fixed until the next press.
+        """
         assert phone.pose is not None
         tip = (np.asarray(tip[0], np.float64), np.asarray(tip[1], np.float64))
         self.owner = phone.id
@@ -240,6 +299,9 @@ class ArmTeleop:
         self._lag_since = None
         self._anchor = (phone.pose, tip)
         self._scale = phone.scale
+        self.frame = phone.frame
+        self._to_torso = to_torso
+        self._turn = np.zeros(3)
         self._last_pose = phone.pose
         self._commanded = tip
         self._velocity = np.zeros(6)
@@ -288,6 +350,40 @@ class ArmTeleop:
 
     # -- tracking ------------------------------------------------------------
 
+    def _goal(self, pose: PhonePose) -> Pose:
+        """The unfiltered target for ``pose``, following the turn on."""
+        assert self._anchor is not None
+        anchor = self._anchor[0]
+        self._turn = unwrap_turn(
+            rotation_vector(pose.rotation @ anchor.rotation.T), self._turn
+        )
+        return map_target(
+            pose,
+            anchor,
+            self._anchor[1],
+            self._scale,
+            self.limits.rotation_scale,
+            self._to_torso,
+            self._turn,
+        )
+
+    def _reanchor(self, phone: Phone) -> None:
+        """Anchor afresh where the target is now, taking up the phone's
+        motion scale: a new scale applies from here on and never moves the
+        arm by itself."""
+        assert phone.pose is not None
+        here = self._goal(phone.pose)
+        self._anchor = (phone.pose, here)
+        self._turn = np.zeros(3)
+        self._scale = phone.scale
+
+    def reframe(self, phone: Phone, to_torso: np.ndarray | None) -> None:
+        """Take up the phone's new Frame choice (``F``: ``to_torso``) from
+        here on, without moving the arm."""
+        self._reanchor(phone)
+        self.frame = phone.frame
+        self._to_torso = to_torso
+
     def target(self, phone: Phone, now: float, dt: float) -> Pose:
         """This tick's tip target: mapped, filtered, then speed and
         acceleration limited."""
@@ -295,24 +391,8 @@ class ArmTeleop:
         assert phone.pose is not None
         limits = self.limits
         if phone.scale != self._scale:
-            # A new motion scale applies from here on: re-anchor where the
-            # target is now, so changing it never moves the arm by itself.
-            here = map_target(
-                phone.pose,
-                self._anchor[0],
-                self._anchor[1],
-                self._scale,
-                limits.rotation_scale,
-            )
-            self._anchor = (phone.pose, here)
-            self._scale = phone.scale
-        goal = map_target(
-            phone.pose,
-            self._anchor[0],
-            self._anchor[1],
-            self._scale,
-            limits.rotation_scale,
-        )
+            self._reanchor(phone)
+        goal = self._goal(phone.pose)
         position = self._filter_p.update(goal[0], now).astype(np.float64)
         quat = _quat_xyzw(goal[1])
         if self._quat_prev is not None and float(np.dot(quat, self._quat_prev)) < 0:

@@ -40,6 +40,7 @@ import numpy as np
 
 from ..constants import (
     ARM_JOINTS,
+    CAMERA_OPTICAL_LINKS,
     GRIPPER_TIP_OFFSET,
     AxolModel,
     Joint,
@@ -452,6 +453,23 @@ class ArmKinematics:
                 cap_b=np.asarray(cap_b, dtype=np.float64).reshape(-1, 3),
             )
 
+        # Camera mounts: the arm a camera rides on (None: the body) and its
+        # optical frame in that arm's gripper mount frame, or the torso frame.
+        self._cameras: dict[str, tuple[Side | None, np.ndarray]] = {}
+        for stream, name in CAMERA_OPTICAL_LINKS.items():
+            if name not in link_names:
+                continue
+            link = link_names.index(name)
+            ride = riding(link)
+            if ride is None:
+                self._cameras[stream] = (None, link_zero(link))
+            elif ride[1] == ARM_DOF - 1:
+                ee = link_names.index(
+                    urdf_body_name(Joint.GRIPPER, is_left=ride[0] == "left")
+                )
+                local = np.linalg.inv(link_zero(ee)) @ link_zero(link)
+                self._cameras[stream] = (ride[0], local)
+
         # Pairs: Pyroki's arm/body pairs, then every left/right arm pair (the
         # teleop model leaves those out, but a jogged gripper can be driven
         # into the other arm). The first capsule is always an arm's.
@@ -620,6 +638,25 @@ class ArmKinematics:
 
     def tips(self, q: np.ndarray) -> tuple[Pose, Pose]:
         return self.tip(q, "left"), self.tip(q, "right")
+
+    @property
+    def cameras(self) -> tuple[str, ...]:
+        """The cameras this model mounts (head, left, right)."""
+        return tuple(self._cameras)
+
+    def camera(self, q: np.ndarray, stream: str) -> Pose | None:
+        """A camera's optical frame (+z along its view, +x to the image's
+        right, +y down it) for a ``(14,)`` joint vector; None if this model
+        doesn't mount that camera (``stream``: head, left or right)."""
+        mount = self._cameras.get(stream)
+        if mount is None:
+            return None
+        side, local = mount
+        if side is None:
+            return local[:3, 3].copy(), local[:3, :3].copy()
+        tip, rotation = self.tip(q, side)
+        origin = tip - rotation @ self._offset  # the gripper mount
+        return origin + rotation @ local[:3, 3], rotation @ local[:3, :3]
 
     # -- clearance ---------------------------------------------------------
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -3191,12 +3192,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def marionette_cameras(ws: WebSocket) -> None:
         """JPEG camera frames for the Marionette page.
 
-        Query ``streams`` (comma-separated: head, left, right) and ``fps``.
-        Each frame is a binary message: the stream id, a newline, then the
-        JPEG. A text message ``{"type": "cameras", "available": [...],
-        "error": ...}`` is sent on connect and whenever it changes. The same
-        compressed frames go to the phones, so watching costs no extra
-        encoding.
+        Query ``streams`` (comma-separated: head, left, right), ``large``
+        (one of them, or empty) and ``fps``. The ``large`` stream, which the
+        page shows big, comes at the hub's ``large_width``; the others at
+        the width the phones get, as the same compressed frames. The page
+        changes ``large`` by sending ``{"large": stream}``. Each frame is a
+        binary message: the stream id, a newline, then the JPEG. A text
+        message ``{"type": "cameras", "available": [...], "error": ...}`` is
+        sent on connect and whenever it changes.
         """
         from ..marionette.cameras import STREAMS
 
@@ -3206,6 +3209,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             for s in (ws.query_params.get("streams") or "head,left,right").split(",")
             if s in STREAMS
         ]
+        large = ws.query_params.get("large") or ""
         try:
             fps = float(ws.query_params.get("fps") or 10)
         except ValueError:
@@ -3217,9 +3221,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         hub: Any = None
 
         async def drain() -> None:
-            # Nothing is expected from the page; this only notices it leave.
+            # The page only says which stream is large; this also notices it leave.
+            nonlocal large
             while True:
-                await ws.receive_bytes()
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                with contextlib.suppress(ValueError, TypeError, AttributeError):
+                    value = json.loads(message.get("text") or "null").get("large")
+                    if value == "" or value in STREAMS:
+                        large = value
 
         reader = asyncio.create_task(drain())
         try:
@@ -3229,6 +3240,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 if current is not hub:
                     if hub is not None:
                         hub.drop(watcher)
+                        hub.drop(f"{watcher}-large")
                     hub, sent = current, {}
                 description = (
                     hub.describe()
@@ -3239,9 +3251,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     described = description
                     await ws.send_json({"type": "cameras", **description})
                 if hub is not None:
-                    hub.want(watcher, wanted)
+                    big = large if large in wanted else ""
+                    hub.want(watcher, [s for s in wanted if s != big])
+                    hub.want(f"{watcher}-large", [big] if big else [], hub.large_width)
                     for stream in wanted:
-                        frame = hub.latest(stream)
+                        frame = hub.latest(
+                            stream, hub.large_width if stream == big else None
+                        )
                         if frame is not None and sent.get(stream) != frame.seq:
                             sent[stream] = frame.seq
                             await ws.send_bytes(stream.encode() + b"\n" + frame.jpeg)
@@ -3254,6 +3270,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 await reader
             if hub is not None:
                 hub.drop(watcher)
+                hub.drop(f"{watcher}-large")
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 

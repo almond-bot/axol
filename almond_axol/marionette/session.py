@@ -8,7 +8,8 @@ stop) whose arms follow phones instead of jog buttons:
   phone's pose, presses and control values from the Marionette gateway.
 - Each arm follows the phone that selected it while that phone holds its
   hold-to-move pad (see :mod:`almond_axol.marionette.teleop` for the
-  clutch, mapping and gates). One step of the fast arm IK per control tick
+  clutch, mapping and gates), in Axol's frame or in a camera's, as the
+  phone's Frame picks. One step of the fast arm IK per control tick
   moves it toward the phone's target, within joint limits, a joint speed
   limit and the self-collision floors.
 - Each arm's gripper follows the closure its phone sends.
@@ -43,10 +44,10 @@ from typing import Any
 import numpy as np
 
 from ..jog.session import ARM_DOF, SIDES, HoldCommand, JogError, JogSession
-from .cameras import CameraHub, streams_for_view
+from .cameras import STREAM_LABELS, CameraHub, streams_for_view
 from .gateway import GatewayClient
-from .phones import Phone, PhoneTracker
-from .teleop import ArmTeleop, TeleopLimits, gate_reason, owners
+from .phones import FRAMES, Phone, PhoneTracker
+from .teleop import ArmTeleop, TeleopLimits, camera_frame, gate_reason, owners
 
 _logger = logging.getLogger(__name__)
 
@@ -418,17 +419,46 @@ class MarionetteSession(JogSession):
                 continue
             if not phone.deadman_live(now, limits.deadman_timeout):
                 continue  # pressed and let go between ticks
-            arm.engage(phone, kin.tip(command, side))
+            arm.engage(
+                phone, kin.tip(command, side), self._to_torso(phone, kin, command)
+            )
             self._notes.pop(phone.id, None)
-            _logger.info("marionette: %s arm engaged by %s", side, phone.name)
+            _logger.info(
+                "marionette: %s arm engaged by %s (moving in the %s frame)",
+                side,
+                phone.name,
+                phone.frame,
+            )
 
         if arm.engaged and kin is not None:
             phone = phones[arm.owner or ""]
+            if phone.frame != arm.frame:
+                arm.reframe(phone, self._to_torso(phone, kin, command))
             target = arm.target(phone, now, dt)
             result = kin.servo_step(command, side, target, limits.joint_speed * dt)
             command = result.q
             arm.note_tip(kin.tip(command, side), now)
         return command
+
+    def _to_torso(
+        self, phone: Phone, kin: Any, command: np.ndarray
+    ) -> np.ndarray | None:
+        """``F`` for the phone's Frame choice, from where its camera is
+        now; None for Axol's frame. A camera this Axol has no mount for
+        falls back to Axol's frame, and the phone is told."""
+        if phone.frame == "axol":
+            return None
+        camera = kin.camera(command, phone.frame)
+        if camera is None:
+            name = STREAM_LABELS.get(phone.frame, phone.frame).lower()
+            self._link.send_status(
+                phone.id,
+                "axol.notice",
+                {},
+                f"This Axol has no {name} camera, so the arm moves in Axol's frame.",
+            )
+            return None
+        return camera_frame(camera[1])
 
     # -- resets ----------------------------------------------------------------
 
@@ -675,7 +705,16 @@ class MarionetteSession(JogSession):
             "stopBy": stop_by or "",
             "resetting": "" if self._reset is None else self._reset.side,
             "streams": ",".join(cameras.available) if cameras is not None else "",
+            "frames": ",".join(self._frames()),
         }
+
+    def _frames(self) -> list[str]:
+        """What a phone can move in on this Axol: its frame, and each camera
+        it mounts (all of them until the arm controller is up)."""
+        planner = self._planner
+        if planner is None:
+            return list(FRAMES)
+        return ["axol", *planner.kinematics.cameras]
 
     async def _camera_loop(self) -> None:
         hub = self.cameras
@@ -777,6 +816,7 @@ class MarionetteSession(JogSession):
             "calibration": phone.calibration,
             "arm": phone.arm,
             "view": phone.view,
+            "frame": phone.frame,
             "scale": phone.scale,
             "speed": phone.speed,
             "deadman": phone.deadman_live(now, self._limits.deadman_timeout),

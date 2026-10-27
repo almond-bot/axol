@@ -34,10 +34,16 @@ from almond_axol.marionette.session import MarionetteSession
 from almond_axol.marionette.teleop import (
     ArmTeleop,
     TeleopLimits,
+    camera_frame,
     gate_reason,
     map_target,
     owners,
+    unwrap_turn,
 )
+
+# A camera looking along Axol's left (+y), upright: the image's right is
+# Axol's forward and its down is Axol's down (ROS optical axes as columns).
+_LOOKING_LEFT = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
 
 
 def _pose(
@@ -240,6 +246,13 @@ class PhoneTrackerTest(unittest.TestCase):
         self.assertAlmostEqual(self.phone().speed, 0.8)
         self.assertAlmostEqual(self.phone().scale, 0.5)
 
+    def test_move_in_picks_a_frame(self) -> None:
+        self.assertEqual(self.phone().frame, "axol")
+        self.input("teleop.frame", "left")
+        self.assertEqual(self.phone().frame, "left")
+        self.input("teleop.frame", "sideways")  # not a frame: ignored
+        self.assertEqual(self.phone().frame, "left")
+
     def test_reset_presses_are_counted_per_arm(self) -> None:
         self.input("arm.resetLeft")
         self.input("arm.resetRight")
@@ -399,6 +412,49 @@ class MappingTest(unittest.TestCase):
             rotation_vector(half @ tip[1].T), [0.0, 0.0, 0.15], atol=1e-9
         )
 
+    def test_the_motion_scale_scales_turns_as_well_as_moves(self) -> None:
+        tip = (np.zeros(3), np.eye(3))
+        anchor = _pose(rotvec=[0.0, 0.0, 0.5])
+        turned = _pose([0.1, 0.0, 0.0], rotvec=[0.0, 0.0, 0.9])
+        p, r = map_target(turned, anchor, tip, 0.5)
+        np.testing.assert_allclose(p, [0.05, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.0, 0.2], atol=1e-9)
+        _, r = map_target(turned, anchor, tip, 2.0, rotation_scale=0.5)
+        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.0, 0.4], atol=1e-9)
+
+    def test_in_a_camera_frame_forward_is_along_its_view(self) -> None:
+        to_torso = camera_frame(_LOOKING_LEFT)
+        # Forward goes where the camera looks, left to the image's left
+        # (Axol's back) and up to the image's up.
+        np.testing.assert_allclose(
+            to_torso, [[0, -1, 0], [1, 0, 0], [0, 0, 1]], atol=1e-12
+        )
+        tip = (np.array([0.3, 0.2, 0.1]), np.eye(3))
+        anchor = _pose()
+        p, _ = map_target(_pose([0.1, 0.0, 0.0]), anchor, tip, 1.0, frame=to_torso)
+        np.testing.assert_allclose(p, [0.3, 0.3, 0.1], atol=1e-12)
+        p, _ = map_target(_pose([0.0, 0.1, 0.05]), anchor, tip, 1.0, frame=to_torso)
+        np.testing.assert_allclose(p, [0.2, 0.2, 0.15], atol=1e-12)
+        # A roll about the phone's forward rolls the gripper about the view.
+        _, r = map_target(
+            _pose(rotvec=[0.2, 0.0, 0.0]), anchor, tip, 1.0, frame=to_torso
+        )
+        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.2, 0.0], atol=1e-9)
+
+    def test_a_turn_past_half_a_turn_stays_continuous(self) -> None:
+        z = np.array([0.0, 0.0, 1.0])
+        np.testing.assert_allclose(unwrap_turn(0.3 * z, np.zeros(3)), 0.3 * z)
+        # 1.01 pi about +z reads as 0.99 pi about -z: followed on, not flipped.
+        flipped = rotation_vector(exp_rotation(1.01 * math.pi * z))
+        np.testing.assert_allclose(flipped, -0.99 * math.pi * z, atol=1e-9)
+        np.testing.assert_allclose(
+            unwrap_turn(flipped, 0.99 * math.pi * z), 1.01 * math.pi * z, atol=1e-9
+        )
+        # A whole turn back where it started stays a whole turn.
+        np.testing.assert_allclose(
+            unwrap_turn(np.zeros(3), 1.98 * math.pi * z), 2 * math.pi * z, atol=1e-9
+        )
+
 
 class GateTest(unittest.TestCase):
     limits = TeleopLimits()
@@ -520,6 +576,36 @@ class ArmTeleopTest(unittest.TestCase):
         phone.pose = _pose(session="s2")
         self.assertFalse(self.arm.anchor_valid(phone))
 
+    def test_a_half_scale_turn_past_half_a_turn_never_jumps(self) -> None:
+        phone = _phone()
+        phone.values["teleop.translationScale"] = 0.5
+        self.arm.engage(phone, self.tip)
+        yaws = []
+        for degrees in range(0, 300, 5):
+            phone.pose = _pose(rotvec=[0.0, 0.0, math.radians(degrees)])
+            _, r = self.arm._goal(phone.pose)
+            yaws.append(math.degrees(math.atan2(r[1, 0], r[0, 0])))
+        np.testing.assert_allclose(np.diff(yaws), 2.5, atol=1e-6)
+        self.assertAlmostEqual(yaws[-1], 147.5, places=6)
+
+    def test_a_new_scale_or_frame_does_not_move_the_target(self) -> None:
+        phone = _phone()
+        self.arm.engage(phone, self.tip)
+        phone.pose = _pose([0.05, 0.02, 0.0], [0.0, 0.0, 0.3])
+        before = self.arm._goal(phone.pose)
+        phone.values["teleop.translationScale"] = 0.5
+        phone.values["teleop.frame"] = "left"
+        self.arm.reframe(phone, camera_frame(_LOOKING_LEFT))
+        self.assertEqual(self.arm.frame, "left")
+        after = self.arm._goal(phone.pose)
+        np.testing.assert_allclose(after[0], before[0], atol=1e-12)
+        np.testing.assert_allclose(after[1], before[1], atol=1e-12)
+        # From here the phone's forward moves the tip left, at half scale.
+        phone.pose = _pose([0.15, 0.02, 0.0], [0.0, 0.0, 0.3])
+        np.testing.assert_allclose(
+            self.arm._goal(phone.pose)[0] - before[0], [0.0, 0.05, 0.0], atol=1e-12
+        )
+
     def test_reach_limit_needs_a_lasting_lag(self) -> None:
         phone = _phone()
         self.arm.engage(phone, self.tip)
@@ -551,6 +637,30 @@ class CameraHubTest(unittest.TestCase):
             1,
         )
         self.assertEqual(tiny.shape[:2], (90, 160))
+
+    def test_a_large_view_gets_its_own_width(self) -> None:
+        import cv2
+
+        hub = CameraHub(
+            SyntheticCameraSource(), fps=30, width=160, large_width=320, quality=50
+        )
+        hub.start()
+        try:
+            hub.want("phones", ["head", "left"])
+            hub.want("page-large", ["head"], hub.large_width)
+            self.assertEqual(hub.wanted(), {160: {"head", "left"}, 320: {"head"}})
+
+            def width(frame: Any) -> int:
+                image = cv2.imdecode(np.frombuffer(frame.jpeg, np.uint8), 1)
+                return image.shape[1]
+
+            self.assertTrue(_wait(lambda: hub.latest("head", 320) is not None))
+            self.assertTrue(_wait(lambda: hub.latest("left") is not None))
+            self.assertEqual(width(hub.latest("head", 320)), 320)
+            self.assertEqual(width(hub.latest("head")), 160)
+            self.assertIsNone(hub.latest("left", 320))
+        finally:
+            hub.stop()
 
     def test_only_watched_streams_are_encoded(self) -> None:
         hub = CameraHub(SyntheticCameraSource(), fps=30, width=160, quality=50)
@@ -1016,6 +1126,33 @@ class MarionetteSessionTest(unittest.TestCase):
             _wait(lambda: np.linalg.norm(self.tip() - held - [0.01, 0, 0]) < 0.002)
         )
 
+    def test_in_a_wrist_camera_frame_the_phone_moves_along_its_view(self) -> None:
+        phone = self.phone()
+        phone.set("teleop.frame", "left")
+        kin = _planner().kinematics
+        view = kin.camera(self.session.current_q(), "left")[1][:, 2]
+        self.assertGreater(abs(view[2]), 0.5)  # hanging at rest, it looks down
+        start = self.tip()
+        phone.press()
+        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        phone.glide([-0.05, 0.0, 0.0])  # back, toward the camera
+        self.assertTrue(
+            _wait(lambda: np.linalg.norm(self.tip() - start + 0.05 * view) < 0.003)
+        )
+        time.sleep(0.5)  # settled
+        held = self.tip()
+        # Back to Axol's frame mid-move: nothing moves until the phone does,
+        # then up is Axol's up.
+        phone.act("teleop.frame", "axol")
+        time.sleep(0.5)
+        np.testing.assert_allclose(self.tip(), held, atol=1e-3)
+        phone.glide([-0.05, 0.0, 0.04])
+        self.assertTrue(
+            _wait(lambda: np.linalg.norm(self.tip() - held - [0, 0, 0.04]) < 0.003)
+        )
+        state = self.session.state()["marionette"]["phones"][0]
+        self.assertEqual(state["frame"], "axol")
+
     def test_a_phone_returning_to_an_arm_does_not_reapply_an_old_grip(self) -> None:
         phone = self.phone()
         phone.act("gripper.set", 1.0)
@@ -1077,6 +1214,7 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertEqual(values["mode"], "sim")
         self.assertEqual(values["arm"], "left")
         self.assertTrue(values["hasLift"] and values["hasBase"])
+        self.assertEqual(values["frames"], "axol,head,left,right")
         # The simulated Jelly has no battery; the robot's reading is rounded.
         self.assertEqual((values["battery"], values["batteryCharging"]), (-1.0, False))
         self.backend.battery_state = lambda: {  # type: ignore[method-assign]
@@ -1266,6 +1404,49 @@ class MarionetteApiTest(unittest.TestCase):
             stream, jpeg = frame.split(b"\n", 1)
             self.assertEqual(stream, b"right")
             self.assertEqual(jpeg[:2], b"\xff\xd8")
+        finally:
+            hub.stop()
+
+    def test_camera_socket_sends_the_large_stream_wider(self) -> None:
+        import cv2
+
+        hub = CameraHub(
+            SyntheticCameraSource(), fps=30, width=160, large_width=320, quality=50
+        )
+        hub.start()
+
+        class Stub(MarionetteSession):
+            def __init__(self) -> None:  # noqa: D107 - a bare stand-in
+                self.cameras = hub
+
+        stub = Stub()
+
+        def widths(ws: Any, count: int) -> dict[str, int]:
+            seen: dict[str, int] = {}
+            while len(seen) < count:
+                message = ws.receive()
+                if message.get("bytes"):
+                    stream, jpeg = message["bytes"].split(b"\n", 1)
+                    image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), 1)
+                    seen[stream.decode()] = image.shape[1]
+            return seen
+
+        try:
+            with (
+                patch("almond_axol.jog.session.active_session", lambda: stub),
+                _client() as client,
+                client.websocket_connect(
+                    "/api/marionette/cameras?streams=head,left&large=head&fps=30"
+                ) as ws,
+            ):
+                self.assertEqual(widths(ws, 2), {"head": 320, "left": 160})
+                ws.send_json({"large": "left"})
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if widths(ws, 2) == {"head": 160, "left": 320}:
+                        break
+                else:
+                    self.fail("the large stream did not change")
         finally:
             hub.stop()
 

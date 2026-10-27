@@ -65,10 +65,13 @@ export function DrivePad({
   disabled,
   speed,
   onDrive,
+  className,
 }: {
   disabled: boolean
   speed: number
   onDrive: (command: Vec3) => void
+  /** Sizes the pad (`size-52` by default). */
+  className?: string
 }) {
   const pad = useRef<HTMLDivElement>(null)
   const [knob, setKnob] = useState<[number, number] | null>(null)
@@ -95,7 +98,8 @@ export function DrivePad({
       aria-disabled={disabled}
       className={cn(
         "relative size-52 shrink-0 touch-none rounded-full border border-white/15 bg-white/[0.03] select-none",
-        disabled ? "opacity-40" : "cursor-grab active:cursor-grabbing"
+        disabled ? "opacity-40" : "cursor-grab active:cursor-grabbing",
+        className
       )}
       onPointerDown={(event) => {
         if (disabled || event.button !== 0) return

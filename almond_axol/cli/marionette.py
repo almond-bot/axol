@@ -60,6 +60,9 @@ class MarionetteCmdConfig:
     """Camera frames per second sent to the phones and the page."""
     camera_width: int = 640
     """Width in pixels of the camera frames sent to the phones and the page."""
+    camera_large_width: int = 1280
+    """Width in pixels of the camera the page shows large (never above what
+    the camera captures)."""
     camera_quality: int = 60
     """JPEG quality (10 to 95) of the camera frames."""
     cameras: dict[str, int] = field(default_factory=dict)
@@ -116,6 +119,7 @@ def build_session(cfg: MarionetteCmdConfig) -> Any:
         source,
         fps=cfg.camera_fps,
         width=cfg.camera_width,
+        large_width=cfg.camera_large_width,
         quality=cfg.camera_quality,
         error=None
         if source is not None

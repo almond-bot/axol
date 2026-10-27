@@ -29,7 +29,7 @@ import { Slider } from "@/components/ui/slider"
 import { SiteNav } from "@/components/site-nav"
 import { DrivePad, HoldButton } from "@/components/jog/hold-controls"
 import { RobotStatus } from "@/components/jog/robot-status"
-import { CameraPanes } from "@/components/marionette/camera-panes"
+import { MarionetteStage } from "@/components/marionette/stage"
 import { ROSTER } from "@/lib/axol-roster"
 import { cn } from "@/lib/utils"
 import {
@@ -49,6 +49,7 @@ import {
   TRACKING_LABELS,
   desktopHold,
   driveKeyOf,
+  frameLabel,
   isTextEntry,
   phoneActivity,
   phoneConnectHint,
@@ -104,6 +105,9 @@ function storedGateway(): string {
   }
 }
 
+// The side panels are denser than the app's default cards.
+const PANEL = "gap-3 p-4"
+
 type Tone = "neutral" | "good" | "warn" | "stop" | "active"
 const TONES: Record<Tone, string> = {
   neutral: "border-white/10 text-white/55",
@@ -142,7 +146,7 @@ function PhoneRow({
     <li
       data-testid={`phone-${phone.id}`}
       className={cn(
-        "flex flex-col gap-1.5 py-3 first:pt-0 last:pb-0",
+        "flex flex-col gap-1.5 py-2.5 first:pt-0 last:pb-0",
         !phone.connected && "opacity-60"
       )}
     >
@@ -160,6 +164,9 @@ function PhoneRow({
           <p className="text-xs text-white/75">{phoneActivity(phone, arms)}</p>
           <div className="flex flex-wrap gap-1">
             <Chip>{phone.arm === "left" ? "Left arm" : "Right arm"}</Chip>
+            <Chip tone={phone.frame === "axol" ? "neutral" : "active"}>
+              {frameLabel(phone.frame)}
+            </Chip>
             <Chip tone={phone.tracking === "normal" ? "good" : "warn"}>
               {TRACKING_LABELS[phone.tracking] ?? phone.tracking}
             </Chip>
@@ -181,14 +188,20 @@ function PhoneRow({
 function PhonesCard({
   phones,
   arms,
+  hint,
 }: {
   phones: MarionettePhone[]
   arms: MarionetteState["arms"] | null
+  /** Where the Marionette app connects. */
+  hint: string
 }) {
   return (
-    <Card data-testid="marionette-phones">
+    <Card data-testid="marionette-phones" className={PANEL}>
       <CardHeader>
         <CardTitle>Phones</CardTitle>
+        <CardDescription data-testid="marionette-connect" className="text-xs">
+          {hint}
+        </CardDescription>
       </CardHeader>
       {phones.length === 0 ? (
         <p className="text-sm text-white/45">No phones connected.</p>
@@ -242,16 +255,16 @@ function ArmRow({
     }
   }
   return (
-    <div data-testid={`arm-${side}`} className="flex flex-col gap-2 py-3 first:pt-0 last:pb-0">
-      <div className="flex items-center justify-between gap-2">
+    <div data-testid={`arm-${side}`} className="flex min-w-0 flex-col gap-2">
+      <div className="flex flex-col items-start gap-1">
         <span className="text-sm font-medium">{side === "left" ? "Left arm" : "Right arm"}</span>
         <Chip tone={arm?.engaged || arm?.resetting ? "active" : "neutral"}>
           {arm?.resetting ? "Returning to rest" : arm?.engaged ? "Following" : "Not following"}
         </Chip>
       </div>
-      <div className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-xs">
+      <div className="grid grid-cols-[auto_1fr] items-center gap-x-2 gap-y-1 text-xs">
         <span className="text-white/50">Phone</span>
-        <span className="flex items-center justify-end gap-1.5 text-white/80">
+        <span className="flex min-w-0 items-center justify-end gap-1.5 truncate text-white/80">
           {owner && <Dot color={owner.color} />}
           {arm?.ownerName ?? (arm?.owner ? arm.owner : "None")}
         </span>
@@ -577,16 +590,17 @@ export default function Marionette() {
     )
 
   return (
-    <div className="min-h-screen">
-      <SiteNav current="marionette" right={<Badge variant={status.variant}>{status.text}</Badge>} />
-      <main className="safe-x mx-auto flex max-w-6xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="font-heading text-2xl font-semibold tracking-tight">Marionette</h1>
-            <p data-testid="marionette-connect" className="mt-1 text-sm text-white/50">
-              {phoneConnectHint(address, axolHost)}
-            </p>
-          </div>
+    // On a wide screen the page fills the window: the stage takes what the
+    // header and Stop leave, and the side panels scroll on their own.
+    <div className="flex min-h-screen flex-col lg:h-dvh lg:min-h-0">
+      <SiteNav
+        wide
+        current="marionette"
+        right={<Badge variant={status.variant}>{status.text}</Badge>}
+      />
+      <main className="safe-x flex flex-1 flex-col gap-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:min-h-0">
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <h1 className="font-heading text-xl font-semibold tracking-tight">Marionette</h1>
           <div className="flex flex-wrap items-center gap-2">
             <label className="flex items-center gap-2 text-xs text-white/55">
               Gateway
@@ -661,29 +675,22 @@ export default function Marionette() {
         {(error || linkError || hostError || otherOperation || live?.solverError) && (
           <div
             role="alert"
-            className="rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-3 text-sm text-amber-200"
+            className="rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-2.5 text-sm text-amber-200"
           >
             {otherOperation
               ? `${otherOperation} is running. Stop it in the Control Panel to use Marionette.`
               : (error ?? live?.solverError ?? linkError ?? hostError)}
           </div>
         )}
-        {!running && mode === "hardware" && !otherOperation && (
-          <p className="text-sm text-white/50">
-            On the robot, an arm moves only while{" "}
-            <strong className="text-white/80">Hold to move</strong> is held on its phone.
-          </p>
-        )}
 
         <div
           data-testid="marionette-stop"
           className={cn(
-            "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border px-4 py-3",
+            "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border px-3 py-2",
             stop?.on ? "border-red-400/40 bg-red-500/[0.08]" : "border-white/10 bg-white/[0.03]"
           )}
         >
           <Button
-            size="lg"
             data-state={stop?.desktop ? "on" : "off"}
             disabled={!running}
             onClick={(event) => {
@@ -692,7 +699,7 @@ export default function Marionette() {
               void setStop(offlineStop ? false : !stop?.desktop)
             }}
             className={cn(
-              "min-w-40 font-semibold",
+              "h-10 min-w-40 font-semibold",
               stop?.desktop
                 ? "border-red-400/50 bg-transparent text-red-200 hover:bg-red-500/10"
                 : "bg-red-600 text-white hover:bg-red-600/85"
@@ -703,7 +710,16 @@ export default function Marionette() {
           </Button>
           <div className="min-w-0 flex-1 text-sm">
             {stopHeadline && <p className="font-medium text-red-200">{stopHeadline}</p>}
-            <p className="text-white/50">{stopNote}</p>
+            <p className="text-white/50">
+              {!running && mode === "hardware" && !otherOperation ? (
+                <>
+                  On the robot, an arm moves only while{" "}
+                  <strong className="text-white/80">Hold to move</strong> is held on its phone.
+                </>
+              ) : (
+                stopNote
+              )}
+            </p>
           </div>
           {running && marionette && (
             <div className="flex flex-col items-end gap-0.5 text-xs">
@@ -731,60 +747,49 @@ export default function Marionette() {
           )}
         </div>
 
-        <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px] lg:items-start">
-          <div className="flex min-w-0 flex-col gap-6">
-            <Card className="gap-0 overflow-hidden p-0">
-              <div className="relative h-[clamp(360px,52vh,560px)]">
-                <Suspense
-                  fallback={
-                    <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
-                      <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
-                    </div>
-                  }
-                >
-                  <JogViewer
-                    key={`${robotModel}:${gripper}`}
-                    robotModel={robotModel}
-                    gripper={gripper}
-                    state={viewState}
-                    plan={null}
-                    activeArm="left"
-                    target={null}
-                    onTargetChange={ignore}
-                    onSelectArm={ignore}
-                  />
-                </Suspense>
-                {running && !ready && (
-                  <div className="pointer-events-none absolute inset-x-0 top-3 flex justify-center">
-                    <span className="flex items-center gap-2 rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
-                      <Loader2 className="size-3.5 animate-spin" /> Starting Marionette…
-                    </span>
+        <div className="grid gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_340px] lg:grid-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_370px]">
+          <MarionetteStage
+            running={running}
+            ready={ready}
+            cameras={marionette?.cameras ?? null}
+            robot={
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
+                    <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
                   </div>
-                )}
-                {!running && (
-                  <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
-                    <span className="rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
-                      Start Marionette to move the robot.
-                    </span>
-                  </div>
-                )}
-              </div>
-            </Card>
-            <CameraPanes running={running} cameras={marionette?.cameras ?? null} />
-          </div>
+                }
+              >
+                <JogViewer
+                  key={`${robotModel}:${gripper}`}
+                  robotModel={robotModel}
+                  gripper={gripper}
+                  state={viewState}
+                  plan={null}
+                  activeArm="left"
+                  target={null}
+                  onTargetChange={ignore}
+                  onSelectArm={ignore}
+                />
+              </Suspense>
+            }
+          />
 
-          <div className="flex flex-col gap-6">
-            <PhonesCard phones={phones} arms={arms} />
+          <aside
+            aria-label="Phones, arms and drive"
+            className="flex min-h-0 flex-col gap-3 lg:-mr-2 lg:overflow-y-auto lg:pr-2"
+          >
+            <PhonesCard phones={phones} arms={arms} hint={phoneConnectHint(address, axolHost)} />
 
-            <Card data-testid="marionette-arms">
+            <Card data-testid="marionette-arms" className={PANEL}>
               <CardHeader>
                 <CardTitle>Arms</CardTitle>
-                <CardDescription>
+                <CardDescription className="text-xs">
                   <strong className="text-white/80">Reset arm</strong> moves an arm back to its rest
                   pose, which straightens out twisted joints. Stop halts it.
                 </CardDescription>
               </CardHeader>
-              <div className="flex flex-col divide-y divide-white/10">
+              <div className="grid grid-cols-2 gap-x-4 divide-x divide-white/10 [&>*+*]:pl-4">
                 {ARMS.map((side) => (
                   <ArmRow
                     key={side}
@@ -797,10 +802,10 @@ export default function Marionette() {
               </div>
             </Card>
 
-            <Card data-testid="marionette-drive">
+            <Card data-testid="marionette-drive" className={PANEL}>
               <CardHeader>
                 <CardTitle>Drive</CardTitle>
-                <CardDescription>
+                <CardDescription className="text-xs">
                   {robotModel === "mobile"
                     ? "Hold a key or a button. Jelly and the lift stop when you let go."
                     : "Only Axol on Jelly has a powered base and lift."}
@@ -819,8 +824,9 @@ export default function Marionette() {
                   format={(v) => `${Math.round(v * 100)} %`}
                 />
               </label>
-              <div className="flex justify-center">
+              <div className="flex items-center gap-3">
                 <DrivePad
+                  className="size-36"
                   disabled={!running || !baseState}
                   speed={driveSpeed}
                   onDrive={(command) => {
@@ -828,51 +834,53 @@ export default function Marionette() {
                     pushHold()
                   }}
                 />
-              </div>
-              <div className="flex gap-2">
-                <HoldButton
-                  label="Turn left"
-                  icon={<RotateCcw />}
-                  disabled={!running || !baseState}
-                  onHold={(held) => {
-                    turn.current = held ? 1 : 0
-                    pushHold()
-                  }}
-                />
-                <HoldButton
-                  label="Turn right"
-                  icon={<RotateCw />}
-                  disabled={!running || !baseState}
-                  onHold={(held) => {
-                    turn.current = held ? -1 : 0
-                    pushHold()
-                  }}
-                />
-              </div>
-              <div className="flex gap-2">
-                <HoldButton
-                  label="Raise lift"
-                  icon={<ArrowUp />}
-                  disabled={!running || !liftState}
-                  onHold={(held) => {
-                    lift.current = held ? 1 : 0
-                    pushHold()
-                  }}
-                />
-                <HoldButton
-                  label="Lower lift"
-                  icon={<ArrowDown />}
-                  disabled={!running || !liftState}
-                  onHold={(held) => {
-                    lift.current = held ? -1 : 0
-                    pushHold()
-                  }}
-                />
+                <div className="grid min-w-0 flex-1 gap-1.5">
+                  <HoldButton
+                    label="Turn left"
+                    icon={<RotateCcw />}
+                    className="h-8"
+                    disabled={!running || !baseState}
+                    onHold={(held) => {
+                      turn.current = held ? 1 : 0
+                      pushHold()
+                    }}
+                  />
+                  <HoldButton
+                    label="Turn right"
+                    icon={<RotateCw />}
+                    className="h-8"
+                    disabled={!running || !baseState}
+                    onHold={(held) => {
+                      turn.current = held ? -1 : 0
+                      pushHold()
+                    }}
+                  />
+                  <HoldButton
+                    label="Raise lift"
+                    icon={<ArrowUp />}
+                    className="h-8"
+                    disabled={!running || !liftState}
+                    onHold={(held) => {
+                      lift.current = held ? 1 : 0
+                      pushHold()
+                    }}
+                  />
+                  <HoldButton
+                    label="Lower lift"
+                    icon={<ArrowDown />}
+                    className="h-8"
+                    disabled={!running || !liftState}
+                    onHold={(held) => {
+                      lift.current = held ? -1 : 0
+                      pushHold()
+                    }}
+                  />
+                </div>
               </div>
             </Card>
 
             <RobotStatus state={live} />
-          </div>
+          </aside>
         </div>
       </main>
     </div>

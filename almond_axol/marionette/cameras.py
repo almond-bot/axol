@@ -4,9 +4,10 @@ The phone screen declares three streams (``head``, ``left``, ``right``) and
 each phone picks a view of them. :class:`CameraHub` grabs only the streams
 someone is watching (a phone's view or the desktop page), downscales each to
 ``width`` and JPEG-encodes it at ``quality``, ``fps`` times a second. The
-gateway client and the desktop WebSocket both read the newest encoded frame
-of a stream with :meth:`CameraHub.latest`, so each frame is compressed once
-however many clients watch it.
+desktop page's large view asks for its stream at ``large_width`` as well.
+The gateway client and the desktop WebSocket both read the newest encoded
+frame of a stream with :meth:`CameraHub.latest`, so each frame is
+compressed once per width however many clients watch it.
 
 Sources:
 
@@ -101,6 +102,7 @@ class EncodedFrame:
     jpeg: bytes
     captured_ms: float  # wall clock, milliseconds
     seq: int
+    width: int = 0  # the width asked for (frames are never upscaled)
 
 
 class CameraHub:
@@ -112,6 +114,7 @@ class CameraHub:
         *,
         fps: float = 12.0,
         width: int = 640,
+        large_width: int = 1280,
         quality: int = 60,
         error: str | None = None,
     ) -> None:
@@ -119,10 +122,12 @@ class CameraHub:
         self._error = error
         self.fps = max(1.0, float(fps))
         self.width = max(64, int(width))
+        self.large_width = max(self.width, int(large_width))
         self.quality = min(max(int(quality), 10), 95)
         self._lock = threading.Lock()
-        self._demand: dict[str, tuple[frozenset[str], float]] = {}
-        self._frames: dict[str, EncodedFrame] = {}
+        # Watcher -> (streams, width, last renewal).
+        self._demand: dict[str, tuple[frozenset[str], int, float]] = {}
+        self._frames: dict[tuple[str, int], EncodedFrame] = {}
         self._seq = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -132,30 +137,41 @@ class CameraHub:
 
     # -- demand --------------------------------------------------------------
 
-    def want(self, watcher: str, streams: Iterable[str]) -> None:
-        """``watcher`` wants these streams; renew within DEMAND_TTL_S."""
+    def want(
+        self, watcher: str, streams: Iterable[str], width: int | None = None
+    ) -> None:
+        """``watcher`` wants these streams, ``width`` wide (default: the
+        hub's ``width``); renew within DEMAND_TTL_S. A watcher wanting two
+        widths registers as two watchers."""
         wanted = frozenset(s for s in streams if s in STREAMS)
+        size = self.width if width is None else max(64, int(width))
         with self._lock:
-            self._demand[watcher] = (wanted, time.monotonic())
+            self._demand[watcher] = (wanted, size, time.monotonic())
 
     def drop(self, watcher: str) -> None:
         with self._lock:
             self._demand.pop(watcher, None)
 
-    def wanted(self) -> set[str]:
+    def wanted(self) -> dict[int, set[str]]:
+        """The streams wanted at each width."""
         now = time.monotonic()
+        widths: dict[int, set[str]] = {}
         with self._lock:
-            for key, (_, at) in list(self._demand.items()):
+            for key, (streams, width, at) in list(self._demand.items()):
                 if now - at > DEMAND_TTL_S:
                     del self._demand[key]
-            return set().union(*(s for s, _ in self._demand.values()))
+                elif streams:
+                    widths.setdefault(width, set()).update(streams)
+        return widths
 
     # -- frames --------------------------------------------------------------
 
-    def latest(self, stream: str) -> EncodedFrame | None:
-        """The newest frame of a stream; None once it is older than STALE_S."""
+    def latest(self, stream: str, width: int | None = None) -> EncodedFrame | None:
+        """The newest frame of a stream at a width (default: the hub's
+        ``width``); None once it is older than STALE_S."""
+        key = (stream, self.width if width is None else int(width))
         with self._lock:
-            frame = self._frames.get(stream)
+            frame = self._frames.get(key)
         if frame is None or time.time() * 1000.0 - frame.captured_ms > STALE_S * 1000:
             return None
         return frame
@@ -165,12 +181,14 @@ class CameraHub:
         now = time.time() * 1000.0
         with self._lock:
             since = dict(self._watched_since)
-            frames = dict(self._frames)
+            newest: dict[str, float] = {}
+            for (stream, _), frame in self._frames.items():
+                newest[stream] = max(newest.get(stream, 0.0), frame.captured_ms)
         late = now - STALE_S * 1000
         return [
             s
             for s, at in sorted(since.items())
-            if at < late and (s not in frames or frames[s].captured_ms < late)
+            if at < late and newest.get(s, 0.0) < late
         ]
 
     @property
@@ -237,15 +255,21 @@ class CameraHub:
         try:
             while not self._stop.is_set():
                 started = time.monotonic()
-                wanted = self.wanted() & set(source.available)
+                available = set(source.available)
+                widths = {
+                    width: streams & available
+                    for width, streams in self.wanted().items()
+                    if streams & available
+                }
                 with self._lock:
                     now_ms = time.time() * 1000.0
                     self._watched_since = {
-                        s: self._watched_since.get(s, now_ms) for s in wanted
+                        s: self._watched_since.get(s, now_ms)
+                        for s in set().union(*widths.values())
                     }
-                if wanted:
+                for width, streams in sorted(widths.items()):
                     try:
-                        frames = source.grab(sorted(wanted), self.width, self.quality)
+                        frames = source.grab(sorted(streams), width, self.quality)
                         self._failure = None
                     except Exception as exc:  # noqa: BLE001 - keep trying
                         _logger.debug("marionette: camera grab failed", exc_info=True)
@@ -255,8 +279,8 @@ class CameraHub:
                     with self._lock:
                         for stream, jpeg in frames.items():
                             self._seq += 1
-                            self._frames[stream] = EncodedFrame(
-                                stream, jpeg, captured, self._seq
+                            self._frames[(stream, width)] = EncodedFrame(
+                                stream, jpeg, captured, self._seq, width
                             )
                 self._stop.wait(max(0.0, period - (time.monotonic() - started)))
         finally:

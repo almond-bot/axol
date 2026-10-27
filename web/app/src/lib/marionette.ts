@@ -34,7 +34,9 @@ export interface MarionettePhone {
   arm: JogArm
   /** The camera view picked on the phone. */
   view: string
-  /** Motion scale, phone to gripper. */
+  /** The frame its arm moves in: Axol's (`axol`), or a camera's. */
+  frame: MarionetteFrame
+  /** Motion scale, phone to gripper, for moves and turns. */
   scale: number
   /** Drive speed, 0 to 1. */
   speed: number
@@ -81,7 +83,7 @@ export interface MarionetteState {
 /** Where Axol reaches the gateway when nothing else is entered. */
 export const DEFAULT_GATEWAY = "localhost:8787"
 export const GATEWAY_STORAGE_KEY = "axolMarionetteGateway"
-export const CAMERA_STORAGE_KEY = "axolMarionetteCameras"
+export const MAIN_VIEW_STORAGE_KEY = "axolMarionetteMainView"
 /** Camera frames per second the page asks for. */
 export const CAMERA_FPS = 10
 
@@ -109,22 +111,39 @@ export function cameraNoun(stream: CameraStream): string {
   return `${cameraLabel(stream).toLowerCase()} camera`
 }
 
-/** The panes to show from what the page stored: every camera unless a valid choice was kept. */
-export function parseCameraChoice(raw: string | null): CameraStream[] {
-  if (raw == null) return CAMERA_STREAMS.map((s) => s.id)
-  try {
-    const value: unknown = JSON.parse(raw)
-    if (!Array.isArray(value)) return CAMERA_STREAMS.map((s) => s.id)
-    return CAMERA_STREAMS.map((s) => s.id).filter((id) => value.includes(id))
-  } catch {
-    return CAMERA_STREAMS.map((s) => s.id)
-  }
+/** The frame a phone moves its arm in: Axol's own, or a camera's. */
+export type MarionetteFrame = "axol" | CameraStream
+
+/** "Axol frame", "Left wrist frame". */
+export function frameLabel(frame: string): string {
+  return `${isCameraStream(frame) ? cameraLabel(frame) : "Axol"} frame`
 }
 
-/** Path of the camera socket for some streams, in a fixed order. */
-export function cameraSocketPath(streams: readonly CameraStream[], fps = CAMERA_FPS): string {
+/** What the page can show large: a camera or the 3D view of the robot. */
+export type MarionetteView = CameraStream | "robot"
+
+export const MARIONETTE_VIEWS: readonly { id: MarionetteView; label: string }[] = [
+  ...CAMERA_STREAMS,
+  { id: "robot", label: "3D view" },
+]
+
+/** The large view the page stored; the head camera if none was kept. */
+export function parseMainView(raw: string | null): MarionetteView {
+  return MARIONETTE_VIEWS.find((view) => view.id === raw)?.id ?? "head"
+}
+
+/**
+ * Path of the camera socket for some streams, in a fixed order. The
+ * `large` one comes sharper, for the page's large view; the page changes
+ * it later by sending `{"large": stream}`.
+ */
+export function cameraSocketPath(
+  streams: readonly CameraStream[],
+  large: CameraStream | null = null,
+  fps = CAMERA_FPS
+): string {
   const ids = CAMERA_STREAMS.map((s) => s.id).filter((id) => streams.includes(id))
-  return `/api/marionette/cameras?streams=${ids.join(",")}&fps=${fps}`
+  return `/api/marionette/cameras?streams=${ids.join(",")}&large=${large ?? ""}&fps=${fps}`
 }
 
 /**

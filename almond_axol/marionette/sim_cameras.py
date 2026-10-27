@@ -24,13 +24,14 @@ from typing import Any
 
 import numpy as np
 
+from ..constants import CAMERA_OPTICAL_LINKS
+
 _logger = logging.getLogger(__name__)
 
 # Stream -> (URDF optical frame link, vertical field of view in degrees).
 _CAMERAS = {
-    "head": ("head_camera_left_optical", 70.0),
-    "left": ("left_wrist_camera_optical", 65.0),
-    "right": ("right_wrist_camera_optical", 65.0),
+    stream: (CAMERA_OPTICAL_LINKS[stream], fovy)
+    for stream, fovy in (("head", 70.0), ("left", 65.0), ("right", 65.0))
 }
 # Table in front of the robot: centre x, half sizes and its top above the floor.
 _TABLE_X, _TABLE_HALF, _TABLE_TOP = 0.6, (0.22, 0.45), 0.72

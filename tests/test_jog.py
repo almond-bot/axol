@@ -192,6 +192,33 @@ def _best_time(fn: Any, repeat: int = 7) -> float:
     return min(times)
 
 
+def test_camera_frames_match_the_urdf(kinematics: Any) -> None:
+    import yourdfpy
+
+    from almond_axol.constants import CAMERA_OPTICAL_LINKS, urdf_path
+    from almond_axol.kinematics.arm_ik import ArmKinematics
+
+    urdf = yourdfpy.URDF.load(
+        str(urdf_path(kinematics.robot_model, gripper="parallel"))
+    )
+    assert kinematics.cameras == ("head", "left", "right")
+    rng = np.random.default_rng(3)
+    for q in (rest_q(), rest_q() + rng.uniform(-0.6, 0.6, 14)):
+        urdf.update_cfg(
+            {
+                **{n: 0.0 for n in urdf.actuated_joint_names},
+                **{n: float(v) for n, v in zip(kinematics.joint_names, q, strict=True)},
+            }
+        )
+        for stream, link in CAMERA_OPTICAL_LINKS.items():
+            expected = urdf.get_transform(link, urdf.base_link)
+            position, rotation = kinematics.camera(q, stream)
+            np.testing.assert_allclose(position, expected[:3, 3], atol=1e-6)
+            np.testing.assert_allclose(rotation, expected[:3, :3], atol=1e-6)
+    # The classic Axol mounts no cameras.
+    assert ArmKinematics("classic", collision=False).camera(rest_q(), "head") is None
+
+
 def test_ik_reaches_a_reachable_target_within_two_mm(planner: Any) -> None:
     q = rest_q()
     left, right = planner.tips(q)

@@ -7,12 +7,13 @@ import {
   desktopHold,
   driveKeyOf,
   isCameraStream,
+  frameLabel,
   isTextEntry,
   keyAxes,
-  parseCameraChoice,
   parseCameraFrame,
   parseCameraInfo,
   phoneActivity,
+  parseMainView,
   phoneConnectHint,
   setMarionetteStop,
   type DriveKey,
@@ -154,20 +155,25 @@ describe("camera streams", () => {
     expect(isCameraStream("wrists")).toBe(false)
   })
 
-  it("shows every camera unless a valid choice was stored", () => {
-    expect(parseCameraChoice(null)).toEqual(["head", "left", "right"])
-    expect(parseCameraChoice("not json")).toEqual(["head", "left", "right"])
-    expect(parseCameraChoice('{"head":true}')).toEqual(["head", "left", "right"])
-    expect(parseCameraChoice('["right","bogus","head"]')).toEqual(["head", "right"])
-    expect(parseCameraChoice("[]")).toEqual([])
+  it("shows the head camera large unless another view was stored", () => {
+    expect(parseMainView(null)).toBe("head")
+    expect(parseMainView("bogus")).toBe("head")
+    expect(parseMainView("left")).toBe("left")
+    expect(parseMainView("robot")).toBe("robot")
   })
 
-  it("asks the socket for the chosen streams in a fixed order", () => {
+  it("names the frame a phone moves in", () => {
+    expect(frameLabel("axol")).toBe("Axol frame")
+    expect(frameLabel("left")).toBe("Left wrist frame")
+    expect(frameLabel("bogus")).toBe("Axol frame")
+  })
+
+  it("asks the socket for the streams in a fixed order, one of them large", () => {
     expect(cameraSocketPath(["right", "head"])).toBe(
-      "/api/marionette/cameras?streams=head,right&fps=10"
+      "/api/marionette/cameras?streams=head,right&large=&fps=10"
     )
-    expect(cameraSocketPath(["head", "left", "right"], 5)).toBe(
-      "/api/marionette/cameras?streams=head,left,right&fps=5"
+    expect(cameraSocketPath(["head", "left", "right"], "left", 5)).toBe(
+      "/api/marionette/cameras?streams=head,left,right&large=left&fps=5"
     )
   })
 })
@@ -223,6 +229,7 @@ describe("phoneActivity", () => {
     calibration: "captured",
     arm: "left",
     view: "all",
+    frame: "axol",
     scale: 1,
     speed: 0.5,
     deadman: false,

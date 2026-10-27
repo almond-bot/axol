@@ -12,12 +12,13 @@ sends these actions:
 - Hold buttons, repeated every 200 ms while held: ``teleop.deadman`` (the
   hold-to-move pad), ``base.turnLeft`` / ``base.turnRight`` and ``lift.up``
   / ``lift.down``.
-- ``safety.estop``: Stop, a toggle. ``arm.select`` (``left`` / ``right``)
-  and ``camera.view``: values.
+- ``safety.estop``: Stop, a toggle. ``arm.select`` (``left`` / ``right``),
+  ``camera.view`` and ``teleop.frame`` (Frame: ``axol``, or a camera's
+  frame: ``head``, ``left`` or ``right``): values.
 - ``arm.resetLeft`` / ``arm.resetRight``: plain buttons in the More sheet
   that send an arm back to its rest pose.
-- Live sliders, streamed while dragged: ``teleop.translationScale``,
-  ``base.speedLimit`` (0 to 100 %) and ``gripper.set`` (how far the gripper
+- Live sliders, streamed while dragged: ``teleop.translationScale`` (the
+  motion scale, for moves and turns alike), ``base.speedLimit`` (0 to 100 %) and ``gripper.set`` (how far the gripper
   should be closed, 0 open to 1 closed).
 - ``base.drive``: the drive stick, ``{"x": forward, "y": left}`` within the
   unit circle. It streams ``live`` samples while touched (repeated every
@@ -42,6 +43,8 @@ DEADMAN = "teleop.deadman"
 ESTOP = "safety.estop"
 ARM = "arm.select"
 VIEW = "camera.view"
+FRAME = "teleop.frame"
+FRAMES = ("axol", "head", "left", "right")
 SCALE = "teleop.translationScale"
 SPEED_LIMIT = "base.speedLimit"
 GRIP = "gripper.set"
@@ -144,6 +147,12 @@ class Phone:
     @property
     def stop(self) -> bool:
         return self.values.get(ESTOP) is True
+
+    @property
+    def frame(self) -> str:
+        """Frame: ``axol``, or the camera whose frame the arm moves in."""
+        value = self.values.get(FRAME)
+        return value if value in FRAMES else "axol"
 
     @property
     def scale(self) -> float:
@@ -427,6 +436,8 @@ class PhoneTracker:
             phone.values[ESTOP] = value
         elif action == ARM and value in ("left", "right"):
             phone.values[ARM] = value
+        elif action == FRAME and value in FRAMES:
+            phone.values[FRAME] = value
         elif action in (SCALE, SPEED_LIMIT):
             # Live slider samples; the gateway's config only follows a drag's
             # start and end.
