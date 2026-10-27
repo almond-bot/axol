@@ -28,7 +28,6 @@ from almond_axol.marionette.cameras import (
     encode_jpeg,
     streams_for_view,
 )
-from almond_axol.marionette.pairing import PairingError, parse_pairing
 from almond_axol.marionette.session import (
     DUPLICATE,
     SCREEN,
@@ -1285,20 +1284,6 @@ class MarionetteApiTest(unittest.TestCase):
             away.json()["error"], "Can't reach the gateway at 127.0.0.1:1."
         )
         self.assertEqual(typo.status_code, 502)
-
-    def test_pairing_details_must_be_an_svg_of_a_pairing_link(self) -> None:
-        good = {
-            "url": "marionette://pair?v=1&host=10.1.10.220&port=8787",
-            "qrSvg": "<svg></svg>",
-        }
-        self.assertEqual(parse_pairing(good)["code"], None)
-        for bad in (
-            None,
-            {**good, "qrSvg": "<script>alert(1)</script>"},
-            {**good, "url": "https://example.com"},
-        ):
-            with self.assertRaises(PairingError):
-                parse_pairing(bad)
 
 
 class RobotLinkTest(unittest.TestCase):

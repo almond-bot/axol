@@ -252,7 +252,7 @@ requires-dist = [
     { name = "jaxlie", specifier = ">=1.5.0,<2" },
     { name = "jsonlines", marker = "extra == 'lerobot'", specifier = ">=4,<5" },
     { name = "lerobot", extras = ["viz", "async", "diffusion", "av-dep", "accelerate-dep"], marker = "extra == 'lerobot'", specifier = "==0.6.1" },
-    { name = "marionette-sdk", extras = ["video", "gateway"], marker = "extra == 'marionette'", git = "https://github.com/theinstancelabs/marionette?subdirectory=sdk%2Fpython&rev=859f67c24f88f96d68d454584144e18d1f931dca" },
+    { name = "marionette-sdk", extras = ["video", "gateway"], marker = "extra == 'marionette'", git = "https://github.com/theinstancelabs/marionette?subdirectory=sdk%2Fpython&rev=0ba6b86fea9d37e87a35d0a57cc56905e52e69e5" },
     { name = "mink", specifier = "==1.2.0" },
     { name = "mujoco", specifier = "==3.11.0" },
     { name = "numpy", specifier = ">=2.2.6,<2.3" },
@@ -1977,8 +1977,8 @@ wheels = [
 
 [[package]]
 name = "marionette-sdk"
-version = "0.1.0"
-source = { git = "https://github.com/theinstancelabs/marionette?subdirectory=sdk%2Fpython&rev=859f67c24f88f96d68d454584144e18d1f931dca#859f67c24f88f96d68d454584144e18d1f931dca" }
+version = "0.1.1"
+source = { git = "https://github.com/theinstancelabs/marionette?subdirectory=sdk%2Fpython&rev=0ba6b86fea9d37e87a35d0a57cc56905e52e69e5#0ba6b86fea9d37e87a35d0a57cc56905e52e69e5" }
 dependencies = [
     { name = "numpy" },
     { name = "websockets" },

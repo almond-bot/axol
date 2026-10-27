@@ -3200,12 +3200,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         Read here, not by the browser: the gateway lets its own computer in
         without the code, and Axol's server usually runs there.
         """
-        from ..marionette.pairing import PairingError, fetch_pairing
+        try:
+            from marionette import PairingError, fetch_pairing
+        except ImportError:  # no marionette extra
+            return JSONResponse(
+                {"error": "Marionette isn't installed on the Axol computer."},
+                status_code=502,
+            )
 
         try:
-            return await asyncio.to_thread(fetch_pairing, gateway)
+            pairing = await asyncio.to_thread(fetch_pairing, gateway)
         except PairingError as exc:
             return JSONResponse({"error": str(exc)}, status_code=502)
+        return pairing.to_json()
 
     @app.websocket("/api/marionette/cameras")
     async def marionette_cameras(ws: WebSocket) -> None:
