@@ -238,6 +238,7 @@ describe("phoneActivity", () => {
     limited: false,
     grip: 0,
     reason: null,
+    resetting: false,
   })
 
   it("says what the phone is doing, most important first", () => {

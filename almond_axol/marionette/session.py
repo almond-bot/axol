@@ -19,6 +19,11 @@ stop) whose arms follow phones instead of jog buttons:
 - Stop on any phone, or on the desktop page, holds the arms and stops the
   base and lift until every Stop is off; each pad must then be pressed
   again.
+- A reset (a phone's More sheet, or the desktop page) sends one arm back
+  to its rest pose along a collision-aware joint path, which undoes a
+  wound-up or flipped joint configuration that IK steps alone would keep.
+  It starts only while no arm is being moved, both arms ignore their pads
+  until it ends, and Stop halts it where it is.
 - Robot feedback goes back to each phone's screen (5 Hz), and the camera
   streams the phones are watching go to the gateway as JPEG frames.
 """
@@ -32,6 +37,7 @@ import math
 import secrets
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -53,6 +59,16 @@ GRIP_RATE = 2.5
 NOTE_S = 5.0
 FEEDBACK_PERIOD_S = 0.2
 DESKTOP = "Desktop"
+
+
+@dataclass
+class _Reset:
+    """One arm on its way back to rest."""
+
+    side: str
+    by: str  # who asked: a phone's name or the desktop
+    path: list[np.ndarray] | None = None  # (14,) waypoints, once planned
+    step: int = 0
 
 
 class MarionetteSession(JogSession):
@@ -98,6 +114,13 @@ class MarionetteSession(JogSession):
         self._stop_by: str | None = None
         self._notes: dict[str, tuple[str, float]] = {}
         self._view_lock = threading.Lock()
+        # Resets asked for and not yet taken up by the loop: (arm, phone id,
+        # or None for the desktop page). The reset running, its planning
+        # task, and each phone's reset presses already seen.
+        self._reset_requests: list[tuple[str, str | None]] = []
+        self._reset: _Reset | None = None
+        self._reset_task: asyncio.Task[None] | None = None
+        self._resets_seen: dict[str, dict[str, int]] = {}
 
     # -- requests from the serve app ---------------------------------------
 
@@ -121,6 +144,20 @@ class MarionetteSession(JogSession):
 
     def execute(self, *_: Any, **__: Any) -> dict[str, Any]:
         raise JogError("Planned moves are not available while Marionette is running.")
+
+    def reset_arm(self, side: str) -> dict[str, Any]:
+        """The desktop page's Reset arm: send ``side`` back to rest."""
+        if side not in SIDES:
+            raise JogError("Choose the left or right arm.")
+        if not self._backend.has_arms:
+            raise JogError("The arms are not connected.")
+        # Refuse what can be refused now; the loop checks again as it starts.
+        reason = self._reset_refusal(side, self._tracker.snapshot(), DESKTOP)
+        if reason is not None:
+            raise JogError(reason)
+        with self._lock:
+            self._reset_requests.append((side, None))
+        return {"arm": side}
 
     def set_stop(self, on: bool) -> dict[str, Any]:
         """The desktop page's Stop."""
@@ -248,6 +285,8 @@ class MarionetteSession(JogSession):
         try:
             await super().run(stop_event)
         finally:
+            if self._reset_task is not None:
+                tasks.append(self._reset_task)
             for task in tasks:
                 task.cancel()
             for task in tasks:
@@ -278,6 +317,7 @@ class MarionetteSession(JogSession):
         kin = None if planner is None else planner.kinematics
         if kin is not None:
             kin.set_lift(self._lift_raised())
+        command = self._step_reset(phones, command, stop_by)
         arm_owners = owners(phones.values(), {s: self._teleop[s].owner for s in SIDES})
         for i, side in enumerate(SIDES):
             command = self._step_arm(side, phones, kin, command, stop_by, now, dt)
@@ -366,6 +406,11 @@ class MarionetteSession(JogSession):
                     if self._planner_error
                     else "The arm controller is still starting. Try again in a moment."
                 )
+            elif self._reset is not None:
+                reason = (
+                    f"Wait for the {self._reset.side} arm to reach rest, "
+                    "then press again."
+                )
             else:
                 reason = self._gate(phone, now)
             if reason is not None:
@@ -384,6 +429,133 @@ class MarionetteSession(JogSession):
             command = result.q
             arm.note_tip(kin.tip(command, side), now)
         return command
+
+    # -- resets ----------------------------------------------------------------
+
+    def _reset_refusal(
+        self, side: str, phones: dict[str, Phone], by: str
+    ) -> str | None:
+        """Why ``side`` can't go back to rest now, or None."""
+        from ..jog.backends import rest_q
+        from ..jog.session import PARK_TOLERANCE_RAD
+
+        stop_by = self._stop_by
+        if stop_by is not None:
+            return "Stop is on." if stop_by == by else f"Stopped by {stop_by}."
+        reset = self._reset
+        if reset is not None:
+            return f"The {reset.side} arm is returning to rest."
+        planner = self._planner
+        if planner is None:
+            return (
+                self._planner_error
+                or "The arm controller is still starting. Try again in a moment."
+            )
+        for other in SIDES:
+            arm = self._teleop[other]
+            if arm.engaged:
+                owner = phones.get(arm.owner or "")
+                name = owner.name if owner is not None else "A phone"
+                return f"{name} is moving the {other} arm. Wait for it to let go."
+        with self._lock:
+            command = None if self._command is None else self._command.copy()
+        if command is None:
+            return "The arms are still starting."
+        own = planner.indices(side)
+        if float(np.max(np.abs(command[own] - rest_q()[own]))) <= PARK_TOLERANCE_RAD:
+            return f"The {side} arm is already at rest."
+        return None
+
+    def _reset_presses(self, phones: dict[str, Phone]) -> list[tuple[str, str]]:
+        """New reset presses: ``(arm, phone id)``. Each counts once, and
+        presses made before the session first saw the phone don't count."""
+        pressed: list[tuple[str, str]] = []
+        for phone in phones.values():
+            seen = self._resets_seen.get(phone.id)
+            self._resets_seen[phone.id] = dict(phone.resets)
+            if seen is None or not phone.connected:
+                continue
+            for side in SIDES:
+                if phone.resets[side] > seen.get(side, 0):
+                    pressed.append((side, phone.id))
+        return pressed
+
+    def _step_reset(
+        self, phones: dict[str, Phone], command: np.ndarray, stop_by: str | None
+    ) -> np.ndarray:
+        """Take up reset requests and move a reset on by one waypoint.
+
+        Returns the arm command. Stop ends a reset where the arm is.
+        """
+        with self._lock:
+            requests, self._reset_requests = self._reset_requests, []
+        for side, phone_id in requests + self._reset_presses(phones):
+            phone = phones.get(phone_id or "")
+            if phone_id is not None and phone is None:
+                continue
+            by = DESKTOP if phone is None else phone.name
+            reason = self._reset_refusal(side, phones, by)
+            if reason is not None:
+                if phone is not None:
+                    self._link.send_status(phone.id, "axol.notice", {}, reason)
+                _logger.info("marionette: %s arm reset refused (%s)", side, reason)
+                continue
+            self._reset = _Reset(side, by)
+            self._reset_task = asyncio.create_task(
+                self._plan_reset(self._reset, command.copy())
+            )
+            _logger.info("marionette: %s returning the %s arm to rest", by, side)
+        reset, planner = self._reset, self._planner
+        if reset is None or planner is None:
+            return command
+        if stop_by is not None:
+            self._reset = None
+            _logger.info(
+                "marionette: %s arm reset halted by Stop (%s)", reset.side, stop_by
+            )
+            return command
+        if reset.path is None:
+            return command  # still planning: both arms hold
+        if reset.step >= len(reset.path):
+            self._reset = None
+            _logger.info("marionette: %s arm is at rest", reset.side)
+            return command
+        own = planner.indices(reset.side)
+        command = command.copy()
+        command[own] = reset.path[reset.step][own]
+        reset.step += 1
+        return command
+
+    async def _plan_reset(self, reset: _Reset, command: np.ndarray) -> None:
+        """Plan ``reset``'s path off the control loop, as the park on stop
+        does; the loop then plays it."""
+        from ..jog.backends import rest_q
+        from ..teleop.config import VRTeleopConfig
+
+        planner = self._planner
+        assert planner is not None
+        own = planner.indices(reset.side)
+        goal = command.copy()
+        goal[own] = rest_q()[own]
+        config = VRTeleopConfig()
+        try:
+            path = await asyncio.to_thread(
+                planner.joint_trajectory,
+                command,
+                goal,
+                speed=config.reset_speed,
+                rate=self._rate,
+                min_duration=config.reset_min_duration,
+            )
+        except Exception:  # noqa: BLE001 - the arm stays put; the log says why
+            _logger.exception(
+                "marionette: planning the %s arm reset failed", reset.side
+            )
+            if self._reset is reset:
+                self._reset = None
+            return
+        if self._reset is reset:  # not halted meanwhile
+            reset.path = path
 
     def _gate(self, phone: Phone, now: float) -> str | None:
         return gate_reason(
@@ -497,6 +669,7 @@ class MarionetteSession(JogSession):
             "driving": driver == f"phone:{phone.id}",
             "driver": self._driver_name(driver, phones),
             "stopBy": stop_by or "",
+            "resetting": "" if self._reset is None else self._reset.side,
             "streams": ",".join(cameras.available) if cameras is not None else "",
         }
 
@@ -547,6 +720,7 @@ class MarionetteSession(JogSession):
         with self._lock:
             driver = self._driver()
         stop_by = self._stop_by
+        reset = self._reset
         arms: dict[str, Any] = {}
         for i, side in enumerate(SIDES):
             arm = self._teleop[side]
@@ -559,6 +733,7 @@ class MarionetteSession(JogSession):
                 "limited": bool(arm.engaged and arm.limited),
                 "grip": round(1.0 - float(self._grip[i]), 3),
                 "reason": None if arm.engaged or not reason else reason,
+                "resetting": reset is not None and reset.side == side,
             }
         state["marionette"] = {
             "gateway": {

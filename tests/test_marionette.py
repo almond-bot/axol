@@ -240,6 +240,12 @@ class PhoneTrackerTest(unittest.TestCase):
         self.assertAlmostEqual(self.phone().speed, 0.8)
         self.assertAlmostEqual(self.phone().scale, 0.5)
 
+    def test_reset_presses_are_counted_per_arm(self) -> None:
+        self.input("arm.resetLeft")
+        self.input("arm.resetRight")
+        self.input("arm.resetRight")
+        self.assertEqual(self.phone().resets, {"left": 1, "right": 2})
+
     def test_drive_stick_turn_and_lift(self) -> None:
         phone = self.phone()
         self.assertEqual(phone.base_command(self.now, 0.25, 0.6), (0.0, 0.0, 0.0, 0))
@@ -293,6 +299,7 @@ class PhoneTrackerTest(unittest.TestCase):
             ("base.drive", {"x": 1, "y": 0}),
             ("gripper.set", 1.0),
             ("base.turnLeft", True),
+            ("arm.resetLeft", None),
         ):
             robot.apply(
                 {
@@ -308,6 +315,7 @@ class PhoneTrackerTest(unittest.TestCase):
         self.assertFalse(phone.deadman_down)
         self.assertIsNone(phone.grip)
         self.assertEqual(phone.base_command(self.now, 0.25, 0.6), (0.0, 0.0, 0.0, 0))
+        self.assertEqual(phone.resets, {"left": 0, "right": 0})
         robot.apply(
             {
                 "type": "input",
@@ -1073,6 +1081,82 @@ class MarionetteSessionTest(unittest.TestCase):
             all(isinstance(v, (str, float, int, bool)) for v in values.values())
         )
 
+    def left_off_rest(self) -> float:
+        from almond_axol.jog.backends import rest_q
+
+        return float(np.max(np.abs(self.session.current_q()[:7] - rest_q()[:7])))
+
+    def move_left_away(self, phone: FakePhone) -> None:
+        phone.press()
+        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        phone.glide([0.08, 0.06, 0.08])
+        time.sleep(0.3)
+        phone.release()
+        self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
+        self.assertGreater(self.left_off_rest(), 0.05)
+
+    def notices(self, pid: str) -> list[str]:
+        return [s[3] for s in self.sent if s[0] == pid and s[1] == "axol.notice"]
+
+    def test_a_reset_returns_the_arm_to_rest(self) -> None:
+        with self.assertRaisesRegex(JogError, "already at rest"):
+            self.session.reset_arm("left")
+        phone = self.phone()
+        self.move_left_away(phone)
+        right = self.session.current_q()[7:].copy()
+        phone.act("arm.resetLeft")
+        self.assertTrue(_wait(lambda: self.arm_state()["resetting"]))
+        feedback = self.session._feedback(
+            self.session._tracker.snapshot()["phone-1"],
+            self.session._tracker.snapshot(),
+            time.monotonic(),
+        )
+        self.assertEqual(feedback["resetting"], "left")
+        # Both arms ignore their pads until it ends.
+        phone.press()
+        time.sleep(0.2)
+        self.assertFalse(self.arm_state()["engaged"])
+        self.assertTrue(self.arm_state()["resetting"])
+        self.assertTrue(_wait(lambda: not self.arm_state()["resetting"], 10))
+        self.assertLess(self.left_off_rest(), 1e-4)
+        np.testing.assert_allclose(self.session.current_q()[7:], right, atol=1e-6)
+        self.assertIn("reach rest", self.arm_state()["reason"])
+        phone.release()
+        phone.press()
+        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+
+    def test_a_reset_waits_for_the_arms_and_stop_halts_it(self) -> None:
+        phone = self.phone()
+        self.move_left_away(phone)
+        phone.press()
+        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        phone.act("arm.resetLeft")
+        self.assertTrue(
+            _wait(
+                lambda: any("moving the left arm" in n for n in self.notices("phone-1"))
+            )
+        )
+        with self.assertRaisesRegex(JogError, "Phone 1 is moving the left arm"):
+            self.session.reset_arm("left")
+        phone.release()
+        self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
+        self.session.reset_arm("left")
+        self.assertTrue(_wait(lambda: self.arm_state()["resetting"]))
+        with self.assertRaisesRegex(JogError, "returning to rest"):
+            self.session.reset_arm("right")
+        time.sleep(0.3)
+        self.session.set_stop(True)
+        self.assertTrue(_wait(lambda: not self.arm_state()["resetting"]))
+        held = self.session.current_q().copy()
+        self.assertGreater(self.left_off_rest(), 0.01)  # halted on the way
+        with self.assertRaisesRegex(JogError, "Stop is on"):
+            self.session.reset_arm("left")
+        phone.act("arm.resetLeft")
+        self.assertTrue(_wait(lambda: "Stopped by Desktop." in self.notices("phone-1")))
+        self.session.set_stop(False)
+        time.sleep(0.3)
+        np.testing.assert_allclose(self.session.current_q(), held, atol=1e-6)
+
     def test_planned_moves_are_refused(self) -> None:
         with self.assertRaises(JogError):
             self.session.plan("left", [0.3, 0.2, 0.1], [0, 0, 0, 1])
@@ -1116,6 +1200,33 @@ class MarionetteApiTest(unittest.TestCase):
             response = client.post("/api/marionette/stop", json={"on": True})
         self.assertEqual(response.json(), {"on": True, "by": "Desktop"})
         self.assertEqual(stub.calls, [True])
+
+    def test_reset_route(self) -> None:
+        with _client() as client:
+            response = client.post("/api/marionette/reset", json={"arm": "left"})
+        self.assertEqual(response.status_code, 409)
+
+        class Stub(MarionetteSession):
+            def __init__(self) -> None:  # noqa: D107 - a bare stand-in
+                self.calls: list[str] = []
+
+            def reset_arm(self, side: str) -> dict[str, Any]:
+                self.calls.append(side)
+                if side != "left":
+                    raise JogError("The right arm is already at rest.")
+                return {"arm": side}
+
+        stub = Stub()
+        with (
+            patch("almond_axol.jog.session.active_session", lambda: stub),
+            _client() as client,
+        ):
+            ok = client.post("/api/marionette/reset", json={"arm": "left"})
+            refused = client.post("/api/marionette/reset", json={"arm": "right"})
+        self.assertEqual(ok.json(), {"arm": "left"})
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(refused.json(), {"error": "The right arm is already at rest."})
+        self.assertEqual(stub.calls, ["left", "right"])
 
     def test_camera_socket_sends_watched_frames(self) -> None:
         hub = CameraHub(SyntheticCameraSource(), fps=30, width=160, quality=50)

@@ -3,7 +3,7 @@ title: "Marionette"
 description: "Drive Axol's arms, grippers, lift and Jelly from one or two iPhones running Marionette."
 ---
 
-Marionette turns an iPhone into a teleoperation controller. Each phone drives one arm and its gripper. Two phones drive both arms. A phone's **Drive** screen also drives Jelly and raises or lowers the lift.
+Marionette turns an iPhone into a teleoperation controller. Each phone drives one arm and its gripper. Two phones drive both arms. Each phone also drives Jelly and raises or lowers the lift.
 
 The control panel's **Marionette** page shows the robot in 3D, every phone and all three cameras. From the page you can drive Jelly and the lift with the keyboard.
 
@@ -50,19 +50,30 @@ It listens on port 8787 and serves the Axol phone screen. Note the computer's ad
 
 ## Phone controls
 
-The phone screen has two modes, **Arm** and **Drive**. **Left arm** / **Right arm**, the cameras and **Stop** show in both.
+The phone screen shows every control at once. Tap **More** for calibration and the arm resets.
 
 | Control | What it does |
 |---|---|
 | **Hold to move** | The arm follows the phone while you hold the pad. While holding, slide your thumb down to close the gripper and up to open it. |
 | **Open gripper** / **Close gripper** | Open or close the gripper fully. |
 | **Motion scale** | How far the gripper moves for each centimetre the phone moves. Start low. It is locked while you hold the pad. |
-| Drive stick | In **Drive**, push the stick to drive Jelly. Jelly stops when you let go. |
+| Drive stick | Push the stick to drive Jelly. Jelly stops when you let go. |
 | **Turn left** / **Turn right** | Turn Jelly while held. |
 | **Raise lift** / **Lower lift** | Move the lift while held. |
 | **Speed limit** | Top speed for driving and turning. |
 | Camera views | Show the head camera, either wrist camera, both wrists or all three. |
+| **Reset left arm** / **Reset right arm** | In **More**. Moves the arm back to its rest pose. See [Reset an arm](#reset-an-arm). |
 | **Stop** | Stops the whole robot: both arms hold where they are, and Jelly and the lift stop. |
+
+## Reset an arm
+
+If an arm's joints end up twisted or folded awkwardly, send the arm back to its rest pose. On a phone, tap **More**, then **Reset left arm** or **Reset right arm**. On the **Marionette** page, press **Reset arm** under the arm in **Arms**.
+
+- The arm moves on its own for a few seconds, along a path that keeps it clear of the body and the other arm.
+- A reset starts only while no phone is moving an arm. Both arms ignore their pads until it ends.
+- **Stop** halts the arm where it is.
+
+When the arm reaches rest, press the pad again to carry on.
 
 ## Desktop keys
 
@@ -83,5 +94,6 @@ On the **Marionette** page, these keys drive Jelly and the lift:
 - **Stop** on any phone, or **Stop motion** on the page, stops the whole robot. After you turn every Stop off, press each pad again to carry on.
 - If a phone goes offline with **Stop** on, the robot stays stopped. Press **Clear Stop** on the page once it is safe.
 - If two phones pick the same arm, the phone that moved it last keeps it. The other phone shows which phone has it.
+- A reset moves an arm without a pad held. **Stop** halts it.
 - Jelly and the lift stop at once if the drive stick, a held button or the page stops sending.
 - Press **Stop Marionette** to end the session. The arms return to rest before their motors turn off.

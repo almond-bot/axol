@@ -18,6 +18,7 @@ import {
   RotateCcw,
   RotateCw,
   Square,
+  Undo2,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -51,6 +52,7 @@ import {
   isTextEntry,
   phoneActivity,
   phoneConnectHint,
+  resetMarionetteArm,
   setMarionetteStop,
   type DriveKey,
   type MarionetteArm,
@@ -204,19 +206,46 @@ function ArmRow({
   side,
   arm,
   phones,
+  canReset,
 }: {
   side: JogArm
   arm: MarionetteArm | null
   phones: MarionettePhone[]
+  /** Marionette runs, Stop is off and no arm is resetting. */
+  canReset: boolean
 }) {
   const owner = arm?.owner ? phones.find((p) => p.id === arm.owner) : undefined
   const closed = arm ? Math.max(0, Math.min(1, arm.grip)) : null
+  const [sending, setSending] = useState(false)
+  const [refusal, setRefusal] = useState<string | null>(null)
+  useEffect(() => {
+    if (!refusal) return
+    const timer = setTimeout(() => setRefusal(null), 6000)
+    return () => clearTimeout(timer)
+  }, [refusal])
+  const reset = async () => {
+    setSending(true)
+    setRefusal(null)
+    try {
+      await resetMarionetteArm(side)
+    } catch (reason) {
+      setRefusal(
+        reason instanceof TypeError
+          ? "Can't reach the Axol host."
+          : reason instanceof Error
+            ? reason.message
+            : String(reason)
+      )
+    } finally {
+      setSending(false)
+    }
+  }
   return (
     <div data-testid={`arm-${side}`} className="flex flex-col gap-2 py-3 first:pt-0 last:pb-0">
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium">{side === "left" ? "Left arm" : "Right arm"}</span>
-        <Chip tone={arm?.engaged ? "active" : "neutral"}>
-          {arm?.engaged ? "Following" : "Not following"}
+        <Chip tone={arm?.engaged || arm?.resetting ? "active" : "neutral"}>
+          {arm?.resetting ? "Returning to rest" : arm?.engaged ? "Following" : "Not following"}
         </Chip>
       </div>
       <div className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1 text-xs">
@@ -242,6 +271,22 @@ function ArmRow({
         </p>
       )}
       {arm?.reason && <p className="text-xs text-white/60">{arm.reason}</p>}
+      <Button
+        variant="outline"
+        size="sm"
+        className="self-start"
+        title={`Move the ${side} arm back to its rest pose.`}
+        disabled={!canReset || sending}
+        onClick={() => void reset()}
+      >
+        {sending ? <Loader2 className="animate-spin" /> : <Undo2 />}
+        Reset arm
+      </Button>
+      {refusal && (
+        <p className="text-xs text-amber-300" role="alert">
+          {refusal}
+        </p>
+      )}
     </div>
   )
 }
@@ -378,6 +423,8 @@ export default function Marionette() {
   const address = running
     ? marionette?.gateway.address || String(ownSession?.args?.gateway ?? "") || gateway
     : gateway
+  const canReset =
+    ready && !stop?.on && !ARMS.some((side) => arms?.[side]?.resetting) && Boolean(arms)
   // The view draws the robot only: no target, plan or arm markers.
   const viewState = useMemo(() => (live ? { ...live, tips: null } : null), [live])
 
@@ -729,10 +776,20 @@ export default function Marionette() {
             <Card data-testid="marionette-arms">
               <CardHeader>
                 <CardTitle>Arms</CardTitle>
+                <CardDescription>
+                  <strong className="text-white/80">Reset arm</strong> moves an arm back to its rest
+                  pose, which straightens out twisted joints. Stop halts it.
+                </CardDescription>
               </CardHeader>
               <div className="flex flex-col divide-y divide-white/10">
                 {ARMS.map((side) => (
-                  <ArmRow key={side} side={side} arm={arms?.[side] ?? null} phones={phones} />
+                  <ArmRow
+                    key={side}
+                    side={side}
+                    arm={arms?.[side] ?? null}
+                    phones={phones}
+                    canReset={canReset}
+                  />
                 ))}
               </div>
             </Card>

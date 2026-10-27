@@ -14,6 +14,8 @@ sends these actions:
   / ``lift.down``.
 - ``safety.estop``: Stop, a toggle. ``arm.select`` (``left`` / ``right``)
   and ``camera.view``: values.
+- ``arm.resetLeft`` / ``arm.resetRight``: plain buttons in the More sheet
+  that send an arm back to its rest pose.
 - Live sliders, streamed while dragged: ``teleop.translationScale``,
   ``base.speedLimit`` (0 to 100 %) and ``gripper.set`` (how far the gripper
   should be closed, 0 open to 1 closed).
@@ -49,6 +51,7 @@ TURN_RIGHT = "base.turnRight"
 LIFT_UP = "lift.up"
 LIFT_DOWN = "lift.down"
 HOLDS = (DEADMAN, TURN_LEFT, TURN_RIGHT, LIFT_UP, LIFT_DOWN)
+RESETS = {"arm.resetLeft": "left", "arm.resetRight": "right"}
 
 TRACKING_STATES = ("initializing", "normal", "limited", "relocalizing", "unavailable")
 
@@ -113,6 +116,8 @@ class Phone:
     stick: Stick = field(default_factory=Stick)
     grip: float | None = None  # requested closure, 0 open .. 1 closed
     grip_seq: int = 0
+    # Presses of each arm's reset button, counted like the pad's.
+    resets: dict[str, int] = field(default_factory=lambda: {"left": 0, "right": 0})
 
     def copy(self) -> Phone:
         return replace(
@@ -120,6 +125,7 @@ class Phone:
             values=dict(self.values),
             holds={a: replace(h) for a, h in self.holds.items()},
             stick=replace(self.stick),
+            resets=dict(self.resets),
         )
 
     @property
@@ -432,6 +438,8 @@ class PhoneTracker:
                 if math.isfinite(value):
                     phone.grip = min(max(float(value), 0.0), 1.0)
                     phone.grip_seq += 1
+        elif action in RESETS and not renew:
+            phone.resets[RESETS[action]] += 1
 
     @staticmethod
     def _stick(phone: Phone, value: Any, live: bool, ended: bool, now: float) -> None:

@@ -138,6 +138,10 @@ class MarionetteStopRequest(BaseModel):
     on: bool
 
 
+class MarionetteResetRequest(BaseModel):
+    arm: str
+
+
 class RobotConnectRequest(BaseModel):
     """Optional CAN interface selection for a robot-link connect.
 
@@ -3162,6 +3166,26 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
         return session.set_stop(req.on)
+
+    @app.post("/api/marionette/reset", response_model=None)
+    async def marionette_reset(
+        req: MarionetteResetRequest,
+    ) -> dict[str, Any] | JSONResponse:
+        """Send one arm back to its rest pose."""
+        from ..jog.session import JogError
+
+        session = _marionette_session()
+        if session is None:
+            return JSONResponse(
+                {
+                    "error": "Marionette is not running. Start it from the Marionette page."
+                },
+                status_code=409,
+            )
+        try:
+            return session.reset_arm(req.arm)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
 
     @app.websocket("/api/marionette/cameras")
     async def marionette_cameras(ws: WebSocket) -> None:

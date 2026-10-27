@@ -6,7 +6,8 @@
  *
  * While the operation runs, `/api/jog/ws` streams the jog state with a
  * `marionette` key ({@link MarionetteState}) and takes the page's base and
- * lift holds; `/api/marionette/stop` sets the desktop Stop and
+ * lift holds; `/api/marionette/stop` sets the desktop Stop,
+ * `/api/marionette/reset` sends an arm back to rest and
  * `/api/marionette/cameras` streams JPEG frames.
  */
 import { combineHold, padCommand, type JogArm, type JogHold, type Vec3 } from "@/lib/jog"
@@ -60,6 +61,8 @@ export interface MarionetteArm {
   grip: number
   /** Why the arm won't move, as a sentence for the operator. */
   reason: string | null
+  /** On its way back to the rest pose. */
+  resetting: boolean
 }
 
 export interface MarionetteState {
@@ -309,6 +312,18 @@ export async function setMarionetteStop(on: boolean): Promise<{ on: boolean; by:
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ on }),
+  })
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error ?? `Request failed (${res.status})`)
+  return body
+}
+
+/** Send one arm back to its rest pose. */
+export async function resetMarionetteArm(arm: JogArm): Promise<{ arm: JogArm }> {
+  const res = await fetch(apiUrl("/api/marionette/reset"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ arm }),
   })
   const body = await res.json().catch(() => ({}))
   if (!res.ok) throw new Error(body.error ?? `Request failed (${res.status})`)
