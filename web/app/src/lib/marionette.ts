@@ -7,7 +7,8 @@
  * While the operation runs, `/api/jog/ws` streams the jog state with a
  * `marionette` key ({@link MarionetteState}) and takes the page's base and
  * lift holds; `/api/marionette/stop` sets the desktop Stop,
- * `/api/marionette/reset` sends an arm back to rest and
+ * `/api/marionette/reset` sends an arm back to rest,
+ * `/api/marionette/pairing` gives the gateway's QR code and pairing code and
  * `/api/marionette/cameras` streams JPEG frames.
  */
 import { combineHold, padCommand, type JogArm, type JogHold, type Vec3 } from "@/lib/jog"
@@ -333,7 +334,59 @@ export function phoneConnectHint(address: string, axolHost = ""): string {
     : "In the Marionette app, connect to the computer running the gateway."
 }
 
+/**
+ * The gateway's pairing details: its QR code (an SVG of `url`, a pairing
+ * link) and its pairing code, which is null when pairing is off.
+ */
+export interface MarionettePairing {
+  name: string
+  auth: "on" | "off" | "strict"
+  code: string | null
+  url: string
+  addresses: string[]
+  port: number | null
+  qrSvg: string
+}
+
+/** Pairing details from `/api/marionette/pairing`, or null if malformed. */
+export function parsePairing(body: unknown): MarionettePairing | null {
+  if (!body || typeof body !== "object") return null
+  const b = body as Record<string, unknown>
+  if (typeof b.url !== "string" || !b.url.startsWith("marionette://pair?")) return null
+  if (typeof b.qrSvg !== "string" || !b.qrSvg.trimStart().startsWith("<svg")) return null
+  return {
+    name: typeof b.name === "string" ? b.name : "",
+    auth: b.auth === "off" || b.auth === "strict" ? b.auth : "on",
+    code: typeof b.code === "string" && b.code ? b.code : null,
+    url: b.url,
+    addresses: Array.isArray(b.addresses)
+      ? b.addresses.filter((a): a is string => typeof a === "string")
+      : [],
+    port: typeof b.port === "number" && Number.isInteger(b.port) ? b.port : null,
+    qrSvg: b.qrSvg,
+  }
+}
+
+/** The QR code as an image source. As an image, the SVG can't run scripts. */
+export function qrImageSource(svg: string): string {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
 // -- API -------------------------------------------------------------------
+
+/**
+ * The QR code and pairing code of the gateway at `gateway`. Axol's server
+ * reads them: the gateway lets its own computer in without the code.
+ */
+export async function fetchMarionettePairing(gateway: string): Promise<MarionettePairing> {
+  const address = gateway.trim() || DEFAULT_GATEWAY
+  const res = await fetch(apiUrl(`/api/marionette/pairing?gateway=${encodeURIComponent(address)}`))
+  const body = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(body.error ?? `Request failed (${res.status})`)
+  const pairing = parsePairing(body)
+  if (!pairing) throw new Error("The gateway's pairing details weren't understood.")
+  return pairing
+}
 
 /** Turn the desktop Stop on or off. */
 export async function setMarionetteStop(on: boolean): Promise<{ on: boolean; by: string | null }> {

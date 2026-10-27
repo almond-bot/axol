@@ -6,6 +6,7 @@ import {
   cameraSocketPath,
   desktopHold,
   driveKeyOf,
+  fetchMarionettePairing,
   isCameraStream,
   frameLabel,
   isTextEntry,
@@ -14,7 +15,9 @@ import {
   parseCameraInfo,
   phoneActivity,
   parseMainView,
+  parsePairing,
   phoneConnectHint,
+  qrImageSource,
   setMarionetteStop,
   type DriveKey,
   type MarionetteArm,
@@ -325,5 +328,62 @@ describe("setMarionetteStop", () => {
     expect(calls[0][1]?.method).toBe("POST")
     expect(JSON.parse(String(calls[0][1]?.body))).toEqual({ on: true })
     await expect(setMarionetteStop(false)).rejects.toThrow("Marionette isn't running.")
+  })
+})
+
+const PAIRING = {
+  name: "axol",
+  auth: "on",
+  code: "K7Q2-M9XD",
+  url: "marionette://pair?v=1&host=10.1.10.220&port=8787&code=K7Q2M9XD",
+  addresses: ["10.1.10.220"],
+  port: 8787,
+  qrSvg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 47 47"></svg>',
+}
+
+describe("parsePairing", () => {
+  it("reads the gateway's pairing details", () => {
+    expect(parsePairing(PAIRING)).toEqual(PAIRING)
+  })
+
+  it("has no code when pairing is off", () => {
+    expect(parsePairing({ ...PAIRING, auth: "off", code: undefined })).toMatchObject({
+      auth: "off",
+      code: null,
+    })
+  })
+
+  it("rejects anything that isn't an SVG QR code of a pairing link", () => {
+    expect(parsePairing(null)).toBeNull()
+    expect(parsePairing({ ...PAIRING, qrSvg: "<img src=x onerror=alert(1)>" })).toBeNull()
+    expect(parsePairing({ ...PAIRING, url: "https://example.com" })).toBeNull()
+  })
+
+  it("shows the QR code as an image, where an SVG can't run scripts", () => {
+    const src = qrImageSource(PAIRING.qrSvg)
+    expect(src.startsWith("data:image/svg+xml;charset=utf-8,")).toBe(true)
+    expect(decodeURIComponent(src.split(",")[1])).toBe(PAIRING.qrSvg)
+  })
+})
+
+describe("fetchMarionettePairing", () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it("asks Axol's server for the gateway's details and surfaces its errors", async () => {
+    const urls: string[] = []
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url)
+        if (urls.length > 1)
+          return new Response(JSON.stringify({ error: "Can't reach the gateway." }), {
+            status: 502,
+          })
+        return new Response(JSON.stringify(PAIRING), { status: 200 })
+      })
+    )
+    expect(await fetchMarionettePairing("  ")).toEqual(PAIRING)
+    expect(urls[0]).toBe("/api/marionette/pairing?gateway=localhost%3A8787")
+    await expect(fetchMarionettePairing("10.1.10.155")).rejects.toThrow("Can't reach the gateway.")
   })
 })

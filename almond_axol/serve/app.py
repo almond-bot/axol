@@ -3191,6 +3191,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         except JogError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
 
+    @app.get("/api/marionette/pairing", response_model=None)
+    async def marionette_pairing(
+        gateway: str = "localhost:8787",
+    ) -> dict[str, Any] | JSONResponse:
+        """The gateway's QR code and pairing code, for the page to show.
+
+        Read here, not by the browser: the gateway lets its own computer in
+        without the code, and Axol's server usually runs there.
+        """
+        from ..marionette.pairing import PairingError, fetch_pairing
+
+        try:
+            return await asyncio.to_thread(fetch_pairing, gateway)
+        except PairingError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+
     @app.websocket("/api/marionette/cameras")
     async def marionette_cameras(ws: WebSocket) -> None:
         """JPEG camera frames for the Marionette page.

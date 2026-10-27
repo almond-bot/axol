@@ -28,6 +28,7 @@ from almond_axol.marionette.cameras import (
     encode_jpeg,
     streams_for_view,
 )
+from almond_axol.marionette.pairing import PairingError, parse_pairing
 from almond_axol.marionette.session import (
     DUPLICATE,
     SCREEN,
@@ -1243,6 +1244,61 @@ class MarionetteApiTest(unittest.TestCase):
                     self.fail("the large stream did not change")
         finally:
             hub.stop()
+
+    def test_pairing_route_reads_the_gateway_on_this_computer(self) -> None:
+        with Gateway(auth="on", token="K7Q2-M9XD") as gateway, _client() as client:
+            response = client.get(
+                "/api/marionette/pairing", params={"gateway": gateway.address}
+            )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual((body["auth"], body["code"]), ("on", "K7Q2-M9XD"))
+        self.assertTrue(body["url"].startswith("marionette://pair?"))
+        self.assertIn("code=K7Q2M9XD", body["url"])
+        self.assertTrue(body["qrSvg"].startswith("<svg"))
+
+    def test_pairing_route_needs_the_code_for_a_strict_gateway(self) -> None:
+        with Gateway(auth="strict", token="K7Q2-M9XD") as gateway, _client() as client:
+            plain = client.get(
+                "/api/marionette/pairing", params={"gateway": gateway.address}
+            )
+            link = (
+                f"marionette://pair?v=1&host=127.0.0.1&port={gateway.port}"
+                "&code=K7Q2M9XD"
+            )
+            paired = client.get("/api/marionette/pairing", params={"gateway": link})
+        self.assertEqual(plain.status_code, 502)
+        self.assertIn("pairing link", plain.json()["error"])
+        self.assertEqual(paired.status_code, 200)
+        self.assertEqual(paired.json()["code"], "K7Q2-M9XD")
+
+    def test_pairing_route_says_when_the_gateway_is_away(self) -> None:
+        with _client() as client:
+            away = client.get(
+                "/api/marionette/pairing", params={"gateway": "127.0.0.1:1"}
+            )
+            typo = client.get(
+                "/api/marionette/pairing", params={"gateway": "not a host"}
+            )
+        self.assertEqual(away.status_code, 502)
+        self.assertEqual(
+            away.json()["error"], "Can't reach the gateway at 127.0.0.1:1."
+        )
+        self.assertEqual(typo.status_code, 502)
+
+    def test_pairing_details_must_be_an_svg_of_a_pairing_link(self) -> None:
+        good = {
+            "url": "marionette://pair?v=1&host=10.1.10.220&port=8787",
+            "qrSvg": "<svg></svg>",
+        }
+        self.assertEqual(parse_pairing(good)["code"], None)
+        for bad in (
+            None,
+            {**good, "qrSvg": "<script>alert(1)</script>"},
+            {**good, "url": "https://example.com"},
+        ):
+            with self.assertRaises(PairingError):
+                parse_pairing(bad)
 
 
 class RobotLinkTest(unittest.TestCase):

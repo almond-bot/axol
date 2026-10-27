@@ -49,14 +49,17 @@ import {
   TRACKING_LABELS,
   desktopHold,
   driveKeyOf,
+  fetchMarionettePairing,
   frameLabel,
   isTextEntry,
   phoneActivity,
   phoneConnectHint,
+  qrImageSource,
   resetMarionetteArm,
   setMarionetteStop,
   type DriveKey,
   type MarionetteArm,
+  type MarionettePairing,
   type MarionettePhone,
   type MarionetteState,
 } from "@/lib/marionette"
@@ -107,6 +110,40 @@ function storedGateway(): string {
 
 // The side panels are denser than the app's default cards.
 const PANEL = "gap-3 p-4"
+// How often the pairing details are read again: a restarted gateway, or one
+// that went away, shows within this long.
+const PAIRING_REFRESH_MS = 15000
+
+/**
+ * The QR code and pairing code of the gateway at `address`, or null while
+ * they can't be read (no gateway there, say). A changed address is read
+ * after a pause, since typing in Gateway changes it on every key.
+ */
+function usePairing(address: string): MarionettePairing | null {
+  // Kept with the address it was read for, so another gateway's code never shows.
+  const [read, setRead] = useState<{ address: string; pairing: MarionettePairing | null }>()
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const load = async () => {
+      let pairing: MarionettePairing | null = null
+      try {
+        pairing = await fetchMarionettePairing(address)
+      } catch {
+        // No gateway there, or it can't say: the page shows the address only.
+      }
+      if (cancelled) return
+      setRead({ address, pairing })
+      timer = setTimeout(load, PAIRING_REFRESH_MS)
+    }
+    timer = setTimeout(load, 400)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [address])
+  return read?.address === address ? read.pairing : null
+}
 
 type Tone = "neutral" | "good" | "warn" | "stop" | "active"
 const TONES: Record<Tone, string> = {
@@ -189,19 +226,52 @@ function PhonesCard({
   phones,
   arms,
   hint,
+  pairing,
 }: {
   phones: MarionettePhone[]
   arms: MarionetteState["arms"] | null
   /** Where the Marionette app connects. */
   hint: string
+  /** The gateway's QR code and pairing code, once read. */
+  pairing: MarionettePairing | null
 }) {
   return (
     <Card data-testid="marionette-phones" className={PANEL}>
       <CardHeader>
         <CardTitle>Phones</CardTitle>
-        <CardDescription data-testid="marionette-connect" className="text-xs">
-          {hint}
-        </CardDescription>
+        {pairing ? (
+          <div data-testid="marionette-pairing" className="flex items-start gap-3 pt-1">
+            <img
+              src={qrImageSource(pairing.qrSvg)}
+              alt="QR code to pair a phone"
+              className="size-32 shrink-0 rounded-md bg-white p-1.5"
+            />
+            <div className="flex min-w-0 flex-col gap-1.5 text-xs text-white/60">
+              <p>
+                To pair a phone, scan this with its camera, or tap{" "}
+                <strong className="text-white/80">Scan QR code</strong> in Marionette.
+              </p>
+              <p data-testid="marionette-connect">{hint}</p>
+              {pairing.code ? (
+                <p>
+                  Pairing code{" "}
+                  <span
+                    data-testid="marionette-pairing-code"
+                    className="font-mono text-sm whitespace-nowrap text-white/90"
+                  >
+                    {pairing.code}
+                  </span>
+                </p>
+              ) : (
+                <p>Pairing is off, so phones need no code.</p>
+              )}
+            </div>
+          </div>
+        ) : (
+          <CardDescription data-testid="marionette-connect" className="text-xs">
+            {hint}
+          </CardDescription>
+        )}
       </CardHeader>
       {phones.length === 0 ? (
         <p className="text-sm text-white/45">No phones connected.</p>
@@ -439,6 +509,7 @@ export default function Marionette() {
   const address = running
     ? marionette?.gateway.address || String(ownSession?.args?.gateway ?? "") || gateway
     : gateway
+  const pairing = usePairing(address)
   const canReset =
     ready && !stop?.on && !ARMS.some((side) => arms?.[side]?.resetting) && Boolean(arms)
   // The view draws the robot only: no target, plan or arm markers.
@@ -779,7 +850,12 @@ export default function Marionette() {
             aria-label="Phones, arms and drive"
             className="flex min-h-0 flex-col gap-3 lg:-mr-2 lg:overflow-y-auto lg:pr-2"
           >
-            <PhonesCard phones={phones} arms={arms} hint={phoneConnectHint(address, axolHost)} />
+            <PhonesCard
+              phones={phones}
+              arms={arms}
+              hint={phoneConnectHint(address, axolHost)}
+              pairing={pairing}
+            />
 
             <Card data-testid="marionette-arms" className={PANEL}>
               <CardHeader>
