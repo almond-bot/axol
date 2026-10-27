@@ -1,6 +1,6 @@
 /**
- * 3D view for the Jog page: the robot's URDF at its live pose, a transform
- * gizmo on the target gripper pose, and an orange ghost of the arm: the
+ * 3D view for the Jog page: the robot's URDF at its live pose, a combined
+ * move-and-turn gizmo on the target gripper pose, and an orange ghost of the arm: the
  * planned move's solution with a dashed path from the gripper, or, before a
  * plan, the live IK preview of the target being dragged.
  *
@@ -9,9 +9,17 @@
  * target, path and markers sit in the same frame IK uses wherever the lift
  * and base have put the torso.
  */
-import { useEffect, useMemo, useRef, useState } from "react"
+import {
+  memo,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react"
 import { Canvas, invalidate, useFrame, type ThreeEvent } from "@react-three/fiber"
-import { Line, OrbitControls, TransformControls } from "@react-three/drei"
+import { Line, OrbitControls, PivotControls } from "@react-three/drei"
 import {
   Box3,
   Color,
@@ -20,6 +28,7 @@ import {
   LineBasicMaterial,
   LineSegments,
   LoadingManager,
+  Matrix4,
   Mesh,
   MeshBasicMaterial,
   MeshStandardMaterial,
@@ -46,8 +55,6 @@ const PLAN_COLOR = "#ff9a3c"
 const PATH_COLOR = "#eff483"
 const EDGE_COLOR = "#0d0f12"
 
-export type GizmoMode = "translate" | "rotate"
-export type GizmoSpace = "world" | "local"
 /** What the orange ghost shows: one arm at a solution, and where its tip lands. */
 type Ghost = Pick<JogPreview, "arm" | "joints" | "reached">
 
@@ -162,19 +169,29 @@ function wrap(robot: URDFRobot): Group {
   return scene
 }
 
-/** Show only one arm's links of the planned-pose ghost. */
-function showArmOnly(robot: URDFRobot, arm: JogArm) {
+/** Show only one arm's links of the planned-pose ghost; true if that changed anything. */
+function showArmOnly(robot: URDFRobot, arm: JogArm): boolean {
+  let changed = false
   for (const [name, link] of Object.entries(robot.links)) {
     const visible = name.startsWith(`${arm}_`)
     for (const child of link.children)
-      if ((child as { isURDFVisual?: boolean }).isURDFVisual) child.visible = visible
+      if ((child as { isURDFVisual?: boolean }).isURDFVisual && child.visible !== visible) {
+        child.visible = visible
+        changed = true
+      }
   }
+  return changed
 }
 
 function applyJoints(robot: URDFRobot, values: Record<string, number>) {
-  for (const [name, value] of Object.entries(values)) robot.joints[name]?.setJointValue(value)
+  let changed = false
+  for (const [name, value] of Object.entries(values))
+    if (robot.joints[name]?.setJointValue(value)) changed = true
+  if (!changed) return
   robot.updateMatrixWorld(true)
-  // The canvas renders on demand; a new pose is a reason to draw.
+  // The canvas renders on demand, and only a pose that moved is a reason to
+  // draw: state arrives at 20 Hz even when the robot is still, and every
+  // needless frame delays the page's hold heartbeat.
   invalidate()
 }
 
@@ -193,9 +210,10 @@ function framing(scene: Group, fov: number) {
   }
 }
 
-function poseFrom(object: Object3D): JogPose {
-  const p = object.position
-  const q = object.quaternion
+function poseFrom(matrix: Matrix4): JogPose {
+  const p = new Vector3()
+  const q = new Quaternion()
+  matrix.decompose(p, q, new Vector3())
   return { position: [p.x, p.y, p.z], quaternion: [q.x, q.y, q.z, q.w] }
 }
 
@@ -217,17 +235,21 @@ function TorsoFrame({ robot, children }: { robot: URDFRobot; children: React.Rea
 }
 
 function Triad({ size = 0.06, opacity = 1 }: { size?: number; opacity?: number }) {
-  const axes: [Vector3, string][] = [
-    [new Vector3(size, 0, 0), "#ef4444"],
-    [new Vector3(0, size, 0), "#22c55e"],
-    [new Vector3(0, 0, size), "#3b82f6"],
-  ]
+  // Stable points, so a re-render doesn't rebuild the lines or force a frame.
+  const axes = useMemo(
+    (): [Vector3[], string][] => [
+      [[new Vector3(), new Vector3(size, 0, 0)], "#ef4444"],
+      [[new Vector3(), new Vector3(0, size, 0)], "#22c55e"],
+      [[new Vector3(), new Vector3(0, 0, size)], "#3b82f6"],
+    ],
+    [size]
+  )
   return (
     <>
-      {axes.map(([end, color]) => (
+      {axes.map(([points, color]) => (
         <Line
           key={color}
-          points={[new Vector3(), end]}
+          points={points}
           color={color}
           lineWidth={2.5}
           transparent
@@ -240,57 +262,133 @@ function Triad({ size = 0.06, opacity = 1 }: { size?: number; opacity?: number }
   )
 }
 
+/**
+ * The combined move-and-turn gizmo. Memoised: drei's handles pass fresh
+ * inline props on every render, and R3F draws a frame for each, so it must
+ * not re-render with the overlay's 20 Hz state.
+ */
+const TargetGizmo = memo(function TargetGizmo({
+  matrix,
+  handlers,
+}: {
+  matrix: Matrix4
+  handlers: {
+    dragStart: () => void
+    drag: (local: Matrix4) => void
+    dragEnd: () => void
+  }
+}) {
+  return (
+    <PivotControls
+      matrix={matrix}
+      autoTransform={false}
+      disableScaling
+      depthTest={false}
+      fixed
+      scale={120}
+      lineWidth={5}
+      onDragStart={handlers.dragStart}
+      onDrag={handlers.drag}
+      onDragEnd={handlers.dragEnd}
+    />
+  )
+})
+
 function Overlay({
   robot,
-  state,
+  tips,
   plan,
   ghost,
   activeArm,
   target,
-  gizmoMode,
-  gizmoSpace,
   onTargetChange,
   onSelectArm,
   onDragging,
 }: {
   robot: URDFRobot
-  state: JogState | null
+  tips: JogState["tips"]
   plan: JogPlan | null
   ghost: Ghost | null
   activeArm: JogArm
   target: JogPose | null
-  gizmoMode: GizmoMode
-  gizmoSpace: GizmoSpace
   onTargetChange: (pose: JogPose) => void
   onSelectArm: (arm: JogArm) => void
   onDragging: (dragging: boolean) => void
 }) {
-  const targetObject = useMemo(() => new Object3D(), [])
+  // The target pose in the torso frame; the gizmo moves it in place.
+  const targetMatrix = useMemo(() => new Matrix4(), [])
   const dragging = useRef(false)
 
   // Follow the target prop unless the operator is dragging the gizmo.
   useEffect(() => {
     if (!target || dragging.current) return
-    targetObject.position.set(...target.position)
-    targetObject.quaternion.set(...target.quaternion)
-    targetObject.updateMatrixWorld(true)
-  }, [target, targetObject])
+    const next = new Matrix4().compose(
+      new Vector3(...target.position),
+      new Quaternion(...target.quaternion),
+      new Vector3(1, 1, 1)
+    )
+    // The page hands over a fresh target with every state message.
+    if (next.equals(targetMatrix)) return
+    targetMatrix.copy(next)
+    invalidate()
+  }, [target, targetMatrix])
 
-  const tips = state?.tips
-  const select = (arm: JogArm) => (event: ThreeEvent<PointerEvent>) => {
-    event.stopPropagation()
-    onSelectArm(arm)
-  }
+  // The canvas draws on demand, and R3F counts a new handler or object prop
+  // as a change worth a frame. State arrives at 20 Hz, so everything handed
+  // to the scene below stays stable across renders: handlers reach the
+  // latest callbacks through a ref.
+  const callbacks = useRef({ onTargetChange, onSelectArm, onDragging })
+  useLayoutEffect(() => {
+    callbacks.current = { onTargetChange, onSelectArm, onDragging }
+  })
+  const handlers = useMemo(
+    () => ({
+      dragStart: () => {
+        dragging.current = true
+        callbacks.current.onDragging(true)
+      },
+      drag: (local: Matrix4) => {
+        targetMatrix.copy(local)
+        callbacks.current.onTargetChange(poseFrom(targetMatrix))
+      },
+      dragEnd: () => {
+        dragging.current = false
+        callbacks.current.onDragging(false)
+        callbacks.current.onTargetChange(poseFrom(targetMatrix))
+      },
+      select: {
+        left: (event: ThreeEvent<PointerEvent>) => {
+          event.stopPropagation()
+          callbacks.current.onSelectArm("left")
+        },
+        right: (event: ThreeEvent<PointerEvent>) => {
+          event.stopPropagation()
+          callbacks.current.onSelectArm("right")
+        },
+      },
+    }),
+    [targetMatrix]
+  )
+  const pathPoints = useMemo(() => plan?.path.map((p) => new Vector3(...p)) ?? [], [plan])
+  const ghostTurn = useMemo(
+    () => (ghost ? new Quaternion(...ghost.reached.quaternion) : undefined),
+    [ghost]
+  )
   return (
     <>
       <TorsoFrame robot={robot}>
-        <primitive object={targetObject}>{target && <Triad size={0.07} />}</primitive>
+        {/* One gizmo moves and turns the target: arrows and planes slide it,
+          rings turn it, all along the gripper's own axes. Dragging a handle
+          pauses the orbit controls. */}
+        {target && <TargetGizmo matrix={targetMatrix} handlers={handlers} />}
         {tips &&
           (["left", "right"] as const).map((arm) => (
             <mesh
               key={arm}
               position={tips[arm].position}
-              onPointerDown={select(arm)}
+              // Only the other arm's marker is clickable, so the active one
+              // never sits over the gizmo's inner handles.
+              onPointerDown={arm === activeArm ? undefined : handlers.select[arm]}
               renderOrder={4}
             >
               <sphereGeometry args={[arm === activeArm ? 0.022 : 0.03, 20, 14]} />
@@ -302,9 +400,9 @@ function Overlay({
               />
             </mesh>
           ))}
-        {plan && plan.path.length > 1 && (
+        {pathPoints.length > 1 && (
           <Line
-            points={plan.path.map((p) => new Vector3(...p))}
+            points={pathPoints}
             color={PATH_COLOR}
             lineWidth={3}
             dashed
@@ -315,10 +413,7 @@ function Overlay({
           />
         )}
         {ghost && (
-          <group
-            position={ghost.reached.position}
-            quaternion={new Quaternion(...ghost.reached.quaternion)}
-          >
+          <group position={ghost.reached.position} quaternion={ghostTurn}>
             <Triad size={0.045} opacity={0.9} />
             <mesh renderOrder={6}>
               <sphereGeometry args={[0.012, 16, 12]} />
@@ -327,26 +422,6 @@ function Overlay({
           </group>
         )}
       </TorsoFrame>
-      {/* The gizmo places itself in world space from the target's world
-        matrix, so it lives at the scene root, not inside the torso frame. */}
-      {target && (
-        <TransformControls
-          object={targetObject}
-          mode={gizmoMode}
-          space={gizmoSpace}
-          size={0.75}
-          onMouseDown={() => {
-            dragging.current = true
-            onDragging(true)
-          }}
-          onMouseUp={() => {
-            dragging.current = false
-            onDragging(false)
-            onTargetChange(poseFrom(targetObject))
-          }}
-          onObjectChange={() => onTargetChange(poseFrom(targetObject))}
-        />
-      )}
     </>
   )
 }
@@ -387,87 +462,95 @@ function CameraRig({ target, radius }: { target: Vector3; radius: number }) {
 
 const FOV = 38
 
-export default function JogViewer({
-  robotModel,
-  gripper,
-  state,
-  plan,
-  preview = null,
-  activeArm,
-  target,
-  gizmoMode,
-  gizmoSpace,
-  onTargetChange,
-  onSelectArm,
-  onDragging = () => undefined,
-}: {
-  robotModel: AxolModel
-  gripper: GripperType
+/** Everything the scene shows or reports that changes while it runs. */
+interface SceneInput {
   state: JogState | null
   plan: JogPlan | null
-  /** The live IK preview of the target, shown as the ghost until there is a plan. */
-  preview?: Ghost | null
+  preview: Ghost | null
   activeArm: JogArm
   target: JogPose | null
-  gizmoMode: GizmoMode
-  gizmoSpace: GizmoSpace
   onTargetChange: (pose: JogPose) => void
   onSelectArm: (arm: JogArm) => void
-  onDragging?: (dragging: boolean) => void
+  onDragging: (dragging: boolean) => void
+}
+
+/**
+ * Hands the scene its input without re-rendering the canvas. R3F's Canvas
+ * draws a frame every time it re-renders, so the page's 20 Hz state must not
+ * reach it as props; the scene inside subscribes here instead and draws only
+ * when something it shows has moved.
+ */
+function createSceneStore(initial: SceneInput) {
+  let value = initial
+  const listeners = new Set<() => void>()
+  return {
+    get: () => value,
+    set(next: SceneInput) {
+      value = next
+      for (const listener of listeners) listener()
+    },
+    subscribe(listener: () => void) {
+      listeners.add(listener)
+      return () => {
+        listeners.delete(listener)
+      }
+    },
+  }
+}
+type SceneStore = ReturnType<typeof createSceneStore>
+
+function LiveScene({
+  live,
+  planned,
+  store,
+}: {
+  live: LoadedRobot
+  planned: LoadedRobot
+  store: SceneStore
 }) {
-  const [live, setLive] = useState<LoadedRobot | null>(null)
-  const [ghost, setGhost] = useState<LoadedRobot | null>(null)
-  const [error, setError] = useState<string | null>(null)
-
-  useEffect(() => {
-    // The page remounts the viewer (key) for another model, so loading
-    // starts from empty state.
-    let cancelled = false
-    Promise.all([loadRobot(robotModel, gripper), loadRobot(robotModel, gripper)])
-      .then(([robot, planned]) => {
-        if (cancelled) return
-        const scene = wrap(robot)
-        styleSolid(scene)
-        const ghostScene = wrap(planned)
-        styleGhost(ghostScene)
-        setLive({ scene, robot })
-        setGhost({ scene: ghostScene, robot: planned })
-      })
-      .catch((reason: Error) => {
-        if (!cancelled) setError(reason.message)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [robotModel, gripper])
-
-  const liftTravel = Number(live?.robot.joints.lift?.limit?.upper ?? 0)
+  const { state, plan, preview, activeArm, target, onTargetChange, onSelectArm, onDragging } =
+    useSyncExternalStore(store.subscribe, store.get)
+  const liftTravel = Number(live.robot.joints.lift?.limit?.upper ?? 0)
   const values = useMemo(() => jointValuesFor(state, liftTravel), [state, liftTravel])
   useEffect(() => {
-    if (live) applyJoints(live.robot, values)
+    applyJoints(live.robot, values)
   }, [live, values])
   const shown: Ghost | null = plan ?? preview
   useEffect(() => {
-    if (!ghost || !shown) return
-    showArmOnly(ghost.robot, shown.arm)
-    applyJoints(ghost.robot, jointValuesFor(state, liftTravel, shown))
-  }, [ghost, shown, state, liftTravel])
+    if (!shown) return
+    if (showArmOnly(planned.robot, shown.arm)) invalidate()
+    applyJoints(planned.robot, jointValuesFor(state, liftTravel, shown))
+  }, [planned, shown, state, liftTravel])
+  return (
+    <>
+      <primitive object={live.scene} />
+      <primitive object={planned.scene} visible={Boolean(shown)} />
+      <Overlay
+        robot={live.robot}
+        tips={state?.tips}
+        plan={plan}
+        ghost={shown}
+        activeArm={activeArm}
+        target={target}
+        onTargetChange={onTargetChange}
+        onSelectArm={onSelectArm}
+        onDragging={onDragging}
+      />
+    </>
+  )
+}
 
+const SceneCanvas = memo(function SceneCanvas({
+  live,
+  planned,
+  store,
+}: {
+  live: LoadedRobot
+  planned: LoadedRobot
+  store: SceneStore
+}) {
   // Frame the whole robot once per model.
-  const view = useMemo(() => (live ? framing(live.scene, FOV) : null), [live])
-
-  if (error)
-    return (
-      <div className="flex h-full items-center justify-center p-6 text-center text-sm text-white/50">
-        {error}
-      </div>
-    )
-  if (!live || !ghost || !view)
-    return (
-      <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
-        <Loader2 className="size-4 animate-spin" /> Loading the robot model…
-      </div>
-    )
+  const view = useMemo(() => framing(live.scene, FOV), [live])
   return (
     <Canvas
       data-testid="jog-canvas"
@@ -486,21 +569,7 @@ export default function JogViewer({
       <hemisphereLight args={["#f4f6f8", "#2a2d33", 1.15]} />
       <directionalLight position={[3, 5, 2]} intensity={1.5} />
       <directionalLight position={[-3, 2.5, -2]} intensity={0.45} />
-      <primitive object={live.scene} />
-      <primitive object={ghost.scene} visible={Boolean(shown)} />
-      <Overlay
-        robot={live.robot}
-        state={state}
-        plan={plan}
-        ghost={shown}
-        activeArm={activeArm}
-        target={target}
-        gizmoMode={gizmoMode}
-        gizmoSpace={gizmoSpace}
-        onTargetChange={onTargetChange}
-        onSelectArm={onSelectArm}
-        onDragging={onDragging}
-      />
+      <LiveScene live={live} planned={planned} store={store} />
       <gridHelper
         args={[12, 48, "#3a3d44", "#24262b"]}
         position={[view.target.x, view.floor, view.target.z]}
@@ -509,4 +578,81 @@ export default function JogViewer({
       <FollowBase robot={live.robot} />
     </Canvas>
   )
+})
+
+export default function JogViewer({
+  robotModel,
+  gripper,
+  state,
+  plan,
+  preview = null,
+  activeArm,
+  target,
+  onTargetChange,
+  onSelectArm,
+  onDragging = () => undefined,
+}: {
+  robotModel: AxolModel
+  gripper: GripperType
+  state: JogState | null
+  plan: JogPlan | null
+  /** The live IK preview of the target, shown as the ghost until there is a plan. */
+  preview?: Ghost | null
+  activeArm: JogArm
+  target: JogPose | null
+  onTargetChange: (pose: JogPose) => void
+  onSelectArm: (arm: JogArm) => void
+  onDragging?: (dragging: boolean) => void
+}) {
+  const [live, setLive] = useState<LoadedRobot | null>(null)
+  const [planned, setPlanned] = useState<LoadedRobot | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const input: SceneInput = {
+    state,
+    plan,
+    preview,
+    activeArm,
+    target,
+    onTargetChange,
+    onSelectArm,
+    onDragging,
+  }
+  const [store] = useState(() => createSceneStore(input))
+  useLayoutEffect(() => store.set(input))
+
+  useEffect(() => {
+    // The page remounts the viewer (key) for another model, so loading
+    // starts from empty state.
+    let cancelled = false
+    Promise.all([loadRobot(robotModel, gripper), loadRobot(robotModel, gripper)])
+      .then(([robot, ghostRobot]) => {
+        if (cancelled) return
+        const scene = wrap(robot)
+        styleSolid(scene)
+        const ghostScene = wrap(ghostRobot)
+        styleGhost(ghostScene)
+        setLive({ scene, robot })
+        setPlanned({ scene: ghostScene, robot: ghostRobot })
+      })
+      .catch((reason: Error) => {
+        if (!cancelled) setError(reason.message)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [robotModel, gripper])
+
+  if (error)
+    return (
+      <div className="flex h-full items-center justify-center p-6 text-center text-sm text-white/50">
+        {error}
+      </div>
+    )
+  if (!live || !planned)
+    return (
+      <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
+        <Loader2 className="size-4 animate-spin" /> Loading the robot model…
+      </div>
+    )
+  return <SceneCanvas live={live} planned={planned} store={store} />
 }
