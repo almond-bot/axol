@@ -343,18 +343,21 @@
   // reload or a newly owned arm always starts from where the gripper is and never jumps it. The slide streams the grip
   // slider; Open and Close send a final value.
   const grip = { value: 0, sentAt: 0 };
-  const gripDrag = K.drag({ action: A.grip, letGoOnLeave: false });
-  let slide, padHeld = false; // slide: { id, y, from, live } while a thumb is down on the pad
+  // A slide the kit or the app cuts (the gateway went, say) sends nothing more: the pad stops following the thumb, and
+  // the gauge goes back to Axol's grip until the thumb lifts and a new slide starts.
+  const gripDrag = K.drag({ action: A.grip, letGoOnLeave: false, onLetGo: () => { if (slide) slide.cut = true; } });
+  let slide, padHeld = false; // slide: { id, y, from, live, cut } while a thumb is down on the pad
   const roundGrip = v => Math.round(K.clamp(v, 0, 1) * 100) / 100;
   const showGrip = v => { if (v !== grip.value) { grip.value = v; renderGrip(); } };
-  function endSlide(quiet) { slide = undefined; if (gripDrag.isOpen()) { gripDrag.end(grip.value, quiet === true); grip.sentAt = Date.now(); } }
+  // end() also clears a cut slide (it does nothing when no slide is going), so the next slide streams again.
+  function endSlide(quiet) { slide = undefined; const sending = gripDrag.isOpen(); gripDrag.end(grip.value, quiet === true); if (sending) grip.sentAt = Date.now(); }
   K.letGoOnLeave(endSlide);
   function slideGrip(v) { if (otherOwner()) { endSlide(); return; } showGrip(v); grip.sentAt = Date.now(); gripDrag.update(v); }
   function setGrip(v) { if (otherOwner()) return; endSlide(); showGrip(v); grip.sentAt = Date.now(); K.send(K.control(A.grip), v); }
   function adoptGrip(value) {
     if (typeof value !== 'number' || !(value >= 0 && value <= 1)) return;
     // Not during a slide, and not while this phone's own last grip may not have reached Axol yet.
-    if ((slide && slide.live) || gripDrag.isOpen() || Date.now() - grip.sentAt < GRIP_SETTLE_MS) return;
+    if ((slide && slide.live && !slide.cut) || gripDrag.isOpen() || Date.now() - grip.sentAt < GRIP_SETTLE_MS) return;
     showGrip(roundGrip(value));
   }
   function renderGrip() { $('gauge-fill').style.height = Math.round(grip.value * 100) + '%'; setText($('grip-val'), Math.round(grip.value * 100) + '%'); }
@@ -375,7 +378,7 @@
   });
   pad.addEventListener('pointerdown', e => { if (!slide) slide = { id: e.pointerId, y: e.clientY, from: grip.value, live: false }; });
   pad.addEventListener('pointermove', e => {
-    if (!slide || e.pointerId !== slide.id || otherOwner()) return;
+    if (!slide || e.pointerId !== slide.id || slide.cut || otherOwner()) return;
     // A few pixels of wobble while the thumb rests on the pad move nothing. Past that the grip follows the slide from
     // where it was when the slide began: down closes, up opens.
     if (!slide.live) { if (Math.abs(e.clientY - slide.y) < GRIP_SLOP_PX) return; slide.live = true; slide.y = e.clientY; slide.from = grip.value; }
