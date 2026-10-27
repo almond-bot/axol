@@ -35,8 +35,8 @@ const METHOD: Record<CollectionMethod, string> = {
 
 /** The payment's description in Stripe and on the receipt. */
 function description(req: DataCollectionRequest): string {
-  const what = req.method == null ? "one-off task" : `training dataset, ${METHOD[req.method]}`
-  return `Teleop Data Collection, ${what}, ${req.hours} h`
+  if (req.method == null) return `Teleoperator, one-off task, ${req.hours} h`
+  return `Teleop Data Collection, training dataset, ${METHOD[req.method]}, ${req.hours} h`
 }
 
 /**

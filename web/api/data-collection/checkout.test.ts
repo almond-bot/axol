@@ -90,7 +90,7 @@ describe("POST /api/data-collection/checkout", () => {
     expect(params.line_items).toEqual([{ price: "price_teleoperator", quantity: 2 }])
     expect(params.metadata.request_type).toBe("task")
     expect(params.metadata.collection_method).toBe("")
-    expect(params.payment_intent_data.description).toBe("Teleop Data Collection, one-off task, 2 h")
+    expect(params.payment_intent_data.description).toBe("Teleoperator, one-off task, 2 h")
     expect(params.custom_text.submit.message).toContain("by the minute")
   })
 
