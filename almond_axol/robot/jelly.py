@@ -17,9 +17,13 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
 
 - While the command is non-zero the wheels track it in VELOCITY mode.
 - When the slew-limited command reaches zero (and the wheels are measured
-  slow), the wheels are parked: switched to MIT/impedance mode and held at
-  their current positions by the motor's internal high-bandwidth position
-  loop, so the base does not roll under load.
+  slow), the wheels are parked in MIT mode. Normally that is a position hold
+  (``hold_kp``/``hold_kd``) at their current positions, so the base does not
+  roll under load. When a wheel's position can't be trusted (see below) it is
+  a braking-only hold instead (``hold_kd`` damping, no target), which resists
+  rolling but can creep on a slope. A parked wheel that moves off its anchor
+  or spins up is treated as a runaway: the core disables the wheels and parks
+  no more that session.
 - Every wheel is armed with the Damiao loss-of-comms alarm
   (``JellyConfig.can_timeout_ms``, RAM only, readback-verified at enable):
   a wheel that goes that long without a command frame faults ``LOST_COMM``
@@ -32,7 +36,7 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   **silence** — no keepalive, no re-send of a stale command — so the alarm
   trips and torques them off; once that has certainly happened and the
   wheels have stopped rolling they are re-enabled straight into the park
-  hold. Parked wheels keep their hold (an anchor, not a motion). The lift
+  hold. Parked wheels keep their hold (an anchor or a brake, not a motion). The lift
   likewise gets one STOP and then nothing on its bus, so the jelly_legs
   board's own 300 ms jog deadman is the safety layer for the legs.
 - When the source returns, wheels the alarm tripped are cleared and
@@ -40,15 +44,13 @@ heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
   ramp restarts from rest. Other faults (over-current, thermal) are reported
   but never cleared blindly.
 
-Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
-factory — about two wheel turns), which drive wheels escape almost
-immediately; anchoring at the reported position then means a phantom error
-of several radians and instant overcurrent. Re-zeroing at park time doesn't
-help either: on this firmware the 0xFE zero command only applies after a
-power cycle. So at startup the PMAX register is raised (RAM only, reverts
-on power-off) to keep multi-turn positions valid for a whole session, and
-parking refuses (with a warning) if a wheel ever approaches the widened
-limit.
+Damiao feedback folds positions into ±PMAX (raised to 400 rad in RAM at
+startup) while the motor keeps counting its own multi-turn position, and the
+0xFE re-zero only applies after a power cycle. A position hold anchored at
+the reported value after a few minutes of driving one way targeted hundreds
+of radians from the wheel and drove the base at full torque. So the Rust
+core only uses the position hold when each motor's own position register is
+inside the range and agrees with the report, and brakes otherwise.
 
 Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
@@ -210,16 +212,17 @@ class JellyConfig:
                          For diagnosing drift; off in normal operation.
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
-        hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
-                         0 disables parking (wheels just idle in velocity mode).
-        hold_kd:         Damping (Nm·s/rad) of the parked MIT hold.
+        hold_kp:         Stiffness (Nm/rad) of the position hold; 0 makes
+                         every park the braking-only hold (see the module docs).
+        hold_kd:         Damping (Nm·s/rad) of both park holds; 0 disables
+                         parking (wheels just idle in velocity mode). At most 5.
         frequency:       Wheel command task rate in Hz.
         command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
                          before the command source is considered dead. On
                          that edge driving wheels get one zero-velocity frame
                          and then nothing on CAN — no keepalive — so their
                          ``can_timeout_ms`` alarm torques them off (they are
-                         then re-anchored into the park hold); parked wheels
+                         then re-enabled into the park hold); parked wheels
                          keep their hold; the lift gets one STOP and then
                          silence so the legs' 300 ms jog deadman takes over.
                          Must comfortably exceed the source's frame period (a
