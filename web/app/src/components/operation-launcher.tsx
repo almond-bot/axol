@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react"
-import { ChevronRight } from "lucide-react"
+import { ChevronRight, Loader2 } from "lucide-react"
 import { OPERATION_GROUPS, type CatalogEntry, type OperationStatus } from "@/lib/operation-catalog"
+import type { StartupView } from "@/lib/operation-progress"
 import type { OperationId } from "@/lib/supervisor"
 import { cn } from "@/lib/utils"
 
@@ -140,5 +141,33 @@ export function ElapsedTime({ startedAt }: { startedAt: number }) {
     <span className="font-mono tabular-nums">
       {h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`}
     </span>
+  )
+}
+
+/** What a starting operation is doing, how far along it is, and a bar. */
+export function StartupBar({ view }: { view: StartupView }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-1.5">
+      <div className="flex min-w-0 items-center justify-between gap-3 text-sm">
+        <span className="flex min-w-0 items-center gap-2 text-white/80">
+          <Loader2 className="size-3.5 shrink-0 animate-spin text-[#eff483]" />
+          <span className="truncate">{view.label}</span>
+        </span>
+        <span className="shrink-0 font-mono text-white/60 tabular-nums">{view.percent}%</span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label={view.label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={view.percent}
+        className="h-1.5 w-full overflow-hidden rounded-full bg-white/10"
+      >
+        <div
+          className="h-full rounded-full bg-[#eff483] transition-[width] duration-500 ease-out"
+          style={{ width: `${view.percent}%` }}
+        />
+      </div>
+    </div>
   )
 }

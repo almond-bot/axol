@@ -35,6 +35,7 @@ import {
   type OperationMeta,
   type PolicyState,
   type RobotStatus,
+  type OperationProgress,
   type SessionInfo,
   type TrackerSourceReadiness,
   type TrackingQuality,
@@ -52,7 +53,8 @@ import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
 import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
-import { ElapsedTime, OperationIcon } from "@/components/operation-launcher"
+import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
+import { useStartupView } from "@/lib/operation-progress"
 import type { CatalogEntry } from "@/lib/operation-catalog"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
@@ -96,6 +98,7 @@ export function OperationPanel({
   viewerPort,
   vrPort,
   startPhase,
+  progress,
   hostBlocker,
   needsMount = false,
   simRobot,
@@ -137,6 +140,8 @@ export function OperationPanel({
   vrPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** The run's startup steps, from the status poll. */
+  progress?: OperationProgress | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
   /** No robot model picked yet (`kinematics.mount`): a run that drives the
@@ -332,6 +337,10 @@ export function OperationPanel({
 
   // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
+  const startup = useStartupView(live ? progress : null, {
+    device: mantisMode ? "Mantis" : "Axol",
+    sim: isSim,
+  })
   // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
   // arms and their CAN bus are never touched. A live run is described by its
   // merged args alone (a default-on flag is omitted from them, so the saved
@@ -526,7 +535,12 @@ export function OperationPanel({
             <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-white/55">
               {meta.description}
             </p>
-            {live && session && (
+            {live && session && startup && (
+              <div className="mt-3 max-w-md">
+                <StartupBar view={startup} />
+              </div>
+            )}
+            {live && session && !startup && (
               <p className="mt-2 flex items-center gap-2 text-sm">
                 <StatusBadge session={session} />
                 {running && (
@@ -738,7 +752,7 @@ function ConnectPrompt({ onConnect }: { onConnect?: () => void }) {
     <div className="flex flex-col items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-5 sm:flex-row sm:items-center">
       <Plug className="size-5 shrink-0 text-white/40" />
       <p className="min-w-0 flex-1 text-sm text-white/60">
-        Connect to the robot&apos;s computer to set up and start this operation.
+        Connect to the Host Computer to set up and start this operation.
       </p>
       {onConnect && (
         <Button size="sm" onClick={onConnect}>
@@ -1492,8 +1506,8 @@ function Unavailable({ spec }: { spec: CommandSpec | null }) {
         Not available on this robot
       </div>
       <p className="text-white/55">
-        This operation needs software or hardware that the robot&apos;s computer doesn&apos;t have,
-        such as LeRobot, the ZED SDK or the Axol arms.
+        This operation needs software or hardware that the Host Computer doesn&apos;t have, such as
+        LeRobot, the ZED SDK or the Axol arms.
       </p>
       {spec?.error && (
         <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">

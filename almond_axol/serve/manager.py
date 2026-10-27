@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from ..progress import Progress
 from .commands import COMMANDS, build_argv
 
 _LOG_BUFFER = 4000
@@ -124,6 +125,9 @@ class Session:
         # marshalled back here via call_soon_threadsafe. None for subprocess
         # sessions, which only ever emit from the server loop.
         self.loop: asyncio.AbstractEventLoop | None = None
+        # Startup steps an in-process operation reports (see
+        # almond_axol.progress). None for CLI sessions and older operations.
+        self.progress: Progress | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +139,7 @@ class Session:
             "error": self.error,
             "startedAt": self.started_at,
             "pid": self.proc.pid if self.proc else None,
+            "progress": self.progress.to_dict() if self.progress else None,
         }
 
     @staticmethod

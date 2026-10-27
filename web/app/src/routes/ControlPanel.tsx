@@ -128,6 +128,7 @@ import {
   useSettledDiscovery,
 } from "@/lib/hardware-status"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
+import { useStartupView } from "@/lib/operation-progress"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { MountQuickPick, MountRequired } from "@/components/settings/mount-required"
@@ -1277,6 +1278,15 @@ export default function ControlPanel() {
     (best, s) => (best && rank(best) >= rank(s) ? best : s),
     null
   )
+  // Startup steps come from the status poll: the logs WebSocket sends its
+  // session once, when the run starts, so its copy never advances.
+  const runProgress =
+    session && session.id === effectiveStatus?.id ? session.progress : effectiveStatus?.progress
+  // What the running operation is doing while it starts (null once ready).
+  const runningStartup = useStartupView(runProgress, {
+    device: effectiveStatus?.args?.[HARDWARE_PROFILE_ARG] ? "Mantis" : "Axol",
+    sim: Boolean(effectiveStatus?.args?.sim),
+  })
   const isLive =
     sources.some(
       (s) => s.status === "running" || s.status === "starting" || s.status === "stopping"
@@ -2078,7 +2088,12 @@ export default function ControlPanel() {
       >
         <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
         <span className="max-w-40 truncate">
-          {isStopping ? "Stopping" : "Running"}: {runningLabel}
+          {isStopping
+            ? "Stopping"
+            : runningStartup
+              ? `Starting ${runningStartup.percent}%`
+              : "Running"}
+          : {runningLabel}
         </span>
       </Link>
     ) : null
@@ -2403,6 +2418,7 @@ export default function ControlPanel() {
               <RunningCard
                 entry={runningEntry}
                 startedAt={effectiveStatus?.status === "running" ? effectiveStatus.startedAt : null}
+                startup={runningStartup}
                 stopping={isStopping}
                 busy={busy}
                 onOpen={openRunningOperation}
@@ -2501,6 +2517,7 @@ export default function ControlPanel() {
               stopping={selectedStopping}
               busy={busy}
               session={selectedLive ? effectiveStatus : null}
+              progress={selectedLive ? runProgress : null}
               host={viewerHost}
               viewerPort={viewerPort}
               vrPort={hostInfo?.vrPort ?? 8000}
@@ -2567,7 +2584,7 @@ export default function ControlPanel() {
             />
           ) : (
             <EmptyState onConnect={() => setSetupOpen(true)}>
-              Connect to the robot&apos;s computer to see its datasets.
+              Connect to the Host Computer to see its datasets.
             </EmptyState>
           ))}
 
@@ -2579,7 +2596,7 @@ export default function ControlPanel() {
 
         {view === "settings" && !connected && (
           <EmptyState onConnect={() => setSetupOpen(true)}>
-            Connect to the robot&apos;s computer to see its settings.
+            Connect to the Host Computer to see its settings.
           </EmptyState>
         )}
 

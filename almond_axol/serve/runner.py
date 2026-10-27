@@ -42,6 +42,7 @@ import threading
 import time
 from typing import Any
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
@@ -955,6 +956,7 @@ class OperationRunner:
         mantis_source = str(getattr(cfg, "mantis_source", "lighthouse"))
         manage_bridge = mantis_mode and mantis_source != "quest" and not grippers_only
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
+        session.progress = progress.begin()
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
         )
@@ -1836,6 +1838,8 @@ class OperationRunner:
         *,
         cleanup_uncertain: bool = False,
     ) -> None:
+        if session.progress is not None:
+            progress.end(session.progress)
         if cleanup_uncertain:
             # The operation could not confirm it torqued the motors off.  Do
             # not make the operator prove it by hand: look now, and only

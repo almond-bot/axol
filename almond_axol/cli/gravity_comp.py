@@ -37,6 +37,7 @@ import time
 
 import numpy as np
 
+from .. import progress
 from ..constants import ARM_JOINTS, Joint
 from ..robot import Axol
 from ..teleop.recorder import TeleopRecorder
@@ -121,9 +122,12 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
         right_channel=cfg.right_channel,
     )
 
+    progress.plan(["arms"])
+    progress.step("arms")
     async with robot as axol:
         # Axol.enable() leaves the joints in the required modes and verifies
         # the core's native feedback stream before returning.
+        progress.ready()
 
         if rec is not None:
             rec.set_engaged(True)

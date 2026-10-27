@@ -85,6 +85,17 @@ export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
+/** The startup steps an operation reports while it gets ready. Step keys
+ *  are the host's ids ("arms", "ik", ...); the panel owns their labels. */
+export interface OperationProgress {
+  steps: string[]
+  /** Index into `steps` of the step under way; -1 before the first. */
+  current: number
+  /** When the current step began, in seconds since the epoch. */
+  stepStartedAt: number | null
+  ready: boolean
+}
+
 export interface SessionInfo {
   id: string
   command: string
@@ -94,6 +105,8 @@ export interface SessionInfo {
   error: string | null
   startedAt: number
   pid: number | null
+  /** Older hosts, and operations that report no steps, leave this out. */
+  progress?: OperationProgress | null
 }
 
 /** A submitted form value; vector fields carry one entry per component

@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
@@ -2928,6 +2929,9 @@ def _run(
     # that the live streams match, so the shapes baked in here stay valid.
     dataset: "LeRobotDataset | None" = None
     resumed_dataset = False
+    # A step the run skips (no dataset, no Cartesian IK to warm up) is
+    # passed over.
+    progress.plan((["dataset"] if repo_id else []) + ["policy", "arms", "ik", "home"])
     if repo_id:
         assert recording_features is not None
         assert dataset_root is not None
@@ -2964,6 +2968,7 @@ def _run(
         from lerobot.configs.video import RGBEncoderConfig
 
         rgb_encoder = RGBEncoderConfig(vcodec=vcodec)
+        progress.step("dataset")
         if is_complete:
             from ..recording.datasets import require_dataset_resume_schema
 
@@ -3042,6 +3047,7 @@ def _run(
         # custom policy is the operator's own, already-running compatible
         # endpoint; nothing is spawned for it.
         custom_policy_url: str | None = None
+        progress.step("policy")
         if custom_policy:
             from ..policy import policy_url
 
@@ -3210,6 +3216,7 @@ def _run(
             )
 
         _logger.info("Connecting robot...")
+        progress.step("arms")
         robot.connect()
         robot_connected = True
         # The first return to rest plays unsupervised; refuse it from far away.
@@ -3228,12 +3235,15 @@ def _run(
             and getattr(cfg.robot_config, "cartesian_controller", "jax") != "mink"
         ):
             _logger.info("Preparing Cartesian action solver (IK)...")
+            progress.step("ik")
             robot.prepare_cartesian_actions()
 
         _logger.info("Returning to rest pose (through zero).")
+        progress.step("home")
         arms_moved = True
         if not _return_to_rest_guarded(startup=True):
             return
+        progress.ready()
         if not control.await_continue("Reset the scene, then start the first episode."):
             return
 

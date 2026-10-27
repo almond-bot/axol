@@ -2,10 +2,11 @@ import type { ReactNode } from "react"
 import { Link } from "react-router-dom"
 import { ArrowRight, CircleAlert, Database, Loader2, Plug, Square } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { ElapsedTime, OperationIcon } from "@/components/operation-launcher"
+import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
 import type { HardwareNotice } from "@/lib/hardware-status"
 import { STATUS_DOT_CLASS, type StatusDot } from "@/lib/jelly-view"
 import type { CatalogEntry } from "@/lib/operation-catalog"
+import type { StartupView } from "@/lib/operation-progress"
 import type { DatasetInfo, OperationId } from "@/lib/supervisor"
 import { cn } from "@/lib/utils"
 
@@ -37,6 +38,7 @@ export function ConnectHero({ failed, onConnect }: { failed: boolean; onConnect:
 export function RunningCard({
   entry,
   startedAt,
+  startup,
   stopping,
   busy,
   onOpen,
@@ -44,6 +46,8 @@ export function RunningCard({
 }: {
   entry: CatalogEntry
   startedAt: number | null
+  /** What it is doing while it starts; null once ready. */
+  startup: StartupView | null
   stopping: boolean
   busy: boolean
   onOpen: () => void
@@ -54,21 +58,27 @@ export function RunningCard({
       <OperationIcon entry={entry} running />
       <div className="min-w-0 flex-1">
         <p className="truncate font-heading text-base font-semibold text-white">{entry.label}</p>
-        <p className="text-sm text-emerald-200/80">
-          {stopping ? (
-            "Stopping…"
-          ) : (
-            <>
-              Running
-              {startedAt != null && (
-                <>
-                  {" · "}
-                  <ElapsedTime startedAt={startedAt} />
-                </>
-              )}
-            </>
-          )}
-        </p>
+        {startup && !stopping ? (
+          <div className="mt-2 max-w-md">
+            <StartupBar view={startup} />
+          </div>
+        ) : (
+          <p className="text-sm text-emerald-200/80">
+            {stopping ? (
+              "Stopping…"
+            ) : (
+              <>
+                Running
+                {startedAt != null && (
+                  <>
+                    {" · "}
+                    <ElapsedTime startedAt={startedAt} />
+                  </>
+                )}
+              </>
+            )}
+          </p>
+        )}
       </div>
       <div className="flex items-center gap-2">
         <Button variant="outline" onClick={onOpen}>

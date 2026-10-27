@@ -47,6 +47,7 @@ from typing import Any
 
 import numpy as np
 
+from .. import progress
 from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, GRIPPER_TIP_OFFSET
 from ..kinematics.config import KinematicsConfig
 from ..robot.base import RobotBase
@@ -963,7 +964,12 @@ async def _session(
             right_channel=cfg.right_channel,
         )
 
+    progress.plan(["arms"])
+    progress.step("arms")
     async with robot:
+        # Teaching starts right away; playback says on its own screen while
+        # it waits for the IK solver.
+        progress.ready()
         session = _Session(cfg, robot, control, stop_event)
         try:
             await session.run()

@@ -94,6 +94,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
@@ -1428,6 +1429,16 @@ def _run(
         # survives. Repair only after the full schema proves this is the
         # current run's intended dataset.
         check_resume_consistency(dataset_root)
+    # A remote policy warms the reset IK worker before the arms connect; a
+    # local one waits for it while moving to the start pose.
+    homes = cfg.home_on_start or not cfg.start_from_current_pose
+    progress.plan(
+        ["policy", "cameras"]
+        + (["ik_reset"] if remote_policy else [])
+        + ["arms", "headset", "ik", "dataset"]
+        + (["home"] if homes else [])
+    )
+    progress.step("policy")
     if remote_policy:
         from ..policy.plan_client import policy_url
         from ..policy.plan_dagger import PlanDaggerPolicy
@@ -1502,6 +1513,7 @@ def _run(
         # (mux only) and a second ring branch, decimated to --policy_fps,
         # gives this policy process readable frames; without gst's shm plugin
         # both fall back to pyshm.
+        progress.step("cameras")
         relay = _start_video_relay(
             cfg,
             dataset_resolution,
@@ -1743,6 +1755,7 @@ def _run(
             # consumes this handshake. Always prove reset/parking readiness
             # before enabling motors, including quit before the first episode.
             _logger.info("Waiting for the collision-aware reset worker...")
+            progress.step("ik_reset")
             if not reset_controller.wait_ready(stopped=stop_event.is_set):
                 return
             if cfg.robot_config.cartesian_actions:
@@ -1751,6 +1764,7 @@ def _run(
                 # policy dispatch cannot stall an armed control loop.
                 robot.prepare_cartesian_actions()
         _logger.info("Connecting robot...")
+        progress.step("arms")
         robot.connect()
         robot_connected = True
         if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
@@ -1793,6 +1807,7 @@ def _run(
         # this process. Mirrors collect-data.
         if is_complete:
             _logger.info(f"Resuming existing dataset at {dataset_root}.")
+        progress.step("dataset")
         recorder = DatasetRecorderProcess(
             raw_cond=relay.raw_cond,
             raw_meta=relay.raw_meta,
@@ -1824,6 +1839,7 @@ def _run(
 
         if cfg.home_on_start or not cfg.start_from_current_pose:
             _logger.info("Returning to rest pose (through zero).")
+            progress.step("home")
             if not _return_to_rest_guarded(_gate_retry, startup=True):
                 return
         else:
@@ -1846,6 +1862,7 @@ def _run(
             teleop.send_feedback_episode(episode_idx + 1)
             control.note_episode(episode_idx + 1)
             control.begin_gate(_idle_gate_message())
+            progress.ready()
             # Drop events latched during the reset/save phase so a stale
             # record press can't auto-start the episode, then arm the
             # grips + reset button for between-episode scene-reset teleop.
