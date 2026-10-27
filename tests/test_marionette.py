@@ -1,8 +1,11 @@
-"""Marionette teleoperation: phone state, the clutch and gates, the session."""
+"""Marionette teleoperation: Axol's meanings, the arm's filter and reach,
+the cameras, and sim sessions against the real bundled gateway driven by
+scripted phones (``marionette.testing``)."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -11,39 +14,34 @@ from typing import Any
 from unittest.mock import patch
 
 import numpy as np
-from scipy.spatial.transform import Rotation
+from marionette import Phone, RobotLink
+from marionette.phones import Pose
+from marionette.teleop import camera_frame, exp_rotation, rotation_vector
+from marionette.testing import Gateway, SimPhone, msg
 
 from almond_axol.jog.backends import SimBackend
 from almond_axol.jog.session import JogError, active_session
-from almond_axol.kinematics.arm_ik import exp_rotation, rotation_vector
+from almond_axol.marionette import phones as meaning
 from almond_axol.marionette.cameras import (
     CameraHub,
     SyntheticCameraSource,
     encode_jpeg,
     streams_for_view,
 )
-from almond_axol.marionette.gateway import GatewayClient, gateway_url
-from almond_axol.marionette.phones import (
-    DEADMAN,
-    Phone,
-    PhonePose,
-    PhoneTracker,
-    parse_stick,
+from almond_axol.marionette.session import (
+    DUPLICATE,
+    SCREEN,
+    MarionetteSession,
 )
-from almond_axol.marionette.session import MarionetteSession
-from almond_axol.marionette.teleop import (
-    ArmTeleop,
-    TeleopLimits,
-    camera_frame,
-    gate_reason,
-    map_target,
-    owners,
-    unwrap_turn,
-)
+from almond_axol.marionette.teleop import ArmTeleop, TeleopLimits, gate_reason
 
 # A camera looking along Axol's left (+y), upright: the image's right is
 # Axol's forward and its down is Axol's down (ROS optical axes as columns).
 _LOOKING_LEFT = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
+# The screen's layout, as the gateway relays it.
+_CONTROLS = json.loads(
+    SCREEN.read_text().split('id="marionette-config">', 1)[1].split("</script>", 1)[0]
+)["controls"]
 
 
 def _pose(
@@ -55,258 +53,112 @@ def _pose(
     calibration: str = "guided-v2:1",
     session: str = "s1",
     received: float | None = None,
-) -> PhonePose:
-    return PhonePose(
-        np.asarray(position, float),
-        exp_rotation(np.asarray(rotvec, float)),
-        tracking,
-        source,
-        True,
-        calibration,
-        session,
-        time.monotonic() if received is None else received,
+    seq: int = 0,
+) -> Pose:
+    rotation = exp_rotation(np.asarray(rotvec, float))
+    return Pose(
+        position=np.asarray(position, float),
+        rotation=rotation,
+        quaternion=np.zeros(4),
+        tracking=tracking,
+        source=source,
+        heartbeat=True,
+        calibration=calibration,
+        session=session,
+        seq=seq,
+        received=time.monotonic() if received is None else received,
+        stamp=seq / 60.0,
     )
 
 
 def _phone(pid: str = "phone-1", arm: str = "left", **pose: Any) -> Phone:
     phone = Phone(pid, pid.replace("phone-", "Phone "), connected=True)
+    phone.calibration = "captured"
     phone.values["arm.select"] = arm
     phone.pose = _pose(**pose)
     return phone
 
 
-class GatewayAddressTest(unittest.TestCase):
-    def test_addresses_like_the_app(self) -> None:
-        self.assertEqual(gateway_url("192.168.1.20"), "ws://192.168.1.20:8787/ws")
-        self.assertEqual(gateway_url("localhost:18787"), "ws://localhost:18787/ws")
-        self.assertEqual(gateway_url("wss://Robot.local"), "wss://robot.local:8787/ws")
-        self.assertEqual(gateway_url("http://10.0.0.2:9000/"), "ws://10.0.0.2:9000/ws")
-        for bad in ("", "not an address!", "host:70000"):
-            with self.assertRaises(ValueError):
-                gateway_url(bad)
+class MeaningsTest(unittest.TestCase):
+    """What Axol reads from a phone, folded by Marionette's tracker."""
 
-    def test_stick_samples_are_parsed_and_kept_in_the_circle(self) -> None:
-        self.assertEqual(parse_stick({"x": 0.5, "y": -0.25}), (0.5, -0.25))
-        x, y = parse_stick({"x": 3, "y": 4})
-        self.assertAlmostEqual(math.hypot(x, y), 1.0)
-        for bad in (
-            None,
-            1.0,
-            "1,0",
-            {"x": 1},
-            {"x": "a", "y": 0},
-            {"x": math.inf, "y": 0},
-        ):
-            self.assertIsNone(parse_stick(bad))
-
-
-class PhoneTrackerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.now = 100.0
-        self.tracker = PhoneTracker(clock=lambda: self.now)
+        self.tracker = meaning.PhoneTracker(clock=lambda: self.now, mirror="allow")
         self.tracker.apply(
-            {
-                "type": "config",
-                "phones": [{"id": "phone-1", "name": "Phone 1", "connected": True}],
-                "phone": {
-                    "id": "phone-1",
-                    "name": "Phone 1",
-                    "color": "#c98200",
-                    "connected": True,
-                },
-                "controls": [
-                    {
-                        "id": "arm",
-                        "type": "select",
-                        "action": "arm.select",
-                        "value": "right",
-                    },
-                    {
-                        "id": "estop",
-                        "type": "toggle",
-                        "action": "safety.estop",
-                        "value": False,
-                    },
-                    {
-                        "id": "deadman",
-                        "type": "button",
-                        "action": "teleop.deadman",
-                        "hold": True,
-                        "held": False,
-                    },
-                ],
-                "calibration": {"status": "captured", "epoch": 2},
-            }
+            msg.config(
+                ["phone-1"], "phone-1", _CONTROLS, {"status": "captured", "epoch": 2}
+            )
         )
 
     def phone(self) -> Phone:
-        return self.tracker.snapshot()["phone-1"]
+        phone = self.tracker.get("phone-1")
+        assert phone is not None
+        return phone
 
     def input(self, action: str, value: Any = None, **extra: Any) -> None:
-        self.tracker.apply(
-            {
-                "type": "input",
-                "phoneId": "phone-1",
-                "action": action,
-                "value": value,
-                **extra,
-            }
-        )
+        self.tracker.apply(msg.input("phone-1", action, value, **extra))
 
-    def test_config_sets_values_and_calibration(self) -> None:
+    def test_values_and_their_defaults(self) -> None:
         phone = self.phone()
-        self.assertTrue(phone.connected)
-        self.assertEqual(phone.arm, "right")
-        self.assertFalse(phone.stop)
-        self.assertEqual((phone.calibration, phone.epoch), ("captured", 2))
-
-    def test_pose_parsing(self) -> None:
-        quat = Rotation.from_rotvec([0, 0, 0.3]).as_quat()
-        self.tracker.apply(
-            {
-                "type": "pose",
-                "phoneId": "phone-1",
-                "position": {"x": 0.1, "y": 0.2, "z": 0.3},
-                "rotation": dict(zip("xyzw", quat, strict=True)),
-                "trackingState": "normal",
-                "source": "arkit",
-                "heartbeat": True,
-                "calibrationVersion": "guided-v2:2",
-                "sessionId": "s1",
-            }
+        self.assertEqual(
+            (meaning.arm(phone), meaning.frame(phone), meaning.view(phone)),
+            ("left", "axol", "head"),
         )
-        pose = self.phone().pose
-        assert pose is not None
-        np.testing.assert_allclose(pose.position, [0.1, 0.2, 0.3])
-        np.testing.assert_allclose(
-            rotation_vector(pose.rotation), [0, 0, 0.3], atol=1e-9
-        )
-        self.assertEqual(pose.received, self.now)
-        # A heartbeat-false pose (the gateway's watchdog) drops it.
-        self.tracker.apply(
-            {
-                "type": "pose",
-                "phoneId": "phone-1",
-                "position": {"x": 0, "y": 0, "z": 0},
-                "rotation": {"x": 0, "y": 0, "z": 0, "w": 1},
-                "trackingState": "unavailable",
-                "heartbeat": False,
-            }
-        )
-        self.assertIsNone(self.phone().pose)
-
-    def test_deadman_presses_renewals_and_releases(self) -> None:
-        self.input("teleop.deadman", True)
-        phone = self.phone()
-        self.assertEqual((phone.deadman_down, phone.deadman_presses), (True, 1))
-        self.now += 0.5
-        self.input("teleop.deadman", True, renew=True)
-        self.assertEqual(self.phone().holds[DEADMAN].at, self.now)
-        self.assertEqual(self.phone().deadman_presses, 1)
-        self.assertTrue(self.phone().deadman_live(self.now + 0.5, 0.6))
-        self.assertFalse(self.phone().deadman_live(self.now + 0.7, 0.6))
-        # A release the gateway inferred counts like the phone's own.
-        self.input("teleop.deadman", False, source="gateway", reason="renewals stopped")
-        self.assertFalse(self.phone().deadman_down)
-        # A renewal never restarts a hold.
-        self.input("teleop.deadman", True, renew=True)
-        self.assertFalse(self.phone().deadman_down)
-        self.input("teleop.deadman", True)
-        self.assertEqual(self.phone().deadman_presses, 2)
-
-    def test_gateway_hold_state_ends_a_hold(self) -> None:
-        self.input("teleop.deadman", True)
-        self.tracker.apply(
-            {
-                "type": "config",
-                "phones": [],
-                "phone": {"id": "phone-1", "connected": True},
-                "controls": [
-                    {
-                        "id": "deadman",
-                        "type": "button",
-                        "action": "teleop.deadman",
-                        "held": False,
-                    }
-                ],
-            }
-        )
-        self.assertFalse(self.phone().deadman_down)
-
-    def test_stop_grip_and_slider_inputs(self) -> None:
-        self.input("safety.estop", True)
-        self.assertTrue(self.phone().stop)
-        self.input("gripper.set", 0.4, live=True)
-        self.input("gripper.set", 0.4, live=True, renew=True)  # a resting finger
-        self.input("gripper.set", 7)
-        phone = self.phone()
-        self.assertEqual((phone.grip, phone.grip_seq), (1.0, 2))
+        self.assertEqual((meaning.scale(phone), meaning.speed(phone)), (1.0, 0.5))
+        self.input("arm.select", "right")
+        self.input("teleop.frame", "left")
+        self.input("teleop.frame", "sideways")  # not a frame: ignored
         self.input("base.speedLimit", 80, live=True)
         self.input("teleop.translationScale", 0.5, live=True)
-        self.assertAlmostEqual(self.phone().speed, 0.8)
-        self.assertAlmostEqual(self.phone().scale, 0.5)
+        phone = self.phone()
+        self.assertEqual((meaning.arm(phone), meaning.frame(phone)), ("right", "left"))
+        self.assertAlmostEqual(meaning.speed(phone), 0.8)
+        self.assertAlmostEqual(meaning.scale(phone), 0.5)
 
-    def test_move_in_picks_a_frame(self) -> None:
-        self.assertEqual(self.phone().frame, "axol")
-        self.input("teleop.frame", "left")
-        self.assertEqual(self.phone().frame, "left")
-        self.input("teleop.frame", "sideways")  # not a frame: ignored
-        self.assertEqual(self.phone().frame, "left")
-
-    def test_reset_presses_are_counted_per_arm(self) -> None:
-        self.input("arm.resetLeft")
-        self.input("arm.resetRight")
-        self.input("arm.resetRight")
-        self.assertEqual(self.phone().resets, {"left": 1, "right": 2})
+    def test_each_grip_request_counts_but_a_resting_finger_does_not(self) -> None:
+        self.assertEqual(meaning.grip(self.phone()), (0, 0.0))
+        self.input("gripper.set", 0.4, live=True)
+        self.input("gripper.set", 0.4, live=True, renew=True)  # a resting finger
+        self.input("gripper.set", 0.6)  # the slide ends
+        self.assertEqual(meaning.grip(self.phone()), (2, 0.6))
+        self.input("gripper.set", 1.0)  # Close gripper, twice
+        self.input("gripper.set", 1.0)
+        self.input("gripper.set", math.inf)  # malformed: ignored
+        self.assertEqual(meaning.grip(self.phone()), (4, 1.0))
 
     def test_drive_stick_turn_and_lift(self) -> None:
-        phone = self.phone()
-        self.assertEqual(phone.base_command(self.now, 0.25, 0.6), (0.0, 0.0, 0.0, 0))
+        def command(at: float) -> Any:
+            return meaning.base_command(self.phone(), at, 0.25, 0.6)
+
+        self.assertEqual(command(self.now), (0.0, 0.0, 0.0, 0))
         self.input("base.drive", {"x": 0.6, "y": -0.2}, live=True)
         self.input("base.turnLeft", True)
         self.input("lift.down", True)
-        self.assertEqual(
-            self.phone().base_command(self.now, 0.25, 0.6), (0.6, -0.2, 1.0, -1)
-        )
+        self.assertEqual(command(self.now), (0.6, -0.2, 1.0, -1))
         # A stick sample older than its timeout is a dead source.
-        self.assertIsNone(self.phone().base_command(self.now + 0.3, 0.25, 0.6))
+        self.assertIsNone(command(self.now + 0.3))
         self.now += 0.2
         self.input("base.drive", {"x": 0.6, "y": -0.2}, live=True, renew=True)
         self.input("base.turnLeft", True, renew=True)
         self.input("lift.down", True, renew=True)
-        self.assertIsNotNone(self.phone().base_command(self.now + 0.2, 0.25, 0.6))
+        self.assertIsNotNone(command(self.now + 0.2))
+        # A hold whose repeats stopped is a dead source too.
+        self.assertIsNone(command(self.now + 0.7))
         # Let go of everything: zeros, and nothing goes stale.
         self.input("base.drive", {"x": 0, "y": 0})
         self.input("base.turnLeft", False)
         self.input("lift.down", False)
-        self.assertEqual(
-            self.phone().base_command(self.now + 5, 0.25, 0.6), (0.0, 0.0, 0.0, 0)
-        )
-
-    def test_a_drag_the_gateway_ended_stays_ended_until_let_go(self) -> None:
+        self.assertEqual(command(self.now + 5), (0.0, 0.0, 0.0, 0))
+        # A drag the gateway ended stays ended until the finger lifts.
         self.input("base.drive", {"x": 1, "y": 0}, live=True)
-        self.input(
-            "base.drive", {"x": 0, "y": 0}, source="gateway", reason="samples stopped"
-        )
-        self.input("base.drive", {"x": 1, "y": 0}, live=True)  # still touching
-        self.assertEqual(self.phone().base_command(self.now, 0.25, 0.6)[:2], (0.0, 0.0))
-        self.input("base.drive", {"x": 0, "y": 0})  # let go
-        self.input("base.drive", {"x": 0.5, "y": 0}, live=True)
-        self.assertEqual(self.phone().base_command(self.now, 0.25, 0.6)[:2], (0.5, 0.0))
-
-    def test_a_malformed_value_is_ignored(self) -> None:
-        self.input("base.drive", {"x": "inf", "y": 0}, live=True)
-        self.input("gripper.set", math.inf)
-        self.assertEqual(
-            self.phone().base_command(self.now, 0.25, 0.6), (0.0, 0.0, 0.0, 0)
-        )
-        self.assertIsNone(self.phone().grip)
+        self.tracker.apply(msg.let_go("phone-1", "base.drive", {"x": 0, "y": 0}))
+        self.input("base.drive", {"x": 1, "y": 0}, live=True)
+        self.assertEqual(command(self.now)[:2], (0.0, 0.0))
 
     def test_mirror_inputs_move_nothing_on_the_robot(self) -> None:
-        robot = PhoneTracker(clock=lambda: self.now, allow_mirror=False)
-        robot.apply(
-            {"type": "config", "phones": [{"id": "phone-1", "connected": True}]}
-        )
+        robot = meaning.tracker(allow_mirror=False)
+        robot.apply(msg.config(["phone-1"], "phone-1", _CONTROLS))
         for action, value in (
             ("teleop.deadman", True),
             ("base.drive", {"x": 1, "y": 0}),
@@ -314,160 +166,28 @@ class PhoneTrackerTest(unittest.TestCase):
             ("base.turnLeft", True),
             ("arm.resetLeft", None),
         ):
-            robot.apply(
-                {
-                    "type": "input",
-                    "phoneId": "phone-1",
-                    "action": action,
-                    "value": value,
-                    "live": True,
-                    "source": "mirror",
-                }
-            )
-        phone = robot.snapshot()["phone-1"]
-        self.assertFalse(phone.deadman_down)
-        self.assertIsNone(phone.grip)
-        self.assertEqual(phone.base_command(self.now, 0.25, 0.6), (0.0, 0.0, 0.0, 0))
-        self.assertEqual(phone.resets, {"left": 0, "right": 0})
-        robot.apply(
-            {
-                "type": "input",
-                "phoneId": "phone-1",
-                "action": "safety.estop",
-                "value": True,
-                "source": "mirror",
-            }
+            robot.apply(msg.input("phone-1", action, value, live=True, source="mirror"))
+        phone = robot.get("phone-1")
+        assert phone is not None
+        self.assertFalse(phone.hold("teleop.deadman").down)
+        self.assertEqual(meaning.grip(phone)[0], 0)
+        self.assertEqual(
+            meaning.base_command(phone, time.monotonic(), 0.25, 0.6),
+            (0.0, 0.0, 0.0, 0),
         )
-        self.assertTrue(robot.snapshot()["phone-1"].stop)
-
-    def test_a_restarted_gateway_forgets_its_old_phones_but_not_a_stop(self) -> None:
-        self.tracker.apply(
-            {
-                "type": "config",
-                "sessionId": "gw-1",
-                "phones": [
-                    {"id": "phone-1", "connected": True},
-                    {"id": "phone-2", "name": "Phone 2", "connected": True},
-                ],
-            }
-        )
-        self.tracker.apply(
-            {
-                "type": "input",
-                "phoneId": "phone-2",
-                "action": "safety.estop",
-                "value": True,
-            }
-        )
-        self.tracker.lost_gateway()
-        self.tracker.apply(
-            {
-                "type": "config",
-                "sessionId": "gw-2",
-                "phones": [{"id": "phone-1", "name": "Phone 1", "connected": True}],
-            }
-        )
-        phones = self.tracker.snapshot()
-        self.assertEqual(sorted(phones), ["phone-1", "phone-2@gw-1"])
-        self.assertTrue(phones["phone-2@gw-1"].stop)
-        self.assertFalse(phones["phone-1"].stop)
-        self.tracker.clear_offline_stops()
-        self.assertEqual(sorted(self.tracker.snapshot()), ["phone-1"])
-
-    def test_disconnect_and_lost_gateway_release_everything(self) -> None:
-        self.input("teleop.deadman", True)
-        self.input("base.drive", {"x": 1, "y": 0}, live=True)
-        self.tracker.apply(
-            {"type": "config", "phones": [{"id": "phone-1", "connected": False}]}
-        )
-        phone = self.phone()
-        self.assertFalse(phone.connected or phone.deadman_down or phone.stick.live)
-        self.tracker.apply(
-            {"type": "config", "phones": [{"id": "phone-1", "connected": True}]}
-        )
-        self.input("teleop.deadman", True)
-        self.tracker.lost_gateway()
-        self.assertFalse(self.phone().connected or self.phone().deadman_down)
-
-
-class MappingTest(unittest.TestCase):
-    def test_phone_motion_moves_the_tip_by_the_same_amount_times_scale(self) -> None:
-        tip = (np.array([0.3, 0.2, 0.1]), exp_rotation(np.array([0.0, 1.0, 0.0])))
-        anchor = _pose([1.0, 2.0, 3.0], [0.0, 0.0, 0.5])
-        moved = _pose([1.1, 1.95, 3.02], [0.0, 0.0, 0.5])
-        p, r = map_target(moved, anchor, tip, scale=2.0)
-        np.testing.assert_allclose(p, [0.5, 0.1, 0.14], atol=1e-12)
-        np.testing.assert_allclose(r, tip[1], atol=1e-12)
-
-    def test_phone_rotation_turns_the_tip_about_the_same_world_axis(self) -> None:
-        tip = (np.zeros(3), exp_rotation(np.array([0.0, 1.0, 0.0])))
-        anchor = _pose(rotvec=[0.0, 0.0, 0.5])
-        turned = _pose(rotvec=[0.0, 0.0, 0.8])  # 0.3 rad more about +z
-        _, r = map_target(turned, anchor, tip, 1.0)
-        np.testing.assert_allclose(
-            rotation_vector(r @ tip[1].T), [0.0, 0.0, 0.3], atol=1e-9
-        )
-        _, half = map_target(turned, anchor, tip, 1.0, rotation_scale=0.5)
-        np.testing.assert_allclose(
-            rotation_vector(half @ tip[1].T), [0.0, 0.0, 0.15], atol=1e-9
-        )
-
-    def test_the_motion_scale_scales_turns_as_well_as_moves(self) -> None:
-        tip = (np.zeros(3), np.eye(3))
-        anchor = _pose(rotvec=[0.0, 0.0, 0.5])
-        turned = _pose([0.1, 0.0, 0.0], rotvec=[0.0, 0.0, 0.9])
-        p, r = map_target(turned, anchor, tip, 0.5)
-        np.testing.assert_allclose(p, [0.05, 0.0, 0.0], atol=1e-12)
-        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.0, 0.2], atol=1e-9)
-        _, r = map_target(turned, anchor, tip, 2.0, rotation_scale=0.5)
-        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.0, 0.4], atol=1e-9)
-
-    def test_in_a_camera_frame_forward_is_along_its_view(self) -> None:
-        to_torso = camera_frame(_LOOKING_LEFT)
-        # Forward goes where the camera looks, left to the image's left
-        # (Axol's back) and up to the image's up.
-        np.testing.assert_allclose(
-            to_torso, [[0, -1, 0], [1, 0, 0], [0, 0, 1]], atol=1e-12
-        )
-        tip = (np.array([0.3, 0.2, 0.1]), np.eye(3))
-        anchor = _pose()
-        p, _ = map_target(_pose([0.1, 0.0, 0.0]), anchor, tip, 1.0, frame=to_torso)
-        np.testing.assert_allclose(p, [0.3, 0.3, 0.1], atol=1e-12)
-        p, _ = map_target(_pose([0.0, 0.1, 0.05]), anchor, tip, 1.0, frame=to_torso)
-        np.testing.assert_allclose(p, [0.2, 0.2, 0.15], atol=1e-12)
-        # A roll about the phone's forward rolls the gripper about the view.
-        _, r = map_target(
-            _pose(rotvec=[0.2, 0.0, 0.0]), anchor, tip, 1.0, frame=to_torso
-        )
-        np.testing.assert_allclose(rotation_vector(r), [0.0, 0.2, 0.0], atol=1e-9)
-
-    def test_a_turn_past_half_a_turn_stays_continuous(self) -> None:
-        z = np.array([0.0, 0.0, 1.0])
-        np.testing.assert_allclose(unwrap_turn(0.3 * z, np.zeros(3)), 0.3 * z)
-        # 1.01 pi about +z reads as 0.99 pi about -z: followed on, not flipped.
-        flipped = rotation_vector(exp_rotation(1.01 * math.pi * z))
-        np.testing.assert_allclose(flipped, -0.99 * math.pi * z, atol=1e-9)
-        np.testing.assert_allclose(
-            unwrap_turn(flipped, 0.99 * math.pi * z), 1.01 * math.pi * z, atol=1e-9
-        )
-        # A whole turn back where it started stays a whole turn.
-        np.testing.assert_allclose(
-            unwrap_turn(np.zeros(3), 1.98 * math.pi * z), 2 * math.pi * z, atol=1e-9
-        )
+        self.assertEqual(phone.presses("arm.resetLeft"), 0)
+        robot.apply(msg.input("phone-1", "safety.estop", True, source="mirror"))
+        self.assertTrue(robot.get("phone-1").stop)  # type: ignore[union-attr]
+        # In sim a mirror acts as its phone.
+        self.assertEqual(meaning.tracker(allow_mirror=True).mirror, "allow")
 
 
 class GateTest(unittest.TestCase):
     limits = TeleopLimits()
 
-    def reason(
-        self, phone: Phone, *, sim: bool = False, now: float | None = None
-    ) -> Any:
-        return gate_reason(
-            phone,
-            time.monotonic() if now is None else now,
-            self.limits,
-            allow_synthetic=sim,
-        )
+    def reason(self, phone: Phone, **options: Any) -> Any:
+        options.setdefault("allow_synthetic", False)
+        return gate_reason(phone, time.monotonic(), self.limits, **options)
 
     def test_good_tracking_passes(self) -> None:
         self.assertIsNone(self.reason(_phone()))
@@ -477,60 +197,34 @@ class GateTest(unittest.TestCase):
         offline.connected = False
         calibrating = _phone()
         calibrating.calibration = "capturing"
-        stale = _phone(received=time.monotonic() - 1.0)
         cases = {
-            "offline": (offline, False),
-            "calibration": (calibrating, False),
-            "No pose": (stale, False),
-            "limited": (_phone(tracking="limited"), False),
-            "starting": (_phone(tracking="initializing"), False),
-            "Simulated motion": (_phone(source="synthetic"), False),
+            "offline": offline,
+            "calibration": calibrating,
+            "No pose": _phone(received=time.monotonic() - 1.0),
+            "limited": _phone(tracking="limited"),
+            "starting": _phone(tracking="initializing"),
+            "Simulated motion": _phone(source="synthetic"),
         }
-        for word, (phone, sim) in cases.items():
-            reason = self.reason(phone, sim=sim)
+        for word, phone in cases.items():
+            reason = self.reason(phone)
             self.assertIsNotNone(reason, word)
             self.assertIn(word, reason)
 
     def test_the_robot_needs_a_calibrated_phone(self) -> None:
         phone = _phone()
         phone.calibration = "uncalibrated"
-        reason = gate_reason(
-            phone,
-            time.monotonic(),
-            self.limits,
-            allow_synthetic=False,
-            require_calibration=True,
+        self.assertEqual(
+            self.reason(phone, require_calibration=True),
+            "Calibrate this phone first, facing the way Axol faces.",
         )
-        self.assertIn("Calibrate", reason)
+        phone.calibration = "capturing"
+        self.assertIn("Finish", self.reason(phone, require_calibration=True))
         phone.calibration = "captured"
-        self.assertIsNone(
-            gate_reason(
-                phone,
-                time.monotonic(),
-                self.limits,
-                allow_synthetic=False,
-                require_calibration=True,
-            )
-        )
+        self.assertIsNone(self.reason(phone, require_calibration=True))
 
     def test_synthetic_motion_is_allowed_in_sim(self) -> None:
-        self.assertIsNone(
-            self.reason(_phone(source="synthetic", tracking="limited"), sim=True)
-        )
-
-
-class OwnersTest(unittest.TestCase):
-    def test_lowest_number_then_the_engaged_phone(self) -> None:
-        one, two = _phone("phone-1"), _phone("phone-2")
-        result = owners([two, one], {"left": None, "right": None})
-        self.assertIs(result["left"], one)
-        self.assertIsNone(result["right"])
-        result = owners([one, two], {"left": "phone-2", "right": None})
-        self.assertIs(result["left"], two)
-        two.values["arm.select"] = "right"
-        result = owners([one, two], {"left": "phone-2", "right": None})
-        self.assertIs(result["left"], one)
-        self.assertIs(result["right"], two)
+        phone = _phone(source="synthetic", tracking="limited")
+        self.assertIsNone(self.reason(phone, allow_synthetic=True))
 
 
 class ArmTeleopTest(unittest.TestCase):
@@ -538,18 +232,6 @@ class ArmTeleopTest(unittest.TestCase):
         self.limits = TeleopLimits(max_speed=0.5, max_turn_rate=3.0, pose_cutoff=50.0)
         self.arm = ArmTeleop("left", self.limits, 125.0)
         self.tip = (np.array([0.3, 0.2, 0.1]), np.eye(3))
-
-    def test_presses_are_counted_once_and_never_replayed(self) -> None:
-        phone = _phone()
-        phone.holds[DEADMAN].presses = 3
-        self.assertFalse(self.arm.new_press(phone))  # first sight
-        self.assertFalse(self.arm.new_press(phone))
-        phone.holds[DEADMAN].presses = 4
-        self.assertTrue(self.arm.new_press(phone))
-        self.assertFalse(self.arm.new_press(phone))
-        phone.holds[DEADMAN].presses = 5
-        self.arm.forget_presses(phone)
-        self.assertFalse(self.arm.new_press(phone))
 
     def test_engaging_holds_the_tip_where_it_is(self) -> None:
         phone = _phone(position=[1.0, 1.0, 1.0])
@@ -562,29 +244,21 @@ class ArmTeleopTest(unittest.TestCase):
         phone = _phone()
         self.arm.engage(phone, self.tip)
         phone.pose = _pose([1.0, 0.0, 0.0], [0.0, 0.0, 1.5])
-        now = time.monotonic()
-        p, r = self.arm.target(phone, now, 0.01)
+        p, r = self.arm.target(phone, time.monotonic(), 0.01)
         self.assertLessEqual(np.linalg.norm(p - self.tip[0]), 0.5 * 0.01 + 1e-9)
         self.assertLessEqual(np.linalg.norm(rotation_vector(r)), 3.0 * 0.01 + 1e-9)
 
-    def test_anchor_is_dropped_by_a_new_session_or_calibration(self) -> None:
-        phone = _phone()
-        self.arm.engage(phone, self.tip)
-        self.assertTrue(self.arm.anchor_valid(phone))
-        phone.pose = _pose(calibration="guided-v2:2")
-        self.assertFalse(self.arm.anchor_valid(phone))
-        phone.pose = _pose(session="s2")
-        self.assertFalse(self.arm.anchor_valid(phone))
-
-    def test_a_half_scale_turn_past_half_a_turn_never_jumps(self) -> None:
+    def test_the_motion_scale_scales_moves_and_turns(self) -> None:
         phone = _phone()
         phone.values["teleop.translationScale"] = 0.5
         self.arm.engage(phone, self.tip)
         yaws = []
         for degrees in range(0, 300, 5):
-            phone.pose = _pose(rotvec=[0.0, 0.0, math.radians(degrees)])
-            _, r = self.arm._goal(phone.pose)
+            pose = _pose([0.1, 0.0, 0.0], [0.0, 0.0, math.radians(degrees)])
+            p, r = self.arm.clutch.target(pose)
             yaws.append(math.degrees(math.atan2(r[1, 0], r[0, 0])))
+        np.testing.assert_allclose(p, self.tip[0] + [0.05, 0.0, 0.0], atol=1e-12)
+        # A half-scale turn past half a turn never jumps.
         np.testing.assert_allclose(np.diff(yaws), 2.5, atol=1e-6)
         self.assertAlmostEqual(yaws[-1], 147.5, places=6)
 
@@ -592,19 +266,18 @@ class ArmTeleopTest(unittest.TestCase):
         phone = _phone()
         self.arm.engage(phone, self.tip)
         phone.pose = _pose([0.05, 0.02, 0.0], [0.0, 0.0, 0.3])
-        before = self.arm._goal(phone.pose)
+        before = self.arm.clutch.target(phone.pose)
         phone.values["teleop.translationScale"] = 0.5
         phone.values["teleop.frame"] = "left"
         self.arm.reframe(phone, camera_frame(_LOOKING_LEFT))
-        self.assertEqual(self.arm.frame, "left")
-        after = self.arm._goal(phone.pose)
+        self.arm.target(phone, time.monotonic(), 1 / 125)  # takes up the scale
+        self.assertEqual((self.arm.frame, self.arm.clutch.scale), ("left", 0.5))
+        after = self.arm.clutch.target(phone.pose)
         np.testing.assert_allclose(after[0], before[0], atol=1e-12)
         np.testing.assert_allclose(after[1], before[1], atol=1e-12)
         # From here the phone's forward moves the tip left, at half scale.
-        phone.pose = _pose([0.15, 0.02, 0.0], [0.0, 0.0, 0.3])
-        np.testing.assert_allclose(
-            self.arm._goal(phone.pose)[0] - before[0], [0.0, 0.05, 0.0], atol=1e-12
-        )
+        moved = self.arm.clutch.target(_pose([0.15, 0.02, 0.0], [0.0, 0.0, 0.3]))
+        np.testing.assert_allclose(moved[0] - before[0], [0.0, 0.05, 0.0], atol=1e-12)
 
     def test_reach_limit_needs_a_lasting_lag(self) -> None:
         phone = _phone()
@@ -616,6 +289,13 @@ class ArmTeleopTest(unittest.TestCase):
         self.assertTrue(self.arm.limited)
         self.arm.note_tip(self.tip, 10.5)
         self.assertFalse(self.arm.limited)
+
+    def test_jumps_use_axols_limits(self) -> None:
+        jumps = self.arm.jumps
+        self.assertEqual(
+            (jumps.distance, jumps.angle, jumps.speed, jumps.turn_speed),
+            (0.04, 0.5, 4.0, 20.0),
+        )
 
 
 class CameraHubTest(unittest.TestCase):
@@ -662,13 +342,18 @@ class CameraHubTest(unittest.TestCase):
         finally:
             hub.stop()
 
-    def test_only_watched_streams_are_encoded(self) -> None:
+    def test_only_watched_streams_are_grabbed_and_jpeg_only_when_wanted(self) -> None:
         hub = CameraHub(SyntheticCameraSource(), fps=30, width=160, quality=50)
         hub.start()
         try:
-            hub.want("page", ["left", "bogus"])
+            hub.want("video", ["left", "bogus"], jpeg=False)
+            self.assertTrue(_wait(lambda: hub.latest_rgb("left") is not None))
+            frame = hub.latest_rgb("left")
+            self.assertEqual((frame.rgb.shape, frame.jpeg), ((90, 160, 3), None))
+            self.assertIsNone(hub.latest("left"))  # nobody wants it as JPEG
+            self.assertIsNone(hub.latest_rgb("head"))
+            hub.want("page", ["left"])
             self.assertTrue(_wait(lambda: hub.latest("left") is not None))
-            self.assertIsNone(hub.latest("head"))
             first = hub.latest("left")
             self.assertTrue(_wait(lambda: hub.latest("left").seq != first.seq))
             self.assertEqual(hub.describe()["source"], "synthetic")
@@ -718,8 +403,9 @@ class ZedSourceTest(unittest.TestCase):
         self.assertEqual(spec["head"]["record_eyes"], ["left"])
         self.assertFalse(spec["left"]["stream"])
         self.assertEqual(spec["left"]["fps"], 60)
-        frames = source.grab(["head", "left"], 320, 60)
+        frames = source.grab(["head", "left"], 320)
         self.assertEqual(set(frames), {"head", "left"})
+        self.assertEqual(frames["head"].shape, (200, 320, 3))
         source.stop()
         self.assertTrue(made[0].closed)
 
@@ -733,9 +419,11 @@ class ZedSourceTest(unittest.TestCase):
             def start(self) -> None: ...
             def stop(self) -> None: ...
 
-            def grab(self, streams: Any, width: int, quality: int) -> dict[str, bytes]:
+            def grab(self, streams: Any, width: int) -> dict[str, np.ndarray]:
                 Once.calls += 1
-                return {"head": b"jpeg"} if Once.calls == 1 else {}
+                return (
+                    {"head": np.zeros((9, 16, 3), np.uint8)} if Once.calls == 1 else {}
+                )
 
         with patch("almond_axol.marionette.cameras.STALE_S", 0.3):
             hub = CameraHub(Once(), fps=30)
@@ -773,223 +461,228 @@ def _planner() -> Any:
     return _PLANNER[0]
 
 
-class FakePhone:
-    """A phone as the gateway relays it: config, a 60 Hz pose, presses."""
-
-    def __init__(self, session: MarionetteSession, pid: str, arm: str = "left") -> None:
-        self.session = session
-        self.id = pid
-        self.name = pid.replace("phone-", "Phone ")
-        self.values: dict[str, Any] = {"arm.select": arm, "safety.estop": False}
-        self.position = np.zeros(3)
-        self.rotvec = np.zeros(3)
-        self.tracking = "normal"
-        self.calibration = "guided-v2:1"
-        self.held = False
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._stream, daemon=True)
-
-    def apply(self, message: dict[str, Any]) -> None:
-        self.session._tracker.apply(message)
-
-    def connect(self) -> FakePhone:
-        self.config()
-        self._thread.start()
-        return self
-
-    def config(self, connected: bool = True) -> None:
-        info = {
-            "id": self.id,
-            "name": self.name,
-            "connected": connected,
-            "sessionId": "s1",
-        }
-        self.apply(
-            {
-                "type": "config",
-                "phones": [info],
-                "phone": info,
-                "controls": [
-                    {"id": k, "type": "select", "action": k, "value": v}
-                    for k, v in self.values.items()
-                ],
-                "calibration": {"status": "captured", "epoch": 1},
-            }
-        )
-
-    def glide(self, position: Any, seconds: float = 0.5) -> None:
-        """Move like a hand: a straight line at the pose rate."""
-        start, end = self.position.copy(), np.asarray(position, float)
-        steps = max(1, round(seconds * 60))
-        for i in range(1, steps + 1):
-            self.position = start + (end - start) * i / steps
-            time.sleep(1 / 60)
-
-    def set(self, action: str, value: Any) -> None:
-        self.values[action] = value
-        self.config()
-
-    def act(self, action: str, value: Any = None, **extra: Any) -> None:
-        self.apply(
-            {
-                "type": "input",
-                "phoneId": self.id,
-                "action": action,
-                "value": value,
-                **extra,
-            }
-        )
-
-    def press(self) -> None:
-        self.held = True
-        self.act("teleop.deadman", True)
-
-    def release(self) -> None:
-        self.held = False
-        self.act("teleop.deadman", False)
-
-    def close(self) -> None:
-        self._stop.set()
-        self._thread.join(2)
-
-    def _stream(self) -> None:
-        tick = 0
-        while not self._stop.wait(1 / 60):
-            quat = Rotation.from_rotvec(self.rotvec).as_quat()
-            self.apply(
-                {
-                    "type": "pose",
-                    "phoneId": self.id,
-                    "position": dict(zip("xyz", self.position, strict=True)),
-                    "rotation": dict(zip("xyzw", quat, strict=True)),
-                    "trackingState": self.tracking,
-                    "source": "arkit",
-                    "heartbeat": True,
-                    "calibrationVersion": self.calibration,
-                    "sessionId": "s1",
-                }
-            )
-            tick += 1
-            if self.held and tick % 12 == 0:
-                self.act("teleop.deadman", True, renew=True)
+def _screen(phone: SimPhone) -> dict[str, Any]:
+    """What Axol's screen reads: Axol's state with this phone's over it."""
+    states = [m for m in phone.robot_states if m.get("robotId") == "axol"]
+    shared = next((m["state"] for m in reversed(states) if "phoneId" not in m), {})
+    own = next(
+        (m["state"] for m in reversed(states) if m.get("phoneId") == phone.phone_id),
+        {},
+    )
+    return {**shared, **own}
 
 
-async def _idle(*_: Any) -> None:
-    await asyncio.Event().wait()
+def _notices(phone: SimPhone) -> list[str]:
+    return [
+        s.get("message", "")
+        for s in phone.statuses
+        if s.get("controlId") == "robot.notice"
+    ]
 
 
 class MarionetteSessionTest(unittest.TestCase):
+    """A sim session against the real gateway, driven by scripted phones."""
+
     def setUp(self) -> None:
+        self.phones: list[SimPhone] = []
+        self.gateway: Gateway | None = None
+        self.thread: threading.Thread | None = None
+        self.stop = threading.Event()
+
+    def start(self, cameras: CameraHub | None = None, **gateway: Any) -> None:
+        self.gateway = Gateway(**gateway).start()
         self.backend = SimBackend("mobile")
         planner = _planner()
-        self.sent: list[tuple[Any, ...]] = []
-        with patch.object(GatewayClient, "run", _idle):
-            self.session = MarionetteSession(
-                self.backend, lambda: planner, gateway="localhost:18999"
-            )
-        self.session._link.connected = True
-        self.session._link.send_status = lambda *a, **k: self.sent.append(a)  # type: ignore[method-assign]
-        self.phones: list[FakePhone] = []
-        self.stop = threading.Event()
-        with patch.object(GatewayClient, "run", _idle):
-            self.thread = threading.Thread(
-                target=lambda: asyncio.run(self.session.run(self.stop)), daemon=True
-            )
-            self.thread.start()
-            self.assertTrue(_wait(lambda: active_session() is self.session))
+        self.session = MarionetteSession(
+            self.backend,
+            lambda: planner,
+            gateway=self.gateway.address,
+            cameras=cameras,
+        )
+        self.thread = threading.Thread(
+            target=lambda: asyncio.run(self.session.run(self.stop)), daemon=True
+        )
+        self.thread.start()
+        self.assertTrue(_wait(lambda: active_session() is self.session))
         self.assertTrue(_wait(lambda: self.session.state()["ready"], 30))
+        self.assertTrue(_wait(lambda: self.gateway_state()["connected"]))
 
     def tearDown(self) -> None:
         for phone in self.phones:
             phone.close()
         self.stop.set()
-        self.thread.join(10)
-        self.assertIsNone(active_session())
+        if self.thread is not None:
+            self.thread.join(15)
+            self.assertIsNone(active_session())
+        if self.gateway is not None:
+            self.gateway.close()
 
-    def phone(self, pid: str = "phone-1", arm: str = "left") -> FakePhone:
-        phone = FakePhone(self.session, pid, arm).connect()
+    def phone(self, arm: str = "left") -> SimPhone:
+        """A phone held level, uncalibrated (its forward is Axol's), on ``arm``."""
+        phone = SimPhone(self.gateway, heading=0).connect()
         self.phones.append(phone)
+        if arm != "left":
+            phone.set("arm.select", arm)
         self.assertTrue(
-            _wait(lambda: self.arm_state(arm)["owner"] is not None or pid != "phone-1")
+            _wait(
+                lambda: any(
+                    p["id"] == phone.phone_id
+                    and p["arm"] == arm
+                    and p["tracking"] == "normal"
+                    for p in self.session.state()["marionette"]["phones"]
+                )
+            )
         )
-        time.sleep(0.05)  # the arm has seen the phone (and its press count)
+        time.sleep(0.05)  # the arms have seen the phone (and its press count)
         return phone
+
+    def gateway_state(self) -> dict[str, Any]:
+        return self.session.state()["marionette"]["gateway"]
 
     def arm_state(self, side: str = "left") -> dict[str, Any]:
         return self.session.state()["marionette"]["arms"][side]
 
     def tip(self, side: str = "left") -> np.ndarray:
-        planner = _planner()
         q = self.session.current_q()
-        return planner.kinematics.tip(q, side)[0]
+        return _planner().kinematics.tip(q, side)[0]
+
+    def press(self, phone: SimPhone) -> None:
+        phone.press("teleop.deadman")
+
+    def release(self, phone: SimPhone) -> None:
+        phone.release("teleop.deadman")
+
+    def engage(self, phone: SimPhone) -> None:
+        self.press(phone)
+        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+
+    def test_the_screen_comes_from_axol_and_state_has_real_types(self) -> None:
+        self.start()
+        phone = self.phone()
+        self.assertTrue(_wait(lambda: phone.html is not None))
+        html = phone.html
+        self.assertEqual(html["source"], {"kind": "robot", "robotId": "axol"})
+        self.assertEqual(html["title"], "Axol")
+        self.assertEqual(html["orientation"], "portrait")
+        self.assertIn("window.MarionetteKit", html["html"])  # the kit, inlined
+        self.assertNotIn('<script src="marionette-kit.js"></script>', html["html"])
+        robots = {r["id"]: r for r in (phone.config or {}).get("robots", [])}
+        self.assertEqual(
+            (robots["axol"]["name"], robots["axol"]["connected"]), ("Axol", True)
+        )
+        self.assertTrue(
+            _wait(lambda: "arm" in _screen(phone) and "frames" in _screen(phone))
+        )
+        state = _screen(phone)
+        self.assertEqual(
+            (state["mode"], state["arm"], state["state"]), ("sim", "left", "idle")
+        )
+        self.assertEqual(state["frames"], ["axol", "head", "left", "right"])
+        self.assertEqual(state["streams"], [])  # this session has no cameras
+        self.assertEqual(set(state["lift"]), {"raised", "moving"})
+        self.assertEqual(state["base"], {"moving": False, "fault": False})
+        # The simulated Jelly has no battery: unknown, not a number.
+        self.assertIsNone(state["battery"])
+        self.assertIsNone(state["owner"])
+        self.assertIsNone(state["reason"])
+        every = {m.get("everyMs") for m in phone.robot_states}
+        self.assertEqual(every, {200})
+        self.backend.battery_state = lambda: {  # type: ignore[method-assign]
+            "percent": 62.6,
+            "charging": False,
+            "underLoad": True,
+        }
+        self.assertTrue(
+            _wait(
+                lambda: _screen(phone)["battery"]
+                == {"percent": 63, "charging": False, "underLoad": True}
+            )
+        )
+        # A reading that isn't a number is unknown; the state keeps flowing.
+        self.backend.battery_state = lambda: {  # type: ignore[method-assign]
+            "percent": math.nan,
+            "charging": False,
+            "underLoad": False,
+        }
+        self.assertTrue(_wait(lambda: _screen(phone)["battery"] is None))
 
     def test_the_arm_follows_only_while_the_pad_is_held(self) -> None:
+        self.start()
         phone = self.phone()
         start = self.tip()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.engage(phone)
         np.testing.assert_allclose(self.tip(), start, atol=1e-4)  # no jump
-        phone.glide([0.06, -0.03, 0.04])
+        self.assertTrue(_wait(lambda: _screen(phone)["engaged"] is True))
+        phone.move_by((0.06, -0.03, 0.04), seconds=0.5)
         self.assertTrue(
             _wait(
                 lambda: np.linalg.norm(self.tip() - start - [0.06, -0.03, 0.04]) < 0.004
             )
         )
-        phone.release()
+        self.release(phone)
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         held = self.tip()
-        phone.position = np.zeros(3)
+        phone.move_to((0.0, 0.0, 0.0), seconds=0.3)
         time.sleep(0.3)
         np.testing.assert_allclose(self.tip(), held, atol=1e-5)
 
     def test_scale_multiplies_the_motion(self) -> None:
+        self.start()
         phone = self.phone()
         phone.set("teleop.translationScale", 0.5)
+        self.assertTrue(
+            _wait(
+                lambda: self.session.state()["marionette"]["phones"][0]["scale"] == 0.5
+            )
+        )
         start = self.tip()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.glide([0.08, 0.0, 0.0])
+        self.engage(phone)
+        phone.move_by((0.08, 0.0, 0.0), seconds=0.5)
         self.assertTrue(
             _wait(lambda: np.linalg.norm(self.tip() - start - [0.04, 0.0, 0.0]) < 0.003)
         )
 
     def test_renewals_stopping_releases_the_arm(self) -> None:
+        # The gateway waits longer than Axol here, so Axol's own check acts.
+        self.start(env={"MARIONETTE_HOLD_TIMEOUT_MS": "5000"})
         phone = self.phone()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.held = False  # the pad stays down but its renewals stop
+        self.engage(phone)
+        phone.pause_renewals()  # the pad stays down but its renewals stop
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"], 2.0))
         self.assertIn("connection dropped", self.arm_state()["reason"])
+        self.assertTrue(
+            _wait(lambda: "connection dropped" in (_screen(phone)["reason"] or ""))
+        )
 
     def test_bad_tracking_or_recalibration_releases_and_needs_a_new_press(self) -> None:
+        self.start()
         phone = self.phone()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.tracking = "limited"
+        self.engage(phone)
+        phone.tracking("limited")
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         self.assertIn("limited", self.arm_state()["reason"])
-        phone.tracking = "normal"
+        phone.tracking("normal")
         time.sleep(0.2)
         self.assertFalse(self.arm_state()["engaged"])  # still held, no new press
-        phone.release()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.calibration = "guided-v2:2"
+        self.release(phone)
+        self.engage(phone)
+        phone.quick_origin()
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         self.assertIn("Tracking restarted", self.arm_state()["reason"])
 
     def test_stop_on_any_phone_or_the_desktop_holds_everything(self) -> None:
-        one = self.phone("phone-1", "left")
-        two = self.phone("phone-2", "right")
-        one.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.start()
+        one = self.phone("left")
+        two = self.phone("right")
+        self.engage(one)
         two.set("safety.estop", True)
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         stop = self.session.state()["marionette"]["stop"]
         self.assertEqual((stop["on"], stop["by"]), (True, "Phone 2"))
         self.assertIn("Stopped by Phone 2", self.arm_state()["reason"])
-        one.release()
-        one.press()
+        self.assertTrue(_wait(lambda: _screen(one).get("stopBy") == "Phone 2"))
+        self.release(one)
+        self.press(one)
         time.sleep(0.2)
         self.assertFalse(self.arm_state()["engaged"])
         two.set("safety.estop", False)
@@ -1001,141 +694,129 @@ class MarionetteSessionTest(unittest.TestCase):
         )
         time.sleep(0.2)
         self.assertFalse(self.arm_state()["engaged"])  # the pad must be pressed again
-        one.release()
-        one.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.release(one)
+        self.engage(one)
 
     def test_two_phones_on_one_arm(self) -> None:
-        one = self.phone("phone-1", "left")
-        two = self.phone("phone-2", "left")
-        self.assertEqual(self.arm_state()["owner"], "phone-1")
-        two.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["owner"] == "phone-2"))
+        self.start()
+        one = self.phone("left")
+        two = self.phone("left")
+        self.assertEqual(self.arm_state()["owner"], one.phone_id)
+        self.press(two)
+        self.assertTrue(_wait(lambda: self.arm_state()["owner"] == two.phone_id))
         self.assertTrue(self.arm_state()["engaged"])
-        one.press()
+        self.press(one)
         time.sleep(0.2)
-        self.assertEqual(self.arm_state()["owner"], "phone-2")
-        feedback = self.session._feedback(
-            self.session._tracker.snapshot()["phone-1"],
-            self.session._tracker.snapshot(),
-            time.monotonic(),
-        )
-        self.assertEqual(feedback["owner"], "Phone 2")
-        self.assertIn("Phone 2 is moving the left arm", feedback["reason"])
+        self.assertEqual(self.arm_state()["owner"], two.phone_id)
+        self.assertTrue(_wait(lambda: _screen(one)["owner"] == "Phone 2"))
+        self.assertIn("Phone 2 is moving the left arm", _screen(one)["reason"])
+        self.assertEqual(_screen(one)["state"], "blocked")
+        self.assertIsNone(_screen(two)["owner"])
 
     def test_grip_follows_the_owner_but_not_a_stale_request(self) -> None:
-        one = self.phone("phone-1", "left")
-        one.act("gripper.set", 0.0)
+        self.start()
+        one = self.phone("left")
+        one.set("gripper.set", 0.0)
         self.assertTrue(_wait(lambda: self.arm_state()["grip"] == 0.0))
-        one.act("gripper.set", 0.7)
+        one.drag("gripper.set", [0.3, 0.5, 0.7])
         self.assertTrue(_wait(lambda: abs(self.arm_state()["grip"] - 0.7) < 1e-6))
-        two = self.phone("phone-2", "right")
-        two.act("gripper.set", 0.0)  # made while it had the right arm
+        self.assertTrue(_wait(lambda: abs(_screen(one)["grip"] - 0.7) < 1e-6))
+        two = self.phone("right")
+        two.set("gripper.set", 0.0)  # made while it had the right arm
         time.sleep(0.1)
         one.set("arm.select", "right")
         two.set("arm.select", "left")
         time.sleep(0.3)
         # Phone 2 has the left arm now; its old request doesn't open it.
-        self.assertEqual(self.arm_state()["owner"], "phone-2")
+        self.assertEqual(self.arm_state()["owner"], two.phone_id)
         self.assertAlmostEqual(self.arm_state()["grip"], 0.7)
 
-    def stream_stick(
-        self, phone: FakePhone, x: float, y: float, seconds: float
-    ) -> None:
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
-            phone.act("base.drive", {"x": x, "y": y}, live=True)
-            time.sleep(0.05)
-
     def test_phone_drive_and_stop(self) -> None:
+        self.start()
         phone = self.phone()
-        self.stream_stick(phone, 1.0, 0.0, 1.0)
+        phone.stick(1.0, 0.0)
+        time.sleep(1.0)
         state = self.session.state()
         self.assertGreater(state["base"]["x"], 0.05)
         self.assertTrue(state["marionette"]["phones"][0]["driving"])
+        self.assertTrue(_wait(lambda: _screen(phone)["driving"] is True))
+        self.assertEqual(_screen(phone)["driver"], "Phone 1")
         # Let go: the phone stays a live zero source, so the base ramps down
         # under a live hold instead of going dead.
-        phone.act("base.drive", {"x": 0, "y": 0})
+        phone.let_go("base.drive")
         time.sleep(0.5)
         state = self.session.state()
         self.assertTrue(state["hold"]["active"])
         self.assertEqual(state["hold"]["drive"], [0.0, 0.0, 0.0])
         # A stick that goes quiet while touched stops everything.
-        phone.act("base.drive", {"x": 1, "y": 0}, live=True)
+        phone.stick(1.0, 0.0)
         self.assertTrue(_wait(lambda: self.session.state()["base"]["moving"]))
-        self.assertTrue(_wait(lambda: not self.session.state()["hold"]["active"], 1.0))
-        phone.act("base.drive", {"x": 0, "y": 0})
-        # Driving through a Stop doesn't resume when Stop goes off.
-        stopper = threading.Event()
-
-        def keep_driving() -> None:
-            while not stopper.wait(0.05):
-                phone.act("base.drive", {"x": 1, "y": 0}, live=True)
-
-        driver = threading.Thread(target=keep_driving, daemon=True)
-        driver.start()
-        try:
+        with phone.renewals_paused():
             self.assertTrue(
-                _wait(lambda: self.session.state()["hold"]["drive"][0] > 0.1)
+                _wait(lambda: not self.session.state()["hold"]["active"], 1.0)
             )
-            self.session.set_stop(True)
-            self.assertTrue(_wait(lambda: not self.session.state()["base"]["moving"]))
-            time.sleep(0.2)
-            self.session.set_stop(False)
-            time.sleep(0.5)
-            self.assertFalse(self.session.state()["base"]["moving"])
-        finally:
-            stopper.set()
-            driver.join(2)
-        phone.act("base.drive", {"x": 0, "y": 0})
-        time.sleep(0.05)
-        self.stream_stick(phone, 0.0, 1.0, 0.5)
+            phone.let_go("base.drive")
+        # Driving through a Stop doesn't resume when Stop goes off.
+        phone.stick(1.0, 0.0)
+        self.assertTrue(_wait(lambda: self.session.state()["hold"]["drive"][0] > 0.1))
+        self.session.set_stop(True)
+        self.assertTrue(_wait(lambda: not self.session.state()["base"]["moving"]))
+        time.sleep(0.2)
+        self.session.set_stop(False)
+        time.sleep(0.5)
+        self.assertFalse(self.session.state()["base"]["moving"])
+        phone.let_go("base.drive")
+        time.sleep(0.2)  # the let-go reaches Axol before the next push
+        phone.stick(0.0, 1.0)
+        time.sleep(0.5)
         self.assertTrue(self.session.state()["base"]["moving"])
+        phone.let_go("base.drive")
 
     def test_turn_and_lift_holds(self) -> None:
+        self.start()
         phone = self.phone()
         yaw = self.session.state()["base"]["yaw"]
-        phone.act("base.turnLeft", True)
-        time.sleep(0.6)
-        phone.act("base.turnLeft", False)
+        phone.hold("base.turnLeft", 0.6)
         self.assertGreater(self.session.state()["base"]["yaw"], yaw + 0.01)
         lift = self.session.state()["lift"]["raised"]
-        phone.act("lift.down", True)
-        for _ in range(5):
-            time.sleep(0.2)
-            phone.act("lift.down", True, renew=True)
-        phone.act("lift.down", False)
+        phone.hold("lift.down", 1.0)
         self.assertLess(self.session.state()["lift"]["raised"], lift - 0.01)
 
     def test_changing_the_scale_while_engaged_does_not_move_the_arm(self) -> None:
+        self.start()
         phone = self.phone()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.engage(phone)
         start = self.tip()
-        phone.glide([0.08, 0.0, 0.0])
+        phone.move_by((0.08, 0.0, 0.0), seconds=0.5)
         self.assertTrue(
             _wait(lambda: np.linalg.norm(self.tip() - start - [0.08, 0, 0]) < 0.003)
         )
         time.sleep(0.8)  # settled
         held = self.tip()
-        phone.act("teleop.translationScale", 0.25, live=True)
+        phone.drag("teleop.translationScale", [0.5, 0.25])
         time.sleep(0.6)
         np.testing.assert_allclose(self.tip(), held, atol=1e-3)
-        phone.glide([0.12, 0.0, 0.0])  # 4 cm more at 0.25x
+        phone.move_by((0.04, 0.0, 0.0), seconds=0.5)  # 4 cm more at 0.25x
         self.assertTrue(
             _wait(lambda: np.linalg.norm(self.tip() - held - [0.01, 0, 0]) < 0.002)
         )
 
     def test_in_a_wrist_camera_frame_the_phone_moves_along_its_view(self) -> None:
+        self.start()
         phone = self.phone()
         phone.set("teleop.frame", "left")
         kin = _planner().kinematics
         view = kin.camera(self.session.current_q(), "left")[1][:, 2]
         self.assertGreater(abs(view[2]), 0.5)  # hanging at rest, it looks down
+        self.assertTrue(
+            _wait(
+                lambda: self.session.state()["marionette"]["phones"][0]["frame"]
+                == "left"
+            )
+        )
         start = self.tip()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.glide([-0.05, 0.0, 0.0])  # back, toward the camera
+        self.engage(phone)
+        phone.move_by((-0.05, 0.0, 0.0), seconds=0.5)  # back, toward the camera
         self.assertTrue(
             _wait(lambda: np.linalg.norm(self.tip() - start + 0.05 * view) < 0.003)
         )
@@ -1143,10 +824,10 @@ class MarionetteSessionTest(unittest.TestCase):
         held = self.tip()
         # Back to Axol's frame mid-move: nothing moves until the phone does,
         # then up is Axol's up.
-        phone.act("teleop.frame", "axol")
+        phone.set("teleop.frame", "axol")
         time.sleep(0.5)
         np.testing.assert_allclose(self.tip(), held, atol=1e-3)
-        phone.glide([-0.05, 0.0, 0.04])
+        phone.move_by((0.0, 0.0, 0.04), seconds=0.5)
         self.assertTrue(
             _wait(lambda: np.linalg.norm(self.tip() - held - [0, 0, 0.04]) < 0.003)
         )
@@ -1154,23 +835,27 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertEqual(state["frame"], "axol")
 
     def test_a_phone_returning_to_an_arm_does_not_reapply_an_old_grip(self) -> None:
+        self.start()
         phone = self.phone()
-        phone.act("gripper.set", 1.0)
+        phone.set("gripper.set", 1.0)
         self.assertTrue(_wait(lambda: self.arm_state()["grip"] > 0.99))
         phone.set("arm.select", "right")
-        self.assertTrue(_wait(lambda: self.arm_state("right")["owner"] == "phone-1"))
+        self.assertTrue(
+            _wait(lambda: self.arm_state("right")["owner"] == phone.phone_id)
+        )
         time.sleep(0.05)
-        phone.act("gripper.set", 0.0)  # opens the right gripper
+        phone.set("gripper.set", 0.0)  # opens the right gripper
         self.assertTrue(_wait(lambda: self.arm_state("right")["grip"] < 0.01))
         phone.set("arm.select", "left")
         time.sleep(0.4)
         self.assertGreater(self.arm_state()["grip"], 0.99)
 
     def test_stop_freezes_the_gripper(self) -> None:
+        self.start()
         phone = self.phone()
-        phone.act("gripper.set", 0.0)
+        phone.set("gripper.set", 0.0)
         self.assertTrue(_wait(lambda: self.arm_state()["grip"] < 0.01))
-        phone.act("gripper.set", 1.0)
+        phone.set("gripper.set", 1.0)
         time.sleep(0.1)
         self.session.set_stop(True)
         time.sleep(0.05)
@@ -1180,91 +865,81 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertLess(frozen, 0.9)
 
     def test_a_phone_that_drops_with_stop_on_keeps_it_on(self) -> None:
-        one = self.phone("phone-1", "left")
-        two = self.phone("phone-2", "right")
+        self.start()
+        one = self.phone("left")
+        two = self.phone("right")
         two.set("safety.estop", True)
-        two.config(connected=False)
-        self.assertTrue(_wait(lambda: self.session.state()["marionette"]["stop"]["on"]))
-        self.assertEqual(
-            self.session.state()["marionette"]["stop"]["by"], "Phone 2 (offline)"
+        two.disconnect()
+        self.assertTrue(
+            _wait(
+                lambda: self.session.state()["marionette"]["stop"]["by"]
+                == "Phone 2 (offline)"
+            )
         )
-        one.press()
+        self.press(one)
         time.sleep(0.3)
         self.assertFalse(self.arm_state()["engaged"])
         # The desktop clears it.
         self.session.set_stop(False)
         self.assertFalse(self.session.state()["marionette"]["stop"]["on"])
-        one.release()
-        one.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.release(one)
+        self.engage(one)
+
+    def test_a_stop_survives_a_restarted_gateway(self) -> None:
+        self.start()
+        self.phone("left")
+        two = self.phone("right")
+        two.set("safety.estop", True)
+        self.assertTrue(_wait(lambda: self.session.state()["marionette"]["stop"]["on"]))
+        for phone in self.phones:
+            phone.close()
+        self.phones.clear()
+        assert self.gateway is not None
+        self.gateway.restart()
+        self.assertTrue(_wait(lambda: self.gateway_state()["connected"], 10))
+        one = self.phone("left")
+        stop = self.session.state()["marionette"]["stop"]
+        self.assertEqual((stop["on"], stop["by"]), (True, "Phone 2 (offline)"))
+        self.press(one)
+        time.sleep(0.3)
+        self.assertFalse(self.arm_state()["engaged"])
+        self.session.set_stop(False)
+        self.release(one)
+        self.engage(one)
 
     def test_a_tracking_jump_releases_the_arm(self) -> None:
+        self.start()
         phone = self.phone()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.position = np.array([0.0, 0.15, 0.0])  # 15 cm in one frame
+        self.engage(phone)
+        phone.move_to((0.0, 0.15, 0.0))  # 15 cm in one frame
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"], 2.0))
         self.assertIn("jumped", self.arm_state()["reason"])
-
-    def test_feedback_reaches_each_phone(self) -> None:
-        self.phone()
-        self.assertTrue(_wait(lambda: any(s[0] == "phone-1" for s in self.sent)))
-        phone_id, control, values = next(s for s in self.sent if s[0] == "phone-1")[:3]
-        self.assertEqual(control, "axol.feedback")
-        self.assertEqual(values["mode"], "sim")
-        self.assertEqual(values["arm"], "left")
-        self.assertTrue(values["hasLift"] and values["hasBase"])
-        self.assertEqual(values["frames"], "axol,head,left,right")
-        # The simulated Jelly has no battery; the robot's reading is rounded.
-        self.assertEqual((values["battery"], values["batteryCharging"]), (-1.0, False))
-        self.backend.battery_state = lambda: {  # type: ignore[method-assign]
-            "percent": 62.6,
-            "charging": False,
-            "underLoad": True,
-        }
-        phones = self.session._tracker.snapshot()
-        values = self.session._feedback(phones["phone-1"], phones, time.monotonic())
-        self.assertEqual(
-            (values["battery"], values["batteryCharging"], values["batteryUnderLoad"]),
-            (63, False, True),
-        )
-        self.assertTrue(
-            all(isinstance(v, (str, float, int, bool)) for v in values.values())
-        )
 
     def left_off_rest(self) -> float:
         from almond_axol.jog.backends import rest_q
 
         return float(np.max(np.abs(self.session.current_q()[:7] - rest_q()[:7])))
 
-    def move_left_away(self, phone: FakePhone) -> None:
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.glide([0.08, 0.06, 0.08])
+    def move_left_away(self, phone: SimPhone) -> None:
+        self.engage(phone)
+        phone.move_by((0.08, 0.06, 0.08), seconds=0.5)
         time.sleep(0.3)
-        phone.release()
+        self.release(phone)
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         self.assertGreater(self.left_off_rest(), 0.05)
 
-    def notices(self, pid: str) -> list[str]:
-        return [s[3] for s in self.sent if s[0] == pid and s[1] == "axol.notice"]
-
     def test_a_reset_returns_the_arm_to_rest(self) -> None:
+        self.start()
         with self.assertRaisesRegex(JogError, "already at rest"):
             self.session.reset_arm("left")
         phone = self.phone()
         self.move_left_away(phone)
         right = self.session.current_q()[7:].copy()
-        phone.act("arm.resetLeft")
+        phone.press("arm.resetLeft")
         self.assertTrue(_wait(lambda: self.arm_state()["resetting"]))
-        feedback = self.session._feedback(
-            self.session._tracker.snapshot()["phone-1"],
-            self.session._tracker.snapshot(),
-            time.monotonic(),
-        )
-        self.assertEqual(feedback["resetting"], "left")
+        self.assertTrue(_wait(lambda: _screen(phone)["resetting"] == "left"))
         # Both arms ignore their pads until it ends.
-        phone.press()
+        self.press(phone)
         time.sleep(0.2)
         self.assertFalse(self.arm_state()["engaged"])
         self.assertTrue(self.arm_state()["resetting"])
@@ -1272,24 +947,22 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertLess(self.left_off_rest(), 1e-4)
         np.testing.assert_allclose(self.session.current_q()[7:], right, atol=1e-6)
         self.assertIn("reach rest", self.arm_state()["reason"])
-        phone.release()
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
+        self.assertTrue(_wait(lambda: _screen(phone)["resetting"] is None))
+        self.release(phone)
+        self.engage(phone)
 
     def test_a_reset_waits_for_the_arms_and_stop_halts_it(self) -> None:
+        self.start()
         phone = self.phone()
         self.move_left_away(phone)
-        phone.press()
-        self.assertTrue(_wait(lambda: self.arm_state()["engaged"]))
-        phone.act("arm.resetLeft")
+        self.engage(phone)
+        phone.press("arm.resetLeft")
         self.assertTrue(
-            _wait(
-                lambda: any("moving the left arm" in n for n in self.notices("phone-1"))
-            )
+            _wait(lambda: any("moving the left arm" in n for n in _notices(phone)))
         )
         with self.assertRaisesRegex(JogError, "Phone 1 is moving the left arm"):
             self.session.reset_arm("left")
-        phone.release()
+        self.release(phone)
         self.assertTrue(_wait(lambda: not self.arm_state()["engaged"]))
         self.session.reset_arm("left")
         self.assertTrue(_wait(lambda: self.arm_state()["resetting"]))
@@ -1302,17 +975,121 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertGreater(self.left_off_rest(), 0.01)  # halted on the way
         with self.assertRaisesRegex(JogError, "Stop is on"):
             self.session.reset_arm("left")
-        phone.act("arm.resetLeft")
-        self.assertTrue(_wait(lambda: "Stopped by Desktop." in self.notices("phone-1")))
+        phone.press("arm.resetLeft")
+        self.assertTrue(_wait(lambda: "Stopped by Desktop." in _notices(phone)))
         self.session.set_stop(False)
         time.sleep(0.3)
         np.testing.assert_allclose(self.session.current_q(), held, atol=1e-6)
 
+    def test_a_second_axol_on_the_gateway_is_refused(self) -> None:
+        self.start()
+        assert self.gateway is not None
+        planner = _planner()
+        other = MarionetteSession(
+            SimBackend("mobile"), lambda: planner, gateway=self.gateway.address
+        )
+        other._link.start()
+        try:
+            self.assertTrue(_wait(lambda: other._gateway_error() == DUPLICATE))
+            self.assertTrue(self.gateway_state()["connected"])
+            # This one stops: the other takes over.
+            self.stop.set()
+            assert self.thread is not None
+            self.thread.join(15)
+            self.thread = None
+            self.assertTrue(_wait(lambda: other._link.connected, 15))
+            self.assertIsNone(other._gateway_error())
+        finally:
+            other._link.stop()
+
+    def test_cameras_go_to_the_phones_over_webrtc(self) -> None:
+        hub = CameraHub(SyntheticCameraSource(), fps=15, width=320, quality=50)
+        self.start(cameras=hub)
+        phone = self.phone()
+        self.assertTrue(
+            _wait(lambda: _screen(phone).get("streams") == ["head", "left", "right"])
+        )
+        self.assertTrue(
+            _wait(
+                lambda: all(
+                    s.get("transport") == "webrtc" and s.get("publisher") == "axol"
+                    for s in (phone.config or {}).get("cameraStreams", [])
+                )
+            )
+        )
+        assert self.gateway is not None
+        frame = asyncio.run(_receive_video(self.gateway.url, "head"))
+        self.assertEqual((frame.width, frame.height), (320, 180))
+        # No JPEG through the gateway while WebRTC works.
+        self.assertFalse(any(m.get("type") == "camera_frame" for m in phone.messages))
+
+    def test_cameras_fall_back_to_jpeg_without_webrtc(self) -> None:
+        hub = CameraHub(SyntheticCameraSource(), fps=15, width=160, quality=50)
+        with patch.dict("sys.modules", {"marionette.video": None}):
+            self.start(cameras=hub)
+            phone = self.phone()
+            self.assertTrue(
+                _wait(
+                    lambda: any(
+                        m.get("type") == "camera_frame" and m.get("cameraId") == "head"
+                        for m in phone.messages
+                    )
+                )
+            )
+        self.assertIsNotNone(self.session._video_error)
+
     def test_planned_moves_are_refused(self) -> None:
+        self.start()
         with self.assertRaises(JogError):
             self.session.plan("left", [0.3, 0.2, 0.1], [0, 0, 0, 1])
         with self.assertRaises(JogError):
             self.session.preview("left", [0.3, 0.2, 0.1], [0, 0, 0, 1])
+
+
+async def _receive_video(url: str, stream: str) -> Any:
+    """Ask the robot for a stream as a desktop viewer does, and return a frame."""
+    from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
+    from websockets.asyncio.client import connect
+
+    async with connect(url) as ws:
+        await ws.send(json.dumps(msg.hello("console", cameras=False)))
+        await ws.send(json.dumps(msg.rtc("request", stream=stream, peer="test-1")))
+        offer: dict[str, Any] = {}
+        async for raw in ws:
+            message = json.loads(raw)
+            if message.get("type") == "rtc" and message.get("kind") == "offer":
+                offer = message
+                break
+        receiver = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        frame: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+
+        @receiver.on("track")
+        def on_track(track: Any) -> None:
+            async def pull() -> None:
+                for _ in range(3):  # the encoder's first frames
+                    await track.recv()
+                frame.set_result(await track.recv())
+
+            asyncio.ensure_future(pull())
+
+        await receiver.setRemoteDescription(
+            RTCSessionDescription(offer["sdp"], "offer")
+        )
+        await receiver.setLocalDescription(await receiver.createAnswer())
+        await ws.send(
+            json.dumps(
+                msg.rtc(
+                    "answer",
+                    to=offer["from"],
+                    peer="test-1",
+                    sdp=receiver.localDescription.sdp,
+                )
+            )
+        )
+        try:
+            return await asyncio.wait_for(frame, 20)
+        finally:
+            await receiver.close()
 
 
 def _client() -> Any:
@@ -1396,11 +1173,10 @@ class MarionetteApiTest(unittest.TestCase):
                     "/api/marionette/cameras?streams=right&fps=30"
                 ) as ws,
             ):
-                if True:
-                    info = ws.receive_json()
-                    self.assertEqual(info["type"], "cameras")
-                    self.assertEqual(info["available"], ["head", "left", "right"])
-                    frame = ws.receive_bytes()
+                info = ws.receive_json()
+                self.assertEqual(info["type"], "cameras")
+                self.assertEqual(info["available"], ["head", "left", "right"])
+                frame = ws.receive_bytes()
             stream, jpeg = frame.split(b"\n", 1)
             self.assertEqual(stream, b"right")
             self.assertEqual(jpeg[:2], b"\xff\xd8")
@@ -1449,6 +1225,20 @@ class MarionetteApiTest(unittest.TestCase):
                     self.fail("the large stream did not change")
         finally:
             hub.stop()
+
+
+class RobotLinkTest(unittest.TestCase):
+    """The gateway takes Axol's screen as it ships."""
+
+    def test_the_screen_is_accepted(self) -> None:
+        with Gateway() as gateway:
+            link = RobotLink(gateway.url, "axol", "Axol", screen=SCREEN).start()
+            try:
+                self.assertTrue(link.wait_connected(5))
+                self.assertTrue(link.wait_screen(5), link.screen_error)
+                self.assertEqual(link.screen_warnings, [])
+            finally:
+                link.stop()
 
 
 if __name__ == "__main__":

@@ -186,8 +186,6 @@ def _worker(conn: Any, urdf: str) -> None:
     try:
         import mujoco
 
-        from .cameras import encode_jpeg
-
         model, data, streams = build_scene(urdf)
     except Exception as exc:  # noqa: BLE001 - reported to the parent
         conn.send(("error", f"{type(exc).__name__}: {exc}"))
@@ -201,7 +199,7 @@ def _worker(conn: Any, urdf: str) -> None:
             return
         if request is None:
             return
-        request_id, wanted, width, quality, state = request
+        request_id, wanted, width, state = request
         try:
             pose_scene(model, data, state)
             height = max(2, round(width * 9 / 16))
@@ -215,7 +213,7 @@ def _worker(conn: Any, urdf: str) -> None:
                 if stream not in streams:
                     continue
                 renderer.update_scene(data, stream)
-                frames[stream] = encode_jpeg(renderer.render(), width, quality)
+                frames[stream] = renderer.render().copy()
             conn.send(("frames", request_id, frames))
         except Exception as exc:  # noqa: BLE001 - reported to the parent
             conn.send(("error", request_id, f"{type(exc).__name__}: {exc}"))
@@ -274,16 +272,14 @@ class SimCameraSource:
                 proc.terminate()
                 proc.join(timeout=3.0)
 
-    def grab(
-        self, streams: Iterable[str], width: int, quality: int
-    ) -> dict[str, bytes]:
+    def grab(self, streams: Iterable[str], width: int) -> dict[str, np.ndarray]:
         conn = self._conn
         if conn is None:
             return {}
         with self._lock:
             self._request += 1
             request = self._request
-            conn.send((request, list(streams), int(width), int(quality), self._state()))
+            conn.send((request, list(streams), int(width), self._state()))
             while True:
                 if not conn.poll(5.0):
                     raise RuntimeError("the sim camera renderer stopped answering")

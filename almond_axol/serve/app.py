@@ -3149,7 +3149,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # -- Marionette (iPhone teleoperation; the session is a jog session) ----
 
     def _marionette_session() -> Any:
-        from ..marionette.session import MarionetteSession
+        try:
+            from ..marionette.session import MarionetteSession
+        except ImportError:  # no marionette extra: no Marionette session either
+            return None
 
         session = _jog_session()
         return session if isinstance(session, MarionetteSession) else None

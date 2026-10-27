@@ -4,8 +4,12 @@
 (same backends, control loop, hold arbitration, state feed and park on
 stop) whose arms follow phones instead of jog buttons:
 
-- A :class:`~almond_axol.marionette.gateway.GatewayClient` receives every
-  phone's pose, presses and control values from the Marionette gateway.
+- Axol connects to the Marionette gateway as the robot ``axol``
+  (:class:`marionette.RobotLink`). It sends the phones its own screen
+  (``screen.html``) on every connect, and a
+  :class:`marionette.PhoneTracker` folds every phone's pose, presses and
+  control values (:mod:`almond_axol.marionette.phones`). The gateway
+  refuses a second Axol on the same gateway; the control panel says so.
 - Each arm follows the phone that selected it while that phone holds its
   hold-to-move pad (see :mod:`almond_axol.marionette.teleop` for the
   clutch, mapping and gates), in Axol's frame or in a camera's, as the
@@ -25,8 +29,13 @@ stop) whose arms follow phones instead of jog buttons:
   wound-up or flipped joint configuration that IK steps alone would keep.
   It starts only while no arm is being moved, both arms ignore their pads
   until it ends, and Stop halts it where it is.
-- Robot feedback goes back to each phone's screen (5 Hz), and the camera
-  streams the phones are watching go to the gateway as JPEG frames.
+- Robot state goes back to the screens at 5 Hz and at once on a change
+  (``robot_state``: Axol's for every phone, :meth:`MarionetteSession.
+  screen_state`, and each phone's own, :meth:`MarionetteSession.
+  screen_phone_state`), and one-off notices as toasts. The camera streams
+  the phones are watching go to them over WebRTC
+  (:class:`marionette.video.VideoPublisher`), or as JPEG frames through the
+  gateway when WebRTC is unavailable.
 """
 
 from __future__ import annotations
@@ -35,21 +44,32 @@ import asyncio
 import contextlib
 import logging
 import math
-import secrets
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from marionette import PressTracker, RobotLink, owners
+from marionette.protocol import CLOSE_PAIRING, CLOSE_ROBOT_ID_IN_USE
+from marionette.teleop import camera_frame
 
 from ..jog.session import ARM_DOF, SIDES, HoldCommand, JogError, JogSession
+from . import phones as meaning
 from .cameras import STREAM_LABELS, CameraHub, streams_for_view
-from .gateway import GatewayClient
-from .phones import FRAMES, Phone, PhoneTracker
-from .teleop import ArmTeleop, TeleopLimits, camera_frame, gate_reason, owners
+from .phones import DEADMAN, FRAMES, RESETS, Phone
+from .teleop import ArmTeleop, TeleopLimits, gate_reason
+
+if TYPE_CHECKING:
+    from marionette.video import VideoPublisher
 
 _logger = logging.getLogger(__name__)
+
+# Axol on the gateway: its robot id, its name on the phones, and its screen.
+ROBOT_ID = "axol"
+ROBOT_NAME = "Axol"
+SCREEN = Path(__file__).with_name("screen.html")
 
 # A live drive stick with no sample for this long (s) is a dead source. The
 # app repeats the stick's latest sample every 50 ms while it is touched.
@@ -58,8 +78,25 @@ DRIVE_TIMEOUT_S = 0.25
 GRIP_RATE = 2.5
 # How long a refusal or a stop reason stays on the phone (s).
 NOTE_S = 5.0
+# Robot state is sent at once on a change and re-sent this often (s), so a
+# screen can tell that Axol stopped answering.
 FEEDBACK_PERIOD_S = 0.2
 DESKTOP = "Desktop"
+# What the control panel says when the gateway won't take this session.
+DUPLICATE = (
+    "Another Axol is connected to this gateway. Stop it, and this one takes over."
+)
+PAIRING = (
+    "This gateway needs its pairing code. Stop Marionette, enter the gateway's "
+    "pairing link in Gateway, and start again."
+)
+
+
+def _reading(value: Any, digits: int) -> float | None:
+    """A sensor reading rounded for the screens; None when it is unknown."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(float(value), digits) if math.isfinite(value) else None
 
 
 @dataclass
@@ -92,20 +129,28 @@ class MarionetteSession(JogSession):
         sim = backend.mode == "sim"
         # On the robot a desktop mirror of a phone's screen can't move
         # anything, and a phone must be calibrated to drive an arm.
-        self._tracker = PhoneTracker(allow_mirror=sim)
-        self._link = GatewayClient(
+        self._tracker = meaning.tracker(allow_mirror=sim)
+        self._link = RobotLink(
             gateway,
-            self._tracker.apply,
-            self._tracker.lost_gateway,
-            session_id=f"axol-{secrets.token_hex(4)}",
+            ROBOT_ID,
+            ROBOT_NAME,
+            screen=SCREEN,
+            title=ROBOT_NAME,
+            watch=True,
+            every=FEEDBACK_PERIOD_S,
+            tracker=self._tracker,
         )
+        self._video: VideoPublisher | None = None
+        self._video_error: str | None = None
+        # The gateway's refusal behind the link's error: (error, close code).
+        self._refusal: tuple[str, int] | None = None
         self.cameras = cameras
         self._allow_synthetic = sim
         self._require_calibration = not sim
         self._teleop = {side: ArmTeleop(side, self._limits, rate) for side in SIDES}
         # The gripper command per arm (0 closed .. 1 open), set from the
         # measured pose at start, and the grip request already applied:
-        # (phone id, its grip_seq).
+        # (phone id, its grip request count).
         self._grip_target: list[float] | None = None
         self._grip_seen: dict[str, tuple[str, int]] = {}
         self._owners: dict[str, str | None] = {"left": None, "right": None}
@@ -121,7 +166,7 @@ class MarionetteSession(JogSession):
         self._reset_requests: list[tuple[str, str | None]] = []
         self._reset: _Reset | None = None
         self._reset_task: asyncio.Task[None] | None = None
-        self._resets_seen: dict[str, dict[str, int]] = {}
+        self._reset_presses = {action: PressTracker(action) for action in RESETS}
 
     # -- requests from the serve app ---------------------------------------
 
@@ -167,7 +212,7 @@ class MarionetteSession(JogSession):
             _logger.info("marionette: Stop turned on from the desktop page")
         else:
             # A phone that went offline with Stop on can't turn it off.
-            self._tracker.clear_offline_stops()
+            self._tracker.clear_stale_stops()
         stop_by = self._current_stop(self._tracker.snapshot())
         # Takes effect now rather than at the next tick.
         self._stop_by = stop_by
@@ -206,7 +251,7 @@ class MarionetteSession(JogSession):
         until it comes back and turns it off, or the desktop page clears it."""
         if self._desktop_stop:
             return DESKTOP
-        on = sorted((p for p in phones.values() if p.stop), key=lambda p: p.number)
+        on = sorted((p for p in phones.values() if p.stop), key=lambda p: p.index)
         if not on:
             return None
         phone = next((p for p in on if p.connected), on[0])
@@ -245,15 +290,15 @@ class MarionetteSession(JogSession):
         for phone in phones.values():
             source = f"phone:{phone.id}"
             command = (
-                phone.base_command(
-                    now, self._drive_timeout, self._limits.deadman_timeout
+                meaning.base_command(
+                    phone, now, self._drive_timeout, self._limits.deadman_timeout
                 )
                 if phone.connected
                 else None
             )
             if command is not None:
                 vx, vy, wz, lift = command
-                speed = phone.speed
+                speed = meaning.speed(phone)
                 self._latch(
                     source, HoldCommand(vx * speed, vy * speed, wz * speed, lift)
                 )
@@ -278,9 +323,11 @@ class MarionetteSession(JogSession):
     async def run(self, stop_event: threading.Event | None = None) -> None:
         if self.cameras is not None:
             self.cameras.start()
+        # The gateway connection and the phones' video run on the link's own
+        # thread, off this control loop.
+        self._link.start()
         tasks = [
-            asyncio.create_task(self._link.run()),
-            asyncio.create_task(self._feedback_loop()),
+            asyncio.create_task(self._state_loop()),
             asyncio.create_task(self._camera_loop()),
         ]
         try:
@@ -293,6 +340,9 @@ class MarionetteSession(JogSession):
             for task in tasks:
                 with contextlib.suppress(BaseException):
                     await task
+            if self._video is not None:
+                await asyncio.to_thread(self._video.close)
+            await asyncio.to_thread(self._link.stop)
             if self.cameras is not None:
                 await asyncio.to_thread(self.cameras.stop)
 
@@ -319,7 +369,12 @@ class MarionetteSession(JogSession):
         if kin is not None:
             kin.set_lift(self._lift_raised())
         command = self._step_reset(phones, command, stop_by)
-        arm_owners = owners(phones.values(), {s: self._teleop[s].owner for s in SIDES})
+        arm_owners = owners(
+            phones.values(),
+            SIDES,
+            meaning.arm,
+            {s: self._teleop[s].owner for s in SIDES},
+        )
         for i, side in enumerate(SIDES):
             command = self._step_arm(side, phones, kin, command, stop_by, now, dt)
             owner = arm_owners[side]
@@ -348,14 +403,17 @@ class MarionetteSession(JogSession):
         arm = self._teleop[side]
         limits = self._limits
         contenders = sorted(
-            (p for p in phones.values() if p.connected and p.arm == side),
-            key=lambda p: p.number,
+            (p for p in phones.values() if p.connected and meaning.arm(p) == side),
+            key=lambda p: p.index,
         )
-        pressed = [p for p in contenders if arm.new_press(p)]
+        # Every press is consumed once, whatever happens to it, so a press
+        # refused (Stop on, bad tracking) never engages later on its own.
+        pressed = [p for p in contenders if arm.presses.pressed(p)]
+        contender_ids = {p.id for p in contenders}
         for phone in phones.values():
-            if phone not in contenders:
+            if phone.id not in contender_ids:
                 # Presses made for the other arm never count here later.
-                arm.forget_presses(phone)
+                arm.presses.forget(phone)
 
         if arm.engaged:
             phone = phones.get(arm.owner or "")
@@ -367,15 +425,15 @@ class MarionetteSession(JogSession):
                 reason = (
                     "Stop is on." if stop_by == phone.name else f"Stopped by {stop_by}."
                 )
-            elif phone.arm != side:
+            elif meaning.arm(phone) != side:
                 reason = None
-            elif not phone.deadman_down:
+            elif not phone.hold(DEADMAN).down:
                 reason = None  # let go
-            elif not phone.deadman_live(now, limits.deadman_timeout):
+            elif not phone.holding(DEADMAN, now, limits.deadman_timeout):
                 reason = "The connection dropped. Press again to keep moving."
-            elif not arm.anchor_valid(phone):
+            elif not arm.clutch.anchor_valid(phone.pose):
                 reason = "Tracking restarted. Press again to keep moving."
-            elif arm.jumped(phone):
+            elif arm.jumps.check(phone.pose):
                 reason = "Tracking jumped. Press again to keep moving."
             else:
                 reason = self._gate(phone, now)
@@ -417,7 +475,7 @@ class MarionetteSession(JogSession):
             if reason is not None:
                 self._note(phone, reason)
                 continue
-            if not phone.deadman_live(now, limits.deadman_timeout):
+            if not phone.holding(DEADMAN, now, limits.deadman_timeout):
                 continue  # pressed and let go between ticks
             arm.engage(
                 phone, kin.tip(command, side), self._to_torso(phone, kin, command)
@@ -427,12 +485,12 @@ class MarionetteSession(JogSession):
                 "marionette: %s arm engaged by %s (moving in the %s frame)",
                 side,
                 phone.name,
-                phone.frame,
+                meaning.frame(phone),
             )
 
         if arm.engaged and kin is not None:
             phone = phones[arm.owner or ""]
-            if phone.frame != arm.frame:
+            if meaning.frame(phone) != arm.frame:
                 arm.reframe(phone, self._to_torso(phone, kin, command))
             target = arm.target(phone, now, dt)
             result = kin.servo_step(command, side, target, limits.joint_speed * dt)
@@ -446,16 +504,15 @@ class MarionetteSession(JogSession):
         """``F`` for the phone's Frame choice, from where its camera is
         now; None for Axol's frame. A camera this Axol has no mount for
         falls back to Axol's frame, and the phone is told."""
-        if phone.frame == "axol":
+        choice = meaning.frame(phone)
+        if choice == "axol":
             return None
-        camera = kin.camera(command, phone.frame)
+        camera = kin.camera(command, choice)
         if camera is None:
-            name = STREAM_LABELS.get(phone.frame, phone.frame).lower()
-            self._link.send_status(
-                phone.id,
-                "axol.notice",
-                {},
+            name = STREAM_LABELS.get(choice, choice).lower()
+            self._link.notice(
                 f"This Axol has no {name} camera, so the arm moves in Axol's frame.",
+                phone=phone.id,
             )
             return None
         return camera_frame(camera[1])
@@ -496,17 +553,13 @@ class MarionetteSession(JogSession):
             return f"The {side} arm is already at rest."
         return None
 
-    def _reset_presses(self, phones: dict[str, Phone]) -> list[tuple[str, str]]:
+    def _new_resets(self, phones: dict[str, Phone]) -> list[tuple[str, str]]:
         """New reset presses: ``(arm, phone id)``. Each counts once, and
         presses made before the session first saw the phone don't count."""
         pressed: list[tuple[str, str]] = []
         for phone in phones.values():
-            seen = self._resets_seen.get(phone.id)
-            self._resets_seen[phone.id] = dict(phone.resets)
-            if seen is None or not phone.connected:
-                continue
-            for side in SIDES:
-                if phone.resets[side] > seen.get(side, 0):
+            for action, side in RESETS.items():
+                if self._reset_presses[action].pressed(phone) and phone.connected:
                     pressed.append((side, phone.id))
         return pressed
 
@@ -519,7 +572,7 @@ class MarionetteSession(JogSession):
         """
         with self._lock:
             requests, self._reset_requests = self._reset_requests, []
-        for side, phone_id in requests + self._reset_presses(phones):
+        for side, phone_id in requests + self._new_resets(phones):
             phone = phones.get(phone_id or "")
             if phone_id is not None and phone is None:
                 continue
@@ -527,7 +580,7 @@ class MarionetteSession(JogSession):
             reason = self._reset_refusal(side, phones, by)
             if reason is not None:
                 if phone is not None:
-                    self._link.send_status(phone.id, "axol.notice", {}, reason)
+                    self._link.notice(reason, phone=phone.id)
                 _logger.info("marionette: %s arm reset refused (%s)", side, reason)
                 continue
             self._reset = _Reset(side, by)
@@ -617,54 +670,100 @@ class MarionetteSession(JogSession):
             self._grip_seen.pop(side, None)
         else:
             seen = self._grip_seen.get(side)
+            count, closure = meaning.grip(owner)
             if seen is None or seen[0] != owner.id:
                 # A new owner: only grip changes made from now on count, so
                 # taking over an arm never opens a closed gripper by itself.
-                self._grip_seen[side] = (owner.id, owner.grip_seq)
-            elif owner.grip_seq != seen[1] and owner.grip is not None:
-                self._grip_seen[side] = (owner.id, owner.grip_seq)
+                self._grip_seen[side] = (owner.id, count)
+            elif count != seen[1] and closure is not None:
+                self._grip_seen[side] = (owner.id, count)
                 if stop_by is None:
-                    targets[index] = 1.0 - owner.grip
+                    targets[index] = 1.0 - closure
         step = GRIP_RATE * dt
         return float(current + min(max(targets[index] - current, -step), step))
 
-    # -- feedback and cameras ------------------------------------------------
+    # -- robot state and cameras for the phones -------------------------------
 
-    async def _feedback_loop(self) -> None:
-        last: dict[str, tuple[dict[str, Any], float]] = {}
+    async def _state_loop(self) -> None:
+        """Robot state for the screens. The link sends a change at once and
+        re-sends the rest every FEEDBACK_PERIOD_S."""
+        failing = False
         while True:
             await asyncio.sleep(0.05)
-            if not self._link.connected:
-                last.clear()
-                continue
-            now = time.monotonic()
-            phones = self._tracker.snapshot()
-            for phone in phones.values():
-                if not phone.connected:
-                    last.pop(phone.id, None)
-                    continue
-                values = self._feedback(phone, phones, now)
-                previous = last.get(phone.id)
-                if (
-                    previous is None
-                    or previous[0] != values
-                    or now - previous[1] >= FEEDBACK_PERIOD_S
-                ):
-                    self._link.send_status(phone.id, "axol.feedback", values)
-                    last[phone.id] = (values, now)
+            try:
+                self._send_state()
+                failing = False
+            except Exception:  # noqa: BLE001 - one bad reading, not the feed
+                if not failing:
+                    _logger.warning("marionette: robot state not sent", exc_info=True)
+                failing = True
+            self._gateway_error()
 
-    def _feedback(
-        self, phone: Phone, phones: dict[str, Phone], now: float
+    def _send_state(self) -> None:
+        now = time.monotonic()
+        phones = self._tracker.snapshot()
+        with self._lock:
+            driver = self._driver()
+        self._link.state(self.screen_state(phones, driver))
+        for phone in phones.values():
+            if phone.connected and not phone.stale:
+                state = self.screen_phone_state(phone, phones, driver, now)
+                self._link.state(state, phone=phone.id)
+            else:
+                self._link.clear_state(phone.id)
+
+    def screen_state(
+        self, phones: dict[str, Phone], driver: str | None
     ) -> dict[str, Any]:
-        side = phone.arm
+        """Axol's state for every phone's screen.
+
+        ``lift``, ``battery`` and ``base`` are None when this Axol has no
+        lift, no battery reading or no base; ``lift.raised`` is None while
+        the lift's height is unknown.
+        """
+        backend = self._backend
+        lift = backend.lift_state()
+        base = backend.base_state()
+        battery = backend.battery_state()
+        raised = None if lift is None else _reading(lift.get("raised"), 3)
+        percent = None if battery is None else _reading(battery.get("percent"), 0)
+        reset = self._reset
+        cameras = self.cameras
+        return {
+            "mode": backend.mode,
+            "ready": self._planner is not None,
+            "stopBy": self._stop_by,
+            "resetting": None if reset is None else reset.side,
+            "driver": self._driver_name(driver, phones) or None,
+            "lift": None
+            if lift is None
+            else {"raised": raised, "moving": bool(lift.get("moving"))},
+            "battery": None
+            if battery is None or percent is None
+            else {
+                "percent": percent,
+                "charging": bool(battery.get("charging")),
+                "underLoad": bool(battery.get("underLoad")),
+            },
+            "base": None
+            if base is None
+            else {"moving": bool(base.get("moving")), "fault": bool(base.get("fault"))},
+            "streams": cameras.available if cameras is not None else [],
+            "frames": self._frames(),
+        }
+
+    def screen_phone_state(
+        self, phone: Phone, phones: dict[str, Phone], driver: str | None, now: float
+    ) -> dict[str, Any]:
+        """Axol's state for one phone's screen: its arm and why it moves or
+        doesn't. ``owner`` names another phone that has the arm."""
+        side = meaning.arm(phone)
         arm = self._teleop[side]
-        owner_id = self._owners.get(side)
         engaged = arm.engaged and arm.owner == phone.id
-        owner = phones.get(owner_id or "")
-        other = owner.name if owner is not None and owner.id != phone.id else ""
-        stop_by = self._stop_by
+        owner = phones.get(self._owners.get(side) or "")
+        other = owner.name if owner is not None and owner.id != phone.id else None
         reason = self._note_for(phone.id, now)
-        if stop_by is not None:
+        if self._stop_by is not None:
             state = "stopped"
         elif engaged:
             state = "engaged"
@@ -673,39 +772,15 @@ class MarionetteSession(JogSession):
         else:
             state = "idle"
         grip = self._grip[SIDES.index(side)] if self._grip else 1.0
-        lift = self._backend.lift_state()
-        base = self._backend.base_state()
-        battery = self._backend.battery_state()
-        with self._lock:
-            driver = self._driver()
-        cameras = self.cameras
         return {
-            "mode": self._backend.mode,
-            "ready": self._planner is not None,
             "arm": side,
             "state": state,
             "engaged": engaged,
             "limited": bool(engaged and arm.limited),
-            "reason": "" if engaged else reason,
+            "reason": None if engaged or not reason else reason,
             "owner": other,
             "grip": round(1.0 - float(grip), 3),
-            "hasLift": lift is not None,
-            "lift": -1.0
-            if lift is None or lift.get("raised") is None
-            else round(float(lift["raised"]), 3),
-            "liftMoving": bool(lift and lift.get("moving")),
-            "battery": -1.0 if battery is None else round(float(battery["percent"])),
-            "batteryCharging": bool(battery and battery["charging"]),
-            "batteryUnderLoad": bool(battery and battery["underLoad"]),
-            "hasBase": base is not None,
-            "baseMoving": bool(base and base.get("moving")),
-            "baseFault": bool(base and base.get("fault")),
             "driving": driver == f"phone:{phone.id}",
-            "driver": self._driver_name(driver, phones),
-            "stopBy": stop_by or "",
-            "resetting": "" if self._reset is None else self._reset.side,
-            "streams": ",".join(cameras.available) if cameras is not None else "",
-            "frames": ",".join(self._frames()),
         }
 
     def _frames(self) -> list[str]:
@@ -717,26 +792,89 @@ class MarionetteSession(JogSession):
         return ["axol", *planner.kinematics.cameras]
 
     async def _camera_loop(self) -> None:
+        """The streams the phones are watching: WebRTC video once the
+        cameras are up, or JPEG frames through the gateway without it."""
         hub = self.cameras
         if hub is None:
             return
         sent: dict[str, int] = {}
+        tried = False
         while True:
             await asyncio.sleep(0.5 / hub.fps)
+            if not tried and hub.available:
+                tried = True
+                await self._start_video(hub)
+            video = self._video
+            jpeg = tried and video is None
             phones = self._tracker.snapshot()
             wanted: set[str] = set()
             for phone in phones.values():
                 if phone.connected:
-                    wanted.update(streams_for_view(phone.view))
-            hub.want("phones", wanted)
+                    wanted.update(streams_for_view(meaning.view(phone)))
+            hub.want("phones", wanted, jpeg=jpeg)
             if not self._link.connected:
                 sent.clear()
                 continue
             for stream in wanted:
-                frame = hub.latest(stream)
-                if frame is not None and sent.get(stream) != frame.seq:
-                    sent[stream] = frame.seq
-                    self._link.send_frame(stream, frame.jpeg, frame.captured_ms)
+                if video is not None and stream in video.streams:
+                    frame = hub.latest_rgb(stream)
+                    if frame is not None and sent.get(stream) != frame.seq:
+                        sent[stream] = frame.seq
+                        video.push(stream, frame.rgb, frame.captured_ms)
+                elif jpeg:
+                    frame = hub.latest(stream)
+                    if frame is not None and frame.jpeg is not None:
+                        if sent.get(stream) != frame.seq:
+                            sent[stream] = frame.seq
+                            self._link.send_jpeg(stream, frame.jpeg, frame.captured_ms)
+
+    async def _start_video(self, hub: CameraHub) -> None:
+        """Publish the cameras this Axol has over WebRTC. Without WebRTC (no
+        aiortc, say) the phones get JPEG frames through the gateway."""
+        try:
+            from marionette.video import VideoPublisher
+        except ImportError as exc:
+            self._video_error = str(exc)
+            _logger.warning(
+                "marionette: no WebRTC video (%s); sending JPEG frames instead", exc
+            )
+            return
+        streams = list(hub.available)
+        size = (hub.width, round(hub.width * 9 / 16))
+
+        async def publish() -> VideoPublisher:
+            # On the link's loop, where the publisher does its work.
+            return VideoPublisher(self._link, streams, fps=hub.fps, size=size)
+
+        try:
+            future = self._link.client.submit(publish())
+            self._video = await asyncio.wrap_future(future)
+        except Exception as exc:  # noqa: BLE001 - JPEG still works
+            self._video_error = str(exc)
+            _logger.warning(
+                "marionette: WebRTC video failed to start (%s); sending JPEG "
+                "frames instead",
+                exc,
+            )
+
+    def _gateway_error(self) -> str | None:
+        """Why Axol isn't connected to the gateway, for the control panel.
+
+        A gateway that refused this session says why with a close code; its
+        meaning stays until the link tries again and fails some other way.
+        """
+        link = self._link
+        if link.connected:
+            self._refusal = None
+            return None
+        error = link.error
+        code = link.client.close_code
+        if code in (CLOSE_ROBOT_ID_IN_USE, CLOSE_PAIRING) and error is not None:
+            self._refusal = (error, code)
+        refusal = self._refusal
+        if refusal is not None and refusal[0] == error:
+            return DUPLICATE if refusal[1] == CLOSE_ROBOT_ID_IN_USE else PAIRING
+        return error
 
     # -- state for the desktop page --------------------------------------------
 
@@ -780,13 +918,13 @@ class MarionetteSession(JogSession):
             }
         state["marionette"] = {
             "gateway": {
-                "address": self._link.url,
+                "address": self._link.client.url,
                 "connected": self._link.connected,
-                "error": None if self._link.connected else self._link.error,
+                "error": self._gateway_error(),
             },
             "phones": [
                 self._phone_state(phone, driver, now)
-                for phone in sorted(phones.values(), key=lambda p: p.number)
+                for phone in sorted(phones.values(), key=lambda p: p.index)
             ],
             "arms": arms,
             "stop": {
@@ -804,8 +942,9 @@ class MarionetteSession(JogSession):
         self, phone: Phone, driver: str | None, now: float
     ) -> dict[str, Any]:
         pose = phone.pose
-        arm = self._teleop[phone.arm]
-        age = phone.pose_age(now)
+        side = meaning.arm(phone)
+        arm = self._teleop[side]
+        age = phone.age(now)
         return {
             "id": phone.id,
             "name": phone.name,
@@ -814,12 +953,12 @@ class MarionetteSession(JogSession):
             "tracking": pose.tracking if pose is not None else "unavailable",
             "source": pose.source if pose is not None else None,
             "calibration": phone.calibration,
-            "arm": phone.arm,
-            "view": phone.view,
-            "frame": phone.frame,
-            "scale": phone.scale,
-            "speed": phone.speed,
-            "deadman": phone.deadman_live(now, self._limits.deadman_timeout),
+            "arm": side,
+            "view": meaning.view(phone),
+            "frame": meaning.frame(phone),
+            "scale": meaning.scale(phone),
+            "speed": meaning.speed(phone),
+            "deadman": phone.holding(DEADMAN, now, self._limits.deadman_timeout),
             "stop": phone.stop,
             "engaged": arm.engaged and arm.owner == phone.id,
             "driving": driver == f"phone:{phone.id}",

@@ -2,12 +2,13 @@
 
 The phone screen declares three streams (``head``, ``left``, ``right``) and
 each phone picks a view of them. :class:`CameraHub` grabs only the streams
-someone is watching (a phone's view or the desktop page), downscales each to
-``width`` and JPEG-encodes it at ``quality``, ``fps`` times a second. The
-desktop page's large view asks for its stream at ``large_width`` as well.
-The gateway client and the desktop WebSocket both read the newest encoded
-frame of a stream with :meth:`CameraHub.latest`, so each frame is
-compressed once per width however many clients watch it.
+someone is watching (a phone's view or the desktop page), downscaled to
+``width``, ``fps`` times a second. The desktop page's large view asks for
+its stream at ``large_width`` as well. Each frame is kept as RGB (the
+phones' WebRTC video encodes it, :meth:`CameraHub.latest_rgb`) and, for the
+watchers that want JPEG (the desktop page, and the phones when WebRTC is
+unavailable), JPEG-encoded at ``quality`` (:meth:`CameraHub.latest`), so
+each frame is compressed once per width however many clients watch it.
 
 Sources:
 
@@ -59,8 +60,8 @@ def streams_for_view(view: str) -> tuple[str, ...]:
     return VIEWS.get(view, VIEWS["head"])
 
 
-def encode_jpeg(rgb: np.ndarray, width: int, quality: int) -> bytes:
-    """Downscale an RGB frame to ``width`` (never up) and JPEG-encode it."""
+def downscale(rgb: np.ndarray, width: int) -> np.ndarray:
+    """An RGB frame at most ``width`` wide (never upscaled), alpha dropped."""
     import cv2
 
     frame = np.asarray(rgb)
@@ -70,9 +71,16 @@ def encode_jpeg(rgb: np.ndarray, width: int, quality: int) -> bytes:
     if w > width:
         height = max(2, round(h * width / w))
         frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(frame)
+
+
+def encode_jpeg(rgb: np.ndarray, width: int, quality: int) -> bytes:
+    """Downscale an RGB frame to ``width`` (never up) and JPEG-encode it."""
+    import cv2
+
     ok, data = cv2.imencode(
         ".jpg",
-        cv2.cvtColor(np.ascontiguousarray(frame), cv2.COLOR_RGB2BGR),
+        cv2.cvtColor(downscale(rgb, width), cv2.COLOR_RGB2BGR),
         [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
     )
     if not ok:
@@ -89,17 +97,17 @@ class CameraSource(Protocol):
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def grab(
-        self, streams: Iterable[str], width: int, quality: int
-    ) -> dict[str, bytes]:
-        """The newest JPEG of each stream that has one."""
+    def grab(self, streams: Iterable[str], width: int) -> dict[str, np.ndarray]:
+        """The newest RGB frame of each stream that has one, at most
+        ``width`` wide."""
         ...
 
 
 @dataclass(frozen=True)
-class EncodedFrame:
+class Frame:
     stream: str
-    jpeg: bytes
+    rgb: np.ndarray  # (height, width, 3) uint8
+    jpeg: bytes | None  # None when no watcher wants JPEG at this width
     captured_ms: float  # wall clock, milliseconds
     seq: int
     width: int = 0  # the width asked for (frames are never upscaled)
@@ -125,9 +133,9 @@ class CameraHub:
         self.large_width = max(self.width, int(large_width))
         self.quality = min(max(int(quality), 10), 95)
         self._lock = threading.Lock()
-        # Watcher -> (streams, width, last renewal).
-        self._demand: dict[str, tuple[frozenset[str], int, float]] = {}
-        self._frames: dict[tuple[str, int], EncodedFrame] = {}
+        # Watcher -> (streams, width, JPEG wanted, last renewal).
+        self._demand: dict[str, tuple[frozenset[str], int, bool, float]] = {}
+        self._frames: dict[tuple[str, int], Frame] = {}
         self._seq = 0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -138,15 +146,21 @@ class CameraHub:
     # -- demand --------------------------------------------------------------
 
     def want(
-        self, watcher: str, streams: Iterable[str], width: int | None = None
+        self,
+        watcher: str,
+        streams: Iterable[str],
+        width: int | None = None,
+        *,
+        jpeg: bool = True,
     ) -> None:
         """``watcher`` wants these streams, ``width`` wide (default: the
-        hub's ``width``); renew within DEMAND_TTL_S. A watcher wanting two
-        widths registers as two watchers."""
+        hub's ``width``), as JPEG or only as RGB frames; renew within
+        DEMAND_TTL_S. A watcher wanting two widths registers as two
+        watchers."""
         wanted = frozenset(s for s in streams if s in STREAMS)
         size = self.width if width is None else max(64, int(width))
         with self._lock:
-            self._demand[watcher] = (wanted, size, time.monotonic())
+            self._demand[watcher] = (wanted, size, jpeg, time.monotonic())
 
     def drop(self, watcher: str) -> None:
         with self._lock:
@@ -154,21 +168,33 @@ class CameraHub:
 
     def wanted(self) -> dict[int, set[str]]:
         """The streams wanted at each width."""
+        return {w: set(s) for w, s in self._wanted()[0].items()}
+
+    def _wanted(self) -> tuple[dict[int, set[str]], set[tuple[str, int]]]:
+        """The streams wanted at each width, and which of them as JPEG."""
         now = time.monotonic()
         widths: dict[int, set[str]] = {}
+        jpegs: set[tuple[str, int]] = set()
         with self._lock:
-            for key, (streams, width, at) in list(self._demand.items()):
+            for key, (streams, width, jpeg, at) in list(self._demand.items()):
                 if now - at > DEMAND_TTL_S:
                     del self._demand[key]
                 elif streams:
                     widths.setdefault(width, set()).update(streams)
-        return widths
+                    if jpeg:
+                        jpegs.update((s, width) for s in streams)
+        return widths, jpegs
 
     # -- frames --------------------------------------------------------------
 
-    def latest(self, stream: str, width: int | None = None) -> EncodedFrame | None:
-        """The newest frame of a stream at a width (default: the hub's
+    def latest(self, stream: str, width: int | None = None) -> Frame | None:
+        """The newest JPEG frame of a stream at a width (default: the hub's
         ``width``); None once it is older than STALE_S."""
+        frame = self.latest_rgb(stream, width)
+        return None if frame is None or frame.jpeg is None else frame
+
+    def latest_rgb(self, stream: str, width: int | None = None) -> Frame | None:
+        """The newest frame of a stream at a width, JPEG-encoded or not."""
         key = (stream, self.width if width is None else int(width))
         with self._lock:
             frame = self._frames.get(key)
@@ -256,9 +282,10 @@ class CameraHub:
             while not self._stop.is_set():
                 started = time.monotonic()
                 available = set(source.available)
+                wanted, jpegs = self._wanted()
                 widths = {
                     width: streams & available
-                    for width, streams in self.wanted().items()
+                    for width, streams in wanted.items()
                     if streams & available
                 }
                 with self._lock:
@@ -269,18 +296,23 @@ class CameraHub:
                     }
                 for width, streams in sorted(widths.items()):
                     try:
-                        frames = source.grab(sorted(streams), width, self.quality)
+                        frames = source.grab(sorted(streams), width)
                         self._failure = None
                     except Exception as exc:  # noqa: BLE001 - keep trying
                         _logger.debug("marionette: camera grab failed", exc_info=True)
                         self._failure = f"Camera frames stopped: {exc}"
                         frames = {}
                     captured = time.time() * 1000.0
-                    with self._lock:
-                        for stream, jpeg in frames.items():
+                    for stream, rgb in frames.items():
+                        jpeg = (
+                            encode_jpeg(rgb, width, self.quality)
+                            if (stream, width) in jpegs
+                            else None
+                        )
+                        with self._lock:
                             self._seq += 1
-                            self._frames[(stream, width)] = EncodedFrame(
-                                stream, jpeg, captured, self._seq, width
+                            self._frames[(stream, width)] = Frame(
+                                stream, rgb, jpeg, captured, self._seq, width
                             )
                 self._stop.wait(max(0.0, period - (time.monotonic() - started)))
         finally:
@@ -303,12 +335,10 @@ class SyntheticCameraSource:
     def stop(self) -> None:
         return None
 
-    def grab(
-        self, streams: Iterable[str], width: int, quality: int
-    ) -> dict[str, bytes]:
+    def grab(self, streams: Iterable[str], width: int) -> dict[str, np.ndarray]:
         import cv2
 
-        out: dict[str, bytes] = {}
+        out: dict[str, np.ndarray] = {}
         t = time.monotonic()
         height = round(width * 9 / 16)
         for stream in streams:
@@ -326,7 +356,7 @@ class SyntheticCameraSource:
                 2,
                 cv2.LINE_AA,
             )
-            out[stream] = encode_jpeg(frame, width, quality)
+            out[stream] = frame
         return out
 
 
@@ -447,10 +477,8 @@ class ZedCameraSource:
             self._relay = None
         self._readers.clear()
 
-    def grab(
-        self, streams: Iterable[str], width: int, quality: int
-    ) -> dict[str, bytes]:
-        out: dict[str, bytes] = {}
+    def grab(self, streams: Iterable[str], width: int) -> dict[str, np.ndarray]:
+        out: dict[str, np.ndarray] = {}
         for stream in streams:
             reader = self._readers.get(stream)
             if reader is None:
@@ -459,5 +487,5 @@ class ZedCameraSource:
                 frame = reader.read_latest()
             except Exception:  # noqa: BLE001 - no frame yet, or a stale one
                 continue
-            out[stream] = encode_jpeg(frame, width, quality)
+            out[stream] = downscale(frame, width)
         return out

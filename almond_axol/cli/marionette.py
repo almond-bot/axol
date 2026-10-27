@@ -1,17 +1,18 @@
 """
 Teleoperate Axol from one or two iPhones running Marionette.
 
-Connects to a Marionette gateway as its consumer. Each phone drives the arm
-it selects while its hold-to-move pad is held, closes and opens that arm's
-gripper, and drives the Jelly base and lift from its Drive screen. The
-control panel's Marionette page shows the robot and the cameras, and drives
-the base and lift from the keyboard. With ``--sim`` nothing touches the
-hardware: a simulated Axol on Jelly moves instead, with rendered camera
-views.
+Connects to a Marionette gateway as the robot ``axol`` and sends the phones
+Axol's screen. Each phone drives the arm it selects while its hold-to-move
+pad is held, closes and opens that arm's gripper, and drives the Jelly base
+and lift from its Drive screen. The control panel's Marionette page shows
+the robot and the cameras, and drives the base and lift from the keyboard.
+With ``--sim`` nothing touches the hardware: a simulated Axol on Jelly moves
+instead, with rendered camera views.
 
-Start the gateway first, with the Axol phone screen: in the Marionette
-repository run ``npm run dev:axol``. The session is started and stopped by
-the control panel (``axol serve``), which owns the page's connection to it.
+Start the gateway first (``axol marionette.gateway``, the gateway bundled
+with the Marionette SDK). The session is started and stopped by the control
+panel (``axol serve``), which owns the page's connection to it. Needs the
+``marionette`` extra.
 """
 
 from __future__ import annotations
@@ -45,7 +46,8 @@ class MarionetteCmdConfig:
     sim: bool = False
     """Drive a simulated Axol instead of the hardware."""
     gateway: str = "localhost:8787"
-    """The Marionette gateway: an IP or host name, host:port, or a ws:// URL."""
+    """The Marionette gateway: an IP or host name, host:port, a ws:// URL, or
+    its pairing link (which carries the pairing code)."""
     max_speed: float = 0.5
     """Fastest a gripper follows its phone (m/s)."""
     max_turn_rate: float = 3.0
@@ -170,9 +172,9 @@ class _FallbackSource:
     def stop(self) -> None:
         self._active.stop()
 
-    def grab(self, streams: Any, width: int, quality: int) -> dict[str, bytes]:
+    def grab(self, streams: Any, width: int) -> dict[str, Any]:
         try:
-            return self._active.grab(streams, width, quality)
+            return self._active.grab(streams, width)
         except Exception as exc:
             if self._active is self._sources[1]:
                 raise
@@ -182,13 +184,19 @@ class _FallbackSource:
             self._active.stop()
             self._active = self._sources[1]
             self._active.start()
-            return self._active.grab(streams, width, quality)
+            return self._active.grab(streams, width)
 
 
 def _validate(cfg: MarionetteCmdConfig) -> None:
-    from ..marionette.gateway import gateway_url
+    try:
+        from marionette.address import resolve
+    except ImportError:
+        raise RuntimeError(
+            "Marionette isn't installed. Install it with: "
+            "pip install 'almond-axol[marionette]'"
+        ) from None
 
-    gateway_url(cfg.gateway)
+    resolve(cfg.gateway)
     speeds = (cfg.max_speed, cfg.max_turn_rate, cfg.joint_speed, cfg.rate_hz)
     if min(speeds) <= 0 or cfg.rotation_scale < 0 or cfg.pose_cutoff <= 0:
         raise ValueError(
