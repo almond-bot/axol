@@ -4,7 +4,7 @@ import { Check, Copy, Rocket, X } from "lucide-react"
 
 const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
   {
-    label: "Run on the robot's computer",
+    label: "Run on the Host Computer",
     cmd: "curl https://axol.almond.bot/install -fsS | bash",
   },
 ]

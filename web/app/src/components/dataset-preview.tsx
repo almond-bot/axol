@@ -153,7 +153,7 @@ export function DatasetPreview({
         setError(
           // An older host answers the unknown route with the SPA's generic 404.
           e instanceof ApiRequestError && e.status === 404 && e.message === "not found"
-            ? "This host can't preview datasets. Update the Axol software on the host."
+            ? "This Host Computer can't preview datasets. Update the Axol software on the Host Computer."
             : errorText(e)
         )
       })

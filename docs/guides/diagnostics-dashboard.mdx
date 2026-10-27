@@ -47,7 +47,7 @@ The buttons above the motor cards run these commands:
 | **Set zero position** | Sets one motor's zero, or walks you through zeroing each joint against its end stop ([`motor.set-zero-pos`](/cli/motor-set-zero-pos)). Axol only. |
 | **Read all parameters** | Reads every configuration parameter from one motor, or from all motors if you leave the CAN ID blank ([`motor.dump-config`](/cli/motor-dump-config)). |
 | **Edit parameter** | Reads or writes one configuration parameter ([`motor.set-config`](/cli/motor-set-config)). |
-| **Flash firmware** | Installs motor firmware from a `.bin` file on the robot's computer ([`motor.flash`](/cli/motor-flash)). Axol only. |
+| **Flash firmware** | Installs motor firmware from a `.bin` file on the Host Computer ([`motor.flash`](/cli/motor-flash)). Axol only. |
 
 Mantis grippers calibrate themselves, so Mantis has no zeroing. To restore a saved configuration file, run [`motor.restore-config`](/cli/motor-restore-config) in a terminal.
 
@@ -157,7 +157,7 @@ Some tests pause for you, for example to put an item in the gripper. The card th
 | **Raise lift to install height** ([`lift.goto`](/cli/lift-goto)) | Moves the lift to the robot's install height. |
 | **Update lift firmware** ([`lift.update`](/cli/lift-update)) | Pick the lift's `firmware.bin`, then press **Run** to install it over CAN. Run it without a file to see the lift's current firmware. |
 
-The lift helpers appear only on Axol on Jelly. To restart or shut down the robot's computer, use **Restart** or **Shut down** on the control panel's [Axol Host tile](/guides/control-panel#axol-host).
+The lift helpers appear only on Axol on Jelly. To restart or shut down the Host Computer, use **Restart** or **Shut down** on the control panel's [Host Computer card](/guides/control-panel#host-computer).
 
 ## Tuning
 
@@ -215,10 +215,10 @@ Charts zoom and pan like the live chart. Double-click to reset the view.
 
 Tick two runs of the same kind in **Past runs**. The charts overlay both runs (A in yellow, B in blue), and a table marks the better value of each score in green. Press **Exit compare** to go back.
 
-Runs are saved in `~/.almond/diagnostics/tuning/` on the robot's computer, shared with the command line's `--save-run`. Select or delete them in **Past runs**.
+Runs are saved in `~/.almond/diagnostics/tuning/` on the Host Computer, shared with the command line's `--save-run`. Select or delete them in **Past runs**.
 
 ## Run history
 
 Every test run is kept with its command, options, duration, result, log and the telemetry recorded during the run. The list shows the newest first, 10 runs per page. Open a run to chart it with the same controls as the live chart. **Clear** deletes the history.
 
-The history is stored in `~/.almond/diagnostics/runs` on the robot's computer.
+The history is stored in `~/.almond/diagnostics/runs` on the Host Computer.

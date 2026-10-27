@@ -1,3 +1,4 @@
+import { useState } from "react"
 import type { CanDiscoveryState } from "@/lib/supervisor"
 
 /**
@@ -35,7 +36,7 @@ export function discoveryNotice(
     case "error":
       return {
         tone: "error",
-        text: "The robot's computer couldn't check its hardware. It tries again on its own. If this keeps happening, restart the robot's computer.",
+        text: "The Host Computer couldn't check its hardware. It tries again on its own. If this keeps happening, restart the Host Computer.",
       }
     default:
       return null
@@ -49,6 +50,29 @@ export function discoveryNeedsRecheck(discovery: CanDiscoveryState | null | unde
     discovery?.status === "partial" ||
     discovery?.status === "error"
   )
+}
+
+/**
+ * The discovery result to show and act on. A check of silent hardware takes
+ * the host many seconds and reports "running" meanwhile; the last result
+ * stands until the check ends, so the notice doesn't blink off and the
+ * backoff doesn't start over.
+ */
+export function settledDiscovery(
+  previous: CanDiscoveryState | null,
+  next: CanDiscoveryState | null
+): CanDiscoveryState | null {
+  if (next?.status === "running" && discoveryNeedsRecheck(previous)) return previous
+  return next
+}
+
+/** `settledDiscovery` over a page's polled discovery state. */
+export function useSettledDiscovery(discovery: CanDiscoveryState | null): CanDiscoveryState | null {
+  const [state, setState] = useState({ seen: discovery, shown: discovery })
+  if (state.seen === discovery) return state.shown
+  const next = { seen: discovery, shown: settledDiscovery(state.shown, discovery) }
+  setState(next)
+  return next.shown
 }
 
 /** How long to wait before the next automatic check: 5 s, doubling to a minute. */
@@ -74,7 +98,7 @@ export function deviceErrorText(error: string | null | undefined, device: string
     return `${device} isn't answering. Turn on its power.`
   }
   if (/permission|denied|not permitted/i.test(raw)) {
-    return "The robot's computer can't open the USB device. Restart the robot's computer."
+    return "The Host Computer can't open the USB device. Restart the Host Computer."
   }
   if (/busy|in use|owns/i.test(raw)) {
     return `${device} is in use. Stop the running operation or test first.`

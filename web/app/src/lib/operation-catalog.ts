@@ -14,7 +14,7 @@ import type { OperationId, OperationMeta } from "@/lib/supervisor"
 /**
  * The operations as the app presents them: names, icons, groups, one-line
  * summaries and what each needs. The app owns this, so the Operations screen
- * looks the same before a robot's computer is connected; the host only adds
+ * looks the same before the Host Computer is connected; the host only adds
  * what it knows (which operations it can run, their per-run fields, their
  * status). An operation a newer host adds that isn't listed here still shows,
  * under "More", with the host's own wording.

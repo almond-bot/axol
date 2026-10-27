@@ -395,7 +395,7 @@ export function OperationPanel({
   } else if (trackerGated && currentTrackerReadinessState !== "ready") {
     trackerIssues.push(
       currentTrackerReadinessState === "error"
-        ? "Can't check the Mantis trackers. Reconnect the Axol host, or update it."
+        ? "Can't check the Mantis trackers. Reconnect the Host Computer, or update it."
         : "Checking the Mantis trackers…"
     )
   }
@@ -731,7 +731,7 @@ function ReadyChecklist({
   )
 }
 
-/** Shown in place of an operation's inputs until a robot's computer is
+/** Shown in place of an operation's inputs until the Host Computer is
  *  connected: the app knows the operation, but only the host can run it. */
 function ConnectPrompt({ onConnect }: { onConnect?: () => void }) {
   return (

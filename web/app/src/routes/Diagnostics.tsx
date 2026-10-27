@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { discoveryNeedsRecheck, discoveryNotice } from "@/lib/hardware-status"
+import { discoveryNeedsRecheck, discoveryNotice, useSettledDiscovery } from "@/lib/hardware-status"
 import { Navigate, useLocation, useNavigate } from "react-router-dom"
 import {
   Cable,
@@ -693,8 +693,10 @@ export default function Diagnostics() {
     [toast]
   )
 
-  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(canDiscovery)
-  const hardwareNotice = discoveryNotice(canDiscovery)
+  const settledCanDiscovery = useSettledDiscovery(canDiscovery)
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(settledCanDiscovery)
+  const hardwareNotice = discoveryNotice(settledCanDiscovery)
+  const canDiscoveryChecking = canDiscoveryRetryBusy || canDiscovery?.status === "running"
   const retryCanIdentification = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
     setCanDiscoveryRetryBusy(true)
@@ -1197,7 +1199,7 @@ export default function Diagnostics() {
               <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
                 <p
                   className="min-w-0 flex-1 text-sm text-amber-100/80"
-                  title={canDiscovery?.message ?? undefined}
+                  title={settledCanDiscovery?.message ?? undefined}
                 >
                   {hardwareNotice.text}
                 </p>
@@ -1206,14 +1208,14 @@ export default function Diagnostics() {
                   size="sm"
                   onClick={() => void retryCanIdentification()}
                   disabled={
-                    canDiscoveryRetryBusy ||
+                    canDiscoveryChecking ||
                     hardwareSessionBusy ||
                     launchBusy ||
                     robotBusy ||
                     activeRun !== null
                   }
                 >
-                  {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  {canDiscoveryChecking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                   Check again
                 </Button>
               </div>
@@ -1493,8 +1495,8 @@ export default function Diagnostics() {
         {tab === "tests" && testCommands.length === 0 && helperCommands.length === 0 && (
           <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-white/45">
             {serverOk
-              ? "This host has no tests or helpers. Update Axol on the host to get them."
-              : "Connect to the robot's computer to see its tests and helpers."}
+              ? "This Host Computer has no tests or helpers. Update Axol on it to get them."
+              : "Connect to the Host Computer to see its tests and helpers."}
           </div>
         )}
 

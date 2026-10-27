@@ -1,7 +1,8 @@
 import {
+  Bot,
   Check,
   CircleDot,
-  Cpu,
+  Grab,
   Loader2,
   Plug,
   Power,
@@ -44,86 +45,110 @@ type Dot = StatusDot
 
 const DOT_CLASS = STATUS_DOT_CLASS
 
-function Tile({
+/**
+ * One device on the Devices page: an icon, its name and status, the main
+ * action at the top right, then what it reports and its other actions.
+ */
+function DeviceCard({
   icon,
-  title,
+  name,
   dot,
-  label,
+  status,
+  statusTitle,
   pulse,
-  children,
-  statusEnd,
-  statusContent,
   badge,
-  onOpenSettings,
-  className,
+  action,
+  children,
+  footer,
 }: {
   icon: ReactNode
-  title: string
+  name: string
   dot: Dot
-  label: string
+  status: string
+  /** The host's own words, for the tooltip. */
+  statusTitle?: string | null
   pulse?: boolean
-  children?: ReactNode
-  statusEnd?: ReactNode
-  statusContent?: ReactNode
-  /** Small marker next to the title (e.g. the selected device). */
+  /** A marker next to the name (the selected device). */
   badge?: ReactNode
-  /** Clicking the tile's title opens this connection's settings. */
-  onOpenSettings?: () => void
-  /** Grid placement (e.g. a tile spanning the row). */
-  className?: string
+  /** The main action: Connect or Disconnect. */
+  action?: ReactNode
+  /** What the device reports while connected. */
+  children?: ReactNode
+  /** Settings and the less frequent actions. */
+  footer?: ReactNode
 }) {
-  const heading = (
-    <>
-      {icon}
-      <span className="font-mono">{title}</span>
-    </>
-  )
+  const active = dot === "ok" || dot === "busy"
   return (
-    <div
-      className={cn(
-        "group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5",
-        onOpenSettings && "transition-colors hover:border-white/20",
-        className
-      )}
-    >
-      <div className="flex min-h-8 items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2">
-          {onOpenSettings ? (
-            <button
-              type="button"
-              onClick={onOpenSettings}
-              title={`Open ${title} settings`}
-              aria-label={`Open ${title} settings`}
-              className="flex items-center gap-2 rounded-md text-xs tracking-widest text-white/40 uppercase transition-colors hover:text-white/80"
-            >
-              {heading}
-              <Settings2 className="size-3.5 text-white/30 transition-colors group-hover:text-white/60" />
-            </button>
-          ) : (
-            <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-              {heading}
-            </div>
+    <section className="flex min-w-0 flex-col rounded-2xl border border-white/10 bg-white/[0.02]">
+      <div className="flex items-start gap-4 p-5">
+        <span
+          className={cn(
+            "flex size-11 shrink-0 items-center justify-center rounded-xl border [&_svg]:size-5",
+            active
+              ? "border-[#eff483]/15 bg-[#eff483]/[0.07] text-[#eff483]"
+              : "border-white/10 bg-white/[0.04] text-white/45"
           )}
-          {badge}
+        >
+          {icon}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-h-6 flex-wrap items-center gap-2">
+            <h2 className="font-heading text-base font-semibold text-white">{name}</h2>
+            {badge}
+          </div>
+          <p className="mt-1 flex min-w-0 items-center gap-2 text-sm">
+            <span
+              className={cn(
+                "size-2 shrink-0 rounded-full",
+                DOT_CLASS[dot],
+                pulse && "animate-pulse"
+              )}
+            />
+            <span
+              className={cn(
+                "min-w-0 truncate",
+                dot === "err" ? "text-red-300/90" : "text-white/55"
+              )}
+              title={statusTitle ?? status}
+            >
+              {status}
+            </span>
+          </p>
         </div>
-        {children && <div className="shrink-0">{children}</div>}
+        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
       </div>
-      {statusContent ?? (
-        <div className="flex min-w-0 items-center gap-2 text-sm">
-          <span
-            className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
-          />
-          <span className="min-w-0 flex-1 truncate text-white/75" title={label}>
-            {label}
-          </span>
-          {statusEnd && <div className="shrink-0">{statusEnd}</div>}
+      {children && <div className="border-t border-white/[0.06] px-5 py-4">{children}</div>}
+      {footer && (
+        <div className="mt-auto flex flex-wrap items-center gap-1 border-t border-white/[0.06] px-3 py-2">
+          {footer}
         </div>
       )}
+    </section>
+  )
+}
+
+/** A label and its value, one line of a device card's details. */
+function Detail({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-4 text-sm">
+      <span className="shrink-0 text-white/45">{label}</span>
+      <span className="min-w-0 truncate text-right text-white/80">{children}</span>
     </div>
   )
 }
 
-/** The two host power actions offered on the connected Axol Host tile. */
+/** Opens a device's settings, from the card's footer. */
+function SettingsButton({ onClick }: { onClick?: () => void }) {
+  if (!onClick) return null
+  return (
+    <Button variant="ghost" size="sm" onClick={onClick} className="text-white/60">
+      <Settings2 />
+      Open settings
+    </Button>
+  )
+}
+
+/** The two host power actions offered on the connected Host Computer tile. */
 type PowerAction = "shutdown" | "restart"
 
 const POWER_ACTIONS: Record<
@@ -131,20 +156,20 @@ const POWER_ACTIONS: Record<
   { title: string; body: string; button: string; done: string }
 > = {
   shutdown: {
-    title: "Shut down host",
+    title: "Shut down the Host Computer",
     body:
-      "Turn off the robot's computer. This panel disconnects right away, and " +
+      "Turn off the Host Computer. This panel disconnects right away, and " +
       "you need to be at the robot to turn it back on.",
     button: "Shut down",
-    done: "Host is shutting down.",
+    done: "The Host Computer is shutting down.",
   },
   restart: {
-    title: "Restart host",
+    title: "Restart the Host Computer",
     body:
-      "Restart the robot's computer. This panel disconnects until it is back " +
+      "Restart the Host Computer. This panel disconnects until it is back " +
       "up, usually within a minute.",
     button: "Restart",
-    done: "Host is restarting.",
+    done: "The Host Computer is restarting.",
   },
 }
 
@@ -155,48 +180,20 @@ const POWER_ACTIONS: Record<
  * per-operation Mantis toggle — teleop and data collection follow it, and
  * Axol-only operations wait until it is back on Axol.
  */
-function DeviceSelect({
-  profile,
-  selected,
-  onSelect,
-  disabled,
-  disabledReason,
-  saving,
-}: {
-  profile: HardwareProfile
-  selected: boolean
-  onSelect?: (profile: HardwareProfile) => void
-  disabled: boolean
-  disabledReason?: string | null
-  saving: boolean
-}) {
-  if (selected) {
-    return (
-      <span
-        className="flex shrink-0 items-center gap-1 rounded-full bg-[#eff483]/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-[#eff483] uppercase"
-        title="Every operation runs on this device"
-      >
-        {saving ? <Loader2 className="size-2.5 animate-spin" /> : <Check className="size-2.5" />}
-        selected
-      </span>
-    )
-  }
-  if (!onSelect) return null
+function SelectedBadge({ saving }: { saving: boolean }) {
   return (
-    <button
-      type="button"
-      onClick={() => onSelect(profile)}
-      disabled={disabled}
-      title={disabled ? (disabledReason ?? undefined) : "Run operations on this device."}
-      className="shrink-0 rounded-full border border-white/15 px-1.5 py-0.5 font-mono text-[0.6rem] tracking-wider text-white/45 uppercase transition-colors hover:border-white/30 hover:text-white/80 disabled:cursor-not-allowed disabled:opacity-50"
+    <span
+      className="flex shrink-0 items-center gap-1 rounded-full bg-[#eff483]/15 px-2 py-0.5 text-xs text-[#eff483]"
+      title="Every operation runs on this device"
     >
-      select
-    </button>
+      {saving ? <Loader2 className="size-3 animate-spin" /> : <Check className="size-3" />}
+      Selected
+    </span>
   )
 }
 
 /**
- * Connection tiles for the Axol Host, the two hardware profiles, and Jelly's
+ * Connection tiles for the Host Computer, the two hardware profiles, and Jelly's
  * two devices. Axol and Mantis share one idle telemetry link, so connecting
  * either hardware tile switches that link to its CAN interfaces and motor
  * set. Jelly's wheels and lift ride their own single-channel adapters and
@@ -204,7 +201,8 @@ function DeviceSelect({
  * disconnect on their own. Clicking a tile's title opens that connection's
  * settings: Axol, Mantis, and Jelly each have their own, and the host tile
  * opens the general (shared) settings. The Axol/Mantis tiles also carry
- * the system-wide device selection (see DeviceSelect).
+ * the system-wide device selection: the selected one is marked, the other
+ * offers "Use for operations".
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
@@ -300,7 +298,7 @@ export function ConnectionsBar({
     [toast]
   )
 
-  // -- axol host --
+  // -- Host Computer --
   const wsDot: Dot =
     conn === "ok" ? "ok" : conn === "err" ? "err" : conn === "idle" ? "idle" : "warn"
   const wsLabel =
@@ -315,7 +313,7 @@ export function ConnectionsBar({
   // Axol and Mantis are two profiles of the same server-owned telemetry link.
   // Older hosts omit profile and are necessarily the original Axol profile.
   const activeProfile = robot?.profile ?? "axol"
-  const hardwareTile = (profile: HardwareProfile, title: string) => {
+  const hardwareCard = (profile: HardwareProfile, title: string) => {
     const active = activeProfile === profile
     const detected = canProfiles?.[profile].present ?? false
     const state = active ? (robot?.state ?? "disconnected") : "disconnected"
@@ -349,66 +347,71 @@ export function ConnectionsBar({
                   ? "Not detected"
                   : "Disconnected"
 
+    const live = active && (state === "connected" || state === "busy")
+    const selected = selectedProfile === profile
     return (
-      <Tile
-        icon={<Cpu className="size-3.5" />}
-        title={title}
+      <DeviceCard
+        icon={profile === "axol" ? <Bot /> : <Grab />}
+        name={title}
         dot={dot}
-        label={label}
+        status={label}
+        statusTitle={state === "error" ? robot?.error : null}
         pulse={state === "connecting"}
-        badge={
-          selectedProfile ? (
-            <DeviceSelect
-              profile={profile}
-              selected={selectedProfile === profile}
-              onSelect={online ? onSelectProfile : undefined}
-              disabled={selectDisabled}
-              disabledReason={selectDisabledReason}
-              saving={selectSaving}
-            />
-          ) : undefined
+        badge={selectedProfile && selected ? <SelectedBadge saving={selectSaving} /> : undefined}
+        action={
+          live ? (
+            <Button
+              variant="outline"
+              onClick={onRobotDisconnect}
+              disabled={robotBusy || opRunning}
+              title={
+                opRunning
+                  ? "Wait for the active operation or setup session to finish."
+                  : `Disconnect ${title}. It stays powered on.`
+              }
+            >
+              <Unplug />
+              Disconnect
+            </Button>
+          ) : (
+            <Button
+              variant={detected ? "default" : "outline"}
+              onClick={() => onRobotConnect(profile)}
+              disabled={!online || robotBusy || opRunning}
+              title={
+                opRunning ? "Wait for the active operation or setup session to finish." : undefined
+              }
+            >
+              {robotBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+              Connect
+            </Button>
+          )
         }
-        onOpenSettings={online && onOpenSettings ? () => onOpenSettings(profile) : undefined}
-        statusContent={
-          active &&
-          robot &&
-          robot.motors.length > 0 &&
-          (state === "connected" || state === "busy") ? (
-            <MotorGrid robot={robot} />
+        footer={
+          online && (onOpenSettings || (selectedProfile && !selected && onSelectProfile)) ? (
+            <>
+              <SettingsButton
+                onClick={onOpenSettings ? () => onOpenSettings(profile) : undefined}
+              />
+              {selectedProfile && !selected && onSelectProfile && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onSelectProfile(profile)}
+                  disabled={selectDisabled}
+                  title={selectDisabled ? (selectDisabledReason ?? undefined) : undefined}
+                  className="ml-auto text-white/60"
+                >
+                  <Check />
+                  Use for operations
+                </Button>
+              )}
+            </>
           ) : undefined
         }
       >
-        {active && (state === "connected" || state === "busy") ? (
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={onRobotDisconnect}
-            disabled={robotBusy || opRunning}
-            aria-label={`Disconnect ${title}`}
-            title={
-              opRunning
-                ? "Wait for the active operation or setup session to finish."
-                : `Disconnect ${title}. It stays powered on.`
-            }
-            className="size-8"
-          >
-            <Unplug />
-          </Button>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => onRobotConnect(profile)}
-            disabled={!online || robotBusy || opRunning}
-            title={
-              opRunning ? "Wait for the active operation or setup session to finish." : undefined
-            }
-          >
-            {robotBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-            Connect
-          </Button>
-        )}
-      </Tile>
+        {live && robot && robot.motors.length > 0 ? <MotorSummary robot={robot} /> : undefined}
+      </DeviceCard>
     )
   }
 
@@ -440,7 +443,7 @@ export function ConnectionsBar({
         </span>
       )
     return (
-      <div key={device} className="flex min-w-0 items-center gap-2 text-sm">
+      <div key={device} className="flex min-h-9 min-w-0 items-center gap-3 text-sm">
         <span
           className={cn(
             "size-2 shrink-0 rounded-full",
@@ -448,47 +451,47 @@ export function ConnectionsBar({
             view.state === "connecting" && "animate-pulse"
           )}
         />
-        <span className="w-14 shrink-0 text-xs tracking-wide text-white/45 uppercase">{short}</span>
+        <span className="w-12 shrink-0 font-medium text-white/80">{short}</span>
         {detail}
         {live ? (
           <Button
             variant="outline"
-            size="icon"
+            size="sm"
             onClick={() => onJellyDisconnect?.(device)}
             disabled={busy || opRunning || view.state === "busy" || !onJellyDisconnect}
-            aria-label={`Disconnect ${title}`}
             title={
               opRunning || view.state === "busy"
                 ? "Wait for the active operation or setup session to finish."
                 : `Disconnect ${title}. It stays powered on.`
             }
-            className="size-7 shrink-0"
+            className="shrink-0"
           >
             {busy ? <Loader2 className="animate-spin" /> : <Unplug />}
+            Disconnect
           </Button>
         ) : (
           <Button
             variant="outline"
-            size="icon"
+            size="sm"
             onClick={() => onJellyConnect?.(device)}
             disabled={!online || !jellySupported || busy || opRunning || !onJellyConnect}
-            aria-label={`Connect ${title}`}
             title={
               !jellySupported
-                ? "Update the software on the host to connect Jelly."
+                ? "Update the software on the Host Computer to connect Jelly."
                 : opRunning
                   ? "Wait for the active operation or setup session to finish."
-                  : `Connect ${title}`
+                  : undefined
             }
-            className="size-7 shrink-0"
+            className="shrink-0"
           >
             {busy ? <Loader2 className="animate-spin" /> : <Plug />}
+            Connect
           </Button>
         )}
       </div>
     )
   }
-  // The tile's headline dot: the worse of the two devices.
+  // The card's headline dot: the worse of the two devices.
   const jellyViews = JELLY_DEVICES.map((device) =>
     jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
   )
@@ -503,7 +506,7 @@ export function ConnectionsBar({
           : "idle"
   const jellyLive = jellyViews.filter((v) => v.state === "connected" || v.state === "busy").length
   const jellyLabel = !jellySupported
-    ? "Not available on this host"
+    ? "Update the Host Computer to use Jelly"
     : jellyLive === 2
       ? "Wheels and lift connected"
       : jellyLive === 1
@@ -514,82 +517,86 @@ export function ConnectionsBar({
   const battery = jellySupported ? jellyBattery(jelly) : null
 
   return (
-    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      <Tile
-        icon={<Server className="size-3.5" />}
-        title="Axol Host"
+    <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <DeviceCard
+        icon={<Server />}
+        name="Host Computer"
         dot={wsDot}
-        label={wsLabel}
+        status={wsLabel}
         pulse={conn === "loading"}
-        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("general") : undefined}
-        statusEnd={
-          online && version ? (
-            <span className="font-mono text-[0.7rem] text-white/35" title={`v${version}`}>
-              axol v{version}
-            </span>
-          ) : undefined
-        }
-      >
-        {online ? (
-          <div className="flex items-center gap-1.5">
+        action={
+          online ? (
             <Button
               variant="outline"
-              size="icon"
-              onClick={() => setPowerOpen("restart")}
-              aria-label="Restart host"
-              title="Restart the robot's computer."
-              className="size-8"
-            >
-              <RotateCcw />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => setPowerOpen("shutdown")}
-              aria-label="Shut down host"
-              title="Shut down the robot's computer."
-              className="size-8 text-red-300 hover:bg-red-400/10"
-            >
-              <Power />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
               onClick={onHostDisconnect}
-              aria-label="Disconnect Axol Host"
-              title="Disconnect this panel. The robot's computer keeps running."
-              className="size-8"
+              title="Disconnect this panel. The Host Computer keeps running."
             >
               <Unplug />
+              Disconnect
             </Button>
-          </div>
-        ) : (
-          <Button variant="outline" size="sm" onClick={onOpenSetup}>
-            <Plug />
-            Connect
-          </Button>
-        )}
-      </Tile>
-
-      {hardwareTile("axol", "Axol")}
-      {hardwareTile("mantis", "Mantis")}
-      <Tile
-        icon={<CircleDot className="size-3.5" />}
-        title="Jelly"
-        dot={jellyDot}
-        label={jellyLabel}
-        onOpenSettings={online && onOpenSettings ? () => onOpenSettings("jelly") : undefined}
-        className="sm:col-span-2 lg:col-span-3"
-        statusContent={
-          jellySupported ? (
-            <div className="grid gap-2 sm:grid-cols-2 sm:gap-x-6">
-              {JELLY_DEVICES.map(jellyRow)}
-            </div>
+          ) : (
+            <Button onClick={onOpenSetup}>
+              <Plug />
+              Connect
+            </Button>
+          )
+        }
+        footer={
+          online ? (
+            <>
+              <SettingsButton
+                onClick={onOpenSettings ? () => onOpenSettings("general") : undefined}
+              />
+              <span className="ml-auto" />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPowerOpen("restart")}
+                className="text-white/60"
+              >
+                <RotateCcw />
+                Restart
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setPowerOpen("shutdown")}
+                className="text-red-300 hover:bg-red-400/10 hover:text-red-200"
+              >
+                <Power />
+                Shut down
+              </Button>
+            </>
           ) : undefined
         }
       >
-        {battery ? <BatteryIndicator battery={battery} /> : undefined}
-      </Tile>
+        {online && (host || version) ? (
+          <div className="flex flex-col gap-2">
+            {host && <Detail label="Address">{host}</Detail>}
+            {version && <Detail label="Software">Axol v{version}</Detail>}
+          </div>
+        ) : undefined}
+      </DeviceCard>
+
+      {hardwareCard("axol", "Axol")}
+      {hardwareCard("mantis", "Mantis")}
+
+      <DeviceCard
+        icon={<CircleDot />}
+        name="Jelly"
+        dot={jellyDot}
+        status={jellyLabel}
+        action={battery ? <BatteryIndicator battery={battery} /> : undefined}
+        footer={
+          online && onOpenSettings ? (
+            <SettingsButton onClick={() => onOpenSettings("jelly")} />
+          ) : undefined
+        }
+      >
+        {jellySupported ? (
+          <div className="flex flex-col gap-2">{JELLY_DEVICES.map(jellyRow)}</div>
+        ) : undefined}
+      </DeviceCard>
 
       {/* Host power confirmation (shutdown / restart) */}
       {powerOpen && (
@@ -645,6 +652,27 @@ export function ConnectionsBar({
   )
 }
 
+/** The motor squares with how many are healthy, on a connected device's card. */
+function MotorSummary({ robot }: { robot: RobotStatus }) {
+  const known = robot.motors.filter((m) => m.reachable != null)
+  const healthy = known.filter(motorHealthy).length
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 text-sm">
+      <span className="text-white/45">
+        Motors
+        {known.length > 0 && (
+          <span
+            className={cn("ml-2", healthy < known.length ? "text-red-300/90" : "text-white/80")}
+          >
+            {healthy} of {robot.motors.length} OK
+          </span>
+        )}
+      </span>
+      <MotorGrid robot={robot} size="md" />
+    </div>
+  )
+}
+
 /** Healthy = reachable on CAN and reporting no error status. */
 function motorHealthy(m: MotorHealth): boolean {
   return m.reachable === true && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
@@ -656,7 +684,7 @@ const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toL
  * Per-motor health as one status row. CAN reachability and the reported motor
  * error are one result: an unreachable motor is an error, not a separate state.
  */
-export function MotorGrid({ robot }: { robot: RobotStatus }) {
+export function MotorGrid({ robot, size = "sm" }: { robot: RobotStatus; size?: "sm" | "md" }) {
   if (!robot.motors.length) return null
   // Unknown is its own square: while a task owns the bus nothing reads these
   // motors, and painting the last-known state would keep showing a motor as
@@ -681,7 +709,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
       {arms.map((arm) => (
         <div key={arm} className="flex items-center gap-1">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-          <div className="flex gap-0.5">
+          <div className={cn("flex", size === "md" ? "gap-1" : "gap-0.5")}>
             {robot.motors
               .filter((m) => m.arm === arm)
               .map((m, index, motors) => {
@@ -695,7 +723,13 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
                     aria-describedby={tooltip}
                     className="group/motor relative inline-flex rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111]"
                   >
-                    <span className={cn("size-2.5 rounded-[3px]", SQUARE[color(m)])} />
+                    <span
+                      className={cn(
+                        "rounded-[3px]",
+                        size === "md" ? "size-3.5" : "size-2.5",
+                        SQUARE[color(m)]
+                      )}
+                    />
                     <span
                       id={tooltip}
                       role="tooltip"

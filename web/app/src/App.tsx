@@ -1783,7 +1783,7 @@ export default function App() {
                   htmlFor="vr-host"
                   className="text-xs font-medium tracking-widest text-white/40 uppercase"
                 >
-                  Axol host address
+                  Host Computer address
                 </label>
                 <SuggestInput
                   id="vr-host"
@@ -1908,8 +1908,9 @@ export default function App() {
             {status === AxolConnectionStatus.Failed && (
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
-                  Could not connect to <span className="font-mono">{hostname || "the host"}</span>.
-                  Check that Teleoperation or Collect data is running on the host
+                  Could not connect to{" "}
+                  <span className="font-mono">{hostname || "the Host Computer"}</span>. Check that
+                  Teleoperation or Collect data is running on the Host Computer
                   {hostCertAuthorizeVisible(hostname)
                     ? ", then authorize its certificate below."
                     : "."}

@@ -124,6 +124,7 @@ import {
   discoveryNeedsRecheck,
   discoveryNotice,
   nextRecheckDelay,
+  useSettledDiscovery,
 } from "@/lib/hardware-status"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
@@ -1300,8 +1301,10 @@ export default function ControlPanel() {
   // Shared by the update banner and the host tile's power confirmations.
   const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
-  const updateBusyReason = isLive ? "Stop the running operation" : "The host is busy"
-  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(canDiscovery)
+  const updateBusyReason = isLive ? "Stop the running operation" : "The Host Computer is busy"
+  const settledCanDiscovery = useSettledDiscovery(canDiscovery)
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(settledCanDiscovery)
+  const canDiscoveryChecking = canDiscoveryRetryBusy || canDiscovery?.status === "running"
 
   // Bring up each detected Jelly device once per (device, interface, server
   // epoch), the way the Axol/Mantis link auto-connects: only from an idle
@@ -1382,7 +1385,7 @@ export default function ControlPanel() {
     !hostBusy &&
     !activeCommandSession &&
     !robotBusy &&
-    !canDiscoveryRetryBusy
+    !canDiscoveryChecking
   useEffect(() => {
     if (!canDiscoveryNeedsRetry) recheckDelayRef.current = null
   }, [canDiscoveryNeedsRetry])
@@ -2148,7 +2151,7 @@ export default function ControlPanel() {
     },
     devices: {
       title: "Devices",
-      description: "The robot's computer and the hardware connected to it.",
+      description: "The Host Computer and the hardware connected to it.",
     },
     settings: {
       title: "Settings",
@@ -2219,11 +2222,11 @@ export default function ControlPanel() {
 
   // The devices at a glance on Home. Mantis and Jelly show once they are
   // plugged in (or selected), so an Axol-only setup sees just Axol.
-  const hardwareNotice = connected ? discoveryNotice(canDiscovery) : null
+  const hardwareNotice = connected ? discoveryNotice(settledCanDiscovery) : null
   const deviceSummaries: DeviceSummary[] = [
     {
       key: "host",
-      name: "Robot's computer",
+      name: "Host Computer",
       dot: hostDot,
       status: connected
         ? `${hostInfo?.hostname || serverHost || "Connected"}`
@@ -2330,7 +2333,7 @@ export default function ControlPanel() {
     <HardwareNoticeCard
       notice={hardwareNotice}
       onCheckAgain={hardwareCheck}
-      checking={canDiscoveryRetryBusy}
+      checking={canDiscoveryChecking}
     />
   )
 
@@ -2673,7 +2676,7 @@ function lastLineIndex(lines: string[], prefix: string): number {
   return -1
 }
 
-/** A page that needs the robot's computer, before one is connected. */
+/** A page that needs the Host Computer, before one is connected. */
 function EmptyState({ children, onConnect }: { children: ReactNode; onConnect?: () => void }) {
   return (
     <div className="flex min-h-56 flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-white/10 p-6 text-center">

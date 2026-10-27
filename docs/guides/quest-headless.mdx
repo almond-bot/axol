@@ -17,7 +17,7 @@ Turn on **Developer Mode** on the headset, as for [Quest over USB](/guides/quest
 
 ## Keep the headset awake from the control panel
 
-1. Plug the headset into the robot's computer with a USB-C cable.
+1. Plug the headset into the Host Computer with a USB-C cable.
 2. If the headset shows **Allow USB debugging?**, accept it.
 3. In the [control panel](/guides/control-panel#quest-usb), open the **Quest** tab under **General settings** and press **Keep awake**.
 
@@ -25,7 +25,7 @@ The display stays on and the VR session keeps running with the headset on a desk
 
 ## Keep the headset awake with adb
 
-The **Keep awake** and **Allow sleep** buttons run these `adb` commands on the robot's computer. [`axol provision`](/cli/provision) installs `adb`. With the headset plugged in, you can run them from any terminal:
+The **Keep awake** and **Allow sleep** buttons run these `adb` commands on the Host Computer. [`axol provision`](/cli/provision) installs `adb`. With the headset plugged in, you can run them from any terminal:
 
 ```bash
 # Disable the proximity sensor (keep the headset awake)

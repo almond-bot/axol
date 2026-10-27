@@ -141,7 +141,7 @@ export default function PoseViewer({
   if (error) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-center text-xs text-white/40">
-        Couldn&apos;t load the robot model from the host: {error}
+        Couldn&apos;t load the robot model from the Host Computer: {error}
       </div>
     )
   }

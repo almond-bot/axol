@@ -41,10 +41,10 @@ lerobot-record \
 | Teleoperator | `axol_vr` | [`AxolVRTeleop`](#axolvrteleop) |
 | Camera | `zed` | [`ZedCamera`](#zedcamera) |
 
-Teleoperation still uses the VR headset: open the [VR app](/operations/teleop) and connect to the robot's computer. For the best data collection performance, use [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) instead. They add ZED capture in a separate process, NVENC dataset encoding on the Jetson, and video streaming to the headset.
+Teleoperation still uses the VR headset: open the [VR app](/operations/teleop) and connect to the Host Computer. For the best data collection performance, use [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) instead. They add ZED capture in a separate process, NVENC dataset encoding on the Jetson, and video streaming to the headset.
 
 <Note>
-  The plugin needs LeRobot 0.6.1, Linux and Python 3.12 or later on the robot's computer. The hosted installer includes Python 3.13. The `zed` camera also needs `pyzed` ([`zed.install`](/cli/zed-install)). To add the plugin to an `axol` environment from the one-command installer, see the [plugin README](https://github.com/almond-bot/axol/tree/main/plugins/lerobot_robot_axol).
+  The plugin needs LeRobot 0.6.1, Linux and Python 3.12 or later on the Host Computer. The hosted installer includes Python 3.13. The `zed` camera also needs `pyzed` ([`zed.install`](/cli/zed-install)). To add the plugin to an `axol` environment from the one-command installer, see the [plugin README](https://github.com/almond-bot/axol/tree/main/plugins/lerobot_robot_axol).
 </Note>
 
 If you install the plugin from PyPI into the hosted Axol environment, Axol

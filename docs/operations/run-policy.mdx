@@ -1,11 +1,11 @@
 ---
 title: "Run Policy"
-description: "Run a trained policy on Axol, with inference on the robot's computer or a remote server."
+description: "Run a trained policy on Axol, with inference on the Host Computer or a remote server."
 ---
 
 Run Policy lets a trained policy drive Axol's arms. Axol sends the arm positions and camera frames to the policy, and the policy sends back chunks of actions. Run it on the same computer as [data collection](/operations/data-collection): the one wired to the robot with the ZED cameras attached. Start it from the web control panel or with `axol run-policy`.
 
-For LeRobot policies, inference runs on the robot's computer by default. You can move it to a more powerful computer on the network instead. Custom policies connect to an endpoint you run, through the [custom policy interface](/api/policy-plan).
+For LeRobot policies, inference runs on the Host Computer by default. You can move it to a more powerful computer on the network instead. Custom policies connect to an endpoint you run, through the [custom policy interface](/api/policy-plan).
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
 - Connect at least one of the ZED cameras the policy was trained on, and have their serial numbers ready. See the [Data Collection](/operations/data-collection#before-you-start) tip for how to list them.
 - Have a trained checkpoint and its policy type (`act`, `smolvla`, `pi0` and so on). The checkpoint can be a local path or a HuggingFace repo.
 - Use the **same** cameras, camera resolution, stereo setting and recording rate the policy was trained on.
-- For GPU inference on the robot's computer, you need a PyTorch build with CUDA. Otherwise, use a remote server (below) or pass `--device cpu`.
+- For GPU inference on the Host Computer, you need a PyTorch build with CUDA. Otherwise, use a remote server (below) or pass `--device cpu`.
 
 <Warning>
   Load only checkpoints and datasets that you made or got from a source you trust. Model and dataset loading is not sandboxed.
@@ -45,7 +45,7 @@ flowchart LR
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**. Under **Axol settings → Cameras**, assign at least one of the cameras the policy was trained on. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Host Computer** and **Axol**. Under **Axol settings → Cameras**, assign at least one of the cameras the policy was trained on. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Run policy and fill in the fields">
@@ -68,7 +68,7 @@ flowchart LR
   </Tab>
 
   <Tab title="CLI">
-    On the robot's computer:
+    On the Host Computer:
 
     ```bash
     axol run-policy \
@@ -137,7 +137,7 @@ Smooth motion still needs consistent targets and fast enough inference. See [`ru
   </Step>
 
   <Step title="Point Run Policy at it">
-    On the robot's computer, run Run Policy as above with the server's address:
+    On the Host Computer, run Run Policy as above with the server's address:
 
     <Tabs>
       <Tab title="Control Panel">

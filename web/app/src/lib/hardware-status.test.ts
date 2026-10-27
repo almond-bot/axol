@@ -5,6 +5,7 @@ import {
   discoveryNeedsRecheck,
   discoveryNotice,
   nextRecheckDelay,
+  settledDiscovery,
 } from "./hardware-status"
 
 const discovery = (status: string) =>
@@ -31,6 +32,24 @@ describe("discoveryNotice", () => {
   })
 })
 
+describe("settledDiscovery", () => {
+  it("keeps the last result while silent hardware is checked again", () => {
+    const silent = discovery("unidentified")
+    expect(settledDiscovery(silent, discovery("running"))).toBe(silent)
+    expect(settledDiscovery(discovery("error"), discovery("running"))?.status).toBe("error")
+  })
+
+  it("takes every other result as it comes", () => {
+    const running = discovery("running")
+    expect(settledDiscovery(null, running)).toBe(running)
+    expect(settledDiscovery(discovery("needed"), running)).toBe(running)
+    expect(settledDiscovery(discovery("unidentified"), discovery("configured"))?.status).toBe(
+      "configured"
+    )
+    expect(settledDiscovery(discovery("unidentified"), null)).toBeNull()
+  })
+})
+
 describe("nextRecheckDelay", () => {
   it("starts at 5 s and backs off to a minute", () => {
     const delays = [null, 5000, 10_000, 20_000, 40_000, 60_000].map(nextRecheckDelay)
@@ -49,7 +68,7 @@ describe("deviceErrorText", () => {
     ],
     [
       "PermissionError: [Errno 1] Operation not permitted",
-      "The robot's computer can't open the USB device. Restart the robot's computer.",
+      "The Host Computer can't open the USB device. Restart the Host Computer.",
     ],
     ["OSError: something odd", "Couldn't connect to Axol."],
     [null, "Couldn't connect to Axol."],

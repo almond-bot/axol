@@ -13,16 +13,16 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes and fix their task text. |
 | **Request data** | Pay Almond to collect training data for your task. |
-| **Devices** | The robot's computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
+| **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
 
-The robot's computer you are connected to, and whether the selected device is connected, show at the top right of every page. Click it to open **Devices**. Before you connect, the **Overview** shows a **Connect** button.
+The Host Computer you are connected to, and whether the selected device is connected, show at the top right of every page. Click it to open **Devices**. Before you connect, the **Overview** shows a **Connect** button.
 
 ## Open the control panel
 
-With the [one-command install](/installation), the server already runs on the robot's computer (the one wired to the arms, with the ZED cameras attached). It starts at boot and restarts if it stops. Open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+With the [one-command install](/installation), the server already runs on the Host Computer (the one wired to the arms, with the ZED cameras attached). It starts at boot and restarts if it stops. Open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
 
 On a development install, start the server yourself:
 
@@ -38,7 +38,7 @@ Axol control panel:
   LAN   : https://192.168.1.50:8001
 ```
 
-Open the **Local** URL on the robot's computer, or the **LAN** URL from another machine on the same network. Accept the self-signed certificate the first time. The panel is at `/control`, and it works on a phone or tablet too.
+Open the **Local** URL on the Host Computer, or the **LAN** URL from another machine on the same network. Accept the self-signed certificate the first time. The panel is at `/control`, and it works on a phone or tablet too.
 
 <Note>
   On a development install, build the local UI once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). Or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve`. See [Development install](/advanced/development-install#build-the-web-ui).
@@ -52,9 +52,9 @@ Open the **Local** URL on the robot's computer, or the **LAN** URL from another 
 
 The **Overview** lists your devices on one line each, with a **Connect** button for one that is plugged in but not connected. Mantis and Jelly show once they are plugged in.
 
-The **Devices** page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
+The **Devices** page has a card each for the **Host Computer**, **Axol**, **Mantis** and **Jelly**. Each card shows the device's status, with **Connect** or **Disconnect** at the top right. Press **Open settings** on a card to open that device's [settings](#settings). On the **Host Computer** card, it opens the general settings.
 
-**Choose the device.** Every operation runs on either Axol or Mantis. The chosen tile shows **selected**, and the other shows **Select**.
+**Choose the device.** Every operation runs on either Axol or Mantis. The chosen card shows **Selected**. Press **Use for operations** on the other card to switch.
 
 - With Mantis selected, only **Teleoperation** and **Collect data** are offered.
 - The choice is saved on the host, so every browser sees the same one.
@@ -65,18 +65,18 @@ The **Devices** page has four tiles: **Axol Host**, **Axol**, **Mantis** and **J
   Closing the browser tab, or disconnecting from the host, does **not** stop anything. The robot connection and any running operation keep going in `axol serve`. Press **Stop** to end an operation.
 </Warning>
 
-### Axol Host
+### Host Computer
 
-The **Axol Host** is the computer running `axol serve`. Press **Connect** on its tile and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
+The **Host Computer** is the computer running `axol serve`. Press **Connect** on its card and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
 
-Once connected, the tile shows the host's name and its installed version (for example `axol v0.1.2`). Teleoperation and gravity compensation need nothing else.
+Once connected, the card shows the host's name and its installed version (for example `Axol v0.1.2`). Teleoperation and gravity compensation need nothing else.
 
-The connected tile has three buttons:
+The connected card has three buttons:
 
 | Button | What it does |
 |---|---|
-| **Restart** | Reboots the robot's computer after you confirm. Reconnect when it is back, usually in under a minute. |
-| **Shut down** | Powers the robot's computer off after you confirm. You need physical access to turn it back on. |
+| **Restart** | Reboots the Host Computer after you confirm. Reconnect when it is back, usually in under a minute. |
+| **Shut down** | Powers the Host Computer off after you confirm. You need physical access to turn it back on. |
 | **Disconnect** | Disconnects this browser only. The server, the robot and any running operation keep going. |
 
 **Restart** and **Shut down** wait until no operation is running and no update is installing. On a development install they need passwordless `sudo`, or the host reports that it couldn't restart and stays up.
@@ -116,13 +116,13 @@ On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Rob
 
 The panel finds the CAN adapters plugged into the host and connects the selected device automatically. On a new hub, it first identifies each adapter (Axol arm, Mantis rig, Jelly wheels or Jelly lift) and names it, the same way [`axol can.setup`](/cli/can-setup) does.
 
-If the automatic connection fails twice, press **Connect** on the tile. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
+If the automatic connection fails twice, press **Connect** on the card. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
 
 **If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
 To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.
 
-**Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the tile. Hover a square to see its status and temperature.
+**Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the card, next to how many are OK. Hover a square to see its status and temperature.
 
 | Square | Meaning |
 |---|---|
@@ -132,7 +132,7 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 
 **If motor power is cut.** If you cut motor power during a run, for example at the power supply, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If a motor still answers with torque on, the panel shows **Re-check motors**. Cut motor power, then press it.
 
-**Mantis.** Press **Select** on the Mantis tile. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
+**Mantis.** Press **Use for operations** on the Mantis card. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
 
 - **Teleoperation** drives the grippers from the rig triggers. It needs only CAN, with no tracking.
 - **Collect data** uses the pose source set under **Mantis settings → Tracking**. See [Mantis Tracking](/mantis/tracking).
@@ -140,9 +140,9 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 
 ### Jelly
 
-The **Jelly** tile has a row each for the wheels and the lift, each with a connect button. Jelly is driven together with Axol, so it isn't part of the device choice.
+The **Jelly** card has a row each for the wheels and the lift, each with **Connect** or **Disconnect**. Jelly is driven together with Axol, so it isn't part of the device choice.
 
-While the lift is connected, the tile shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
+While the lift is connected, the card shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
 
 - A reading with `~` (for example `~40%`) was measured while Jelly was moving, so it reads low.
 - While an operation uses the bus, the last reading stays dimmed. Hover it to see its age.
@@ -152,7 +152,7 @@ From Python, [`Jelly.battery`](/api/robot#jelly) returns the same estimate.
 
 ## Settings
 
-Settings that apply to every run live on the **Settings** page. Switch between **Axol**, **Mantis**, **Jelly** and **General** at the top of the page, or click a tile's title on **Devices**.
+Settings that apply to every run live on the **Settings** page. Switch between **Axol**, **Mantis**, **Jelly** and **General** at the top of the page, or press **Open settings** on a card on **Devices**.
 
 **Axol settings**
 
@@ -233,7 +233,7 @@ The Mantis **Head** slot starts unassigned. A slot you leave unassigned is off.
 
 The **Quest** tab under **General settings** runs the optional [Quest over USB](/guides/quest-over-usb) link. It sends the controller poses over a USB cable for lower latency. Camera video still uses the network.
 
-1. Plug the Quest into the robot's computer with a USB-C cable.
+1. Plug the Quest into the Host Computer with a USB-C cable.
 2. The first time, put the headset on and accept **Allow USB debugging?**.
 3. The link connects automatically and shows *Controller over USB*. Press **Connect** to retry if it doesn't.
 

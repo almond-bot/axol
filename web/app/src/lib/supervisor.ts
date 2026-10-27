@@ -180,7 +180,7 @@ async function json<T>(res: Response): Promise<T> {
   try {
     return (await res.json()) as T
   } catch {
-    throw new Error("this address is not an Axol host. Check the Axol host address.")
+    throw new Error("this address is not a Host Computer. Check the address.")
   }
 }
 
@@ -1112,7 +1112,7 @@ export async function fetchCommands(): Promise<CommandSpec[]> {
     })
   } catch (e) {
     if (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError")) {
-      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
+      throw new Error(`no response from the Host Computer after ${CONNECT_TIMEOUT_MS / 1000}s`)
     }
     throw e
   }

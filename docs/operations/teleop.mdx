@@ -7,8 +7,8 @@ Teleoperation drives Axol's arms live from a Meta Quest headset. You can drive t
 
 ## Before you start
 
-- Install Axol with the [one-command install](/installation) on the robot's computer. For sim, a [development install](/advanced/development-install) is enough.
-- Select and connect the device. In the control panel, press **Select** on the **Axol** or **Mantis** tile. The panel brings up CAN and checks the motors when it connects. On the CLI, run [`axol can.setup`](/cli/can-setup) once.
+- Install Axol with the [one-command install](/installation) on the Host Computer. For sim, a [development install](/advanced/development-install) is enough.
+- Select and connect the device. In the control panel, press **Use for operations** on the **Axol** or **Mantis** card on **Devices**. The panel brings up CAN and checks the motors when it connects. On the CLI, run [`axol can.setup`](/cli/can-setup) once.
 - For Axol, have a Meta Quest with the [TLS certificate authorized](#authorize-the-tls-certificate). Mantis teleoperation needs no headset.
 - For Mantis, finish the [hardware setup](/mantis/hardware). Tracking is not used here, so you don't need [Mantis Tracking](/mantis/tracking) yet.
 
@@ -32,7 +32,7 @@ To approve it by hand instead, open `https://<hostname>.local:8000` or `https://
   <Tab title="Axol">
     <Steps>
       <Step title="Connect the host and robot">
-        Open the control panel and connect the **Axol Host**. With **Axol** selected, the panel connects the robot and runs `can.setup` the first time. If the tile isn't green, press **Connect** on it. For sim, skip the robot connection. See [Connections](/guides/control-panel#connections).
+        Open the control panel and connect the **Host Computer**. With **Axol** selected, the panel connects the robot and runs `can.setup` the first time. If its card isn't green, press **Connect** on it. For sim, skip the robot connection. See [Connections](/guides/control-panel#connections).
       </Step>
 
       <Step title="Assign cameras (optional)">
@@ -48,7 +48,7 @@ To approve it by hand instead, open `https://<hostname>.local:8000` or `https://
       </Step>
     </Steps>
 
-    **From the CLI**, on the robot's computer:
+    **From the CLI**, on the Host Computer:
 
     ```bash
     axol teleop
@@ -74,7 +74,7 @@ To approve it by hand instead, open `https://<hostname>.local:8000` or `https://
 
     <Steps>
       <Step title="Select and connect Mantis">
-        Press **Select** on the **Mantis** tile. The panel connects the rigs, or you can press **Connect**. The tile shows the CAN health of both grippers. If you haven't checked the side mapping yet, do that first. See [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
+        Press **Use for operations** on the **Mantis** card. The panel connects the rigs, or you can press **Connect**. The card shows the CAN health of both grippers. If you haven't checked the side mapping yet, do that first. See [Mantis Hardware](/mantis/hardware#selecting-and-connecting-mantis).
       </Step>
 
       <Step title="Start and check the grippers">

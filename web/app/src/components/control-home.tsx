@@ -8,7 +8,7 @@ import type { CatalogEntry } from "@/lib/operation-catalog"
 import type { DatasetInfo, OperationId } from "@/lib/supervisor"
 import { cn } from "@/lib/utils"
 
-/** The first thing on Home until a robot's computer is connected. */
+/** The first thing on Home until the Host Computer is connected. */
 export function ConnectHero({ failed, onConnect }: { failed: boolean; onConnect: () => void }) {
   return (
     <section className="flex flex-col gap-4 rounded-2xl border border-[#eff483]/20 bg-gradient-to-br from-[#eff483]/[0.07] via-transparent to-transparent p-6 sm:flex-row sm:items-center">
@@ -17,12 +17,12 @@ export function ConnectHero({ failed, onConnect }: { failed: boolean; onConnect:
       </span>
       <div className="min-w-0 flex-1">
         <h2 className="font-heading text-lg font-semibold">
-          {failed ? "Can't reach the robot's computer" : "Connect to your robot"}
+          {failed ? "Can't reach the Host Computer" : "Connect to your robot"}
         </h2>
         <p className="mt-1 max-w-prose text-sm text-white/55">
           {failed
             ? "Check that it is on and on this network, then connect again."
-            : "Operations run on the computer inside Axol. Connect to it to start one."}
+            : "Operations run on the Host Computer. Connect to it to start one."}
         </p>
       </div>
       <Button size="lg" onClick={onConnect}>
@@ -150,7 +150,7 @@ export function QuickStart({
   )
 }
 
-/** The newest datasets on the robot's computer, each opening the Datasets page. */
+/** The newest datasets on the Host Computer, each opening the Datasets page. */
 export function RecentDatasets({ datasets }: { datasets: DatasetInfo[] }) {
   return (
     <section className="flex flex-col gap-3">

@@ -101,7 +101,7 @@ export function UltimateWifiPanel() {
       // Blank now means preserve the host-side secret on later edits.
       setPassword("")
       setShowPassword(false)
-      toast.success("Tracker Wi-Fi saved on the host.")
+      toast.success("Tracker Wi-Fi saved on the Host Computer.")
     } catch (reason) {
       setError(message(reason))
       toast.error(`Couldn't save the tracker Wi-Fi: ${message(reason)}`)

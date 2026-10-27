@@ -284,7 +284,7 @@ export function HardwareOverview({
         disabled={!online || !jellySupported || busy || hardwareBusy}
         title={
           !jellySupported
-            ? "Update the software on the host to connect Jelly."
+            ? "Update the software on the Host Computer to connect Jelly."
             : hardwareBusy
               ? busyTitle
               : undefined
