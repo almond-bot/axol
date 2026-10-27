@@ -1,10 +1,10 @@
 """IK and joint-space planning for jog moves.
 
-A jog move names a gripper-tip pose for one arm. :class:`JogPlanner` runs
-Axol's IK solver (the same one teleop uses) to convergence from the arm's
-current configuration, so the result is the reachable pose closest to the
-target, then plans a collision-aware joint-space trajectory to it. The other
-arm stays where it is.
+A jog move names a gripper-tip pose for one arm. :class:`JogPlanner` solves
+IK for it with :class:`~almond_axol.kinematics.arm_ik.ArmKinematics` (single
+arm, NumPy, about a millisecond), so the result is the reachable pose
+closest to the target, then plans a joint-space path to it that keeps the
+arms clear of the body and of each other. The other arm stays where it is.
 
 Poses are in the torso frame IK uses (+x forward, +y left, +z up, the URDF's
 ``root`` link), at the gripper tips (:data:`~almond_axol.constants.GRIPPER_TIP_OFFSET`
@@ -14,28 +14,16 @@ out from the mount).
 from __future__ import annotations
 
 import itertools
-import threading
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
 import numpy as np
 
-from ..constants import GRIPPER_TIP_OFFSET
-from ..kinematics.path import _apply_offset, _remove_offset, _rot_angle
+from ..kinematics.arm_ik import ArmKinematics, rotation_angle
 
 Arm = Literal["left", "right"]
 Pose = tuple[np.ndarray, np.ndarray]
 
-# Convergence of the closest-pose search. Each IK call moves a bounded step,
-# so the search repeats it until the tip lands within these tolerances or
-# stops getting closer.
-_POS_TOLERANCE_M = 5e-4
-_ORI_TOLERANCE_RAD = np.radians(0.5)
-_MAX_ITERATIONS = 400
-_STALL_ITERATIONS = 15
-# Per-call step multiplier: 4x the solver's per-tick joint bound, the most
-# teleop ever lets a single solve move.
-_DELTA_SCALE = 4.0
 # A solution counts as reaching the target within these errors.
 REACH_POS_TOLERANCE_M = 2e-3
 REACH_ORI_TOLERANCE_RAD = np.radians(2.0)
@@ -61,6 +49,11 @@ class IkSolution:
             and self.orientation_error <= REACH_ORI_TOLERANCE_RAD
         )
 
+    @property
+    def score(self) -> float:
+        """Closeness to the target: a radian of orientation weighs like 5 cm."""
+        return self.position_error + 0.05 * self.orientation_error
+
 
 @dataclass
 class JogPlan:
@@ -81,43 +74,43 @@ class JogPlan:
 
 
 class JogPlanner:
-    """Thread-safe IK and trajectory planning on one :class:`KinematicsSolver`.
+    """IK, previews and joint-space paths on one :class:`ArmKinematics`.
 
-    The solver keeps per-call state, so every use goes through one lock.
+    Thread-safe without a lock: the control loop, previews and plans may
+    call it at once.
     """
 
-    def __init__(self, solver: Any, tool_offset=GRIPPER_TIP_OFFSET) -> None:
-        self._solver = solver
-        self._offset = np.asarray(tool_offset, dtype=np.float32)
-        self._lock = threading.Lock()
+    def __init__(self, kinematics: ArmKinematics) -> None:
+        self._kin = kinematics
 
     @property
-    def solver(self) -> Any:
-        return self._solver
+    def kinematics(self) -> ArmKinematics:
+        return self._kin
 
     def indices(self, arm: Arm) -> list[int]:
-        return list(
-            self._solver.left_indices if arm == "left" else self._solver.right_indices
-        )
+        return self._kin.indices(arm)
 
-    def tips(self, q: np.ndarray, *, blocking: bool = True) -> tuple[Pose, Pose] | None:
+    def tips(self, q: np.ndarray, *, blocking: bool = True) -> tuple[Pose, Pose]:
         """``(left, right)`` gripper-tip poses for a full joint vector.
 
-        With ``blocking=False`` this returns None instead of waiting for a
-        plan in progress, so a control loop never stalls on it.
+        ``blocking`` is accepted for callers written against a locked
+        solver; nothing here waits.
         """
-        if not self._lock.acquire(blocking=blocking):
-            return None
-        try:
-            left, right = self._solver.fk(np.asarray(q, dtype=np.float32))
-        finally:
-            self._lock.release()
-        return _apply_offset(left, self._offset), _apply_offset(right, self._offset)
+        del blocking
+        left, right = self._kin.tips(np.asarray(q, dtype=np.float64))
+        return (
+            (left[0].astype(np.float32), left[1].astype(np.float32)),
+            (right[0].astype(np.float32), right[1].astype(np.float32)),
+        )
 
-    def _tip_position(self, q: np.ndarray, side: int) -> np.ndarray:
-        tips = self.tips(q)
-        assert tips is not None
-        return tips[side][0]
+    def _solution(self, q: np.ndarray, arm: Arm, target: Pose) -> IkSolution:
+        tip = self._kin.tip(q, arm)
+        return IkSolution(
+            q=np.asarray(q, dtype=np.float32).copy(),
+            tip=(tip[0].astype(np.float32), tip[1].astype(np.float32)),
+            position_error=float(np.linalg.norm(tip[0] - target[0])),
+            orientation_error=rotation_angle(tip[1], np.asarray(target[1], np.float64)),
+        )
 
     def solve(
         self,
@@ -125,63 +118,42 @@ class JogPlanner:
         arm: Arm,
         target: Pose,
         lift_raised: float | None = None,
+        *,
+        seed: np.ndarray | None = None,
     ) -> IkSolution:
         """Closest reachable configuration putting ``arm``'s tip at ``target``.
 
-        Repeats the solver's bounded step from ``q_now`` until the tip is on
-        the target or stops getting closer, keeping the best configuration
-        seen. The posture attractor follows the solution so it does not pull
-        the arm back toward where it started.
+        Solves from ``seed`` (the last preview's solution, so what the page
+        showed is what gets planned) when given, else from ``q_now``. A seed
+        that ends short of the target is checked against a fresh solve from
+        ``q_now``, and the closer one wins. The other arm stays at ``q_now``.
         """
-        solver = self._solver
-        q_now = np.asarray(q_now, dtype=np.float32)
-        position = np.asarray(target[0], dtype=np.float32)
-        rotation = np.asarray(target[1], dtype=np.float32)
-        mount = _remove_offset((position, rotation), self._offset)
+        kin = self._kin
+        kin.set_lift(lift_raised)
+        q_now = np.asarray(q_now, dtype=np.float64)
+        position = np.asarray(target[0], dtype=np.float64)
+        rotation = np.asarray(target[1], dtype=np.float64)
         own = self.indices(arm)
-        other = [i for i in range(len(q_now)) if i not in own]
-        with self._lock:
-            if lift_raised is not None:
-                solver.set_lift(lift_raised)
-            # The other arm aims at where it already is, which keeps the solve
-            # on the warmed-up two-pose graph; its joints are pinned after.
-            other_mount = solver.fk(q_now)[1 if arm == "left" else 0]
-            poses = (mount, other_mount) if arm == "left" else (other_mount, mount)
-            q = q_now.copy()
-            # (score, position error, orientation error, q); the score weighs
-            # a radian of orientation like 5 cm of position.
-            best: tuple[float, float, float, np.ndarray] | None = None
-            stalled = 0
-            for _ in range(_MAX_ITERATIONS):
-                solver.set_posture_pose(q)
-                q = solver.ik(
-                    q, left_pose=poses[0], right_pose=poses[1], delta_scale=_DELTA_SCALE
-                )
-                q[other] = q_now[other]
-                reached = solver.fk(q)[0 if arm == "left" else 1]
-                tip = _apply_offset(reached, self._offset)
-                pos_err = float(np.linalg.norm(tip[0] - position))
-                ori_err = _rot_angle(tip[1], rotation)
-                score = pos_err + 0.05 * ori_err
-                if best is None or score < best[0] - 1e-6:
-                    best = (score, pos_err, ori_err, q.copy())
-                    stalled = 0
-                else:
-                    stalled += 1
-                if pos_err <= _POS_TOLERANCE_M and ori_err <= _ORI_TOLERANCE_RAD:
-                    break
-                if stalled >= _STALL_ITERATIONS:
-                    break
-            solver.set_posture_pose(q_now)
-            assert best is not None
-            _, pos_err, ori_err, q_best = best
-            reached = solver.fk(q_best)[0 if arm == "left" else 1]
-        return IkSolution(
-            q=q_best,
-            tip=_apply_offset(reached, self._offset),
-            position_error=pos_err,
-            orientation_error=ori_err,
-        )
+        starts = [q_now]
+        if seed is not None:
+            start = q_now.copy()
+            start[own] = np.asarray(seed, dtype=np.float64)[own]
+            starts.insert(0, start)
+        best: IkSolution | None = None
+        for start in starts:
+            result = kin.solve(start, arm, (position, rotation))
+            solution = IkSolution(
+                q=result.q,
+                tip=result.tip,
+                position_error=result.position_error,
+                orientation_error=result.orientation_error,
+            )
+            if best is None or solution.score < best.score - 1e-6:
+                best = solution
+            if best.reached:
+                break
+        assert best is not None
+        return best
 
     def joint_trajectory(
         self,
@@ -192,19 +164,17 @@ class JogPlanner:
         rate: float,
         min_duration: float,
     ) -> list[np.ndarray]:
-        """Collision-aware joint-space trajectory between two configurations."""
-        from ..teleop.trajectory import plan_collision_aware_trajectory
+        """Joint-space trajectory between two configurations at ``rate`` Hz.
 
-        with self._lock:
-            trajectory = plan_collision_aware_trajectory(
-                self._solver,
-                np.asarray(q_from, dtype=np.float32),
-                np.asarray(q_to, dtype=np.float32),
-                speed=speed,
-                rate=rate,
-                min_duration=min_duration,
-            )
-        return [np.asarray(q, dtype=np.float32) for q in trajectory]
+        A smoothstep whose worst joint averages ``speed`` (peak ``1.5 *
+        speed``), at least ``min_duration`` long, kept clear of the body and
+        the other arm (see :meth:`ArmKinematics.path`).
+        """
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        distance = float(np.max(np.abs(q_to - q_from))) if q_from.size else 0.0
+        steps = max(2, round(max(distance / speed, min_duration) * rate))
+        return self._kin.path(q_from, q_to, steps)
 
     def plan(
         self,
@@ -216,38 +186,41 @@ class JogPlanner:
         rate: float,
         min_duration: float,
         lift_raised: float | None = None,
+        seed: np.ndarray | None = None,
     ) -> JogPlan:
         """IK to the closest pose, then a collision-aware trajectory to it."""
         q_now = np.asarray(q_now, dtype=np.float32)
-        solution = self.solve(q_now, arm, target, lift_raised)
+        target = (
+            np.asarray(target[0], dtype=np.float32),
+            np.asarray(target[1], dtype=np.float32),
+        )
+        solution = self.solve(q_now, arm, target, lift_raised, seed=seed)
         trajectory = self.joint_trajectory(
             q_now, solution.q, speed=speed, rate=rate, min_duration=min_duration
         )
         own = self.indices(arm)
         other = [i for i in range(len(q_now)) if i not in own]
-        pinned = []
         for q in trajectory:
-            q = np.asarray(q, dtype=np.float32).copy()
             q[other] = q_now[other]
-            pinned.append(q)
-        if not pinned:
-            pinned = [solution.q.copy()]
-        # End exactly on the solution the preview shows.
-        pinned[-1] = solution.q.copy()
+        if float(np.max(np.abs(trajectory[-1] - solution.q))) > 1e-4:
+            # The path could not clear the body all the way: the move ends
+            # where it stopped, and the plan says so.
+            solution = self._solution(trajectory[-1], arm, target)
+        else:
+            trajectory[-1] = solution.q.copy()
         side = 0 if arm == "left" else 1
         picks = np.unique(
-            np.linspace(0, len(pinned) - 1, min(_PATH_POINTS, len(pinned))).astype(int)
+            np.linspace(0, len(trajectory) - 1, min(_PATH_POINTS, len(trajectory)))
+            .round()
+            .astype(int)
         )
-        path = [self._tip_position(pinned[i], side) for i in picks]
+        path = [self.tips(trajectory[i])[side][0] for i in picks]
         return JogPlan(
             arm=arm,
-            target=(
-                np.asarray(target[0], dtype=np.float32),
-                np.asarray(target[1], dtype=np.float32),
-            ),
+            target=target,
             solution=solution,
             q_from=q_now.copy(),
-            trajectory=pinned,
+            trajectory=trajectory,
             rate=rate,
             path=path,
         )

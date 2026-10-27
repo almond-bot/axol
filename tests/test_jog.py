@@ -149,21 +149,46 @@ class BaseSimTest(unittest.TestCase):
         self.assertGreater(base.y, 0.0)
 
 
-# -- IK planning on the real solver ----------------------------------------
+# -- IK planning on the real kinematics ------------------------------------
 
 
-@pytest.fixture(scope="module")
-def planner() -> Any:
-    from almond_axol.jog.planner import JogPlanner
+def _kinematics(model: str = "mobile") -> Any:
+    from almond_axol.kinematics.arm_ik import ArmKinematics
     from almond_axol.kinematics.config import (
         KinematicsConfig,
         apply_mantis_kinematics_profile,
     )
-    from almond_axol.kinematics.solver import KinematicsSolver
 
-    config = KinematicsConfig(robot_model="mobile")
+    config = KinematicsConfig(robot_model=model, gripper="parallel")
     apply_mantis_kinematics_profile(config)
-    return JogPlanner(KinematicsSolver(config))
+    return ArmKinematics(
+        model,
+        gripper="parallel",
+        collision_margin=config.self_collision_margin,
+    )
+
+
+@pytest.fixture(scope="module")
+def kinematics() -> Any:
+    return _kinematics()
+
+
+@pytest.fixture(scope="module")
+def planner(kinematics: Any) -> Any:
+    from almond_axol.jog.planner import JogPlanner
+
+    return JogPlanner(kinematics)
+
+
+def _best_time(fn: Any, repeat: int = 7) -> float:
+    """Fastest of a few runs (s): robust to a busy CI machine."""
+    fn()
+    times = []
+    for _ in range(repeat):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return min(times)
 
 
 def test_ik_reaches_a_reachable_target_within_two_mm(planner: Any) -> None:
@@ -221,6 +246,348 @@ def test_plan_starts_at_the_current_pose_and_ends_on_the_solution(planner: Any) 
     assert all(np.array_equal(p[7:], q[7:]) for p in plan.trajectory)
     np.testing.assert_allclose(plan.path[-1], plan.solution.tip[0], atol=1e-5)
     np.testing.assert_allclose(plan.path[0], left[0], atol=5e-3)
+
+
+def test_planned_path_keeps_the_arms_clear(planner: Any) -> None:
+    kin = planner.kinematics
+    q = rest_q()
+    left, _ = planner.tips(q)
+    # Toward the torso: the solution and every waypoint keep the floors.
+    target = (np.array([0.05, 0.0, -0.1], np.float32), left[1])
+    plan = planner.plan(q, "left", target, speed=0.6, rate=125.0, min_duration=1.0)
+    assert not plan.solution.reached
+    for waypoint in plan.trajectory:
+        assert kin.clearances(waypoint).min() > -1e-3
+    steps = np.abs(np.diff(np.stack([q, *plan.trajectory]), axis=0))
+    assert float(steps.max()) < 0.05
+
+
+# -- the NumPy kinematics against the Pyroki model ---------------------------
+
+
+@pytest.mark.parametrize("model", ["mobile", "classic"])
+def test_numpy_fk_and_capsules_match_pyroki(model: str) -> None:
+    import jax.numpy as jnp
+
+    from almond_axol.constants import GRIPPER_TIP_OFFSET, Joint, urdf_body_name
+    from almond_axol.kinematics.model import shared_robot, shared_robot_collision
+
+    kin = _kinematics(model)
+    robot = shared_robot(model, gripper="parallel")
+    coll = shared_robot_collision(model, gripper="parallel")
+    actuated = list(robot.joints.actuated_names)
+    names = kin.joint_names
+    order = np.array([names.index(n) for n in actuated])
+    links = list(robot.links.names)
+    offset = np.asarray(GRIPPER_TIP_OFFSET)
+    body = kin.body_pairs
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        q = rng.uniform(kin.lower, kin.upper)
+        poses = np.asarray(robot.forward_kinematics(jnp.asarray(q[order])))
+        for side in ("left", "right"):
+            pose = poses[
+                links.index(urdf_body_name(Joint.GRIPPER, is_left=side == "left"))
+            ]
+            w, x, y, z = pose[:4]
+            rotation = Rotation.from_quat([x, y, z, w]).as_matrix()
+            tip = kin.tip(q, side)
+            np.testing.assert_allclose(tip[0], pose[4:] + rotation @ offset, atol=1e-5)
+            np.testing.assert_allclose(tip[1], rotation, atol=1e-5)
+        expected = np.asarray(
+            coll.compute_self_collision_distance(robot, jnp.asarray(q[order]))
+        )
+        np.testing.assert_allclose(
+            np.sort(kin.clearances(q)[body] + kin.floors[body]),
+            np.sort(expected),
+            atol=1e-4,
+        )
+
+
+def test_floors_keep_the_teleop_solver_upper_arm_guard(kinematics: Any) -> None:
+    from almond_axol.kinematics.model import upper_arm_guard_floor
+
+    home = kinematics.clearances(np.zeros(14)) + kinematics.floors
+    floors = kinematics.floors
+    # Every pair is clear at the straight-down home pose and at rest.
+    assert kinematics.clearances(np.zeros(14)).min() >= 0.0
+    assert kinematics.clearances(rest_q()).min() > 0.0
+    guarded = [
+        k for k in range(len(floors)) if floors[k] == upper_arm_guard_floor(home[k])
+    ]
+    assert guarded, "the upper arms keep their hard guard against the body"
+    assert float(floors.max()) <= 0.005 + 1e-9
+
+
+def test_lowering_the_lift_brings_the_body_closer(kinematics: Any) -> None:
+    q = rest_q()
+    raised = kinematics.clearances(q)
+    try:
+        kinematics.set_lift(0.0)
+        lowered = kinematics.clearances(q)
+    finally:
+        kinematics.set_lift(1.0)
+    assert float(np.min(lowered - raised)) < -0.01
+    np.testing.assert_allclose(kinematics.clearances(q), raised)
+
+
+# -- speed: the reason this module exists ----------------------------------
+
+
+def test_ik_is_fast_enough_for_a_live_preview(planner: Any) -> None:
+    q = rest_q()
+    left, _ = planner.tips(q)
+    reachable = (left[0] + np.array([0.1, 0.05, 0.12], np.float32), left[1])
+    unreachable = (left[0] + np.array([0.9, 0.4, 0.0], np.float32), left[1])
+    # Generous bounds for a loaded CI machine: a desktop CPU takes about a
+    # millisecond, a Jetson a few.
+    assert _best_time(lambda: planner.solve(q, "left", reachable)) < 0.02
+    assert _best_time(lambda: planner.solve(q, "left", unreachable)) < 0.05
+    # Dragging: each frame starts from the last solution.
+    seed = planner.solve(q, "left", reachable).q
+    nudged = (reachable[0] + np.array([0.002, 0.0, 0.001], np.float32), reachable[1])
+    assert _best_time(lambda: planner.solve(q, "left", nudged, seed=seed)) < 0.005
+
+
+def test_jog_tick_and_plan_are_fast(planner: Any) -> None:
+    kin = planner.kinematics
+    q = rest_q()
+    left, _ = planner.tips(q)
+    nudge = (left[0] + np.array([0.0, 0.0, 0.0005]), left[1])
+    assert _best_time(lambda: kin.servo_step(q, "left", nudge, 0.008)) < 0.002
+    target = (left[0] + np.array([0.1, 0.05, 0.12], np.float32), left[1])
+    assert (
+        _best_time(
+            lambda: planner.plan(
+                q, "left", target, speed=0.6, rate=125.0, min_duration=1.0
+            ),
+            repeat=3,
+        )
+        < 0.25
+    )
+
+
+# -- Cartesian jogging -----------------------------------------------------
+
+RATE = 125.0
+TICK = 1.0 / RATE
+
+
+def _arm_jog(kinematics: Any, side: str = "left", **limits: Any) -> Any:
+    from almond_axol.jog.servo import ArmJog, JogLimits
+
+    return ArmJog(kinematics, side, JogLimits(**limits))
+
+
+def _run_jog(
+    jog: Any, q: np.ndarray, command: Any, seconds: float, **kw: Any
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    history = []
+    for _ in range(round(seconds * RATE)):
+        nxt = jog.step(q, None if command is None else np.asarray(command), TICK, **kw)
+        if nxt is not None:
+            q = nxt
+        history.append(q.copy())
+    return q, history
+
+
+def test_holding_up_moves_the_tip_up_at_the_jog_speed(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics)
+    q = rest_q()
+    start = kinematics.tip(q, "left")
+    up = [0, 0, 1, 0, 0, 0]
+    q, history = _run_jog(jog, q, up, 1.0)
+    tip = kinematics.tip(q, "left")
+    speed, ramp = jog.limits.linear_speed, jog.limits.ramp_s
+    # Ramp up, then full speed: distance = v (t - ramp / 2).
+    assert abs((tip[0][2] - start[0][2]) - speed * (1.0 - ramp / 2)) < 0.003
+    assert np.linalg.norm(tip[0][:2] - start[0][:2]) < 1e-3
+    assert (
+        np.degrees(np.arccos(np.clip((np.trace(tip[1].T @ start[1]) - 1) / 2, -1, 1)))
+        < 0.2
+    )
+    # The other arm never moves, and no joint outruns the joint speed.
+    assert all(np.array_equal(h[7:], rest_q()[7:]) for h in history)
+    steps = np.abs(np.diff(np.stack(history), axis=0))
+    assert float(steps.max()) <= jog.limits.joint_speed * TICK + 1e-6
+    # Release: ramps down over the ramp time, then holds still.
+    q, history = _run_jog(jog, q, [0] * 6, jog.limits.ramp_s + 0.1)
+    moved = [kinematics.tip(h, "left")[0][2] for h in history]
+    assert moved[1] - moved[0] > 0  # still coasting just after release
+    assert not jog.moving
+    assert moved[-1] == moved[-2]
+    coast = moved[-1] - tip[0][2]
+    assert 0 < coast < speed * ramp  # about v * ramp / 2
+
+
+def test_a_dead_source_stops_the_arm_in_the_same_tick(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics)
+    q, _ = _run_jog(jog, rest_q(), [1, 0, 0, 0, 0, 0], 0.6)
+    assert jog.moving
+    assert jog.step(q, None, TICK) is None
+    assert not jog.moving
+    # Picking up again starts from zero speed, at the arm's actual pose.
+    nxt = jog.step(q, np.array([1.0, 0, 0, 0, 0, 0]), TICK)
+    first = np.linalg.norm(
+        kinematics.tip(nxt, "left")[0] - kinematics.tip(q, "left")[0]
+    )
+    assert first < jog.limits.linear_speed * TICK * 0.1
+
+
+def test_rotation_jog_turns_about_the_tip(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics, "right")
+    q = rest_q()
+    start = kinematics.tip(q, "right")
+    for frame in ("torso", "gripper"):
+        q2, _ = _run_jog(jog, q, [0, 0, 0, 0, 0, 1], 1.0, frame=frame)
+        jog.stop()
+        tip = kinematics.tip(q2, "right")
+        assert np.linalg.norm(tip[0] - start[0]) < 2e-3, frame
+        turned = Rotation.from_matrix(tip[1] @ start[1].T).as_rotvec()
+        axis = np.array([0, 0, 1.0]) if frame == "torso" else start[1][:, 2]
+        expected = jog.limits.angular_speed * (1.0 - jog.limits.ramp_s / 2)
+        assert abs(float(turned @ axis) - expected) < 0.03, frame
+
+
+def test_jog_in_the_gripper_frame_follows_the_gripper(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics)
+    q = rest_q()
+    start = kinematics.tip(q, "left")
+    q, _ = _run_jog(jog, q, [0, 0, -1, 0, 0, 0], 0.8, frame="gripper")
+    moved = kinematics.tip(q, "left")[0] - start[0]
+    direction = moved / np.linalg.norm(moved)
+    assert float(direction @ -start[1][:, 2]) > 0.99
+
+
+def test_jog_stops_at_a_limit_without_a_backlog(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics)
+    q = rest_q()
+    # Far out of reach: the arm runs out of joint range or extension.
+    q, history = _run_jog(jog, q, [1, 0, 0, 0, 0, 0], 12.0)
+    assert jog.limited
+    stuck = kinematics.tip(q, "left")[0]
+    assert np.all(q >= kinematics.lower - 1e-6) and np.all(q <= kinematics.upper + 1e-6)
+    # Reversing moves back at once: there is no queued motion to unwind.
+    q, _ = _run_jog(jog, q, [-1, 0, 0, 0, 0, 0], 0.2)
+    assert kinematics.tip(q, "left")[0][0] < stuck[0] - 1e-3
+
+
+def test_jog_toward_the_body_stops_short_of_it(kinematics: Any) -> None:
+    jog = _arm_jog(kinematics)
+    q = rest_q()
+    # In toward the torso and down past it.
+    for command in ([0, -1, 0, 0, 0, 0], [-1, 0, -1, 0, 0, 0], [0, -1, -1, 0, 0, 0]):
+        q, history = _run_jog(jog, q, command, 6.0)
+        for h in history[::10]:
+            assert kinematics.clearances(h).min() > -1e-3
+    jog.stop()
+
+
+# -- the session with the real planner -------------------------------------
+
+
+class JogSessionArmTest(unittest.TestCase):
+    """Preview and gripper jogging through the session's control loop."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from almond_axol.jog.planner import JogPlanner
+
+        cls.planner = JogPlanner(_kinematics())
+
+    def setUp(self) -> None:
+        self.backend = SimBackend("mobile")
+        self.session = JogSession(self.backend, lambda: self.planner, rate=RATE)
+        self.thread, self.stop = _start(self.session)
+        self.assertTrue(_wait(lambda: self.session.state()["ready"]))
+
+    def tearDown(self) -> None:
+        self.stop.set()
+        self.thread.join(5)
+
+    def _tip(self) -> np.ndarray:
+        return self.planner.tips(self.session.current_q())[0][0]
+
+    def _hold_arm(self, twist: list[float], seconds: float, **kw: Any) -> None:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.session.hold(0, 0, 0, 0, arms={"left": twist}, **kw)
+            time.sleep(0.05)
+
+    def test_holding_a_jog_moves_the_gripper_and_release_stops_it(self) -> None:
+        start = self._tip()
+        self._hold_arm([0, 0, 1, 0, 0, 0], 1.0)
+        held = self._tip()
+        self.assertGreater(held[2] - start[2], 0.02)
+        self.assertTrue(self.session.state()["armJog"]["left"]["moving"])
+        self.session.release()
+        self.assertTrue(
+            _wait(lambda: not self.session.state()["armJog"]["left"]["moving"], 1.0)
+        )
+        settled = self._tip()
+        time.sleep(0.2)
+        np.testing.assert_array_equal(self._tip(), settled)
+        right = self.session.state()["arms"]["right"]
+        np.testing.assert_allclose(right, rest_q()[7:], atol=1e-6)
+
+    def test_a_vanished_page_stops_a_jog_at_once(self) -> None:
+        self._hold_arm([1, 0, 0, 0, 0, 0], 0.6)
+        self.session.disconnect()
+        time.sleep(2 * TICK)
+        stopped = self._tip()
+        time.sleep(0.2)
+        np.testing.assert_array_equal(self._tip(), stopped)
+        self.assertFalse(self.session.state()["armJog"]["left"]["moving"])
+
+    def test_preview_then_plan_lands_on_the_previewed_pose(self) -> None:
+        left = self.planner.tips(self.session.current_q())[0]
+        quat = list(Rotation.from_matrix(left[1]).as_quat())
+        for k in range(1, 6):
+            goal = [float(v) for v in left[0] + np.array([0.02 * k, 0.0, 0.02 * k])]
+            preview = self.session.preview("left", goal, quat)
+            self.assertTrue(preview["reachable"])
+        plan = self.session.plan("left", goal, quat)
+        np.testing.assert_allclose(plan["joints"], preview["joints"], atol=1e-4)
+        # Nothing moved.
+        np.testing.assert_allclose(self.session.state()["arms"]["left"], rest_q()[:7])
+
+    def test_a_plan_running_owns_the_arm(self) -> None:
+        left = self.planner.tips(self.session.current_q())[0]
+        quat = list(Rotation.from_matrix(left[1]).as_quat())
+        goal = [float(v) for v in left[0] + np.array([0.05, 0.0, 0.05])]
+        plan = self.session.plan("left", goal, quat)
+        self.session.execute(plan["id"])
+        self._hold_arm([0, 1, 0, 0, 0, 0], 0.3)
+        self.assertFalse(self.session.state()["armJog"]["left"]["moving"])
+        self.session.release()
+        self.assertTrue(
+            _wait(
+                lambda: (self.session.state()["lastExecution"] or {}).get("status")
+                == "done",
+                5.0,
+            )
+        )
+        np.testing.assert_allclose(
+            self.session.state()["arms"]["left"], plan["joints"], atol=1e-6
+        )
+
+    def test_bad_arm_jog_commands_are_refused_and_release(self) -> None:
+        self.session.hold(0, 0, 0, 0, arms={"left": [0, 0, 1, 0, 0, 0]})
+        self.assertTrue(self.session.state()["hold"]["arms"]["left"][2] == 1)
+        for bad in (
+            {"arms": {"left": [0, 0, 1]}},
+            {"arms": {"middle": [0] * 6}},
+            {"arms": {"left": [0, 0, float("nan"), 0, 0, 0]}},
+            {"arms": {"left": [0, 0, True, 0, 0, 0]}},
+            {"frame": "world"},
+            {"speed": float("inf")},
+        ):
+            with self.assertRaises(JogError, msg=str(bad)):
+                self.session.hold(0, 0, 0, 0, **bad)
+            self.assertEqual(self.session.state()["hold"]["arms"]["left"], [0.0] * 6)
+        self.session.hold(0, 0, 0, 0, arms={"right": [5, -5, 0, 0, 0, 0]})
+        self.assertEqual(self.session.state()["hold"]["arms"]["right"][:2], [1.0, -1.0])
+        self.session.release()
 
 
 # -- the session -----------------------------------------------------------
@@ -590,9 +957,9 @@ class HardwareBackendTest(unittest.TestCase):
 
 
 def test_jog_is_a_sim_capable_operation_using_gravity_comp_settings() -> None:
-    from almond_axol.serve.commands import COMMANDS, build_argv
     from almond_axol.cli.config import parse
     from almond_axol.cli.jog import JogCmdConfig
+    from almond_axol.serve.commands import COMMANDS, build_argv
 
     cmd = COMMANDS["jog"]
     assert cmd.is_operation and cmd.sim_capable and cmd.sim_flag == "sim"
@@ -615,6 +982,7 @@ def test_jog_is_a_sim_capable_operation_using_gravity_comp_settings() -> None:
 class _StubSession:
     def __init__(self) -> None:
         self.holds: list[tuple[Any, ...]] = []
+        self.previews: list[list[float]] = []
         self.disconnected = 0
 
     def state(self) -> dict[str, Any]:
@@ -636,10 +1004,21 @@ class _StubSession:
         return True
 
     def hold(
-        self, vx: float, vy: float, wz: float, lift: int, source: str = ""
+        self, vx: float, vy: float, wz: float, lift: int, source: str = "", **kw: Any
     ) -> None:
         assert source.startswith("ws-")
         self.holds.append((vx, vy, wz, lift))
+        if kw.get("arms"):
+            self.holds.append(("arms", kw["arms"], kw["frame"], kw["speed"]))
+
+    def preview(
+        self, arm: str, position: list[float], quaternion: list[float]
+    ) -> dict[str, Any]:
+        if arm != "left":
+            raise JogError("Choose the left or right arm.")
+        time.sleep(0.05)
+        self.previews.append(position)
+        return {"arm": arm, "joints": [0.0] * 7, "reachable": True}
 
     def release(self, source: str = "") -> None:
         self.holds.append(("release",))
@@ -701,9 +1080,44 @@ def test_jog_api_routes_to_the_session(tmp_path: Path) -> None:
                 message = ws.receive_json()
             ws.send_json({"type": "release"})
             ws.receive_json()
+            ws.send_json(
+                {
+                    "type": "hold",
+                    "drive": [0, 0, 0],
+                    "lift": 0,
+                    "arms": {"left": [0, 0, 1, 0, 0, 0]},
+                    "armFrame": "gripper",
+                    "armSpeed": 0.5,
+                }
+            )
+            # Previews: the newest wins, older and repeated seqs are dropped.
+            for seq in (1, 2, 3, 3, 2):
+                ws.send_json(
+                    {
+                        "type": "preview",
+                        "seq": seq,
+                        "arm": "left",
+                        "position": [seq, 0, 0],
+                        "quaternion": QUAT,
+                    }
+                )
+            ws.send_json({"type": "preview", "seq": 4, "arm": "right"})
+            replies = []
+            while len(replies) < 2 or replies[-1]["seq"] != 4:
+                message = ws.receive_json()
+                if message["type"] == "preview":
+                    replies.append(message)
+            assert replies[-1]["error"] == "Choose the left or right arm."
+            assert [r["seq"] for r in replies] == sorted({r["seq"] for r in replies})
+            assert all(r["seq"] in (1, 2, 3, 4) for r in replies)
         assert _wait(lambda: stub.disconnected >= 1)
         assert (0.5, 0, 0, 1) in stub.holds
         assert ("release",) in stub.holds
+        assert ("arms", {"left": [0, 0, 1, 0, 0, 0]}, "gripper", 0.5) in stub.holds
+        # Previews ran in order, and the overtaken ones were skipped.
+        assert stub.previews[0] == [1, 0, 0]
+        assert stub.previews == sorted(stub.previews)
+        assert len(stub.previews) < 3 or stub.previews[-1] == [3, 0, 0]
 
 
 def test_jog_operation_end_to_end_in_sim(tmp_path: Path) -> None:
@@ -757,6 +1171,43 @@ def test_jog_operation_end_to_end_in_sim(tmp_path: Path) -> None:
             assert _wait(
                 lambda: client.get("/api/jog/state").json()["base"]["command"]
                 == [0, 0, 0],
+                2,
+            )
+            # A live preview, then a held gripper jog, over the socket.
+            right = client.get("/api/jog/state").json()["tips"]["right"]
+            goal = [p + d for p, d in zip(right["position"], (0.05, 0.0, 0.05))]
+            with client.websocket_connect("/api/jog/ws") as ws:
+                ws.send_json(
+                    {
+                        "type": "preview",
+                        "seq": 1,
+                        "arm": "right",
+                        "position": goal,
+                        "quaternion": right["quaternion"],
+                    }
+                )
+                message = ws.receive_json()
+                while message["type"] != "preview":
+                    message = ws.receive_json()
+                assert message["reachable"] and len(message["joints"]) == 7
+                for _ in range(20):
+                    ws.send_json(
+                        {
+                            "type": "hold",
+                            "drive": [0, 0, 0],
+                            "lift": 0,
+                            "arms": {"right": [0, 0, 1, 0, 0, 0]},
+                        }
+                    )
+                    time.sleep(0.05)
+                state = client.get("/api/jog/state").json()
+                assert state["armJog"]["right"]["moving"]
+                raised = state["tips"]["right"]["position"][2]
+                assert raised - right["position"][2] > 0.02
+            assert _wait(
+                lambda: not client.get("/api/jog/state").json()["armJog"]["right"][
+                    "moving"
+                ],
                 2,
             )
         finally:

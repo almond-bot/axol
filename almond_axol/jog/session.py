@@ -4,21 +4,25 @@ A :class:`JogSession` runs a fixed-rate control loop on the ``jog``
 operation's thread. The control panel reaches it through the serve app,
 from other threads, with three kinds of request:
 
-- **Hold commands** (:meth:`JogSession.hold`): the base velocity and lift
-  direction for the buttons currently held. The page sends them continuously
-  while it is connected, zeros included, the way a headset streams teleop
-  frames. A release ramps the base and lift down like the real controllers;
-  a page that stops sending (closed, hidden, disconnected) is a dead command
-  source and everything stops at once.
+- **Hold commands** (:meth:`JogSession.hold`): the base velocity, lift
+  direction and gripper jog twists for the buttons currently held. The page
+  sends them continuously while it is connected, zeros included, the way a
+  headset streams teleop frames. A release ramps the base, lift and arms
+  down like the real controllers; a page that stops sending (closed,
+  hidden, disconnected) is a dead command source and everything stops at
+  once.
+- **Previews** (:meth:`JogSession.preview`): IK to the closest reachable
+  tip pose, for the page's live ghost of the arm while a target is dragged.
 - **Plans** (:meth:`JogSession.plan`): IK to the closest reachable tip pose
   and a trajectory to it. Nothing moves.
 - **Execution** (:meth:`JogSession.execute` / :meth:`JogSession.cancel`):
   stream a plan's trajectory to the arms. It is refused when the arms have
   moved since planning.
 
-The arms are always streamed a command at the loop rate (the hold pose when
-nothing is executing), which keeps the realtime core's watchdog fed on
-hardware.
+The arms are always streamed a command at the loop rate (the hold pose, or
+the jog, when nothing is executing), which keeps the realtime core's
+watchdog fed on hardware. Jogged arm targets go through the same stream as
+executed plans.
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .planner import Arm, JogPlan, JogPlanner, Pose
+from .servo import FRAMES, ArmJog, Frame, JogLimits
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +53,10 @@ PLAN_START_TOLERANCE_RAD = 0.02
 PARK_TOLERANCE_RAD = 0.01
 # Number of joints per arm (the gripper is the 8th entry of a motion command).
 ARM_DOF = 7
+# A preview seeded from the last one is kept only while the arms hold the
+# pose it was solved from.
+PREVIEW_SEED_TOLERANCE_RAD = 1e-4
+SIDES: tuple[Arm, Arm] = ("left", "right")
 
 _session: JogSession | None = None
 _session_lock = threading.Lock()
@@ -92,18 +101,44 @@ class JogBackend(Protocol):
     def base_state(self) -> dict[str, Any] | None: ...
 
 
-_IDLE = (0.0, 0.0, 0.0, 0)
+_NO_TWIST = (0.0,) * 6
 
 
-def _engaged(command: tuple[float, float, float, int]) -> bool:
-    return any(v != 0 for v in command)
+@dataclass(frozen=True)
+class HoldCommand:
+    """What one page is holding: base velocity, lift direction, gripper jogs.
+
+    ``left`` / ``right`` are each gripper's jog twist, ``(x, y, z, roll,
+    pitch, yaw)`` in -1..1, in ``frame`` and scaled by ``speed`` (0..1).
+    """
+
+    vx: float = 0.0
+    vy: float = 0.0
+    wz: float = 0.0
+    lift: int = 0
+    left: tuple[float, ...] = _NO_TWIST
+    right: tuple[float, ...] = _NO_TWIST
+    frame: Frame = "torso"
+    speed: float = 1.0
+
+    @property
+    def base(self) -> tuple[float, float, float, int]:
+        """The base and lift command the backend takes."""
+        return (self.vx, self.vy, self.wz, self.lift)
+
+    @property
+    def engaged(self) -> bool:
+        return any(v != 0 for v in (*self.base, *self.left, *self.right))
+
+
+_IDLE = HoldCommand()
 
 
 @dataclass
 class _Source:
     """One page's latest hold command."""
 
-    command: tuple[float, float, float, int]
+    command: HoldCommand
     at: float
     engaged_at: float
 
@@ -125,6 +160,25 @@ def _pose_dict(pose: Pose) -> dict[str, list[float]]:
         "position": [float(v) for v in pose[0]],
         "quaternion": _quaternion(pose[1]),
     }
+
+
+def _finite(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _twist(value: Any) -> tuple[float, ...]:
+    """A gripper jog twist from a request: six numbers, each clipped to -1..1."""
+    if value is None:
+        return _NO_TWIST
+    if not isinstance(value, (list, tuple)) or len(value) != 6:
+        raise JogError("An arm jog needs six values: x, y, z, roll, pitch and yaw.")
+    if not all(_finite(v) for v in value):
+        raise JogError("Arm jog commands must be finite numbers.")
+    return tuple(max(-1.0, min(1.0, float(v))) for v in value)
 
 
 def _pose_from_request(position: list[float], quaternion: list[float]) -> Pose:
@@ -152,17 +206,20 @@ class JogSession:
         rate: float = 125.0,
         arm_speed: float = 0.6,
         min_duration: float = 1.0,
+        jog_limits: JogLimits | None = None,
     ) -> None:
         """
         Args:
             backend:         The simulator or the robot.
             planner_factory: Zero-argument callable building the
-                             :class:`JogPlanner` (the IK warm-up takes
-                             seconds, so it runs on its own thread).
+                             :class:`JogPlanner` (loading the robot model
+                             takes a second or more, so it runs on its own
+                             thread).
             rate:            Control loop and trajectory rate in Hz.
             arm_speed:       Average speed (rad/s) of the furthest-moving
                              joint along a planned move.
             min_duration:    Shortest planned move in seconds.
+            jog_limits:      Gripper jog speeds and ramps.
         """
         self._backend = backend
         self._rate = float(rate)
@@ -181,13 +238,24 @@ class JogSession:
         self._planner_error: str | None = None
         self._planner_ready = threading.Event()
         self._planner_factory = planner_factory
+        self._jog_limits = jog_limits or JogLimits()
+        self._jogs: dict[Arm, ArmJog] | None = None
+        # Per arm: (the arms' pose it was solved from, the last preview's
+        # solution), the seed for the next preview and plan of that arm.
+        self._preview_seed: dict[Arm, tuple[np.ndarray, np.ndarray]] = {}
         self._stop = threading.Event()
 
     # -- planner -----------------------------------------------------------
 
     def _build_planner(self) -> None:
         try:
-            self._planner = self._planner_factory()
+            planner = self._planner_factory()
+            kinematics = getattr(planner, "kinematics", None)
+            if kinematics is not None:
+                self._jogs = {
+                    side: ArmJog(kinematics, side, self._jog_limits) for side in SIDES
+                }
+            self._planner = planner
         except Exception as exc:  # noqa: BLE001 - reported to the page
             _logger.exception("jog: IK solver failed to start")
             self._planner_error = f"The IK solver failed to start: {exc}"
@@ -204,43 +272,76 @@ class JogSession:
     # -- requests from the serve app (any thread) --------------------------
 
     def hold(
-        self, vx: float, vy: float, wz: float, lift: int, source: str = "page"
+        self,
+        vx: float,
+        vy: float,
+        wz: float,
+        lift: int,
+        source: str = "page",
+        *,
+        arms: dict[str, Any] | None = None,
+        frame: str = "torso",
+        speed: float = 1.0,
     ) -> None:
-        """Latch ``source``'s held base velocity (normalized) and lift direction.
+        """Latch ``source``'s held controls.
 
-        Each connected page is its own source. The base and lift follow the
-        source that most recently started holding something, so a second
-        page sitting idle never cancels the operator's command.
+        ``vx``, ``vy``, ``wz`` are the normalized base velocity and ``lift``
+        the lift direction. ``arms`` maps ``"left"`` / ``"right"`` to that
+        gripper's jog twist, ``(x, y, z, roll, pitch, yaw)`` in -1..1, in
+        ``frame`` (``"torso"`` or ``"gripper"``), scaled by ``speed`` (0..1).
+
+        Each connected page is its own source. Everything follows the source
+        that most recently started holding something, so a second page
+        sitting idle never cancels the operator's command. An invalid
+        command releases the source before it is refused.
         """
-        values = (vx, vy, wz)
-        if not all(
-            isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
-            for v in values
-        ):
+        try:
+            if not all(_finite(v) for v in (vx, vy, wz)):
+                raise JogError("Drive commands must be finite numbers.")
+            if lift not in (-1, 0, 1) or isinstance(lift, bool):
+                raise JogError("The lift command must be -1, 0 or 1.")
+            arms = arms or {}
+            if not isinstance(arms, dict) or not set(arms) <= set(SIDES):
+                raise JogError("Arm jogs are given per arm: left and right.")
+            if frame not in FRAMES:
+                raise JogError("Jog in the torso or the gripper frame.")
+            if not _finite(speed):
+                raise JogError("The jog speed must be a finite number.")
+            left, right = _twist(arms.get("left")), _twist(arms.get("right"))
+        except JogError:
             self.release(source)
-            raise JogError("Drive commands must be finite numbers.")
-        if lift not in (-1, 0, 1) or isinstance(lift, bool):
-            self.release(source)
-            raise JogError("The lift command must be -1, 0 or 1.")
+            raise
 
         def clamp(v: float) -> float:
             return max(-1.0, min(1.0, float(v)))
 
         # No stick deadzone here: the page's drive pad has its own dead
         # centre, and its speed limit must scale the command linearly.
-        self._latch(source, (clamp(vx), clamp(vy), clamp(wz), int(lift)))
+        self._latch(
+            source,
+            HoldCommand(
+                clamp(vx),
+                clamp(vy),
+                clamp(wz),
+                int(lift),
+                left,
+                right,
+                frame,  # type: ignore[arg-type]
+                max(0.0, min(1.0, float(speed))),
+            ),
+        )
 
     def release(self, source: str = "page") -> None:
         """``source`` let go of every control."""
         self._latch(source, _IDLE)
 
-    def _latch(self, source: str, command: tuple[float, float, float, int]) -> None:
+    def _latch(self, source: str, command: HoldCommand) -> None:
         now = time.monotonic()
         with self._lock:
             previous = self._sources.get(source)
-            if not _engaged(command):
+            if not command.engaged:
                 engaged_at = -math.inf
-            elif previous is not None and _engaged(previous.command):
+            elif previous is not None and previous.command.engaged:
                 engaged_at = previous.engaged_at
             else:
                 engaged_at = now
@@ -250,24 +351,24 @@ class JogSession:
         """``source`` went away. If it was driving, everything stops at once."""
         with self._lock:
             gone = self._sources.pop(source, None)
-            if gone is not None and _engaged(gone.command):
+            if gone is not None and gone.command.engaged:
                 self._dead_until = time.monotonic() + HOLD_TIMEOUT_S
 
-    def _effective_hold(self, now: float) -> tuple[float, float, float, int] | None:
-        """This tick's base and lift command; None is a dead command source.
+    def _effective_hold(self, now: float) -> HoldCommand | None:
+        """This tick's held controls; None is a dead command source.
 
         Call with the lock held. A source that stops sending is dropped; if it
-        was holding a control, the base and lift stop at once as they do when
-        a headset's link drops, instead of ramping down.
+        was holding a control, the base, lift and arms stop at once as they
+        do when a headset's link drops, instead of ramping down.
         """
         for name, source in list(self._sources.items()):
             if now - source.at > HOLD_TIMEOUT_S:
                 del self._sources[name]
-                if _engaged(source.command):
+                if source.command.engaged:
                     self._dead_until = now + HOLD_TIMEOUT_S
         if now < self._dead_until or not self._sources:
             return None
-        engaged = [s for s in self._sources.values() if _engaged(s.command)]
+        engaged = [s for s in self._sources.values() if s.command.engaged]
         if not engaged:
             return _IDLE
         return max(engaged, key=lambda s: s.engaged_at).command
@@ -289,7 +390,6 @@ class JogSession:
         target = _pose_from_request(position, quaternion)
         planner = self._require_planner()
         q_now = self.current_q()
-        lift = self._backend.lift_state()
         plan = planner.plan(
             q_now,
             arm,
@@ -297,12 +397,61 @@ class JogSession:
             speed=self._arm_speed,
             rate=self._rate,
             min_duration=self._min_duration,
-            lift_raised=None if lift is None else lift.get("raised"),
+            lift_raised=self._lift_raised(),
+            seed=self._seed(arm, q_now),
         )
         with self._lock:
             # Only the latest plan can be executed.
             self._plans = {plan.id: plan}
         return self._plan_dict(plan, planner)
+
+    def preview(
+        self, arm: Arm, position: list[float], quaternion: list[float]
+    ) -> dict[str, Any]:
+        """The closest reachable pose of ``arm``'s tip to a target, for the
+        page's live preview. Nothing moves. Blocking (a few milliseconds):
+        run off the event loop.
+
+        Each preview starts from the last one's solution while the arms hold
+        still, so the previewed arm moves continuously as the target is
+        dragged, and a Plan of the same target lands on the same pose.
+        """
+        if arm not in ("left", "right"):
+            raise JogError("Choose the left or right arm.")
+        if not self._backend.has_arms:
+            raise JogError("The arms are not connected.")
+        target = _pose_from_request(position, quaternion)
+        planner = self._require_planner(timeout=0.0)
+        q_now = self.current_q()
+        solution = planner.solve(
+            q_now, arm, target, self._lift_raised(), seed=self._seed(arm, q_now)
+        )
+        with self._lock:
+            self._preview_seed[arm] = (q_now.copy(), solution.q.copy())
+        own = planner.indices(arm)
+        return {
+            "arm": arm,
+            "target": _pose_dict(target),
+            "reached": _pose_dict(solution.tip),
+            "reachable": solution.reached,
+            "positionError": float(solution.position_error),
+            "orientationError": float(solution.orientation_error),
+            "joints": [float(solution.q[i]) for i in own],
+        }
+
+    def _seed(self, arm: Arm, q_now: np.ndarray) -> np.ndarray | None:
+        """The last preview's solution for ``arm``, if the arms haven't moved."""
+        with self._lock:
+            seed = self._preview_seed.get(arm)
+        if seed is None:
+            return None
+        if float(np.max(np.abs(seed[0] - q_now))) > PREVIEW_SEED_TOLERANCE_RAD:
+            return None
+        return seed[1]
+
+    def _lift_raised(self) -> float | None:
+        lift = self._backend.lift_state()
+        return None if lift is None else lift.get("raised")
 
     def _plan_dict(self, plan: JogPlan, planner: JogPlanner) -> dict[str, Any]:
         solution = plan.solution
@@ -358,6 +507,7 @@ class JogSession:
             hold = self._effective_hold(time.monotonic())
             tips = self._tips
             last = self._last_result
+        jogs = self._jogs
         arms = None
         if command is not None:
             arms = {
@@ -376,8 +526,18 @@ class JogSession:
             "base": self._backend.base_state(),
             "hold": {
                 "active": hold is not None,
-                "drive": list((hold or _IDLE)[:3]),
-                "lift": (hold or _IDLE)[3],
+                "drive": list((hold or _IDLE).base[:3]),
+                "lift": (hold or _IDLE).lift,
+                "arms": {
+                    "left": list((hold or _IDLE).left),
+                    "right": list((hold or _IDLE).right),
+                },
+            },
+            "armJog": None
+            if jogs is None
+            else {
+                side: {"moving": jog.moving, "limited": jog.limited}
+                for side, jog in jogs.items()
             },
             "execution": None
             if execution is None
@@ -417,10 +577,11 @@ class JogSession:
                 started = time.monotonic()
                 elapsed = min(0.1, started - last)
                 last = started
-                await self._step_arms()
                 with self._lock:
                     hold = self._effective_hold(started)
-                backend.drive(hold, elapsed)
+                # A late tick moves the arms at most two ticks' worth.
+                await self._step_arms(hold, min(elapsed, 2.0 * dt))
+                backend.drive(None if hold is None else hold.base, elapsed)
                 if tick % max(1, round(self._rate / 15)) == 0:
                     self._refresh_tips()
                 tick += 1
@@ -475,7 +636,7 @@ class JogSession:
             await self._backend.send_arms(left, right)
             await asyncio.sleep(max(0.0, dt - (time.monotonic() - started)))
 
-    async def _step_arms(self) -> None:
+    async def _step_arms(self, hold: HoldCommand | None, dt: float) -> None:
         backend = self._backend
         if not backend.has_arms:
             return
@@ -494,13 +655,61 @@ class JogSession:
                 else:
                     self._command = plan.trajectory[execution.step].copy()
                     execution.step += 1
+            executing = self._execution is not None
             command = None if self._command is None else self._command.copy()
             grip = self._grip
         if command is None:
             return
+        command = self._jog_arms(command, None if executing else hold, executing, dt)
         left = np.append(command[:ARM_DOF], grip[0]).astype(np.float32)
         right = np.append(command[ARM_DOF:], grip[1]).astype(np.float32)
         await backend.send_arms(left, right)
+
+    def _jog_arms(
+        self,
+        command: np.ndarray,
+        hold: HoldCommand | None,
+        executing: bool,
+        dt: float,
+    ) -> np.ndarray:
+        """Advance held gripper jogs by one tick; returns the arm command.
+
+        A planned move owns the arms: it stops any jog at once, as does a
+        dead command source (``hold`` None).
+        """
+        jogs = self._jogs
+        planner = self._planner
+        if jogs is None or planner is None:
+            return command
+        if executing:
+            for jog in jogs.values():
+                jog.stop()
+            return command
+        jogged = False
+        for side, jog in jogs.items():
+            twist = None if hold is None else getattr(hold, side)
+            if twist is not None and not any(twist) and not jog.moving:
+                continue
+            if not jogged and twist is not None:
+                planner.kinematics.set_lift(self._lift_raised())
+            q = jog.step(
+                command,
+                None if twist is None else np.asarray(twist),
+                dt,
+                frame=hold.frame if hold is not None else "torso",
+                speed=hold.speed if hold is not None else 0.0,
+            )
+            if q is not None:
+                command = q
+                jogged = True
+        if jogged:
+            with self._lock:
+                # A plan that started meanwhile wins the arms.
+                if self._execution is None:
+                    self._command = command.copy()
+                else:
+                    command = self._command.copy()
+        return command
 
     def _refresh_tips(self) -> None:
         planner = self._planner
