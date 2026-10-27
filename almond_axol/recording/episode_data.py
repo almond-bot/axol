@@ -4,13 +4,15 @@ The panel's dataset view charts what each episode recorded and replays it on
 the robot model, so an operator can see that a teleop or Mantis take is sound
 before training on it. This reads the episode's rows from its ``data/`` file
 and returns, per named feature, the measured (``observation.state``) and
-commanded (``action``) values, plus each gripper mount's pose:
+commanded (``action``) values, plus each gripper mount's pose when the
+dataset records it (Mantis, or ``observe_cartesian``: ``{side}_ee.*``).
 
-* a Cartesian dataset (Mantis, or ``observe_cartesian``) records the pose
-  itself as ``{side}_ee.{x,y,z,rx,ry,rz}``;
-* a joint-space dataset gets it from forward kinematics of the recorded joint
-  angles (:class:`~almond_axol.kinematics.mujoco_fk.AxolForwardKinematics`,
-  no JAX), in the same frame: the URDF root, metres and an axis-angle vector.
+This is all file reading and vectorized NumPy on purpose. The serve process
+also runs a recording's control loop, and a panel open on the dataset being
+recorded asks for every take as it is saved, so per-frame Python work here
+would hold the interpreter lock against that loop. That is why a joint-space
+episode's gripper poses (and its gripper jump check) are worked out in the
+viewer's browser from the robot model (``web/app/src/lib/episode-fk.ts``).
 
 It also reports what an operator would otherwise have to spot by eye: frames
 the recorder dropped and the largest jump between two frames, which is what a
@@ -22,14 +24,13 @@ extra every recording host has), never ``lerobot`` or ``torch``.
 
 from __future__ import annotations
 
+import json
 import math
-import threading
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS
 from .dataset_browser import (
     _DEFAULT_DATA_PATH,
     DatasetBrowseError,
@@ -41,19 +42,6 @@ SIDES = ("left", "right")
 POSE_AXES = ("x", "y", "z", "rx", "ry", "rz")
 # A frame interval this many times the nominal one counts as dropped frames.
 GAP_FACTOR = 1.5
-
-_fk: Any = None
-_fk_lock = threading.Lock()
-
-
-def _forward_kinematics() -> Any:
-    global _fk
-    with _fk_lock:
-        if _fk is None:
-            from ..kinematics.mujoco_fk import AxolForwardKinematics
-
-            _fk = AxolForwardKinematics()
-        return _fk
 
 
 def _feature_names(info: dict[str, Any], key: str) -> list[str]:
@@ -68,54 +56,32 @@ def _feature_names(info: dict[str, Any], key: str) -> list[str]:
 def _column(table: Any, name: str) -> np.ndarray | None:
     if name not in table.schema.names:
         return None
+    import pyarrow as pa
+
     column = table.column(name).combine_chunks()
-    values = column.to_numpy(zero_copy_only=False)
-    if values.dtype == object:
-        return np.stack([np.asarray(v, dtype=np.float64) for v in values])
-    return values.astype(np.float64)
+    if pa.types.is_list(column.type) or pa.types.is_fixed_size_list(column.type):
+        # One vector per frame: flatten in Arrow, not per frame in Python.
+        flat = column.flatten().to_numpy(zero_copy_only=False)
+        return flat.astype(np.float64).reshape(len(column), -1)
+    return column.to_numpy(zero_copy_only=False).astype(np.float64)
 
 
 def _rounded(values: np.ndarray, digits: int) -> list[float | None]:
     out = np.round(values.astype(np.float64), digits)
-    return [float(v) if math.isfinite(v) else None for v in out]
-
-
-def _arm_joint_names(side: str) -> list[str]:
-    return [f"{side}_{joint.value}.pos" for joint in ARM_JOINTS]
+    listed: list[float | None] = out.tolist()
+    for i in np.flatnonzero(~np.isfinite(out)):
+        listed[i] = None
+    return listed
 
 
 def _poses(names: list[str], values: np.ndarray) -> dict[str, np.ndarray]:
-    """Each side's ``(frames, 6)`` gripper-mount pose, recorded or from FK."""
+    """Each side's ``(frames, 6)`` gripper-mount pose, where it is recorded."""
     index = {name: i for i, name in enumerate(names)}
     poses: dict[str, np.ndarray] = {}
     for side in SIDES:
         keys = [f"{side}_ee.{axis}" for axis in POSE_AXES]
         if all(k in index for k in keys):
             poses[side] = values[:, [index[k] for k in keys]]
-    missing = [
-        side
-        for side in SIDES
-        if side not in poses and all(k in index for k in _arm_joint_names(side))
-    ]
-    if missing and len(values):
-        fk = _forward_kinematics()
-        joints = {
-            side: values[:, [index[k] for k in _arm_joint_names(side)]]
-            for side in SIDES
-            if all(k in index for k in _arm_joint_names(side))
-        }
-        zeros = np.zeros((len(values), len(ARM_JOINTS)))
-        left = joints.get("left", zeros)
-        right = joints.get("right", zeros)
-        computed = {side: np.full((len(values), 6), np.nan) for side in missing}
-        for frame in range(len(values)):
-            if not (np.isfinite(left[frame]).all() and np.isfinite(right[frame]).all()):
-                continue
-            pose_l, pose_r = fk.ee_poses(left[frame], right[frame])
-            for side, pose in (("left", pose_l), ("right", pose_r)):
-                if side in computed:
-                    computed[side][frame] = pose
-        poses.update(computed)
     return poses
 
 
@@ -168,6 +134,23 @@ def _largest_pose_jump(
                 "t": round(float(t[frame + 1]), 3),
             }
     return best
+
+
+def to_json(value: Any) -> str:
+    """Encode :func:`read_episode_data`'s result one column at a time.
+
+    A single ``json.dumps`` of a long episode is one C call of tens of
+    milliseconds that never lets go of the interpreter lock; per column, each
+    call is about a millisecond and the control loop gets its turns between
+    them. (FastAPI's own encoder is slower still and runs on the event loop.)
+    """
+    if isinstance(value, dict):
+        return (
+            "{"
+            + ",".join(f"{json.dumps(str(k))}:{to_json(v)}" for k, v in value.items())
+            + "}"
+        )
+    return json.dumps(value, separators=(",", ":"))
 
 
 def read_episode_data(root: Path, episode_index: int) -> dict[str, Any]:

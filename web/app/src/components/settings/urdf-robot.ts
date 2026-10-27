@@ -33,7 +33,10 @@ export interface LoadedModel {
 export function useUrdfRobot(
   robotModel: AxolModel,
   gripper: GripperType,
-  onLoaded?: (limits: JointLimits) => void
+  onLoaded?: (limits: JointLimits) => void,
+  /** Let joints take values past their URDF limits (a recorded take shown
+   *  as it was), instead of clamping them. */
+  ignoreLimits = false
 ): { model: LoadedModel | null; error: string | null } {
   const [model, setModel] = useState<LoadedModel | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -53,6 +56,7 @@ export function useUrdfRobot(
     let robot: URDFRobot | null = null
     loader.load(urdfUrl(robotModel, gripper), (r) => {
       robot = r
+      if (ignoreLimits) for (const joint of Object.values(r.joints)) joint.ignoreLimits = true
     })
     manager.onError = (url) => {
       if (!cancelled) setError(url)
@@ -112,7 +116,7 @@ export function useUrdfRobot(
       cancelled = true
       clearTimeout(timer)
     }
-  }, [robotModel, gripper])
+  }, [robotModel, gripper, ignoreLimits])
 
   return { model, error }
 }

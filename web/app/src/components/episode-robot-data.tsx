@@ -7,6 +7,7 @@ import {
   formatEpisodeTime,
   frameAt,
   hasJointState,
+  withJointPoses,
   type ChartGroup,
 } from "@/lib/episode-data"
 import {
@@ -95,6 +96,31 @@ function Checks({ data, onSeek }: { data: EpisodeData; onSeek: (t: number) => vo
 }
 
 /**
+ * A joint episode with its gripper poses, worked out here from the robot
+ * model: the Host Computer sends joints only, so a panel following a live
+ * recording costs that recording no CPU. If the model can't load, the
+ * episode shows without gripper poses.
+ */
+async function withPoses(
+  data: EpisodeData,
+  robotModel: AxolModel | undefined,
+  gripper: GripperType | undefined
+): Promise<EpisodeData> {
+  if (!hasJointState(data) || Object.keys(data.pose).length > 0) return data
+  try {
+    const { loadKinematics, posesFromJoints } = await import("@/lib/episode-fk")
+    const robot = await loadKinematics(robotModel ?? "classic", gripper ?? "parallel")
+    return withJointPoses(
+      data,
+      posesFromJoints(robot, data.state, data.frames),
+      posesFromJoints(robot, data.action, data.frames)
+    )
+  } catch {
+    return data
+  }
+}
+
+/**
  * An episode's recorded robot data, to check a take before training on it:
  * quick checks (dropped frames, jumps), a 3D replay and charts of the joints,
  * the gripper pose and opening. Everything follows the player's time
@@ -128,6 +154,7 @@ export function EpisodeRobotData({
   useEffect(() => {
     let cancelled = false
     fetchEpisodeData(repoId, episode.index)
+      .then((data) => withPoses(data, robotModel, gripper))
       .then((data) => {
         if (!cancelled) setLoaded({ key: requestKey, data, error: null })
       })
@@ -143,7 +170,7 @@ export function EpisodeRobotData({
     return () => {
       cancelled = true
     }
-  }, [repoId, episode.index, requestKey])
+  }, [repoId, episode.index, requestKey, robotModel, gripper])
 
   const current = loaded?.key === requestKey ? loaded : null
   const data = current?.data ?? null

@@ -69,7 +69,8 @@ export default function EpisodeReplay({
   robotModel?: AxolModel
   gripper?: GripperType
 }) {
-  const { model, error } = useUrdfRobot(robotModel, gripper)
+  // The take as recorded: joints past their limits aren't clamped.
+  const { model, error } = useUrdfRobot(robotModel, gripper, undefined, true)
   const joints = useMemo(() => replayJoints(data, frame), [data, frame])
 
   useEffect(() => {

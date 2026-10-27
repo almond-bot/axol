@@ -2855,21 +2855,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/datasets/episode-data", response_model=None)
     async def get_dataset_episode_data(
         repo_id: str, episode: int
-    ) -> dict[str, Any] | JSONResponse:
-        """One saved episode's state, actions, gripper poses and checks.
+    ) -> Response | JSONResponse:
+        """One saved episode's state, actions, recorded gripper poses and checks.
 
-        For the panel's dataset charts and 3D replay. Joint-space datasets get
-        their gripper poses from forward kinematics; see
+        For the panel's dataset charts and 3D replay. A recording's control
+        loop shares this process, so this only reads the file: joint-space
+        episodes' gripper poses are worked out in the browser. See
         ``recording.episode_data``.
         """
         from ..recording.dataset_browser import DatasetBrowseError
-        from ..recording.episode_data import read_episode_data
+        from ..recording.episode_data import read_episode_data, to_json
 
-        def _read() -> dict[str, Any]:
-            return {
-                "repoId": repo_id,
-                **read_episode_data(_dataset_root(repo_id), episode),
-            }
+        def _read() -> Response:
+            data = read_episode_data(_dataset_root(repo_id), episode)
+            # Encoded here, off the event loop and a column at a time.
+            body = to_json({"repoId": repo_id, **data})
+            return Response(body, media_type="application/json")
 
         try:
             return await asyncio.to_thread(_read)

@@ -59,6 +59,47 @@ export function replayJoints(data: EpisodeData, frame: number): Record<string, n
   return values
 }
 
+/** The largest move of a gripper mount between two frames (mirrors the
+ *  Host Computer's check for recorded poses). */
+export function largestPoseJump(
+  poses: Partial<Record<Side, EpisodePose>>,
+  t: number[]
+): EpisodeData["checks"]["poseJump"] {
+  let best: EpisodeData["checks"]["poseJump"] = null
+  for (const side of SIDES) {
+    const pose = poses[side]
+    if (!pose) continue
+    for (let i = 1; i < pose.x.length; i++) {
+      const [x0, y0, z0, x1, y1, z1] = [
+        pose.x[i - 1],
+        pose.y[i - 1],
+        pose.z[i - 1],
+        pose.x[i],
+        pose.y[i],
+        pose.z[i],
+      ]
+      if ([x0, y0, z0, x1, y1, z1].some((v) => v == null)) continue
+      const m = Math.hypot(x1! - x0!, y1! - y0!, z1! - z0!)
+      if (!best || m > best.m) best = { side, m, t: t[i] }
+    }
+  }
+  return best
+}
+
+/** The episode with the gripper poses the panel worked out from its joints. */
+export function withJointPoses(
+  data: EpisodeData,
+  pose: Partial<Record<Side, EpisodePose>>,
+  actionPose: Partial<Record<Side, EpisodePose>>
+): EpisodeData {
+  return {
+    ...data,
+    pose,
+    actionPose,
+    checks: { ...data.checks, poseJump: largestPoseJump(pose, data.t) },
+  }
+}
+
 /** One chart: what it shows, its unit and its series over the episode. */
 export interface ChartSpec {
   key: string

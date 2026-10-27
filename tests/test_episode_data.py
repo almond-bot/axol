@@ -13,7 +13,6 @@ pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
 from almond_axol.constants import ARM_JOINTS  # noqa: E402
-from almond_axol.kinematics.mujoco_fk import AxolForwardKinematics  # noqa: E402
 from almond_axol.recording.dataset_browser import DatasetBrowseError  # noqa: E402
 from almond_axol.recording.episode_data import read_episode_data  # noqa: E402
 
@@ -85,7 +84,7 @@ def _make(
     return root
 
 
-def test_a_joint_episode_gets_its_gripper_poses_from_forward_kinematics(
+def test_a_joint_episode_sends_its_joints_and_leaves_poses_to_the_browser(
     tmp_path: Path,
 ) -> None:
     frames = np.zeros((4, len(JOINT_NAMES)))
@@ -99,10 +98,10 @@ def test_a_joint_episode_gets_its_gripper_poses_from_forward_kinematics(
     assert data["t"] == [0.0, 0.1, 0.2, 0.3]
     assert data["state"]["left_elbow.pos"] == [0.0, 0.1, 0.2, 0.3]
     assert data["action"]["left_elbow.pos"][0] == pytest.approx(0.01)
-    left, right = AxolForwardKinematics().ee_poses(frames[2, :8], frames[2, 8:])
-    assert data["pose"]["left"]["x"][2] == pytest.approx(float(left[0]), abs=1e-4)
-    assert data["pose"]["right"]["z"][2] == pytest.approx(float(right[2]), abs=1e-4)
-    assert set(data["actionPose"]) == {"left", "right"}
+    # No forward kinematics on the Host Computer: the panel works the poses
+    # out from the joints (web/app/src/lib/episode-fk.ts).
+    assert data["pose"] == {} and data["actionPose"] == {}
+    assert data["checks"]["poseJump"] is None
     jump = data["checks"]["jointJump"]
     assert jump["name"] == "left_elbow.pos"
     assert jump["deg"] == pytest.approx(math.degrees(0.1), abs=0.05)
@@ -162,7 +161,7 @@ def test_the_api_serves_an_episode_and_reports_a_missing_one(
             assert found.status_code == 200
             body = found.json()
             assert body["repoId"] == "ds" and body["frames"] == 3
-            assert set(body["pose"]) == {"left", "right"}
+            assert body["state"]["left_elbow.pos"] == [0.0, 0.0, 0.0]
             missing = await client.get(
                 "/api/datasets/episode-data", params={"repo_id": "ds", "episode": 9}
             )
