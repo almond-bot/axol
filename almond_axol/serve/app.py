@@ -40,6 +40,7 @@ from ..constants import (
 )
 from ..motor.errors import MotorError
 from ..robot import lift_firmware
+from ..robot.safety import SafetyError
 from ..settings import resolve_robot_model
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
@@ -62,6 +63,7 @@ from .commands import (
     safety_flags,
 )
 from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
+from .safety_link import SafetyLink
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner, prove_motors_torque_free
@@ -928,6 +930,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # Jelly's wheel bus and lift controller get their own idle links (status
     # only; never commanded) so the panel shows them next to Axol and Mantis.
     jelly = JellyLink()
+    # Jelly's safety board (on the lift bus, where fitted) stays connected for
+    # the whole server life, tasks included: the panel's software E-stop must
+    # work most of all while something is running.
+    safety = SafetyLink()
     runner = OperationRunner(robot, settings=settings, jelly_link=jelly)
     runs = DiagnosticsRunStore(hub)
     # ZED devices are exclusive. Hold this across preview capture and operation
@@ -1095,7 +1101,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
             from ..cli.can.setup import setup_detected_hubs
 
-            result = await asyncio.to_thread(setup_detected_hubs)
+            # The safety board rides the lift bus; it reopens on its own once
+            # discovery has finished renaming the interfaces.
+            await asyncio.to_thread(safety.pause)
+            try:
+                result = await asyncio.to_thread(setup_detected_hubs)
+            finally:
+                safety.resume()
             refreshed = await asyncio.to_thread(_attached_hub_state)
             can_discovery.finish(
                 refreshed,
@@ -1706,6 +1718,38 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if result[device]["state"] == "disconnected":
                 manually_disconnected_jelly[device] = channel
             return result
+
+    # -- Jelly safety board (software E-stop) --------------------------------
+    #
+    # Never gated on the launch reservation or a running operation: a stop
+    # must go out whatever else the server is doing.
+
+    @app.get("/api/safety/status")
+    async def safety_status() -> dict[str, Any]:
+        """The safety board's E-stop chain, or ``detected: False`` without one."""
+        return safety.status()
+
+    @app.post("/api/safety/stop", response_model=None)
+    async def safety_stop() -> dict[str, Any] | JSONResponse:
+        """Software E-stop: cut power to Axol, confirmed by the board."""
+        try:
+            return await asyncio.to_thread(safety.stop)
+        except (SafetyError, TimeoutError) as exc:
+            return JSONResponse(
+                {"error": str(exc) or "The stop was not confirmed. Press the E-Stop."},
+                status_code=503,
+            )
+
+    @app.post("/api/safety/start", response_model=None)
+    async def safety_start() -> dict[str, Any] | JSONResponse:
+        """Remote start: switch power back on, like the green on-switch."""
+        try:
+            return await asyncio.to_thread(safety.start)
+        except (SafetyError, TimeoutError) as exc:
+            return JSONResponse(
+                {"error": str(exc) or "Power did not come on."},
+                status_code=409,
+            )
 
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
@@ -3370,6 +3414,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
         await asyncio.to_thread(jelly.shutdown)
+        await asyncio.to_thread(safety.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

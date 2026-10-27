@@ -25,6 +25,7 @@ from .config import (
 from .jelly import Jelly, JellyConfig, detect_jelly
 from .lift import PowerStatus, read_battery, read_power
 from .mantis import MantisGripperArm
+from .safety import SafetyBoard, SafetyError, SafetyStatus, read_safety_status
 from .sim import Sim
 
 __all__ = [
@@ -47,6 +48,10 @@ __all__ = [
     "PowerStatus",
     "read_battery",
     "read_power",
+    "SafetyBoard",
+    "SafetyError",
+    "SafetyStatus",
+    "read_safety_status",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

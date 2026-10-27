@@ -253,6 +253,60 @@ asyncio.run(main())
 
 The curve is EVE's published resting voltage chart per cell (3.40 V full, 3.26 V half, 3.20 V at 20%), times eight for the 8S packs. LiFePO4 voltage barely changes in the middle of the charge, about 0.16 V across the pack from 40% to 60%, so treat `percent` as a range. The board's ADC can also be off by a few hundred millivolts.
 
+### Safety board
+
+Some Jelly builds include a safety board on the lift's CAN bus (see [Software E-Stop](/hardware-setup/jelly#software-e-stop)). `SafetyBoard` reads its E-Stop chain, cuts power and switches it back on. It works without enabling `Jelly`, and it never moves a motor.
+
+```python
+import asyncio
+from almond_axol.robot import SafetyBoard, SafetyError, read_safety_status
+
+async def main():
+    status = await read_safety_status()      # None without a safety board
+    if status is not None:
+        print(status.output_on, status.estop_pressed, status.supply_volts)
+
+    board = SafetyBoard()                    # the lift's bus, like the lift
+    await board.start()
+    try:
+        await board.stop()                   # cut power, confirmed by the board
+        try:
+            await board.remote_start()       # like the green on-switch
+        except SafetyError as exc:
+            print(exc)                       # for example, the E-Stop is pressed
+    finally:
+        await board.close()
+
+asyncio.run(main())
+```
+
+While started, `SafetyBoard` polls the board at 5 Hz into `board.status`. Its methods:
+
+| Method | Description |
+|---|---|
+| `stop()` | Cuts power, like the E-Stop. It re-sends the stop until the board reports power off, and raises `SafetyError` if that takes longer than 0.5 s. |
+| `remote_start()` | Switches power back on, like the green on-switch. It raises `SafetyError` with the reason when the E-Stop is pressed or power does not come on. |
+| `enable()` | Clears a software stop without switching power on. |
+| `request_status()` | Asks for a fresh status and returns it. |
+| `read_voltages()` | Reads the voltage at each point of the E-Stop chain, for wiring checks. |
+| `set_heartbeat()` | Arms a host heartbeat in milliseconds, or disarms it with `0`. The board cuts power when it hears nothing for that long. The poll keeps it fed while the driver runs, and it stays armed after `close()`. |
+| `close()` | Closes the bus. It sends nothing, so power stays as it is. |
+
+`board.status` and `read_safety_status()` return a `SafetyStatus`:
+
+| Field | Description |
+|---|---|
+| `output_on` | Power is on. |
+| `estop_ok` | The E-Stop is released. `estop_pressed` is the opposite. A pressed E-Stop and an unplugged E-Stop cable read the same. |
+| `latched` | The start latch is closed. A stop of any kind opens it, and only a start closes it again. |
+| `sw_enable` | No software stop is in force. `software_stopped` is the opposite. |
+| `stop_cause` | Why the last software stop happened: `"can"` (a host), `"heartbeat"`, `"console"` (the board's USB console), or `"none"`. |
+| `supply_volts` | The 24 V rail that feeds the board. `supply_ok` is `False` below 18 V, too low to switch power on. |
+| `output_volts` | The voltage switched to the main contactor. |
+| `remote_start_failed` | The last `remote_start()` did not switch power on. |
+| `heartbeat_lost` | The heartbeat cut power since it was last cleared. |
+| `k2_stuck` | A relay reads back wrong. `relay_fault` is `True` when this, `k2_no_close` or `k1_pole_b` is set. Contact Almond support. |
+
 ## `Sim`
 
 `Sim` implements the same interface as `Axol`. Use it to visualise motion without hardware. Requires the `sim` extra.

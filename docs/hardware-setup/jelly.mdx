@@ -45,6 +45,25 @@ The power panel is on the back of Jelly. It has four parts:
   Cutting power to a running Jetson can corrupt its operating system. Shut the Jetson down from its operating system first, then turn the red power switch off.
 </Note>
 
+### Software E-Stop
+
+Some Jelly builds include a safety board. On those, you can also cut power from the control panel, the command line or Python. A software stop works like the E-Stop: Axol loses power at once, and the arms drop.
+
+| To | Control panel | Command line |
+|---|---|---|
+| Cut power | **Cut power** at the top right of any page | `axol safety.stop` |
+| Switch power back on | Click the status, then **Restore power** | `axol safety.start` |
+| See the state | The status at the top right | `axol safety.status` |
+
+- Power stays off after a stop until someone switches it back on.
+- The Jetson stays on through any stop, so the control panel keeps working.
+- The green on-switch always switches power back on, even after a software stop.
+- Nothing switches power on while the E-Stop is pressed. Release it first.
+
+<Warning>
+  A software stop needs the Jetson and its network to work. Keep the E-Stop within reach. It cuts power even when the control panel can't.
+</Warning>
+
 ### Assembling Jelly
 
 <Steps>

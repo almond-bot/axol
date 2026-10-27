@@ -167,6 +167,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`lift.home`](https://docs.almond.bot/cli/lift-home)
 - [`lift.goto`](https://docs.almond.bot/cli/lift-goto)
 - [`lift.update`](https://docs.almond.bot/cli/lift-update)
+- [`safety.status` / `safety.stop` / `safety.start`](https://docs.almond.bot/cli/safety) — software E-Stop on a Jelly with a safety board
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)

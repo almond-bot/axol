@@ -180,6 +180,12 @@
                 ]
               },
               {
+                "group": "Safety",
+                "pages": [
+                  "cli/safety"
+                ]
+              },
+              {
                 "group": "Cameras",
                 "pages": [
                   "cli/zed-install",

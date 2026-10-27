@@ -597,6 +597,70 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
+// ---------------------------------------------------------------------------
+// Jelly safety board (software E-stop; always connected, tasks included)
+// ---------------------------------------------------------------------------
+
+/** One status frame from the safety board (almond_axol/robot/safety.py). */
+export interface SafetyBoardStatus {
+  /** The E-Stop is released and its loop is fed. */
+  estopOk: boolean
+  /** The start latch is sealed in. */
+  latched: boolean
+  /** The contactor is closed: Axol has power. */
+  outputOn: boolean
+  /** No software stop is in force. */
+  softwareEnable: boolean
+  remoteStartActive: boolean
+  heartbeatOn: boolean
+  /** The 24 V rail is high enough to switch the contactor. */
+  supplyOk: boolean
+  supplyVolts: number
+  outputVolts: number
+  /** Why the software enable is off: "none" | "can" | "heartbeat" | "console". */
+  stopCause: string
+  firmware: string
+  faults: {
+    /** Any relay reading back wrong: the board needs service. */
+    relay: boolean
+    k2Stuck: boolean
+    k2NoClose: boolean
+    k1PoleB: boolean
+    remoteStartFailed: boolean
+    heartbeatLost: boolean
+  }
+}
+
+export interface SafetyLinkStatus {
+  channel: string
+  /** The host has the board's bus open. */
+  connected: boolean
+  /** Closed for CAN discovery. */
+  paused: boolean
+  /** A safety board has answered since the server started. False on a Jelly without one. */
+  detected: boolean
+  /** The board answered within the last second. */
+  reachable: boolean
+  ageSeconds: number | null
+  /** The latest frame (kept, with `reachable` false, when the board goes quiet). */
+  status: SafetyBoardStatus | null
+  error: string | null
+}
+
+export async function fetchSafetyStatus(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/status")))
+}
+
+/** Software E-stop. Rejects unless the board confirmed that power is off. */
+export async function safetyStop(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/stop"), { method: "POST" }))
+}
+
+/** Switch power back on, like the green on-switch. Rejects with the reason it did not. */
+export async function safetyStart(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/start"), { method: "POST" }))
+}
+
 /** A lift firmware image the serve host validated and stored for `lift.update`. */
 export interface LiftFirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */

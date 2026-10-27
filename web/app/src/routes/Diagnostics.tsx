@@ -16,6 +16,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AppShell, PageSection } from "@/components/app-shell"
+import { SafetyControl } from "@/components/safety-control"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
@@ -1181,6 +1182,7 @@ export default function Diagnostics() {
         title={tab === "" ? "Diagnostics" : `Diagnostics: ${tabLabel}`}
         wide
         actions={<Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>}
+        safety={<SafetyControl enabled={serverOk} />}
         host={{
           dot: serverOk ? "ok" : "err",
           label: serverOk ? storedHost || "Connected" : "Can't reach the robot",
