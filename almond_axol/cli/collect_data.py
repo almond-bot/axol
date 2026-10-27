@@ -1597,6 +1597,12 @@ def _run_session(
     if (note_dataset := getattr(control, "note_dataset", None)) is not None:
         note_dataset(repo_id, dataset_root)
 
+    # The upload runs when the session ends; check the login now, not then.
+    if push_to_hub:
+        from ..recording.hub_auth import require_hub_login
+
+        require_hub_login()
+
     # Flag physically-stereo ZED X before the relay/robot opens the cameras so
     # the relay and in-process fallback both use the stereo grab path. The pure
     # assigned/recording validation above already pruned placeholder slots.

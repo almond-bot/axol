@@ -32,6 +32,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             vcodec="h264",
             repo_id="local/dagger",
             root=str(root),
+            push_to_hub=False,
             rerun_ip=None,
             rerun_port=9876,
             robot_config=object(),

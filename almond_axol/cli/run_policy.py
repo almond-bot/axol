@@ -2875,6 +2875,11 @@ def _run(
         # package may hand in its own control without this hook.
         if (note_dataset := getattr(control, "note_dataset", None)) is not None:
             note_dataset(repo_id, dataset_root)
+        # The upload runs when the session ends; check the login now, not then.
+        if push_to_hub:
+            from ..recording.hub_auth import require_hub_login
+
+            require_hub_login()
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the

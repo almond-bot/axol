@@ -251,6 +251,18 @@ When a take ends without being saved, the **Episode control** box shows the reas
 
 See the [VR Interface](/guides/vr-interface) guide for every controller binding and headset state.
 
+## Upload to the HuggingFace Hub
+
+Turn on **Push to HuggingFace Hub** to upload the dataset when the session ends. The upload runs only if the session saved at least one episode. It uploads the whole dataset, including episodes from earlier sessions.
+
+Log in to HuggingFace on the robot first. Run this as the user who installed Axol, and use a token with write access:
+
+```bash
+/opt/axol/uv/tools/almond-axol/bin/hf auth login
+```
+
+If `hf` is on your `PATH`, `hf auth login` works too. The session checks the login when it starts. If the login is missing, rejected or read-only, the session stops and the error says what to fix.
+
 ## Mix Axol and Mantis episodes
 
 Axol and Mantis episodes can go in one dataset. For each Axol run:
