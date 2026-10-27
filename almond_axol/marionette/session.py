@@ -284,8 +284,8 @@ class MarionetteSession(JogSession):
         arriving. A connected phone touching none of them stays a live zero
         source, so Jelly ramps down on let-go and keeps hearing zeros
         instead of timing out. A control that is still touched but goes
-        quiet, or a phone that disconnects, is a dead source: everything
-        stops at once, as when a headset's link drops.
+        quiet, or a phone that disconnects or leaves the gateway's list, is a
+        dead source: everything stops at once, as when a headset's link drops.
         """
         for phone in phones.values():
             source = f"phone:{phone.id}"
@@ -306,6 +306,10 @@ class MarionetteSession(JogSession):
             elif source in self._phone_sources:
                 self._phone_sources.discard(source)
                 self.disconnect(source)
+        listed = {f"phone:{phone.id}" for phone in phones.values()}
+        for source in self._phone_sources - listed:
+            self._phone_sources.discard(source)
+            self.disconnect(source)
 
     # -- notes for the phones -------------------------------------------------
 

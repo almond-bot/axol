@@ -772,6 +772,24 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertTrue(self.session.state()["base"]["moving"])
         phone.let_go("base.drive")
 
+    def test_a_driving_phone_that_leaves_the_list_stops_the_base_at_once(self) -> None:
+        # The gateway drops an older app (no device id) from its list when it
+        # goes, so the phone vanishes from Axol's snapshot instead of going
+        # offline. Its drive must end then, not when its hold times out.
+        session = MarionetteSession(
+            SimBackend("mobile"), _planner, gateway="localhost:1"
+        )
+        tracker = meaning.PhoneTracker(clock=lambda: 100.0, mirror="allow")
+        tracker.apply(msg.config(["phone-1"], "phone-1", _CONTROLS))
+        tracker.apply(msg.input("phone-1", "base.drive", {"x": 1, "y": 0}, live=True))
+        session._drive_phones(tracker.snapshot(), 100.0)
+        self.assertIn("phone:phone-1", session._sources)
+        before = time.monotonic()
+        session._drive_phones({}, 100.0)
+        self.assertNotIn("phone:phone-1", session._sources)
+        self.assertGreater(session._dead_until, before)  # a dead source: stop at once
+        self.assertEqual(session._phone_sources, set())
+
     def test_turn_and_lift_holds(self) -> None:
         self.start()
         phone = self.phone()
