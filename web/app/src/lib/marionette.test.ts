@@ -277,6 +277,23 @@ describe("phoneConnectHint", () => {
     expect(phoneConnectHint("localhost")).toBe(
       "In the Marionette app, connect to the computer running the gateway."
     )
+    expect(phoneConnectHint("localhost:8787", "127.0.0.1")).toBe(local)
+  })
+
+  it("names Axol's address when the gateway runs on Axol", () => {
+    expect(phoneConnectHint("localhost:8787", "10.1.10.220")).toBe(
+      "In the Marionette app, connect to 10.1.10.220:8787."
+    )
+    expect(phoneConnectHint("", "axol.local")).toBe(
+      "In the Marionette app, connect to axol.local:8787."
+    )
+    expect(phoneConnectHint("localhost", "[fd7a::5]")).toBe(
+      "In the Marionette app, connect to [fd7a::5]."
+    )
+    // A gateway elsewhere is named as typed, wherever Axol is.
+    expect(phoneConnectHint("10.1.10.155:8787", "10.1.10.220")).toBe(
+      "In the Marionette app, connect to 10.1.10.155:8787."
+    )
   })
 })
 

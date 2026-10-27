@@ -10,7 +10,7 @@ The control panel's **Marionette** page shows the robot in 3D, every phone and a
 ## Before you start
 
 - Build the Marionette app onto each iPhone from a current copy of the Marionette repository. See its README.
-- Install Node 22 or newer on a computer that the phones and the robot can both reach, and clone the Marionette repository there. This can be the robot's computer, a laptop on the same Wi-Fi, or a machine on the same Tailscale network.
+- Install Node 22 or newer on Axol's computer and clone the Marionette repository there. The phones then talk to the robot directly, which gives the least delay. Any other computer that the phones and the robot can both reach also works, such as a laptop on the same Wi-Fi or a machine on the same Tailscale network.
 - For cameras, assign the ZED cameras in **Axol settings → Cameras**. In sim, rendered head and wrist views are used instead.
 
 ## Start the gateway
@@ -28,7 +28,7 @@ It listens on port 8787 and serves the Axol phone screen. Note the computer's ad
 
 <Steps>
   <Step title="Open the Marionette page">
-    In the control panel, open **Marionette**. Type the gateway's address in **Gateway**, for example `192.168.1.20` or `localhost` when the gateway runs on the robot.
+    In the control panel, open **Marionette**. In **Gateway**, keep `localhost` when the gateway runs on Axol's computer. Otherwise type its address, for example `192.168.1.20`.
   </Step>
 
   <Step title="Start">
@@ -36,7 +36,7 @@ It listens on port 8787 and serves the Axol phone screen. Note the computer's ad
   </Step>
 
   <Step title="Connect the phones">
-    On each iPhone, open Marionette, type the gateway's address and tap **Connect**. Each phone appears on the page with its name and color.
+    On each iPhone, open Marionette, type the address the **Marionette** page shows and tap **Connect**. Each phone appears on the page with its name and color.
   </Step>
 
   <Step title="Calibrate each phone">

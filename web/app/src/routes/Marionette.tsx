@@ -67,6 +67,7 @@ import {
   setServerBase,
   startOperation,
   stopOperation,
+  wsBaseUrl,
   type AxolModel,
   type GripperType,
   type OpStatus,
@@ -420,6 +421,8 @@ export default function Marionette() {
   const stop = marionette?.stop ?? null
   const phones = marionette?.phones ?? []
   const arms = marionette?.arms ?? null
+  // The Axol computer as this page reaches it (the page may come from elsewhere).
+  const axolHost = new URL(wsBaseUrl()).hostname
   const address = running
     ? marionette?.gateway.address || String(ownSession?.args?.gateway ?? "") || gateway
     : gateway
@@ -581,7 +584,7 @@ export default function Marionette() {
           <div>
             <h1 className="font-heading text-2xl font-semibold tracking-tight">Marionette</h1>
             <p data-testid="marionette-connect" className="mt-1 text-sm text-white/50">
-              {phoneConnectHint(address)}
+              {phoneConnectHint(address, axolHost)}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">

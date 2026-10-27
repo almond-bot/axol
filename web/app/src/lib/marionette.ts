@@ -285,8 +285,14 @@ export function phoneActivity(
   return "Idle"
 }
 
-/** The sentence telling an operator where to point the Marionette app. */
-export function phoneConnectHint(address: string): string {
+const isLoopback = (host: string) => host === "localhost" || host === "::1" || /^127\./.test(host)
+
+/**
+ * The sentence telling an operator where to point the Marionette app.
+ * `axolHost` is the Axol computer's address as this page reaches it: a
+ * gateway local to Axol is reached at that address.
+ */
+export function phoneConnectHint(address: string, axolHost = ""): string {
   const typed = address.trim() || DEFAULT_GATEWAY
   let host = ""
   let port = ""
@@ -297,8 +303,12 @@ export function phoneConnectHint(address: string): string {
   } catch {
     return `In the Marionette app, connect to ${typed}.`
   }
-  const loopback = host === "localhost" || host === "::1" || /^127\./.test(host)
-  if (!loopback) return `In the Marionette app, connect to ${typed}.`
+  if (!isLoopback(host)) return `In the Marionette app, connect to ${typed}.`
+  const axol = axolHost.replace(/^\[|\]$/g, "")
+  if (axol && !isLoopback(axol)) {
+    const named = axol.includes(":") ? `[${axol}]` : axol
+    return `In the Marionette app, connect to ${port ? `${named}:${port}` : named}.`
+  }
   return port
     ? `In the Marionette app, connect to port ${port} on the computer running the gateway.`
     : "In the Marionette app, connect to the computer running the gateway."
