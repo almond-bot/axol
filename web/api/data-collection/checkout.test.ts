@@ -15,6 +15,8 @@ const { POST, OPTIONS } = await import("./checkout.js")
 const { GET } = await import("./price.js")
 
 const request = {
+  service: "dataset",
+  method: "your_axol",
   hours: 12,
   task: "Fold the towel in half twice.",
   example: { kind: "dataset", value: "https://huggingface.co/datasets/org/towels" },
@@ -34,6 +36,8 @@ function post(body: unknown) {
 
 beforeEach(() => {
   process.env.STRIPE_DATA_COLLECTION_PRICE_ID = "price_hourly"
+  process.env.STRIPE_TELEOPERATOR_PRICE_ID = "price_teleoperator"
+  process.env.STRIPE_REMOTE_DATA_COLLECTION_PRICE_ID = "price_remote"
   vi.spyOn(console, "error").mockImplementation(() => {})
 })
 
@@ -54,7 +58,7 @@ describe("POST /api/data-collection/checkout", () => {
 
     const params = create.mock.calls[0][0]
     expect(params.mode).toBe("payment")
-    expect(params.line_items).toEqual([{ price: "price_hourly", quantity: 12 }])
+    expect(params.line_items).toEqual([{ price: "price_remote", quantity: 12 }])
     expect(params).not.toHaveProperty("payment_method_types")
     expect(params.success_url).toBe(
       "https://192.168.1.50:8001/control/operations?data_collection=paid#top"
@@ -64,6 +68,8 @@ describe("POST /api/data-collection/checkout", () => {
     )
     expect(params.metadata).toEqual({
       service: "data_collection",
+      request_type: "dataset",
+      collection_method: "your_axol",
       hours: "12",
       task: "Fold the towel in half twice.",
       example_kind: "dataset",
@@ -71,6 +77,31 @@ describe("POST /api/data-collection/checkout", () => {
       operation: "collect-data",
     })
     expect(params.payment_intent_data.metadata).toEqual(params.metadata)
+    expect(params.payment_intent_data.description).toBe(
+      "Teleop Data Collection, training dataset, collected on your Axol, 12 h"
+    )
+    expect(params.custom_text.submit.message).toContain("fewer usable hours")
+  })
+
+  it("bills a one-off task on the teleoperator price", async () => {
+    create.mockResolvedValue({ id: "cs_3", url: "https://checkout.stripe.com/c/pay/cs_3" })
+    expect((await post({ ...request, service: "task", hours: 2 })).status).toBe(200)
+    const params = create.mock.calls[0][0]
+    expect(params.line_items).toEqual([{ price: "price_teleoperator", quantity: 2 }])
+    expect(params.metadata.request_type).toBe("task")
+    expect(params.metadata.collection_method).toBe("")
+    expect(params.payment_intent_data.description).toBe("Teleoperator, one-off task, 2 h")
+    expect(params.custom_text.submit.message).toContain("by the minute")
+  })
+
+  it("charges data on Almond's Axol at its own price", async () => {
+    create.mockResolvedValue({ id: "cs_4", url: "https://checkout.stripe.com/c/pay/cs_4" })
+    expect((await post({ ...request, method: "almond_axol" })).status).toBe(200)
+    const params = create.mock.calls[0][0]
+    expect(params.line_items).toEqual([{ price: "price_hourly", quantity: 12 }])
+    expect(params.payment_intent_data.description).toBe(
+      "Teleop Data Collection, training dataset, collected by Almond with Axol, 12 h"
+    )
   })
 
   it("sends an empty example when there is none", async () => {
@@ -117,6 +148,20 @@ describe("GET /api/data-collection/price", () => {
     const response = await GET()
     expect(retrieve).toHaveBeenCalledWith("price_hourly")
     expect(await response.json()).toEqual({ unitAmount: 5000, currency: "usd" })
+  })
+
+  it("reads the price asked for", async () => {
+    retrieve.mockResolvedValue({ id: "p", active: true, unit_amount: 1500, currency: "usd" })
+    const url = "https://axol.almond.bot/api/data-collection/price"
+    for (const key of ["teleoperator", "almond_axol", "your_axol", "bogus"]) {
+      await GET(new Request(`${url}?price=${key}`))
+    }
+    expect(retrieve.mock.calls).toEqual([
+      ["price_teleoperator"],
+      ["price_hourly"],
+      ["price_remote"],
+      ["price_hourly"],
+    ])
   })
 
   it("fails when the price is archived", async () => {

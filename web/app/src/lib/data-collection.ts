@@ -17,28 +17,78 @@ export const MAX_LINK_LENGTH = 500
 
 export type ExampleKind = "video" | "dataset"
 
+/**
+ * The two Teleop Data Collection services, told apart by what the customer
+ * gets:
+ * - `task`: teleop as a service. An Almond operator controls the customer's
+ *   own Axol to finish a one-off task. The output is the task done. Billed by
+ *   the minute: the customer prepays hours and Almond refunds unused minutes.
+ * - `dataset`: a training dataset, collected one of the `COLLECTION_METHODS`
+ *   ways. The output is the dataset. Billed per hour of usable data, however
+ *   long it takes to record.
+ * Each is charged at its own hourly Stripe Price (see `priceKey`).
+ */
+export const DATA_COLLECTION_SERVICES = ["task", "dataset"] as const
+export type DataCollectionService = (typeof DATA_COLLECTION_SERVICES)[number]
+
+/** The sidebar page that sells each service. */
+export const REQUEST_PAGE = {
+  task: "request-teleoperator",
+  dataset: "request-data",
+} as const satisfies Record<DataCollectionService, string>
+
+/**
+ * How Almond collects a training dataset:
+ * - `almond_axol`: Almond sets up the environment and records it with teleop
+ *   on its own Axol.
+ * - `your_axol`: Almond teleoperates the customer's Axol remotely, in the
+ *   customer's environment.
+ */
+export const COLLECTION_METHODS = ["almond_axol", "your_axol"] as const
+export type CollectionMethod = (typeof COLLECTION_METHODS)[number]
+
+/**
+ * Which hourly Stripe Price a request is charged at: the teleoperator's for a
+ * one-off task, else the collection method's. The amounts live in Stripe.
+ */
+export const PRICE_KEYS = ["teleoperator", ...COLLECTION_METHODS] as const
+export type PriceKey = (typeof PRICE_KEYS)[number]
+
+export function priceKey(
+  service: DataCollectionService,
+  method: CollectionMethod | null
+): PriceKey {
+  return service === "task" ? "teleoperator" : (method ?? "almond_axol")
+}
+
 /** The pages that show the Teleop Data Collection card. */
 export const DATA_COLLECTION_OFFER_OPERATIONS = ["overview", "teleop", "collect-data"] as const
 export type DataCollectionOfferOperation = (typeof DATA_COLLECTION_OFFER_OPERATIONS)[number]
 
-/** Where a request was made from: the Request data page itself, or the page
- *  whose card led there. Sent as the checkout's `operation` metadata, which
- *  Beaver shows with the request. */
+/** Where a request was made from: a request page itself, or the page whose
+ *  card led there. Sent as the checkout's `operation` metadata, which Beaver
+ *  shows with the request. */
 export const DATA_COLLECTION_OPERATIONS = [
-  "request-data",
+  ...Object.values(REQUEST_PAGE),
   ...DATA_COLLECTION_OFFER_OPERATIONS,
 ] as const
 export type DataCollectionOperation = (typeof DATA_COLLECTION_OPERATIONS)[number]
 
-/** The `?from=` of a Request data link, or the page itself when it names no
- *  page with the card. */
-export function requestSource(from: string | null): DataCollectionOperation {
+/** The `?from=` of a link to a service's request page, or that page itself
+ *  when it names no page with the card. */
+export function requestSource(
+  from: string | null,
+  service: DataCollectionService
+): DataCollectionOperation {
   return (DATA_COLLECTION_OFFER_OPERATIONS as readonly (string | null)[]).includes(from)
     ? (from as DataCollectionOfferOperation)
-    : "request-data"
+    : REQUEST_PAGE[service]
 }
 
 export interface DataCollectionRequest {
+  service: DataCollectionService
+  /** How a dataset is collected; null for a one-off task. */
+  method: CollectionMethod | null
   hours: number
   task: string
   /** A video or sample dataset of the task; optional. */
@@ -91,6 +141,18 @@ export function validateDataCollectionRequest(raw: unknown): Validation<DataColl
   const body = (raw ?? {}) as Record<string, unknown>
   const example = (body.example ?? {}) as Record<string, unknown>
 
+  const service = body.service
+  if (!(DATA_COLLECTION_SERVICES as readonly unknown[]).includes(service)) {
+    return { ok: false, error: "Choose a one-off task or a training dataset." }
+  }
+  let method: CollectionMethod | null = null
+  if (service === "dataset") {
+    if (!(COLLECTION_METHODS as readonly unknown[]).includes(body.method)) {
+      return { ok: false, error: "Choose how Almond collects the data." }
+    }
+    method = body.method as CollectionMethod
+  }
+
   const hours = Number(body.hours)
   if (!Number.isInteger(hours) || hours < MIN_HOURS || hours > MAX_HOURS) {
     return {
@@ -138,7 +200,18 @@ export function validateDataCollectionRequest(raw: unknown): Validation<DataColl
   const returnUrl = parseVideoUrl(typeof body.returnUrl === "string" ? body.returnUrl : "")
   if (!returnUrl) return { ok: false, error: "Unknown return page." }
 
-  return { ok: true, value: { hours, task, example: parsedExample, operation, returnUrl } }
+  return {
+    ok: true,
+    value: {
+      service: service as DataCollectionService,
+      method,
+      hours,
+      task,
+      example: parsedExample,
+      operation,
+      returnUrl,
+    },
+  }
 }
 
 /** "$50" for 5000 USD cents; whole amounts drop the decimals. */

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react"
-import type { DataCollectionPrice, DataCollectionRequest } from "@/lib/data-collection"
+import type { DataCollectionPrice, DataCollectionRequest, PriceKey } from "@/lib/data-collection"
 
 /**
  * Calls to Almond's Teleop Data Collection functions (web/api), which hold the
@@ -28,8 +28,8 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   return body
 }
 
-export function fetchDataCollectionPrice(): Promise<DataCollectionPrice> {
-  return call<DataCollectionPrice>("/api/data-collection/price")
+export function fetchDataCollectionPrice(key: PriceKey): Promise<DataCollectionPrice> {
+  return call<DataCollectionPrice>(`/api/data-collection/price?price=${key}`)
 }
 
 /** Creates the Stripe Checkout session and returns its page URL. */
@@ -42,21 +42,26 @@ export async function startDataCollectionCheckout(request: DataCollectionRequest
   return url
 }
 
-/** The hourly price from Stripe, or null until it arrives (or when almond.bot
- *  can't be reached: the price is then left out rather than guessed). */
-export function useDataCollectionPrice(enabled = true): DataCollectionPrice | null {
-  const [price, setPrice] = useState<DataCollectionPrice | null>(null)
+/** An hourly price from Stripe, or null until it arrives (or when
+ *  almond.bot can't be reached: the price is then left out rather than
+ *  guessed). */
+export function useDataCollectionPrice(key: PriceKey, enabled = true): DataCollectionPrice | null {
+  // Kept with the key it is for, so another price never shows.
+  const [price, setPrice] = useState<{
+    key: PriceKey
+    value: DataCollectionPrice
+  } | null>(null)
   useEffect(() => {
     if (!enabled) return
     let active = true
-    fetchDataCollectionPrice()
-      .then((p) => {
-        if (active) setPrice(p)
+    fetchDataCollectionPrice(key)
+      .then((value) => {
+        if (active) setPrice({ key, value })
       })
       .catch(() => {})
     return () => {
       active = false
     }
-  }, [enabled])
-  return price
+  }, [key, enabled])
+  return price?.key === key ? price.value : null
 }

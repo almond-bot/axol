@@ -118,12 +118,13 @@ import {
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
 import { DataCollectionOffer } from "@/components/data-collection-offer"
-import { RequestDataPage } from "@/components/request-data"
+import { RequestPage } from "@/components/request-data"
 import { requestSource } from "@/lib/data-collection"
 import {
   deviceErrorText,
   discoveryNeedsRecheck,
   discoveryNotice,
+  jellyPresentOnCan,
   nextRecheckDelay,
   useSettledDiscovery,
 } from "@/lib/hardware-status"
@@ -155,6 +156,7 @@ type ControlView =
   | "operations"
   | "datasets"
   | "request-data"
+  | "request-teleoperator"
   | "devices"
   | "settings"
   | "logs"
@@ -164,6 +166,7 @@ const CONTROL_VIEWS: Record<string, ControlView> = {
   operations: "operations",
   datasets: "datasets",
   "request-data": "request-data",
+  "request-teleoperator": "request-teleoperator",
   devices: "devices",
   settings: "settings",
   logs: "logs",
@@ -247,12 +250,9 @@ export default function ControlPanel() {
     if (!outcome || handledCheckoutRef.current === location.search) return
     handledCheckoutRef.current = location.search
     if (outcome === "paid") {
-      toast.success(
-        "Payment received. Almond will contact you by email to plan your Teleop Data Collection.",
-        12000
-      )
+      toast.success("Payment received. Almond will email you to schedule the work.", 12000)
     } else if (outcome === "cancelled") {
-      toast.info("Teleop Data Collection request cancelled. You weren't charged.")
+      toast.info("Request cancelled. You weren't charged.")
     }
     params.delete("data_collection")
     const search = params.toString()
@@ -1083,12 +1083,17 @@ export default function ControlPanel() {
   // discovery report none: settled.)
   const canDiscoverySettled =
     canDiscovery == null || canDiscovery.status === "ready" || canDiscovery.status === "configured"
+  //
+  // Jelly's CAN interfaces being present is enough: Axol sits on Jelly even
+  // with its wheels and lift switched off in settings (which makes the host
+  // report the mount-derived model instead of "mobile").
   const needsMount =
     conn.state === "ok" &&
     canDiscoverySettled &&
     !settingsError &&
     hardwareProfile !== "mantis" &&
     settingsSnap?.robotModel !== "mobile" &&
+    jellyPresentOnCan(canDevices) !== true &&
     (settingsSnap?.schema ?? []).some((c) =>
       c.settings.some((f) => f.key === "kinematics.mount")
     ) &&
@@ -1107,9 +1112,7 @@ export default function ControlPanel() {
   // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
   // that comes up a moment after the panel connects turns the robot into
   // Axol on Jelly (and drops the "What is Axol mounted on?" pick) without a reload.
-  const jellyPresent = canDevices
-    ? Boolean(canDevices.wheels?.present || canDevices.lift?.present)
-    : null
+  const jellyPresent = jellyPresentOnCan(canDevices)
   const robotModelInputs = conn.state === "ok" ? `${jellyPresent}:${canDiscoverySettled}` : null
   const robotModelInputsRef = useRef<string | null>(null)
   useEffect(() => {
@@ -2100,7 +2103,7 @@ export default function ControlPanel() {
 
   // Alerts that apply wherever the operator is: an update, a version skew, a
   // robot held after a failed shutdown, and hardware still to identify. Not on
-  // Request data, which works without the robot. The connection itself shows
+  // Request data or Request teleoperator, which work without the robot. The connection itself shows
   // in the header pill, and on the pages that need it.
   const notices = (
     <>
@@ -2158,8 +2161,11 @@ export default function ControlPanel() {
     },
     "request-data": {
       title: "Request data",
-      description:
-        "With Teleop Data Collection, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training.",
+      description: "Get a LeRobot dataset of your task, recorded by Almond and ready for training.",
+    },
+    "request-teleoperator": {
+      title: "Request teleoperator",
+      description: "Have an Almond operator control your Axol remotely to finish a task for you.",
     },
     devices: {
       title: "Devices",
@@ -2380,7 +2386,7 @@ export default function ControlPanel() {
     if (blocker.includes("Mantis settings") || blocker.includes("Mantis trackers")) {
       return { label: "Open Mantis settings", onClick: () => openSettings("mantis-tracking") }
     }
-    if (blocker.startsWith("Fix the motor fault")) {
+    if (blocker.startsWith("Fix the motor fault") || blocker.includes("isn't answering")) {
       return { label: "Open Diagnostics", onClick: () => navigate("/diagnostics") }
     }
     return null
@@ -2400,7 +2406,7 @@ export default function ControlPanel() {
         back={routeOp ? "/control/operations" : undefined}
         description={page[view].description}
         actions={runningChip}
-        notices={view === "request-data" ? undefined : notices}
+        notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
         badges={badges}
         host={host}
       >
@@ -2592,9 +2598,14 @@ export default function ControlPanel() {
             </EmptyState>
           ))}
 
-        {view === "request-data" && (
-          <RequestDataPage
-            source={requestSource(new URLSearchParams(location.search).get("from"))}
+        {(view === "request-data" || view === "request-teleoperator") && (
+          <RequestPage
+            key={view}
+            service={view === "request-teleoperator" ? "task" : "dataset"}
+            source={requestSource(
+              new URLSearchParams(location.search).get("from"),
+              view === "request-teleoperator" ? "task" : "dataset"
+            )}
           />
         )}
 

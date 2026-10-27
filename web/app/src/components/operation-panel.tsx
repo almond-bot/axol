@@ -22,7 +22,7 @@ import {
   isCustomPolicyRun,
   isRobotFreeRun,
   isSimRun,
-  motorFaultLabel,
+  motorFaultBlockers,
   perRunFields,
   recordingCameraCount,
   type CameraSpec,
@@ -390,9 +390,13 @@ export function OperationPanel({
   // faults remain actionable.
   const checkActiveProfileFaults = mantisMode ? mantisOk : !robotFree && axolOk
   if (checkActiveProfileFaults) {
-    for (const f of robot?.faults ?? []) {
-      blockers.push(`Fix the motor fault on ${motorFaultLabel(f)}`)
-    }
+    blockers.push(
+      ...motorFaultBlockers(
+        robot?.faults ?? [],
+        robot?.motors ?? [],
+        mantisMode ? "Mantis" : "Axol"
+      )
+    )
   }
   // Tracker setup gates a Mantis *collection* (the server refuses it too).
   // Mantis teleop never tracks — it drives the grippers from the rig

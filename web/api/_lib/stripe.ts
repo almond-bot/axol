@@ -1,4 +1,5 @@
 import Stripe from "stripe"
+import type { PriceKey } from "../../app/src/lib/data-collection.js"
 
 /**
  * Shared plumbing for the Teleop Data Collection functions. They run on Vercel with
@@ -8,8 +9,13 @@ import Stripe from "stripe"
  * Environment (set as Vercel sensitive variables, per environment):
  * - STRIPE_SECRET_KEY: a restricted key (`rk_…`) with write access to
  *   Checkout Sessions and read access to Prices.
- * - STRIPE_DATA_COLLECTION_PRICE_ID: the hourly Price of the Teleop Data Collection
- *   product. The panel shows whatever amount it has.
+ * - STRIPE_TELEOPERATOR_PRICE_ID: the hourly Price of a teleoperator for a
+ *   one-off task (Request teleoperator).
+ * - STRIPE_DATA_COLLECTION_PRICE_ID: the Price per hour of usable data that
+ *   Almond collects on its own Axol (Request data, Almond's Axol).
+ * - STRIPE_REMOTE_DATA_COLLECTION_PRICE_ID: the Price per hour of usable data
+ *   collected on the customer's Axol (Request data, Your Axol).
+ * The panel shows whatever amounts they have.
  *
  * Fulfillment is not here: Beaver (beaver.almond.bot) already receives every
  * checkout on the account through its own Stripe webhook, and opens a Teleop
@@ -28,6 +34,17 @@ export function requiredEnv(name: string): string {
   const value = process.env[name]
   if (!value) throw new MissingConfigError(name)
   return value
+}
+
+/** The env var holding each hourly Price. */
+const PRICE_ENV: Record<PriceKey, string> = {
+  teleoperator: "STRIPE_TELEOPERATOR_PRICE_ID",
+  almond_axol: "STRIPE_DATA_COLLECTION_PRICE_ID",
+  your_axol: "STRIPE_REMOTE_DATA_COLLECTION_PRICE_ID",
+}
+
+export function priceIdFor(key: PriceKey): string {
+  return requiredEnv(PRICE_ENV[key])
 }
 
 let client: Stripe | null = null

@@ -7,6 +7,7 @@ import {
   Cpu,
   Database,
   DatabaseZap,
+  Headset,
   Glasses,
   LayoutDashboard,
   Menu,
@@ -44,6 +45,7 @@ const MAIN_NAV: NavItem[] = [
   { to: "/control/operations", label: "Operations", icon: Play },
   { to: "/control/datasets", label: "Datasets", icon: Database },
   { to: "/control/request-data", label: "Request data", icon: DatabaseZap },
+  { to: "/control/request-teleoperator", label: "Request teleoperator", icon: Headset },
   { to: "/control/settings", label: "Settings", icon: Settings2 },
 ]
 

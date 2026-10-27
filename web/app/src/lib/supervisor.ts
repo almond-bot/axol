@@ -388,6 +388,42 @@ export function motorFaultLabel(f: MotorFault): string {
   return `${f.arm[0].toUpperCase()} ${joint}: ${f.problem}${temp}`
 }
 
+/**
+ * The "Before you start" lines for a robot's motor faults, grouped so a
+ * powered-off robot reads as one problem instead of one line per motor:
+ * - every motor unreachable: one line to turn the device on;
+ * - every motor of one side unreachable: one line for that arm (or gripper);
+ * - anything else: one line per motor, with `motorFaultLabel`.
+ * `device` is "Axol" or "Mantis".
+ */
+export function motorFaultBlockers(
+  faults: MotorFault[],
+  motors: MotorHealth[],
+  device: "Axol" | "Mantis"
+): string[] {
+  if (faults.length === 0) return []
+  const unreachable = faults.filter((f) => f.problem === "unreachable")
+  if (motors.length > 0 && unreachable.length === motors.length) {
+    return [`${device} isn't answering. Turn on its power.`]
+  }
+  const part = device === "Mantis" ? "gripper" : "arm"
+  const deadSides = new Set<string>()
+  for (const side of new Set(motors.map((m) => m.arm))) {
+    const total = motors.filter((m) => m.arm === side).length
+    const down = unreachable.filter((f) => f.arm === side).length
+    if (total > 1 && down === total) deadSides.add(side)
+  }
+  const lines = [...deadSides].map(
+    (side) =>
+      `${side[0].toUpperCase()}${side.slice(1)} ${part} isn't answering. Check its power and cable.`
+  )
+  for (const f of faults) {
+    if (f.problem === "unreachable" && deadSides.has(f.arm)) continue
+    lines.push(`Fix the motor fault on ${motorFaultLabel(f)}`)
+  }
+  return lines
+}
+
 export async function fetchRobotStatus(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/status")))
 }
