@@ -51,7 +51,7 @@ This command is configured through draccus. Local inference uses `--policy_path`
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution of the dataset video and of the policy's images (default: `SVGA`, 960×600). A resumed dataset keeps its original resolution. |
 | `--vcodec STR` | Dataset video codec (default: `h264` on Jetson, `auto` elsewhere). Same as [`collect-data`](/cli/collect-data). |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
-| `--push_to_hub true` | Push the dataset to HuggingFace Hub when done |
+| `--push_to_hub true` | Push the dataset to HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
 | `--robot_config.cameras DICT` | Camera slots and serial numbers, as in [`collect-data`](/cli/collect-data): `--robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"`. Assign the cameras the policy was trained on. At least one must record. |
 | `--robot_config.axol_config.left_stiffness S` | Left arm stiffness in `[0, 1]` (default: 1). Match the value used to collect the policy's data. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--teleop_config.vr_teleop_config.reset_torque_threshold FLOAT` | Contact limit (Nm) for every return to rest (default: 6.0). `0` turns it off. |

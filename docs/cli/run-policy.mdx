@@ -36,7 +36,7 @@ This command is configured through draccus. The robot settings (cameras, per-joi
 | `--fps INT` | Control loop rate (default: 30). Must match the rate the policy was trained on. |
 | `--repo_id <user>/<dataset>` | Dataset repo ID to save rollouts to (optional) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
-| `--push_to_hub true` | Push the rollout dataset to HuggingFace Hub when done |
+| `--push_to_hub true` | Push the rollout dataset to HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
 | `--vcodec STR` | Video codec for saved rollouts (default: `h264` on Jetson, `auto` elsewhere). Used only with `--repo_id`. |
 | `--device STR` | PyTorch device for LeRobot inference (default: `cuda`; unused with `custom`). The hosted Jetson install has CPU-only PyTorch, so use `cpu` or remote inference. |
 | `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null` starts a policy server on the robot. With `custom`, the address of your endpoint (default `127.0.0.1`); a `ws://` or `wss://` URL also works. |
