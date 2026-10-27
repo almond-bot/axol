@@ -1,4 +1,5 @@
 import { Zap } from "lucide-react"
+import { BatteryIndicator } from "@/components/jelly-status"
 import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 import type { JogArm, JogPlan, JogState } from "@/lib/jog"
@@ -31,6 +32,7 @@ export function RobotStatus({
   const arms = state?.arms
   const lift = state?.lift
   const base = state?.base
+  const battery = state?.battery
   const row = "contents"
   const name = "text-white/50"
   const value = "text-right font-mono text-white/80 tabular-nums"
@@ -81,6 +83,14 @@ export function RobotStatus({
               ? "Not homed"
               : "–"}
         </span>
+        {(lift || base) && (
+          <>
+            <span className={name}>Battery</span>
+            <span data-testid="status-battery" className={value}>
+              {battery ? <BatteryIndicator battery={battery} /> : "–"}
+            </span>
+          </>
+        )}
         <span className={name}>Base position{base?.estimated ? " (est.)" : ""}</span>
         <span data-testid="status-odometry" className={value}>
           {base ? `${base.x.toFixed(2)}, ${base.y.toFixed(2)} m · ${deg(base.yaw, 0)}` : "–"}

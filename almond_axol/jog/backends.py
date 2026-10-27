@@ -80,6 +80,9 @@ class SimBackend:
             return None
         return _lift_dict(self.lift.raised, self.lift.velocity, self.lift.moving)
 
+    def battery_state(self) -> dict[str, Any] | None:
+        return None  # the simulated Jelly has no battery
+
     def base_state(self) -> dict[str, Any] | None:
         if not self.has_base:
             return None
@@ -213,6 +216,24 @@ class HardwareBackend:
             velocity = float(status.velocity) / JOG_SPEED / LIFT_FULL_TRAVEL_S
             moving = bool(status.moving)
         return _lift_dict(self._jelly.lift_raised, velocity, moving)
+
+    def battery_state(self) -> dict[str, Any] | None:
+        """The battery estimate the lift board's power frames give, while
+        they are fresh (see :attr:`~almond_axol.robot.jelly.Jelly.battery`)."""
+        jelly = self._jelly
+        if jelly is None or not self._jelly_open:
+            return None
+        battery = jelly.battery
+        if battery is None:
+            return None
+        return {
+            "voltage": round(battery.voltage, 2),
+            "percent": round(battery.percent, 1),
+            "charging": battery.charging,
+            "underLoad": battery.under_load,
+            "ageSeconds": round(jelly.battery_age or 0.0, 1),
+            "live": True,
+        }
 
     def base_state(self) -> dict[str, Any] | None:
         if not self.has_base:

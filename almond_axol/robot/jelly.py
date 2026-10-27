@@ -533,6 +533,11 @@ class Jelly:
         """
         return self._lift.battery if self._lift is not None else None
 
+    @property
+    def battery_age(self) -> float | None:
+        """Seconds since the lift board's latest power frame, or None."""
+        return self._lift.power_age if self._lift is not None else None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------

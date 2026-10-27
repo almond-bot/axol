@@ -16,6 +16,7 @@ import {
   wsBaseUrl,
   type AxolModel,
   type GripperType,
+  type JellyBattery,
 } from "@/lib/supervisor"
 
 export type JogArm = "left" | "right"
@@ -64,6 +65,8 @@ export interface JogState {
   tips?: { left: JogPose; right: JogPose } | null
   lift?: JogLiftState | null
   base?: JogBaseState | null
+  /** Jelly's battery reading while the session runs Jelly; null in sim or without one. */
+  battery?: JellyBattery | null
   hold?: { active: boolean; drive: Vec3; lift: number; arms?: Record<JogArm, number[]> }
   /** Per arm: jogging, and held back by a joint limit or the body. */
   armJog?: Record<JogArm, { moving: boolean; limited: boolean }> | null

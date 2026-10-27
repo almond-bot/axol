@@ -99,6 +99,9 @@ class JogBackend(Protocol):
 
     def lift_state(self) -> dict[str, Any] | None: ...
     def base_state(self) -> dict[str, Any] | None: ...
+    def battery_state(self) -> dict[str, Any] | None:
+        """Jelly's battery reading, shaped like the control panel's, or None."""
+        ...
 
 
 _NO_TWIST = (0.0,) * 6
@@ -524,6 +527,7 @@ class JogSession:
             "tips": tips,
             "lift": self._backend.lift_state(),
             "base": self._backend.base_state(),
+            "battery": self._backend.battery_state(),
             "hold": {
                 "active": hold is not None,
                 "drive": list((hold or _IDLE).base[:3]),

@@ -645,6 +645,7 @@ class MarionetteSession(JogSession):
         grip = self._grip[SIDES.index(side)] if self._grip else 1.0
         lift = self._backend.lift_state()
         base = self._backend.base_state()
+        battery = self._backend.battery_state()
         with self._lock:
             driver = self._driver()
         cameras = self.cameras
@@ -663,6 +664,9 @@ class MarionetteSession(JogSession):
             if lift is None or lift.get("raised") is None
             else round(float(lift["raised"]), 3),
             "liftMoving": bool(lift and lift.get("moving")),
+            "battery": -1.0 if battery is None else round(float(battery["percent"])),
+            "batteryCharging": bool(battery and battery["charging"]),
+            "batteryUnderLoad": bool(battery and battery["underLoad"]),
             "hasBase": base is not None,
             "baseMoving": bool(base and base.get("moving")),
             "baseFault": bool(base and base.get("fault")),

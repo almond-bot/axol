@@ -1077,6 +1077,19 @@ class MarionetteSessionTest(unittest.TestCase):
         self.assertEqual(values["mode"], "sim")
         self.assertEqual(values["arm"], "left")
         self.assertTrue(values["hasLift"] and values["hasBase"])
+        # The simulated Jelly has no battery; the robot's reading is rounded.
+        self.assertEqual((values["battery"], values["batteryCharging"]), (-1.0, False))
+        self.backend.battery_state = lambda: {  # type: ignore[method-assign]
+            "percent": 62.6,
+            "charging": False,
+            "underLoad": True,
+        }
+        phones = self.session._tracker.snapshot()
+        values = self.session._feedback(phones["phone-1"], phones, time.monotonic())
+        self.assertEqual(
+            (values["battery"], values["batteryCharging"], values["batteryUnderLoad"]),
+            (63, False, True),
+        )
         self.assertTrue(
             all(isinstance(v, (str, float, int, bool)) for v in values.values())
         )

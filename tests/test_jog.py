@@ -29,6 +29,7 @@ from almond_axol.jog.sim import (
     LiftSim,
     body_velocity,
 )
+from almond_axol.robot.battery import BatteryStatus
 from almond_axol.robot.jelly import JellyConfig
 
 DT = 0.02  # Jelly's 50 Hz command period
@@ -877,6 +878,10 @@ class _FakeJelly:
         self.lift_status = _FakeStatus()
         self.wheel_fault = False
         self.enabled = self.disabled = False
+        self.battery = BatteryStatus(
+            voltage=26.4, percent=62.34, charging=False, under_load=True
+        )
+        self.battery_age = 0.42
 
     async def enable(self) -> None:
         self.enabled = True
@@ -912,6 +917,19 @@ class HardwareBackendTest(unittest.TestCase):
             self.assertEqual(state["lift"]["raised"], 0.5)
             self.assertLess(state["lift"]["velocity"], 0.0)
             self.assertTrue(state["base"]["estimated"])
+            self.assertEqual(
+                state["battery"],
+                {
+                    "voltage": 26.4,
+                    "percent": 62.3,
+                    "charging": False,
+                    "underLoad": True,
+                    "ageSeconds": 0.4,
+                    "live": True,
+                },
+            )
+            jelly.battery = None  # no pack, or the board went quiet
+            self.assertIsNone(session.state()["battery"])
             time.sleep(HOLD_TIMEOUT_S + 0.1)
             count = len(jelly.commands)
             time.sleep(0.1)
