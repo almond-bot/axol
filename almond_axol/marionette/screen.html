@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="marionette-orientation" content="portrait">
+<title>Axol</title>
+<!--
+  Axol's phone screen. Axol sends it to the gateway when it connects (almond_axol/marionette/session.py), the gateway
+  sends it to every phone, and the Marionette app shows it full screen; the gateway also serves it at /screen for a
+  desktop browser. The block below declares the controls and cameras Axol reads (almond_axol/marionette/phones.py).
+  Axol answers with robot state (MarionetteSession.screen_state for every phone, screen_phone_state for this one),
+  notices shown as toasts, and WebRTC video of the streams below. Built on Marionette's screen kit
+  (docs/SCREEN-KIT.md in the Marionette repository): holds, drags, Stop, the strip, cameras and calibration.
+-->
+<script type="application/json" id="marionette-config">
+{
+  "controls": [
+    { "id": "deadman", "type": "button", "label": "Hold to move", "action": "teleop.deadman", "tone": "accent", "hold": true },
+    { "id": "estop", "type": "toggle", "label": "Stop", "action": "safety.estop", "value": false },
+    { "id": "arm", "type": "select", "label": "Arm", "action": "arm.select", "value": "left", "options": [{ "label": "Left arm", "value": "left" }, { "label": "Right arm", "value": "right" }] },
+    { "id": "cameras", "type": "select", "label": "Cameras", "action": "camera.view", "value": "head", "options": [{ "label": "Head", "value": "head" }, { "label": "Both wrists", "value": "wrists" }, { "label": "Left wrist", "value": "left" }, { "label": "Right wrist", "value": "right" }, { "label": "All three", "value": "all" }] },
+    { "id": "frame", "type": "select", "label": "Frame", "action": "teleop.frame", "value": "axol", "options": [{ "label": "Axol", "value": "axol" }, { "label": "Head", "value": "head" }, { "label": "Left wrist", "value": "left" }, { "label": "Right wrist", "value": "right" }] },
+    { "id": "scale", "type": "slider", "label": "Motion scale", "action": "teleop.translationScale", "value": 1, "min": 0.25, "max": 3, "step": 0.05, "unit": "×" },
+    { "id": "grip", "type": "slider", "label": "Gripper", "action": "gripper.set", "value": 0, "min": 0, "max": 1, "step": 0.01 },
+    { "id": "drive", "type": "joystick", "label": "Drive", "action": "base.drive", "value": { "x": 0, "y": 0 } },
+    { "id": "turn-left", "type": "button", "label": "Turn left", "action": "base.turnLeft", "hold": true },
+    { "id": "turn-right", "type": "button", "label": "Turn right", "action": "base.turnRight", "hold": true },
+    { "id": "lift-up", "type": "button", "label": "Raise lift", "action": "lift.up", "hold": true },
+    { "id": "lift-down", "type": "button", "label": "Lower lift", "action": "lift.down", "hold": true },
+    { "id": "speed-limit", "type": "slider", "label": "Speed limit", "action": "base.speedLimit", "value": 50, "min": 0, "max": 100, "step": 1, "unit": "%" },
+    { "id": "reset-left", "type": "button", "label": "Reset left arm", "action": "arm.resetLeft" },
+    { "id": "reset-right", "type": "button", "label": "Reset right arm", "action": "arm.resetRight" },
+    { "id": "calibration-start", "type": "button", "label": "Start calibration", "action": "calibration.start", "tone": "accent" },
+    { "id": "calibration", "type": "button", "label": "Capture calibration step", "action": "calibration.capture", "tone": "accent" },
+    { "id": "capture-origin", "type": "button", "label": "Set origin here", "action": "calibration.captureOrigin", "tone": "accent" },
+    { "id": "calibration-cancel", "type": "button", "label": "Cancel calibration", "action": "calibration.cancel" },
+    { "id": "reset-origin", "type": "button", "label": "Reset calibration", "action": "calibration.reset" },
+    { "id": "calibration-check", "type": "button", "label": "Validate calibration", "action": "calibration.check" }
+  ],
+  "cameraStreams": [
+    { "id": "head", "label": "Head", "url": "axol://head", "status": "live" },
+    { "id": "left", "label": "Left wrist", "url": "axol://left", "status": "live" },
+    { "id": "right", "label": "Right wrist", "url": "axol://right", "status": "live" }
+  ],
+  "cameraViews": [
+    { "id": "head", "label": "Head", "streams": ["head"] },
+    { "id": "wrists", "label": "Both wrists", "streams": ["left", "right"] },
+    { "id": "left", "label": "Left wrist", "streams": ["left"] },
+    { "id": "right", "label": "Right wrist", "streams": ["right"] },
+    { "id": "all", "label": "All three", "streams": ["head", "left", "right"] }
+  ]
+}
+</script>
+<link rel="stylesheet" href="marionette-kit.css">
+<script src="marionette-kit.js"></script>
+<style>
+/* One screen, no modes: everything an operator touches is visible at once on a portrait phone. Sizes are tuned so a
+   390 × 844 iPhone needs no scrolling; the kit's parts are sized down to match. */
+:root{--mk-stop-right:12px;--mk-toast-bottom:calc(360px + var(--bottom))}
+.app{min-height:100vh;min-height:100dvh;display:flex;flex-direction:column;padding-top:var(--top);padding-bottom:var(--bottom)}
+
+/* Status strip: who this is, its tracking and link, More, and the floating Stop. While Stop is on, the banner takes the chips' place. */
+.strip{flex-wrap:nowrap;gap:5px;min-height:70px;padding:0 82px 0 12px}
+.strip .mk-chip{height:30px;gap:6px;padding:0 9px;border-radius:15px;font-size:13px}
+.strip .mk-me .mk-dot{width:10px;height:10px}
+.strip.stopped .mk-chip{display:none}
+.more{flex:none;margin-left:auto;height:44px;border-radius:22px;padding:0 12px;background:#fff;border:1px solid var(--rule);color:var(--blue);font-weight:500;font-size:14px;white-space:nowrap}
+.mk-stop{top:calc(var(--top) + 6px);width:58px;height:58px;font-size:15px}
+.strip .mk-banner{flex:1 1 auto;min-width:0;margin:0;gap:8px;padding:2px 2px 2px 12px}
+.strip .mk-banner b{font-size:15px;white-space:nowrap}
+.strip .mk-banner button{padding:0 10px;border-radius:9px;font-size:15px;white-space:nowrap}
+
+/* Segmented controls: the arm, the camera view and the frame. */
+.mk-seg button{min-width:0;min-height:44px;padding:0 6px}
+.col .mk-seg button{font-size:14px;padding:0 4px}
+
+/* Headline and robot state: one line of state, a note of up to two lines, then the tags. Fixed height, so nothing below moves. */
+.pad-x{padding:0 12px}
+.state{font-size:20px;line-height:24px;font-weight:600;letter-spacing:-.01em;margin:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.state.moving{color:var(--blue)}.state.stopped{color:var(--red)}
+.note{font-family:var(--hand);color:var(--blue);font-size:15px;line-height:18px;height:36px;margin:1px 0 0 1px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.note.bad{color:var(--red)}
+.robot{display:flex;flex-wrap:nowrap;gap:6px;margin-top:4px;height:22px;overflow:hidden}
+.tag{flex:none;display:inline-flex;align-items:center;height:22px;padding:0 8px;border-radius:11px;border:1px solid var(--rule);background:#fff;font-size:12px;white-space:nowrap}
+.tag.sim{background:var(--hi);border-color:#d8c64e;font-weight:600}
+.tag.moving{border-color:var(--blue);color:var(--blue)}
+.tag.bad{border-color:var(--red);color:var(--red);font-weight:600}
+.tag.warn{border-color:var(--amber);color:#7d6400}
+.tag.ok{color:var(--green)}
+
+/* Cameras: three streams put the head large on the left and the wrists stacked beside it. */
+.cam{margin:6px 0 0}
+.cam[data-panes="3"]:not([aria-expanded=true]){grid-template-columns:minmax(0,2fr) minmax(0,1fr);grid-template-rows:auto auto}
+.cam[data-panes="3"]:not([aria-expanded=true]) .mk-pane:first-child{grid-row:1 / span 2;aspect-ratio:auto}
+.cam .mk-empty{padding:0 10px;font-size:14px;line-height:1.25}
+.cam[role=button]:not([aria-expanded=true]) .mk-empty{font-size:12px}
+.cam[role=button]:not([aria-expanded=true]) .mk-pane figcaption{left:5px;bottom:5px;font-size:11px}
+/* The camera view picker sits right under the panes, compact; labels may wrap to two lines. Then the frame. */
+.views{margin-top:6px}
+.views button,.frames button{min-height:36px;height:36px;padding:0 3px;font-size:12px;line-height:1.1}
+.frame-row{display:flex;align-items:center;gap:8px;margin-top:6px}
+.frame-row>span{flex:none;font-size:13px;color:var(--ink2)}
+.frame-row .mk-seg{flex:1;min-width:0}
+
+/* The More sheet's rows. */
+.rows{margin-top:6px}
+.row-note{margin:6px 0 0;font-size:14px;color:var(--ink2)}
+
+/* Controls: the arm on the left thumb, the base on the right, filling the rest of the screen. The pad and the stick
+   take whatever height is left; everything else is a fixed 44 px row. */
+.controls{flex:1 0 auto;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;padding:8px 12px}
+.col{display:flex;flex-direction:column;gap:8px;min-width:0}
+.pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px}
+.key{height:44px;min-width:0;border-radius:12px;border:1.5px solid var(--ink);background:#fff;font-weight:500;font-size:13px;line-height:1.15;display:flex;align-items:center;justify-content:center;gap:4px;padding:0 4px;text-align:center}
+.key:active:not(:disabled){background:var(--paper2)}
+.key:disabled{border-color:var(--rule);color:var(--ink2);background:var(--paper2)}
+/* Turn and lift holds: the arrow over the label. They show what the gateway knows: filled once it reports the hold,
+   red if it let go while still pressed. */
+.hold-key{touch-action:none;flex-direction:column;gap:1px}
+.hold-key b{font-weight:400;font-size:12px;line-height:12px}
+.key[data-state=pending]{background:var(--paper2)}
+.key[data-state=held]{background:var(--ink);color:var(--paper)}
+.key[data-state=dropped]{border-color:var(--red);color:var(--red)}
+/* A slider: its label and value on one line, the slider under them. Blue once the gateway hears a drag, red if it stopped. */
+.setting{display:grid;grid-template-columns:minmax(0,1fr) auto;grid-template-rows:16px 28px;row-gap:2px;align-items:center;column-gap:6px;font-size:13px}
+.setting span{color:var(--ink2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.setting output{grid-column:2;grid-row:1;text-align:right;font-weight:500}
+.setting input{grid-column:1/-1;grid-row:2;height:28px}
+.setting output[data-state=live]{color:var(--blue)}.setting output[data-state=dropped]{color:var(--red)}
+/* Motion scale is off while the hold-to-move pad is held. */
+.setting.locked{opacity:.4}
+
+/* The hold-to-move pad, with the grip gauge on its right: a vertical slide while held moves the grip. */
+.pad{flex:1 1 0;min-height:150px;display:flex;align-items:stretch;border-radius:20px;border:2.5px solid var(--blue);background:#fff;color:var(--blue);touch-action:none;padding:0;text-align:center;overflow:hidden}
+.pad-text{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:0 6px;font-weight:600;font-size:17px;line-height:1.15}
+.pad-text small{font-weight:400;font-size:12px;line-height:1.25;color:var(--ink2)}
+.pad[data-state=pending]{background:var(--blue-wash)}
+.pad[data-state=held]{background:var(--blue);color:#fff}
+.pad[data-state=held] .pad-text small,.pad[data-state=held] .gauge small{color:#dfe6f7}
+.pad[data-state=dropped]{border-color:var(--red);color:var(--red);background:#fff}
+.gauge{flex:none;width:44px;display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 0 8px;border-left:1.5px solid var(--blue-wash)}
+.pad[data-state=held] .gauge{border-left-color:rgba(255,255,255,.3)}
+.gauge small{font-size:11px;font-weight:400;color:var(--ink2);line-height:1}
+.gauge b{font-size:13px;font-weight:600;line-height:1}
+.gauge-bar{position:relative;flex:1;width:14px;border-radius:7px;background:var(--paper2);border:1px solid var(--rule);overflow:hidden}
+.gauge-bar i{position:absolute;left:0;right:0;top:0;height:0;background:var(--blue)}
+.pad[data-state=held] .gauge-bar{background:rgba(255,255,255,.2);border-color:rgba(255,255,255,.45)}
+.pad[data-state=held] .gauge-bar i{background:#fff}
+.gauge.off{opacity:.45}
+
+/* Drive: the kit's spring-return stick, as large a circle as its cell allows, nearest the thumb. Off without a base. */
+.stick-cell{flex:1 1 0;min-height:150px;container-type:size;display:grid;place-items:end center}
+.stick-cell .mk-stick{width:min(100cqw,100cqh)}
+.mk-edge{font-size:11px}
+.off-note{display:none;position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;font-size:14px;color:var(--ink2)}
+.mk-stick[aria-disabled=true]{border-color:var(--rule);background:var(--paper2);cursor:default}
+.mk-stick[aria-disabled=true] svg,.mk-stick[aria-disabled=true] .mk-edge,.mk-stick[aria-disabled=true] .mk-knob{display:none}
+.mk-stick[aria-disabled=true] .off-note{display:block}
+
+/* Desktop preview: a phone-width column. */
+@media (min-width:600px){
+  :root{--mk-stop-right:calc(50% - 215px + 12px)}
+  html,body{background:#e9ebe6}
+  .app{max-width:430px;margin:0 auto;box-shadow:0 0 0 1px var(--rule);background-color:var(--paper);background-image:var(--paper-grid);background-size:24px 24px}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <header class="strip" id="strip">
+    <div id="estop-banner" hidden><b>Stop is on</b><button type="button" data-stop-reset>Reset Stop</button></div>
+    <button type="button" class="more" id="more" aria-label="More: calibration, arm resets and the gateway">More</button>
+  </header>
+  <section class="pad-x">
+    <h1 class="state" id="state">Connecting…</h1>
+    <p class="note" id="state-note"></p>
+    <div class="robot" id="robot"></div>
+    <figure class="cam" id="cam" hidden></figure>
+    <div class="views" id="views" aria-label="Cameras"></div>
+    <div class="frame-row"><span id="frame-label">Frame</span><div class="frames" id="frames" aria-labelledby="frame-label"></div></div>
+  </section>
+  <section class="controls" id="controls">
+    <div class="col" aria-label="Arm">
+      <div id="arms" aria-label="Arm"></div>
+      <button type="button" class="pad" id="pad" aria-label="Hold to move. Slide down to close the gripper, up to open it.">
+        <span class="pad-text"><span id="pad-label">Hold to move</span><small id="pad-sub"></small></span>
+        <span class="gauge" id="gauge" aria-hidden="true"><small>Open</small><span class="gauge-bar"><i id="gauge-fill"></i></span><small>Closed</small><b id="grip-val"></b></span>
+      </button>
+      <div class="pair"><button type="button" class="key" id="grip-open">Open gripper</button><button type="button" class="key" id="grip-close">Close gripper</button></div>
+      <div class="setting" id="scale-setting"><span>Motion scale</span><output id="scale-out"></output></div>
+    </div>
+    <div class="col" aria-label="Drive">
+      <div class="stick-cell" id="stick-cell"></div>
+      <div class="pair" id="turn-row">
+        <button type="button" class="key hold-key" id="turn-left"><b aria-hidden="true">↺</b><span>Turn left</span></button>
+        <button type="button" class="key hold-key" id="turn-right"><b aria-hidden="true">↻</b><span>Turn right</span></button>
+      </div>
+      <div class="pair" id="lift-row">
+        <button type="button" class="key hold-key" id="lift-up"><b aria-hidden="true">▲</b><span>Raise lift</span></button>
+        <button type="button" class="key hold-key" id="lift-down"><b aria-hidden="true">▼</b><span>Lower lift</span></button>
+      </div>
+      <div class="setting" id="speed-setting"><span>Speed limit</span><output id="speed-out"></output></div>
+    </div>
+  </section>
+</div>
+<script>
+(() => {
+  const K = window.MarionetteKit, $ = id => document.getElementById(id), h = K.h, setText = K.setText;
+  // Every control is found by its action, as Axol reads them. The grip slider (0 open, 1 closed) is driven by the pad
+  // slide and the Open and Close buttons; the stick, turn and lift holds and the speed limit are the base's controls.
+  const A = {
+    deadman: 'teleop.deadman', arm: 'arm.select', view: 'camera.view', frame: 'teleop.frame', scale: 'teleop.translationScale', grip: 'gripper.set',
+    drive: 'base.drive', turnLeft: 'base.turnLeft', turnRight: 'base.turnRight', liftUp: 'lift.up', liftDown: 'lift.down', speedLimit: 'base.speedLimit',
+    resetLeft: 'arm.resetLeft', resetRight: 'arm.resetRight',
+  };
+  const DRIVE_HOLDS = [A.turnLeft, A.turnRight, A.liftUp, A.liftDown];
+  const PLACED = new Set([...Object.values(A), ...Object.values(K.ACTIONS)]);
+  // Grip slide: 133 px is the full range, short enough to finish low on the pad, and a few pixels of thumb wobble move
+  // nothing. After this phone sets the grip, Axol's state that predates it is not adopted for a moment.
+  const GRIP_FULL_PX = 133, GRIP_SLOP_PX = 6, GRIP_SETTLE_MS = 250;
+  const REASON_NOTES = { excessiveMotion: 'Move a little slower.', insufficientFeatures: 'Point the camera at something with texture.', interrupted: 'Tracking was interrupted.', relocalizing: 'Hold still for a moment.', initializing: 'Move the phone gently to start.', synthetic: 'Simulated motion, not a real pose.' };
+  const cap = word => (word ? word[0].toUpperCase() + word.slice(1) : '');
+
+  /* ---------- Axol's state ---------- */
+  // Axol sends its state for every phone and for this one 5 times a second; the kit says when it goes stale or offline.
+  let axol;
+  const fresh = () => (axol && !axol.offline && !axol.stale ? axol.values : undefined);
+  // What Axol last said, even if it has gone quiet: whether it has a base and a lift doesn't change.
+  const known = () => (axol ? axol.values : {});
+  const myName = () => { const c = K.config(); return c && c.phone ? c.phone.name : ''; };
+  // Another phone has this phone's arm: Axol ignores this phone's grip, so the grip controls are off.
+  const otherOwner = () => { const f = fresh(); return f && typeof f.owner === 'string' && f.owner && f.owner !== myName() ? f.owner : ''; };
+  const otherDriver = f => (f && typeof f.driver === 'string' && f.driver !== myName() ? f.driver : '');
+  function armSide() { const f = fresh(); if (f && (f.arm === 'left' || f.arm === 'right')) return f.arm; const c = K.control(A.arm); return c ? c.value : ''; }
+  const armText = () => (armSide() ? armSide() + ' arm' : 'arm');
+
+  /* ---------- Status strip, Stop, More, toasts ---------- */
+  K.strip($('strip'));
+  // Stop lets go of everything when it turns on (the kit does that); its banner takes the chips' place.
+  const stop = K.stop({ banner: $('estop-banner'), onChange: on => $('strip').classList.toggle('stopped', on) });
+  const toast = text => K.toast(text, { above: $('controls') });
+  $('more').addEventListener('click', openMore);
+
+  /* ---------- Calibration, in Axol's words ---------- */
+  const calibration = K.calibration({ copy: {
+    introTitle: 'Set which way is forward', startPosition: 'The phone’s start position',
+    introBody: 'Stand behind Axol, facing the way it faces. Then make four short moves with the phone: flat, forward, right and up. It takes about a minute.',
+    validate: 'Validate calibration', validateOptional: 'Validate calibration', reset: 'Reset calibration',
+    steps: { flat: { body: 'Hold the phone in your hand, roughly flat, screen up, top edge pointing the way Axol faces.' } },
+    moves: { right: { body: 'Back at the flat spot, move it straight to your right about 10 cm.' }, up: { body: 'Back at the flat spot, lift it straight up about 10 cm.' } },
+    notes: {
+      flatReady: 'Flat enough. Capture when ready.', flatter: 'Hold it flatter, screen up.', backFirst: 'Go back to the flat spot first.',
+      enough: 'That’s enough. Capture when steady.', minimum: '30 mm is enough to capture.', waiting: 'Waiting for tracking.',
+      limited: 'Tracking is limited. Hold the phone up so the camera sees the room.', startFlat: 'Start from the flat spot.',
+      moving: (direction, travel) => 'Moving ' + direction + ', ' + travel + ' mm.',
+      wrongWay: (direction, travel) => travel + ' mm ' + direction + ' of the flat spot. Go back to it first.',
+    },
+  } });
+  // A short calibration state for the tags, so "Not calibrated" is always in view.
+  function calibrationTag() {
+    const c = K.config(); const cal = c ? c.calibration : { status: 'uncalibrated' }; const check = cal.check;
+    if (cal.status === 'capturing') return ['Calibrating', 'warn'];
+    if (cal.status !== 'captured') return ['Not calibrated', 'warn'];
+    if (check && check.passed === false) return ['Validation failed', 'bad'];
+    return [check && check.passed === true ? 'Validated' : 'Calibrated', 'ok'];
+  }
+
+  /* ---------- Robot tags: calibration, Sim, the lift, Jelly's battery and the base ---------- */
+  function renderRobot() {
+    const f = fresh() || {}; const box = $('robot'); const tags = [];
+    if (calibration.available()) tags.push([...calibrationTag(), 'calibration']);
+    if (f.mode === 'sim') tags.push(['Sim', 'sim']);
+    const lift = f.lift, battery = f.battery, base = f.base;
+    if (lift) tags.push([typeof lift.raised === 'number' ? 'Lift ' + Math.round(K.clamp(lift.raised, 0, 1) * 100) + '%' : 'Lift unknown', lift.moving ? 'moving' : '']);
+    // Jelly's battery, as the control panel shows it: "~" marks a reading taken while the lift or wheels moved.
+    if (battery && typeof battery.percent === 'number') tags.push(battery.charging ? ['Battery charging', 'ok'] : ['Battery ' + (battery.underLoad ? '~' : '') + Math.round(battery.percent) + '%', battery.percent <= 10 ? 'bad' : battery.percent <= 25 ? 'warn' : '']);
+    if (base) tags.push(base.fault ? ['Base fault', 'bad'] : otherDriver(f) ? [f.driver + ' driving', 'moving'] : base.moving ? ['Base moving', 'moving'] : ['Base still', '']);
+    const key = JSON.stringify(tags); if (box.dataset.key === key) return; box.dataset.key = key;
+    box.replaceChildren(...tags.map(([text, tone, kind]) => kind === 'calibration'
+      ? h('button', { type: 'button', class: 'tag ' + tone, onclick: () => calibration.open('intro'), 'aria-label': text + '. Open calibration.' }, text)
+      : h('span', { class: 'tag ' + tone }, text)));
+  }
+
+  /* ---------- Headline ---------- */
+  // Most urgent first: no gateway, a Stop, no answer from Axol, a dropped touch, then the base while it is driven with
+  // the arm at rest, then the arm's state and what stands in its way.
+  function renderHeadline() {
+    const c = K.config(), t = K.latest('tracking'), conn = K.latest('connection'), f = fresh(), me = myName();
+    const pad = K.holdState(K.control(A.deadman));
+    const stickState = K.liveState(K.control(A.drive)); const holds = DRIVE_HOLDS.map(action => K.holdState(K.control(action)));
+    const turning = stickState !== 'idle' || holds.slice(0, 2).some(x => x !== 'idle'), lifting = holds.slice(2).some(x => x !== 'idle');
+    let title = 'Connecting…', tone = '', note = '', bad = false;
+    const say = (nextTitle, nextNote, problem, nextTone) => { title = nextTitle; note = nextNote || ''; bad = !!problem; tone = nextTone || ''; };
+    const rough = t && t.state !== 'normal' ? (REASON_NOTES[t.reason] || REASON_NOTES[t.state] || 'The pose may be rough until tracking recovers.') : '';
+    const noTracking = t && (t.message || t.state === 'unavailable');
+    if (conn && conn.state !== 'connected') say('Gateway lost', conn.state === 'reconnecting' ? 'Reconnecting…' : cap(conn.reason) || 'Reconnect to keep going.', true);
+    else if (!c) say('Connecting…');
+    else if (c.phone && c.phone.connected === false) say(c.phone.name + ' is offline', 'Showing its last state until it reconnects.', true);
+    else if (stop.isOn()) say('Stopped', 'Reset Stop when it’s safe. Axol holds still until every Stop is off.', true, 'stopped');
+    else if (f && (f.stopBy || f.state === 'stopped')) say(f.stopBy && f.stopBy !== me ? 'Stopped by ' + f.stopBy : 'Stopped', 'Axol holds still until every Stop is off.', true, 'stopped');
+    else if (!f) say('No answer from Axol', 'Start Marionette in the Axol control panel.', true);
+    else if (pad === 'dropped') say('Hold dropped', 'Let go of the pad and press again.', true);
+    else if (stickState === 'dropped' || holds.includes('dropped')) say('Drive dropped', 'The gateway stopped hearing it. Let go, then touch it again.', true);
+    else if (f.resetting === 'left' || f.resetting === 'right') say('Returning the ' + f.resetting + ' arm to rest', 'Press Stop to halt it.', false, 'moving');
+    // Driving with the arm at rest: the base's state. Otherwise the arm's.
+    else if ((turning || lifting) && pad === 'idle' && !f.engaged) {
+      const confirmed = stickState === 'live' || holds.includes('held');
+      if (f.base && f.base.fault) say('Base fault', 'Check Jelly, then try again.', true);
+      else if (otherDriver(f)) say(f.driver + ' is driving', 'Axol follows whoever pressed last.');
+      else say(turning ? 'Driving' : 'Moving the lift', confirmed ? 'Let go to stop.' : 'Waiting for the gateway.', false, 'moving');
+    }
+    else if (noTracking) say('No tracking', t.message || 'Hold the phone up so the camera sees the room.', true);
+    else if (otherOwner()) say(otherOwner() + ' has the ' + armText(), 'Choose the other arm, or ask ' + otherOwner() + ' to switch.', true);
+    else if (f.state === 'blocked') say('Can’t move the ' + armText(), f.reason || '', true);
+    else if (f.engaged && f.limited) say('At reach limit', 'Bring the phone back a little.', true, 'moving');
+    else if (f.engaged) say('Moving the ' + armText(), rough || (turning || lifting ? 'Driving too. Let go of the pad to stop the arm.' : 'Let go of the pad to stop.'), !!rough, 'moving');
+    else if (pad !== 'idle') say('Holding…', 'Waiting for Axol.');
+    else if (f.base && f.base.fault) say('Base fault', 'Check Jelly, then try again.', true);
+    else if (f.ready === false) say('Axol is starting', 'Wait a few seconds.');
+    else if (c.calibration.status === 'capturing') say('Calibrating', 'Finish or cancel calibration first.');
+    else if (rough) say(t.state === 'initializing' ? 'Starting up' : K.TRACKING_WORDS[t.state] || 'Tracking ' + t.state, rough);
+    else say(cap(armText()) + ' ready', f.base === null ? 'Hold the pad to move it.' : 'Hold the pad to move it. Drag the stick to drive.');
+    setText($('state'), title); $('state').className = 'state ' + tone;
+    setText($('state-note'), note); $('state-note').className = 'note' + (bad ? ' bad' : '');
+  }
+
+  /* ---------- Cameras, the view picker and the frame ---------- */
+  // Axol lists the cameras it has; a stream it doesn't have says so instead of waiting for ever.
+  const cams = K.cameras($('cam'), { empty: (id, label, state) => {
+    const f = fresh(); const noun = label.toLowerCase() + ' camera';
+    if (f && Array.isArray(f.streams) && f.streams.indexOf(id) < 0) return 'No ' + noun;
+    return state === 'unavailable' ? 'No video from the ' + noun + '. Trying again.' : 'Waiting for the ' + noun;
+  } });
+  K.segments($('views'), { action: A.view });
+  // The frame the arm moves in: forward is Axol's forward, or along the picked camera's view. Axol lists the frames it
+  // has, so a camera it doesn't mount can't be picked; a change applies at once, even mid-move.
+  const frames = K.segments($('frames'), { action: A.frame, disabled: value => { const f = fresh(); return !!f && Array.isArray(f.frames) && f.frames.indexOf(value) < 0; } });
+  K.segments($('arms'), { action: A.arm });
+
+  /* ---------- The arm: the hold-to-move pad, the grip and the motion scale ---------- */
+  // The grip this phone commands, 0 open to 1 closed. It follows Axol's grip except during a slide, so a slide, a
+  // reload or a newly owned arm always starts from where the gripper is and never jumps it. The slide streams the grip
+  // slider; Open and Close send a final value.
+  const grip = { value: 0, sentAt: 0 };
+  const gripDrag = K.drag({ action: A.grip, letGoOnLeave: false });
+  let slide, padHeld = false; // slide: { id, y, from, live } while a thumb is down on the pad
+  const roundGrip = v => Math.round(K.clamp(v, 0, 1) * 100) / 100;
+  const showGrip = v => { if (v !== grip.value) { grip.value = v; renderGrip(); } };
+  function endSlide(quiet) { slide = undefined; if (gripDrag.isOpen()) { gripDrag.end(grip.value, quiet === true); grip.sentAt = Date.now(); } }
+  K.letGoOnLeave(endSlide);
+  function slideGrip(v) { if (otherOwner()) { endSlide(); return; } showGrip(v); grip.sentAt = Date.now(); gripDrag.update(v); }
+  function setGrip(v) { if (otherOwner()) return; endSlide(); showGrip(v); grip.sentAt = Date.now(); K.send(K.control(A.grip), v); }
+  function adoptGrip(value) {
+    if (typeof value !== 'number' || !(value >= 0 && value <= 1)) return;
+    // Not during a slide, and not while this phone's own last grip may not have reached Axol yet.
+    if ((slide && slide.live) || gripDrag.isOpen() || Date.now() - grip.sentAt < GRIP_SETTLE_MS) return;
+    showGrip(roundGrip(value));
+  }
+  function renderGrip() { $('gauge-fill').style.height = Math.round(grip.value * 100) + '%'; setText($('grip-val'), Math.round(grip.value * 100) + '%'); }
+  function renderGripControls() {
+    const off = !!otherOwner(); if (off && (slide || gripDrag.isOpen())) endSlide();
+    $('grip-open').disabled = off; $('grip-close').disabled = off; $('gauge').classList.toggle('off', off);
+  }
+  $('grip-open').addEventListener('click', () => setGrip(0));
+  $('grip-close').addEventListener('click', () => setGrip(1));
+
+  // Every hold shows what the gateway knows: filled once it reports the hold, red if it let go while still pressed here.
+  const PAD_TEXT = { pending: ['Holding…', 'Waiting for the gateway'], held: ['Holding', 'Slide down to close, up to open'], dropped: ['Hold dropped', 'Let go and press again'] };
+  const pad = $('pad');
+  K.hold(pad, {
+    action: A.deadman,
+    onChange: on => { padHeld = on; if (!on) endSlide(); renderScaleLock(); renderHeadline(); },
+    onState: state => { const [label, sub] = PAD_TEXT[state] || ['Hold to move', 'Slide while holding to grip']; setText($('pad-label'), label); setText($('pad-sub'), sub); },
+  });
+  pad.addEventListener('pointerdown', e => { if (!slide) slide = { id: e.pointerId, y: e.clientY, from: grip.value, live: false }; });
+  pad.addEventListener('pointermove', e => {
+    if (!slide || e.pointerId !== slide.id || otherOwner()) return;
+    // A few pixels of wobble while the thumb rests on the pad move nothing. Past that the grip follows the slide from
+    // where it was when the slide began: down closes, up opens.
+    if (!slide.live) { if (Math.abs(e.clientY - slide.y) < GRIP_SLOP_PX) return; slide.live = true; slide.y = e.clientY; slide.from = grip.value; }
+    slideGrip(roundGrip(slide.from + (e.clientY - slide.y) / GRIP_FULL_PX));
+  });
+  for (const name of ['pointerup', 'pointercancel', 'lostpointercapture']) pad.addEventListener(name, e => { if (slide && e.pointerId === slide.id) endSlide(); });
+
+  // Each column ends with its slider, in reach of the thumb: motion scale for the arm, the speed limit for the base.
+  const scale = K.slider(null, { action: A.scale, out: $('scale-out') });
+  $('scale-setting').insertBefore(scale.el, $('scale-out'));
+  const speed = K.slider(null, { action: A.speedLimit, out: $('speed-out') });
+  $('speed-setting').insertBefore(speed.el, $('speed-out'));
+  // Changing the scale mid-move would rescale a motion in progress, so the slider is off while the pad is held.
+  function renderScaleLock() { if (padHeld) scale.finish(); scale.el.disabled = padHeld; $('scale-setting').classList.toggle('locked', padHeld); }
+
+  /* ---------- The base: the drive stick, turn and lift holds ---------- */
+  const drive = K.stick(null, { action: A.drive, label: 'Drive', edges: ['Forward', 'Back', 'Left', 'Right'] });
+  drive.el.append(h('span', { class: 'off-note' }, 'No Jelly base'));
+  $('stick-cell').append(drive.el);
+  for (const [id, action] of [['turn-left', A.turnLeft], ['turn-right', A.turnRight], ['lift-up', A.liftUp], ['lift-down', A.liftDown]]) K.hold($(id), { action });
+  // What Axol has: no Jelly base turns off the stick and turning, no lift turns off the lift buttons. They stay in place,
+  // so the columns never shift. Until Axol says, everything is on.
+  function renderDocks() {
+    const v = known(); const noBase = 'base' in v && v.base === null, noLift = 'lift' in v && v.lift === null;
+    drive.el.setAttribute('aria-disabled', String(noBase));
+    for (const id of ['turn-left', 'turn-right']) $(id).disabled = noBase;
+    for (const id of ['lift-up', 'lift-down']) $(id).disabled = noLift;
+    renderGripControls();
+  }
+
+  /* ---------- More: calibration, the arm resets, any other controls, the gateway ---------- */
+  let moreParts = K.group();
+  const more = K.sheet({ onHide: () => moreParts.dispose() });
+  function openMore() {
+    moreParts.dispose(); moreParts = K.group();
+    const rows = h('div', { class: 'rows' });
+    if (calibration.available()) rows.append(calibration.row({ group: moreParts }));
+    // A reset moves an arm on its own, so the sheet closes to show the headline (and Stop) while it runs.
+    const resets = [A.resetLeft, A.resetRight].map(K.control).filter(c => c && c.type === 'button');
+    if (resets.length) rows.append(h('div', { class: 'mk-row mk-stack' }, h('div', { class: 'pair' }, resets.map(c => h('button', { type: 'button', class: 'mk-btn', onclick: () => { K.send(c); more.hide(); } }, c.label))), h('p', { class: 'row-note' }, 'Moves the arm back to its rest pose.')));
+    const c = K.config();
+    for (const x of c ? c.controls.filter(x => !PLACED.has(x.action)) : []) rows.append(K.controlRow(x, { group: moreParts }));
+    const conn = K.latest('connection');
+    rows.append(h('div', { class: 'mk-row' }, h('span', { class: 'mk-mono' }, conn ? conn.gateway : ''), h('button', { type: 'button', class: 'mk-btn', onclick: () => window.Marionette.disconnect() }, 'Disconnect')));
+    more.show([K.sheetTop('Close', 'More', '', () => more.hide()), h('div', { class: 'mk-sheet-body' }, rows)]);
+  }
+
+  /* ---------- Wiring ---------- */
+  function renderAll() { renderHeadline(); renderRobot(); renderDocks(); cams.render(); frames.render(); }
+  K.robot('axol', robot => {
+    axol = robot;
+    const f = fresh(); if (f) adoptGrip(f.grip);
+    renderAll();
+  });
+  K.on('config', () => {
+    // Until Axol answers, the grip starts from this phone's own last value.
+    if (!fresh()) { const g = K.control(A.grip); if (g) adoptGrip(g.value); }
+    renderAll();
+  });
+  for (const type of ['connection', 'tracking', 'touch']) K.on(type, renderHeadline);
+  // Axol's notices and the gateway's replies show as toasts; the calibration sheet shows its own.
+  K.on('status', m => { if (!calibration.handles(m) && m.message && m.message !== 'Connected to Marionette gateway') toast(m.message); });
+  renderGrip(); renderAll();
+})();
+</script>
+</body>
+</html>
