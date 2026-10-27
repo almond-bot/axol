@@ -2852,6 +2852,35 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=501,
             )
 
+    @app.get("/api/datasets/episode-data", response_model=None)
+    async def get_dataset_episode_data(
+        repo_id: str, episode: int
+    ) -> dict[str, Any] | JSONResponse:
+        """One saved episode's state, actions, gripper poses and checks.
+
+        For the panel's dataset charts and 3D replay. Joint-space datasets get
+        their gripper poses from forward kinematics; see
+        ``recording.episode_data``.
+        """
+        from ..recording.dataset_browser import DatasetBrowseError
+        from ..recording.episode_data import read_episode_data
+
+        def _read() -> dict[str, Any]:
+            return {
+                "repoId": repo_id,
+                **read_episode_data(_dataset_root(repo_id), episode),
+            }
+
+        try:
+            return await asyncio.to_thread(_read)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse(
+                {"error": f"dataset preview needs the lerobot extra ({exc})"},
+                status_code=501,
+            )
+
     @app.get("/api/datasets/video", response_model=None)
     async def get_dataset_video(
         repo_id: str, episode: int, camera: str, fps: int = 0

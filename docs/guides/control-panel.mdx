@@ -12,7 +12,7 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | **Overview** | What is running, what to set up next, quick start and recent datasets. |
 | **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
-| **Datasets** | Watch recorded episodes and fix their task text. |
+| **Datasets** | Watch recorded episodes, check their robot data and fix their task text. |
 | **Request data** | Pay Almond to collect training data for your task. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
@@ -347,6 +347,17 @@ The menu next to the scrub bar sets the playback rate: **15 fps** (the default),
 **Rename a task.** Type the new task text, or pick one of the dataset's tasks, and press **Save task**. The change is written into the dataset, so replay and training see the new text.
 
 During a recording session, the page follows the dataset being recorded and selects each take once it is saved. You can review earlier takes and fix a mistyped task without stopping the session.
+
+### Check an episode's robot data
+
+Under the videos, **Robot data** shows what the episode recorded, so you can check a teleop or Mantis take before you train on it. Everything follows the scrub bar. Click a chart to move to that moment.
+
+- **Checks** at the top flag dropped frames and the largest jump between two frames. A jump of more than 5° in a joint or 3 cm at a gripper is marked. It is usually a re-engage, lost tracking or a glitch. Click it to go to that frame.
+- **3D view.** The robot model replays the recorded joints, and a line shows each gripper's path. A marker shows the gripper at the current frame, with its axes. Mantis episodes record gripper poses, not joints, so the arms stay still and the paths show the motion.
+- **Charts.** **Joints** shows each arm's joint angles in degrees. **Gripper pose** shows each gripper's position in cm and its rotation in degrees. For Mantis it also shows the lag between the cameras and the trackers. **Gripper opening** shows how far open each gripper is.
+- **Show commanded** adds what the robot was told to do, drawn see-through. A gap between the two lines is the arm lagging its command.
+
+Gripper poses are in the robot's frame, at the gripper mount. For a joint episode, the panel works them out from the recorded joints. The 3D view uses the Axol version set under **Axol settings → Robot**.
 
 ## Request data
 

@@ -976,6 +976,45 @@ export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpiso
   return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
 }
 
+/** One gripper mount's pose per frame, in the robot model's root frame:
+ *  metres and an axis-angle vector (radians). */
+export type EpisodePose = Record<"x" | "y" | "z" | "rx" | "ry" | "rz", (number | null)[]>
+
+/** One saved episode's robot data (see the host's recording/episode_data.py). */
+export interface EpisodeData {
+  repoId: string
+  episode: number
+  fps: number
+  frames: number
+  /** "cartesian" when the state records gripper poses (Mantis), else joints. */
+  space: "joint" | "cartesian"
+  /** Seconds from the episode's first frame. */
+  t: number[]
+  /** Measured values per feature name ("left_elbow.pos", "left_ee.x", ...). */
+  state: Record<string, (number | null)[]>
+  /** Commanded values per feature name. */
+  action: Record<string, (number | null)[]>
+  /** Measured gripper-mount poses: recorded, or from the joints. */
+  pose: Partial<Record<"left" | "right", EpisodePose>>
+  /** Commanded gripper-mount poses. */
+  actionPose: Partial<Record<"left" | "right", EpisodePose>>
+  /** Mantis datasets: camera-to-tracker skew per frame, in ms. */
+  poseLagMs: (number | null)[] | null
+  /** DAgger datasets: frames where the operator took over. */
+  intervention: boolean[] | null
+  checks: {
+    droppedFrames: number
+    longestGapS: number
+    jointJump: { name: string; deg: number; t: number } | null
+    poseJump: { side: "left" | "right"; m: number; t: number } | null
+  }
+}
+
+export async function fetchEpisodeData(repoId: string, episode: number): Promise<EpisodeData> {
+  const q = new URLSearchParams({ repo_id: repoId, episode: String(episode) })
+  return json(await fetch(apiUrl(`/api/datasets/episode-data?${q}`)))
+}
+
 /** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
  *  `dataset_browser.preview_step`; 1 = every frame). */
 export function previewStep(datasetFps: number, previewFps: number): number {

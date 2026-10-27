@@ -2154,7 +2154,7 @@ export default function ControlPanel() {
     operations: { title: "Operations" },
     datasets: {
       title: "Datasets",
-      description: "Watch recorded episodes and fix their task text.",
+      description: "Watch recorded episodes, check their robot data and fix their task text.",
     },
     "request-data": {
       title: "Request data",
@@ -2579,6 +2579,10 @@ export default function ControlPanel() {
               key={`datasets-${renderedConnectionGeneration}`}
               connected
               embedded
+              robot={{
+                model: settingsSnap?.robotModel,
+                gripper: parseGripper(settingsSnap?.values["axol.gripper"]),
+              }}
               liveDataset={policy?.dataset ?? null}
               episodesRecorded={policy?.episodesRecorded ?? null}
             />
