@@ -387,16 +387,31 @@ fn arm_can_timeout(sock: &CanSock, can_timeout_ms: f64) -> io::Result<()> {
     Ok(())
 }
 
-/// Enable `ids` into VELOCITY mode without replaying a stale target.
+/// Put torqued-off `ids` into MIT mode with their command state zeroed.
 ///
 /// A Damiao keeps its last command target across a fault or a torque-off and
-/// the enable alone can act on it; only a control-mode *switch* zeroes the
-/// command state. So: switch to MIT first (zero gains, torque-free), clear the
-/// fault, enable, then switch to VELOCITY — a second zeroing — so the first
-/// thing the wheel acts on is the next frame this loop sends.
-fn enable_for_velocity(sock: &CanSock, ids: &[u8]) -> io::Result<()> {
+/// the enable alone can act on it; only a control-mode *change* zeroes the
+/// command state, and writing the mode a wheel is already in is not one. A
+/// wheel disabled out of a park hold is still in MIT with that hold latched
+/// (after a runaway trip, the very target that ran away), so VELOCITY is
+/// written first to guarantee the MIT write is a change. Both are harmless
+/// while the wheels are torqued off.
+fn mit_zeroed(sock: &CanSock, ids: &[u8]) -> io::Result<()> {
+    set_mode_for(sock, ids, MODE_VELOCITY)?;
+    std::thread::sleep(ENABLE_STEP_SETTLE);
     set_mode_for(sock, ids, MODE_MIT)?;
     std::thread::sleep(ENABLE_STEP_SETTLE);
+    Ok(())
+}
+
+/// Enable `ids` into VELOCITY mode without replaying a stale target.
+///
+/// MIT first with the command state zeroed (`mit_zeroed`; zero gains,
+/// torque-free), clear the fault, enable, then switch to VELOCITY — a second
+/// zeroing — so the first thing the wheel acts on is the next frame this loop
+/// sends.
+fn enable_for_velocity(sock: &CanSock, ids: &[u8]) -> io::Result<()> {
+    mit_zeroed(sock, ids)?;
     for &id in ids {
         sock.send(id as u16, &proto::DM_CLEAR_ERRORS)?;
     }
@@ -617,8 +632,9 @@ enum Hold {
 ///
 /// With `reenable` the wheels are expected to be torqued off (their CAN
 /// timeout tripped after the source went away): they are polled for fresh
-/// state, the mode is switched to MIT *first* — a mode switch zeroes the
-/// motor's command state, and MIT with zero gains is torque-free — and only
+/// state, the mode is switched to MIT *first* (`mit_zeroed`: a mode change
+/// zeroes the motor's command state, and MIT with zero gains is torque-free)
+/// and only
 /// then cleared and re-enabled, so no velocity target can be replayed by the
 /// enable. The hold frames that follow are the only thing they then act on.
 /// The re-enable is then confirmed by a fresh poll: every wheel must report
@@ -666,9 +682,10 @@ fn park(
         }
         *brake_noted = true;
     }
-    set_mode(sock, MODE_MIT)?;
     if reenable {
-        std::thread::sleep(ENABLE_STEP_SETTLE);
+        // Torqued off out of a lapsed hold the wheels may still be in MIT
+        // with that hold latched; force a real mode change before enabling.
+        mit_zeroed(sock, &IDS)?;
         for id in IDS {
             sock.send(id as u16, &proto::DM_CLEAR_ERRORS)?;
         }
@@ -693,6 +710,10 @@ fn park(
                 faults.join(", ")
             )));
         }
+    } else {
+        // Enabled wheels driving in VELOCITY: switching to MIT is a change,
+        // so it zeroes the velocity target before the first hold frame.
+        set_mode(sock, MODE_MIT)?;
     }
     Ok(Some(match brake_reason {
         None => Hold::Position(wheels.pos),
@@ -1721,5 +1742,77 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         motors.join().unwrap();
+    }
+
+    /// A wheel torqued off out of a park hold is still in MIT with that hold
+    /// latched (after a runaway trip, the target that ran away). Writing MIT
+    /// again is not a mode change, so it would not zero that target and the
+    /// enable would replay it. Every re-enable must write VELOCITY then MIT.
+    #[test]
+    fn reenable_forces_a_mode_change_before_enabling() {
+        let _vcan = VCAN.lock().unwrap_or_else(|e| e.into_inner());
+        let iface = "vcan0";
+        let Ok(sock) = CanSock::open(iface) else {
+            eprintln!("skipping: no {iface} interface");
+            return;
+        };
+        let spy = CanSock::open(iface).unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let motors = std::thread::spawn({
+            let ready = Arc::clone(&ready);
+            let stop = Arc::clone(&stop);
+            let iface = iface.to_owned();
+            move || fake_wheels(&iface, 0.0, ready, stop)
+        });
+        while !ready.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let mut wheels = Wheels {
+            ranges: [RANGES; 4],
+            pos: [0.0; 4],
+            vel: [0.0; 4],
+            status: [STATUS_LOST_COMM; 4],
+            answered: [false; 4],
+        };
+        let mut brake_noted = false;
+        park(
+            &sock,
+            iface,
+            &test_config(),
+            &mut wheels,
+            &mut brake_noted,
+            true,
+        )
+        .unwrap()
+        .expect("stationary wheels park");
+        enable_for_velocity(&sock, &IDS).unwrap();
+        stop.store(true, Ordering::Relaxed);
+        motors.join().unwrap();
+
+        // Per wheel: the modes written since the last enable, checked at each
+        // enable (one from park, one from enable_for_velocity).
+        let mut modes: [Vec<u32>; 4] = Default::default();
+        let mut enables = [0; 4];
+        while let Some(f) = spy.recv_timeout(Duration::from_millis(20)).unwrap() {
+            if f.id == proto::DM_REG_ARB as u32
+                && f.data[2] == DM_REG_WRITE
+                && f.data[3] == proto::DM_REG_CTRL_MODE
+            {
+                let mode = u32::from_le_bytes(f.data[4..].try_into().unwrap());
+                modes[f.data[0] as usize - 1].push(mode);
+            } else if (1..=4).contains(&f.id) && f.data == proto::DM_ENABLE {
+                let i = f.id as usize - 1;
+                assert!(
+                    modes[i].ends_with(&[MODE_VELOCITY, MODE_MIT]),
+                    "wheel {} enabled after modes {:?}",
+                    i + 1,
+                    modes[i]
+                );
+                modes[i].clear();
+                enables[i] += 1;
+            }
+        }
+        assert_eq!(enables, [2; 4]);
     }
 }
