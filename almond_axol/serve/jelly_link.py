@@ -11,9 +11,9 @@ wheels) — and this module gives each of them the same treatment:
 - **wheels**: open the wheel bus and ping the four motors once a second
   (status, temperature, bus voltage). Never enables or commands a motor.
 - **lift**: open the lift's bus and poll the jelly_legs board's status
-  (homed, height, moving, stall/driver faults) and power telemetry (the 24 V
-  rail, i.e. Jelly's battery — see :mod:`almond_axol.robot.battery`) once a
-  second. Never sends a motion opcode — only ``SET_RATE 0`` (quiet the
+  (homed, height, moving, stall/driver faults) once a second and its power
+  telemetry (the 24 V rail, i.e. Jelly's battery — see
+  :mod:`almond_axol.robot.battery`) every 20 seconds. Never sends a motion opcode — only ``SET_RATE 0`` (quiet the
   board's broadcast), ``GET_STATUS`` and ``GET_POWER``. The last battery
   estimate outlives a hand-over to a task, reported with its age, since the
   pack drains over hours and "as of a few minutes ago" beats nothing.
@@ -51,6 +51,8 @@ from ..robot.lift import (
     _OP_GET_POWER,
     _OP_GET_STATUS,
     _OP_SET_RATE,
+    _POWER_FRESH_S,
+    _POWER_POLL_S,
     LiftStatus,
     decode_power,
     decode_status,
@@ -77,8 +79,6 @@ _PING_TIMEOUT_S = 0.5
 # A lift status frame older than this (with GET_STATUS polled every second)
 # means the board stopped answering: unpowered, unplugged, or not on this bus.
 _LIFT_FRESH_S = 3.0
-# Same for the power frame (GET_POWER polled every second).
-_POWER_FRESH_S = 3.0
 
 # Damiao feedback (MST) ID = 0x10 + motor ID, the factory convention Jelly's
 # wheels follow (see ``almond_axol.motor.motor.make_driver``).
@@ -258,10 +258,15 @@ class _LiftDevice:
         self._bus = None
 
     async def ping(self) -> None:
-        """Solicit one status and one power frame; never raises."""
+        """Solicit one status frame, and a power frame once the last
+        battery reading is :data:`_POWER_POLL_S` old; never raises."""
         if self._bus is None:
             return
-        for op in (_OP_GET_STATUS, _OP_GET_POWER):
+        ops = [_OP_GET_STATUS]
+        last = self.last_power_monotonic
+        if last is None or time.monotonic() - last >= _POWER_POLL_S:
+            ops.append(_OP_GET_POWER)
+        for op in ops:
             try:
                 await asyncio.wait_for(
                     self._bus._send(_ID_CMD, bytes([op])),

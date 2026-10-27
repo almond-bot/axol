@@ -82,8 +82,9 @@ CHARGING_CLEAR_VOLTS = 27.05
 # disconnected or switched off, not empty.
 PACK_ABSENT_VOLTS = 6.0
 
-# Smoothing weight per resting sample. At the 1 Hz poll this is a ~5 s time
-# constant: enough to hide ADC noise, short enough that a real change shows.
+# Smoothing weight per resting sample: about the last five readings (under
+# two minutes at the 20 s poll). Enough to hide ADC noise, short enough that
+# a real change shows.
 _SMOOTHING = 0.2
 
 

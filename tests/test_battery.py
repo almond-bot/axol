@@ -244,17 +244,17 @@ class LiftPowerTest(unittest.IsolatedAsyncioTestCase):
         assert battery is not None
         self.assertAlmostEqual(battery.voltage, 26.2)
 
-    async def test_polling_run_asks_for_power_once_a_second(self) -> None:
-        lift = Lift("can-test")
+    async def _power_polls(self, lift: Lift, seconds: float) -> int:
+        """GET_POWER requests a polling run sends in ``seconds``."""
         lift._send = AsyncMock()  # type: ignore[method-assign]
         clock = [100.0]
         loop = asyncio.get_running_loop()
         ticks = [0]
 
-        async def sleep(seconds: float) -> None:
-            clock[0] += seconds
+        async def sleep(step: float) -> None:
+            clock[0] += step
             ticks[0] += 1
-            if ticks[0] >= 50:  # 2.5 s of 50 ms ticks
+            if ticks[0] >= round(seconds / 0.05):  # 50 ms ticks
                 raise asyncio.CancelledError
 
         with (
@@ -263,13 +263,25 @@ class LiftPowerTest(unittest.IsolatedAsyncioTestCase):
             self.assertRaises(asyncio.CancelledError),
         ):
             await lift._run()
-
-        power_polls = [
-            c
+        return sum(
+            1
             for c in lift._send.await_args_list
             if c.args[0] == lift_module._OP_GET_POWER
-        ]
-        self.assertEqual(len(power_polls), 2)
+        )
+
+    async def test_polling_run_asks_for_power_once_a_second_until_answered(
+        self,
+    ) -> None:
+        self.assertEqual(await self._power_polls(Lift("can-test"), 2.5), 2)
+
+    async def test_a_recent_reading_waits_for_the_poll_period(self) -> None:
+        lift = Lift("can-test")
+        lift._on_message(SimpleNamespace(arbitration_id=0x422, data=_power_frame()))
+        self.assertEqual(await self._power_polls(lift, 2.5), 0)
+        lift._last_power_monotonic = (
+            lift_module.time.monotonic() - lift_module._POWER_POLL_S
+        )
+        self.assertEqual(await self._power_polls(lift, 1.5), 1)
 
     async def test_broadcast_mode_never_polls_power(self) -> None:
         lift = Lift("can-test", status_period_ms=200)

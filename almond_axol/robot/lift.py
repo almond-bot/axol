@@ -45,9 +45,9 @@ README is the spec):
 - ``GET_POWER`` (opcode 0x08) answers one power frame on **0x422**: the 24 V
   rail (VM) in mV, each leg's motor current in mA, and the same driver
   health bytes as status. In polling mode the driver asks for one every
-  second; the rail is Jelly's battery voltage (see
-  :mod:`almond_axol.robot.battery`). Older firmware ignores the opcode, so
-  :attr:`Lift.power` simply stays ``None``.
+  20 seconds, and once a second until the board answers; the rail is
+  Jelly's battery voltage (see :mod:`almond_axol.robot.battery`). Older
+  firmware ignores the opcode, so :attr:`Lift.power` simply stays ``None``.
 
 A leg stalling mid-move sets the ``stall fault`` status flag and aborts the
 move. Any new motion command clears the fault and retries, so a host must
@@ -128,11 +128,15 @@ JOG_SPEED = 650
 _JOG_RESEND_S = 0.05
 # Status poll cadence (broadcast is off — see the module docstring).
 _STATUS_POLL_S = 0.2
-# Power telemetry poll cadence (polling mode only). The pack voltage moves
-# over minutes; this is plenty and adds one frame a second to the bus.
-_POWER_POLL_S = 1.0
-# A power frame older than this no longer describes the battery.
-_POWER_FRESH_S = 5.0
+# Power telemetry cadence (polling mode only): a new reading once the last
+# is this old. The pack voltage moves over minutes, so this keeps the bus
+# nearly quiet.
+_POWER_POLL_S = 20.0
+# Until the board answers (at start, or after a lost reply), ask this often.
+_POWER_RETRY_S = 1.0
+# A power frame older than this no longer describes the battery: a poll
+# period plus ten unanswered retries.
+_POWER_FRESH_S = _POWER_POLL_S + 10.0
 # A leg drawing more than this is moving (idle reads ~25 mA of ADC offset).
 _LEG_LOAD_A = 0.3
 # Retry receive-only mode after this many missing broadcast intervals.
@@ -803,7 +807,7 @@ class Lift:
         next_poll = 0.0
         started = asyncio.get_running_loop().time()
         # First power request a beat after the first status poll.
-        next_power = started + _POWER_POLL_S
+        next_power = started + _POWER_RETRY_S
         warned_silent = False
         prev_stall = False
         while True:
@@ -878,8 +882,10 @@ class Lift:
             if self._status_period_ms == 0 and now >= next_power:
                 # Polling mode only: broadcast mode is for diagnostics that
                 # keep this host's TX quiet while the legs move.
-                next_power = now + _POWER_POLL_S
-                await self._send(_OP_GET_POWER)
+                next_power = now + _POWER_RETRY_S
+                age = self.power_age
+                if age is None or age >= _POWER_POLL_S:
+                    await self._send(_OP_GET_POWER)
 
             if (
                 not warned_silent
