@@ -250,9 +250,9 @@ export function CanAdapterDialog({
         {detected != null && detected.length === 0 && (
           <p className="rounded-md border border-amber-400/25 bg-amber-400/[0.05] p-2.5 text-xs leading-relaxed text-amber-100/90">
             {detectFailed
-              ? "Couldn't list the host's CAN interfaces. The host may be offline, or " +
+              ? "Couldn't list the Host Computer's CAN interfaces. The Host Computer may be offline, or " +
                 "its software may need an update. You can still type an interface name."
-              : "No CAN interfaces found on the host. Plug in a CAN adapter, or type " +
+              : "No CAN interfaces found on the Host Computer. Plug in a CAN adapter, or type " +
                 "the interface name it will have."}
           </p>
         )}

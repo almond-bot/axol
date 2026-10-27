@@ -1,9 +1,9 @@
 ---
 title: "Remote Teleop"
-description: "Drive Axol over the internet by putting the Quest and the robot's computer on one Tailscale network."
+description: "Drive Axol over the internet by putting the Quest and the Host Computer on one Tailscale network."
 ---
 
-[Teleoperation](/operations/teleop) normally runs over your local network, with the headset and the robot's computer on the same Wi-Fi. To drive Axol from anywhere over the internet, put the Meta Quest and the robot's computer on the same [Tailscale](https://tailscale.com) network (a "tailnet"). The headset then reaches the robot by its Tailscale address as if it were on the same network, and the traffic is encrypted.
+[Teleoperation](/operations/teleop) normally runs over your local network, with the headset and the Host Computer on the same Wi-Fi. To drive Axol from anywhere over the internet, put the Meta Quest and the Host Computer on the same [Tailscale](https://tailscale.com) network (a "tailnet"). The headset then reaches the robot by its Tailscale address as if it were on the same network, and the traffic is encrypted.
 
 Tailscale isn't in the Meta Quest Store, so you have to sideload it. This guide covers that, then the connection.
 
@@ -54,9 +54,9 @@ The Quest runs Horizon OS, which is based on Android, so you can install Tailsca
   A sideloaded Tailscale doesn't update itself. Sideload a newer APK from time to time.
 </Note>
 
-## Connect the robot's computer to the same tailnet
+## Connect the Host Computer to the same tailnet
 
-On the robot's computer, install Tailscale and start it (see [Tailscale's Linux install docs](https://tailscale.com/download/linux)):
+On the Host Computer, install Tailscale and start it (see [Tailscale's Linux install docs](https://tailscale.com/download/linux)):
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -70,7 +70,7 @@ Sign in to the **same tailnet** as the headset. Note the computer's Tailscale ad
 With both devices on the tailnet, use [teleoperation](/operations/teleop) as usual, with the Tailscale address instead of the local one:
 
 <Steps>
-  <Step title="Start teleop on the robot's computer">
+  <Step title="Start teleop on the Host Computer">
     Start it from the [control panel](/guides/control-panel) or with `axol teleop`, as for local teleop.
   </Step>
 
@@ -124,7 +124,7 @@ Camera video travels as a separate stream that doesn't go through Funnel. When t
 
 The repo includes a coturn setup for [Fly.io](https://fly.io) in [`deploy/turn/`](https://github.com/almond-bot/axol/tree/main/deploy/turn). Fly supports the UDP traffic TURN needs, which most hosting services don't. Follow [`deploy/turn/README.md`](https://github.com/almond-bot/axol/blob/main/deploy/turn/README.md) to launch your own server with a few `flyctl` commands.
 
-Then set these variables on the robot's computer **before** you start teleop:
+Then set these variables on the Host Computer **before** you start teleop:
 
 ```bash
 export AXOL_TURN_URL="turn:turn.example.com:3478,turns:turn.example.com:5349"

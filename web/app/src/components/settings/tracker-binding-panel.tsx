@@ -406,7 +406,7 @@ export function TrackerBindingPanel({
         <p className="text-sm text-red-300/85">
           {bindingsError
             ? "Couldn't read the setup status. Check the connection, then press Retry."
-            : "Update Axol on the host to see the tracker setup status."}
+            : "Update Axol on the Host Computer to see the tracker setup status."}
         </p>
         {bindingsError && (
           <Button
@@ -789,8 +789,9 @@ export function TrackerBindingPanel({
               <div className="flex flex-col gap-2 rounded-md border border-amber-400/20 bg-amber-400/[0.04] p-2.5">
                 <p className="text-[11px] leading-relaxed text-amber-200/75">
                   To open the dongle, the user that runs Axol must be in the <code>dialout</code>{" "}
-                  group. Run this command in a terminal on the host. Then log out and back in (or
-                  restart), and reconnect the dongle. This step turns green when it&apos;s done.
+                  group. Run this command in a terminal on the Host Computer. Then log out and back
+                  in (or restart), and reconnect the dongle. This step turns green when it&apos;s
+                  done.
                 </p>
                 <CopyableCommand command={'sudo usermod -aG dialout "$USER"'} />
               </div>
@@ -1055,7 +1056,7 @@ export function TrackerBindingPanel({
                     }
                   >
                     {bindingsError
-                      ? "Validation status unavailable. Reconnect to the host."
+                      ? "Validation status unavailable. Reconnect to the Host Computer."
                       : lastCheckOnly
                         ? `Last check passed ${ago(validation!.checkedAt!)}${
                             causes.includes("refined") ? ". Calibration refined since then." : ""
@@ -1171,7 +1172,7 @@ export function TrackerBindingPanel({
                 </div>
                 {!supported && (
                   <p className="text-xs text-amber-200/85">
-                    Update Axol on the host to validate and recalibrate here.
+                    Update Axol on the Host Computer to validate and recalibrate here.
                   </p>
                 )}
                 {!lighthouse.binding.complete && (

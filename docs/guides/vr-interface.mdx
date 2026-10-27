@@ -12,12 +12,12 @@ You can open the app from two places:
 | | URL | When to use |
 |---|---|---|
 | **Hosted** | [axol.almond.bot](https://axol.almond.bot) | Most setups. |
-| **Self-hosted** | `https://<host>:8001/` | Served by [`axol serve`](/cli/serve) on the robot's computer. Use it offline or when you change the app. |
+| **Self-hosted** | `https://<host>:8001/` | Served by [`axol serve`](/cli/serve) on the Host Computer. Use it offline or when you change the app. |
 
-Either way, the headset connects to port 8000 on the robot's computer. That port is open while [`axol teleop`](/cli/teleop), [`axol collect-data`](/cli/collect-data), or a teleop or data collection operation from the [control panel](/guides/control-panel) is running.
+Either way, the headset connects to port 8000 on the Host Computer. That port is open while [`axol teleop`](/cli/teleop), [`axol collect-data`](/cli/collect-data), or a teleop or data collection operation from the [control panel](/guides/control-panel) is running.
 
 1. Open the app in the Quest browser.
-2. Enter the robot computer's address in **Axol host address**. Tap the field to pick one of the last five hosts you connected to.
+2. Enter the robot computer's address in **Host Computer address**. Tap the field to pick one of the last five hosts you connected to.
 3. Press **Connect**.
 4. The first time, the connection fails because the certificate is self-signed. Tap **Authorize certificate**, accept the warning in the popup, and the app reconnects. You can also open `https://<host>:8000` in the headset browser and accept the warning there.
 5. Press **Enter VR**.

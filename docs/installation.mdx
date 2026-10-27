@@ -1,6 +1,6 @@
 ---
 title: "Installation"
-description: "Install the Axol software on the robot's computer with one command, then open the control panel."
+description: "Install the Axol software on the Host Computer with one command, then open the control panel."
 ---
 
 Install the Axol software with one command on the computer connected to Axol. This is usually the Jetson in your Compute Kit. The command installs the `axol` command line and starts the web control panel in the background. When it finishes, you can drive Axol from a browser.
@@ -32,7 +32,7 @@ If your ZED Box came from Almond, log in with these default credentials:
 
 ## Install
 
-Run this on the robot's computer:
+Run this on the Host Computer:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
@@ -79,7 +79,7 @@ systemctl restart axol       # restart manually
 ## First connection
 
 1. On any computer on the same network, open [axol.almond.bot](https://axol.almond.bot).
-2. Enter the IP address of the robot's computer.
+2. Enter the IP address of the Host Computer.
 3. The first time, your browser warns about the robot's security certificate. Accept it. You only do this once, for both the control panel and the VR headset link.
 
 On the first connection, the control panel sets up the connection to Axol's arms for you (see [`can.setup`](/cli/can-setup)). See the [Web Control Panel guide](/guides/control-panel) for the rest of the steps.

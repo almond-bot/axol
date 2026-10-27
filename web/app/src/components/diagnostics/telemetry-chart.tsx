@@ -46,6 +46,12 @@ interface TelemetryChartProps {
    * the 10 Hz fast stream; the 1 Hz slow (temperature) series needs more.
    */
   gapBreakS?: number
+  /** Time-axis and tooltip labels (default: clock time). */
+  formatTime?: (t: number) => string
+  /** A playhead drawn at this time; the legend then shows values there. */
+  cursorT?: number | null
+  /** A click (not a drag) on the plot asks to move the playhead here. */
+  onSeek?: (t: number) => void
   className?: string
 }
 
@@ -131,6 +137,11 @@ function fmtValue(v: number): string {
   return v.toFixed(3)
 }
 
+/** First letter up, the rest as given ("wrist 2 commanded" -> "Wrist 2 commanded"). */
+function sentenceCase(label: string): string {
+  return label.charAt(0).toUpperCase() + label.slice(1)
+}
+
 function fmtClock(t: number): string {
   const d = new Date(t * 1000)
   return d.toLocaleTimeString(undefined, { hour12: false })
@@ -155,6 +166,9 @@ export function TelemetryChart({
   quietReason,
   height = 260,
   gapBreakS = GAP_BREAK_S,
+  formatTime = fmtClock,
+  cursorT = null,
+  onSeek,
   className,
 }: TelemetryChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -264,8 +278,23 @@ export function TelemetryChart({
     return { t: snapT, values }
   }, [hoverT, data])
 
-  // Latest value per series, for the legend's live value labels.
+  // Latest value per series, for the legend's live value labels; with a
+  // playhead, the value at the playhead instead.
   const latest = useMemo(() => {
+    if (cursorT != null) {
+      let lo = 0
+      let hi = frames.length - 1
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1
+        if (frames[mid].t < cursorT) lo = mid + 1
+        else hi = mid
+      }
+      const frame = frames[lo]
+      return series.map((s) => {
+        const v = frame?.m[s.key]?.[metric]
+        return v == null ? null : v * scale
+      })
+    }
     return series.map((s) => {
       for (let i = frames.length - 1; i >= Math.max(0, frames.length - 20); i--) {
         const v = frames[i].m[s.key]?.[metric]
@@ -274,7 +303,7 @@ export function TelemetryChart({
       return null
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version is the buffer's change signal
-  }, [frames, version, series, metric, scale])
+  }, [frames, version, series, metric, scale, cursorT])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -328,7 +357,7 @@ export function TelemetryChart({
     const nTicksX = Math.max(2, Math.floor(plotW / 90))
     for (const tick of ticks(view.t0, view.t1, nTicksX)) {
       ctx.fillStyle = AXIS_INK
-      ctx.fillText(fmtClock(tick), x(tick), size.h - PAD.bottom + 8)
+      ctx.fillText(formatTime(tick), x(tick), size.h - PAD.bottom + 8)
     }
     // Baseline.
     ctx.strokeStyle = BASELINE
@@ -355,6 +384,16 @@ export function TelemetryChart({
       ctx.stroke()
     }
 
+    // Playhead.
+    if (cursorT != null && cursorT >= view.t0 && cursorT <= view.t1) {
+      ctx.strokeStyle = "#eff483"
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      ctx.moveTo(x(cursorT), PAD.top)
+      ctx.lineTo(x(cursorT), size.h - PAD.bottom)
+      ctx.stroke()
+    }
+
     // Crosshair + marker dots (2px surface ring so dots read over lines).
     if (hover) {
       const px = x(hover.t)
@@ -376,7 +415,7 @@ export function TelemetryChart({
         ctx.stroke()
       }
     }
-  }, [data, size, series, hover, quietReason, view, plotW, gapBreakS])
+  }, [data, size, series, hover, quietReason, view, plotW, gapBreakS, formatTime, cursorT])
 
   const toTime = useCallback(
     (clientX: number) => {
@@ -389,7 +428,7 @@ export function TelemetryChart({
   )
 
   function onPointerDown(e: React.PointerEvent) {
-    if (!onViewChange || e.button !== 0) return
+    if (!(onViewChange || onSeek) || e.button !== 0) return
     drag.current = { x: e.clientX, view, moved: false }
     ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
   }
@@ -410,8 +449,13 @@ export function TelemetryChart({
     setHoverT(toTime(e.clientX))
   }
 
-  function onPointerUp() {
+  function onPointerUp(e: React.PointerEvent) {
+    const d = drag.current
     drag.current = null
+    if (d && !d.moved && onSeek) {
+      const t = toTime(e.clientX)
+      if (t != null) onSeek(t)
+    }
   }
 
   function onKeyDown(e: React.KeyboardEvent) {
@@ -480,7 +524,7 @@ export function TelemetryChart({
             className="pointer-events-none absolute top-2 z-10 w-44 rounded-md border border-white/10 bg-[#1c1c1c]/95 px-2.5 py-2 text-xs shadow-xl"
             style={flip ? { right: size.w - tooltipLeft + 8 } : { left: tooltipLeft + 8 }}
           >
-            <div className="mb-1 font-mono text-[0.65rem] text-white/40">{fmtClock(hover.t)}</div>
+            <div className="mb-1 font-mono text-[0.65rem] text-white/40">{formatTime(hover.t)}</div>
             {series.map((s, i) => (
               <div key={s.key} className="flex items-center gap-2 leading-5">
                 <span
@@ -490,7 +534,7 @@ export function TelemetryChart({
                 <span className="font-mono font-semibold text-white/90 tabular-nums">
                   {hover.values[i] == null ? "–" : fmtValue(hover.values[i]!)}
                 </span>
-                <span className="truncate text-white/45 capitalize">{s.label}</span>
+                <span className="truncate text-white/45">{sentenceCase(s.label)}</span>
               </div>
             ))}
           </div>
@@ -501,7 +545,7 @@ export function TelemetryChart({
         {series.map((s, i) => (
           <span key={s.key} className="inline-flex items-center gap-1.5 text-xs">
             <span className="inline-block h-0.5 w-3 rounded" style={{ background: s.color }} />
-            <span className="text-white/50 capitalize">{s.label}</span>
+            <span className="text-white/50">{sentenceCase(s.label)}</span>
             <span className="font-mono text-white/80 tabular-nums">
               {latest[i] == null ? "–" : fmtValue(latest[i]!)}
             </span>

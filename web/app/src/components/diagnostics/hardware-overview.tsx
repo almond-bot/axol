@@ -1,4 +1,5 @@
-import { ArrowUpFromLine, CircleDot, Cpu, Loader2, Plug, Unplug } from "lucide-react"
+import { ArrowUpFromLine, CircleDot, Loader2, Plug, Unplug } from "lucide-react"
+import { DEVICE_ICONS } from "@/lib/device-icons"
 import type { ReactNode } from "react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -217,10 +218,11 @@ export function HardwareOverview({
           Connect
         </Button>
       )
+    const Icon = DEVICE_ICONS[profile]
     return (
       <HardwareRow
         key={profile}
-        icon={<Cpu className="size-3.5" />}
+        icon={<Icon className="size-3.5" />}
         title={title}
         state={state}
         dot={dot}
@@ -284,7 +286,7 @@ export function HardwareOverview({
         disabled={!online || !jellySupported || busy || hardwareBusy}
         title={
           !jellySupported
-            ? "Update the software on the host to connect Jelly."
+            ? "Update the software on the Host Computer to connect Jelly."
             : hardwareBusy
               ? busyTitle
               : undefined

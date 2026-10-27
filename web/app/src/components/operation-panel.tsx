@@ -1,9 +1,13 @@
 import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
+  ChevronRight,
+  CircleAlert,
+  CircleCheck,
   ExternalLink,
   Loader2,
   Play,
+  Plug,
   RotateCcw,
   Settings2,
   Square,
@@ -31,6 +35,7 @@ import {
   type OperationMeta,
   type PolicyState,
   type RobotStatus,
+  type OperationProgress,
   type SessionInfo,
   type TrackerSourceReadiness,
   type TrackingQuality,
@@ -41,13 +46,16 @@ import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { EpisodeBriefCard } from "@/components/episode-brief"
 import { SessionSettings } from "@/components/session-settings"
-import { Card, CardContent } from "@/components/ui/card"
+import { Card } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
 import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
+import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
+import { useStartupView } from "@/lib/operation-progress"
+import type { CatalogEntry } from "@/lib/operation-catalog"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -55,14 +63,21 @@ function isMantisTrackerSource(value: string): value is MantisTrackerSource {
   return MANTIS_TRACKER_SOURCES.has(value as MantisTrackerSource)
 }
 
+/** A way to fix one "before you start" item from where it is listed. */
+export type BlockerFix = { label: string; onClick: () => void }
+
 /**
- * One operation's panel: just its per-run inputs (dataset / task / policy
- * identity) and Start/Stop. Everything reusable across runs — cameras, arm
- * behaviour, recording, inference — lives in the shared Settings and is folded
- * in server-side at start. Which hardware the run targets is the panel-wide
- * device selection, not a per-operation toggle.
+ * One operation's screen: a header with its Start/Stop, the checks still in
+ * the way, its per-run inputs (dataset / task / policy identity), and while it
+ * runs, the operator's live view. Everything reusable across runs — cameras,
+ * arm behaviour, recording, inference — lives in the shared Settings and is
+ * folded in server-side at start. Which hardware the run targets is the
+ * panel-wide device selection, not a per-operation toggle.
  */
 export function OperationPanel({
+  entry,
+  fixFor,
+  onConnect,
   meta,
   spec,
   settings,
@@ -83,6 +98,7 @@ export function OperationPanel({
   viewerPort,
   vrPort,
   startPhase,
+  progress,
   hostBlocker,
   needsMount = false,
   simRobot,
@@ -93,6 +109,12 @@ export function OperationPanel({
   onStop,
   onEpisode,
 }: {
+  /** How the app presents the operation: its icon and name. */
+  entry: CatalogEntry
+  /** The button that fixes a "before you start" item, when there is one. */
+  fixFor?: (blocker: string) => BlockerFix | null
+  /** Opens the connection dialog, offered while no host is connected. */
+  onConnect?: () => void
   meta: OperationMeta
   spec: CommandSpec | null
   settings: Record<string, FormValue>
@@ -118,6 +140,8 @@ export function OperationPanel({
   vrPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** The run's startup steps, from the status poll. */
+  progress?: OperationProgress | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
   /** No robot model picked yet (`kinematics.mount`): a run that drives the
@@ -313,6 +337,10 @@ export function OperationPanel({
 
   // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
+  const startup = useStartupView(live ? progress : null, {
+    device: mantisMode ? "Mantis" : "Axol",
+    sim: isSim,
+  })
   // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
   // arms and their CAN bus are never touched. A live run is described by its
   // merged args alone (a default-on flag is omitted from them, so the saved
@@ -376,7 +404,7 @@ export function OperationPanel({
   } else if (trackerGated && currentTrackerReadinessState !== "ready") {
     trackerIssues.push(
       currentTrackerReadinessState === "error"
-        ? "Can't check the Mantis trackers. Reconnect the Axol host, or update it."
+        ? "Can't check the Mantis trackers. Reconnect the Host Computer, or update it."
         : "Checking the Mantis trackers…"
     )
   }
@@ -476,13 +504,24 @@ export function OperationPanel({
   const editedCount = Object.keys(settings).length
   const available = spec?.available ?? false
 
+  const running = live && session?.status === "running"
+  const ready = available && blockers.length === 0
+
   return (
-    <div className="flex min-w-0 flex-col gap-6">
-      <Card className="gap-0 p-0">
-        <div className="flex flex-col gap-4 border-b border-white/10 p-5 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
+    <div className="flex min-w-0 flex-col gap-5">
+      <section
+        className={cn(
+          "flex flex-col gap-5 rounded-2xl border p-5 sm:flex-row sm:items-center",
+          live
+            ? "border-emerald-400/25 bg-gradient-to-br from-emerald-400/[0.06] to-transparent"
+            : "border-white/10 bg-gradient-to-br from-white/[0.04] to-transparent"
+        )}
+      >
+        <div className="flex min-w-0 flex-1 items-start gap-4">
+          <OperationIcon entry={entry} size="lg" running={live} />
+          <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-heading text-lg font-semibold">{meta.label}</h2>
+              <h2 className="font-heading text-xl font-semibold">{meta.label}</h2>
               {/* Which hardware this run targets — the system-wide device
                   selection, or the device a live run was started on. */}
               <Badge
@@ -491,161 +530,235 @@ export function OperationPanel({
               >
                 {mantisMode ? "Mantis" : "Axol"}
               </Badge>
-              <StatusBadge session={live ? session : null} />
+              {isSim && <Badge variant="neutral">Sim</Badge>}
             </div>
-            <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {/* Only Mantis collection owns a tracker bridge to reset;
-                Mantis teleop is grippers-only. */}
-            {live && mantisMode && mantisSource !== "quest" && meta.id === "collect-data" && (
-              <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
-                <RotateCcw /> Reset
-              </Button>
+            <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-white/55">
+              {meta.description}
+            </p>
+            {live && session && startup && (
+              <div className="mt-3 max-w-md">
+                <StartupBar view={startup} />
+              </div>
             )}
-            {stopping ? (
-              <Button variant="destructive" disabled>
-                <Loader2 className="animate-spin" />
-                Stopping…
-              </Button>
-            ) : live ? (
-              <Button variant="destructive" onClick={onStop} disabled={busy}>
-                {busy ? <Loader2 className="animate-spin" /> : <Square />}
-                Stop
-              </Button>
-            ) : (
-              <Button onClick={onStart} disabled={busy || !available || blockers.length > 0}>
-                {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                {busy && startPhase ? startPhase : "Start"}
-              </Button>
+            {live && session && !startup && (
+              <p className="mt-2 flex items-center gap-2 text-sm">
+                <StatusBadge session={session} />
+                {running && (
+                  <span className="text-white/70">
+                    <ElapsedTime startedAt={session.startedAt} />
+                  </span>
+                )}
+              </p>
             )}
           </div>
         </div>
-
-        <CardContent className="gap-5 p-5">
-          {!available ? (
-            <Unavailable spec={spec} />
-          ) : (
-            <>
-              {runFields.length > 0 && (
-                <>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
-                      This run
-                    </span>
-                    {editedCount > 0 && !live && (
-                      <button
-                        type="button"
-                        onClick={onResetAll}
-                        className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
-                      >
-                        <RotateCcw className="size-3" />
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  {textFields.length > 0 && (
-                    <CuratedForm
-                      fields={textFields}
-                      suggestions={suggestions}
-                      strictKeys={strictKeys}
-                      overrides={settings}
-                      disabled={live}
-                      onChange={onChange}
-                      onReset={onReset}
-                    />
-                  )}
-                  {customPolicy && (
-                    <p className="text-xs leading-relaxed text-white/45">
-                      Custom policy: start your policy server (
-                      <code className="font-mono text-white/60">almond_axol.policy.serve</code>)
-                      before you press Start. Run policy connects to the host and port on the
-                      Inference tab of General settings. A blank host means this computer, and the
-                      default port is 8765. Choose the model and instruction on your policy server.
-                      The task only labels the recordings.
-                    </p>
-                  )}
-                  {!live &&
-                    suggestionNotes.map((note) => (
-                      <p key={note.key} className="text-xs leading-relaxed text-white/45">
-                        {note.strict
-                          ? `${sentenceCase(note.label)} options couldn't be loaded, so you can't set this field.`
-                          : `${sentenceCase(note.label)} suggestions couldn't be loaded. Type the value.`}{" "}
-                        <span className="break-words text-white/35">{note.error}</span>
-                      </p>
-                    ))}
-                  {jointField && (
-                    <ArmJointPicker
-                      value={settings[jointField.key]}
-                      disabled={live}
-                      onChange={(v) => onChange(jointField.key, v)}
-                      onReset={() => onReset(jointField.key)}
-                    />
-                  )}
-                </>
-              )}
-
-              {isSim && simRobot && onSimRobotChange && (
-                <SimRobotPicker value={simRobot} onChange={onSimRobotChange} disabled={live} />
-              )}
-
-              <button
-                type="button"
-                onClick={onOpenSettings}
-                className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
-              >
-                <Settings2 className="size-3.5" />
-                {runFields.length > 0
-                  ? "Set cameras, arm behavior, recording and everything else in Settings"
-                  : "Nothing to set per run. Configure Settings, then press Start."}
-              </button>
-
-              {blockers.length > 0 && !live && (
-                <div className="flex flex-col gap-1 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-                  <span className="font-medium">Before you can start:</span>
-                  <ul className="list-inside list-disc">
-                    {blockers.map((b) => (
-                      <li key={b}>{b}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {/* Everything the operator watches during a session — episode
-                  status/controls, the mirrored headset popups, and the live
-                  camera feeds — grouped so it can expand to a fullscreen
-                  operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer, an arms-off run has no video relay, and
-                  Mantis teleop is grippers-only (no cameras). Mantis collection
-                  still relays its configured camera feeds even when
-                  Lighthouse/Ultimate make the headset unnecessary. */}
-              {live && (meta.episodeControl || showFeeds || showSettings) && (
-                <OperatorDeck
-                  label={meta.label}
-                  episodeControl={meta.episodeControl}
-                  showFeeds={showFeeds}
-                  showSettings={showSettings}
-                  policy={policy}
-                  onEpisode={onEpisode}
-                  host={host}
-                  vrPort={vrPort}
-                />
-              )}
-
-              <RunningHints
-                usesHeadset={meta.usesHeadset}
-                mantisMode={mantisMode}
-                mantisSource={mantisSource}
-                dataCollection={meta.id === "collect-data"}
-                session={live ? session : null}
-                isSim={isSim}
-                host={host}
-                viewerPort={viewerPort}
-              />
-            </>
+        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+          {/* Only Mantis collection owns a tracker bridge to reset;
+              Mantis teleop is grippers-only. */}
+          {live && mantisMode && mantisSource !== "quest" && meta.id === "collect-data" && (
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() => onEpisode("bridge-reset")}
+              disabled={busy}
+            >
+              <RotateCcw /> Reset
+            </Button>
           )}
-        </CardContent>
-      </Card>
+          {stopping ? (
+            <Button variant="destructive" size="lg" disabled>
+              <Loader2 className="animate-spin" />
+              Stopping…
+            </Button>
+          ) : live ? (
+            <Button variant="destructive" size="lg" onClick={onStop} disabled={busy}>
+              {busy ? <Loader2 className="animate-spin" /> : <Square />}
+              Stop
+            </Button>
+          ) : (
+            <Button size="lg" className="min-w-32" onClick={onStart} disabled={busy || !ready}>
+              {busy ? <Loader2 className="animate-spin" /> : <Play />}
+              {busy && startPhase ? startPhase : "Start"}
+            </Button>
+          )}
+        </div>
+      </section>
+
+      {!available ? (
+        connected ? (
+          <Unavailable spec={spec} />
+        ) : (
+          <ConnectPrompt onConnect={onConnect} />
+        )
+      ) : (
+        <>
+          {!live && <ReadyChecklist blockers={blockers} fixFor={fixFor} />}
+
+          {/* Everything the operator watches during a session — episode
+              status/controls, the mirrored headset popups, and the live
+              camera feeds — grouped so it can expand to a fullscreen
+              operator view (the headset-off replacement for the HUD). */}
+          {/* Sim has the browser viewer, an arms-off run has no video relay, and
+              Mantis teleop is grippers-only (no cameras). Mantis collection
+              still relays its configured camera feeds even when
+              Lighthouse/Ultimate make the headset unnecessary. */}
+          {live && (meta.episodeControl || showFeeds || showSettings) && (
+            <OperatorDeck
+              label={meta.label}
+              episodeControl={meta.episodeControl}
+              showFeeds={showFeeds}
+              showSettings={showSettings}
+              policy={policy}
+              onEpisode={onEpisode}
+              host={host}
+              vrPort={vrPort}
+            />
+          )}
+
+          <RunningHints
+            usesHeadset={meta.usesHeadset}
+            mantisMode={mantisMode}
+            mantisSource={mantisSource}
+            dataCollection={meta.id === "collect-data"}
+            session={live ? session : null}
+            isSim={isSim}
+            host={host}
+            viewerPort={viewerPort}
+          />
+
+          <Card className="gap-5">
+            {(runFields.length > 0 || (isSim && simRobot && onSimRobotChange)) && (
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="font-heading text-sm font-semibold">Run details</h3>
+                {editedCount > 0 && !live && (
+                  <button
+                    type="button"
+                    onClick={onResetAll}
+                    className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
+                  >
+                    <RotateCcw className="size-3" />
+                    Reset
+                  </button>
+                )}
+              </div>
+            )}
+            {textFields.length > 0 && (
+              <CuratedForm
+                fields={textFields}
+                suggestions={suggestions}
+                strictKeys={strictKeys}
+                overrides={settings}
+                disabled={live}
+                onChange={onChange}
+                onReset={onReset}
+              />
+            )}
+            {customPolicy && (
+              <p className="text-xs leading-relaxed text-white/45">
+                Custom policy: start your policy server (
+                <code className="font-mono text-white/60">almond_axol.policy.serve</code>) before
+                you press Start. Run policy connects to the host and port on the Inference tab of
+                General settings. A blank host means this computer, and the default port is 8765.
+                Choose the model and instruction on your policy server. The task only labels the
+                recordings.
+              </p>
+            )}
+            {!live &&
+              suggestionNotes.map((note) => (
+                <p key={note.key} className="text-xs leading-relaxed text-white/45">
+                  {note.strict
+                    ? `${sentenceCase(note.label)} options couldn't be loaded, so you can't set this field.`
+                    : `${sentenceCase(note.label)} suggestions couldn't be loaded. Type the value.`}{" "}
+                  <span className="break-words text-white/35">{note.error}</span>
+                </p>
+              ))}
+            {jointField && (
+              <ArmJointPicker
+                value={settings[jointField.key]}
+                disabled={live}
+                onChange={(v) => onChange(jointField.key, v)}
+                onReset={() => onReset(jointField.key)}
+              />
+            )}
+            {isSim && simRobot && onSimRobotChange && (
+              <SimRobotPicker value={simRobot} onChange={onSimRobotChange} disabled={live} />
+            )}
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="group flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2.5 text-left text-sm text-white/60 transition-colors hover:border-white/20 hover:text-white/85"
+            >
+              <Settings2 className="size-4 shrink-0 text-white/40" />
+              <span className="min-w-0 flex-1">
+                {runFields.length > 0
+                  ? "Cameras, arm behavior and recording are in Settings."
+                  : "Nothing to set for each run. Cameras, arm behavior and recording are in Settings."}
+              </span>
+              <ChevronRight className="size-4 shrink-0 text-white/25 group-hover:text-white/60" />
+            </button>
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** What still stands between the operator and Start, each with its fix when
+ *  the app knows one; a green line once nothing does. */
+function ReadyChecklist({
+  blockers,
+  fixFor,
+}: {
+  blockers: string[]
+  fixFor?: (blocker: string) => BlockerFix | null
+}) {
+  if (blockers.length === 0) {
+    return (
+      <div className="flex items-center gap-2.5 rounded-xl border border-emerald-400/20 bg-emerald-400/[0.04] px-4 py-3 text-sm text-emerald-200/90">
+        <CircleCheck className="size-4 shrink-0 text-emerald-300" />
+        Ready to start.
+      </div>
+    )
+  }
+  return (
+    <section className="flex flex-col overflow-hidden rounded-xl border border-amber-400/20 bg-amber-400/[0.03]">
+      <h3 className="border-b border-amber-400/15 px-4 py-2.5 text-sm font-medium text-amber-200/90">
+        Before you start
+      </h3>
+      <ul className="flex flex-col divide-y divide-white/[0.06]">
+        {blockers.map((b) => {
+          const fix = fixFor?.(b) ?? null
+          return (
+            <li key={b} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
+              <CircleAlert className="size-4 shrink-0 text-amber-300/80" />
+              <span className="min-w-0 flex-1 text-sm text-white/75">{b}</span>
+              {fix && (
+                <Button variant="outline" size="sm" onClick={fix.onClick}>
+                  {fix.label}
+                </Button>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </section>
+  )
+}
+
+/** Shown in place of an operation's inputs until the Host Computer is
+ *  connected: the app knows the operation, but only the host can run it. */
+function ConnectPrompt({ onConnect }: { onConnect?: () => void }) {
+  return (
+    <div className="flex flex-col items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-5 sm:flex-row sm:items-center">
+      <Plug className="size-5 shrink-0 text-white/40" />
+      <p className="min-w-0 flex-1 text-sm text-white/60">
+        Connect to the Host Computer to set up and start this operation.
+      </p>
+      {onConnect && (
+        <Button size="sm" onClick={onConnect}>
+          Connect
+        </Button>
+      )}
     </div>
   )
 }
@@ -1390,10 +1503,10 @@ function Unavailable({ spec }: { spec: CommandSpec | null }) {
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
       <div className="flex items-center gap-2 font-medium text-amber-300/90">
         <AlertTriangle className="size-4" />
-        Not available on this Axol host
+        Not available on this robot
       </div>
       <p className="text-white/55">
-        This operation needs software or hardware that this Axol host doesn&apos;t have, such as
+        This operation needs software or hardware that the Host Computer doesn&apos;t have, such as
         LeRobot, the ZED SDK or the Axol arms.
       </p>
       {spec?.error && (

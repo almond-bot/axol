@@ -128,7 +128,7 @@ describe("supervisor API client", () => {
       "fetch",
       vi.fn(async () => new Response("not json"))
     )
-    await expect(api.fetchInfo()).rejects.toThrow("this address is not an Axol host")
+    await expect(api.fetchInfo()).rejects.toThrow("this address is not a Host Computer")
   })
 
   it("turns connection probe timeouts into a concise offline error", async () => {
@@ -136,7 +136,7 @@ describe("supervisor API client", () => {
       "fetch",
       vi.fn(async () => Promise.reject(new DOMException("late", "TimeoutError")))
     )
-    await expect(api.fetchCommands()).rejects.toThrow("no response from the host after 2s")
+    await expect(api.fetchCommands()).rejects.toThrow("no response from the Host Computer after 2s")
   })
 
   it("builds URLs and fault labels", () => {

@@ -49,7 +49,7 @@ export function SetupDialog({
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <div className="flex items-center gap-2">
             <Server className="size-4 text-[#eff483]" />
-            <span className="font-heading text-base font-semibold">Axol Host</span>
+            <span className="font-heading text-base font-semibold">Host Computer</span>
           </div>
           <button
             type="button"
@@ -64,7 +64,7 @@ export function SetupDialog({
         <div className="flex flex-col gap-6 p-5">
           <section className="flex flex-col gap-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="setup-server-host">Axol host address</Label>
+              <Label htmlFor="setup-server-host">Host Computer address</Label>
               <ConnBadge state={conn.state} />
             </div>
             <p className="text-xs text-white/45">The computer connected to Axol.</p>
@@ -101,13 +101,13 @@ export function SetupDialog({
               <div className="flex flex-col gap-2 text-xs text-red-400">
                 <span className="flex items-center gap-1.5">
                   <AlertTriangle className="size-3" />
-                  Can&apos;t reach {base || "the host"}.
+                  Can&apos;t reach {base || "the Host Computer"}.
                 </span>
                 {base && (
                   <>
                     <span className="text-white/45">
-                      If the host is running, authorize its certificate. Accept the warning in the
-                      window that opens, and the panel reconnects.
+                      If the Host Computer is running, authorize its certificate. Accept the warning
+                      in the window that opens, and the panel reconnects.
                     </span>
                     <Button
                       type="button"

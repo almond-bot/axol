@@ -76,6 +76,7 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
@@ -1759,6 +1760,12 @@ def _run_session(
     # memory, so the control loops stay as fast as `axol teleop`. Only use it
     # when it exported raw frames for every observation camera; otherwise tear
     # it down and fall back to the in-process camera path (robot owns cameras).
+    progress.plan(
+        ["cameras", "arms"]
+        + (["grippers"] if mantis_mode else [])
+        + ["headset", "ik", "dataset"]
+    )
+    progress.step("cameras")
     relay = _start_video_relay(cfg, dataset_resolution)
     expected = set(cfg.robot_config.observation_cameras().keys())
     use_relay = relay is not None and expected <= set(relay.raw_cameras)
@@ -1856,6 +1863,7 @@ def _run_session(
         return hardware_failure
 
     try:
+        progress.step("arms")
         robot.connect()
         if not mantis_mode:
             # The teleop's startup move to rest plays unsupervised; refuse it
@@ -1866,6 +1874,7 @@ def _run_session(
             # hard-stop calibration), then drop torque again, so the jaws are
             # already wide when the first take starts instead of finishing
             # their sweep in-shot. See _preopen_mantis_grippers.
+            progress.step("grippers")
             _preopen_mantis_grippers(robot, stop_event, _logger.info)
 
         # The dataset lives in the recorder (subprocess or in-process), not here.
@@ -1993,6 +2002,7 @@ def _run_session(
         )
         if is_complete:
             _logger.info(f"Resuming existing dataset at {dataset_root}.")
+        progress.step("dataset")
         if use_relay:
             recorder: DatasetRecorderProcess | InProcessRecorder = (
                 DatasetRecorderProcess(
@@ -3143,6 +3153,7 @@ def _run_session(
             # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
             _logger.info(_note_ready(episode_idx + 1))
+            progress.ready()
 
             try:
                 (

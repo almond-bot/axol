@@ -5,16 +5,24 @@ description: "Connect to Axol from a browser, set up cameras and settings, and r
 
 The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
 
-From top to bottom, the page has:
+The sidebar on the left switches between its pages. On a phone, open it with the **☰** button.
 
-- **Connection tiles** for the robot's computer, Axol, Mantis and Jelly.
-- The **Settings** card.
-- The **operation panel**, where you pick an operation and press **Start**.
-- The **Logs** console.
+| Page | What it is for |
+|---|---|
+| **Overview** | What is running, what to set up next, quick start and recent datasets. |
+| **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
+| **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
+| **Datasets** | Watch recorded episodes, check their robot data and fix their task text. |
+| **Request data** | Pay Almond to collect training data for your task. |
+| **Settings** | Settings shared by every operation and every browser. |
+| **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
+| **Logs** | The output of the latest operation. |
+
+The Host Computer you are connected to, and whether the selected device is connected, show at the top right of every page. Click it to open **Devices**. Before you connect, the **Overview** shows a **Connect** button.
 
 ## Open the control panel
 
-With the [one-command install](/installation), the server already runs on the robot's computer (the one wired to the arms, with the ZED cameras attached). It starts at boot and restarts if it stops. Open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+With the [one-command install](/installation), the server already runs on the Host Computer (the one wired to the arms, with the ZED cameras attached). It starts at boot and restarts if it stops. Open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
 
 On a development install, start the server yourself:
 
@@ -30,21 +38,23 @@ Axol control panel:
   LAN   : https://192.168.1.50:8001
 ```
 
-Open the **Local** URL on the robot's computer, or the **LAN** URL from another machine on the same network. Accept the self-signed certificate the first time. The panel is at `/control`, and it works on a phone or tablet too.
+Open the **Local** URL on the Host Computer, or the **LAN** URL from another machine on the same network. Accept the self-signed certificate the first time. The panel is at `/control`, and it works on a phone or tablet too.
 
 <Note>
   On a development install, build the local UI once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). Or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve`. See [Development install](/advanced/development-install#build-the-web-ui).
 </Note>
 
 <Tip>
-  The **Quickstart** button in the nav bar (in the **☰** menu on a phone) has commands to copy for installing the CLI and starting the server.
+  **Quickstart** at the bottom of the sidebar has commands to copy for installing the CLI and starting the server.
 </Tip>
 
 ## Connections
 
-The top of the page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Jelly**. Each has a status dot. Click a tile's title to open its [settings](#settings). The **Axol Host** tile opens the general settings.
+The **Overview** lists your devices on one line each, with a **Connect** button for one that is plugged in but not connected. Mantis and Jelly show once they are plugged in.
 
-**Choose the device.** Every operation runs on either Axol or Mantis. The chosen tile shows **selected**, and the other shows **Select**.
+The **Devices** page has a card each for the **Host Computer**, **Axol**, **Mantis** and **Jelly**. Each card shows the device's status, with **Connect** or **Disconnect** at the top right. Press **Open settings** on a card to open that device's [settings](#settings). On the **Host Computer** card, it opens the general settings.
+
+**Choose the device.** Every operation runs on either Axol or Mantis. The chosen card shows **Selected**. Press **Use for operations** on the other card to switch.
 
 - With Mantis selected, only **Teleoperation** and **Collect data** are offered.
 - The choice is saved on the host, so every browser sees the same one.
@@ -55,25 +65,25 @@ The top of the page has four tiles: **Axol Host**, **Axol**, **Mantis** and **Je
   Closing the browser tab, or disconnecting from the host, does **not** stop anything. The robot connection and any running operation keep going in `axol serve`. Press **Stop** to end an operation.
 </Warning>
 
-### Axol Host
+### Host Computer
 
-The **Axol Host** is the computer running `axol serve`. Press **Connect** on its tile and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
+The **Host Computer** is the computer running `axol serve`. Press **Connect** on its card and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
 
-Once connected, the tile shows the host's name and its installed version (for example `axol v0.1.2`). Teleoperation and gravity compensation need nothing else.
+Once connected, the card shows the host's name and its installed version (for example `Axol v0.1.2`). Teleoperation and gravity compensation need nothing else.
 
-The connected tile has three buttons:
+The connected card has three buttons:
 
 | Button | What it does |
 |---|---|
-| **Restart** | Reboots the robot's computer after you confirm. Reconnect when it is back, usually in under a minute. |
-| **Shut down** | Powers the robot's computer off after you confirm. You need physical access to turn it back on. |
+| **Restart** | Reboots the Host Computer after you confirm. Reconnect when it is back, usually in under a minute. |
+| **Shut down** | Powers the Host Computer off after you confirm. You need physical access to turn it back on. |
 | **Disconnect** | Disconnects this browser only. The server, the robot and any running operation keep going. |
 
 **Restart** and **Shut down** wait until no operation is running and no update is installing. On a development install they need passwordless `sudo`, or the host reports that it couldn't restart and stays up.
 
 #### Updates
 
-When a newer [release](https://github.com/almond-bot/axol/releases) is available, a banner above the tiles shows the version change and links to the release notes. Nothing updates until you press **Update**.
+When a newer [release](https://github.com/almond-bot/axol/releases) is available, a banner at the top of every page shows the version change and links to the release notes. Nothing updates until you press **Update**.
 
 1. Stop any running operation. **Update** is disabled while one runs.
 2. Press **Update**. The button shows each step: `Upgrading…`, `Installing packages…`, `Restarting…` or `Rebooting host…`.
@@ -98,7 +108,7 @@ When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies 
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, the main page shows a **What is Axol mounted on?** card, and runs that drive the arms list *Choose what Axol is mounted on* under [Before you can start](#before-you-can-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, **Set up** on the **Overview** lists the mounts with a **Save mount** button, and the **Devices** page shows a **What is Axol mounted on?** card. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
 
 On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
@@ -106,13 +116,13 @@ On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Rob
 
 The panel finds the CAN adapters plugged into the host and connects the selected device automatically. On a new hub, it first identifies each adapter (Axol arm, Mantis rig, Jelly wheels or Jelly lift) and names it, the same way [`axol can.setup`](/cli/can-setup) does.
 
-If the automatic connection fails twice, press **Connect** on the tile. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
+If the automatic connection fails twice, press **Connect** on the card. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
 
-**If an adapter isn't identified.** This happens when the hardware was off while the server started. Power on the hardware, then press **Connect** or **Retry CAN identification**. If that still fails, run `axol can.setup` in a terminal.
+**If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
 To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.
 
-**Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the tile. Hover a square to see its status and temperature.
+**Motor status.** While no operation runs, the panel checks every motor once a second: all 16 Axol motors, or the two Mantis grippers. Each motor is a square on the card, next to how many are OK. Hover a square to see its status and temperature.
 
 | Square | Meaning |
 |---|---|
@@ -122,7 +132,7 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 
 **If motor power is cut.** If you cut motor power during a run, for example at the power supply, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If a motor still answers with torque on, the panel shows **Re-check motors**. Cut motor power, then press it.
 
-**Mantis.** Press **Select** on the Mantis tile. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
+**Mantis.** Press **Use for operations** on the Mantis card. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
 
 - **Teleoperation** drives the grippers from the rig triggers. It needs only CAN, with no tracking.
 - **Collect data** uses the pose source set under **Mantis settings → Tracking**. See [Mantis Tracking](/mantis/tracking).
@@ -130,9 +140,9 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 
 ### Jelly
 
-The **Jelly** tile has a row each for the wheels and the lift, each with a connect button. Jelly is driven together with Axol, so it isn't part of the device choice.
+The **Jelly** card has one **Connect** button. It connects the wheels and the lift, whichever are plugged in. **Disconnect** drops both. A row each for the wheels and the lift shows its status. Jelly is driven together with Axol, so it isn't part of the device choice.
 
-While the lift is connected, the tile shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
+While the lift is connected, the card shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
 
 - A reading with `~` (for example `~40%`) was measured while Jelly was moving, so it reads low.
 - While an operation uses the bus, the last reading stays dimmed. Hover it to see its age.
@@ -142,7 +152,7 @@ From Python, [`Jelly.battery`](/api/robot#jelly) returns the same estimate.
 
 ## Settings
 
-Settings that apply to every run live in the **Settings** card below the tiles. Switch between **Axol**, **Mantis**, **Jelly** and **General** in the card header, or click a tile's title.
+Settings that apply to every run live on the **Settings** page. Switch between **Axol**, **Mantis**, **Jelly** and **General** at the top of the page, or press **Open settings** on a card on **Devices**.
 
 **Axol settings**
 
@@ -186,9 +196,9 @@ Settings that apply to every run live in the **Settings** card below the tiles. 
 
 Recording fps above 60 raises the cameras' capture rate to match. The ZED X supports rates above 60 only at `SVGA`.
 
-**Saving.** Changes stay in your browser until you press **Save** (or **Discard**). Settings are saved on the host in `~/.almond/settings.json`, so every operation and every browser uses the same values. The [`axol` CLI](/cli/configuration#the-shared-settings-file) and the [SDK](/api/robot#shared-settings) read the same file. A field you haven't set shows its default in grey, and a changed field has a reset button.
+**Saving.** Changes stay in your browser until you press **Save** (or **Discard**). They are kept while you visit other pages, and a dot next to **Settings** in the sidebar shows that some are unsaved. Settings are saved on the host in `~/.almond/settings.json`, so every operation and every browser uses the same values. The [`axol` CLI](/cli/configuration#the-shared-settings-file) and the [SDK](/api/robot#shared-settings) read the same file. A field you haven't set shows its default in grey, and a changed field has a reset button.
 
-**Export** and **Import** at the bottom of the card save the whole settings file as JSON, or load one. Use them for backups or to copy settings to another robot. The [Settings File](/guides/control-panel-settings) page describes the file. Each operation's **Config Parameters** page, such as [Teleoperation](/operations/teleop-config), lists every setting with its default.
+**Export** and **Import** at the bottom of the settings save the whole settings file as JSON, or load one. Use them for backups or to copy settings to another robot. The [Settings File](/guides/control-panel-settings) page describes the file. Each operation's **Config Parameters** page, such as [Teleoperation](/operations/teleop-config), lists every setting with its default.
 
 ### Cameras
 
@@ -223,7 +233,7 @@ The Mantis **Head** slot starts unassigned. A slot you leave unassigned is off.
 
 The **Quest** tab under **General settings** runs the optional [Quest over USB](/guides/quest-over-usb) link. It sends the controller poses over a USB cable for lower latency. Camera video still uses the network.
 
-1. Plug the Quest into the robot's computer with a USB-C cable.
+1. Plug the Quest into the Host Computer with a USB-C cable.
 2. The first time, put the headset on and accept **Allow USB debugging?**.
 3. The link connects automatically and shows *Controller over USB*. Press **Connect** to retry if it doesn't.
 
@@ -233,12 +243,16 @@ For [headless](/guides/quest-headless) use, press **Keep awake** with the headse
 
 ## Operations
 
-Pick an operation from the selector, fill in its fields, and press **Start**. The panel asks only for values that change between runs, such as a dataset name or a policy path. Everything else is in [Settings](#settings).
+The **Operations** page shows every operation as a card, grouped into **Drive**, **Record** and **Play back**. Each card says what the operation needs, or what is in the way. **Quick start** on the **Overview** offers the ones you used last.
+
+Click a card to open the operation. Fill in its fields under **Run details** and press **Start**. The panel asks only for values that change between runs, such as a dataset name or a policy path. Everything else is in [Settings](#settings).
 
 - Hover the **ⓘ** next to a field for its description.
 - Some fields offer a list to pick from, such as the datasets on the host. You can still type your own value.
 - A few fields accept only values from their list. **Start** stays disabled with *Pick &lt;field&gt; from the list* until you pick one.
 - Your browser remembers these values for next time.
+
+While the operation starts, its screen shows what it is doing and how far along it is, such as **Warming up IK** at 40%. The **Overview** and the chip at the top of every page show the same. Once it is ready, it shows **Running** and how long it has run. Starting takes a few seconds to a minute, depending on the operation and on whether cameras, a dataset or a policy have to load.
 
 | Operation | Needs | What it does |
 |---|---|---|
@@ -262,9 +276,9 @@ Pick an operation from the selector, fill in its fields, and press **Start**. Th
 
 Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to preview a saved path in the browser. See [`waypoints`](/cli/waypoints).
 
-### Before you can start
+### Before you start
 
-**Start** stays disabled until the operation has what it needs. A **Before you can start** list says what is missing, for example:
+**Start** stays disabled until the operation has what it needs. A **Before you start** list says what is missing, with a button that opens the place to fix it, for example:
 
 - *Connect Axol*
 - *Choose what Axol is mounted on* (see [Axol version](#axol-version))
@@ -276,10 +290,12 @@ Fix tracker problems under **Mantis settings → Tracking** ([Mantis Tracking](/
 
 ### Logs and stopping
 
-The **Logs** console at the bottom shows the running operation's output, including messages from the ZED SDK, GStreamer and CUDA. When a camera fails, the reason appears here.
+The newest line of output shows below the operation. If the operation stops with an error, that line turns red and shows the error. Click it, or open **Logs** in the sidebar, to see the full output, including messages from the ZED SDK, GStreamer and CUDA.
 
-- The console follows new lines while you are scrolled to the bottom. Scroll up to read, and press the arrow button to jump back.
-- The download button saves the console to a `.log` file to attach to a bug report.
+- The log follows new lines while you are scrolled to the bottom. Scroll up to read, and press the arrow button to jump back.
+- The download button saves the log to a `.log` file to attach to a bug report.
+
+While an operation runs, its page shows how long it has run. Every other page shows its name at the top right, and **Operations** in the sidebar has a green dot. The **Overview** also shows it with **Open** and **Stop** buttons.
 
 Press **Stop** to end an operation. The badge shows **Stopping…** until the operation has shut down, then the robot returns to idle. You can disconnect Axol only when no operation is running.
 
@@ -322,21 +338,45 @@ With Axol or Mantis on Quest, the VR controllers also work, and whichever input 
 - Squeeze and release both rig triggers together to engage tracking and start a take. **Start recording** works only after the rig is engaged.
 - While recording, press either trigger three times to save, or four times to discard.
 
-## Dataset preview
+## Datasets
 
-The **Dataset preview** card appears below the operation panel for **Collect data**, **Collect DAgger** and **Run policy**. Press **Show**, then pick a dataset and an episode. All of the episode's cameras play side by side with one play button and scrub bar.
+The **Datasets** page plays the datasets on the host. Pick a dataset and an episode. All of the episode's cameras play side by side with one play button and scrub bar.
 
 The menu next to the scrub bar sets the playback rate: **15 fps** (the default), **30 fps** or the full recorded rate. Full rate with four cameras needs about 85 Mbps, more than most Wi-Fi or Tailscale links carry. Nothing downloads until you press play.
 
 **Rename a task.** Type the new task text, or pick one of the dataset's tasks, and press **Save task**. The change is written into the dataset, so replay and training see the new text.
 
-During a recording session, the card follows the dataset being recorded and selects each take once it is saved. You can review earlier takes and fix a mistyped task without stopping the session.
+During a recording session, the page follows the dataset being recorded and selects each take once it is saved. You can review earlier takes and fix a mistyped task without stopping the session.
+
+### Check an episode's robot data
+
+Under the videos, **Robot data** shows what the episode recorded, so you can check a teleop or Mantis take before you train on it. Everything follows the scrub bar. Click a chart to move to that moment.
+
+- **Checks** at the top flag dropped frames and the largest jump between two frames. A jump of more than 5° in a joint or 3 cm at a gripper is marked. It is usually a re-engage, lost tracking or a glitch. Click it to go to that frame.
+- **3D view.** The robot model replays the recorded joints, and a line shows each gripper's path. A marker shows the gripper at the current frame, with its axes. Mantis episodes record gripper poses, not joints, so the arms stay still and the paths show the motion.
+- **Charts.** **Joints** shows each arm's joint angles in degrees. **Gripper pose** shows each gripper's position in cm and its rotation in degrees. For Mantis it also shows the lag between the cameras and the trackers. **Gripper opening** shows how far open each gripper is.
+- **Show commanded** adds what the robot was told to do, drawn see-through. A gap between the two lines is the arm lagging its command.
+
+Gripper poses are in the robot's frame, at the gripper mount. For a joint episode, the panel works them out from the recorded joints. The 3D view uses the Axol version set under **Axol settings → Robot**.
+
+## Request data
+
+With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Overview**, **Teleoperation** and **Collect data** pages also have a card that leads there.
+
+1. Enter the hours of usable data you want. The form shows the hourly price and the total.
+2. Describe the task: what the robot should do, with which objects, and what counts as done.
+3. Optionally, add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
+4. Press **Continue to payment** and pay on Stripe's checkout page.
+
+You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
+
+The request needs an internet connection on the computer running the browser. To hide the card, press **×** on it. **Request data** stays in the sidebar.
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Diagnostics dashboard" icon="chart-line" href="/guides/diagnostics-dashboard">
-    Live motor telemetry, health tiles and diagnostic scripts on the `/diagnostics` page.
+    Live motor telemetry, health tiles and diagnostic scripts under **Diagnostics** in the sidebar.
   </Card>
   <Card title="serve reference" icon="terminal" href="/cli/serve">
     Flags, TLS, and what the server exposes.

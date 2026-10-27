@@ -5,7 +5,14 @@ import { Card } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 
 /** Auto-scrolling log viewer shared by the operation panels and setup page. */
-export function LogConsole({ lines }: { lines: string[] }) {
+export function LogConsole({
+  lines,
+  fill = false,
+}: {
+  lines: string[]
+  /** Fill the rest of the window (the Logs page) instead of a fixed box. */
+  fill?: boolean
+}) {
   const scrollRef = useRef<HTMLDivElement>(null)
   // Whether new lines should pull the view to the bottom. True while the user
   // is at (or near) the bottom; cleared once they scroll up so they can read
@@ -76,7 +83,10 @@ export function LogConsole({ lines }: { lines: string[] }) {
         <div
           ref={scrollRef}
           onScroll={handleScroll}
-          className="max-h-[60vh] min-h-[280px] overflow-auto px-4 pb-4 font-mono text-xs leading-relaxed"
+          className={cn(
+            "overflow-auto px-4 pb-4 font-mono text-xs leading-relaxed",
+            fill ? "h-[calc(100dvh-15rem)] min-h-[320px]" : "max-h-[60vh] min-h-[280px]"
+          )}
         >
           {lines.length === 0 ? (
             <p className="text-white/30">No output yet.</p>

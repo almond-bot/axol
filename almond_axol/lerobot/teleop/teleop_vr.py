@@ -52,6 +52,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
+from ... import progress
 from ...constants import AxolModel, Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
@@ -379,11 +380,13 @@ class AxolVRTeleop(Teleoperator):
         # Park early headset video requests until set_video_manager /
         # set_video_sources lands (they run after the caller's camera setup).
         self._vr_server.set_video_expected(self._video_expected)
+        progress.step("headset")
         await self._vr_server.enable()
 
         if self._jelly is not None:
             # Runs on this dedicated event loop, so Jelly's command task
             # lives here too — off the caller's synchronous control loop.
+            progress.step("jelly")
             await self._jelly.enable()
 
         ctx = multiprocessing.get_context("spawn")
@@ -430,6 +433,7 @@ class AxolVRTeleop(Teleoperator):
         child_conn.close()
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
+        progress.step("ik")
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ChevronDown,
   Download,
@@ -108,7 +108,7 @@ function cameraProfilesAfterEdit(
 }
 
 /**
- * The shared settings, directly on the control panel page, split by device:
+ * The shared settings on the control panel's Settings page, split by device:
  * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
  * **Mantis** (tracking source and setup, trigger calibration, head and wrist cameras, CAN), and
  * **General** (Quest, recording, inference, system, Advanced). Each
@@ -136,9 +136,16 @@ export function SettingsSection({
   activeCommandSession,
   onCommandSessionChange,
   axolConnected = false,
+  embedded = false,
+  onDirtyChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Rendered as the body of the Settings page: no collapsible header or
+   *  scope switcher (the page owns those), and nothing while closed. */
+  embedded?: boolean
+  /** Reports whether staged edits are waiting for Save. */
+  onDirtyChange?: (dirty: boolean) => void
   tab: SettingsTab
   onTabChange: (tab: SettingsTab) => void
   /** Server-stored settings + schema; null while loading or on an old host. */
@@ -176,6 +183,9 @@ export function SettingsSection({
     [draft, cameras, devices]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
 
   // Seed / reseed the draft from the stored state ("adjust state when props
   // change" — set during render, not in an effect). Do not seed while the
@@ -396,12 +406,15 @@ export function SettingsSection({
     mantisSourceSaved &&
     (draftMantisSource !== "quest" || draftQuestTrackerKey === storedQuestTrackerKey)
 
+  if (embedded && !open) return null
+
   return (
     <Card className="gap-0 p-0">
       <div
         className={cn(
           "flex w-full items-center gap-3 px-5 py-3.5",
-          open && "border-b border-white/10"
+          open && "border-b border-white/10",
+          embedded && "hidden"
         )}
       >
         <button
@@ -551,7 +564,7 @@ export function SettingsSection({
                   </div>
                 ) : (
                   <p className="text-sm text-white/40">
-                    Update Axol on the host to edit trigger calibration.
+                    Update Axol on the Host Computer to edit trigger calibration.
                   </p>
                 )}
               </div>
@@ -578,7 +591,7 @@ export function SettingsSection({
                   </div>
                 ) : (
                   <p className="text-sm text-white/40">
-                    Update Axol on the host to edit the CAN channels.
+                    Update Axol on the Host Computer to edit the CAN channels.
                   </p>
                 )}
               </div>
@@ -616,12 +629,12 @@ export function SettingsSection({
                 </div>
               ) : (
                 <p className="text-sm text-white/40">
-                  Update Axol on the host to edit Jelly&apos;s parameters.
+                  Update Axol on the Host Computer to edit Jelly&apos;s parameters.
                 </p>
               )
             ) : tab === "jelly" && !activeCategory ? (
               <p className="text-sm text-white/40">
-                Update Axol on the host to edit the wheel and lift switches.
+                Update Axol on the Host Computer to edit the wheel and lift switches.
               </p>
             ) : activeCategory ? (
               <CategoryPanel
@@ -718,9 +731,9 @@ function UpdateRequired({ error }: { error: string }) {
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
       <span className="font-medium text-amber-300/90">Update required</span>
       <p className="text-white/55">
-        Update Axol on the host to edit these settings. Use the update banner on the control panel
-        or run <span className="font-mono">axol update</span>, then reconnect. Camera settings work
-        without the update.
+        Update Axol on the Host Computer to edit these settings. Use the update banner on the
+        control panel or run <span className="font-mono">axol update</span>, then reconnect. Camera
+        settings work without the update.
       </p>
       <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">{error}</code>
     </div>
@@ -786,13 +799,13 @@ function UsbPanel({
   const hint = !usb
     ? "Checking for a headset on USB."
     : !usb.installed
-      ? "Install adb on the host, then reconnect the headset."
+      ? "Install adb on the Host Computer, then reconnect the headset."
       : usb.ready
         ? "Controller poses stream over the cable. If the cable drops, they switch to Wi-Fi."
         : usb.state === "device"
           ? "Headset found and connecting. Press Connect to retry."
           : usb.state === "none"
-            ? "Plug the Quest into the host with a USB-C cable."
+            ? "Plug the Quest into the Host Computer with a USB-C cable."
             : usb.state === "unauthorized"
               ? "Put the headset on and accept the “Allow USB debugging?” prompt."
               : "Reconnect the headset's USB cable."
@@ -800,7 +813,7 @@ function UsbPanel({
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
         Stream controller poses over USB instead of Wi-Fi for lower latency. The link starts when
-        you plug an authorized headset into the host. Camera video still uses the network.
+        you plug an authorized headset into the Host Computer. Camera video still uses the network.
       </p>
       <div className="flex max-w-xl flex-col gap-1.5">
         <div className="flex items-center justify-between gap-4">

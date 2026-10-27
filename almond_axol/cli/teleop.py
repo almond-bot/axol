@@ -34,6 +34,7 @@ import os
 import socket
 from typing import TYPE_CHECKING, Any
 
+from .. import progress
 from ..utils import affinity
 from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.network import local_ip
@@ -433,6 +434,8 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
     from ..robot.jelly import Jelly
     from ..vr import VRServer
 
+    progress.plan(["jelly", "headset"])
+    progress.step("jelly")
     jelly = Jelly(jelly_cfg)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
@@ -447,7 +450,9 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
         "to stop); the arms are untouched"
     )
     try:
+        progress.step("headset")
         async with server:
+            progress.ready()
             await asyncio.Event().wait()  # until Ctrl-C / supervisor stop
     finally:
         if imu_src is not None:
@@ -584,6 +589,12 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         vr_server_config=cfg.vr_server,
         jelly=jelly,
     )
+    progress.plan(
+        ["headset", "arms"]
+        + (["jelly"] if jelly is not None else [])
+        + ["ik"]
+        + (["cameras"] if cfg.cameras else [])
+    )
     if cfg.cameras:
         # The VR server accepts headsets long before the cameras finish
         # opening (IK compile + relay bring-up can take minutes). Declare
@@ -595,6 +606,8 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
         # in-process sources when it isn't applicable.
+        if cfg.cameras:
+            progress.step("cameras")
         stereo_set = await asyncio.to_thread(_stereo_serials_for, cfg)
         relay = await asyncio.to_thread(_start_video_relay, cfg, stereo_set)
         cameras: list[tuple[str, Any]] = []

@@ -42,6 +42,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, AxolModel
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
@@ -398,6 +399,7 @@ class VRTeleop:
                 "previous teleop cleanup is incomplete; retry disable() before "
                 "starting another session"
             )
+        progress.step("headset")
         self._vr_stop.clear()
         self._vr_ready.clear()
         self._vr_start_error = None
@@ -414,6 +416,7 @@ class VRTeleop:
         # session settings (their controls mirror the server; see set_announce).
         self._live.announce()
 
+        progress.step("arms")
         await self._robot.enable()
         pos_l, pos_r = await self._robot.get_positions()
         # The startup trajectory plays from here to rest unsupervised; refuse
@@ -423,6 +426,7 @@ class VRTeleop:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
+            progress.step("jelly")
             await self._jelly.enable()
 
         self._core.set_initial_grips(
@@ -472,6 +476,7 @@ class VRTeleop:
             raise
         child_conn.close()
 
+        progress.step("ik")
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
@@ -936,6 +941,7 @@ class VRTeleop:
             # starting (read-only home, full disk, etc.).
             _logger.warning("could not publish teleop timing boundary: %s", exc)
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
+        progress.ready()
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
         deadline = time.perf_counter()

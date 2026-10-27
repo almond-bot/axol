@@ -36,6 +36,7 @@ from typing import Any, Callable
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..mantis.relative import quat_xyzw_to_rotvec
@@ -383,6 +384,8 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         )
 
     _logger.info(f"Loading episode {episode} from {dataset_root}.")
+    progress.plan(["dataset", "arms", "home"])
+    progress.step("dataset")
     try:
         dataset = LeRobotDataset(repo_id, root=str(dataset_root), episodes=[episode])
     except Exception as exc:  # noqa: BLE001 - surface a clean message
@@ -613,6 +616,9 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     session_error: BaseException | None = None
     try:
         _logger.info("Connecting robot...")
+        if recorded_cartesian:
+            progress.plan(["dataset", "arms", "ik", "home"])
+        progress.step("arms")
         robot.connect()
         # The first return to rest plays unsupervised; refuse it from far away.
         check_start_pose(robot.positions)
@@ -622,13 +628,16 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # the return-to-rest below instead of stalling the first replayed frame.
         if recorded_cartesian:
             _logger.info("Preparing Cartesian action solver (IK)...")
+            progress.step("ik")
             robot.prepare_cartesian_actions()
 
         # Start every take from rest, the same place collect-data records from,
         # so the first replayed action is ~rest and there's no jump. The first
         # home goes through zero, the arms' natural resting pose.
         arms_moved = True
+        progress.step("home")
         _go_to_rest("Returning to rest pose (through zero).", startup=True)
+        progress.ready()
 
         loop = bool(cfg.loop)
         interp_note = (

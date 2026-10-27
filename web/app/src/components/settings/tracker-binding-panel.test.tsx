@@ -349,7 +349,7 @@ describe("Lighthouse validation", () => {
     await render()
     expect(button("Validate tracking").disabled).toBe(true)
     expect(button("Recalibrate Lighthouse").disabled).toBe(true)
-    expect(container.textContent).toContain("Update Axol on the host")
+    expect(container.textContent).toContain("Update Axol on the Host Computer")
   })
 
   it("expires an old pass even while the next host response is pending", async () => {

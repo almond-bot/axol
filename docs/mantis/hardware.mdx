@@ -15,7 +15,7 @@ Each rig has:
 - An analog **trigger** that opens and closes the gripper. The further you squeeze, the further the gripper closes.
 - A mount for a **pose tracker**: a Meta Quest controller, a VIVE Tracker 3.0 or a VIVE Ultimate Tracker.
 
-In the control panel, Mantis appears as its own device next to Axol, with its own tile and settings. Mantis supports **Teleoperation** and **Data collection**. The other operations are for Axol only.
+In the control panel, Mantis appears as its own device next to Axol, with its own card and settings. Mantis supports **Teleoperation** and **Data collection**. The other operations are for Axol only.
 
 ## Overview
 
@@ -95,7 +95,7 @@ Set up Mantis in this order:
     Plug the hub's USB cable into the computer, then power both rigs. The computer finds the hub and works out which rig is left and which is right. If you unplug the hub and plug it back in, it reconnects on its own.
   </Step>
   <Step title="Let the control panel identify it">
-    Open the [control panel](/guides/control-panel#connections) and connect to the **Axol Host**. The panel identifies a new hub on its own while both rigs are powered. If it can't, power the rigs and press **Connect** or **Retry CAN identification**. You can also run [`axol can.setup`](/cli/can-setup) in a terminal.
+    Open the [control panel](/guides/control-panel#connections) and connect to the **Host Computer**. The panel identifies a new hub on its own while both rigs are powered. If it can't, power the rigs: the panel checks again on its own and connects them. You can also run [`axol can.setup`](/cli/can-setup) in a terminal.
   </Step>
 </Steps>
 
@@ -107,17 +107,17 @@ Set up Mantis in this order:
 
 <Steps>
   <Step title="Select Mantis">
-    Press **Select** on the **Mantis** tile. Teleoperation and data collection now run on the rigs, and the Axol-only operations are hidden until you select Axol again. The choice is saved on the computer, so everyone who uses the control panel sees it.
+    Press **Use for operations** on the **Mantis** card. Teleoperation and data collection now run on the rigs, and the Axol-only operations are hidden until you select Axol again. The choice is saved on the computer, so everyone who uses the control panel sees it.
 
     <Frame>
-      <img src="/assets/mantis_tile.png" alt="The Mantis tile in the control panel's connections bar, selected and awaiting hardware" width="320" style={{ margin: "0 auto" }} />
+      <img src="/assets/mantis_card.png" alt="The Mantis card on the control panel's Devices page, selected and waiting for hardware" width="480" style={{ margin: "0 auto" }} />
     </Frame>
   </Step>
   <Step title="Connect">
-    When Mantis is selected and the hub is found, the panel connects on its own. If it doesn't, press **Connect** on the tile. The tile then shows the status of both grippers. A red square means a gripper can't be reached or has a fault. Fix it before you run an operation.
+    When Mantis is selected and the hub is found, the panel connects on its own. If it doesn't, press **Connect** on the card. The card then shows the status of both grippers. A red square means a gripper can't be reached or has a fault. Fix it before you run an operation.
   </Step>
   <Step title="Check the left and right sides">
-    Click the title of the Mantis tile to open **Mantis settings**, then open **CAN**. The left and right fields must be filled in and different. The defaults are `can_mantis_l` and `can_mantis_r`. If squeezing the **left** trigger moves the **right** input, swap the two values, save and reconnect. You don't need to move any cables.
+    Press **Open settings** on the Mantis card to open **Mantis settings**, then open **CAN**. The left and right fields must be filled in and different. The defaults are `can_mantis_l` and `can_mantis_r`. If squeezing the **left** trigger moves the **right** input, swap the two values, save and reconnect. You don't need to move any cables.
 
     <Frame>
       <img src="/assets/mantis_can.png" alt="Mantis settings CAN tab with the left and right channel fields at their defaults" style={{ margin: "0 auto" }} />

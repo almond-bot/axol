@@ -39,8 +39,8 @@ createRoot(document.getElementById("root")!).render(
           <Routes>
             <Route path="/" element={<RootRedirect />} />
             <Route path="/vr" element={<VrApp />} />
-            <Route path="/control" element={<ControlPanel />} />
-            <Route path="/diagnostics" element={<Diagnostics />} />
+            <Route path="/control/*" element={<ControlPanel />} />
+            <Route path="/diagnostics/*" element={<Diagnostics />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

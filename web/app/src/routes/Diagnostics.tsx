@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { discoveryNeedsRecheck, discoveryNotice, useSettledDiscovery } from "@/lib/hardware-status"
+import { Navigate, useLocation, useNavigate } from "react-router-dom"
 import {
-  Activity,
   Cable,
   Crosshair,
   ClipboardList,
@@ -14,7 +15,7 @@ import {
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { SiteNav } from "@/components/site-nav"
+import { AppShell, PageSection } from "@/components/app-shell"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
@@ -180,8 +181,22 @@ const HARDWARE_DEFAULTS: Record<HardwareProfile, Record<"left" | "right", string
  * the server decodes the task's own CAN traffic through a passive observer
  * socket, so the charts stay live throughout.
  */
+/** The diagnostics pages, listed under Diagnostics in the sidebar. */
+const DIAGNOSTICS_TABS = [
+  { key: "", label: "Live" },
+  { key: "tests", label: "Tests and helpers" },
+  { key: "tuning", label: "Tuning" },
+  { key: "history", label: "Run history" },
+] as const
+
+type DiagnosticsTab = (typeof DIAGNOSTICS_TABS)[number]["key"]
+
 export default function Diagnostics() {
   const toast = useToast()
+  const location = useLocation()
+  const navigate = useNavigate()
+  const tabKey = location.pathname.replace(/^\/diagnostics\/?/, "").split("/")[0] ?? ""
+  const tab = DIAGNOSTICS_TABS.find((t) => t.key === tabKey)?.key as DiagnosticsTab | undefined
   const [serverOk, setServerOk] = useState(false)
   const [commands, setCommands] = useState<CommandSpec[]>([])
   const [robot, setRobot] = useState<RobotStatus | null>(null)
@@ -212,7 +227,6 @@ export default function Diagnostics() {
     []
   )
   const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
-  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries (or a 404) identifies an
   // older host. It cannot distinguish attached roles, so only retain the
   // historical profile already reported by that host's robot status.
@@ -552,7 +566,6 @@ export default function Diagnostics() {
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     autoJellyAttemptsRef.current.clear()
     manualJellyOverrideRef.current.clear()
   }, [canServerInstanceId, resetAutoRobotRetry])
@@ -680,10 +693,10 @@ export default function Diagnostics() {
     [toast]
   )
 
-  const canDiscoveryNeedsRetry =
-    canDiscovery?.status === "partial" ||
-    canDiscovery?.status === "unidentified" ||
-    canDiscovery?.status === "error"
+  const settledCanDiscovery = useSettledDiscovery(canDiscovery)
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(settledCanDiscovery)
+  const hardwareNotice = discoveryNotice(settledCanDiscovery)
+  const canDiscoveryChecking = canDiscoveryRetryBusy || canDiscovery?.status === "running"
   const retryCanIdentification = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
     setCanDiscoveryRetryBusy(true)
@@ -692,18 +705,11 @@ export default function Diagnostics() {
       if (!autoRobotMountedRef.current) return
       canInventoryKnownRef.current = true
       installCanInventory(inventory)
-      const result = inventory.discovery
-      if (result?.status === "configured" || result?.status === "ready") {
-        toast.success("CAN hardware identified")
-      } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware is still unidentified.")
-      } else {
-        toast.error(result?.message ?? "CAN hardware could not be identified.")
+      if (inventory.discovery?.status === "configured" || inventory.discovery?.status === "ready") {
+        toast.success("Hardware found")
       }
-    } catch (error) {
-      if (autoRobotMountedRef.current) {
-        toast.error(`CAN identification failed: ${String(error)}`)
-      }
+    } catch {
+      // Busy or rate-limited: the notice stays until the hardware answers.
     } finally {
       if (autoRobotMountedRef.current) setCanDiscoveryRetryBusy(false)
     }
@@ -716,7 +722,6 @@ export default function Diagnostics() {
   useEffect(() => {
     if (!serverOk) {
       automaticCanDiscoveryAttemptsRef.current.clear()
-      canDiscoveryNoticesRef.current.clear()
       return
     }
     if (!canDiscovery) return
@@ -747,10 +752,6 @@ export default function Diagnostics() {
         if (canDiscoveryRequestCanRetry(error)) {
           automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
         }
-        const noticeKey = `request:${attemptKey}`
-        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-        canDiscoveryNoticesRef.current.add(noticeKey)
-        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
       })
   }, [
     activeRun,
@@ -766,26 +767,6 @@ export default function Diagnostics() {
     serverOk,
     toast,
   ])
-
-  useEffect(() => {
-    if (
-      !serverOk ||
-      !canDiscovery ||
-      (canDiscovery.status !== "partial" &&
-        canDiscovery.status !== "unidentified" &&
-        canDiscovery.status !== "error")
-    )
-      return
-    const noticeKey = `${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
-    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-    canDiscoveryNoticesRef.current.add(noticeKey)
-    const fallback =
-      canDiscovery.status === "unidentified"
-        ? "Power on the attached hardware, then press Retry CAN identification."
-        : "Run axol can.setup in a terminal if the problem continues."
-    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
-    else toast.error(canDiscovery.message ?? fallback)
-  }, [canDiscovery, canServerInstanceId, currentCanServerEpoch, serverOk, toast])
 
   // Direct navigation to Diagnostics still brings up an unambiguous host, but
   // this route is never a second profile-policy authority. With both profiles
@@ -1189,301 +1170,321 @@ export default function Diagnostics() {
   const lastT = Math.max(motorLastT, timingLastT) || windowSec
   const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
+  if (tab === undefined) return <Navigate to="/diagnostics" replace />
+
+  const storedHost = localStorage.getItem("axolServerHost") ?? ""
+  const tabLabel = DIAGNOSTICS_TABS.find((t) => t.key === tab)?.label ?? ""
+
   return (
-    <div className="min-h-screen">
-      <SiteNav
-        current="diagnostics"
-        right={
-          <span className="mr-1 hidden items-center gap-2 sm:flex">
-            <Activity className="size-4 text-white/30" />
-            <Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>
-          </span>
+    <>
+      <AppShell
+        title={tab === "" ? "Diagnostics" : `Diagnostics: ${tabLabel}`}
+        wide
+        actions={<Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>}
+        host={{
+          dot: serverOk ? "ok" : "err",
+          label: serverOk ? storedHost || "Connected" : "Can't reach the robot",
+          onClick: () => navigate("/control/devices"),
+        }}
+        subNav={{
+          under: "/diagnostics",
+          items: DIAGNOSTICS_TABS.map((t) => ({
+            to: t.key ? `/diagnostics/${t.key}` : "/diagnostics",
+            label: t.label,
+          })),
+        }}
+        notices={
+          <>
+            {serverOk && canDiscoveryNeedsRetry && hardwareNotice && (
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
+                <p
+                  className="min-w-0 flex-1 text-sm text-amber-100/80"
+                  title={settledCanDiscovery?.message ?? undefined}
+                >
+                  {hardwareNotice.text}
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void retryCanIdentification()}
+                  disabled={
+                    canDiscoveryChecking ||
+                    hardwareSessionBusy ||
+                    launchBusy ||
+                    robotBusy ||
+                    activeRun !== null
+                  }
+                >
+                  {canDiscoveryChecking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+                  Check again
+                </Button>
+              </div>
+            )}
+
+            {/* Robot link gate */}
+            {robot && robot.state === "disconnected" && (
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+                <p className="text-sm text-white/60">
+                  {robot.profile === "mantis" ? "Mantis" : "Axol"} is disconnected. Connect it to
+                  see motor telemetry.
+                </p>
+                <div className="ml-auto flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAdapterOpen(true)}
+                    disabled={robotBusy || hardwareSessionBusy || launchBusy}
+                    title="Choose Axol or Mantis and the CAN interfaces to inspect."
+                  >
+                    <Cable /> Choose CAN adapter
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void connectRobot()}
+                    disabled={robotBusy || hardwareSessionBusy || launchBusy}
+                  >
+                    {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect{" "}
+                    {robot.profile === "mantis" ? "Mantis" : "Axol"}
+                  </Button>
+                </div>
+              </div>
+            )}
+            {robot?.state === "error" && robot.error && (
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3">
+                <p className="text-xs text-red-200/80">{robot.error}</p>
+                <div className="ml-auto flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setAdapterOpen(true)}
+                    disabled={robotBusy || hardwareSessionBusy || launchBusy}
+                    title="Choose Axol or Mantis and the CAN interfaces to inspect."
+                  >
+                    <Cable /> Choose CAN adapter
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => void connectRobot()}
+                    disabled={robotBusy || hardwareSessionBusy || launchBusy}
+                  >
+                    {robotBusy ? <Loader2 className="animate-spin" /> : null} Retry
+                  </Button>
+                </div>
+              </div>
+            )}
+          </>
         }
-      />
-      <main className="safe-x mx-auto flex max-w-6xl flex-col gap-8 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        {serverOk && canDiscoveryNeedsRetry && (
-          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
-            <p className="min-w-0 flex-1 text-xs text-amber-100/80">
-              {canDiscovery?.message ??
-                "CAN hardware is attached but not yet identified as Axol, Mantis, or Jelly."}{" "}
-              Power on the hardware, then retry. The robot link may drop briefly during the check.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void retryCanIdentification()}
-              disabled={
-                canDiscoveryRetryBusy ||
-                hardwareSessionBusy ||
-                launchBusy ||
-                robotBusy ||
-                activeRun !== null
-              }
-            >
-              {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              Retry CAN identification
-            </Button>
-          </div>
-        )}
-
-        {/* Robot link gate */}
-        {robot && robot.state === "disconnected" && (
-          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
-            <p className="text-sm text-white/60">
-              {robot.profile === "mantis" ? "Mantis" : "Axol"} is disconnected. Connect it to see
-              motor telemetry.
-            </p>
-            <div className="ml-auto flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setAdapterOpen(true)}
-                disabled={robotBusy || hardwareSessionBusy || launchBusy}
-                title="Choose Axol or Mantis and the CAN interfaces to inspect."
-              >
-                <Cable /> Choose CAN adapter
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => void connectRobot()}
-                disabled={robotBusy || hardwareSessionBusy || launchBusy}
-              >
-                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect{" "}
-                {robot.profile === "mantis" ? "Mantis" : "Axol"}
-              </Button>
-            </div>
-          </div>
-        )}
-        {robot?.state === "error" && robot.error && (
-          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3">
-            <p className="text-xs text-red-200/80">{robot.error}</p>
-            <div className="ml-auto flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setAdapterOpen(true)}
-                disabled={robotBusy || hardwareSessionBusy || launchBusy}
-                title="Choose Axol or Mantis and the CAN interfaces to inspect."
-              >
-                <Cable /> Choose CAN adapter
-              </Button>
-              <Button
-                size="sm"
-                onClick={() => void connectRobot()}
-                disabled={robotBusy || hardwareSessionBusy || launchBusy}
-              >
-                {robotBusy ? <Loader2 className="animate-spin" /> : null} Retry
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {/* Every CAN-attached device: Axol / Mantis (the telemetry link's two
+      >
+        {tab === "" && (
+          <>
+            {/* Every CAN-attached device: Axol / Mantis (the telemetry link's two
             profiles) plus Jelly's wheels and lift on their own adapters. */}
-        <section className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <h2 className="font-heading text-base font-semibold">Hardware</h2>
-            <span className="text-xs text-white/40">
-              Only one of Axol and Mantis can be connected at a time. Jelly&apos;s wheels and lift
-              connect separately.
-            </span>
-          </div>
-          <HardwareOverview
-            online={serverOk}
-            robot={robot}
-            robotBusy={robotBusy}
-            canProfiles={canProfiles}
-            hardwareBusy={activeRun != null || hardwareSessionBusy || launchBusy}
-            onRobotConnect={(profile) => void connectRobot(profile)}
-            onRobotDisconnect={() => void disconnectRobot()}
-            jelly={jelly}
-            jellySupported={jellySupported}
-            jellyBusy={jellyBusy}
-            canDevices={canDevices}
-            onJellyConnect={(device) => void connectJelly(device)}
-            onJellyDisconnect={(device) => void disconnectJelly(device)}
-          />
-        </section>
-
-        {/* Motor status */}
-        <section className="flex flex-col gap-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <h2 className="font-heading text-base font-semibold">
-              {robot?.profile === "mantis" ? "Mantis motors" : "Axol motors"}
-            </h2>
-            {robot && (
-              <span className="text-xs text-white/40">
-                {robot.reachableCount}/{robot.motorCount} reachable
-              </span>
-            )}
-            <div className="ml-auto flex flex-wrap items-center gap-2">
-              {(["can.setup", "can.enable"] as const).map((id) => {
-                const cmd = canCommand(id)
-                if (!cmd) return null
-                const running = activeRun?.command === id
-                // CAN enable is the page's home for the arm→adapter mapping:
-                // it opens the adapter dialog, whose Save & connect persists
-                // the choice and brings the interfaces up. Reopen it any time
-                // to remap. can.setup stays a direct launch (hub provisioning
-                // with visible output).
-                const onClick = running
-                  ? stopActive
-                  : id === "can.enable"
-                    ? () => setAdapterOpen(true)
-                    : () => launch(id, {})
-                return (
-                  <Button
-                    key={id}
-                    variant="outline"
-                    size="sm"
-                    title={
-                      id === "can.enable"
-                        ? "Choose the CAN adapter for each arm and bring the interfaces up. Every run uses this mapping."
-                        : cmd.description
-                    }
-                    disabled={
-                      !serverOk || launchBusy || busyElsewhere || (activeRun != null && !running)
-                    }
-                    onClick={onClick}
-                  >
-                    {running ? (
-                      <Loader2 className="animate-spin" />
-                    ) : id === "can.setup" ? (
-                      <Wrench />
-                    ) : (
-                      <Cable />
-                    )}
-                    {running ? `Stop ${cmd.label}` : cmd.label}
-                  </Button>
-                )
-              })}
-              {visibleMotorTools.map((tool) => {
-                const cmd = canCommand(tool.command)
-                if (!cmd) return null
-                return (
-                  <Button
-                    key={tool.key}
-                    variant="outline"
-                    size="sm"
-                    title={tool.description ?? cmd.description}
-                    disabled={!serverOk || busyElsewhere}
-                    onClick={() => setMotorTool(tool.key)}
-                  >
-                    <tool.icon /> {tool.label}
-                  </Button>
-                )
-              })}
-            </div>
-          </div>
-          {(["left", "right"] as ArmSide[]).map((side) => (
-            <div key={side} className="flex flex-col gap-2">
-              <span className="text-xs font-medium tracking-wide text-white/45 uppercase">
-                {side} {robot?.profile === "mantis" ? "gripper" : "arm"}
-              </span>
-              <MotorGrid
-                arm={side}
-                slow={stream.slow}
-                frames={stream.frames}
-                version={stream.version}
-                canInspect={linkState === "connected"}
-                joints={joints}
+            <PageSection
+              title="Hardware"
+              description="Only one of Axol and Mantis can be connected at a time. Jelly's wheels and lift connect separately."
+            >
+              <HardwareOverview
+                online={serverOk}
+                robot={robot}
+                robotBusy={robotBusy}
+                canProfiles={canProfiles}
+                hardwareBusy={activeRun != null || hardwareSessionBusy || launchBusy}
+                onRobotConnect={(profile) => void connectRobot(profile)}
+                onRobotDisconnect={() => void disconnectRobot()}
+                jelly={jelly}
+                jellySupported={jellySupported}
+                jellyBusy={jellyBusy}
+                canDevices={canDevices}
+                onJellyConnect={(device) => void connectJelly(device)}
+                onJellyDisconnect={(device) => void disconnectJelly(device)}
               />
-            </div>
-          ))}
-        </section>
+            </PageSection>
 
-        <ControlHealth
-          frames={stream.timingFrames}
-          version={stream.version}
-          nowT={lastT}
-          view={view}
-          onViewChange={setPinnedView}
-        />
+            {/* Motor status */}
+            <section className="flex flex-col gap-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <h2 className="font-heading text-base font-semibold">
+                  {robot?.profile === "mantis" ? "Mantis motors" : "Axol motors"}
+                </h2>
+                {robot && (
+                  <span className="text-xs text-white/40">
+                    {robot.reachableCount}/{robot.motorCount} reachable
+                  </span>
+                )}
+                <div className="flex basis-full flex-wrap items-center gap-2">
+                  {(["can.setup", "can.enable"] as const).map((id) => {
+                    const cmd = canCommand(id)
+                    if (!cmd) return null
+                    const running = activeRun?.command === id
+                    // CAN enable is the page's home for the arm→adapter mapping:
+                    // it opens the adapter dialog, whose Save & connect persists
+                    // the choice and brings the interfaces up. Reopen it any time
+                    // to remap. can.setup stays a direct launch (hub provisioning
+                    // with visible output).
+                    const onClick = running
+                      ? stopActive
+                      : id === "can.enable"
+                        ? () => setAdapterOpen(true)
+                        : () => launch(id, {})
+                    return (
+                      <Button
+                        key={id}
+                        variant="outline"
+                        size="sm"
+                        title={
+                          id === "can.enable"
+                            ? "Choose the CAN adapter for each arm and bring the interfaces up. Every run uses this mapping."
+                            : cmd.description
+                        }
+                        disabled={
+                          !serverOk ||
+                          launchBusy ||
+                          busyElsewhere ||
+                          (activeRun != null && !running)
+                        }
+                        onClick={onClick}
+                      >
+                        {running ? (
+                          <Loader2 className="animate-spin" />
+                        ) : id === "can.setup" ? (
+                          <Wrench />
+                        ) : (
+                          <Cable />
+                        )}
+                        {running ? `Stop ${cmd.label}` : cmd.label}
+                      </Button>
+                    )
+                  })}
+                  {visibleMotorTools.map((tool) => {
+                    const cmd = canCommand(tool.command)
+                    if (!cmd) return null
+                    return (
+                      <Button
+                        key={tool.key}
+                        variant="outline"
+                        size="sm"
+                        title={tool.description ?? cmd.description}
+                        disabled={!serverOk || busyElsewhere}
+                        onClick={() => setMotorTool(tool.key)}
+                      >
+                        <tool.icon /> {tool.label}
+                      </Button>
+                    )
+                  })}
+                </div>
+              </div>
+              {(["left", "right"] as ArmSide[]).map((side) => (
+                <div key={side} className="flex flex-col gap-2">
+                  <span className="text-xs font-medium tracking-wide text-white/45 uppercase">
+                    {side} {robot?.profile === "mantis" ? "gripper" : "arm"}
+                  </span>
+                  <MotorGrid
+                    arm={side}
+                    slow={stream.slow}
+                    frames={stream.frames}
+                    version={stream.version}
+                    canInspect={linkState === "connected"}
+                    joints={joints}
+                  />
+                </div>
+              ))}
+            </section>
 
-        {/* Live charts */}
-        <section className="flex flex-col gap-3">
-          {/* One filter row scoping every chart below it. */}
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="mr-2 font-heading text-base font-semibold">Live telemetry</h2>
-            <div className="flex overflow-hidden rounded-md border border-white/10">
-              {METRICS.map((m) => (
-                <button
-                  key={m.key}
-                  type="button"
-                  onClick={() => {
-                    setMetricKey(m.key)
-                    localStorage.setItem("axolDiagMetric", m.key)
-                  }}
-                  className={cn(
-                    "px-2.5 py-1 text-xs transition-colors",
-                    metricKey === m.key
-                      ? "bg-[#eff483]/15 text-[#eff483]"
-                      : "text-white/50 hover:bg-white/[0.05]"
-                  )}
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-            <div className="flex overflow-hidden rounded-md border border-white/10">
-              {WINDOWS.map((w) => (
-                <button
-                  key={w.seconds}
-                  type="button"
-                  onClick={() => {
-                    setWindowSec(w.seconds)
-                    setPinnedView(null)
-                  }}
-                  className={cn(
-                    "px-2.5 py-1 text-xs transition-colors",
-                    pinnedView == null && windowSec === w.seconds
-                      ? "bg-[#eff483]/15 text-[#eff483]"
-                      : "text-white/50 hover:bg-white/[0.05]"
-                  )}
-                >
-                  {w.label}
-                </button>
-              ))}
-            </div>
-            {pinnedView != null && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-[#eff483]/90"
-                onClick={() => setPinnedView(null)}
-              >
-                <Radio /> Go live
-              </Button>
-            )}
-          </div>
-          <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} joints={joints} />
-          <p className="text-xs text-white/30">
-            Scroll to zoom and drag to pan. Zooming pauses the live view until you press Go live.
-          </p>
-          {/* One metric at a time — the toggle row above picks it (temperature
+            <ControlHealth
+              frames={stream.timingFrames}
+              version={stream.version}
+              nowT={lastT}
+              view={view}
+              onViewChange={setPinnedView}
+            />
+
+            {/* Live charts */}
+            <section className="flex flex-col gap-3">
+              {/* One filter row scoping every chart below it. */}
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="mr-2 font-heading text-base font-semibold">Live telemetry</h2>
+                <div className="flex overflow-hidden rounded-md border border-white/10">
+                  {METRICS.map((m) => (
+                    <button
+                      key={m.key}
+                      type="button"
+                      onClick={() => {
+                        setMetricKey(m.key)
+                        localStorage.setItem("axolDiagMetric", m.key)
+                      }}
+                      className={cn(
+                        "px-2.5 py-1 text-xs transition-colors",
+                        metricKey === m.key
+                          ? "bg-[#eff483]/15 text-[#eff483]"
+                          : "text-white/50 hover:bg-white/[0.05]"
+                      )}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="flex overflow-hidden rounded-md border border-white/10">
+                  {WINDOWS.map((w) => (
+                    <button
+                      key={w.seconds}
+                      type="button"
+                      onClick={() => {
+                        setWindowSec(w.seconds)
+                        setPinnedView(null)
+                      }}
+                      className={cn(
+                        "px-2.5 py-1 text-xs transition-colors",
+                        pinnedView == null && windowSec === w.seconds
+                          ? "bg-[#eff483]/15 text-[#eff483]"
+                          : "text-white/50 hover:bg-white/[0.05]"
+                      )}
+                    >
+                      {w.label}
+                    </button>
+                  ))}
+                </div>
+                {pinnedView != null && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-[#eff483]/90"
+                    onClick={() => setPinnedView(null)}
+                  >
+                    <Radio /> Go live
+                  </Button>
+                )}
+              </div>
+              <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} joints={joints} />
+              <p className="text-xs text-white/30">
+                Scroll to zoom and drag to pan. Zooming pauses the live view until you press Go
+                live.
+              </p>
+              {/* One metric at a time — the toggle row above picks it (temperature
               reads the 1 Hz sweep buffer) — charted as a left/right pair
               sharing the same time view so both arms read at once; the header
               button on each chart takes it truly full screen. */}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            {(["left", "right"] as ArmSide[]).map((side) => (
-              <TelemetryChart
-                key={side}
-                title={`${metric.title}, ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
-                unit={metric.unit}
-                series={seriesBySide[side]}
-                frames={chartFrames}
-                version={stream.version}
-                metric={metric.metric}
-                scale={metric.scale}
-                view={view}
-                onViewChange={setPinnedView}
-                quietReason={quietReason}
-                height={340}
-                gapBreakS={metric.slow ? 5 : undefined}
-              />
-            ))}
-          </div>
-        </section>
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                {(["left", "right"] as ArmSide[]).map((side) => (
+                  <TelemetryChart
+                    key={side}
+                    title={`${metric.title}, ${side} ${robot?.profile === "mantis" ? "gripper" : "arm"}`}
+                    unit={metric.unit}
+                    series={seriesBySide[side]}
+                    frames={chartFrames}
+                    version={stream.version}
+                    metric={metric.metric}
+                    scale={metric.scale}
+                    view={view}
+                    onViewChange={setPinnedView}
+                    quietReason={quietReason}
+                    height={340}
+                    gapBreakS={metric.slow ? 5 : undefined}
+                  />
+                ))}
+              </div>
+            </section>
+          </>
+        )}
 
         {/* Each Diagnostics command has exactly one home: Tests or Helpers
             below, or a tab of the tuning workbench for the "tuning" section
@@ -1491,7 +1492,15 @@ export default function Diagnostics() {
             test, stays CLI-only). */}
 
         {/* Tests: pass/fail checks (ROM soak, lift cycle, camera cable). */}
-        {testCommands.length > 0 && (
+        {tab === "tests" && testCommands.length === 0 && helperCommands.length === 0 && (
+          <div className="flex min-h-48 items-center justify-center rounded-xl border border-dashed border-white/10 p-6 text-center text-sm text-white/45">
+            {serverOk
+              ? "This Host Computer has no tests or helpers. Update Axol on it to get them."
+              : "Connect to the Host Computer to see its tests and helpers."}
+          </div>
+        )}
+
+        {tab === "tests" && testCommands.length > 0 && (
           <section className="flex flex-col gap-3">
             <h2 className="font-heading text-base font-semibold">Tests</h2>
             <DiagnosticActions
@@ -1509,7 +1518,7 @@ export default function Diagnostics() {
         )}
 
         {/* Helpers: utility moves (ROM cleanup, lift homing / height). */}
-        {helperCommands.length > 0 && (
+        {tab === "tests" && helperCommands.length > 0 && (
           <section className="flex flex-col gap-3">
             <h2 className="font-heading text-base font-semibold">Helpers</h2>
             <DiagnosticActions
@@ -1528,20 +1537,31 @@ export default function Diagnostics() {
 
         {/* Tuning workbench: inline sine/step/motion/analysis launches with
             the resulting graphs, scorecards, and A/B compare in place. */}
-        <TuningWorkbench
-          enabled={serverOk}
-          commands={commands}
-          activeCommand={activeRun?.command ?? null}
-          busy={launchBusy}
-          disabled={busyElsewhere}
-          liveLines={activeLines}
-          onLaunch={launch}
-          onStop={stopActive}
-        />
+        {/* Kept mounted on every tab so a run's charts and A/B picks survive a
+            look at another page. */}
+        <div className={cn(tab !== "tuning" && "hidden")}>
+          <TuningWorkbench
+            enabled={serverOk}
+            commands={commands}
+            activeCommand={activeRun?.command ?? null}
+            busy={launchBusy}
+            disabled={busyElsewhere}
+            liveLines={activeLines}
+            onLaunch={launch}
+            onStop={stopActive}
+          />
+        </div>
 
         {/* Run history */}
-        <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />
-      </main>
+        {tab === "history" && (
+          <RunHistory
+            runs={runs}
+            loading={runsLoading}
+            onRefresh={refreshRuns}
+            onClear={clearRuns}
+          />
+        )}
+      </AppShell>
 
       {/* Per-motor service tool dialog (CAN ID / zero / config / firmware) */}
       {openTool && openToolSpec && (
@@ -1597,6 +1617,6 @@ export default function Diagnostics() {
           onStop={stopActive}
         />
       )}
-    </div>
+    </>
   )
 }
