@@ -16,7 +16,7 @@ asks its questions first, then runs each flash through ``sudo`` (one password
 prompt), the same root step the automatic bring-up flash uses.
 
     axol hub.info
-    axol hub.flash                 # every outdated hub, and any hub in BOOTSEL
+    axol hub.flash                 # every outdated hub, and any hub in its bootloader
     axol hub.flash --port 1-3      # one hub by USB port
     axol hub.flash --force         # reflash even if already current
 """
@@ -58,7 +58,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 _NO_HUB = (
     "No Axol hub found on USB. If the hub's LED is on but it does not show up, "
-    "hold its BOOTSEL button while plugging it in, then run `axol hub.flash`."
+    "flip the BOOTSEL switch next to its USB port, replug the hub, then run "
+    "`axol hub.flash`."
 )
 
 

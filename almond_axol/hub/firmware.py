@@ -20,7 +20,8 @@ Motors keep executing their last command meanwhile (the arms set no CAN
 timeout), and the reboot itself discards anything the old firmware had
 queued. A hub whose firmware predates the reflash request (before 2026-08-17)
 cannot be rebooted into its bootloader from the host; it needs one manual
-flash (hold BOOTSEL while plugging it in, then ``axol hub.flash``).
+flash (flip the BOOTSEL switch next to its USB port and replug it, then
+``axol hub.flash``, then flip the switch back and replug it again).
 """
 
 from __future__ import annotations
@@ -167,7 +168,7 @@ def attached_hubs(*, sysfs: Path = _SYSFS) -> list[Hub]:
 def bootloader_ports(*, sysfs: Path = _SYSFS) -> list[str]:
     """USB ports of RP2350s sitting in their bootrom.
 
-    A hub is there after BOOTSEL was held while plugging it in, after an
+    A hub is there after a replug with its BOOTSEL switch on, after an
     interrupted flash, or when it has no firmware. The bootrom carries no
     identity of its own, so this can be any RP2350 board.
     """
@@ -333,8 +334,9 @@ def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> in
                 # Stalled: the firmware does not know the request.
                 raise HubFirmwareError(
                     f"the Axol hub at USB port {port} runs firmware too old to "
-                    "update over USB; flash it once by hand: hold its BOOTSEL "
-                    "button while plugging it in, then run `axol hub.flash`"
+                    "update over USB. Flash it once by hand: flip the BOOTSEL "
+                    "switch next to its USB port, replug the hub, then run "
+                    "`axol hub.flash`"
                 ) from exc
             # Otherwise the hub most likely rebooted before the status stage.
         _wait_for(lambda: _in_bootloader(port, sysfs), 10, "the hub's bootloader")
@@ -346,12 +348,14 @@ def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> in
         hub = _wait_for(lambda: _hub_at(device), 20, "the hub to restart")
     except HubFirmwareError:
         if _in_bootloader(port, sysfs):
-            # The bootrom reboots once the image lands; with BOOTSEL still
-            # held (a manual flash) it comes straight back to the bootloader.
+            # The bootrom reboots once the image lands; with the BOOTSEL
+            # switch still on (a manual flash) it comes straight back to the
+            # bootloader, and the switch is only read at power-on.
             raise HubFirmwareError(
                 f"the hub at USB port {port} restarted into its bootloader "
-                "again; if BOOTSEL is still held, release it and replug the "
-                "hub to boot the new firmware, otherwise rerun the flash"
+                "again. If its BOOTSEL switch is on, flip it back and replug "
+                "the hub to start the new firmware. Otherwise run "
+                "`axol hub.flash` again"
             ) from None
         raise
     return hub.version
