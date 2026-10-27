@@ -10,10 +10,10 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | Page | What it is for |
 |---|---|
 | **Overview** | What is running, what to set up next, quick start and recent datasets. |
+| **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes and fix their task text. |
 | **Request data** | Pay Almond to collect training data for your task. |
-| **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
@@ -108,7 +108,7 @@ When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies 
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, the **Devices** page shows a **What is Axol mounted on?** card, and runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, **Set up** on the **Overview** lists the mounts with a **Save mount** button, and the **Devices** page shows a **What is Axol mounted on?** card. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
 
 On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
@@ -140,7 +140,7 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 
 ### Jelly
 
-The **Jelly** card has a row each for the wheels and the lift, each with **Connect** or **Disconnect**. Jelly is driven together with Axol, so it isn't part of the device choice.
+The **Jelly** card has one **Connect** button. It connects the wheels and the lift, whichever are plugged in. **Disconnect** drops both. A row each for the wheels and the lift shows its status. Jelly is driven together with Axol, so it isn't part of the device choice.
 
 While the lift is connected, the card shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
 
@@ -348,7 +348,7 @@ During a recording session, the page follows the dataset being recorded and sele
 
 ## Request data
 
-With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Teleoperation** and **Collect data** pages also have a card that leads there.
+With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Overview**, **Teleoperation** and **Collect data** pages also have a card that leads there.
 
 1. Enter the hours of usable data you want. The form shows the hourly price and the total.
 2. Describe the task: what the robot should do, with which objects, and what counts as done.
@@ -357,7 +357,7 @@ With **Teleop Data Collection**, Almond collects labeled data for your task and 
 
 You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
 
-The request needs an internet connection on the computer running the browser. To hide the card on the operation pages, press **×** on it. **Request data** stays in the sidebar.
+The request needs an internet connection on the computer running the browser. To hide the card, press **×** on it. **Request data** stays in the sidebar.
 
 ## Next steps
 

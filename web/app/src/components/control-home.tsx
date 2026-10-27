@@ -1,3 +1,4 @@
+import type { ReactNode } from "react"
 import { Link } from "react-router-dom"
 import { ArrowRight, CircleAlert, Database, Loader2, Plug, Square } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -85,11 +86,15 @@ export function RunningCard({
 export interface AttentionItem {
   key: string
   text: string
-  action: string
-  onAction: () => void
+  /** A button that fixes it elsewhere. */
+  action?: string
+  onAction?: () => void
+  /** Or the fix itself, right here (the mount choice). */
+  content?: ReactNode
 }
 
-/** What to sort out before running: each item with the button that fixes it. */
+/** What to sort out before running: each item with its fix, inline or a
+ *  button away. */
 export function AttentionList({ items }: { items: AttentionItem[] }) {
   if (items.length === 0) return null
   return (
@@ -97,12 +102,17 @@ export function AttentionList({ items }: { items: AttentionItem[] }) {
       <h2 className="font-heading text-sm font-semibold text-white/60">Set up</h2>
       <ul className="flex flex-col divide-y divide-white/[0.06] overflow-hidden rounded-xl border border-amber-400/20 bg-amber-400/[0.03]">
         {items.map((item) => (
-          <li key={item.key} className="flex flex-wrap items-center gap-3 px-4 py-3">
-            <CircleAlert className="size-4 shrink-0 text-amber-300/80" />
-            <span className="min-w-0 flex-1 text-sm text-white/75">{item.text}</span>
-            <Button variant="outline" size="sm" onClick={item.onAction}>
-              {item.action}
-            </Button>
+          <li key={item.key} className="flex flex-col gap-3 px-4 py-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <CircleAlert className="size-4 shrink-0 text-amber-300/80" />
+              <span className="min-w-0 flex-1 text-sm text-white/75">{item.text}</span>
+              {item.action && (
+                <Button variant="outline" size="sm" onClick={item.onAction}>
+                  {item.action}
+                </Button>
+              )}
+            </div>
+            {item.content && <div className="sm:pl-7">{item.content}</div>}
           </li>
         ))}
       </ul>

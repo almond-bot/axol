@@ -17,13 +17,14 @@ function readHidden(): boolean {
 }
 
 const LEAD: Record<DataCollectionOfferOperation, string> = {
+  overview: "Want Almond to collect your training data?",
   teleop: "Need training data for a task?",
   "collect-data": "Need more episodes than you can record?",
 }
 
 /**
- * The Teleop Data Collection offer on the Teleoperation and Collect data
- * pages: a short card that leads to the Request data page, which stays in the
+ * The Teleop Data Collection offer on Overview and the Teleoperation and
+ * Collect data pages: a short card that leads to the Request data page, which stays in the
  * sidebar after the card is hidden. The hourly price comes from Stripe;
  * without a connection to almond.bot the card still shows, without a number.
  */

@@ -45,10 +45,10 @@ describe("AppShell", () => {
     const labels = [...desktopNav().querySelectorAll("a")].map((a) => a.textContent)
     expect(labels).toEqual([
       "Overview",
+      "Devices",
       "Operations",
       "Datasets",
       "Request data",
-      "Devices",
       "Settings",
       "Diagnostics",
       "Logs",

@@ -84,6 +84,7 @@ describe("requestSource", () => {
   it("keeps the operation page a card linked from, else names the page itself", () => {
     expect(requestSource("teleop")).toBe("teleop")
     expect(requestSource("collect-data")).toBe("collect-data")
+    expect(requestSource("overview")).toBe("overview")
     expect(requestSource(null)).toBe("request-data")
     expect(requestSource("run-policy")).toBe("request-data")
   })

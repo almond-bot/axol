@@ -52,6 +52,7 @@ import {
   type CameraSpec,
   type CanDeviceInventory,
   type CanDiscoveryState,
+  type AxolMount,
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
@@ -129,7 +130,7 @@ import {
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
-import { MountRequired } from "@/components/settings/mount-required"
+import { MountQuickPick, MountRequired } from "@/components/settings/mount-required"
 import {
   SETTINGS_SCOPES,
   camerasSettingsTab,
@@ -2124,18 +2125,14 @@ export default function ControlPanel() {
     </>
   )
 
-  const mountCard = needsMount && (
-    <MountRequired
-      locked={!axolConnected}
-      onSave={async (mount) => {
-        await handleSettingsSave(
-          { values: { "kinematics.mount": mount } },
-          renderedConnectionGeneration
-        )
-        toast.success("Mount saved. You can change it in Axol settings → Robot.")
-      }}
-    />
-  )
+  const saveMount = async (mount: AxolMount) => {
+    await handleSettingsSave(
+      { values: { "kinematics.mount": mount } },
+      renderedConnectionGeneration
+    )
+    toast.success("Mount saved. You can change it in Axol settings → Robot.")
+  }
+  const mountCard = needsMount && <MountRequired locked={!axolConnected} onSave={saveMount} />
 
   const page: Record<ControlView, { title: string; description?: string }> = {
     overview: { title: "Overview" },
@@ -2204,12 +2201,20 @@ export default function ControlPanel() {
   // What Home asks the operator to sort out, each with the page that fixes it.
   const attention: AttentionItem[] = []
   if (needsMount) {
-    attention.push({
-      key: "mount",
-      text: "Choose what Axol is mounted on.",
-      action: "Choose mount",
-      onAction: () => navigate("/control/devices"),
-    })
+    attention.push(
+      axolConnected
+        ? {
+            key: "mount",
+            text: "Choose what Axol is mounted on, so the arms don't hit it.",
+            content: <MountQuickPick onSave={saveMount} />,
+          }
+        : {
+            key: "mount",
+            text: "Connect Axol, then choose what it is mounted on.",
+            action: "Connect Axol",
+            onAction: () => connectDevice("axol"),
+          }
+    )
   }
   if (connected && !selectedHasCamera && settingsSnap !== null) {
     attention.push({
@@ -2386,6 +2391,10 @@ export default function ControlPanel() {
       >
         {view === "overview" && (
           <>
+            {hardwareNoticeCard}
+
+            <AttentionList items={attention} />
+
             {(conn.state === "idle" || conn.state === "err") && (
               <ConnectHero failed={conn.state === "err"} onConnect={() => setSetupOpen(true)} />
             )}
@@ -2403,11 +2412,9 @@ export default function ControlPanel() {
 
             {connected && <DevicesRow devices={deviceSummaries} onConnect={connectDevice} />}
 
-            {hardwareNoticeCard}
-
-            <AttentionList items={attention} />
-
             <QuickStart entries={quickEntries} onOpen={openOperation} />
+
+            {!isLive && <DataCollectionOffer operation="overview" />}
 
             {connected && recentDatasets && <RecentDatasets datasets={recentDatasets} />}
           </>

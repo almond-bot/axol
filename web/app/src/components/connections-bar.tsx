@@ -1,16 +1,5 @@
-import {
-  Bot,
-  Check,
-  CircleDot,
-  Grab,
-  Loader2,
-  Plug,
-  Power,
-  RotateCcw,
-  Server,
-  Settings2,
-  Unplug,
-} from "lucide-react"
+import { Check, Loader2, Plug, Power, RotateCcw, Settings2, Unplug } from "lucide-react"
+import { DEVICE_ICONS } from "@/lib/device-icons"
 import { deviceErrorText } from "@/lib/hardware-status"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
@@ -24,7 +13,6 @@ import {
 } from "@/lib/jelly-view"
 import type { SettingsScope } from "@/lib/settings-scope"
 import {
-  JELLY_DEVICE_LABELS,
   JELLY_DEVICES,
   restartHost,
   shutdownHost,
@@ -349,9 +337,10 @@ export function ConnectionsBar({
 
     const live = active && (state === "connected" || state === "busy")
     const selected = selectedProfile === profile
+    const Icon = DEVICE_ICONS[profile]
     return (
       <DeviceCard
-        icon={profile === "axol" ? <Bot /> : <Grab />}
+        icon={<Icon />}
         name={title}
         dot={dot}
         status={label}
@@ -415,16 +404,14 @@ export function ConnectionsBar({
     )
   }
 
-  // Jelly's wheels and lift: two independent idle links on their own
-  // adapters, shown as two rows of one tile (each with its own status and
-  // connect / disconnect). Neither takes part in the Axol / Mantis device
-  // selection — Jelly is driven alongside Axol, not instead of it.
+  // Jelly's wheels and lift: two idle links on their own adapters, shown as
+  // one device. The card's Connect brings up every part that is plugged in,
+  // and Disconnect drops every connected one; each row shows its part's
+  // status. Neither takes part in the Axol / Mantis device selection: Jelly
+  // is driven alongside Axol, not instead of it.
   const jellyRow = (device: JellyDevice) => {
-    const title = JELLY_DEVICE_LABELS[device]
     const short = device === "wheels" ? "Wheels" : "Lift"
     const view = jellyDeviceView(device, jelly, canDevices?.[device], jellySupported)
-    const busy = jellyBusy?.[device] ?? false
-    const live = view.state === "connected" || view.state === "busy"
     const detail =
       jelly && view.state === "connected" && !view.fault ? (
         device === "wheels" ? (
@@ -443,7 +430,7 @@ export function ConnectionsBar({
         </span>
       )
     return (
-      <div key={device} className="flex min-h-9 min-w-0 items-center gap-3 text-sm">
+      <div key={device} className="flex min-h-7 min-w-0 items-center gap-3 text-sm">
         <span
           className={cn(
             "size-2 shrink-0 rounded-full",
@@ -453,41 +440,6 @@ export function ConnectionsBar({
         />
         <span className="w-12 shrink-0 font-medium text-white/80">{short}</span>
         {detail}
-        {live ? (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => onJellyDisconnect?.(device)}
-            disabled={busy || opRunning || view.state === "busy" || !onJellyDisconnect}
-            title={
-              opRunning || view.state === "busy"
-                ? "Wait for the active operation or setup session to finish."
-                : `Disconnect ${title}. It stays powered on.`
-            }
-            className="shrink-0"
-          >
-            {busy ? <Loader2 className="animate-spin" /> : <Unplug />}
-            Disconnect
-          </Button>
-        ) : (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => onJellyConnect?.(device)}
-            disabled={!online || !jellySupported || busy || opRunning || !onJellyConnect}
-            title={
-              !jellySupported
-                ? "Update the software on the Host Computer to connect Jelly."
-                : opRunning
-                  ? "Wait for the active operation or setup session to finish."
-                  : undefined
-            }
-            className="shrink-0"
-          >
-            {busy ? <Loader2 className="animate-spin" /> : <Plug />}
-            Connect
-          </Button>
-        )}
       </div>
     )
   }
@@ -510,16 +462,66 @@ export function ConnectionsBar({
     : jellyLive === 2
       ? "Wheels and lift connected"
       : jellyLive === 1
-        ? "One of two connected"
+        ? `${["connected", "busy"].includes(jellyViews[JELLY_DEVICES.indexOf("lift")].state) ? "Lift" : "Wheels"} connected`
         : jellyViews.some((v) => v.label === "Detected")
           ? "Detected"
           : "Disconnected"
   const battery = jellySupported ? jellyBattery(jelly) : null
+  const jellyParts = JELLY_DEVICES.map((device, i) => ({ device, view: jellyViews[i] }))
+  const jellyLiveParts = jellyParts.filter(
+    (p) => p.view.state === "connected" || p.view.state === "busy"
+  )
+  // Connect brings up what is plugged in, or tries both when neither is, so
+  // the error says what is missing.
+  const jellyPlugged = jellyParts.filter(
+    (p) =>
+      canDevices?.[p.device]?.present &&
+      (p.view.state === "disconnected" || p.view.state === "error")
+  )
+  const jellyToConnect = jellyPlugged.length
+    ? jellyPlugged
+    : jellyLiveParts.length
+      ? []
+      : jellyParts
+  const jellyBusyAny = JELLY_DEVICES.some((d) => jellyBusy?.[d])
+  const jellyInUse = jellyParts.some((p) => p.view.state === "busy")
+  const jellyAction =
+    jellyToConnect.length > 0 ? (
+      <Button
+        variant={jellyPlugged.length ? "default" : "outline"}
+        onClick={() => jellyToConnect.forEach((p) => onJellyConnect?.(p.device))}
+        disabled={!online || !jellySupported || jellyBusyAny || opRunning || !onJellyConnect}
+        title={
+          !jellySupported
+            ? "Update the software on the Host Computer to connect Jelly."
+            : opRunning
+              ? "Wait for the active operation or setup session to finish."
+              : undefined
+        }
+      >
+        {jellyBusyAny ? <Loader2 className="animate-spin" /> : <Plug />}
+        Connect
+      </Button>
+    ) : (
+      <Button
+        variant="outline"
+        onClick={() => jellyLiveParts.forEach((p) => onJellyDisconnect?.(p.device))}
+        disabled={jellyBusyAny || opRunning || jellyInUse || !onJellyDisconnect}
+        title={
+          opRunning || jellyInUse
+            ? "Wait for the active operation or setup session to finish."
+            : "Disconnect Jelly. It stays powered on."
+        }
+      >
+        {jellyBusyAny ? <Loader2 className="animate-spin" /> : <Unplug />}
+        Disconnect
+      </Button>
+    )
 
   return (
     <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
       <DeviceCard
-        icon={<Server />}
+        icon={<DEVICE_ICONS.host />}
         name="Host Computer"
         dot={wsDot}
         status={wsLabel}
@@ -582,11 +584,16 @@ export function ConnectionsBar({
       {hardwareCard("mantis", "Mantis")}
 
       <DeviceCard
-        icon={<CircleDot />}
+        icon={<DEVICE_ICONS.jelly />}
         name="Jelly"
         dot={jellyDot}
         status={jellyLabel}
-        action={battery ? <BatteryIndicator battery={battery} /> : undefined}
+        action={
+          <>
+            {battery && <BatteryIndicator battery={battery} />}
+            {jellyAction}
+          </>
+        }
         footer={
           online && onOpenSettings ? (
             <SettingsButton onClick={() => onOpenSettings("jelly")} />

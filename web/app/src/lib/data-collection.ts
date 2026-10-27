@@ -17,8 +17,8 @@ export const MAX_LINK_LENGTH = 500
 
 export type ExampleKind = "video" | "dataset"
 
-/** The operation pages that show the Teleop Data Collection card. */
-export const DATA_COLLECTION_OFFER_OPERATIONS = ["teleop", "collect-data"] as const
+/** The pages that show the Teleop Data Collection card. */
+export const DATA_COLLECTION_OFFER_OPERATIONS = ["overview", "teleop", "collect-data"] as const
 export type DataCollectionOfferOperation = (typeof DATA_COLLECTION_OFFER_OPERATIONS)[number]
 
 /** Where a request was made from: the Request data page itself, or the page
@@ -31,7 +31,7 @@ export const DATA_COLLECTION_OPERATIONS = [
 export type DataCollectionOperation = (typeof DATA_COLLECTION_OPERATIONS)[number]
 
 /** The `?from=` of a Request data link, or the page itself when it names no
- *  operation page. */
+ *  page with the card. */
 export function requestSource(from: string | null): DataCollectionOperation {
   return (DATA_COLLECTION_OFFER_OPERATIONS as readonly (string | null)[]).includes(from)
     ? (from as DataCollectionOfferOperation)

@@ -40,10 +40,10 @@ type NavItem = {
 
 const MAIN_NAV: NavItem[] = [
   { to: "/control", label: "Overview", icon: LayoutDashboard, end: true },
+  { to: "/control/devices", label: "Devices", icon: Cpu },
   { to: "/control/operations", label: "Operations", icon: Play },
   { to: "/control/datasets", label: "Datasets", icon: Database },
   { to: "/control/request-data", label: "Request data", icon: DatabaseZap },
-  { to: "/control/devices", label: "Devices", icon: Cpu },
   { to: "/control/settings", label: "Settings", icon: Settings2 },
 ]
 
