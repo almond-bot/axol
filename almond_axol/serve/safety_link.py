@@ -58,6 +58,7 @@ def status_payload(status: SafetyStatus) -> dict[str, Any]:
         "outputOn": status.output_on,
         "softwareEnable": status.sw_enable,
         "remoteStartActive": status.remote_start_active,
+        "updateLocked": status.update_locked,
         "heartbeatOn": status.heartbeat_on,
         "supplyOk": status.supply_ok,
         "supplyVolts": round(status.supply_volts, 2),

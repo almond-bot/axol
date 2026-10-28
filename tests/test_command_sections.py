@@ -59,7 +59,13 @@ class DiagnosticsSectionsTest(unittest.TestCase):
         )
         self.assertEqual(
             by_section["helper"],
-            {"diag.rom-disable", "lift.home", "lift.goto", "lift.update"},
+            {
+                "diag.rom-disable",
+                "lift.home",
+                "lift.goto",
+                "lift.update",
+                "safety.update",
+            },
         )
 
 

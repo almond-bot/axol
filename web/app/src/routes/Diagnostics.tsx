@@ -59,6 +59,7 @@ import {
   fetchCommands,
   fetchJellyStatus,
   fetchRobotStatus,
+  fetchSafetyStatus,
   fetchSessions,
   flattenFields,
   JELLY_DEVICE_LABELS,
@@ -970,9 +971,30 @@ export default function Diagnostics() {
     () => diagCommands.filter((c) => (c.section ?? "test") === "test"),
     [diagCommands]
   )
+  // The safety board helper only makes sense on a Jelly that has one.
+  const [safetyDetected, setSafetyDetected] = useState(false)
+  useEffect(() => {
+    if (!serverOk) return
+    let active = true
+    const check = () =>
+      fetchSafetyStatus()
+        .then((s) => {
+          if (active) setSafetyDetected(s.detected)
+        })
+        .catch(() => {})
+    void check()
+    const timer = setInterval(check, 5000)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [serverOk])
   const helperCommands = useMemo(
-    () => diagCommands.filter((c) => c.section === "helper"),
-    [diagCommands]
+    () =>
+      diagCommands.filter(
+        (c) => c.section === "helper" && (c.id !== "safety.update" || safetyDetected)
+      ),
+    [diagCommands, safetyDetected]
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 

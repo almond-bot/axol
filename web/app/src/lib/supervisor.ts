@@ -612,12 +612,14 @@ export interface SafetyBoardStatus {
   /** No software stop is in force. */
   softwareEnable: boolean
   remoteStartActive: boolean
+  /** A firmware update is running: power stays off until it finishes. Absent on older hosts. */
+  updateLocked?: boolean
   heartbeatOn: boolean
   /** The 24 V rail is high enough to switch the contactor. */
   supplyOk: boolean
   supplyVolts: number
   outputVolts: number
-  /** Why the software enable is off: "none" | "can" | "heartbeat" | "console". */
+  /** Why the software enable is off: "none" | "can" | "heartbeat" | "console" | "update". */
   stopCause: string
   firmware: string
   faults: {
@@ -661,8 +663,8 @@ export async function safetyStart(): Promise<SafetyLinkStatus> {
   return json(await fetch(apiUrl("/api/safety/start"), { method: "POST" }))
 }
 
-/** A lift firmware image the serve host validated and stored for `lift.update`. */
-export interface LiftFirmwareUpload {
+/** A firmware image the serve host validated and stored for `lift.update` or `safety.update`. */
+export interface FirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */
   path: string
   version: string
@@ -671,15 +673,25 @@ export interface LiftFirmwareUpload {
   size: number
 }
 
-/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
-export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+export type LiftFirmwareUpload = FirmwareUpload
+
+/** Which board a firmware file is for: the lift (jelly_legs) or the safety board. */
+export type FirmwareBoard = "lift" | "safety"
+
+/** Upload a board's firmware.bin; the host rejects any other board's file. */
+export async function uploadFirmware(board: FirmwareBoard, file: Blob): Promise<FirmwareUpload> {
   return json(
-    await fetch(apiUrl("/api/lift/firmware"), {
+    await fetch(apiUrl(`/api/${board}/firmware`), {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
     })
   )
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<FirmwareUpload> {
+  return uploadFirmware("lift", file)
 }
 
 /** Healthy = reachable on CAN and reporting no error status. */

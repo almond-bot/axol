@@ -66,6 +66,14 @@ describe("safetyView", () => {
     expect(v.detail).toContain("stopped responding")
   })
 
+  it("blocks the restore while the board updates its firmware", () => {
+    const v = safetyView(
+      link(board({ ...off, softwareEnable: false, stopCause: "update", updateLocked: true }))
+    )
+    expect(v).toMatchObject({ label: "Updating firmware", canStart: false, canStop: false })
+    expect(v.startHint).toBe("Wait for the update to finish.")
+  })
+
   it("offers a restore when the latch is open", () => {
     expect(safetyView(link(board(off)))).toMatchObject({ label: "Power off", canStart: true })
   })

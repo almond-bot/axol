@@ -32,6 +32,8 @@ def fmt_status(st: SafetyStatus) -> str:
     """One human-readable status line."""
     if st.output_on:
         state = "POWER ON"
+    elif st.update_locked:
+        state = "FIRMWARE UPDATE (power locked off until it finishes)"
     elif st.estop_pressed:
         state = "E-STOP PRESSED"
     elif st.software_stopped:

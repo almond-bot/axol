@@ -34,6 +34,7 @@ const STOP_CAUSE_DETAIL: Record<string, string> = {
   can: "Power was cut by a software stop.",
   heartbeat: "Power was cut because the robot computer stopped responding.",
   console: "Power was cut from the safety board's service console.",
+  update: "Power was cut for a safety board firmware update.",
 }
 
 /** The safety board's state, in operator terms. */
@@ -72,6 +73,18 @@ export function safetyView(link: SafetyLinkStatus | null | undefined): SafetyVie
         "The safety board reports a relay fault. Use the E-Stop, then contact Almond support.",
       canStop: s.outputOn,
       startHint: "Contact Almond support before restoring power.",
+      notes,
+    }
+  }
+  if (s.updateLocked && !s.outputOn) {
+    return {
+      ...HIDDEN,
+      visible: true,
+      tone: "off",
+      label: "Updating firmware",
+      detail:
+        "The safety board is installing new firmware. Power stays off until the update finishes.",
+      startHint: "Wait for the update to finish.",
       notes,
     }
   }

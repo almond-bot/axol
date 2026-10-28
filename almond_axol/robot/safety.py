@@ -76,7 +76,13 @@ _OP_SET_HEARTBEAT = 0x07
 _OP_GET_VOLTAGES = 0x08
 
 # Status byte 2: why the software enable is off.
-STOP_CAUSES: dict[int, str] = {0: "none", 1: "can", 2: "heartbeat", 4: "console"}
+STOP_CAUSES: dict[int, str] = {
+    0: "none",
+    1: "can",
+    2: "heartbeat",
+    4: "console",
+    5: "update",  # firmware update running, or a new image on trial
+}
 
 # Status poll cadence once the board has answered, and while it has not (a
 # Jelly without a safety board: one unanswered frame a second is plenty).
@@ -91,9 +97,9 @@ _RESEND_S = 0.05
 # within this. K2 drops 10-20 ms after the pump stops; the rest is margin for
 # a lost frame or two.
 STOP_TIMEOUT_S = 0.5
-# The remote-start pulse runs for 300 ms at most, plus the 30 ms hold after
-# the contactor closes.
-START_TIMEOUT_S = 1.0
+# The remote-start pulse runs until the output has held for 200 ms (through
+# the contactor's pull-in), 1 s at most; firmware before 0.3 stopped at 300 ms.
+START_TIMEOUT_S = 2.0
 
 
 def resolve_safety_channel(channel: str | None = None) -> str:
@@ -130,10 +136,13 @@ class SafetyStatus:
     k1_pole_b: bool  # output on with K1 not latched
     remote_start_failed: bool  # sticky: the last remote start did not latch
     heartbeat_lost: bool  # sticky: the heartbeat timeout tripped
-    stop_cause: str  # "none", "can", "heartbeat", "console", or the raw code
+    stop_cause: str  # "none", "can", "heartbeat", "console", "update", or the raw code
     firmware: tuple[int, int]  # (major, minor)
     supply_volts: float
     output_volts: float
+    # A firmware update is running or a new image is on trial: the board
+    # keeps the software enable off until it is confirmed (firmware 0.3+).
+    update_locked: bool = False
 
     @property
     def estop_pressed(self) -> bool:
@@ -178,6 +187,7 @@ def decode_status(data: bytes) -> SafetyStatus:
         firmware=(version >> 4, version & 0x0F),
         supply_volts=supply_mv / 1000.0,
         output_volts=output_mv / 1000.0,
+        update_locked=bool(state & 0x10),
     )
 
 
@@ -203,6 +213,11 @@ def decode_voltages(data: bytes) -> SafetyVoltages:
 
 def explain_start_failure(status: SafetyStatus) -> str:
     """Why a remote start left the power off, in operator terms."""
+    if status.update_locked:
+        return (
+            "The safety board is updating its firmware. Wait for the update to "
+            "finish, then try again."
+        )
     if status.estop_pressed:
         return "The E-Stop is pressed. Release it, then try again."
     if status.relay_fault:
@@ -357,9 +372,9 @@ class SafetyBoard:
         status = await self.request_status()
         if status.output_on:
             return status
-        if status.estop_pressed or status.latched:
-            # The board refuses a remote start in both cases. Latched with
-            # no output is a relay fault (or the green switch held down).
+        if status.estop_pressed or status.latched or status.update_locked:
+            # The board refuses a remote start in all three cases. Latched
+            # with no output is a relay fault (or the green switch held down).
             raise SafetyError(explain_start_failure(status))
         await self._send(_OP_REMOTE_START)
         status = await self._wait_for(

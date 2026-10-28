@@ -23,6 +23,7 @@ from . import (
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import safety as safety_cmd
+from . import safety_update as safety_update_cmd
 from . import serve as serve_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
@@ -163,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)
     safety_cmd.add_parser(subparsers)
+    safety_update_cmd.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
