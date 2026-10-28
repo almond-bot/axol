@@ -39,20 +39,25 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
   const [error, setError] = useState<string | null>(null)
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
+  // Bumped when a stop or start begins and ends. A poll sent before or during
+  // the action can carry the old state, so its answer is dropped.
+  const actionGen = useRef(0)
 
   useEffect(() => {
     if (!enabled) return
     let active = true
-    const poll = () =>
-      fetchSafetyStatus()
+    const poll = () => {
+      const gen = actionGen.current
+      return fetchSafetyStatus()
         .then((status) => {
-          if (active) setLink(status)
+          if (active && gen === actionGen.current) setLink(status)
         })
         .catch((e) => {
           // A host that predates the safety link has no such endpoint. Any
           // other failure keeps the last state until the next poll.
           if (active && String(e).includes("HTTP 404")) setLink(null)
         })
+    }
     void poll()
     const timer = setInterval(poll, POLL_MS)
     return () => {
@@ -81,6 +86,7 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
   if (!view.visible) return null
 
   async function run(action: "stop" | "start") {
+    actionGen.current += 1
     setPending(action)
     setError(null)
     try {
@@ -90,6 +96,7 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
       setError(errorText(e))
       setOpen(true)
     } finally {
+      actionGen.current += 1
       setPending(null)
     }
   }

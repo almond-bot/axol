@@ -45,6 +45,8 @@ const status = (outputOn: boolean, over: Partial<SafetyLinkStatus> = {}): Safety
 
 type Reply = { ok: boolean; status?: number; body: unknown }
 let replies: Record<string, Reply>
+// While set, status polls wait for it before they answer.
+let holdStatus: Promise<void> | null
 const calls: string[] = []
 
 beforeEach(() => {
@@ -53,18 +55,21 @@ beforeEach(() => {
   root = createRoot(container)
   calls.length = 0
   replies = {}
+  holdStatus = null
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
       const key = `${init?.method ?? "GET"} ${url}`
       calls.push(key)
       const reply = replies[key] ?? { ok: false, status: 404, body: {} }
+      if (key === "GET /api/safety/status" && holdStatus) await holdStatus
       return new Response(JSON.stringify(reply.body), { status: reply.ok ? 200 : reply.status })
     })
   )
 })
 
 afterEach(() => {
+  vi.useRealTimers()
   act(() => root.unmount())
   container.remove()
   vi.unstubAllGlobals()
@@ -103,6 +108,23 @@ describe("SafetyControl", () => {
     await flush()
     expect(calls).toContain("POST /api/safety/stop")
     expect(container.textContent).toContain("Power cut")
+  })
+
+  it("keeps the cut state when an older poll answers late", async () => {
+    vi.useFakeTimers()
+    replies["GET /api/safety/status"] = { ok: true, body: status(true) }
+    replies["POST /api/safety/stop"] = { ok: true, body: status(false) }
+    await render()
+    let release!: () => void
+    holdStatus = new Promise((resolve) => (release = resolve))
+    await act(async () => vi.advanceTimersByTime(1000))
+    await act(async () => buttonNamed("Cut power")!.click())
+    await flush()
+    expect(container.textContent).toContain("Power cut")
+    release()
+    await flush()
+    expect(container.textContent).toContain("Power cut")
+    expect(buttonNamed("Cut power")).toBeUndefined()
   })
 
   it("shows an unconfirmed stop in the panel", async () => {

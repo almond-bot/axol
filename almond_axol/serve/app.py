@@ -1102,9 +1102,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             from ..cli.can.setup import setup_detected_hubs
 
             # The safety board rides the lift bus; it reopens on its own once
-            # discovery has finished renaming the interfaces.
-            await asyncio.to_thread(safety.pause)
+            # discovery has finished renaming the interfaces. A pause that
+            # fails partway has already set the flag, so resume either way.
             try:
+                await asyncio.to_thread(safety.pause)
                 result = await asyncio.to_thread(setup_detected_hubs)
             finally:
                 safety.resume()
