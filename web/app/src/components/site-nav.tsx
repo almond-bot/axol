@@ -16,6 +16,7 @@ const PAGE_LABEL: Record<string, string> = {
   control: "Control Panel",
   vr: "VR",
   diagnostics: "Diagnostics",
+  jog: "Jogging",
 }
 
 function NavLinks({
@@ -50,6 +51,11 @@ function NavLinks({
           Diagnostics
         </a>
       )}
+      {current !== "jog" && (
+        <a href="/jog" className={item}>
+          Jogging
+        </a>
+      )}
       {current !== "vr" && (
         <a href="/vr" className={item}>
           VR App
@@ -63,7 +69,7 @@ export function SiteNav({
   current,
   right,
 }: {
-  current: "control" | "vr" | "diagnostics"
+  current: "control" | "vr" | "diagnostics" | "jog"
   right?: ReactNode
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
