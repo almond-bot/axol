@@ -124,6 +124,16 @@ class OpStartRequest(BaseModel):
     cameras: dict[str, Any] | None = None
 
 
+class JogPlanRequest(BaseModel):
+    arm: Literal["left", "right"]
+    position: list[float]
+    quaternion: list[float]
+
+
+class JogExecuteRequest(BaseModel):
+    id: int
+
+
 class RobotConnectRequest(BaseModel):
     """Optional CAN interface selection for a robot-link connect.
 
@@ -2958,6 +2968,114 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             req.task.strip(),
         )
         return {"episode": summary}
+
+    # -- jogging (the Jog page drives the running ``jog`` operation) ---------
+
+    def _jog_session() -> Any:
+        from ..jog.session import active_session
+
+        return active_session()
+
+    def _jog_not_running() -> JSONResponse:
+        return JSONResponse(
+            {"error": "Jogging is not running. Start it from the Jog page."},
+            status_code=409,
+        )
+
+    @app.get("/api/jog/state")
+    async def jog_state() -> dict[str, Any]:
+        session = _jog_session()
+        return {"running": session is not None, **(session.state() if session else {})}
+
+    @app.post("/api/jog/plan", response_model=None)
+    async def jog_plan(req: JogPlanRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(
+                session.plan, req.arm, req.position, req.quaternion
+            )
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/execute", response_model=None)
+    async def jog_execute(req: JogExecuteRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return session.execute(req.id)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/cancel", response_model=None)
+    async def jog_cancel() -> dict[str, Any] | JSONResponse:
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        return {"stopped": session.cancel()}
+
+    @app.websocket("/api/jog/ws")
+    async def jog_ws(ws: WebSocket) -> None:
+        """Hold commands in, jog state out.
+
+        The page sends ``{"type": "hold", "drive": [vx, vy, wz], "lift": d}``
+        every 50 ms while it is connected, zeros included. Silence for longer
+        than the session's hold timeout stops the base and lift, as does
+        closing the socket. State goes out at 20 Hz.
+        """
+        from ..jog.session import JogError
+
+        await ws.accept()
+        last_session: Any = None
+        source = f"ws-{id(ws):x}"
+
+        async def receive() -> None:
+            nonlocal last_session
+            while True:
+                message = await ws.receive_json()
+                session = _jog_session()
+                if session is None or not isinstance(message, dict):
+                    continue
+                last_session = session
+                if message.get("type") == "hold":
+                    drive = message.get("drive") or [0.0, 0.0, 0.0]
+                    try:
+                        if not isinstance(drive, list) or len(drive) != 3:
+                            raise JogError("drive must be [vx, vy, wz]")
+                        session.hold(*drive, message.get("lift", 0), source=source)
+                    except (JogError, TypeError) as exc:
+                        await ws.send_json({"type": "error", "error": str(exc)})
+                elif message.get("type") == "release":
+                    session.release(source)
+
+        async def send() -> None:
+            while True:
+                session = _jog_session()
+                state = session.state() if session else {}
+                await ws.send_json(
+                    {"type": "state", "running": session is not None, **state}
+                )
+                await asyncio.sleep(0.05)
+
+        tasks = [asyncio.create_task(receive()), asyncio.create_task(send())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+            # The page is gone: if it was driving, the base and lift stop now.
+            session = _jog_session()
+            for candidate in {id(s): s for s in (session, last_session) if s}.values():
+                candidate.disconnect(source)
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 
