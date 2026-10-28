@@ -6,7 +6,7 @@ The browser front-ends for the Almond Axol robot. This directory lives inside th
 - **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
 - **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles (with a MyActuator parameter editor), and diagnostics / calibration script runners with run history. Also served by `axol serve`.
 
-The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`. The control panel and diagnostics dashboard share one app shell (`app/src/components/app-shell.tsx`): a sidebar with client-side routes for `/control` (overview), `/control/operations` (the launcher) and `/control/operations/<id>` (one operation), `/control/datasets`, `/control/request-data`, `/control/devices`, `/control/settings/<tab>`, `/control/logs`, and `/diagnostics` with its `tests`, `tuning` and `history` sub-pages. The operations' names, icons and groups come from the app (`app/src/lib/operation-catalog.ts`), so the screens look the same before a host answers; the host adds which operations it can run and their per-run fields.
+The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`. The control panel and diagnostics dashboard share one app shell (`app/src/components/app-shell.tsx`): a sidebar with client-side routes for `/control` (overview), `/control/operations` (the launcher) and `/control/operations/<id>` (one operation), `/control/datasets`, `/control/request-teleoperator`, `/control/request-data`, `/control/devices`, `/control/settings/<tab>`, `/control/logs`, and `/diagnostics` with its `tests`, `tuning` and `history` sub-pages. The operations' names, icons and groups come from the app (`app/src/lib/operation-catalog.ts`), so the screens look the same before a host answers; the host adds which operations it can run and their per-run fields.
 
 > Docs: [Web Control Panel](https://docs.almond.bot/guides/control-panel) · [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) · [VR Interface](https://docs.almond.bot/guides/vr-interface). The `serve` backend (FastAPI) that the control panel and diagnostics dashboard talk to lives in `almond_axol/serve/`.
 
@@ -299,22 +299,23 @@ The **control panel** joins the same `/ws` as one more **view-only** WebRTC clie
 
 ## Teleop Data Collection checkout (`api/`)
 
-The **Request data** page (`/control/request-data`, with a card leading to it on the Teleoperation and Collect data pages) pays through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
+The **Request teleoperator** page (`/control/request-teleoperator`, with a card leading to it on the Overview and Teleoperation pages) and the **Request data** page (`/control/request-data`, with a card on the Collect data page) pay through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
 
-| Route                                                  | What it does                                                                                                                                                                                                                                     |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /api/data-collection/price?service=task\|dataset` | A service's hourly price, read from Stripe: `task` for Request teleoperator, `dataset` (the default) for Request data. The panel shows these amounts, so prices change in Stripe, not in code.                                                   |
-| `POST /api/data-collection/checkout`                   | Validates the request (`app/src/lib/data-collection.ts`) and creates a Checkout Session for hours × that service's price. The task, collection method and example ride along as session and payment metadata, with `service: "data_collection"`. |
+| Route                                                                       | What it does                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/data-collection/price?price=teleoperator\|almond_axol\|your_axol` | An hourly price, read from Stripe: `teleoperator` for Request teleoperator, `almond_axol` (the default) and `your_axol` for Request data collected on Almond's Axol or the customer's. The panel shows these amounts, so prices change in Stripe, not in code. |
+| `POST /api/data-collection/checkout`                                        | Validates the request (`app/src/lib/data-collection.ts`) and creates a Checkout Session for hours × that service's price. The task, collection method and example ride along as session and payment metadata, with `service: "data_collection"`.               |
 
 There is no webhook here. Beaver's Stripe webhook already receives every checkout on the account: for a paid session tagged `service: "data_collection"` it opens a request under **Sales → Data collection** at beaver.almond.bot and posts it in #sales. Keep the metadata keys (`service`, `request_type`, `collection_method`, `hours`, `task`, `example_kind`, `example`, `operation`) in step with Beaver's `lib/data-collection-math.ts`.
 
 Set these as Vercel environment variables (the key as **sensitive**), with test values on Preview and live values on Production:
 
-| Variable                          | Value                                                                             |
-| --------------------------------- | --------------------------------------------------------------------------------- |
-| `STRIPE_SECRET_KEY`               | A restricted key (`rk_…`) with **Checkout Sessions: Write** and **Prices: Read**. |
-| `STRIPE_DATA_COLLECTION_PRICE_ID` | The hourly Price (`price_…`) of a training dataset, per hour of usable data.      |
-| `STRIPE_TELEOPERATOR_PRICE_ID`    | The hourly Price (`price_…`) of a teleoperator for a one-off task.                |
+| Variable                                 | Value                                                                               |
+| ---------------------------------------- | ----------------------------------------------------------------------------------- |
+| `STRIPE_SECRET_KEY`                      | A restricted key (`rk_…`) with **Checkout Sessions: Write** and **Prices: Read**.   |
+| `STRIPE_DATA_COLLECTION_PRICE_ID`        | The Price (`price_…`) per hour of usable data that Almond collects on its own Axol. |
+| `STRIPE_REMOTE_DATA_COLLECTION_PRICE_ID` | The Price (`price_…`) per hour of usable data collected on the customer's Axol.     |
+| `STRIPE_TELEOPERATOR_PRICE_ID`           | The hourly Price (`price_…`) of a teleoperator for a one-off task.                  |
 
 Create the product and price once per Stripe environment, for example with the Stripe CLI:
 
