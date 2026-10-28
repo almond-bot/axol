@@ -21,8 +21,8 @@ const INTEGRATION_ID = "axol-data-collection-rkqzmwtb"
 /** Shown above the Pay button on Stripe's checkout page. */
 const REFUND_NOTE: Record<DataCollectionService, string> = {
   task:
-    "You prepay the hours you request. Almond bills by the minute and refunds " +
-    "any time you don't use.",
+    "You're buying credit for the hours you request. Almond bills the session " +
+    "by the minute and refunds any credit you don't use.",
   dataset:
     "You pay for the hours you request. If Almond delivers fewer usable hours, " +
     "we refund the difference.",
@@ -35,7 +35,7 @@ const METHOD: Record<CollectionMethod, string> = {
 
 /** The payment's description in Stripe and on the receipt. */
 function description(req: DataCollectionRequest): string {
-  if (req.method == null) return `Teleoperator, one-off task, ${req.hours} h`
+  if (req.method == null) return `Teleoperator credit, one-off task, ${req.hours} h`
   return `Teleop Data Collection, training dataset, ${METHOD[req.method]}, ${req.hours} h`
 }
 
