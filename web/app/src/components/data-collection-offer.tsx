@@ -39,7 +39,7 @@ const BODY: Record<DataCollectionService, string> = {
 }
 
 const BILLING: Record<DataCollectionService, string> = {
-  task: "per hour, billed by the minute.",
+  task: "per hour, prepaid as credit and billed by the minute.",
   dataset: "per hour of usable data.",
 }
 

@@ -30,26 +30,31 @@ function returnUrl(): string {
 
 interface ServiceCopy {
   hoursLabel: string
+  /** How the hours are billed, under the hours field. */
+  hoursHint?: string
   defaultHours: string
   placeholder: string
   steps: string[]
-  refund: string
+  /** How the price works, under the steps. */
+  refund?: string
   footer: string
+  submit: string
 }
 
 const SERVICES: Record<DataCollectionService, ServiceCopy> = {
   task: {
-    hoursLabel: "Hours of operator time",
+    hoursLabel: "Hours of credit",
+    hoursHint: "Almond bills the session by the minute and refunds any credit you don't use.",
     defaultHours: "1",
     placeholder: "For example: unload the parts from the 3D printer and drop them in the bin.",
     steps: [
       "Describe the task. An example of it helps, but is optional.",
-      "Choose how many hours you expect it to take, and pay on Stripe's checkout page.",
+      "Buy credit for the hours you expect the task to take, on Stripe's checkout page.",
       "Almond emails you to schedule the session.",
       "An Almond operator controls your Axol until the task is done.",
     ],
-    refund: "Billed by the minute. Almond refunds any time you don't use.",
-    footer: "You prepay the hours now. Unused minutes are refunded.",
+    footer: "You pay for the credit now.",
+    submit: "Buy credit",
   },
   dataset: {
     hoursLabel: "Hours of usable data",
@@ -63,9 +68,9 @@ const SERVICES: Record<DataCollectionService, ServiceCopy> = {
       "Almond emails you to plan the collection.",
       "Almond records the episodes and delivers them as a LeRobot dataset.",
     ],
-    refund:
-      "You pay per hour of usable data, however long recording takes. If Almond delivers fewer usable hours than you paid for, we refund the difference.",
+    refund: "You pay per hour of usable data, however long recording takes.",
     footer: "You pay for the hours you request now.",
+    submit: "Continue to payment",
   },
 }
 
@@ -120,9 +125,11 @@ export function RequestPage({
             </li>
           ))}
         </ol>
-        <p className="text-sm text-white/65">
-          {rate && <span className="text-white/85">{rate}</span>} {copy.refund}
-        </p>
+        {copy.refund && (
+          <p className="text-sm text-white/65">
+            {rate && <span className="text-white/85">{rate}</span>} {copy.refund}
+          </p>
+        )}
       </PageSection>
     </div>
   )
@@ -250,6 +257,7 @@ function RequestForm({
               </span>
             )}
           </div>
+          {copy.hoursHint && <p className="text-xs text-white/40">{copy.hoursHint}</p>}
         </div>
 
         <div className="flex flex-col gap-1.5">
@@ -336,7 +344,7 @@ function RequestForm({
         <p className="text-xs text-white/40">{copy.footer}</p>
         <Button type="submit" size="sm" disabled={submitting}>
           {submitting && <Loader2 className="animate-spin" />}
-          Continue to payment
+          {copy.submit}
         </Button>
       </div>
     </form>
