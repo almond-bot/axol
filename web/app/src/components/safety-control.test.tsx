@@ -107,7 +107,7 @@ describe("SafetyControl", () => {
     await act(async () => buttonNamed("Cut power")!.click())
     await flush()
     expect(calls).toContain("POST /api/safety/stop")
-    expect(container.textContent).toContain("Power cut")
+    expect(buttonNamed("Restore power")).toBeDefined()
   })
 
   it("keeps the cut state when an older poll answers late", async () => {
@@ -120,10 +120,10 @@ describe("SafetyControl", () => {
     await act(async () => vi.advanceTimersByTime(1000))
     await act(async () => buttonNamed("Cut power")!.click())
     await flush()
-    expect(container.textContent).toContain("Power cut")
+    expect(buttonNamed("Restore power")).toBeDefined()
     release()
     await flush()
-    expect(container.textContent).toContain("Power cut")
+    expect(buttonNamed("Restore power")).toBeDefined()
     expect(buttonNamed("Cut power")).toBeUndefined()
   })
 
@@ -140,14 +140,37 @@ describe("SafetyControl", () => {
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("Press the E-Stop")
   })
 
-  it("restores power from the panel", async () => {
+  it("restores power at the first click", async () => {
     replies["GET /api/safety/status"] = { ok: true, body: status(false) }
     replies["POST /api/safety/start"] = { ok: true, body: status(true) }
     await render()
-    await act(async () => buttonNamed("Power cut")!.click())
     await act(async () => buttonNamed("Restore power")!.click())
     await flush()
     expect(calls).toContain("POST /api/safety/start")
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
     expect(buttonNamed("Cut power")).toBeDefined()
+  })
+
+  it("shows a refused restore in the panel", async () => {
+    replies["GET /api/safety/status"] = { ok: true, body: status(false) }
+    replies["POST /api/safety/start"] = {
+      ok: false,
+      status: 409,
+      body: { error: "Power did not switch on. Check the E-Stop, then try again." },
+    }
+    await render()
+    await act(async () => buttonNamed("Restore power")!.click())
+    await flush()
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("try again")
+  })
+
+  it("explains why power can't come back on", async () => {
+    const pressed = status(false)
+    pressed.status = { ...pressed.status!, estopOk: false }
+    replies["GET /api/safety/status"] = { ok: true, body: pressed }
+    await render()
+    expect(buttonNamed("Restore power")).toBeUndefined()
+    await act(async () => buttonNamed("E-Stop pressed")!.click())
+    expect(container.textContent).toContain("Release the E-Stop first.")
   })
 })

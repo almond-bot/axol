@@ -30,8 +30,10 @@ function errorText(error: unknown): string {
 /**
  * The software E-stop for Jelly builds with a safety board, at the top right of
  * every page. While Axol has power it is one red **Cut power** button that
- * stops at the first click. Otherwise it shows why power is off and opens a
- * panel to restore it. Renders nothing on a robot without a safety board.
+ * stops at the first click, and while power can come back on it is one green
+ * **Restore power** button. Otherwise it shows why power is off and opens a
+ * panel with details. A failed stop or start opens that panel with the error.
+ * Renders nothing on a robot without a safety board.
  */
 export function SafetyControl({ enabled }: { enabled: boolean }) {
   const [link, setLink] = useState<SafetyLinkStatus | null>(null)
@@ -102,6 +104,7 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
   }
 
   const stopLabel = pending === "stop" ? "Cutting power…" : "Cut power"
+  const startLabel = pending === "start" ? "Restoring power…" : "Restore power"
 
   return (
     <div ref={ref} className="relative shrink-0">
@@ -115,6 +118,17 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
         >
           <OctagonX className="size-4" aria-hidden />
           {stopLabel}
+        </button>
+      ) : view.canStart ? (
+        <button
+          type="button"
+          onClick={() => void run("start")}
+          disabled={pending !== null}
+          title="Switches Axol's power back on."
+          className="flex h-8 items-center gap-1.5 rounded-full bg-emerald-600 px-3 text-xs font-semibold text-white shadow-sm transition-colors outline-none hover:bg-emerald-500 focus-visible:ring-2 focus-visible:ring-emerald-300 disabled:opacity-60"
+        >
+          <Power className="size-4" aria-hidden />
+          {startLabel}
         </button>
       ) : (
         <button
@@ -162,7 +176,7 @@ export function SafetyControl({ enabled }: { enabled: boolean }) {
             {view.canStart && (
               <Button size="sm" onClick={() => void run("start")} disabled={pending !== null}>
                 <Power aria-hidden />
-                {pending === "start" ? "Restoring power…" : "Restore power"}
+                {startLabel}
               </Button>
             )}
             {view.canStop && view.tone !== "on" && (
