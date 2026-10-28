@@ -13,7 +13,8 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes, check their robot data and fix their task text. |
-| **Request data** | Pay Almond to collect training data for your task. |
+| **Request teleoperator** | Pay Almond to finish a one-off task on your Axol remotely. |
+| **Request data** | Pay Almond to collect a training dataset of your task. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
@@ -108,7 +109,7 @@ When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies 
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, **Set up** on the **Overview** shows the mount cards with a **Save** button. The **Devices** page shows the same cards under **What is Axol mounted on?**. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, **Set up** on the **Overview** shows the mount cards with a **Save** button. The **Devices** page shows the same cards under **What is Axol mounted on?**. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it. While Jelly's wheel or lift adapter is plugged in, the panel doesn't ask what Axol is mounted on.
 
 On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
@@ -282,7 +283,9 @@ Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to pr
 
 - *Connect Axol*
 - *Choose what Axol is mounted on* (see [Axol version](#axol-version))
-- *Fix motor fault*, followed by the motor and the fault
+- *Axol isn't answering. Turn on its power.* when no motor answers
+- *Left arm isn't answering. Check its power and cable.* when no motor on one arm answers
+- *Fix the motor fault on*, followed by the motor and the fault
 - *Assign a camera and enable Record in Axol settings → Cameras*
 - *Identify left + right Lighthouse trackers*
 
