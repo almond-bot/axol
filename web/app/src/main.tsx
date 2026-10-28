@@ -43,10 +43,15 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/vr" element={<VrApp />} />
             <Route path="/control/*" element={<ControlPanel />} />
             <Route path="/diagnostics/*" element={<Diagnostics />} />
-            {/* Jog has its own screen in place of the generic operation one. */}
+            {/* Jog and Marionette have their own screens in place of the
+                generic operation one. */}
             <Route path="/control/operations/jog" element={<Jogging />} />
             <Route path="/jog" element={<Navigate to="/control/operations/jog" replace />} />
-            <Route path="/marionette" element={<Marionette />} />
+            <Route path="/control/operations/marionette" element={<Marionette />} />
+            <Route
+              path="/marionette"
+              element={<Navigate to="/control/operations/marionette" replace />}
+            />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

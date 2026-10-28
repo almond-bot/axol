@@ -4,7 +4,7 @@ import type { HostSummary } from "@/components/app-shell"
 import { fetchInfo } from "@/lib/supervisor"
 
 /**
- * The header pill for an operation screen with its own route (Jog), outside
+ * The header pill for an operation screen with its own route (Jog, Marionette), outside
  * the control panel's state: the Host Computer's name once it answers, and
  * Devices on click, as on the control panel's pages.
  *

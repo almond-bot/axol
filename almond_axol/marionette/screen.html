@@ -299,7 +299,7 @@
     else if (c.phone && c.phone.connected === false) say(c.phone.name + ' is offline', 'Showing its last state until it reconnects.', true);
     else if (stop.isOn()) say('Stopped', 'Reset Stop when it’s safe. Axol holds still until every Stop is off.', true, 'stopped');
     else if (f && (f.stopBy || f.state === 'stopped')) say(f.stopBy && f.stopBy !== me ? 'Stopped by ' + f.stopBy : 'Stopped', 'Axol holds still until every Stop is off.', true, 'stopped');
-    else if (!f) say('No answer from Axol', 'Start Marionette in the Axol control panel.', true);
+    else if (!f) say('No answer from Axol', 'In Axol\'s control panel, open Operations and start Marionette.', true);
     else if (pad === 'dropped') say('Hold dropped', 'Let go of the pad and press again.', true);
     else if (stickState === 'dropped' || holds.includes('dropped')) say('Drive dropped', 'The gateway stopped hearing it. Let go, then touch it again.', true);
     else if (f.resetting === 'left' || f.resetting === 'right') say('Returning the ' + f.resetting + ' arm to rest', 'Press Stop to halt it.', false, 'moving');

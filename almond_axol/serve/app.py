@@ -3204,7 +3204,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             from marionette import PairingError, fetch_pairing
         except ImportError:  # no marionette extra
             return JSONResponse(
-                {"error": "Marionette isn't installed on the Axol computer."},
+                {"error": "Marionette isn't installed on the Host Computer."},
                 status_code=502,
             )
 

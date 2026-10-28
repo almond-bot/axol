@@ -8,13 +8,14 @@ import {
   useState,
   type ReactNode,
 } from "react"
+import { Link } from "react-router-dom"
 import {
   ArrowDown,
   ArrowUp,
   Hand,
   Loader2,
   OctagonX,
-  Power,
+  Play,
   RotateCcw,
   RotateCw,
   Square,
@@ -26,11 +27,14 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 import { Input } from "@/components/ui/input"
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
-import { SiteNav } from "@/components/site-nav"
+import { AppShell } from "@/components/app-shell"
+import { OperationIcon } from "@/components/operation-launcher"
 import { DrivePad, HoldButton } from "@/components/jog/hold-controls"
 import { RobotStatus } from "@/components/jog/robot-status"
 import { MarionetteStage } from "@/components/marionette/stage"
 import { ROSTER } from "@/lib/axol-roster"
+import { useHostSummary } from "@/lib/host-summary"
+import { catalogEntry, rememberOperation } from "@/lib/operation-catalog"
 import { cn } from "@/lib/utils"
 import {
   IDLE_HOLD,
@@ -78,6 +82,8 @@ import {
 } from "@/lib/supervisor"
 
 const JogViewer = lazy(() => import("@/components/jog/jog-viewer"))
+
+const OPERATION = catalogEntry("marionette")
 
 type Mode = "sim" | "hardware"
 
@@ -315,7 +321,7 @@ function ArmRow({
     } catch (reason) {
       setRefusal(
         reason instanceof TypeError
-          ? "Can't reach the Axol host."
+          ? "Can't reach the Host Computer."
           : reason instanceof Error
             ? reason.message
             : String(reason)
@@ -422,6 +428,9 @@ export default function Marionette() {
   const [host, setHost] = useState<{ model: AxolModel; gripper: GripperType } | null>(null)
   const [hostError, setHostError] = useState<string | null>(null)
   const [opStatus, setOpStatus] = useState<OpStatus | null>(null)
+  // Whether the Host Computer answered the last status poll; null until it does.
+  const [reachable, setReachable] = useState<boolean | null>(null)
+  const hostSummary = useHostSummary(reachable)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [gateway, setGateway] = useState(storedGateway)
@@ -465,16 +474,22 @@ export default function Marionette() {
         })
       )
       .catch(() =>
-        setHostError("Can't reach the Axol host. Connect to it in the Control Panel first.")
+        setHostError("Can't reach the Host Computer. Connect to it on the Devices page.")
       )
   }, [])
+
+  useEffect(() => rememberOperation("marionette"), [])
 
   useEffect(() => {
     let cancelled = false
     const poll = () =>
       fetchOpStatus()
-        .then((status) => !cancelled && setOpStatus(status))
-        .catch(() => undefined)
+        .then((status) => {
+          if (cancelled) return
+          setOpStatus(status)
+          setReachable(true)
+        })
+        .catch(() => !cancelled && setReachable(false))
     poll()
     const timer = setInterval(poll, 1000)
     return () => {
@@ -504,7 +519,7 @@ export default function Marionette() {
   const stop = marionette?.stop ?? null
   const phones = marionette?.phones ?? []
   const arms = marionette?.arms ?? null
-  // The Axol computer as this page reaches it (the page may come from elsewhere).
+  // The Host Computer as this page reaches it (the page may come from elsewhere).
   const axolHost = new URL(wsBaseUrl()).hostname
   const address = running
     ? marionette?.gateway.address || String(ownSession?.args?.gateway ?? "") || gateway
@@ -521,7 +536,7 @@ export default function Marionette() {
     } catch (reason) {
       const detail =
         reason instanceof TypeError
-          ? "Can't reach the Axol host."
+          ? "Can't reach the Host Computer."
           : reason instanceof Error
             ? reason.message
             : String(reason)
@@ -663,302 +678,329 @@ export default function Marionette() {
   return (
     // On a wide screen the page fills the window: the stage takes what the
     // header and Stop leave, and the side panels scroll on their own.
-    <div className="flex min-h-screen flex-col lg:h-dvh lg:min-h-0">
-      <SiteNav
-        wide
-        current="marionette"
-        right={<Badge variant={status.variant}>{status.text}</Badge>}
-      />
-      <main className="safe-x flex flex-1 flex-col gap-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:min-h-0">
-        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-          <h1 className="font-heading text-xl font-semibold tracking-tight">Marionette</h1>
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="flex items-center gap-2 text-xs text-white/55">
-              Gateway
-              <Input
-                aria-label="Gateway address"
-                className="w-44"
-                value={running ? address : gateway}
-                placeholder={DEFAULT_GATEWAY}
-                disabled={running}
-                spellCheck={false}
-                autoComplete="off"
-                onChange={(event) => changeGateway(event.target.value)}
-              />
-            </label>
-            <div
-              className="flex rounded-lg border border-white/10 bg-white/[0.03] p-1"
-              role="radiogroup"
-              aria-label="Mode"
-            >
-              {(["sim", "hardware"] as const).map((value) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="radio"
-                  aria-checked={viewMode === value}
-                  disabled={running}
-                  onClick={() => setMode(value)}
-                  className={cn(
-                    "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed",
-                    viewMode === value
-                      ? "bg-white/10 text-white"
-                      : "text-white/50 hover:text-white/80"
-                  )}
-                >
-                  {value === "sim" ? "Sim" : "Robot"}
-                </button>
-              ))}
+    <AppShell
+      title="Operations"
+      back="/control/operations"
+      fill
+      badges={{ "/control/operations": session ? "running" : undefined }}
+      host={hostSummary}
+    >
+      <section
+        className={cn(
+          "flex flex-wrap items-center gap-x-6 gap-y-3 rounded-2xl border p-4",
+          running
+            ? "border-emerald-400/25 bg-gradient-to-br from-emerald-400/[0.06] to-transparent"
+            : "border-white/10 bg-gradient-to-br from-white/[0.04] to-transparent"
+        )}
+      >
+        <div className="flex min-w-64 flex-1 items-center gap-3">
+          <OperationIcon entry={OPERATION} running={running} />
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="font-heading text-lg font-semibold">{OPERATION.label}</h2>
+              <Badge variant={status.variant}>{status.text}</Badge>
             </div>
-            {viewMode === "sim" && (
-              <Select
-                aria-label="Robot model"
-                className="w-48"
-                value={robotModel}
-                disabled={running}
-                onChange={(event) => {
-                  const next = event.target.value as AxolModel
-                  setSimModel(next)
-                  storeSimRobot({ model: next, gripper: simGripper })
-                }}
-              >
-                {Object.values(ROSTER).map(({ model, name }) => (
-                  <SelectOption key={model} value={model} label={name} />
-                ))}
-              </Select>
-            )}
-            {running ? (
-              <Button variant="outline" onClick={stopRun} disabled={busy === "stop"}>
-                <Square /> Stop Marionette
-              </Button>
-            ) : (
-              <Button
-                onClick={start}
-                disabled={Boolean(busy) || Boolean(otherOperation) || !connected}
-              >
-                {busy === "start" ? <Loader2 className="animate-spin" /> : <Power />}
-                {mode === "sim" ? "Start sim" : "Start on robot"}
-              </Button>
-            )}
+            <p className="mt-0.5 text-sm text-white/55">{OPERATION.summary}</p>
           </div>
         </div>
-
-        {(error || linkError || hostError || otherOperation || live?.solverError) && (
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-2 text-xs text-white/55">
+            Gateway
+            <Input
+              aria-label="Gateway address"
+              className="w-44"
+              value={running ? address : gateway}
+              placeholder={DEFAULT_GATEWAY}
+              disabled={running}
+              spellCheck={false}
+              autoComplete="off"
+              onChange={(event) => changeGateway(event.target.value)}
+            />
+          </label>
           <div
-            role="alert"
-            className="rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-2.5 text-sm text-amber-200"
+            className="flex rounded-lg border border-white/10 bg-white/[0.03] p-1"
+            role="radiogroup"
+            aria-label="Mode"
           >
-            {otherOperation
-              ? `${otherOperation} is running. Stop it in the Control Panel to use Marionette.`
-              : (error ?? live?.solverError ?? linkError ?? hostError)}
-          </div>
-        )}
-
-        <div
-          data-testid="marionette-stop"
-          className={cn(
-            "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border px-3 py-2",
-            stop?.on ? "border-red-400/40 bg-red-500/[0.08]" : "border-white/10 bg-white/[0.03]"
-          )}
-        >
-          <Button
-            data-state={stop?.desktop ? "on" : "off"}
-            disabled={!running}
-            onClick={(event) => {
-              // The second click of a double-click must not turn Stop back off.
-              if (event.detail > 1) return
-              void setStop(offlineStop ? false : !stop?.desktop)
-            }}
-            className={cn(
-              "h-10 min-w-40 font-semibold",
-              stop?.desktop
-                ? "border-red-400/50 bg-transparent text-red-200 hover:bg-red-500/10"
-                : "bg-red-600 text-white hover:bg-red-600/85"
-            )}
-          >
-            <OctagonX />
-            {offlineStop ? "Clear Stop" : stop?.desktop ? "Turn Stop off" : "Stop motion"}
-          </Button>
-          <div className="min-w-0 flex-1 text-sm">
-            {stopHeadline && <p className="font-medium text-red-200">{stopHeadline}</p>}
-            <p className="text-white/50">
-              {!running && mode === "hardware" && !otherOperation ? (
-                <>
-                  On the robot, an arm moves only while{" "}
-                  <strong className="text-white/80">Hold to move</strong> is held on its phone.
-                </>
-              ) : (
-                stopNote
-              )}
-            </p>
-          </div>
-          {running && marionette && (
-            <div className="flex flex-col items-end gap-0.5 text-xs">
-              <span
+            {(["sim", "hardware"] as const).map((value) => (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={viewMode === value}
+                disabled={running}
+                onClick={() => setMode(value)}
                 className={cn(
-                  "flex items-center gap-1.5",
-                  marionette.gateway.connected ? "text-emerald-300" : "text-amber-300"
+                  "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed",
+                  viewMode === value
+                    ? "bg-white/10 text-white"
+                    : "text-white/50 hover:text-white/80"
                 )}
               >
-                <span
-                  aria-hidden
-                  className={cn(
-                    "size-2 rounded-full",
-                    marionette.gateway.connected ? "bg-emerald-400" : "bg-amber-400"
-                  )}
-                />
-                {marionette.gateway.connected ? "Gateway connected" : "Gateway not connected"}
-              </span>
-              {marionette.gateway.error && (
-                <span className="max-w-80 text-right text-amber-200/80">
-                  {marionette.gateway.error}
-                </span>
-              )}
-            </div>
+                {value === "sim" ? "Sim" : "Robot"}
+              </button>
+            ))}
+          </div>
+          {viewMode === "sim" && (
+            <Select
+              aria-label="Robot model"
+              className="w-48"
+              value={robotModel}
+              disabled={running}
+              onChange={(event) => {
+                const next = event.target.value as AxolModel
+                setSimModel(next)
+                storeSimRobot({ model: next, gripper: simGripper })
+              }}
+            >
+              {Object.values(ROSTER).map(({ model, name }) => (
+                <SelectOption key={model} value={model} label={name} />
+              ))}
+            </Select>
+          )}
+          {running ? (
+            <Button variant="outline" onClick={stopRun} disabled={busy === "stop"}>
+              {busy === "stop" ? <Loader2 className="animate-spin" /> : <Square />}
+              Stop Marionette
+            </Button>
+          ) : (
+            <Button
+              className="min-w-32"
+              onClick={start}
+              disabled={Boolean(busy) || Boolean(otherOperation) || !connected}
+            >
+              {busy === "start" ? <Loader2 className="animate-spin" /> : <Play />}
+              {mode === "sim" ? "Start sim" : "Start on robot"}
+            </Button>
           )}
         </div>
+      </section>
 
-        <div className="grid gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_340px] lg:grid-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_370px]">
-          <MarionetteStage
-            running={running}
-            ready={ready}
-            cameras={marionette?.cameras ?? null}
-            robot={
-              <Suspense
-                fallback={
-                  <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
-                    <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
-                  </div>
-                }
+      {(error || linkError || hostError || otherOperation || live?.solverError) && (
+        <div
+          role="alert"
+          className="rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-2.5 text-sm text-amber-200"
+        >
+          {otherOperation ? (
+            <>
+              {catalogEntry(otherOperation).label} is running. Stop it to use Marionette.{" "}
+              <Link
+                to={`/control/operations/${encodeURIComponent(otherOperation)}`}
+                className="font-medium underline underline-offset-2"
               >
-                <JogViewer
-                  key={`${robotModel}:${gripper}`}
-                  robotModel={robotModel}
-                  gripper={gripper}
-                  state={viewState}
-                  plan={null}
-                  activeArm="left"
-                  target={null}
-                  onTargetChange={ignore}
-                  onSelectArm={ignore}
-                />
-              </Suspense>
-            }
+                Open {catalogEntry(otherOperation).label}
+              </Link>
+            </>
+          ) : (
+            (error ?? live?.solverError ?? linkError ?? hostError)
+          )}
+        </div>
+      )}
+
+      <div
+        data-testid="marionette-stop"
+        className={cn(
+          "flex flex-wrap items-center gap-x-4 gap-y-2 rounded-xl border px-3 py-2",
+          stop?.on ? "border-red-400/40 bg-red-500/[0.08]" : "border-white/10 bg-white/[0.03]"
+        )}
+      >
+        <Button
+          data-state={stop?.desktop ? "on" : "off"}
+          disabled={!running}
+          onClick={(event) => {
+            // The second click of a double-click must not turn Stop back off.
+            if (event.detail > 1) return
+            void setStop(offlineStop ? false : !stop?.desktop)
+          }}
+          className={cn(
+            "h-10 min-w-40 font-semibold",
+            stop?.desktop
+              ? "border-red-400/50 bg-transparent text-red-200 hover:bg-red-500/10"
+              : "bg-red-600 text-white hover:bg-red-600/85"
+          )}
+        >
+          <OctagonX />
+          {offlineStop ? "Clear Stop" : stop?.desktop ? "Turn Stop off" : "Stop motion"}
+        </Button>
+        <div className="min-w-0 flex-1 text-sm">
+          {stopHeadline && <p className="font-medium text-red-200">{stopHeadline}</p>}
+          <p className="text-white/50">
+            {!running && mode === "hardware" && !otherOperation ? (
+              <>
+                On the robot, an arm moves only while{" "}
+                <strong className="text-white/80">Hold to move</strong> is held on its phone.
+              </>
+            ) : (
+              stopNote
+            )}
+          </p>
+        </div>
+        {running && marionette && (
+          <div className="flex flex-col items-end gap-0.5 text-xs">
+            <span
+              className={cn(
+                "flex items-center gap-1.5",
+                marionette.gateway.connected ? "text-emerald-300" : "text-amber-300"
+              )}
+            >
+              <span
+                aria-hidden
+                className={cn(
+                  "size-2 rounded-full",
+                  marionette.gateway.connected ? "bg-emerald-400" : "bg-amber-400"
+                )}
+              />
+              {marionette.gateway.connected ? "Gateway connected" : "Gateway not connected"}
+            </span>
+            {marionette.gateway.error && (
+              <span className="max-w-80 text-right text-amber-200/80">
+                {marionette.gateway.error}
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="grid gap-3 lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(0,1fr)_340px] lg:grid-rows-[minmax(0,1fr)] xl:grid-cols-[minmax(0,1fr)_370px]">
+        <MarionetteStage
+          running={running}
+          ready={ready}
+          cameras={marionette?.cameras ?? null}
+          robot={
+            <Suspense
+              fallback={
+                <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
+                  <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
+                </div>
+              }
+            >
+              <JogViewer
+                key={`${robotModel}:${gripper}`}
+                robotModel={robotModel}
+                gripper={gripper}
+                state={viewState}
+                plan={null}
+                activeArm="left"
+                target={null}
+                onTargetChange={ignore}
+                onSelectArm={ignore}
+              />
+            </Suspense>
+          }
+        />
+
+        <aside
+          aria-label="Phones, arms and drive"
+          className="flex min-h-0 flex-col gap-3 lg:-mr-2 lg:overflow-y-auto lg:pr-2"
+        >
+          <PhonesCard
+            phones={phones}
+            arms={arms}
+            hint={phoneConnectHint(address, axolHost)}
+            pairing={pairing}
           />
 
-          <aside
-            aria-label="Phones, arms and drive"
-            className="flex min-h-0 flex-col gap-3 lg:-mr-2 lg:overflow-y-auto lg:pr-2"
-          >
-            <PhonesCard
-              phones={phones}
-              arms={arms}
-              hint={phoneConnectHint(address, axolHost)}
-              pairing={pairing}
-            />
-
-            <Card data-testid="marionette-arms" className={PANEL}>
-              <CardHeader>
-                <CardTitle>Arms</CardTitle>
-                <CardDescription className="text-xs">
-                  <strong className="text-white/80">Reset arm</strong> moves an arm back to its rest
-                  pose, which straightens out twisted joints. Stop halts it.
-                </CardDescription>
-              </CardHeader>
-              <div className="grid grid-cols-2 gap-x-4 divide-x divide-white/10 [&>*+*]:pl-4">
-                {ARMS.map((side) => (
-                  <ArmRow
-                    key={side}
-                    side={side}
-                    arm={arms?.[side] ?? null}
-                    phones={phones}
-                    canReset={canReset}
-                  />
-                ))}
-              </div>
-            </Card>
-
-            <Card data-testid="marionette-drive" className={PANEL}>
-              <CardHeader>
-                <CardTitle>Drive</CardTitle>
-                <CardDescription className="text-xs">
-                  {robotModel === "mobile"
-                    ? "Hold a key or a button. Jelly and the lift stop when you let go."
-                    : "Only Axol on Jelly has a powered base and lift."}
-                </CardDescription>
-              </CardHeader>
-              <KeyLegend pressed={pressed} active={running} />
-              <label className="flex flex-col gap-1 text-xs text-white/55">
-                Speed limit
-                <Slider
-                  aria-label="Speed limit"
-                  value={driveSpeed}
-                  min={0.1}
-                  max={1}
-                  step={0.05}
-                  onChange={setDriveSpeed}
-                  format={(v) => `${Math.round(v * 100)} %`}
+          <Card data-testid="marionette-arms" className={PANEL}>
+            <CardHeader>
+              <CardTitle>Arms</CardTitle>
+              <CardDescription className="text-xs">
+                <strong className="text-white/80">Reset arm</strong> moves an arm back to its rest
+                pose, which straightens out twisted joints. Stop halts it.
+              </CardDescription>
+            </CardHeader>
+            <div className="grid grid-cols-2 gap-x-4 divide-x divide-white/10 [&>*+*]:pl-4">
+              {ARMS.map((side) => (
+                <ArmRow
+                  key={side}
+                  side={side}
+                  arm={arms?.[side] ?? null}
+                  phones={phones}
+                  canReset={canReset}
                 />
-              </label>
-              <div className="flex items-center gap-3">
-                <DrivePad
-                  className="size-36"
+              ))}
+            </div>
+          </Card>
+
+          <Card data-testid="marionette-drive" className={PANEL}>
+            <CardHeader>
+              <CardTitle>Drive</CardTitle>
+              <CardDescription className="text-xs">
+                {robotModel === "mobile"
+                  ? "Hold a key or a button. Jelly and the lift stop when you let go."
+                  : "Only Axol on Jelly has a powered base and lift."}
+              </CardDescription>
+            </CardHeader>
+            <KeyLegend pressed={pressed} active={running} />
+            <label className="flex flex-col gap-1 text-xs text-white/55">
+              Speed limit
+              <Slider
+                aria-label="Speed limit"
+                value={driveSpeed}
+                min={0.1}
+                max={1}
+                step={0.05}
+                onChange={setDriveSpeed}
+                format={(v) => `${Math.round(v * 100)} %`}
+              />
+            </label>
+            <div className="flex items-center gap-3">
+              <DrivePad
+                className="size-36"
+                disabled={!running || !baseState}
+                speed={driveSpeed}
+                onDrive={(command) => {
+                  pad.current = command
+                  pushHold()
+                }}
+              />
+              <div className="grid min-w-0 flex-1 gap-1.5">
+                <HoldButton
+                  label="Turn left"
+                  icon={<RotateCcw />}
+                  className="h-8"
                   disabled={!running || !baseState}
-                  speed={driveSpeed}
-                  onDrive={(command) => {
-                    pad.current = command
+                  onHold={(held) => {
+                    turn.current = held ? 1 : 0
                     pushHold()
                   }}
                 />
-                <div className="grid min-w-0 flex-1 gap-1.5">
-                  <HoldButton
-                    label="Turn left"
-                    icon={<RotateCcw />}
-                    className="h-8"
-                    disabled={!running || !baseState}
-                    onHold={(held) => {
-                      turn.current = held ? 1 : 0
-                      pushHold()
-                    }}
-                  />
-                  <HoldButton
-                    label="Turn right"
-                    icon={<RotateCw />}
-                    className="h-8"
-                    disabled={!running || !baseState}
-                    onHold={(held) => {
-                      turn.current = held ? -1 : 0
-                      pushHold()
-                    }}
-                  />
-                  <HoldButton
-                    label="Raise lift"
-                    icon={<ArrowUp />}
-                    className="h-8"
-                    disabled={!running || !liftState}
-                    onHold={(held) => {
-                      lift.current = held ? 1 : 0
-                      pushHold()
-                    }}
-                  />
-                  <HoldButton
-                    label="Lower lift"
-                    icon={<ArrowDown />}
-                    className="h-8"
-                    disabled={!running || !liftState}
-                    onHold={(held) => {
-                      lift.current = held ? -1 : 0
-                      pushHold()
-                    }}
-                  />
-                </div>
+                <HoldButton
+                  label="Turn right"
+                  icon={<RotateCw />}
+                  className="h-8"
+                  disabled={!running || !baseState}
+                  onHold={(held) => {
+                    turn.current = held ? -1 : 0
+                    pushHold()
+                  }}
+                />
+                <HoldButton
+                  label="Raise lift"
+                  icon={<ArrowUp />}
+                  className="h-8"
+                  disabled={!running || !liftState}
+                  onHold={(held) => {
+                    lift.current = held ? 1 : 0
+                    pushHold()
+                  }}
+                />
+                <HoldButton
+                  label="Lower lift"
+                  icon={<ArrowDown />}
+                  className="h-8"
+                  disabled={!running || !liftState}
+                  onHold={(held) => {
+                    lift.current = held ? -1 : 0
+                    pushHold()
+                  }}
+                />
               </div>
-            </Card>
+            </div>
+          </Card>
 
-            <RobotStatus state={live} />
-          </aside>
-        </div>
-      </main>
-    </div>
+          <RobotStatus state={live} />
+        </aside>
+      </div>
+    </AppShell>
   )
 }

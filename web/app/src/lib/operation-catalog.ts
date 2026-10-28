@@ -8,6 +8,7 @@ import {
   Move3d,
   Play,
   Route,
+  Smartphone,
   type LucideIcon,
 } from "lucide-react"
 import type { OperationId, OperationMeta } from "@/lib/supervisor"
@@ -72,6 +73,14 @@ export const OPERATION_CATALOG: CatalogEntry[] = [
     icon: Move3d,
     group: "drive",
     needs: [],
+  },
+  {
+    id: "marionette",
+    label: "Marionette",
+    summary: "Drive the arms, lift and Jelly from iPhones running Marionette.",
+    icon: Smartphone,
+    group: "drive",
+    needs: ["iPhone with Marionette"],
   },
   {
     id: "collect-data",

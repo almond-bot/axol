@@ -309,7 +309,7 @@ const isLoopback = (host: string) => host === "localhost" || host === "::1" || /
 
 /**
  * The sentence telling an operator where to point the Marionette app.
- * `axolHost` is the Axol computer's address as this page reaches it: a
+ * `axolHost` is the Host Computer's address as this page reaches it: a
  * gateway local to Axol is reached at that address.
  */
 export function phoneConnectHint(address: string, axolHost = ""): string {

@@ -1,7 +1,7 @@
 """``axol marionette.gateway``: run the Marionette gateway on this computer.
 
 The gateway the phones connect to ships inside the Marionette SDK (the
-``marionette`` extra), with a Node runtime, so Axol's computer needs no copy
+``marionette`` extra), with a Node runtime, so the Host Computer needs no copy
 of the Marionette repository. Every argument is the gateway's own:
 ``--port``, ``--name``, ``--auth``, ``--token``, ``--no-mdns`` and so on
 (``axol marionette.gateway --help``).

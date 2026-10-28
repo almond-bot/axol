@@ -10,14 +10,12 @@ import { cn } from "@/lib/utils"
  * switching routes does a full navigation (each route lazy-loads its bundle).
  * ``right`` injects route-specific controls (e.g. the connection pill) just
  * before the Docs / cross-link buttons. On narrow screens the links collapse
- * into a hamburger menu so the bar never overflows the viewport. ``wide``
- * spans the whole window, for a page that does.
+ * into a hamburger menu so the bar never overflows the viewport.
  */
 const PAGE_LABEL: Record<string, string> = {
   control: "Control Panel",
   vr: "VR",
   diagnostics: "Diagnostics",
-  marionette: "Marionette",
 }
 
 function NavLinks({
@@ -52,11 +50,6 @@ function NavLinks({
           Diagnostics
         </a>
       )}
-      {current !== "marionette" && (
-        <a href="/marionette" className={item}>
-          Marionette
-        </a>
-      )}
       {current !== "vr" && (
         <a href="/vr" className={item}>
           VR App
@@ -69,11 +62,9 @@ function NavLinks({
 export function SiteNav({
   current,
   right,
-  wide = false,
 }: {
-  current: "control" | "vr" | "diagnostics" | "marionette"
+  current: "control" | "vr" | "diagnostics"
   right?: ReactNode
-  wide?: boolean
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
   // Owned here, not by the menu item: closing the menu unmounts its contents,
@@ -81,12 +72,7 @@ export function SiteNav({
   const [quickstartOpen, setQuickstartOpen] = useState(false)
   return (
     <header className="sticky top-0 z-40 border-b border-white/10 bg-[#121212]/85 pt-[env(safe-area-inset-top)] backdrop-blur-md">
-      <div
-        className={cn(
-          "safe-x relative mx-auto flex h-14 items-center justify-between gap-2 sm:h-16",
-          !wide && "max-w-6xl"
-        )}
-      >
+      <div className="safe-x relative mx-auto flex h-14 max-w-6xl items-center justify-between gap-2 sm:h-16">
         <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           <img src="/almond.svg" alt="Almond" className="h-6 w-6 shrink-0" />
           <span className="font-heading text-base font-semibold tracking-tight whitespace-nowrap">
