@@ -23,9 +23,7 @@ const REFUND_NOTE: Record<DataCollectionService, string> = {
   task:
     "You're buying credit for the hours you request. Almond bills the session " +
     "by the minute and refunds any credit you don't use.",
-  dataset:
-    "You pay for the hours you request. If Almond delivers fewer usable hours, " +
-    "we refund the difference.",
+  dataset: "You pay per hour of usable data, however long recording takes.",
 }
 
 const METHOD: Record<CollectionMethod, string> = {

@@ -80,7 +80,7 @@ describe("POST /api/data-collection/checkout", () => {
     expect(params.payment_intent_data.description).toBe(
       "Teleop Data Collection, training dataset, collected on your Axol, 12 h"
     )
-    expect(params.custom_text.submit.message).toContain("fewer usable hours")
+    expect(params.custom_text.submit.message).toContain("per hour of usable data")
   })
 
   it("bills a one-off task on the teleoperator price", async () => {

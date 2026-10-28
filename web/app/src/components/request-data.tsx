@@ -68,8 +68,7 @@ const SERVICES: Record<DataCollectionService, ServiceCopy> = {
       "Almond emails you to plan the collection.",
       "Almond records the episodes and delivers them as a LeRobot dataset.",
     ],
-    refund:
-      "You pay per hour of usable data, however long recording takes. If Almond delivers fewer usable hours than you paid for, we refund the difference.",
+    refund: "You pay per hour of usable data, however long recording takes.",
     footer: "You pay for the hours you request now.",
     submit: "Continue to payment",
   },
