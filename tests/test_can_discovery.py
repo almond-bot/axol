@@ -983,6 +983,48 @@ class CanDiscoveryApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(robot.disconnects, 1)
         self.assertEqual(robot.connects, 1)
 
+    async def test_a_failed_safety_pause_still_resumes_the_link(self) -> None:
+        events: list[str] = []
+
+        class _FlakySafety:
+            def __init__(self) -> None:
+                self.paused = False
+
+            def pause(self) -> None:
+                events.append("pause")
+                self.paused = True
+                raise TimeoutError
+
+            def resume(self) -> None:
+                events.append("resume")
+                self.paused = False
+
+            def shutdown(self) -> None:
+                pass
+
+        safety = _FlakySafety()
+        initial = _state(
+            candidates=(("usb-1", "SERIAL"),),
+            validation=(("usb", "usb-1", "SERIAL"),),
+        )
+        discover = Mock()
+        with (
+            patch.object(app_module, "SafetyLink", lambda: safety),
+            patch.object(app_module.os, "geteuid", return_value=0),
+            patch.object(app_module, "_list_can_interfaces", return_value=[]),
+            patch.object(app_module, "_attached_hub_state", return_value=initial),
+            patch.object(setup, "setup_detected_hubs", discover),
+        ):
+            _app, _robot, _runner, _manager, transport = self._transport()
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as client:
+                await client.post("/api/can/discover")
+
+        discover.assert_not_called()
+        self.assertEqual(events, ["pause", "resume"])
+        self.assertFalse(safety.paused)
+
     async def test_app_restart_changes_inventory_instance_id(self) -> None:
         attached = _state()
         _first, _robot, _runner, _manager, first_transport = self._transport()

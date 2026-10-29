@@ -1,0 +1,25 @@
+---
+title: "safety"
+description: "Cut power to Axol, switch it back on, or check the E-Stop on a Jelly with a safety board."
+---
+
+On a Jelly with a safety board, these commands work like the E-Stop and the green on-switch. See [Software E-Stop](/hardware-setup/jelly#software-e-stop).
+
+```bash
+axol safety.status            # the E-Stop, power, and battery voltage
+axol safety.status --watch    # keep printing until Ctrl-C
+axol safety.stop              # cut power to Axol, like the E-Stop
+axol safety.start             # switch power back on, like the green on-switch
+```
+
+| Command | What it does |
+|---|---|
+| `safety.status` | Prints whether power is on, the E-Stop is pressed, or a software stop is in force. It also prints the battery and output voltage and any fault. |
+| `safety.stop` | Cuts power to Axol and waits for the safety board to confirm. The arms drop. Power stays off until a start. |
+| `safety.start` | Switches power back on. It fails with the reason when the E-Stop is pressed or power does not come on. |
+
+`--channel` picks the CAN interface. By default the commands use the lift's bus: `can_alm_axol_c` when it exists, otherwise `can_alm_axol_b`.
+
+<Warning>
+  If `safety.stop` reports that the stop was not confirmed, press the E-Stop.
+</Warning>

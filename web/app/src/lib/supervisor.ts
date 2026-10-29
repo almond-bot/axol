@@ -633,8 +633,76 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
-/** A lift firmware image the serve host validated and stored for `lift.update`. */
-export interface LiftFirmwareUpload {
+// ---------------------------------------------------------------------------
+// Jelly safety board (software E-stop; always connected, tasks included)
+// ---------------------------------------------------------------------------
+
+/** One status frame from the safety board (almond_axol/robot/safety.py). */
+export interface SafetyBoardStatus {
+  /** The E-Stop is released and its loop is fed. */
+  estopOk: boolean
+  /** The start latch is sealed in. */
+  latched: boolean
+  /** The contactor is closed: Axol has power. */
+  outputOn: boolean
+  /** No software stop is in force. */
+  softwareEnable: boolean
+  remoteStartActive: boolean
+  /** A firmware update is running: power stays off until it finishes. Absent on older hosts. */
+  updateLocked?: boolean
+  heartbeatOn: boolean
+  /** The 24 V rail is high enough to switch the contactor. */
+  supplyOk: boolean
+  supplyVolts: number
+  outputVolts: number
+  /** Why the software enable is off: "none" | "can" | "heartbeat" | "console" | "update". */
+  stopCause: string
+  firmware: string
+  faults: {
+    /** Any relay reading back wrong: the board needs service. */
+    relay: boolean
+    k2Stuck: boolean
+    k2NoClose: boolean
+    k1PoleB: boolean
+    remoteStartFailed: boolean
+    heartbeatLost: boolean
+    /** The 24 V supply dipped since the last start (firmware 0.4+). Absent on older hosts. */
+    supplyDip?: boolean
+  }
+}
+
+export interface SafetyLinkStatus {
+  channel: string
+  /** The host has the board's bus open. */
+  connected: boolean
+  /** Closed for CAN discovery. */
+  paused: boolean
+  /** A safety board has answered since the server started. False on a Jelly without one. */
+  detected: boolean
+  /** The board answered within the last second. */
+  reachable: boolean
+  ageSeconds: number | null
+  /** The latest frame (kept, with `reachable` false, when the board goes quiet). */
+  status: SafetyBoardStatus | null
+  error: string | null
+}
+
+export async function fetchSafetyStatus(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/status")))
+}
+
+/** Software E-stop. Rejects unless the board confirmed that power is off. */
+export async function safetyStop(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/stop"), { method: "POST" }))
+}
+
+/** Switch power back on, like the green on-switch. Rejects with the reason it did not. */
+export async function safetyStart(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/start"), { method: "POST" }))
+}
+
+/** A firmware image the serve host validated and stored for `lift.update` or `safety.update`. */
+export interface FirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */
   path: string
   version: string
@@ -643,15 +711,25 @@ export interface LiftFirmwareUpload {
   size: number
 }
 
-/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
-export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+export type LiftFirmwareUpload = FirmwareUpload
+
+/** Which board a firmware file is for: the lift (jelly_legs) or the safety board. */
+export type FirmwareBoard = "lift" | "safety"
+
+/** Upload a board's firmware.bin; the host rejects any other board's file. */
+export async function uploadFirmware(board: FirmwareBoard, file: Blob): Promise<FirmwareUpload> {
   return json(
-    await fetch(apiUrl("/api/lift/firmware"), {
+    await fetch(apiUrl(`/api/${board}/firmware`), {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
     })
   )
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<FirmwareUpload> {
+  return uploadFirmware("lift", file)
 }
 
 /** Healthy = reachable on CAN and reporting no error status. */

@@ -242,6 +242,7 @@ export function AppShell({
   notices,
   badges,
   host,
+  safety,
   subNav,
   wide = false,
   children,
@@ -256,6 +257,8 @@ export function AppShell({
   notices?: ReactNode
   badges?: NavBadges
   host?: HostSummary
+  /** The software E-stop, on every page next to the connection status. */
+  safety?: ReactNode
   /** Sub-pages of one section, listed under its sidebar item. */
   subNav?: { under: string; items: SubNavItem[] }
   /** Wider content column, for chart-heavy pages. */
@@ -348,6 +351,7 @@ export function AppShell({
             </h1>
           )}
           {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+          {safety}
           {host && <HostPill host={host} />}
         </div>
       </header>

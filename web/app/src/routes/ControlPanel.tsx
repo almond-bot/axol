@@ -143,6 +143,7 @@ import {
 } from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { AppShell, type HostSummary, type NavBadges } from "@/components/app-shell"
+import { SafetyControl } from "@/components/safety-control"
 import { jellyDeviceView, type StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
@@ -2409,6 +2410,7 @@ export default function ControlPanel() {
         notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
         badges={badges}
         host={host}
+        safety={<SafetyControl key={connectionGeneration} enabled={conn.state === "ok"} />}
       >
         {view === "overview" && (
           <>

@@ -796,6 +796,23 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="helper",
     ),
+    "safety.update": CommandDef(
+        "safety.update",
+        "safety.update",
+        "Update safety board firmware",
+        "Install a safety board firmware file (.bin) on Jelly's safety board over "
+        "CAN, in a few seconds. It cuts power to Axol first, and power stays off "
+        "until you restore it. If the new firmware doesn't start correctly, the "
+        "board goes back to the old one. Without a file, it shows the running "
+        "firmware version. Needs safety board firmware 0.3 or later, installed "
+        "once over USB.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.safety_update"),
+        requires_hardware=True,
+        hardware_profiles=("axol",),
+        section="helper",
+    ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",
