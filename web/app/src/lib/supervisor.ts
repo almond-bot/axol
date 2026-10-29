@@ -633,8 +633,8 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
-/** A lift firmware image the serve host validated and stored for `lift.update`. */
-export interface LiftFirmwareUpload {
+/** A firmware image the serve host validated and stored for `lift.update` or `mantis.update`. */
+export interface FirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */
   path: string
   version: string
@@ -643,15 +643,25 @@ export interface LiftFirmwareUpload {
   size: number
 }
 
-/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
-export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+export type LiftFirmwareUpload = FirmwareUpload
+
+/** Which board a firmware file is for: the lift (jelly_legs) or the Mantis trigger. */
+export type FirmwareBoard = "lift" | "mantis"
+
+/** Upload a board's firmware.bin; the host rejects any other board's file. */
+export async function uploadFirmware(board: FirmwareBoard, file: Blob): Promise<FirmwareUpload> {
   return json(
-    await fetch(apiUrl("/api/lift/firmware"), {
+    await fetch(apiUrl(`/api/${board}/firmware`), {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
     })
   )
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<FirmwareUpload> {
+  return uploadFirmware("lift", file)
 }
 
 /** Healthy = reachable on CAN and reporting no error status. */

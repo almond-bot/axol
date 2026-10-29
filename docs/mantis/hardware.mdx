@@ -168,6 +168,12 @@ Mantis can record two wrist cameras and the head stereo camera at the same time.
 
 You must turn on **Record** for at least one camera before you can collect data. The Mantis camera layout is saved separately from Axol's, so changing one doesn't change the other. In the dataset, the head camera is named `overhead`. See [Cameras](/guides/control-panel#cameras) for the stream and record controls.
 
+## Updating the firmware
+
+Each rig's trigger board can take new firmware over its CAN bus. Run [`axol mantis.update --firmware firmware.bin`](/cli/mantis-update), or use **Update Mantis firmware** under **Diagnostics → Helpers** with Mantis selected. Keep both triggers released while it runs, because each rig learns its trigger's released position when it restarts.
+
+The rigs need Mantis firmware 0.2 or newer, installed once over USB, before they can update over CAN.
+
 ## Next steps
 
 <CardGroup cols={2}>

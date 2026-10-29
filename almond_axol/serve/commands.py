@@ -796,6 +796,21 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="helper",
     ),
+    "mantis.update": CommandDef(
+        "mantis.update",
+        "mantis.update",
+        "Update Mantis firmware",
+        "Install a Mantis firmware file (.bin) on both rigs over CAN, in a few "
+        "seconds each. Keep the triggers released. If the new firmware doesn't "
+        "start correctly, the rig goes back to the old one. Without a file, it "
+        "shows the running firmware version.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.mantis_update"),
+        requires_hardware=True,
+        hardware_profiles=("mantis",),
+        section="helper",
+    ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",
