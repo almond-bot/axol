@@ -72,6 +72,7 @@ def status_payload(status: SafetyStatus) -> dict[str, Any]:
             "k1PoleB": status.k1_pole_b,
             "remoteStartFailed": status.remote_start_failed,
             "heartbeatLost": status.heartbeat_lost,
+            "supplyDip": status.supply_dip,
         },
     }
 

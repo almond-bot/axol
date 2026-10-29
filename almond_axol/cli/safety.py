@@ -48,6 +48,7 @@ def fmt_status(st: SafetyStatus) -> str:
             ("k1_pole_b", st.k1_pole_b),
             ("start_failed", st.remote_start_failed),
             ("heartbeat_lost", st.heartbeat_lost),
+            ("supply_dip", st.supply_dip),
         )
         if on
     ]

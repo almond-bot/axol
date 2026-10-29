@@ -74,6 +74,14 @@ describe("safetyView", () => {
     expect(v.startHint).toBe("Wait for the update to finish.")
   })
 
+  it("notes a supply dip while power is off", () => {
+    const faults = { ...board().faults, supplyDip: true }
+    expect(safetyView(link(board({ ...off, faults }))).notes).toContain(
+      "Jelly's 24 V supply dipped, which can cut power on its own."
+    )
+    expect(safetyView(link(board({ faults }))).notes).toEqual([])
+  })
+
   it("offers a restore when the latch is open", () => {
     expect(safetyView(link(board(off)))).toMatchObject({ label: "Power off", canStart: true })
   })

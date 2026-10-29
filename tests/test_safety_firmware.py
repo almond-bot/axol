@@ -190,6 +190,12 @@ class SafetyStatusUpdateLockTest(unittest.TestCase):
         self.assertEqual(status.stop_cause, "update")
         self.assertIn("updating its firmware", explain_start_failure(status))
 
+    def test_decodes_a_supply_dip(self) -> None:
+        status = decode_status(bytes([0x89, 0x08, 0, 0x04, 0x20, 0x67, 0, 0]))
+        self.assertTrue(status.supply_dip)
+        self.assertEqual(status.firmware_version, "0.4")
+        self.assertFalse(status.relay_fault)
+
     def test_older_firmware_reads_unlocked(self) -> None:
         status = decode_status(bytes([0x8F, 0, 0, 0x02, 0x20, 0x67, 0x90, 0x65]))
         self.assertFalse(status.update_locked)

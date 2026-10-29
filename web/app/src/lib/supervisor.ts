@@ -630,6 +630,8 @@ export interface SafetyBoardStatus {
     k1PoleB: boolean
     remoteStartFailed: boolean
     heartbeatLost: boolean
+    /** The 24 V supply dipped since the last start (firmware 0.4+). Absent on older hosts. */
+    supplyDip?: boolean
   }
 }
 

@@ -62,6 +62,9 @@ export function safetyView(link: SafetyLinkStatus | null | undefined): SafetyVie
   if (s.faults.heartbeatLost && s.stopCause !== "heartbeat") {
     notes.push("The robot computer stopped responding earlier.")
   }
+  if (s.faults.supplyDip && !s.outputOn) {
+    notes.push("Jelly's 24 V supply dipped, which can cut power on its own.")
+  }
 
   if (s.faults.relay) {
     return {

@@ -143,6 +143,9 @@ class SafetyStatus:
     # A firmware update is running or a new image is on trial: the board
     # keeps the software enable off until it is confirmed (firmware 0.3+).
     update_locked: bool = False
+    # Sticky: the 24 V supply dipped below 18 V since the last start, which
+    # can cut power by itself (firmware 0.4+).
+    supply_dip: bool = False
 
     @property
     def estop_pressed(self) -> bool:
@@ -188,6 +191,7 @@ def decode_status(data: bytes) -> SafetyStatus:
         supply_volts=supply_mv / 1000.0,
         output_volts=output_mv / 1000.0,
         update_locked=bool(state & 0x10),
+        supply_dip=bool(faults & 0x08),
     )
 
 
