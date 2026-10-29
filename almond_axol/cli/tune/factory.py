@@ -523,6 +523,10 @@ async def _calibrate_joint(
             # An implausible fit means bad sweep data — keep the CAD CoM but
             # don't lose the friction fit over it.
             print(f"  ! Gravity fit rejected: {exc}")
+            print(
+                "    Keeping this joint's current gravity values. A few rejected "
+                "joints are normal, mostly elbow and wrist_1."
+            )
 
     com_fit = None
     if gravity_fit is not None:
@@ -690,6 +694,10 @@ async def _calibrate_joint_slow(
             gravity_fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
         except RuntimeError as exc:
             print(f"  ! Gravity fit rejected: {exc}")
+            print(
+                "    Keeping this joint's current gravity values. A few rejected "
+                "joints are normal, mostly elbow and wrist_1."
+            )
             gravity_fit = None
         if gravity_fit is not None:
             com_fit, fo, tau_before, tau_after = gravity_fit

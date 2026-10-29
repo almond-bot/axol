@@ -32,7 +32,7 @@ The upload merges with what is already stored, joint by joint:
 
 ## Custom end-effectors
 
-The gravity fit keeps each link's mass fixed and fits only its center of mass. The gripper and everything mounted on it count as the `wrist_3` link, including wrist cameras and their brackets. The stock mass, 0.75&nbsp;kg, includes the Camera Kit wrist camera and its mount. If you change the weight on the wrist, give the new `wrist_3` mass before you calibrate. Otherwise the extra weight shows up at the elbow and shoulders, and their fits are rejected.
+The gravity fit keeps each link's mass fixed and fits only its center of mass. The gripper and everything mounted on it count as the `wrist_3` link, including wrist cameras and their brackets. The stock mass, 0.75&nbsp;kg, includes the Camera Kit wrist camera and its mount. If you change the weight on the wrist, give the new `wrist_3` mass before you calibrate. Otherwise the extra weight is spread over the wrong links.
 
 Set the mass in one of two places:
 
@@ -52,7 +52,7 @@ axol tune.factory --mass wrist_3=0.78                                         # 
 axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14    # one arm, seeded CoM
 ```
 
-For a step-by-step walkthrough, and what to do when a fit is rejected, see [After you change the end-effector or add cameras](/guides/axol-calibration#after-you-change-the-end-effector-or-add-cameras).
+A few rejected gravity fits are normal, mostly on `elbow` and `wrist_1`. For a step-by-step walkthrough, and when a rejected fit needs attention, see [After you change the end-effector or add cameras](/guides/axol-calibration#after-you-change-the-end-effector-or-add-cameras).
 
 ### Keeping a hand-tuned gravity model
 
