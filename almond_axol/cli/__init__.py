@@ -91,12 +91,26 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
     ),
 }
 
+# Commands that hand their arguments to another program's own parser,
+# dispatched lazily like the diagnostics.
+_TOOL_COMMANDS: dict[str, tuple[str, str]] = {
+    "marionette.gateway": (
+        "almond_axol.cli.marionette_gateway",
+        "Run the Marionette gateway the phones connect to.",
+    ),
+}
+
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
     "waypoints": (
         "waypoints",
         "Teach waypoints by hand, then replay them as straight-line moves.",
+    ),
+    "jog": ("jog", "Jog the arms, lift and base from the control panel."),
+    "marionette": (
+        "marionette",
+        "Teleoperate the arms, lift and base from iPhones running Marionette.",
     ),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "collect-dagger": (
@@ -198,7 +212,11 @@ def build_parser() -> argparse.ArgumentParser:
     # they show up in ``axol --help``; their real parsing happens in the
     # interceptors above (``axol <cmd> --help`` is handled by the command's
     # own parser).
-    for name, (_, help_text) in (*_DRACCUS_COMMANDS.items(), *_DIAG_COMMANDS.items()):
+    for name, (_, help_text) in (
+        *_DRACCUS_COMMANDS.items(),
+        *_DIAG_COMMANDS.items(),
+        *_TOOL_COMMANDS.items(),
+    ):
         subparsers.add_parser(name, help=help_text, add_help=False)
     return parser
 
@@ -213,8 +231,9 @@ def main() -> None:
     if argv and argv[0] in _DRACCUS_COMMANDS:
         _dispatch_draccus(argv[0], argv[1:])
         return
-    if argv and argv[0] in _DIAG_COMMANDS:
-        module_name, _ = _DIAG_COMMANDS[argv[0]]
+    lazy = {**_DIAG_COMMANDS, **_TOOL_COMMANDS}
+    if argv and argv[0] in lazy:
+        module_name, _ = lazy[argv[0]]
         importlib.import_module(module_name).main(argv[1:])
         return
 

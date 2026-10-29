@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -122,6 +123,24 @@ class OpStartRequest(BaseModel):
     op: str
     args: dict[str, Any] = {}
     cameras: dict[str, Any] | None = None
+
+
+class JogPlanRequest(BaseModel):
+    arm: Literal["left", "right"]
+    position: list[float]
+    quaternion: list[float]
+
+
+class JogExecuteRequest(BaseModel):
+    id: int
+
+
+class MarionetteStopRequest(BaseModel):
+    on: bool
+
+
+class MarionetteResetRequest(BaseModel):
+    arm: str
 
 
 class RobotConnectRequest(BaseModel):
@@ -2974,6 +2993,326 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             req.task.strip(),
         )
         return {"episode": summary}
+
+    # -- jogging (the Jog page drives the running ``jog`` operation) ---------
+
+    def _jog_session() -> Any:
+        from ..jog.session import active_session
+
+        return active_session()
+
+    def _jog_not_running() -> JSONResponse:
+        return JSONResponse(
+            {"error": "Jogging is not running. Start it from the Jog page."},
+            status_code=409,
+        )
+
+    @app.get("/api/jog/state")
+    async def jog_state() -> dict[str, Any]:
+        session = _jog_session()
+        return {"running": session is not None, **(session.state() if session else {})}
+
+    @app.post("/api/jog/plan", response_model=None)
+    async def jog_plan(req: JogPlanRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(
+                session.plan, req.arm, req.position, req.quaternion
+            )
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/execute", response_model=None)
+    async def jog_execute(req: JogExecuteRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return session.execute(req.id)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/cancel", response_model=None)
+    async def jog_cancel() -> dict[str, Any] | JSONResponse:
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        return {"stopped": session.cancel()}
+
+    @app.websocket("/api/jog/ws")
+    async def jog_ws(ws: WebSocket) -> None:
+        """Hold commands and previews in, jog state out.
+
+        The page sends ``{"type": "hold", "drive": [vx, vy, wz], "lift": d,
+        "arms": {"left": [x, y, z, roll, pitch, yaw]}, "armFrame": "torso",
+        "armSpeed": s}`` every 50 ms while it is connected, zeros included
+        (``arms``, ``armFrame`` and ``armSpeed`` are optional). Silence for
+        longer than the session's hold timeout stops the base, lift and
+        arms, as does closing the socket. State goes out at 20 Hz.
+
+        ``{"type": "preview", "seq": n, "arm": a, "position": p,
+        "quaternion": q}`` asks for the IK preview of a target; the answer
+        comes back as ``{"type": "preview", "seq": n, ...}``. The latest
+        request wins: one still waiting when a newer one arrives is dropped,
+        and a ``seq`` no newer than the last is ignored.
+        """
+        from ..jog.session import JogError
+
+        await ws.accept()
+        last_session: Any = None
+        source = f"ws-{id(ws):x}"
+        preview_wanted = asyncio.Event()
+        preview_request: dict[str, Any] | None = None
+        preview_seq = -math.inf
+
+        async def receive() -> None:
+            nonlocal last_session, preview_request, preview_seq
+            while True:
+                message = await ws.receive_json()
+                session = _jog_session()
+                if session is None or not isinstance(message, dict):
+                    continue
+                last_session = session
+                if message.get("type") == "hold":
+                    drive = message.get("drive") or [0.0, 0.0, 0.0]
+                    try:
+                        if not isinstance(drive, list) or len(drive) != 3:
+                            raise JogError("drive must be [vx, vy, wz]")
+                        session.hold(
+                            *drive,
+                            message.get("lift", 0),
+                            source=source,
+                            arms=message.get("arms"),
+                            frame=message.get("armFrame", "torso"),
+                            speed=message.get("armSpeed", 1.0),
+                        )
+                    except (JogError, TypeError) as exc:
+                        await ws.send_json({"type": "error", "error": str(exc)})
+                elif message.get("type") == "release":
+                    session.release(source)
+                elif message.get("type") == "preview":
+                    seq = message.get("seq")
+                    if (
+                        not isinstance(seq, (int, float))
+                        or isinstance(seq, bool)
+                        or not math.isfinite(seq)
+                        or seq <= preview_seq
+                    ):
+                        continue
+                    preview_seq = seq
+                    preview_request = message
+                    preview_wanted.set()
+
+        async def preview() -> None:
+            nonlocal preview_request
+            while True:
+                await preview_wanted.wait()
+                preview_wanted.clear()
+                request, preview_request = preview_request, None
+                session = _jog_session()
+                if request is None or session is None:
+                    continue
+                reply: dict[str, Any] = {"type": "preview", "seq": request["seq"]}
+                try:
+                    reply.update(
+                        await asyncio.to_thread(
+                            session.preview,
+                            request.get("arm"),
+                            request.get("position") or [],
+                            request.get("quaternion") or [],
+                        )
+                    )
+                except (JogError, TypeError) as exc:
+                    reply["error"] = str(exc)
+                except Exception:  # noqa: BLE001 - keep the socket's holds alive
+                    _logger.exception("jog: preview failed")
+                    reply["error"] = "The preview failed. Try moving the target again."
+                await ws.send_json(reply)
+
+        async def send() -> None:
+            while True:
+                session = _jog_session()
+                state = session.state() if session else {}
+                await ws.send_json(
+                    {"type": "state", "running": session is not None, **state}
+                )
+                await asyncio.sleep(0.05)
+
+        tasks = [
+            asyncio.create_task(receive()),
+            asyncio.create_task(send()),
+            asyncio.create_task(preview()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+            # The page is gone: if it was driving, the base and lift stop now.
+            session = _jog_session()
+            for candidate in {id(s): s for s in (session, last_session) if s}.values():
+                candidate.disconnect(source)
+
+    # -- Marionette (iPhone teleoperation; the session is a jog session) ----
+
+    def _marionette_session() -> Any:
+        try:
+            from ..marionette.session import MarionetteSession
+        except ImportError:  # no marionette extra: no Marionette session either
+            return None
+
+        session = _jog_session()
+        return session if isinstance(session, MarionetteSession) else None
+
+    @app.post("/api/marionette/stop", response_model=None)
+    async def marionette_stop(
+        req: MarionetteStopRequest,
+    ) -> dict[str, Any] | JSONResponse:
+        session = _marionette_session()
+        if session is None:
+            return JSONResponse(
+                {
+                    "error": "Marionette is not running. Start it from the Marionette page."
+                },
+                status_code=409,
+            )
+        return session.set_stop(req.on)
+
+    @app.post("/api/marionette/reset", response_model=None)
+    async def marionette_reset(
+        req: MarionetteResetRequest,
+    ) -> dict[str, Any] | JSONResponse:
+        """Send one arm back to its rest pose."""
+        from ..jog.session import JogError
+
+        session = _marionette_session()
+        if session is None:
+            return JSONResponse(
+                {
+                    "error": "Marionette is not running. Start it from the Marionette page."
+                },
+                status_code=409,
+            )
+        try:
+            return session.reset_arm(req.arm)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.get("/api/marionette/pairing", response_model=None)
+    async def marionette_pairing(
+        gateway: str = "localhost:8787",
+    ) -> dict[str, Any] | JSONResponse:
+        """The gateway's QR code and pairing code, for the page to show.
+
+        Read here, not by the browser: the gateway lets its own computer in
+        without the code, and Axol's server usually runs there.
+        """
+        try:
+            from marionette import PairingError, fetch_pairing
+        except ImportError:  # no marionette extra
+            return JSONResponse(
+                {"error": "Marionette isn't installed on the Host Computer."},
+                status_code=502,
+            )
+
+        try:
+            pairing = await asyncio.to_thread(fetch_pairing, gateway)
+        except PairingError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        return pairing.to_json()
+
+    @app.websocket("/api/marionette/cameras")
+    async def marionette_cameras(ws: WebSocket) -> None:
+        """JPEG camera frames for the Marionette page.
+
+        Query ``streams`` (comma-separated: head, left, right), ``large``
+        (one of them, or empty) and ``fps``. The ``large`` stream, which the
+        page shows big, comes at the hub's ``large_width``; the others at
+        the width the phones get, as the same compressed frames. The page
+        changes ``large`` by sending ``{"large": stream}``. Each frame is a
+        binary message: the stream id, a newline, then the JPEG. A text
+        message ``{"type": "cameras", "available": [...], "error": ...}`` is
+        sent on connect and whenever it changes.
+        """
+        from ..marionette.cameras import STREAMS
+
+        await ws.accept()
+        wanted = [
+            s
+            for s in (ws.query_params.get("streams") or "head,left,right").split(",")
+            if s in STREAMS
+        ]
+        large = ws.query_params.get("large") or ""
+        try:
+            fps = float(ws.query_params.get("fps") or 10)
+        except ValueError:
+            fps = 10.0
+        fps = min(max(fps, 1.0), 30.0) if math.isfinite(fps) else 10.0
+        watcher = f"page-{id(ws):x}"
+        sent: dict[str, int] = {}
+        described: dict[str, Any] | None = None
+        hub: Any = None
+
+        async def drain() -> None:
+            # The page only says which stream is large; this also notices it leave.
+            nonlocal large
+            while True:
+                message = await ws.receive()
+                if message["type"] == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                with contextlib.suppress(ValueError, TypeError, AttributeError):
+                    value = json.loads(message.get("text") or "null").get("large")
+                    if value == "" or value in STREAMS:
+                        large = value
+
+        reader = asyncio.create_task(drain())
+        try:
+            while not reader.done():
+                session = _marionette_session()
+                current = None if session is None else session.cameras
+                if current is not hub:
+                    if hub is not None:
+                        hub.drop(watcher)
+                        hub.drop(f"{watcher}-large")
+                    hub, sent = current, {}
+                description = (
+                    hub.describe()
+                    if hub is not None
+                    else {"available": [], "source": None, "error": None}
+                )
+                if description != described:
+                    described = description
+                    await ws.send_json({"type": "cameras", **description})
+                if hub is not None:
+                    big = large if large in wanted else ""
+                    hub.want(watcher, [s for s in wanted if s != big])
+                    hub.want(f"{watcher}-large", [big] if big else [], hub.large_width)
+                    for stream in wanted:
+                        frame = hub.latest(
+                            stream, hub.large_width if stream == big else None
+                        )
+                        if frame is not None and sent.get(stream) != frame.seq:
+                            sent[stream] = frame.seq
+                            await ws.send_bytes(stream.encode() + b"\n" + frame.jpeg)
+                await asyncio.sleep(1.0 / fps)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            reader.cancel()
+            with contextlib.suppress(BaseException):
+                await reader
+            if hub is not None:
+                hub.drop(watcher)
+                hub.drop(f"{watcher}-large")
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 

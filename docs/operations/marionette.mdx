@@ -1,0 +1,122 @@
+---
+title: "Marionette"
+description: "Drive Axol's arms, grippers, lift and Jelly from one or two iPhones running Marionette."
+---
+
+Marionette turns an iPhone into a teleoperation controller. Each phone drives one arm and its gripper. Two phones drive both arms. Each phone also drives Jelly and raises or lowers the lift.
+
+In the control panel, the **Marionette** page fills the window with the cameras: one large view and three small ones under it. The side panels show every phone and both arms, and let you drive Jelly and the lift with the keyboard.
+
+## Before you start
+
+- Build the Marionette app onto each iPhone from a current copy of the Marionette repository. See its README.
+- For cameras, assign the ZED cameras in **Axol settings → Cameras**. In sim, rendered head and wrist views are used instead.
+
+## Start the gateway
+
+The phones and Axol meet at a Marionette gateway. Run it on the Host Computer, so the phones talk to the robot directly with the least delay:
+
+```bash
+axol marionette.gateway
+```
+
+- It listens on port 8787. Pick another with `--port`.
+- When it starts it prints its pairing code (such as `K7Q2-M9XD`), a pairing link and a QR code. The code stays the same when the gateway restarts.
+- Keep it running while you use Marionette. Axol sends the phones its own screen when Marionette starts.
+
+Any other computer that the phones and the robot can both reach also works, such as a laptop on the same Wi-Fi or a machine on the same Tailscale network. Install the Marionette SDK there and run `marionette-gateway`, as the Marionette README describes.
+
+## Run it
+
+<Steps>
+  <Step title="Open Marionette">
+    In the control panel, open **Operations**, then **Marionette**. In **Gateway**, keep `localhost` when the gateway runs on the Host Computer. For a gateway on another computer, enter the pairing link it prints (it starts with `marionette://`), so that Axol has its pairing code.
+  </Step>
+
+  <Step title="Start">
+    Pick **Sim** or **Robot**, then press **Start sim** or **Start on robot**. The page shows when Axol has connected to the gateway.
+  </Step>
+
+  <Step title="Connect the phones">
+    The page's **Phones** panel shows the gateway's QR code, its address and its pairing code. On each iPhone, scan the QR code with the Camera app, or tap **Scan QR code** in Marionette. You can also pick the gateway under **Nearby** in Marionette, or type the address and tap **Connect**, then enter the pairing code when the app asks for it. Each phone shows Axol's screen and appears on the page with its name and color.
+
+    The panel shows the QR code whenever Axol can read it from the gateway, even before you start. For a gateway on another computer, enter its pairing link in **Gateway** so that Axol has its pairing code.
+  </Step>
+
+  <Step title="Calibrate each phone">
+    Stand facing the same way as Axol. On the phone, tap **Calibration**, then **Start calibration**, and follow the four steps. Forward on the phone is then forward for the robot.
+  </Step>
+
+  <Step title="Pick an arm and drive">
+    On each phone, choose **Left** or **Right**. Hold the **Hold to move** pad and move the phone: the gripper follows, moving and turning the same way. Let go to stop. Press again to carry on from where the phone is now.
+  </Step>
+</Steps>
+
+## Watch the cameras
+
+The **Marionette** page shows the head camera, both wrist cameras and the 3D view of the robot. One of them is large. To make another one large, click it, or pick it at the top left of the large view. The page remembers your choice.
+
+The large view gets sharper frames than the small ones: up to 1280 pixels wide (`camera_large_width`), never more than the camera captures. The phones always get 640-pixel frames.
+
+## Phone controls
+
+The phone screen shows every control at once. Tap **More** for calibration and the arm resets.
+
+| Control | What it does |
+|---|---|
+| **Hold to move** | The arm follows the phone while you hold the pad. While holding, slide your thumb down to close the gripper and up to open it. A 133-pixel slide (about 2 cm on an iPhone) goes from fully open to fully closed. |
+| **Open gripper** / **Close gripper** | Open or close the gripper fully. |
+| **Frame** | The directions the arm moves in. See [Move in a camera's view](#move-in-a-cameras-view). |
+| **Motion scale** | How far the gripper moves and turns for each centimetre and degree the phone moves and turns. At 0.5×, turning the phone 90° turns the gripper 45°. Start low. It is locked while you hold the pad. |
+| Drive stick | Push the stick to drive Jelly. Jelly stops when you let go. |
+| **Turn left** / **Turn right** | Turn Jelly while held. |
+| **Raise lift** / **Lower lift** | Move the lift while held. |
+| **Speed limit** | Top speed for driving and turning. |
+| Camera views | Show the head camera, either wrist camera, both wrists or all three. |
+| **Reset left arm** / **Reset right arm** | In **More**. Moves the arm back to its rest pose. See [Reset an arm](#reset-an-arm). |
+| **Stop** | Stops the whole robot: both arms hold where they are, and Jelly and the lift stop. |
+
+## Move in a camera's view
+
+**Frame** on the phone sets the directions the arm moves in:
+
+- **Axol**: Axol's own directions. Push the phone forward and the gripper goes the way Axol faces, whatever the cameras show.
+- **Head**, **Left wrist** or **Right wrist**: that camera's view. Push the phone forward and the gripper goes where the camera looks. Move it left or up and the gripper goes to the left or the top of that camera's picture. Turns follow the camera the same way.
+
+For example, with **Left wrist** picked and the left wrist camera looking to Axol's left, pushing the phone forward moves the gripper to Axol's left.
+
+The camera's direction is read when you press the pad. A wrist camera turns with its gripper, but that doesn't change the directions until you let go and press again. You can change **Frame** while you hold the pad: the arm doesn't move, and the new directions apply from there.
+
+## Reset an arm
+
+If an arm's joints end up twisted or folded awkwardly, send the arm back to its rest pose. On a phone, tap **More**, then **Reset left arm** or **Reset right arm**. On the **Marionette** page, press **Reset arm** under the arm in **Arms**.
+
+- The arm moves on its own for a few seconds, along a path that keeps it clear of the body and the other arm.
+- A reset starts only while no phone is moving an arm. Both arms ignore their pads until it ends.
+- **Stop** halts the arm where it is.
+
+When the arm reaches rest, press the pad again to carry on.
+
+## Desktop keys
+
+On the **Marionette** page, these keys drive Jelly and the lift:
+
+| Key | Action |
+|---|---|
+| W / S | Drive forward / back |
+| A / D | Drive left / right |
+| Q / E | Turn left / right |
+| Z / X | Raise / lower the lift |
+| Esc | Turn **Stop motion** on |
+
+## Safety
+
+- On the robot, a phone must be calibrated before it can move an arm.
+- The arm moves only while the phone's pad is held, its tracking is good and it is not calibrating. If anything drops out, or tracking jumps, the arm stops and waits for a new press.
+- **Stop** on any phone, or **Stop motion** on the page, stops the whole robot. After you turn every Stop off, press each pad again to carry on.
+- If a phone goes offline with **Stop** on, the robot stays stopped. Press **Clear Stop** on the page once it is safe.
+- If two phones pick the same arm, the phone that moved it last keeps it. The other phone shows which phone has it.
+- A reset moves an arm without a pad held. **Stop** halts it.
+- Jelly and the lift stop at once if the drive stick, a held button or the page stops sending.
+- Only one Axol can use a gateway at a time. If another one is connected, such as a sim and the robot on the same gateway, the page shows **Gateway not connected** and says why. Stop the other one, and this one takes over.
+- Press **Stop Marionette** to end the session. The arms return to rest before their motors turn off.

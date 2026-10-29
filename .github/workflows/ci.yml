@@ -31,7 +31,7 @@ jobs:
       - name: Install Python 3.13 and locked dependencies
         run: |
           uv python install 3.13
-          uv sync --locked --extra sim --extra lerobot --dev
+          uv sync --locked --extra sim --extra lerobot --extra marionette --dev
       - name: Lint and format check
         run: |
           uvx --from ruff==0.9.7 ruff check .

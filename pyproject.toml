@@ -54,6 +54,11 @@ dependencies = [
 
 [project.optional-dependencies]
 gamepad = ["pygame>=2.6,<3"]
+# Marionette (axol marionette): iPhones drive Axol through a Marionette
+# gateway. The SDK brings the gateway connection, phone tracking, teleop
+# parts, WebRTC video and the gateway itself (with Node, for robots without
+# it). Only almond_axol.marionette imports it.
+marionette = ["marionette-sdk[video,gateway]>=0.1.1,<0.2"]
 # training backs `axol mantis.train` (LeRobot's trainer: accelerate + wandb);
 # diffusion adds the diffusers dependency for --policy.type diffusion.
 # Pin 0.6.1: the bindings use lerobot.lerobot_types, VideoEncoderConfig, and
@@ -102,6 +107,15 @@ include = [
     "/pyproject.toml",
     "/web/app/public/install",
 ]
+
+[tool.uv.sources]
+# marionette-sdk is not on PyPI yet, so it comes from a pinned commit of the
+# Marionette repository. PyPI metadata keeps the plain requirement above, so
+# the published package stays installable. Drop this once the SDK is
+# published. To work on the SDK beside Axol, install a Marionette checkout
+# over it:
+#   uv pip install -e "../marionette/sdk/python[video,gateway]"
+marionette-sdk = { git = "https://github.com/theinstancelabs/marionette", subdirectory = "sdk/python", rev = "0ba6b86fea9d37e87a35d0a57cc56905e52e69e5" }
 
 [dependency-groups]
 dev = [

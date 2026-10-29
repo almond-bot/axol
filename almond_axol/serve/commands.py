@@ -320,6 +320,30 @@ def _waypoints_run() -> Callable[..., Any]:
     return _run
 
 
+def _jog() -> type:
+    from ..cli.jog import JogCmdConfig
+
+    return JogCmdConfig
+
+
+def _jog_run() -> Callable[..., Any]:
+    from ..cli.jog import _run
+
+    return _run
+
+
+def _marionette() -> type:
+    from ..cli.marionette import MarionetteCmdConfig
+
+    return MarionetteCmdConfig
+
+
+def _marionette_run() -> Callable[..., Any]:
+    from ..cli.marionette import _run
+
+    return _run
+
+
 def _waypoints_control() -> Callable[..., Any]:
     from ..cli.waypoints import _QueueWaypointControl
 
@@ -443,6 +467,42 @@ COMMANDS: dict[str, CommandDef] = {
         field_ui={
             "speed_scale": {"widget": "slider", "min": 0.1, "max": 1.0, "step": 0.05}
         },
+    ),
+    "jog": CommandDef(
+        "jog",
+        "jog",
+        "Jog",
+        "Move a gripper to a pose you drag in 3D, raise or lower the lift, and "
+        "drive Jelly, all from the Jog page. Turn on sim to jog a simulated Axol.",
+        "Operate",
+        "draccus",
+        _jog,
+        sim_capable=True,
+        entrypoint=_jog_run,
+        sim_flag="sim",
+        # Arm gains and channels are the robot's shared settings, the same
+        # ones gravity compensation and waypoints use.
+        settings_like="gravity-comp",
+        per_run_fields=("sim",),
+    ),
+    "marionette": CommandDef(
+        "marionette",
+        "marionette",
+        "Marionette",
+        "Drive the arms, grippers, lift and Jelly from one or two iPhones running "
+        "Marionette, and watch the robot and its cameras on the Marionette page. "
+        "Turn on sim to drive a simulated Axol.",
+        "Operate",
+        "draccus",
+        _marionette,
+        sim_capable=True,
+        entrypoint=_marionette_run,
+        sim_flag="sim",
+        # The control panel's camera assignments, as teleop gets them.
+        camera_mode="teleop",
+        # Arm gains and channels are the robot's shared settings, like jog.
+        settings_like="gravity-comp",
+        per_run_fields=("sim", "gateway"),
     ),
     "collect-data": CommandDef(
         "collect-data",

@@ -215,9 +215,10 @@ if cfg is not None:
 
 Jelly estimates its charge from the 24 V rail that its lift controller measures (the `GET_POWER` telemetry). The estimate uses the resting voltage curve of its two 24 V 50 Ah LiFePO4 packs, wired in parallel (8S, 100 Ah).
 
-While Jelly is enabled with its lift, `jelly.battery` updates about once a second. It is `None`:
+While Jelly is enabled with its lift, `jelly.battery` updates every 20 seconds. The first reading arrives about a second after `enable()`. It is `None`:
 
 - before the first reading
+- when the lift board has not answered for 30 seconds
 - when no pack is connected and the board runs from USB
 - on firmware that doesn't answer `GET_POWER`
 

@@ -244,6 +244,7 @@ export function AppShell({
   host,
   subNav,
   wide = false,
+  fill = false,
   children,
 }: {
   title: string
@@ -260,6 +261,10 @@ export function AppShell({
   subNav?: { under: string; items: SubNavItem[] }
   /** Wider content column, for chart-heavy pages. */
   wide?: boolean
+  /** The whole window below the header, for a page that sizes its content to
+   *  the window (Marionette's cameras). From `lg` up the page doesn't scroll;
+   *  its panels scroll on their own. */
+  fill?: boolean
   children: ReactNode
 }) {
   const [drawerOpen, setDrawerOpen] = useState(false)
@@ -289,7 +294,7 @@ export function AppShell({
   }
 
   return (
-    <div className="min-h-screen lg:pl-60">
+    <div className={cn("min-h-screen lg:pl-60", fill && "flex flex-col lg:h-dvh lg:min-h-0")}>
       {/* Desktop sidebar */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-60 border-r border-white/10 bg-[#0e0e0f] pt-[env(safe-area-inset-top)] lg:block">
         <SidebarContents {...sidebarProps} />
@@ -320,7 +325,7 @@ export function AppShell({
         <div
           className={cn(
             "safe-x mx-auto flex h-14 items-center gap-3 sm:h-16",
-            wide ? "max-w-6xl" : "max-w-5xl"
+            !fill && (wide ? "max-w-6xl" : "max-w-5xl")
           )}
         >
           <button
@@ -354,8 +359,11 @@ export function AppShell({
 
       <main
         className={cn(
-          "safe-x mx-auto flex flex-col gap-6 py-6 pb-[max(2rem,env(safe-area-inset-bottom))]",
-          wide ? "max-w-6xl" : "max-w-5xl"
+          "safe-x mx-auto flex flex-col",
+          fill
+            ? "w-full flex-1 gap-3 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] lg:min-h-0"
+            : "gap-6 py-6 pb-[max(2rem,env(safe-area-inset-bottom))]",
+          !fill && (wide ? "max-w-6xl" : "max-w-5xl")
         )}
       >
         {description && <p className="-mt-1 max-w-prose text-sm text-white/50">{description}</p>}

@@ -422,6 +422,15 @@ class LiftDeviceSnapshotTest(unittest.TestCase):
         device._bus = SimpleNamespace(_send=send)  # type: ignore[assignment]
         asyncio.run(device.ping())
         self.assertEqual(sent, [b"\x04", b"\x08"])
+        # A fresh battery reading: only status until it is a poll period old.
+        device.last_power_monotonic = time.monotonic()
+        sent.clear()
+        asyncio.run(device.ping())
+        self.assertEqual(sent, [b"\x04"])
+        device.last_power_monotonic = time.monotonic() - jelly_link._POWER_POLL_S
+        sent.clear()
+        asyncio.run(device.ping())
+        self.assertEqual(sent, [b"\x04", b"\x08"])
 
     def test_other_frames_are_ignored(self) -> None:
         device = _LiftDevice()

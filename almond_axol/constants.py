@@ -233,6 +233,15 @@ def torso_links(model: AxolModel | str = AxolModel.CLASSIC) -> tuple[str, ...]:
 # straight-line move into a visible arc as the wrist reorients.
 GRIPPER_TIP_OFFSET: tuple[float, float, float] = (0.0, 0.0, -0.145)
 
+# Each camera's ROS optical frame in the URDFs that mount it (+z along the
+# view, +x to the image's right, +y down it): the head camera's left lens,
+# whose image the head stream shows, and each wrist camera.
+CAMERA_OPTICAL_LINKS: dict[str, str] = {
+    "head": "head_camera_left_optical",
+    "left": "left_wrist_camera_optical",
+    "right": "right_wrist_camera_optical",
+}
+
 
 # Single source of truth for URDF joint and body names. All helpers
 # (gravity comp, IK solver, simulation) compose ``f"{side}_{suffix}"`` from
