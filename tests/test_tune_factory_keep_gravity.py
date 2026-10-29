@@ -102,6 +102,50 @@ class KeepGravityTest(unittest.TestCase):
         # One arm only: the other side's links are not touched.
         self.assertEqual(set(factory.settings_link_overrides(["right"])), {"right"})
 
+    def test_settings_masses_feed_the_fit_without_keep_gravity(self) -> None:
+        from almond_axol.cli.tune import factory
+
+        settings = factory.settings_link_overrides(["left", "right"])
+        overrides = factory.parse_link_overrides(
+            ["right.wrist_3=1.0"], [], ["left", "right"]
+        )
+        shadowed = factory.merge_settings_overrides(
+            overrides, settings, keep_gravity=False
+        )
+        # Masses come from the settings; a CLI --mass still wins.
+        self.assertEqual(overrides["left"]["wrist_3"], {"mass": 0.92})
+        self.assertEqual(overrides["left"]["shoulder_1"], {"mass": 1.4})
+        self.assertEqual(overrides["right"]["wrist_3"], {"mass": 1.0})
+        # CoMs are not seeded from the settings (they would shadow the fit),
+        # and the links they shadow are reported.
+        self.assertNotIn("elbow", overrides["left"])
+        self.assertEqual(
+            sorted(shadowed),
+            [
+                ("left", "elbow"),
+                ("left", "wrist_3"),
+                ("right", "elbow"),
+                ("right", "wrist_3"),
+            ],
+        )
+
+    def test_keep_gravity_takes_settings_mass_and_com(self) -> None:
+        from almond_axol.cli.tune import factory
+
+        settings = factory.settings_link_overrides(["left"])
+        overrides = factory.parse_link_overrides([], [], ["left"])
+        shadowed = factory.merge_settings_overrides(
+            overrides, settings, keep_gravity=True
+        )
+        self.assertEqual(shadowed, [])
+        self.assertEqual(overrides["left"]["wrist_3"]["mass"], 0.92)
+        np.testing.assert_allclose(
+            overrides["left"]["wrist_3"]["com"], (-0.0285, 0.015, -0.11)
+        )
+        np.testing.assert_allclose(
+            overrides["left"]["elbow"]["com"], (-0.0256064, 0.03, -0.07)
+        )
+
     def test_slow_profile_saves_friction_but_no_gravity(self) -> None:
         from almond_axol.cli.tune import factory
         from almond_axol.cli.tune.gravity import _model_torques

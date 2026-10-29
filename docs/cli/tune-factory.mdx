@@ -32,24 +32,31 @@ The upload merges with what is already stored, joint by joint:
 
 ## Custom end-effectors
 
-The gravity fit keeps each link's mass fixed and fits only its center of mass. A gripper much heavier or longer than stock can push the fit past its 60 mm limit, so the fit is rejected. Give the gripper's mass up front instead.
+The gravity fit keeps each link's mass fixed and fits only its center of mass. The gripper and everything mounted on it count as the `wrist_3` link, including wrist cameras and their brackets. The stock mass, 0.75&nbsp;kg, includes the Camera Kit wrist camera and its mount. If you change the weight on the wrist, give the new `wrist_3` mass before you calibrate. Otherwise the extra weight shows up at the elbow and shoulders, and their fits are rejected.
 
-The gripper counts as part of the `wrist_3` link, so `--mass wrist_3=<kg>` sets it. `--com` optionally sets a starting center of mass, in metres, in that arm's URDF link frame.
+Set the mass in one of two places:
 
-Both values are written to `~/.almond/calibration.json` before the sweeps, so every fit uses them. They are uploaded with the calibration even if a fit fails. To go back to a standard gripper, pass the stock mass (`--mass wrist_3=0.75`) and calibrate again.
+- In the control panel, under **General settings → Advanced**, in the `wrist_3` row of each arm's table. The run uses this mass for its fits and saves it with the calibration.
+- On the command line, with `--mass wrist_3=<kg>`. This overrides the panel setting.
+
+`--com` optionally sets a starting center of mass, in metres, in that arm's URDF link frame. A center of mass set in the panel overrides the fitted one when Axol runs, so the run warns you about it. Clear it in the panel, or use [`--keep-gravity`](#keeping-a-hand-tuned-gravity-model).
+
+The mass and center of mass are written to `~/.almond/calibration.json` before the sweeps, so every fit uses them. They are uploaded with the calibration even if a fit fails. To go back to the standard gripper and Camera Kit wrist camera, pass the stock mass (`--mass wrist_3=0.75`) and calibrate again.
 
 - A `--mass` without a side applies to every arm being calibrated.
 - `--com` must name its side (`left.` or `right.`), because the arms are mirror images.
 - An arm that isn't being calibrated, an unknown joint, or a mass of zero or less is an error, reported before anything moves.
 
 ```bash
-axol tune.factory --mass wrist_3=1.1                                          # custom gripper on both arms
+axol tune.factory --mass wrist_3=0.78                                         # other wrist cameras on both arms
 axol tune.factory --mass left.wrist_3=1.1 --com left.wrist_3=-0.03,0,-0.14    # one arm, seeded CoM
 ```
 
+For a step-by-step walkthrough, and what to do when a fit is rejected, see [After you change the end-effector or add cameras](/guides/axol-calibration#after-you-change-the-end-effector-or-add-cameras).
+
 ### Keeping a hand-tuned gravity model
 
-If you set link masses or centers of mass by hand in the control panel (**Settings → Advanced → Axol**), run with `--keep-gravity`. The run then fits friction against your settings and doesn't fit or save any mass or center of mass. `--mass` and `--com` still take priority over the settings. Without the flag, the run warns at start when your settings override a link's mass or center of mass.
+If you set link masses or centers of mass by hand in the control panel (**General settings → Advanced**), run with `--keep-gravity`. The run then fits friction against your settings and doesn't fit or save any mass or center of mass. `--mass` and `--com` still take priority over the settings. Without the flag, the run uses the masses from your settings, fits each center of mass, and warns you about any center of mass set in the settings.
 
 ```bash
 axol tune.factory --keep-gravity
@@ -81,7 +88,7 @@ The saved calibration holds `friction`, `mass` (kg) and `com` for each joint:
 | `--raw-dir DIR` | Save each joint's raw sweep samples to `DIR/<side>-<joint>.csv`. Refit them later with `tune.friction --fit-csv`. |
 | `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub's USB serial) |
 | `--keep-gravity` | Keep the [hand-tuned gravity model](#keeping-a-hand-tuned-gravity-model) from the panel settings. Saves friction only. |
-| `--mass [SIDE.]JOINT=KG` | Link mass for a [custom end-effector](#custom-end-effectors). Repeatable. |
+| `--mass [SIDE.]JOINT=KG` | Link mass for a [custom end-effector or wrist camera](#custom-end-effectors). Overrides the mass in the panel settings. Repeatable. |
 | `--com SIDE.JOINT=X,Y,Z` | Starting link center of mass in metres, uploaded as given if the fit is rejected. Repeatable. |
 
 <Note>

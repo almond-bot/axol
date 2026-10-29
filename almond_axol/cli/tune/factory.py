@@ -35,7 +35,9 @@ longer than stock needs its link mass given up front. ``--mass`` sets a
 link's mass (the gripper is lumped into ``wrist_3``) and ``--com`` seeds its
 CoM; both are written to the calibration file *before* the sweeps, so every
 fit — including the proximal joints that carry the gripper — runs against
-the custom numbers, and they ride along in the cloud document. A fitted CoM
+the custom numbers, and they ride along in the cloud document. A link mass
+set in the panel settings (Advanced → Axol) is taken the same way, below
+any ``--mass``. A fitted CoM
 is always uploaded with the mass it was fitted against. Pass the stock mass
 (``--mass wrist_3=0.75``) to go back after refitting a standard gripper.
 
@@ -290,6 +292,39 @@ def settings_link_overrides(sides: list[str]) -> dict[str, dict[str, LinkOverrid
     return out
 
 
+def merge_settings_overrides(
+    overrides: dict[str, dict[str, LinkOverride]],
+    from_settings: dict[str, dict[str, LinkOverride]],
+    *,
+    keep_gravity: bool,
+) -> list[tuple[str, str]]:
+    """Fold the panel settings' link masses / CoMs into ``overrides`` in place.
+
+    ``--mass`` / ``--com`` always win. Under ``keep_gravity`` the settings'
+    masses and CoMs are both taken as-is (nothing is fitted). Otherwise only
+    their masses are: teleop runs the settings' mass on top of the
+    calibration file, and the fit only identifies m·c, so every CoM must be
+    fitted against that mass or the saved pair is wrong at runtime (a
+    camera or heavier gripper entered in the panel would otherwise be
+    dumped into the light wrist / elbow CoMs and rejected). A settings CoM
+    is not taken as a seed: it would shadow the fitted CoM at runtime
+    anyway, so those links are returned as ``(side, joint)`` for a warning.
+    """
+    shadowed: list[tuple[str, str]] = []
+    for side_str, joints in from_settings.items():
+        for joint_name, link in joints.items():
+            given = overrides.get(side_str, {}).get(joint_name, {})
+            if keep_gravity:
+                taken: LinkOverride = dict(link)  # type: ignore[assignment]
+            else:
+                taken = {"mass": link["mass"]} if "mass" in link else {}
+                if "com" in link and "com" not in given:
+                    shadowed.append((side_str, joint_name))
+            if taken:
+                overrides.setdefault(side_str, {})[joint_name] = {**taken, **given}
+    return shadowed
+
+
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     """Register the ``tune.factory`` subcommand."""
     p = subparsers.add_parser(
@@ -372,9 +407,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         action="append",
         default=[],
         metavar="[SIDE.]JOINT=KG",
-        help="Link mass for a custom end-effector (repeatable), e.g. "
-        "wrist_3=1.1 (both arms) or left.wrist_3=1.1. The gripper's mass is "
-        "lumped into wrist_3. Saved and uploaded with the calibration.",
+        help="Link mass for a custom end-effector or wrist camera (repeatable), "
+        "e.g. wrist_3=1.1 (both arms) or left.wrist_3=1.1. The gripper and "
+        "anything mounted on it count as wrist_3. Overrides a mass set in the "
+        "panel settings. Saved and uploaded with the calibration.",
     )
     p.add_argument(
         "--com",
@@ -793,11 +829,9 @@ async def _run(args: argparse.Namespace) -> None:
                 f"ERROR: --keep-gravity could not read the shared settings: {exc}"
             )
         from_settings = {}
-    if args.keep_gravity:
-        for side_str, joints in from_settings.items():
-            for joint_name, link in joints.items():
-                given = overrides.get(side_str, {}).get(joint_name, {})
-                overrides.setdefault(side_str, {})[joint_name] = {**link, **given}
+    shadowed = merge_settings_overrides(
+        overrides, from_settings, keep_gravity=args.keep_gravity
+    )
 
     creds = supabase_credentials()
     print("\nAxol factory calibration — friction + gravity, all joints")
@@ -813,14 +847,12 @@ async def _run(args: argparse.Namespace) -> None:
             "  Gravity: kept — fits run against this robot's model "
             "(calibration + panel settings); no CoM or mass is fitted or saved."
         )
-    elif from_settings:
-        links = ", ".join(
-            f"{s} {j}" for s, joints in from_settings.items() for j in joints
-        )
+    elif shadowed:
+        links = ", ".join(f"{s} {j}" for s, j in shadowed)
         print(
-            f"  ! The panel settings override link mass/CoM ({links}): teleop runs "
-            "those, so fitted CoMs there are shadowed and Fo is fitted against a "
-            "different model. Pass --keep-gravity to keep the hand-tuned gravity."
+            f"  ! The panel settings set the center of mass of {links}. Axol uses "
+            "those, not the values this run fits there. Pass --keep-gravity to "
+            "keep the settings, or clear them under General settings → Advanced."
         )
     if creds is None:
         print(

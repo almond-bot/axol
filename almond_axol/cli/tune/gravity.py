@@ -211,9 +211,10 @@ def fit_com(
         raise RuntimeError(
             f"fitted CoM shift {shift * 1000:.0f} mm exceeds the "
             f"{_MAX_SHIFT_M * 1000:.0f} mm plausibility cap. The sweep data "
-            "is suspect (collision, something touching the arm, dropped "
-            "feedback, or distal links not yet calibrated — run distal → "
-            "proximal); not applying it"
+            "is suspect: a collision, something touching the arm, a cable "
+            "pulling on the arm, dropped feedback, an end-effector or camera "
+            "heavier than the model (set it with --mass wrist_3=KG), or distal "
+            "links not yet calibrated (run distal to proximal). Not applying it"
         )
     com_fit = tuple(float(v) for v in com0 + delta)
     offset = float(solution[3])
