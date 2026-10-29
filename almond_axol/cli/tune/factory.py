@@ -318,7 +318,9 @@ def merge_settings_overrides(
                 taken: LinkOverride = dict(link)  # type: ignore[assignment]
             else:
                 taken = {"mass": link["mass"]} if "mass" in link else {}
-                if "com" in link and "com" not in given:
+                # Even a --com seed is only fitted from: the settings CoM
+                # still wins at runtime.
+                if "com" in link:
                     shadowed.append((side_str, joint_name))
             if taken:
                 overrides.setdefault(side_str, {})[joint_name] = {**taken, **given}

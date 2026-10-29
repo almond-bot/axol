@@ -129,6 +129,20 @@ class KeepGravityTest(unittest.TestCase):
             ],
         )
 
+    def test_cli_com_still_warns_about_a_settings_com(self) -> None:
+        from almond_axol.cli.tune import factory
+
+        settings = factory.settings_link_overrides(["left"])
+        overrides = factory.parse_link_overrides(
+            [], ["left.wrist_3=-0.03,0,-0.1"], ["left"]
+        )
+        shadowed = factory.merge_settings_overrides(
+            overrides, settings, keep_gravity=False
+        )
+        self.assertIn(("left", "wrist_3"), shadowed)
+        self.assertEqual(overrides["left"]["wrist_3"]["com"], (-0.03, 0.0, -0.1))
+        self.assertEqual(overrides["left"]["wrist_3"]["mass"], 0.92)
+
     def test_keep_gravity_takes_settings_mass_and_com(self) -> None:
         from almond_axol.cli.tune import factory
 
