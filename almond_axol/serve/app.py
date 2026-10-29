@@ -124,6 +124,16 @@ class OpStartRequest(BaseModel):
     cameras: dict[str, Any] | None = None
 
 
+class JogPlanRequest(BaseModel):
+    arm: Literal["left", "right"]
+    position: list[float]
+    quaternion: list[float]
+
+
+class JogExecuteRequest(BaseModel):
+    id: int
+
+
 class RobotConnectRequest(BaseModel):
     """Optional CAN interface selection for a robot-link connect.
 
@@ -2974,6 +2984,174 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             req.task.strip(),
         )
         return {"episode": summary}
+
+    # -- jogging (the Jog page drives the running ``jog`` operation) ---------
+
+    def _jog_session() -> Any:
+        from ..jog.session import active_session
+
+        return active_session()
+
+    def _jog_not_running() -> JSONResponse:
+        return JSONResponse(
+            {"error": "Jogging is not running. Start it from the Jog page."},
+            status_code=409,
+        )
+
+    @app.get("/api/jog/state")
+    async def jog_state() -> dict[str, Any]:
+        session = _jog_session()
+        return {"running": session is not None, **(session.state() if session else {})}
+
+    @app.post("/api/jog/plan", response_model=None)
+    async def jog_plan(req: JogPlanRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(
+                session.plan, req.arm, req.position, req.quaternion
+            )
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/execute", response_model=None)
+    async def jog_execute(req: JogExecuteRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return session.execute(req.id)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/cancel", response_model=None)
+    async def jog_cancel() -> dict[str, Any] | JSONResponse:
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        return {"stopped": session.cancel()}
+
+    @app.websocket("/api/jog/ws")
+    async def jog_ws(ws: WebSocket) -> None:
+        """Hold commands and previews in, jog state out.
+
+        The page sends ``{"type": "hold", "drive": [vx, vy, wz], "lift": d,
+        "arms": {"left": [x, y, z, roll, pitch, yaw]}, "armFrame": "torso",
+        "armSpeed": s}`` every 50 ms while it is connected, zeros included
+        (``arms``, ``armFrame`` and ``armSpeed`` are optional). Silence for
+        longer than the session's hold timeout stops the base, lift and
+        arms, as does closing the socket. State goes out at 20 Hz.
+
+        ``{"type": "preview", "seq": n, "arm": a, "position": p,
+        "quaternion": q}`` asks for the IK preview of a target; the answer
+        comes back as ``{"type": "preview", "seq": n, ...}``. The latest
+        request wins: one still waiting when a newer one arrives is dropped,
+        and a ``seq`` no newer than the last is ignored.
+        """
+        from ..jog.session import JogError
+
+        await ws.accept()
+        last_session: Any = None
+        source = f"ws-{id(ws):x}"
+        preview_wanted = asyncio.Event()
+        preview_request: dict[str, Any] | None = None
+        preview_seq = -math.inf
+
+        async def receive() -> None:
+            nonlocal last_session, preview_request, preview_seq
+            while True:
+                message = await ws.receive_json()
+                session = _jog_session()
+                if session is None or not isinstance(message, dict):
+                    continue
+                last_session = session
+                if message.get("type") == "hold":
+                    drive = message.get("drive") or [0.0, 0.0, 0.0]
+                    try:
+                        if not isinstance(drive, list) or len(drive) != 3:
+                            raise JogError("drive must be [vx, vy, wz]")
+                        session.hold(
+                            *drive,
+                            message.get("lift", 0),
+                            source=source,
+                            arms=message.get("arms"),
+                            frame=message.get("armFrame", "torso"),
+                            speed=message.get("armSpeed", 1.0),
+                        )
+                    except (JogError, TypeError) as exc:
+                        await ws.send_json({"type": "error", "error": str(exc)})
+                elif message.get("type") == "release":
+                    session.release(source)
+                elif message.get("type") == "preview":
+                    seq = message.get("seq")
+                    if (
+                        not isinstance(seq, (int, float))
+                        or isinstance(seq, bool)
+                        or not math.isfinite(seq)
+                        or seq <= preview_seq
+                    ):
+                        continue
+                    preview_seq = seq
+                    preview_request = message
+                    preview_wanted.set()
+
+        async def preview() -> None:
+            nonlocal preview_request
+            while True:
+                await preview_wanted.wait()
+                preview_wanted.clear()
+                request, preview_request = preview_request, None
+                session = _jog_session()
+                if request is None or session is None:
+                    continue
+                reply: dict[str, Any] = {"type": "preview", "seq": request["seq"]}
+                try:
+                    reply.update(
+                        await asyncio.to_thread(
+                            session.preview,
+                            request.get("arm"),
+                            request.get("position") or [],
+                            request.get("quaternion") or [],
+                        )
+                    )
+                except (JogError, TypeError) as exc:
+                    reply["error"] = str(exc)
+                except Exception:  # noqa: BLE001 - keep the socket's holds alive
+                    _logger.exception("jog: preview failed")
+                    reply["error"] = "The preview failed. Try moving the target again."
+                await ws.send_json(reply)
+
+        async def send() -> None:
+            while True:
+                session = _jog_session()
+                state = session.state() if session else {}
+                await ws.send_json(
+                    {"type": "state", "running": session is not None, **state}
+                )
+                await asyncio.sleep(0.05)
+
+        tasks = [
+            asyncio.create_task(receive()),
+            asyncio.create_task(send()),
+            asyncio.create_task(preview()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+            # The page is gone: if it was driving, the base and lift stop now.
+            session = _jog_session()
+            for candidate in {id(s): s for s in (session, last_session) if s}.values():
+                candidate.disconnect(source)
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 
