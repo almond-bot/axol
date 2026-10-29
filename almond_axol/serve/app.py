@@ -16,7 +16,7 @@ import secrets
 import socket
 import subprocess
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -39,7 +39,7 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
-from ..robot import lift_firmware
+from ..robot import lift_firmware, mantis_firmware
 from ..settings import resolve_robot_model
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
@@ -2065,31 +2065,34 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Delete the whole run history (the dashboard's Clear button)."""
         return {"removed": await asyncio.to_thread(runs.clear)}
 
-    # -- lift firmware upload ------------------------------------------------
+    # -- lift and Mantis firmware upload --------------------------------------
     #
     # The dashboard's "Update lift firmware" dialog uploads the raw
     # firmware.bin here first; the validated image is stored on the host and
     # its path filled into the lift.update run's --firmware argument.
 
-    @app.post("/api/lift/firmware", response_model=None)
-    async def upload_lift_firmware(request: Request) -> JSONResponse:
+    async def _upload_firmware(
+        request: Request,
+        parse: Callable[[bytes], lift_firmware.FirmwareImage],
+        store: Callable[[lift_firmware.FirmwareImage], Path],
+    ) -> JSONResponse:
         data = bytearray()
         async for part in request.stream():
             data += part
             if len(data) > lift_firmware.MAX_IMAGE_BYTES:
                 return JSONResponse(
                     {
-                        "error": "the file is larger than a lift firmware "
+                        "error": "the file is larger than a firmware "
                         f"partition ({lift_firmware.MAX_IMAGE_BYTES} bytes)"
                     },
                     status_code=413,
                 )
         try:
-            image = lift_firmware.FirmwareImage.parse(bytes(data))
+            image = parse(bytes(data))
         except lift_firmware.FirmwareUpdateError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         try:
-            path = await asyncio.to_thread(lift_firmware.store_upload, image)
+            path = await asyncio.to_thread(store, image)
         except OSError as exc:
             return JSONResponse(
                 {"error": f"could not store the firmware on the host: {exc}"},
@@ -2103,6 +2106,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "buildId": f"0x{image.build_id:08x}",
                 "size": len(image.data),
             }
+        )
+
+    @app.post("/api/lift/firmware", response_model=None)
+    async def upload_lift_firmware(request: Request) -> JSONResponse:
+        return await _upload_firmware(
+            request, lift_firmware.FirmwareImage.parse, lift_firmware.store_upload
+        )
+
+    # The same for `mantis.update`: only a Mantis firmware.bin passes.
+    @app.post("/api/mantis/firmware", response_model=None)
+    async def upload_mantis_firmware(request: Request) -> JSONResponse:
+        return await _upload_firmware(
+            request, mantis_firmware.parse_image, mantis_firmware.store_upload
         )
 
     @app.get("/api/diagnostics/runs/{run_id}")

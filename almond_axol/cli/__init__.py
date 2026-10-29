@@ -12,6 +12,7 @@ from . import hub as hub_cmd
 from . import (
     mantis_latency,
     mantis_session,
+    mantis_update,
     tracker_bridge,
     tracker_identify,
     tracker_install,
@@ -161,6 +162,7 @@ def build_parser() -> argparse.ArgumentParser:
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)
+    mantis_update.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)

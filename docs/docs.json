@@ -189,6 +189,12 @@
                 ]
               },
               {
+                "group": "Mantis",
+                "pages": [
+                  "cli/mantis-update"
+                ]
+              },
+              {
                 "group": "Mantis tracking",
                 "pages": [
                   "cli/tracker"
