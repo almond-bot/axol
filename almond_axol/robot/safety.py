@@ -18,6 +18,9 @@ green on-switch)::
   re-enables K2 and pulses the PhotoMOS until the contactor closes. It is
   refused while the E-Stop is pressed, and the firmware can never close the
   contactor against a pressed E-Stop.
+- :meth:`SafetyBoard.power_cycle` cuts power and switches it back on a few
+  seconds later. That resets every motor on Axol's supply, which clears
+  latched motor errors and applies a Damiao's new zero.
 - The green on-switch always clears a software stop. A person at the robot
   can restart it whatever the host wants.
 - K2 is held in only by a toggling GPIO, so a firmware crash, watchdog reset
@@ -100,6 +103,13 @@ STOP_TIMEOUT_S = 0.5
 # The remote-start pulse runs until the output has held for 200 ms (through
 # the contactor's pull-in), 1 s at most; firmware before 0.3 stopped at 300 ms.
 START_TIMEOUT_S = 2.0
+# How long a power cycle keeps power off. The board can't see the motors'
+# supply (its output reading is the contactor coil), so this is a fixed wait,
+# long enough for the motors' bulk capacitance to drain and their
+# controllers to reset. A Damiao applies a new zero only after such a reset.
+POWER_CYCLE_OFF_S = 3.0
+# After power returns, motors take this long to boot and answer on CAN.
+MOTOR_BOOT_S = 1.5
 
 
 def resolve_safety_channel(channel: str | None = None) -> str:
@@ -268,6 +278,10 @@ class SafetyBoard:
         self._voltages_seq = 0
         self._frame_event = asyncio.Event()
         self._failure: BaseException | None = None
+        # Counts stops, ours and any other host's seen on the bus, so a power
+        # cycle can tell that a stop came in while power was off and must not
+        # switch it back on.
+        self._stop_requests = 0
 
     @property
     def channel(self) -> str:
@@ -348,6 +362,7 @@ class SafetyBoard:
         release). Power stays off until :meth:`remote_start` or the green
         on-switch.
         """
+        self._stop_requests += 1
         status = await self._wait_for(
             lambda s: not s.sw_enable and not s.output_on,
             op=_OP_SW_STOP,
@@ -393,6 +408,34 @@ class SafetyBoard:
         if latest is None:
             raise SafetyError("The safety board stopped answering.")
         raise SafetyError(explain_start_failure(latest))
+
+    async def power_cycle(self, off_s: float = POWER_CYCLE_OFF_S) -> SafetyStatus:
+        """Cut power, keep it off for ``off_s``, then switch it back on.
+
+        Resets every motor on Axol's supply: it clears latched motor errors
+        and applies a Damiao's new zero. The arms drop while power is off.
+        Checks first that a start would be accepted, so a pressed E-Stop, a
+        firmware update or a low battery raises :class:`SafetyError` before
+        anything is cut. A stop while power is off (this driver's, or one any
+        other host sends on the bus) cancels the restart (raising :class:`SafetyError`). Returns once the
+        motors have had :data:`MOTOR_BOOT_S` to boot.
+        """
+        status = await self.request_status()
+        if (
+            status.estop_pressed
+            or status.update_locked
+            or status.relay_fault
+            or not status.supply_ok
+        ):
+            raise SafetyError(explain_start_failure(status))
+        await self.stop()
+        stops = self._stop_requests
+        await asyncio.sleep(off_s)
+        if self._stop_requests != stops:
+            raise SafetyError("Power stays off: a stop came in during the power cycle.")
+        status = await self.remote_start()
+        await asyncio.sleep(MOTOR_BOOT_S)
+        return status
 
     async def enable(self) -> SafetyStatus:
         """Clear a software stop without switching power on.
@@ -453,6 +496,15 @@ class SafetyBoard:
             self._status_monotonic = time.monotonic()
             self._status_seq += 1
             self._frame_event.set()
+        elif (
+            msg.arbitration_id == _ID_CMD
+            and len(msg.data) >= 1
+            and msg.data[0] == _OP_SW_STOP
+        ):
+            # Another host (or process) sent a stop, such as the control
+            # panel's while this process runs a power cycle. Our own frames
+            # don't come back to us.
+            self._stop_requests += 1
         elif msg.arbitration_id == _ID_VOLTAGES and len(msg.data) >= 8:
             self._voltages = decode_voltages(bytes(msg.data))
             self._voltages_seq += 1

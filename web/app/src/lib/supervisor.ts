@@ -641,6 +641,8 @@ export interface SafetyLinkStatus {
   connected: boolean
   /** Closed for CAN discovery. */
   paused: boolean
+  /** A power cycle is running. Absent on older hosts. */
+  powerCycling?: boolean
   /** A safety board has answered since the server started. False on a Jelly without one. */
   detected: boolean
   /** The board answered within the last second. */
@@ -663,6 +665,15 @@ export async function safetyStop(): Promise<SafetyLinkStatus> {
 /** Switch power back on, like the green on-switch. Rejects with the reason it did not. */
 export async function safetyStart(): Promise<SafetyLinkStatus> {
   return json(await fetch(apiUrl("/api/safety/start"), { method: "POST" }))
+}
+
+/**
+ * Switch Axol's power off for a few seconds and back on, which resets every
+ * motor on it. Rejects with the reason when the board refuses or power does
+ * not come back.
+ */
+export async function safetyPowerCycle(): Promise<SafetyLinkStatus> {
+  return json(await fetch(apiUrl("/api/safety/power-cycle"), { method: "POST" }))
 }
 
 /** A firmware image the serve host validated and stored for `lift.update` or `safety.update`. */

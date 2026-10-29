@@ -1,5 +1,5 @@
 """
-axol safety.status / safety.stop / safety.start
+axol safety.status / safety.stop / safety.start / safety.power-cycle
 
 Jelly's safety board (on Jelly builds that carry it) from the command line,
 through the :class:`~almond_axol.robot.safety.SafetyBoard` driver:
@@ -9,12 +9,16 @@ through the :class:`~almond_axol.robot.safety.SafetyBoard` driver:
   E-Stop, and waits for the board to confirm.
 - ``safety.start`` switches power back on, like the green on-switch. The
   board refuses while the E-Stop is pressed.
+- ``safety.power-cycle`` switches power off for a few seconds and back on,
+  which resets every motor on Axol's supply: it clears motor faults and
+  applies new Damiao zeros. The arms drop while power is off.
 
 Usage:
     axol safety.status
     axol safety.status --watch
     axol safety.stop
     axol safety.start
+    axol safety.power-cycle
 """
 
 from __future__ import annotations
@@ -64,6 +68,11 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         ("safety.status", "Show the state of Jelly's E-stop chain.", _status),
         ("safety.stop", "Software E-stop: cut power to Axol.", _stop),
         ("safety.start", "Switch power back on, like the green on-switch.", _start),
+        (
+            "safety.power-cycle",
+            "Switch power off and back on to reset Axol's motors.",
+            _power_cycle,
+        ),
     ):
         p = subparsers.add_parser(name, help=help_text)
         p.add_argument(
@@ -122,4 +131,11 @@ async def _stop(board: SafetyBoard, args: argparse.Namespace) -> None:
 async def _start(board: SafetyBoard, args: argparse.Namespace) -> None:
     status = await board.remote_start()
     print("Power is on.")
+    print(fmt_status(status))
+
+
+async def _power_cycle(board: SafetyBoard, args: argparse.Namespace) -> None:
+    print("Switching power off for a few seconds. The arms drop.", flush=True)
+    status = await board.power_cycle()
+    print("Power is back on. The motors have restarted.")
     print(fmt_status(status))

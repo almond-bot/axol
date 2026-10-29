@@ -1,4 +1,32 @@
-import type { SafetyLinkStatus } from "./supervisor"
+import { wheelName } from "./jelly-view"
+import {
+  motorFaultLabel,
+  wheelFaults,
+  type JellyStatus,
+  type RobotStatus,
+  type SafetyLinkStatus,
+} from "./supervisor"
+
+/**
+ * Faulted motors on Axol's power supply, which a power cycle resets: the arm
+ * motors and Jelly's wheels. Mantis grippers are not on that supply.
+ */
+export function motorFaultLabels(
+  robot: RobotStatus | null | undefined,
+  jelly: JellyStatus | null | undefined
+): string[] {
+  const arms =
+    robot && robot.profile !== "mantis" && robot.state === "connected"
+      ? (robot.faults ?? []).map(motorFaultLabel)
+      : []
+  const wheels = wheelFaults(jelly?.wheels).map((m) => {
+    const problem = m.reachable
+      ? (m.status ?? "error").replace(/_/g, " ").toLowerCase()
+      : "unreachable"
+    return `${wheelName(m)} wheel: ${problem}`
+  })
+  return [...arms, ...wheels]
+}
 
 /** How the header's safety control looks. */
 export type SafetyTone = "on" | "off" | "estop" | "fault" | "unknown"

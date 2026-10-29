@@ -17,6 +17,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AppShell, PageSection } from "@/components/app-shell"
 import { SafetyControl } from "@/components/safety-control"
+import { motorFaultLabels } from "@/lib/safety-view"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
@@ -1110,7 +1111,8 @@ export default function Diagnostics() {
           description:
             "Zero each selected joint of one arm against an end stop. Wrist 2 and " +
             "wrist 3 can use either end stop. Each step shows instructions and waits " +
-            "for Continue.",
+            "for Continue. On Jelly with a safety board, the last step switches power " +
+            "off and back on so the new wrist zeros take effect.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },
@@ -1204,7 +1206,7 @@ export default function Diagnostics() {
         title={tab === "" ? "Diagnostics" : `Diagnostics: ${tabLabel}`}
         wide
         actions={<Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>}
-        safety={<SafetyControl enabled={serverOk} />}
+        safety={<SafetyControl enabled={serverOk} motorFaults={motorFaultLabels(robot, jelly)} />}
         host={{
           dot: serverOk ? "ok" : "err",
           label: serverOk ? storedHost || "Connected" : "Can't reach the robot",

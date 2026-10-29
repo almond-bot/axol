@@ -53,6 +53,7 @@ Some Jelly builds include a safety board. On those, you can also cut power from 
 |---|---|---|
 | Cut power | **Cut power** at the top right of any page | `axol safety.stop` |
 | Switch power back on | **Restore power** at the top right of any page | `axol safety.start` |
+| Restart the motors after a motor fault | **Motor fault** at the top right, then **Power-cycle motors** | `axol safety.power-cycle` |
 | See the state | The status at the top right | `axol safety.status` |
 | Update the safety board's firmware | **Diagnostics → Helpers → Update safety board firmware** | [`axol safety.update`](/cli/safety-update) |
 
@@ -60,6 +61,9 @@ Some Jelly builds include a safety board. On those, you can also cut power from 
 - The Jetson stays on through any stop, so the control panel keeps working.
 - The green on-switch always switches power back on, even after a software stop.
 - Nothing switches power on while the E-Stop is pressed. Release it first.
+- A motor fault clears only when the motor restarts. **Power-cycle motors** switches power off for a few seconds and back on. Support the arms first, because they drop. Stop any running operation before you power-cycle.
+- After guided zeroing (**Set zero position → Guided**), Axol restarts its wrist motors on its own so the new zeros take effect. Support the arms when the step asks.
+- A stop during a power cycle keeps power off.
 
 <Warning>
   A software stop needs the Jetson and its network to work. Keep the E-Stop within reach. It cuts power even when the control panel can't.

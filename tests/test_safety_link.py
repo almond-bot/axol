@@ -56,6 +56,10 @@ class FakeBoard:
         self.status = _ON
         return _ON
 
+    async def power_cycle(self):  # noqa: ANN201
+        self.calls.append("power_cycle")
+        return _ON
+
 
 class SafetyLinkTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -123,6 +127,19 @@ class SafetyLinkTest(unittest.TestCase):
             ["start(bring_up=False)", "stop", "remote_start"],
         )
 
+    def test_power_cycle_goes_through_the_board(self) -> None:
+        self.tick()
+        status = self.link.power_cycle()
+        self.assertTrue(status["status"]["outputOn"])
+        self.assertFalse(status["powerCycling"])
+        self.assertEqual(FakeBoard.instances[0].calls[-1], "power_cycle")
+
+    def test_power_cycle_needs_a_detected_board(self) -> None:
+        FakeBoard.answers = False
+        self.tick()
+        with self.assertRaisesRegex(SafetyError, "no safety board"):
+            self.link.power_cycle()
+
     def test_stop_without_a_board_tells_the_operator_to_use_the_estop(self) -> None:
         with self.assertRaisesRegex(SafetyError, "Press the E-Stop"):
             self.link.stop()
@@ -164,9 +181,9 @@ class SafetyLinkTest(unittest.TestCase):
 class SafetyApiTest(unittest.IsolatedAsyncioTestCase):
     """The endpoints answer whatever else the server is doing."""
 
-    async def _client(self, safety: Mock) -> httpx.AsyncClient:
+    async def _client(self, safety: Mock, *, running: bool = True) -> httpx.AsyncClient:
         runner = _Runner()
-        runner.is_running = lambda: True  # type: ignore[method-assign]
+        runner.is_running = lambda: running  # type: ignore[method-assign]
         with patch.object(app_module, "SafetyLink", return_value=safety):
             app = _test_app(_Manager(), runner)
         transport = httpx.ASGITransport(app=app)
@@ -195,6 +212,30 @@ class SafetyApiTest(unittest.IsolatedAsyncioTestCase):
         safety.start.side_effect = SafetyError("The E-Stop is pressed.")
         async with await self._client(safety) as client:
             response = await client.post("/api/safety/start")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"], "The E-Stop is pressed.")
+
+    async def test_power_cycle_refused_while_an_operation_runs(self) -> None:
+        safety = Mock()
+        async with await self._client(safety) as client:
+            response = await client.post("/api/safety/power-cycle")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Stop the running operation", response.json()["error"])
+        safety.power_cycle.assert_not_called()
+
+    async def test_power_cycle_when_idle(self) -> None:
+        safety = Mock()
+        safety.power_cycle.return_value = {"detected": True}
+        async with await self._client(safety, running=False) as client:
+            response = await client.post("/api/safety/power-cycle")
+        self.assertEqual(response.status_code, 200)
+        safety.power_cycle.assert_called_once_with()
+
+    async def test_refused_power_cycle_says_why(self) -> None:
+        safety = Mock()
+        safety.power_cycle.side_effect = SafetyError("The E-Stop is pressed.")
+        async with await self._client(safety, running=False) as client:
+            response = await client.post("/api/safety/power-cycle")
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"], "The E-Stop is pressed.")
 

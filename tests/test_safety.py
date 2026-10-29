@@ -315,6 +315,52 @@ class RemoteStartTest(BoardTestCase):
             await self.board.remote_start(timeout=0.3)
 
 
+class PowerCycleTest(BoardTestCase):
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        patcher = patch.object(safety_module, "MOTOR_BOOT_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_cuts_then_restores_power(self) -> None:
+        st = await self.board.power_cycle(off_s=0.01)
+        self.assertTrue(st.output_on)
+        ops = self.fw.received
+        self.assertLess(ops.index(0x01), ops.index(0x03))
+
+    async def test_refused_before_cutting_power(self) -> None:
+        self.fw.estop_ok = False
+        with self.assertRaisesRegex(SafetyError, "E-Stop is pressed"):
+            await self.board.power_cycle(off_s=0.01)
+        self.assertNotIn(0x01, self.fw.received)
+
+    async def test_low_battery_refused_before_cutting_power(self) -> None:
+        self.fw.supply_mv = 15000
+        with self.assertRaisesRegex(SafetyError, "too low"):
+            await self.board.power_cycle(off_s=0.01)
+        self.assertNotIn(0x01, self.fw.received)
+
+    async def test_a_stop_while_off_keeps_power_off(self) -> None:
+        cycle = asyncio.create_task(self.board.power_cycle(off_s=0.2))
+        await asyncio.sleep(0.05)
+        await self.board.stop()
+        with self.assertRaisesRegex(SafetyError, "Power stays off"):
+            await cycle
+        self.assertNotIn(0x03, self.fw.received)
+        self.assertFalse(self.fw.output_on)
+
+    async def test_another_hosts_stop_while_off_keeps_power_off(self) -> None:
+        cycle = asyncio.create_task(self.board.power_cycle(off_s=0.2))
+        await asyncio.sleep(0.05)
+        # The control panel's stop, sent by the server's own connection.
+        frame = SimpleNamespace(arbitration_id=CMD, data=bytes([0x01]))
+        for listener in self.bus.listeners:
+            listener(frame)
+        with self.assertRaisesRegex(SafetyError, "Power stays off"):
+            await cycle
+        self.assertNotIn(0x03, self.fw.received)
+
+
 class OtherCommandsTest(BoardTestCase):
     async def test_enable_rearms_without_switching_power_on(self) -> None:
         await self.board.stop()
@@ -366,6 +412,21 @@ class CliTest(unittest.TestCase):
         self.assertFalse(self.fw.sw_enable)
         self._run("safety.start")
         self.assertTrue(self.fw.output_on)
+
+    def test_power_cycle(self) -> None:
+        with (
+            patch.object(safety_module, "MOTOR_BOOT_S", 0.0),
+            patch.object(SafetyBoard.power_cycle, "__defaults__", (0.0,)),
+        ):
+            self._run("safety.power-cycle")
+        self.assertTrue(self.fw.output_on)
+        self.assertLess(self.fw.received.index(0x01), self.fw.received.index(0x03))
+
+    def test_power_cycle_refused_with_the_estop_pressed(self) -> None:
+        self.fw.estop_ok = False
+        with self.assertRaisesRegex(SystemExit, "E-Stop is pressed"):
+            self._run("safety.power-cycle")
+        self.assertNotIn(0x01, self.fw.received)
 
     def test_no_board_exits_with_a_message(self) -> None:
         self.fw.silent = True

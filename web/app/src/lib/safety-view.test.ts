@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
 
-import { safetyView } from "./safety-view"
-import type { SafetyBoardStatus, SafetyLinkStatus } from "./supervisor"
+import { motorFaultLabels, safetyView } from "./safety-view"
+import type { JellyStatus, RobotStatus, SafetyBoardStatus, SafetyLinkStatus } from "./supervisor"
 
 const board = (over: Partial<SafetyBoardStatus> = {}): SafetyBoardStatus => ({
   estopOk: true,
@@ -109,5 +109,40 @@ describe("safetyView", () => {
     expect(safetyView(link(board({ ...off, faults }))).notes).toContain(
       "The last restore did not switch power on."
     )
+  })
+})
+
+describe("motorFaultLabels", () => {
+  const robot = (over: Partial<RobotStatus> = {}) =>
+    ({
+      state: "connected",
+      connected: true,
+      profile: "axol",
+      faults: [{ arm: "left", joint: "WRIST_2", problem: "over current", temperature: 40 }],
+      ...over,
+    }) as RobotStatus
+  const jelly = {
+    wheels: {
+      connected: true,
+      motors: [
+        { name: "front_left", id: 1, reachable: false, status: null },
+        { name: "front_right", id: 2, reachable: true, status: "OK" },
+      ],
+    },
+  } as unknown as JellyStatus
+
+  it("lists arm and wheel faults", () => {
+    expect(motorFaultLabels(robot(), jelly)).toEqual([
+      "L wrist 2: over current",
+      "front left wheel: unreachable",
+    ])
+  })
+
+  it("leaves out Mantis grippers, which are not on Axol's supply", () => {
+    expect(motorFaultLabels(robot({ profile: "mantis" }), null)).toEqual([])
+  })
+
+  it("is empty when nothing is faulted", () => {
+    expect(motorFaultLabels(robot({ faults: [] }), null)).toEqual([])
   })
 })

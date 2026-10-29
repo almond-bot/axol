@@ -32,6 +32,8 @@ import threading
 from typing import Any
 
 from ..robot.safety import (
+    MOTOR_BOOT_S,
+    POWER_CYCLE_OFF_S,
     SafetyBoard,
     SafetyError,
     SafetyStatus,
@@ -88,6 +90,7 @@ class SafetyLink:
         # answering instead of hiding the control.
         self._detected: set[str] = set()
         self._paused = False
+        self._cycling = False
         self._error: str | None = None
         self._lock = threading.Lock()
         self._loop = asyncio.new_event_loop()
@@ -129,6 +132,7 @@ class SafetyLink:
             "channel": channel,
             "connected": board is not None and board.running,
             "paused": paused,
+            "powerCycling": self._cycling,
             "detected": detected,
             "reachable": board is not None and board.status_is_fresh(_REACHABLE_S),
             "ageSeconds": None if age is None else round(age, 1),
@@ -144,6 +148,19 @@ class SafetyLink:
     def start(self) -> dict[str, Any]:
         """Remote start: power back on. Raises :class:`SafetyError` with why not."""
         self._submit(self._command("start"))
+        return self.status()
+
+    def power_cycle(self) -> dict[str, Any]:
+        """Cut power and restore it a few seconds later, resetting every motor.
+
+        Raises :class:`SafetyError` when the board refuses or power does not
+        come back. A software stop during the cycle goes out at once and
+        keeps power off.
+        """
+        self._submit(
+            self._power_cycle(),
+            timeout=_COMMAND_TIMEOUT_S * 2 + POWER_CYCLE_OFF_S + MOTOR_BOOT_S,
+        )
         return self.status()
 
     def pause(self) -> None:
@@ -194,6 +211,29 @@ class SafetyLink:
                 status = await board.remote_start()
                 _logger.info("remote start: power is on")
             return status
+
+    async def _power_cycle(self) -> SafetyStatus:
+        # The board lock is not held across the cycle, so a stop is never
+        # queued behind it: board.stop() during the off time cancels the
+        # restart instead.
+        async with self._board_lock:
+            board = self._board
+            with self._lock:
+                detected = self._channel in self._detected
+            if not detected:
+                raise SafetyError("This Jelly has no safety board.")
+            if board is None or not board.running:
+                raise SafetyError("Jelly's safety board is not connected.")
+            if self._cycling:
+                raise SafetyError("A power cycle is already running.")
+            self._cycling = True
+        try:
+            _logger.warning("power cycle requested from the control panel")
+            status = await board.power_cycle()
+            _logger.warning("power cycle done: power is on")
+            return status
+        finally:
+            self._cycling = False
 
     async def _pause(self) -> None:
         with self._lock:

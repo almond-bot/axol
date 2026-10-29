@@ -33,6 +33,7 @@ from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
 from ...robot.axol import EITHER_STOP_JOINTS, closer_end_stop
+from ...robot.safety import SafetyBoard, SafetyError, resolve_safety_channel
 from . import add_side_and_channel_arguments, resolve_channel
 
 # Marker prefix a --web-prompts step prints before blocking on stdin (same
@@ -343,7 +344,7 @@ async def _run_guided(args: argparse.Namespace) -> None:
             print(f"  {joint.name:<12} start: {_fmt(starts[joint])}")
 
         results: list[tuple[Joint, bool]] = []
-        any_damiao = False
+        zeroed_damiao: list[Joint] = []
         for joint in joints:
             target, sign = closer_end_stop(joint, is_left)
             motor = motors[joint]
@@ -361,13 +362,64 @@ async def _run_guided(args: argparse.Namespace) -> None:
                 break
             results.append((joint, ok))
             if ok and isinstance(motor._driver, DamiaoMotor):
-                any_damiao = True
+                zeroed_damiao.append(joint)
 
         print("\n— summary —")
         for joint, ok in results:
             print(f"  {joint.name:<12} {'zeroed' if ok else 'skipped'}")
 
-        if any_damiao:
-            print(
-                "\n⚠  Damiao motors zeroed (WRIST_2 / WRIST_3) — power-cycle required."
+        if zeroed_damiao:
+            await _apply_damiao_zeros(
+                [motors[j] for j in zeroed_damiao], args.web_prompts
             )
+
+
+async def _apply_damiao_zeros(motors: list[Motor], web_prompts: bool) -> None:
+    """Power-cycle Axol through Jelly's safety board so new Damiao zeros apply.
+
+    A Damiao only takes a new zero after a reset. With a safety board on the
+    lift bus this cuts power for a few seconds and restores it, once the
+    operator has the arms supported. Without one (or if the operator
+    declines), it falls back to asking for a manual power cycle.
+    """
+    names = ", ".join(m.joint.name for m in motors)
+    manual = f"\n⚠  Damiao motors zeroed ({names}) — power-cycle required."
+    channel = resolve_safety_channel()
+    from ..can.setup import iface_up
+
+    if not iface_up(channel):
+        print(manual)
+        return
+    board = SafetyBoard(channel)
+    try:
+        await board.start(bring_up=False)
+        await board.request_status()
+    except (OSError, SafetyError):
+        # No safety board on this robot.
+        await board.close()
+        print(manual)
+        return
+    try:
+        if not _prompt(
+            "support both arms: power to Axol goes off for a few seconds "
+            "to apply the new Damiao zeros",
+            web_prompts,
+        ):
+            print(manual)
+            return
+        print("\n  power-cycling Axol through the safety board...", flush=True)
+        try:
+            await board.power_cycle()
+        except SafetyError as exc:
+            print(f"\n⚠  power cycle failed: {exc}")
+            print(manual)
+            return
+    finally:
+        await board.close()
+    print("  ✓ power is back on.")
+    for motor in motors:
+        try:
+            print(f"  {motor.joint.name:<12} now: {_fmt(await motor.get_position())}")
+        except Exception as exc:  # noqa: BLE001 - reported, zero already saved
+            print(f"  {motor.joint.name:<12} not answering yet ({exc})")
+    print("  Damiao zeros applied.")

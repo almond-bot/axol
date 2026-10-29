@@ -1752,6 +1752,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
 
+    @app.post("/api/safety/power-cycle", response_model=None)
+    async def safety_power_cycle() -> dict[str, Any] | JSONResponse:
+        """Cut power and restore it a few seconds later: resets every motor."""
+        # Held for the whole cycle, so no operation starts while power is off.
+        async with session_launch_reservation:
+            if runner.is_running() or _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "Stop the running operation before you "
+                        "power-cycle the motors."
+                    },
+                    status_code=409,
+                )
+            try:
+                return await asyncio.to_thread(safety.power_cycle)
+            except (SafetyError, TimeoutError) as exc:
+                return JSONResponse(
+                    {"error": str(exc) or "Power did not come back on."},
+                    status_code=409,
+                )
+
     @app.get("/api/can/interfaces", response_model=None)
     async def can_interfaces() -> dict[str, Any] | JSONResponse:
         """SocketCAN inventory, trusted profiles, and discovery state."""

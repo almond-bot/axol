@@ -79,8 +79,8 @@ const flush = async () => {
   for (let i = 0; i < 5; i++) await act(async () => {})
 }
 
-const render = async (enabled = true) => {
-  await act(async () => root.render(<SafetyControl enabled={enabled} />))
+const render = async (enabled = true, motorFaults: string[] = []) => {
+  await act(async () => root.render(<SafetyControl enabled={enabled} motorFaults={motorFaults} />))
   await flush()
 }
 
@@ -162,6 +162,78 @@ describe("SafetyControl", () => {
     await act(async () => buttonNamed("Restore power")!.click())
     await flush()
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("try again")
+  })
+
+  it("offers no power cycle without a motor fault", async () => {
+    replies["GET /api/safety/status"] = { ok: true, body: status(true) }
+    await render()
+    expect(buttonNamed("Motor fault")).toBeUndefined()
+  })
+
+  it("power-cycles the motors from the motor fault panel", async () => {
+    replies["GET /api/safety/status"] = { ok: true, body: status(true) }
+    replies["POST /api/safety/power-cycle"] = { ok: true, body: status(true) }
+    await render(true, ["L wrist 2: over current"])
+    await act(async () => buttonNamed("Motor fault")!.click())
+    expect(container.textContent).toContain("L wrist 2: over current")
+    expect(container.textContent).toContain("Support the arms first")
+    expect(calls).not.toContain("POST /api/safety/power-cycle")
+    await act(async () => buttonNamed("Power-cycle motors")!.click())
+    await flush()
+    expect(calls).toContain("POST /api/safety/power-cycle")
+    expect(container.querySelector('[role="dialog"]')).toBeNull()
+  })
+
+  it("keeps Cut power live while a power cycle runs", async () => {
+    vi.useFakeTimers()
+    replies["GET /api/safety/status"] = { ok: true, body: status(true) }
+    let finish!: () => void
+    const cycle = new Promise<void>((resolve) => (finish = resolve))
+    const fetchMock = vi.mocked(fetch)
+    const base = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (url, init) => {
+      if (String(url) === "/api/safety/power-cycle") {
+        calls.push("POST /api/safety/power-cycle")
+        await cycle
+        return new Response(JSON.stringify({ error: "Power stays off." }), { status: 409 })
+      }
+      return base(url, init)
+    })
+    replies["POST /api/safety/stop"] = { ok: true, body: status(false) }
+    await render(true, ["L wrist 2: over current"])
+    await act(async () => buttonNamed("Motor fault")!.click())
+    await act(async () => buttonNamed("Power-cycle motors")!.click())
+    await flush()
+    expect(buttonNamed("Power-cycling motors")).toBeDefined()
+    // Power is off part way through the cycle: Cut power stays, Restore doesn't.
+    replies["GET /api/safety/status"] = { ok: true, body: status(false, { powerCycling: true }) }
+    await act(async () => vi.advanceTimersByTime(1000))
+    await flush()
+    expect(buttonNamed("Restore power")).toBeUndefined()
+    const cut = buttonNamed("Cut power")!
+    expect(cut.disabled).toBe(false)
+    await act(async () => cut.click())
+    await flush()
+    expect(calls).toContain("POST /api/safety/stop")
+    finish()
+    await flush()
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Power stays off.")
+  })
+
+  it("shows a refused power cycle in the panel", async () => {
+    replies["GET /api/safety/status"] = { ok: true, body: status(true) }
+    replies["POST /api/safety/power-cycle"] = {
+      ok: false,
+      status: 409,
+      body: { error: "Stop the running operation before you power-cycle the motors." },
+    }
+    await render(true, ["R elbow: unreachable"])
+    await act(async () => buttonNamed("Motor fault")!.click())
+    await act(async () => buttonNamed("Power-cycle motors")!.click())
+    await flush()
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "Stop the running operation"
+    )
   })
 
   it("explains why power can't come back on", async () => {
