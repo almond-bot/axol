@@ -292,19 +292,49 @@ class FlashTest(unittest.TestCase):
         ):
             hub_fw._copy_uf2("/dev/sda1", image)
 
+    def _run_mount(self, mount_results: list[int]):
+        """A subprocess.run stand-in: findmnt finds nothing, mount returns in turn."""
+        calls: list[str] = []
+
+        def run(cmd, **_k):
+            calls.append(cmd[0])
+            if cmd[0] == "mount":
+                code = mount_results.pop(0) if mount_results else 32
+                return subprocess.CompletedProcess(cmd, code, "", "mount: bad fs")
+            return subprocess.CompletedProcess(
+                cmd, 1 if cmd[0] == "findmnt" else 0, "", ""
+            )
+
+        return run, calls
+
     def test_a_failed_mount_is_a_firmware_error(self) -> None:
         image = Path(self.enterContext(tempfile.TemporaryDirectory())) / "a.uf2"
         image.write_bytes(b"")
-        results = [
-            subprocess.CompletedProcess([], 1, stdout="", stderr=""),  # findmnt
-            subprocess.CompletedProcess([], 32, stdout="", stderr="mount: bad fs"),
-        ]
+        run, calls = self._run_mount([])
+        clock = iter(range(0, 100, 2))
         with (
-            patch.object(hub_fw.subprocess, "run", side_effect=results),
+            patch.object(hub_fw.subprocess, "run", side_effect=run),
+            patch.object(hub_fw.time, "monotonic", side_effect=lambda: next(clock)),
+            patch.object(hub_fw.time, "sleep"),
             self.assertRaises(hub_fw.HubFirmwareError) as raised,
         ):
             hub_fw._copy_uf2("/dev/sda1", image)
         self.assertIn("bad fs", str(raised.exception))
+        self.assertGreater(calls.count("mount"), 1)
+
+    def test_a_mount_that_fails_as_the_disk_appears_is_retried(self) -> None:
+        # The /dev node can trail the sysfs entry the disk was found by.
+        image = Path(self.enterContext(tempfile.TemporaryDirectory())) / "a.uf2"
+        image.write_bytes(b"\0" * 512)
+        run, calls = self._run_mount([32, 0])
+        with (
+            patch.object(hub_fw.subprocess, "run", side_effect=run),
+            patch.object(hub_fw.time, "sleep"),
+            patch("builtins.open", side_effect=OSError(errno.ENOENT, "gone")),
+        ):
+            hub_fw._copy_uf2("/dev/sda1", image)
+        self.assertEqual(calls.count("mount"), 2)
+        self.assertIn("umount", calls)
 
     def test_refuses_without_root(self) -> None:
         with (
@@ -347,6 +377,48 @@ class FlashTest(unittest.TestCase):
             version = hub_fw.flash("1-3", sysfs=self.sysfs.root)
         self.assertEqual(copied, ["/dev/sda1"])
         self.assertEqual(version, hub_fw.FIRMWARE_VERSION)
+
+    def _bootloader_block(self, device: Path) -> Path:
+        block = device / "1-3:1.0" / "host0" / "target0:0:0" / "0:0:0:0" / "block"
+        (block / "sda").mkdir(parents=True)
+        return block / "sda"
+
+    def test_waits_for_the_partition_table_before_picking_the_disk(self) -> None:
+        # The disk appears in sysfs before the kernel has read its partition
+        # table; mounting the bare disk then fails and strands the hub in its
+        # bootloader (seen on a Raspberry Pi 5).
+        device = self.sysfs.usb("1-3", vid=hub_fw.BOOT_VID, pid=hub_fw.BOOT_PID)
+        disk = self._bootloader_block(device)
+        self.assertIsNone(hub_fw._bootloader_disk("1-3", self.sysfs.root))
+        (disk / "sda1").mkdir()
+        self.assertEqual(hub_fw._bootloader_disk("1-3", self.sysfs.root), "/dev/sda1")
+
+    def test_a_disk_without_partitions_is_used_after_the_wait(self) -> None:
+        device = self.sysfs.usb("1-3", vid=hub_fw.BOOT_VID, pid=hub_fw.BOOT_PID)
+        self._bootloader_block(device)
+        copied: list[str] = []
+
+        def copy(disk: str, image: Path) -> None:
+            copied.append(disk)
+            self.sysfs.usb(
+                "1-3",
+                vid=hub_fw.HUB_VID,
+                pid=hub_fw.HUB_PID,
+                version=hub_fw.FIRMWARE_VERSION,
+            )
+
+        def no_partition(predicate, timeout_s, what):
+            if "disk" in what:
+                self.assertIsNone(predicate())
+                raise hub_fw.HubFirmwareError(f"timed out waiting for {what}")
+            return predicate()
+
+        with (
+            patch.object(hub_fw, "_wait_for", side_effect=no_partition),
+            patch.object(hub_fw, "_copy_uf2", side_effect=copy),
+        ):
+            hub_fw.flash("1-3", sysfs=self.sysfs.root)
+        self.assertEqual(copied, ["/dev/sda"])
 
 
 class BringUpOrderTest(unittest.IsolatedAsyncioTestCase):
