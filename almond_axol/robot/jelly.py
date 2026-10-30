@@ -145,6 +145,43 @@ def deadzone(value: float, threshold: float) -> float:
     return scaled if value > 0 else -scaled
 
 
+def stick_curve(value: float, expo: float) -> float:
+    """Shape a deadzoned stick axis ([-1, 1]) for fine control near centre.
+
+    The usual RC "expo": a blend ``(1 - expo) * x + expo * x**3`` of the
+    linear response and a cubic, so small deflections give a fraction of
+    the speed a linear map would while full deflection still gives full
+    speed. ``expo`` 0 is linear; it is clamped to [0, 1] (above 1 the
+    curve would turn back on itself).
+    """
+    e = min(max(float(expo), 0.0), 1.0)
+    return (1.0 - e) * value + e * value**3
+
+
+def stick_command(
+    lx: float, ly: float, rx: float, deadzone_: float, expo: float
+) -> tuple[float, float, float]:
+    """Normalized ``(vx, vy, wz)`` from raw thumbstick axes.
+
+    ``lx`` / ``ly`` / ``rx``: the left stick's x and y and the right
+    stick's x, gamepad convention (+x right, +y pulled back). Each axis is
+    deadzoned (:func:`deadzone`), then shaped by :func:`stick_curve` — the
+    translation by its *magnitude*, so a diagonal keeps its heading, and the
+    rotation on its own. Shared by every stick frontend (the headset's
+    :meth:`Jelly.apply_vr_frame`, the gamepad drive tool) so they feel the
+    same.
+    """
+    # +x right, +y pulled back → body frame +x forward, +y left, +wz CCW.
+    vx = -deadzone(ly, deadzone_)
+    vy = -deadzone(lx, deadzone_)
+    wz = -deadzone(rx, deadzone_)
+    mag = math.hypot(vx, vy)
+    if mag > 0.0:
+        k = stick_curve(min(mag, 1.0), expo) / mag
+        vx, vy = vx * k, vy * k
+    return vx, vy, stick_curve(wz, expo)
+
+
 def mix(
     vx: float, vy: float, wz: float, max_speed: float, turn_scale: float
 ) -> list[float]:
@@ -212,6 +249,13 @@ class JellyConfig:
                          For diagnosing drift; off in normal operation.
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
+        stick_expo:      Stick response curve, in [0, 1] (see
+                         :func:`stick_curve`): ``0`` maps deflection to speed
+                         linearly; higher keeps more of the stick's travel for
+                         slow, fine moves, with full deflection still full
+                         speed. The default ``0.6`` gives ~11% speed at a
+                         quarter of the stick's travel past the deadzone and
+                         ~28% at half (linear: 25% / 50%).
         hold_kp:         Stiffness (Nm/rad) of the position hold; 0 makes
                          every park the braking-only hold (see the module docs).
         hold_kd:         Damping (Nm·s/rad) of both park holds; 0 disables
@@ -263,6 +307,7 @@ class JellyConfig:
     yaw_hold_max: float = 0.3
     yaw_log: bool = False
     deadzone: float = 0.15
+    stick_expo: float = 0.6
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
@@ -831,12 +876,13 @@ class Jelly:
         if resetting or frame.reset:
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
-        dz = self._config.deadzone
-        # WebXR sticks: +x right, +y pulled back → body frame +x forward,
-        # +y left, +wz CCW.
-        vx = -deadzone(frame.l_stick_y, dz)
-        vy = -deadzone(frame.l_stick_x, dz)
-        wz = -deadzone(frame.r_stick_x, dz)
+        vx, vy, wz = stick_command(
+            frame.l_stick_x,
+            frame.l_stick_y,
+            frame.r_stick_x,
+            self._config.deadzone,
+            self._config.stick_expo,
+        )
         if frame.r_stick_click and not frame.l_stick_click:
             lift = UP
         elif frame.l_stick_click and not frame.r_stick_click:

@@ -40,7 +40,7 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--jelly.lift BOOL` | Run Jelly's lift when its CAN bus is attached (default: `true`). Control panel: **Jelly lift**. |
 | `--jelly.lift_channel <ch\|null>` | CAN interface for the lift. Default `null` uses `can_alm_axol_c` if it exists, otherwise the wheel bus `can_alm_axol_b`. |
 | `--jelly.imu BOOL` | Use the carrier board's IMU to hold Jelly's heading while driving straight (default: `false`). |
-| `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
+| `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed` or the stick response curve `--jelly.stick_expo`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
 | `--axol.left_stiffness S` | Left arm stiffness, from `0` (fully hand-guidable) to `1` (default, the tuned production gains). A scalar (`0.8`) or one value per joint (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`). See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
 | `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5). Use `right` for the right gripper. |
@@ -133,27 +133,26 @@ Raise a limit if normal moves trip it. Set it to `0` to turn the watchdog off.
 
 [Box mode](/guides/vr-interface#box-mode) needs the parcel gripper (`--axol.gripper parcel`). With the parallel gripper, box mode and its settings don't exist, and `--teleop.box_mode` is ignored with a warning.
 
-In box mode the grippers clamp a box between their flat faces, like two hands. One grip drives both arms as a pair, by position and by heading about the vertical. The other grip takes over the lead. While a grip leads, the thumbsticks set the grip width. Freeze the pair and the thumbsticks drive Jelly again (see [Driving with the box](/guides/vr-interface#driving-with-the-box)).
+In box mode the grippers clamp a box between their flat faces, like two hands. One grip drives both arms as a pair, by position and rotation. The other grip takes over the lead. While a grip leads, the right thumbstick's forward and back sets the grip width. The rest of the thumbsticks drive Jelly as usual, led or frozen (see [Driving with the box](/guides/vr-interface#driving-with-the-box)).
 
 To switch box mode on or off during a session, press the headset's **Box** button, click both thumbsticks together, or use the control panel's **Session settings** card. The switch engages right away.
 
 | Flag | Description |
 |---|---|
 | `--teleop.box_lead_hand` | Hand that leads when box mode turns on: `right` (default) or `left`. |
-| `--teleop.box_grasp` | `straight` (default, fingers point straight forward) or `flush` (each gripper turned inward onto the plate's chamfer). Click either stick while leading to switch. |
+| `--teleop.box_grasp` | `straight` (default, fingers point straight forward) or `flush` (each gripper turned inward onto the plate's chamfer). Tap either stick click while leading to switch. Hold the click to run the lift instead. |
 | `--teleop.box_flush_deg` | How far the flush grasp turns each gripper inward (default: `39`°). |
 | `--teleop.box_face_left` / `box_face_right` | Which side of each gripper faces the box: `auto` (default), `+x` or `-x`. |
 | `--teleop.box_grip_tilt` | Fixed inward yaw trim in degrees (default: `0`). A calibration value, not a live control. |
-| `--teleop.box_width_speed` | How fast the thumbsticks change the width (default: `0.08` m/s). |
-| `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0.02` / `0.70` m). The gripper bodies raise the minimum. The straight grasp stops at about 77 mm. |
+| `--teleop.box_width_speed` | How fast the right thumbstick changes the width (default: `0.08` m/s). |
+| `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0` / `0.70` m). The gripper bodies raise the minimum where needed. The parcel gripper's faces can close all the way together. |
 | `--teleop.box_align_duration` | Time to blend into the pair when box mode engages (default: `1.5` s). |
-| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `30`). Push either thumbstick forward or back to adjust it live. |
-| `--teleop.box_elbow_speed` | How fast the thumbsticks move the elbows (default: `30`°/s). |
-| `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and the thumbsticks don't move the elbows. |
+| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `30`). Live control: **Elbows out**. |
+| `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and **Elbows out** does nothing. |
 | `--teleop.box_squeeze_lean` | Lean each gripper into the box as you squeeze, so the face presses evenly from root to tip (default: `1`; `0` is off). Live control: **Squeeze lean**. |
 | `--teleop.box_squeeze_trim` | Largest extra inward turn, in degrees, added while squeezing to square each face to the box (default: `5`; `0` is off). Live control: **Squeeze trim**. |
-| `--teleop.box_squeeze_force` | Clamp force cap per arm, in N (default: `0`, off). Live control: **Squeeze force**. |
-| `--teleop.box_wrist_torque` | Torque cap (Nm) on `wrist_2` and `wrist_3` in box mode (default: `5`; `0` is off). It also sets the automatic clamp force limit, about 39 N a side. |
+| `--teleop.box_squeeze_force` | Clamp force cap per arm, in N (default: `0`, off). With it off, nothing limits the clamp. Live control: **Squeeze force**. |
+| `--teleop.box_wrist_torque` | Torque cap (Nm) on `wrist_2` and `wrist_3` in box mode (default: `5`; `0` is off). It doesn't stop the width closing. Past about 39 N a side, the tip can unload onto the facet. |
 | `--teleop.box_squeeze_torque` | Torque cap (Nm) on the squeezing shoulder joints, `shoulder_2` and `shoulder_3` (default: `0`, off). It also slows the arms moving toward each other. Live control: **Squeeze cap**. |
 
 The wrist and shoulder torque caps work on hardware only.

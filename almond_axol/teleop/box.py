@@ -8,11 +8,11 @@ robot's world frame (FLU:
 
 The **box frame** sits at the midpoint of the two gripper mount frames. Its
 axes are ``x`` forward, ``y`` *lateral* — the horizontal direction from the
-right gripper to the left one — and ``z`` up: the frame is always level, and
-turns only about the vertical (yaw), so the grippers are always held level
-with the hands straight out and the one thing the operator steers besides
-the pair's position is its heading on the table plane, to line up with the
-box. The grippers live at ``center ± y * width / 2`` and hold the box the
+right gripper to the left one — and ``z`` up, as set at the engage snap,
+where the frame is level. From there the leader hand turns it freely (yaw,
+pitch and roll about the centre), so the operator lines the pair up with
+the box and can tip it once held. The grippers live at
+``center ± y * width / 2`` and hold the box the
 way two flat hands
 clamp its sides: the fingers point *forward* (the gripper link's ``-Z``, the
 direction the fingers point, goes along ``+x``) and the flat outer face of
@@ -102,9 +102,14 @@ class ToolGeometry:
         The width is between the contact faces and each body sits
         :attr:`body_in` past its face, so this is the width at which the
         bodies are ``clearance`` apart, never less than ``0``; the
-        operator's ``box_width_min`` is applied on top.
+        operator's ``box_width_min`` is applied on top. A tool whose
+        contact face is proud of its body (``body_in <= 0``, the parcel
+        gripper) has no such floor: its faces meet first and may close all
+        the way, onto each other.
         """
-        return max(0.0, 2.0 * self.body_in + clearance)
+        if self.body_in <= 0.0:
+            return 0.0
+        return 2.0 * self.body_in + clearance
 
     @staticmethod
     def point(fwd: float, in_: float, up: float, face: float) -> np.ndarray:
@@ -307,14 +312,12 @@ class BoxState:
 
     ``center`` / ``rot`` are the box pose *at the snap* (``rot`` is level,
     yaw only); every frame the leader controller's translation since its own
-    snap is applied to the centre and the vertical-axis part of its rotation
-    (:func:`twist_about` the room's up) turns the pair about that centre — the box rides on
-    the leader gripper's clutch mapping, position and heading only, the
-    hand's pitch and roll are ignored (see ``IKWorker``). The thumbsticks own
-    the other two numbers:
-    ``width``, the separation of the two contact faces (the box size), and
-    ``tilt``, the grippers' inward yaw trim (rad, seeded from the config) on
-    top of the tool's flush yaw. ``face`` records which flat face (``±1``,
+    snap is applied to the centre and the leader gripper's full rotation
+    since the snap turns the pair about that centre — the box rides on the
+    leader gripper's clutch mapping (see ``IKWorker``). ``width`` is the
+    separation of the two contact faces (the box size), set by the right
+    thumbstick, and ``tilt`` the grippers' inward yaw trim (rad, from the
+    config) on top of the tool's flush yaw. ``face`` records which flat face (``±1``,
     the gripper's ``±X`` side) each gripper turns toward the box, chosen at
     the snap; with ``tilt`` and ``tool`` it gives each gripper's rotation
     relative to the box frame (:meth:`grip_rel`) and where its mount sits
@@ -335,11 +338,6 @@ class BoxState:
     # Wall time of the previous stick integration step (None before the first).
     stick_t: float | None = None
     tool: ToolGeometry = URDF_TOOL
-    # Stick-click state for the grasp toggle (``IKWorker._stick_click_toggle``):
-    # last frame's (left, right) click flags and whether a single press is
-    # armed to toggle on its release.
-    click_prev: tuple[bool, bool] = (False, False)
-    click_armed: bool = False
 
     def grip_rel(self) -> dict[str, np.ndarray]:
         """Each gripper's rotation relative to the box frame (see :func:`side_clamp_rotation`)."""
@@ -515,6 +513,26 @@ def pair_aligned(
     )
 
 
+def tipped_frame_holds(
+    left: Pose, right: Pose, rot: np.ndarray, tol_deg: float
+) -> bool:
+    """True when both grippers still sit in the (possibly tipped) box frame ``rot``.
+
+    In either grasp a box-mode gripper's ``Y`` axis — the parcel
+    gripper's hinge — is along the box's up (``±``, by face; the grasp's
+    yaw turns the gripper about that axis), so each gripper's ``Y`` must be
+    within ``tol_deg`` of ``±rot[:, 2]``. A pair the leader tipped and then
+    froze, handed over or switched grasp passes; one moved elsewhere since
+    (a reset, hand guiding) doesn't, and is squared up level again.
+    """
+    up = np.asarray(rot, dtype=np.float64)[:, 2]
+    cos_tol = math.cos(math.radians(tol_deg))
+    return all(
+        abs(float(np.asarray(pose[1], dtype=np.float64)[:, 1] @ up)) >= cos_tol
+        for pose in (left, right)
+    )
+
+
 def snap_box(
     left: Pose,
     right: Pose,
@@ -525,6 +543,7 @@ def snap_box(
     tilt: float = 0.0,
     tool: ToolGeometry = URDF_TOOL,
     faces: Faces | None = None,
+    rot: np.ndarray | None = None,
 ) -> BoxState:
     """Build the box state for an engage snap from the current gripper poses.
 
@@ -539,8 +558,14 @@ def snap_box(
     holding a box keeps its grip, and a switch between the parcel
     gripper's grasps rolls it from its face onto its facet about the edge
     between them instead of swinging the facet into the box.
+
+    ``rot`` keeps a given box rotation instead of the level one
+    :func:`box_frame` builds — a re-snap of a pair the leader has tipped
+    (:func:`tipped_frame_holds`), so it isn't levelled under the box.
     """
-    _mounts, rot, _width = box_frame(left[0], right[0])
+    if rot is None:
+        _mounts, rot, _width = box_frame(left[0], right[0])
+    rot = np.asarray(rot, dtype=np.float32)
     yaw = tilt + tool.flush_tilt
     face = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
     feet = {side: tool.foot(face[side]) for side in _SIDE_SIGN}
@@ -739,40 +764,6 @@ def squeeze_lean(
         pullback=capped - depth,
         stiffness=stiffness,
     )
-
-
-def joint_force_limit(
-    jac: np.ndarray,
-    rotation: np.ndarray,
-    normal: np.ndarray,
-    contacts: np.ndarray,
-    joint_caps: np.ndarray,
-) -> float:
-    """Largest even clamp (N) the arm's torque-capped joints can hold.
-
-    The clamp :func:`squeeze_lean` renders is a force along ``normal``
-    through the contacts' centroid; statics puts ``|J^T w|`` of it on each
-    joint. A joint with a spring-torque cap (``joint_caps``, Nm, ``inf``
-    for none — box mode's 5 Nm on the wrists) can't deliver more than that, and the
-    joint that saturates first is the one holding the moment that keeps the
-    far contact pressed (``wrist_2``, ~0.13 Nm per N for the parcel
-    gripper's facet and tip): past it every extra newton goes where that
-    joint adds no torque — its own axis, behind the facet — so the tip
-    unloads and the facet takes it all, the pinch. Returns the force at
-    which the first capped joint saturates (``inf`` if none is loaded).
-    """
-    pts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
-    if pts.shape[0] == 0:
-        return math.inf
-    n = np.asarray(normal, dtype=np.float64)
-    r_c = pts.mean(axis=0) @ np.asarray(rotation, dtype=np.float64).T
-    unit_wrench = np.concatenate([n, np.cross(r_c, n)])
-    per_newton = np.abs(np.asarray(jac, dtype=np.float64).T @ unit_wrench)
-    caps = np.asarray(joint_caps, dtype=np.float64)
-    loaded = np.isfinite(caps) & (per_newton > 1e-9)
-    if not np.any(loaded):
-        return math.inf
-    return float(np.min(caps[loaded] / per_newton[loaded]))
 
 
 def tip_inward_sign(rot: np.ndarray, normal: np.ndarray, up: np.ndarray) -> float:

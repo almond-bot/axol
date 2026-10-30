@@ -50,10 +50,12 @@ async with VRServer() as vr:
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION` or `RECORDING`, set by the headset. `SAVING` and `ERROR` are only pushed by the server. |
 | `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick (right is `+1`, forward is `-1`). Drives [Jelly](/guides/vr-interface#jelly)'s translation when one is configured. |
 | `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Drives Jelly's rotation. |
-| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Used only in [box mode](/guides/vr-interface#box-mode), where it moves the elbows. |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Used only in [box mode](/guides/vr-interface#box-mode) while a grip leads, where it sets the grip width. Jelly ignores it. |
 | `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Left lowers Jelly's lift and right raises it. See the notes below for box mode. |
 
-In box mode, while a grip leads the pair, a single click of either thumbstick toggles the grasp (`box_grasp`). With the pair frozen, the thumbsticks drive Jelly as usual. Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
+In box mode, the thumbsticks drive Jelly as usual, led or frozen. While a grip leads the pair, a quick tap of either thumbstick click toggles the grasp (`box_grasp`). A tap is released within about 0.3 s, with the other stick up. A longer hold runs the lift.
+
+Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
 
 The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so a client that leaves them out still works.
 

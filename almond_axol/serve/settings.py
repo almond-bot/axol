@@ -724,11 +724,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box mode at startup",
                 type="boolean",
                 help=(
-                    "Start sessions in box mode. The grippers clamp a box between them "
-                    "like two flat hands, and one controller moves both arms while "
-                    "keeping them level. The thumbsticks set the clamp width while you "
-                    "lead, and drive the base while the arms are frozen. Toggle it "
-                    "from the headset menu or by clicking both thumbsticks, which "
+                    "Start sessions in box mode, where the grippers clamp a box like two "
+                    "flat hands and one controller moves and turns both arms. "
+                    "While you lead, push the right thumbstick forward or back to set the "
+                    "clamp width. The rest of the thumbsticks drive the base as usual. "
+                    "Toggle it from the headset menu or by clicking both thumbsticks, which "
                     "engages the arms right away."
                 ),
                 targets={
