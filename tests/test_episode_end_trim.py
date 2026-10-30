@@ -41,10 +41,14 @@ class _Source:
 class _Trigger:
     def __init__(self, grip: float = 1.0) -> None:
         self.value = grip
+        self.pressed: bool | None = None
         self.stale = False
 
     def grip(self) -> float:
         return self.value
+
+    def button(self) -> bool | None:
+        return self.pressed
 
     def is_stale(self) -> bool:
         return self.stale

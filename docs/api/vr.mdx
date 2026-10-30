@@ -74,8 +74,8 @@ The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so 
 | Field | Type | Description |
 |---|---|---|
 | `l_trigger_live` / `r_trigger_live` | `bool` | Whether each Mantis trigger node is still sending input. When it stops, the take fails its quality check. Defaults to `True`. |
-| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` or `failure` signal from a trigger gesture. The outcome is logged but not saved in the dataset. |
-| `episode_end_t_host` | `float \| None` | Host time at which a saved episode should end. The tracker bridge sets it to the start of the end gesture, so the trigger clicks are trimmed from the take. |
+| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` or `failure` signal from a trigger gesture or the rig's side button. The outcome is logged but not saved in the dataset. |
+| `episode_end_t_host` | `float \| None` | Host time at which a saved episode should end. The tracker bridge sets it to the start of the end gesture or button press, so the trigger clicks are trimmed from the take. |
 | `lock_release_id` | `int \| None` | Handshake ID for tracker bridges. The teleop core echoes it once it has handled a grip release. |
 
 ### Set by the server

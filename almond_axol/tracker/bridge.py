@@ -20,9 +20,15 @@ Both hands pressing together count as one gesture (while a take is open and
 tracking is engaged, a two-handed squeeze/release is *not* a start gesture,
 so two-handed x3/x4 work the same as one-handed). Triple presses while idle
 are ignored. A managed plain-teleop bridge uses
-the same start gesture purely to engage. Other flows use
-:class:`StdinControls` (the trigger frame carries no buttons — session
-controls arrive with a later PCB revision): Enter toggles tracking engage,
+the same start gesture purely to engage.
+
+The side push button on either rig (reported in the same trigger frame, see
+:class:`SideButtonRecognizer`) is a one-handed alternative that leaves the
+grip untouched: a short press acts as the start gesture when no take is open
+and ends and saves the take while recording; holding it for
+:data:`_BUTTON_HOLD_S` ends and discards the take.
+
+Other flows use :class:`StdinControls`: Enter toggles tracking engage,
 ``r`` triggers a reset. A manual toggle is realised as a short pulse of both
 lock bits — the shared teleop core enables on a rising edge of both locks
 together and disables on a rising edge of either.
@@ -98,6 +104,11 @@ _GESTURE_TIMEOUT_S = 0.6
 # start at the moment the first squeeze *began*, not where it crossed the
 # press threshold, so none of the click's motion ends up in a saved episode.
 _GESTURE_SQUEEZE_EPS = 0.02
+# Side-button hold that discards the take instead of saving it. Resolves the
+# moment it is reached, so the operator gets the discard without releasing.
+_BUTTON_HOLD_S = 1.0
+_BUTTON_SHORT = "short"
+_BUTTON_LONG = "long"
 
 # Placeholder pose streamed for a side with no tracker assigned (teleop can
 # run one-armed, but VRFrame carries both sides).
@@ -223,6 +234,49 @@ class TriggerGestureRecognizer:
         self._presses = 0
         self._last_press_at = None
         self._sequence_started_at = None
+
+
+class SideButtonRecognizer:
+    """Turn one rig's side-button samples into short and long presses.
+
+    A short press resolves on release. A press held for :data:`_BUTTON_HOLD_S`
+    resolves as long once the hold time is reached, and its release is then
+    ignored so a discard never doubles as the next start. A button that was
+    already held when the recognizer started, or while its input was
+    cancelled, must be released before it counts again.
+    """
+
+    def __init__(self) -> None:
+        self._pressed_at: float | None = None
+        self._needs_release = True
+        #: When the most recently resolved press began. Set alongside a
+        #: non-None return from :meth:`update`.
+        self.last_press_at: float | None = None
+
+    def update(self, pressed: bool, now: float) -> str | None:
+        """Consume one button sample and return a completed press."""
+        if not pressed:
+            self._needs_release = False
+            if self._pressed_at is None:
+                return None
+            self.last_press_at = self._pressed_at
+            self._pressed_at = None
+            return _BUTTON_SHORT
+        if self._needs_release:
+            return None
+        if self._pressed_at is None:
+            self._pressed_at = now
+        if now - self._pressed_at >= _BUTTON_HOLD_S:
+            self.last_press_at = self._pressed_at
+            self._pressed_at = None
+            self._needs_release = True
+            return _BUTTON_LONG
+        return None
+
+    def cancel(self) -> None:
+        """Forget a press in progress and wait for the next release."""
+        self._pressed_at = None
+        self._needs_release = True
 
 
 class StdinControls:
@@ -476,6 +530,10 @@ class TrackerBridge:
         self._gesture = {
             "left": TriggerGestureRecognizer(),
             "right": TriggerGestureRecognizer(),
+        }
+        self._button = {
+            "left": SideButtonRecognizer(),
+            "right": SideButtonRecognizer(),
         }
 
         self._seq = 0
@@ -809,6 +867,34 @@ class TrackerBridge:
             if self._triggers[side] is not None and not self._trigger_fresh[side]:
                 recognizer.cancel_sequence()
 
+        # Side buttons follow the same rules: a press cannot straddle a CAN
+        # dropout, the post-take SAVING/ERROR window, or (managed) any input
+        # dropout. Either rig's button acts; a long press wins a tie.
+        button_inputs_ok = self._state not in (VRState.SAVING, VRState.ERROR) and (
+            all_required_inputs_fresh or not self._confirm_auto_engage
+        )
+        button_presses: dict[str, str] = {}
+        for side, recognizer in self._button.items():
+            reader = self._triggers[side]
+            pressed = (
+                reader.button()
+                if reader is not None and self._trigger_fresh[side]
+                else None
+            )
+            if pressed is None or not button_inputs_ok:
+                recognizer.cancel()
+                continue
+            press = recognizer.update(pressed, now)
+            if press is not None:
+                button_presses[side] = press
+        button_press = (
+            _BUTTON_LONG
+            if _BUTTON_LONG in button_presses.values()
+            else _BUTTON_SHORT
+            if button_presses
+            else None
+        )
+
         # Start gesture: both triggers squeezed together, then both released.
         # Only a bridge with two trigger readers can see it; a side without a
         # reader streams 1.0 and never squeezes.
@@ -848,6 +934,17 @@ class TrackerBridge:
             elif self._start_gesture_squeezed and all_released:
                 self._start_gesture_squeezed = False
                 start_gesture = True
+        if (
+            button_press == _BUTTON_SHORT
+            and self._state != VRState.RECORDING
+            and all_required_fresh
+            and all_required_triggers_fresh
+        ):
+            # Outside a take a short press is the start gesture. Drop any
+            # half-made trigger start so its release cannot request a second
+            # engage behind this one.
+            self._start_gesture_squeezed = False
+            start_gesture = True
         if start_gesture:
             for side, recognizer in self._gesture.items():
                 # Let each recognizer see the release, then forget the start
@@ -855,6 +952,11 @@ class TrackerBridge:
                 # triple/quadruple gesture.
                 recognizer.update(grips[side], now)
                 recognizer.cancel_sequence()
+            # A button still held (the other rig's, or one held through a
+            # trigger start) belongs to this start. Its release must not
+            # save or discard the take it just opened.
+            for button in self._button.values():
+                button.cancel()
             if self._auto_disengage_pending or self._auto_disengage_waiting_ack:
                 # A freshness-loss disengage is still in flight; its
                 # acknowledgement would wipe any request made now.
@@ -869,8 +971,10 @@ class TrackerBridge:
                 self._auto_engage_pending = True
                 self._record_after_engage = self._state == VRState.DATA_COLLECTION
                 _logger.info(
-                    "start gesture (both triggers squeezed then released) — "
-                    "engaging Mantis%s",
+                    "start gesture (%s) — engaging Mantis%s",
+                    "side button"
+                    if button_press is not None
+                    else "both triggers squeezed then released",
                     " and starting a take" if self._record_after_engage else "",
                 )
             elif self._engaged:
@@ -958,15 +1062,32 @@ class TrackerBridge:
                 if self._triggers[side] is not None and self._trigger_fresh[side]
             }
         )
+        button_outcome: VREpisodeOutcome | None = None
+        if self._state == VRState.RECORDING and not start_gesture:
+            if button_press == _BUTTON_LONG:
+                button_outcome = VREpisodeOutcome.FAILURE
+            elif button_press == _BUTTON_SHORT:
+                button_outcome = VREpisodeOutcome.SUCCESS
+        elif button_press == _BUTTON_LONG:
+            _logger.info("side button hold ignored — no take is open")
         gesture = (
             VREpisodeOutcome.FAILURE
-            if VREpisodeOutcome.FAILURE in outcomes.values()
+            if VREpisodeOutcome.FAILURE in (*outcomes.values(), button_outcome)
             else VREpisodeOutcome.SUCCESS
-            if VREpisodeOutcome.SUCCESS in outcomes.values()
+            if VREpisodeOutcome.SUCCESS in (*outcomes.values(), button_outcome)
             else None
         )
+        by_button = gesture is not None and gesture == button_outcome
         gesture_started_at: float | None = None
-        if gesture is not None:
+        if by_button:
+            # Cut a button-ended take at the press edge. The button doesn't
+            # move the jaws, but the hand reaching for it may move the rig.
+            # A trigger sequence still pending is an ordinary grasp, not part
+            # of this gesture.
+            gesture_started_at = min(
+                self._button[side].last_press_at or now for side in button_presses
+            )
+        elif gesture is not None:
             # When did the operator start this gesture? The earliest first
             # squeeze across the side(s) that resolved and any contemporaneous
             # sequence still pending on the other hand (see below): a saved
@@ -980,6 +1101,7 @@ class TrackerBridge:
             ]
             known = [t for t in starts if t is not None]
             gesture_started_at = min(known) if known else now
+        if gesture is not None:
             # The operator commonly squeezes both Mantis triggers together.
             # Their CAN samples can cross the 0.6 s resolution deadline one
             # frame apart: without consuming both pending sequences, the
@@ -988,6 +1110,9 @@ class TrackerBridge:
             # gesture.
             for recognizer in self._gesture.values():
                 recognizer.cancel_sequence()
+            # A button held while the take ends belongs to that ending.
+            for button in self._button.values():
+                button.cancel()
         episode_outcome: VREpisodeOutcome | None = None
         if self._state == VRState.RECORDING and gesture is not None:
             # Whatever the operator is still squeezing belongs to the gesture
@@ -1004,8 +1129,9 @@ class TrackerBridge:
                 # three clicks (and their gripper commands) stay out of the data.
                 self._episode_end_t_host = gesture_started_at
                 _logger.info(
-                    "triple trigger press → end episode and save (data cut "
+                    "%s → end episode and save (data cut "
                     "%.0f ms before the gesture resolved)",
+                    "side button press" if by_button else "triple trigger press",
                     (now - gesture_started_at) * 1000.0
                     if gesture_started_at is not None
                     else 0.0,
@@ -1018,7 +1144,10 @@ class TrackerBridge:
                 # is written, so the edge lands on the transition frame.
                 self._state = VRState.DATA_COLLECTION
                 self._reset_pulse = _PULSE_FRAMES
-                _logger.info("quadruple trigger press → discard episode")
+                _logger.info(
+                    "%s → discard episode",
+                    "side button hold" if by_button else "quadruple trigger press",
+                )
         elif gesture is not None and self._state == VRState.DATA_COLLECTION:
             _logger.info(
                 "trigger press gesture ignored while idle — squeeze both "

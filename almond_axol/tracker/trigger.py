@@ -24,7 +24,8 @@ circuits-py repo, protocol table in the adjacent README):
     0x009** (0x008 is reserved for the gripper motor itself, whose
     feedback answers on motor ID + 0x10), DLC 6 or 7, published at
     100 Hz whenever the device is powered. Both variants use the same
-    six-byte core payload; the optional seventh opaque byte is ignored.
+    six-byte core payload; firmware with the side push button appends it
+    as a seventh byte.
   - Core payload layout, **little-endian**
     (``struct.unpack("<fH", data[:6])``):
 
@@ -36,10 +37,12 @@ circuits-py repo, protocol table in the adjacent README):
              (gripper closed). The node already clamps to this range
     4-5      uint16 raw 12-bit ADC reading, for calibration/debug
              only — ignore in production
+    6        uint8 side push button, 1 = pressed (DLC 7 only; a DLC 6
+             node has no button)
     =======  ===========================================================
 
-  - The node oversamples the pot 16x per published sample, so no
-    host-side filtering or debounce is needed.
+  - The node oversamples the pot 16x per published sample and debounces
+    the button, so no host-side filtering or debounce is needed.
 
 The position maps to the VRFrame grip convention (0.0 = fully closed …
 1.0 = fully open) by :func:`position_to_grip`. With the default endpoint
@@ -80,10 +83,11 @@ TRIGGER_RATE_HZ = 100.0
 # stale: hold the last grip command rather than jumping to a default.
 STALE_AFTER_S = 0.25
 
-# Payload size (float32 trigger state + uint16 raw switch level), plus an
-# optional one-byte opaque extension. Both variants exist on physical rigs.
+# Payload size (float32 trigger state + uint16 raw ADC level), plus the
+# optional side-button byte. Both variants exist on physical rigs.
 _CORE_FRAME_LEN = 6
-_FRAME_LENGTHS = frozenset({_CORE_FRAME_LEN, _CORE_FRAME_LEN + 1})
+_BUTTON_FRAME_LEN = _CORE_FRAME_LEN + 1
+_FRAME_LENGTHS = frozenset({_CORE_FRAME_LEN, _BUTTON_FRAME_LEN})
 _FRAME_FMT = "<fH"
 
 
@@ -97,17 +101,20 @@ class TriggerFrame:
             (gripper closed).
         raw:      Raw 12-bit ADC reading, for calibration/debug only —
             ignore it in production code.
+        button:   Side push button state (True = pressed), or ``None`` for
+            firmware that does not report a button (6-byte frame).
     """
 
     position: float
     raw: int
+    button: bool | None = None
 
 
 def decode_trigger_payload(data: bytes) -> tuple[float, int] | None:
     """Decode the finite wire values from a 6- or 7-byte trigger payload.
 
-    The optional seventh opaque byte is deliberately ignored: the
-    position/raw core is unchanged. Values are not clamped here so identity
+    Only the position/raw core is decoded; :func:`parse_trigger_frame`
+    adds the optional button byte. Values are not clamped here so identity
     probes can strictly validate the wire range.
     """
     if len(data) not in _FRAME_LENGTHS:
@@ -132,20 +139,27 @@ def parse_trigger_frame(data: bytes) -> TriggerFrame | None:
     if decoded is None:
         return None
     trigger, raw = decoded
-    return TriggerFrame(position=min(max(trigger, 0.0), 1.0), raw=raw)
+    button = bool(data[_CORE_FRAME_LEN]) if len(data) == _BUTTON_FRAME_LEN else None
+    return TriggerFrame(position=min(max(trigger, 0.0), 1.0), raw=raw, button=button)
 
 
-def encode_trigger_frame(position: float, raw: int | None = None) -> bytes:
+def encode_trigger_frame(
+    position: float, raw: int | None = None, button: bool | None = None
+) -> bytes:
     """Encode one trigger-node payload (reference encoder, mirrors firmware).
 
     The inverse of :func:`parse_trigger_frame`; used by tests and as
     executable documentation for the firmware author. ``raw`` defaults to
     a mid-scale-ish ADC count consistent with ``position``, which only
-    matters for debug readouts.
+    matters for debug readouts. ``button=None`` encodes the 6-byte frame
+    of firmware without a side button.
     """
     if raw is None:
         raw = int(round(position * 4095))
-    return struct.pack(_FRAME_FMT, position, raw)
+    payload = struct.pack(_FRAME_FMT, position, raw)
+    if button is not None:
+        payload += bytes([1 if button else 0])
+    return payload
 
 
 def validate_trigger_full_scale(full_scale: float) -> float:
@@ -227,6 +241,7 @@ class TriggerReader:
         self._bus = bus
         self._lock = threading.Lock()
         self._grip: float | None = None
+        self._button: bool | None = None
         self._last_rx: float | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -284,6 +299,13 @@ class TriggerReader:
         frame has ever been received. Check :meth:`is_stale` for freshness."""
         with self._lock:
             return self._grip
+
+    def button(self) -> bool | None:
+        """Latest side-button state (True = pressed), or ``None`` if no
+        frame has been received or the node's firmware has no button. Check
+        :meth:`is_stale` for freshness."""
+        with self._lock:
+            return self._button
 
     def is_stale(self, now: float | None = None) -> bool:
         """True if no frame arrived within :data:`STALE_AFTER_S` (or ever).
@@ -356,4 +378,5 @@ class TriggerReader:
             now = time.monotonic()
             with self._lock:
                 self._grip = grip
+                self._button = frame.button
                 self._last_rx = now
