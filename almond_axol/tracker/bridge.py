@@ -952,6 +952,11 @@ class TrackerBridge:
                 # triple/quadruple gesture.
                 recognizer.update(grips[side], now)
                 recognizer.cancel_sequence()
+            # A button still held (the other rig's, or one held through a
+            # trigger start) belongs to this start. Its release must not
+            # save or discard the take it just opened.
+            for button in self._button.values():
+                button.cancel()
             if self._auto_disengage_pending or self._auto_disengage_waiting_ack:
                 # A freshness-loss disengage is still in flight; its
                 # acknowledgement would wipe any request made now.

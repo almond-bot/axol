@@ -202,6 +202,35 @@ class BridgeSideButtonTest(unittest.TestCase):
         _, opened = self.click(self.left)
         self.assertEqual(opened["state"], VRState.RECORDING.value)
 
+    def test_buttons_held_through_a_start_do_not_end_the_take(self) -> None:
+        self.bridge._handle_tracking_state(True)
+
+        # Both rigs pressed together; the left releases first and starts.
+        self.left.pressed = self.right.pressed = True
+        self.frame()
+        self.frame(0.1)
+        self.left.pressed = False
+        self.assertEqual(self.frame()["state"], VRState.RECORDING.value)
+        self.right.pressed = False
+        late = self.frame()
+        self.assertEqual(late["state"], VRState.RECORDING.value)
+        self.assertIsNone(late["episode_outcome"])
+
+        # A button held through the trigger start gesture, even past the
+        # discard hold time, is ignored once the take is open.
+        self.bridge._state = VRState.DATA_COLLECTION
+        self.right.pressed = True
+        self.frame()
+        self.left.value = self.right.value = 0.0
+        self.frame()
+        self.left.value = self.right.value = 1.0
+        self.assertEqual(self.frame()["state"], VRState.RECORDING.value)
+        held = self.frame(_BUTTON_HOLD_S + 0.1)
+        self.assertEqual(held["state"], VRState.RECORDING.value)
+        self.assertFalse(held["reset"])
+        self.right.pressed = False
+        self.assertEqual(self.frame()["state"], VRState.RECORDING.value)
+
     def test_hold_discards_and_its_release_does_not_restart(self) -> None:
         self.start_take()
         self.left.pressed = True
