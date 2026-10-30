@@ -59,9 +59,13 @@ class ApplyDamiaoZerosTest(unittest.IsolatedAsyncioTestCase):
         self.iface_up = True
         self.prompt_answer = True
         self.prompts: list[str] = []
+        self.buttons: list[str | None] = []
 
-        def prompt(instruction: str, web_prompts: bool) -> bool:
+        def prompt(
+            instruction: str, web_prompts: bool, button: str | None = None
+        ) -> bool:
             self.prompts.append(instruction)
+            self.buttons.append(button)
             return self.prompt_answer
 
         for p in (
@@ -89,6 +93,7 @@ class ApplyDamiaoZerosTest(unittest.IsolatedAsyncioTestCase):
         out = await self._apply()
         self.assertEqual(len(self.prompts), 1)
         self.assertIn("support both arms", self.prompts[0])
+        self.assertEqual(self.buttons, ["Power-cycle Axol"])
         self.assertEqual(
             FakeBoard.instances[0].calls, ["start", "power_cycle", "close"]
         )
@@ -122,6 +127,26 @@ class ApplyDamiaoZerosTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("power cycle failed: The E-Stop is pressed.", out)
         self.assertIn("power-cycle required", out)
         self.assertIn("close", FakeBoard.instances[0].calls)
+
+
+class PromptButtonTest(unittest.TestCase):
+    def test_web_prompt_names_its_button(self) -> None:
+        out = io.StringIO()
+        with (
+            patch.object(set_zero_pos.sys, "stdin", io.StringIO("\n")),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertTrue(
+                set_zero_pos._prompt("Support the arms.", True, "Power-cycle Axol")
+            )
+        self.assertEqual(
+            out.getvalue(), "[prompt] Support the arms. [button: Power-cycle Axol]\n"
+        )
+
+    def test_tty_prompt_says_what_enter_does(self) -> None:
+        with patch("builtins.input", return_value="") as ask:
+            set_zero_pos._prompt("Support the arms.", False, "Power-cycle Axol")
+        self.assertIn("Press Enter to power-cycle Axol", ask.call_args.args[0])
 
 
 class GuidedRunTest(unittest.IsolatedAsyncioTestCase):

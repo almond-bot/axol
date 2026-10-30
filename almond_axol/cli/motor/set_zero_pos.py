@@ -39,6 +39,8 @@ from . import add_side_and_channel_arguments, resolve_channel
 # Marker prefix a --web-prompts step prints before blocking on stdin (same
 # convention as the ROM diagnostics); the dashboard shows a Continue button.
 PROMPT_MARKER = "[prompt]"
+# Appended to a prompt to name its web button: "[prompt] text [button: Label]".
+BUTTON_MARKER = "[button:"
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -164,20 +166,26 @@ _MIN_MOTION_RAD = math.radians(3.0)
 _MAGNITUDE_WARN_RAD = math.radians(20.0)
 
 
-def _prompt(instruction: str, web_prompts: bool) -> bool:
+def _prompt(instruction: str, web_prompts: bool, button: str | None = None) -> bool:
     """Block until the operator confirms a hands-on step.
 
     ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
-    Continue button, then block until it writes a line to our stdin. Otherwise
-    an ordinary tty Enter prompt. Returns ``False`` on Ctrl-C / EOF.
+    button (Continue, or ``button`` when given), then block until it writes a
+    line to our stdin. Otherwise an ordinary tty Enter prompt. Returns
+    ``False`` on Ctrl-C / EOF.
     """
     try:
         if web_prompts:
-            print(f"{PROMPT_MARKER} {instruction}", flush=True)
+            label = f" {BUTTON_MARKER} {button}]" if button else ""
+            print(f"{PROMPT_MARKER} {instruction}{label}", flush=True)
             if sys.stdin.readline() == "":
                 raise EOFError
             return True
-        input(f"  {instruction} — press Enter: ")
+        if button:
+            action = button[0].lower() + button[1:]
+            input(f"  {instruction}\n  Press Enter to {action}, or Ctrl-C to skip: ")
+        else:
+            input(f"  {instruction} — press Enter: ")
         return True
     except (EOFError, KeyboardInterrupt):
         print("\n    skipped.")
@@ -401,9 +409,11 @@ async def _apply_damiao_zeros(motors: list[Motor], web_prompts: bool) -> None:
         return
     try:
         if not _prompt(
-            "support both arms: power to Axol goes off for a few seconds "
-            "to apply the new Damiao zeros",
+            f"Zeroing is done. To apply the new zeros on {names}, Axol's power "
+            "goes off for a few seconds and comes back on. The arms drop while "
+            "power is off, so support both arms first.",
             web_prompts,
+            button="Power-cycle Axol",
         ):
             print(manual)
             return

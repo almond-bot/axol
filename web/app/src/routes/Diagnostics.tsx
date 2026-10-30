@@ -1111,8 +1111,8 @@ export default function Diagnostics() {
           description:
             "Zero each selected joint of one arm against an end stop. Wrist 2 and " +
             "wrist 3 can use either end stop. Each step shows instructions and waits " +
-            "for Continue. On Jelly with a safety board, the last step switches power " +
-            "off and back on so the new wrist zeros take effect.",
+            "for Continue. On Jelly with a safety board, after the last joint it asks you " +
+            "to press Power-cycle Axol so the new wrist zeros take effect.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },

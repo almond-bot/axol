@@ -3,7 +3,7 @@ title: "motor.set-zero-pos"
 description: "Zero a motor's encoder at a joint end stop."
 ---
 
-Sets a motor's zero to its current position and saves it to the motor's flash. Use `--guided` to zero every arm joint in turn. Damiao motors (`wrist_2` and `wrist_3`) apply a new zero only after a power cycle. On a Jelly with a safety board, `--guided` does this for you at the end: support the arms when it asks. Otherwise, power-cycle Axol yourself.
+Sets a motor's zero to its current position and saves it to the motor's flash. Use `--guided` to zero every arm joint in turn. Damiao motors (`wrist_2` and `wrist_3`) apply a new zero only after a power cycle. On a Jelly with a safety board, `--guided` asks after the last joint. Support both arms, then confirm to power-cycle Axol. Otherwise, power-cycle Axol yourself.
 
 <Warning>
   Each joint is zeroed at one of its mechanical **end stops**, not at the rest pose. `--guided` mode walks you to the right end stop. With `--id`, you must hold the joint at the right end stop yourself before you zero it. Axol still reports joint positions with `0` at the rest pose.
