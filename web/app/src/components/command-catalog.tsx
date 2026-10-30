@@ -70,7 +70,9 @@ export function CommandCatalog({
       <div className="flex max-h-[calc(100vh-12rem)] flex-col gap-4 overflow-auto p-3">
         {!connected ? (
           <div className="flex flex-col items-center gap-3 px-2 py-8 text-center">
-            <p className="text-sm text-white/45">Connect to a machine running axol serve.</p>
+            <p className="text-sm text-white/45">
+              Connect to the Host Computer to see its commands.
+            </p>
             <Button variant="outline" size="sm" onClick={onOpenSetup}>
               <Plug />
               Connect

@@ -105,3 +105,9 @@ class TeleopPathsShareTheWaitTest(unittest.TestCase):
         conn.recv = lambda: ("error", "boom")
         with self.assertRaisesRegex(RuntimeError, "Unexpected IK worker handshake"):
             core.wait_for_ik_ready(conn, _Proc())
+
+    def test_rejected_startup_move_names_the_reason(self) -> None:
+        conn = _Conn(polls_until_ready=1)
+        conn.recv = lambda: ("startup_error", "elbow past its limit")
+        with self.assertRaisesRegex(RuntimeError, "elbow past its limit"):
+            core.wait_for_ik_ready(conn, _Proc())

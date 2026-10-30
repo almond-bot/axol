@@ -1,28 +1,32 @@
 ---
 title: "can.driver"
-description: "Ensure a compatible gs_usb kernel driver is selected and loaded."
+description: "Install a gs_usb kernel driver that works with the Axol Hub."
 ---
 
-Builds the `gs_usb` USB-CAN kernel driver from vendored source and installs it for the running kernel. Needed on NVIDIA Jetson / ZED Box machines, whose L4T (tegra) kernels ship without any USB-CAN drivers — the Axol Hub enumerates on USB but no `can*` network interfaces ever appear.
+Builds and installs the `gs_usb` USB CAN kernel driver for the running kernel. You need it on NVIDIA Jetson and ZED Box computers, whose kernels ship without USB CAN drivers. Without it the Axol Hub shows up on USB, but no `can*` network interfaces appear.
 
 ```bash
 axol can.driver
 ```
 
-The command keeps a compatible native driver in place. In particular, Linux 6.13 and newer contain both hub fixes and are left untouched when the selected module advertises every ID needed by the adapters currently plugged in. Maintained 6.2+ distro kernels (including signed Secure Boot builds) that backported endpoint discovery are kept when kmod's imported-symbol metadata proves the capability. A `weak-updates` symlink back to that kernel's in-tree module is recognized as native too. An older or unverifiable driver is replaced conservatively; an attached `16d0:117e` CANable also requires its less-common alias, while an unattached one never causes a replacement.
-
 <Note>
-  [`can.setup`](/cli/can-setup) runs this check automatically, so you normally never need to invoke it directly.
+  [`can.setup`](/cli/can-setup) runs this check for you, so you rarely need to run it yourself.
 </Note>
 
-<Info>
-  The vendored driver is the upstream 5.15 `gs_usb` with two backports the Axol Hub requires — per-channel `dev_id` (to tell the left/right arms apart) and bulk endpoint discovery from the USB descriptor (the Hub firmware uses `EP1 IN`/`EP1 OUT`, while the stock 5.15 driver hardcodes `OUT 2`) — plus robustness fixes for the receive path: RX URBs are re-anchored on resubmit so closing an interface really stops them (in the stock driver their buffers were freed while still in flight, and the next open parsed the first frames from freed memory — a kernel panic on the single-channel wheel/chest adapter), and frames naming a channel the adapter does not have, runt transfers, or frames for a closed channel are dropped instead of dereferencing NULL or detaching the device. See `almond_axol/cli/can/gs_usb/README.md` for the full list. The module is installed under `/lib/modules/$(uname -r)/updates/` and loads automatically on boot. Requires kernel headers and `build-essential`; both ship with JetPack.
-</Info>
+## What it does
 
-<Note>
-  The installed backport is built for the exact running kernel release. A normal reboot into that same kernel needs no action. After a JetPack/L4T or other kernel update changes `uname -r`, run `axol can.driver` (or `axol can.setup`, which calls it) once under the new kernel to rebuild and install the matching module.
-</Note>
+- If the kernel's own driver supports every adapter that is plugged in, it keeps that driver. Linux 6.13 and newer, and many maintained 6.2+ distribution kernels, fall in this group.
+- Otherwise it builds Almond's driver from source and installs it under `/lib/modules/$(uname -r)/updates/`. The driver then loads on every boot.
+- If the install or load fails, it restores the previous driver.
 
-<Note>
-  On a signature-enforcing/Secure Boot host, an unsigned backport is rejected before the active module is changed. Sign it with an enrolled key or use a compatible native kernel. A previously installed, trusted and signed Almond backport from before version markers were added is retained only when its selected/loaded source identity, install path, and complete Almond USB-ID fingerprint all match; arbitrary external modules are not trusted by location alone. If installation or loading fails after a change begins, the previous module and load configuration are restored.
-</Note>
+Almond's driver is the Linux 5.15 `gs_usb` driver with the fixes the Axol Hub needs: it tells the left and right arm channels apart, finds the hub's USB endpoints, and fixes receive-path crashes. See `almond_axol/cli/can/gs_usb/README.md` for the full list.
+
+Building needs the kernel headers and `build-essential`. Both ship with JetPack.
+
+## After a kernel update
+
+The driver is built for the exact running kernel. Rebooting into the same kernel needs no action. After a JetPack or other kernel update changes `uname -r`, run `axol can.driver` or `axol can.setup` once under the new kernel to rebuild it.
+
+## Secure Boot
+
+On a computer that enforces module signatures, `can.driver` refuses to install an unsigned driver and leaves the current one in place. Sign the module with an enrolled key, or use a newer kernel whose built-in driver supports your adapters.

@@ -1,18 +1,20 @@
 ---
 title: "lift.goto"
-description: "Move the telescoping lift to a target height."
+description: "Move Jelly's telescoping lift to a target height."
 ---
 
-Moves Jelly's telescoping lift to a target height, given as percent of its homed travel. The default target of **75%** is the **robot install height** — high enough to slide the robot comfortably onto its Jelly mount.
+Moves Jelly's telescoping lift to a height, given as a percentage of its homed travel. The default, **75%**, is the install height: high enough to slide Axol onto its Jelly mount.
 
 ```bash
-axol lift.goto                  # 75% — the install height
+axol lift.goto                  # 75%, the install height
 axol lift.goto --percent 30
 axol lift.goto --percent 100 --speed 300
 ```
 
-The lift controller decelerates into the target and keeps both legs level. The command watches progress and reports the final height; Ctrl-C (or **Stop** in the control panel) halts the move immediately, otherwise it runs to completion on its own. `--speed` caps the move in encoder counts/s (~650 is full speed).
+The lift slows down as it reaches the target and keeps both legs level. The command reports the final height when the move ends. Press Ctrl-C, or **Stop** in the control panel, to stop the move right away.
+
+`--speed` limits the speed in encoder counts/s. Full speed is about 650.
 
 <Note>
-  Requires a **homed** lift — run [`lift.home`](/cli/lift-home) once first (the calibration persists in the lift board's flash). Also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Raise lift (install height)**.
+  The lift must be homed. Run [`lift.home`](/cli/lift-home) once first. The lift board keeps its calibration across power cycles. You can also run this command from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Raise lift (install height)**.
 </Note>

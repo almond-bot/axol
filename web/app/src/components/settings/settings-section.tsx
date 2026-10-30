@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   ChevronDown,
   Download,
@@ -12,11 +12,15 @@ import {
 } from "lucide-react"
 import {
   HARDWARE_PROFILE_SETTING,
+  cameraSerials,
   flattenFields,
   setQuestProximityDisabled,
   settingShown,
+  parseAxolMount,
+  parseGripper,
   visibleAdvancedSections,
   type AdvancedSection,
+  type AxolModel,
   type CameraDevice,
   type CameraSlot,
   type CameraSpec,
@@ -41,6 +45,7 @@ import { Card } from "@/components/ui/card"
 import { FieldRow, FlatSchemaForm } from "@/components/config-form"
 import { materializeCameraSpec, type CameraProfileBySlot } from "@/lib/camera-spec"
 import { buildSettingsFile, parseSettingsFile } from "@/lib/settings-file"
+import { applySavedSettingValues, diffSettingValues } from "@/lib/settings-patch"
 import {
   AXOL_CATEGORY_KEYS,
   JELLY_ADVANCED_SECTION,
@@ -54,6 +59,8 @@ import {
 } from "@/lib/settings-scope"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
+import { MountPicker } from "./mount-picker"
+import { rebaseValues } from "@/lib/settings-rebase"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
@@ -61,13 +68,17 @@ import { cn } from "@/lib/utils"
 // render on the Mantis tabs instead.
 const MANTIS_SOURCE_KEYS = ["mantis.source", "mantis.quest_tracker_key"]
 const MANTIS_CHANNEL_KEYS = ["mantis.left_channel", "mantis.right_channel"]
+const MANTIS_TRIGGER_KEYS = ["mantis.left_trigger_full_scale", "mantis.right_trigger_full_scale"]
 // Keys the card never edits: the device selection has its own switch above.
 const EXTERNALLY_MANAGED_KEYS = new Set([HARDWARE_PROFILE_SETTING])
 
 interface Draft {
   /** Every staged value by canonical key — curated tabs and Advanced alike. */
   values: Record<string, SettingValue>
+  /** Values that were stored when this draft began. */
+  baseValues: Record<string, SettingValue>
   cameras: CameraSpec
+  baseCameras: CameraSpec
   /** Layout whose controls most recently changed each shared logical slot. */
   cameraProfiles: CameraProfileBySlot
 }
@@ -75,10 +86,7 @@ interface Draft {
 const CAMERA_SLOTS: CameraSlot[] = ["overhead", "left_arm", "right_arm"]
 
 function assignedSerial(spec: CameraSpec, profile: HardwareProfile, slot: CameraSlot): string {
-  if (profile === "mantis" && slot !== "overhead") {
-    return spec.mantis_serials?.[slot] ?? spec.serials[slot]
-  }
-  return spec.serials[slot]
+  return cameraSerials(spec, profile === "mantis")[slot]
 }
 
 /** Attribute only the logical slots an edit actually touched to its layout. */
@@ -90,22 +98,19 @@ function cameraProfilesAfterEdit(
 ): CameraProfileBySlot {
   const next = { ...current }
   for (const slot of CAMERA_SLOTS) {
-    // Mantis has no overhead assignment/control; an imported overhead change
-    // always belongs to the Axol layout even when imported from that tab.
-    const slotProfile = slot === "overhead" ? "axol" : profile
     const assignmentChanged =
-      assignedSerial(before, slotProfile, slot) !== assignedSerial(after, slotProfile, slot)
+      assignedSerial(before, profile, slot) !== assignedSerial(after, profile, slot)
     const streamChanged = before.stream?.[slot] !== after.stream?.[slot]
     const recordChanged = before.record?.[slot] !== after.record?.[slot]
-    if (assignmentChanged || streamChanged || recordChanged) next[slot] = slotProfile
+    if (assignmentChanged || streamChanged || recordChanged) next[slot] = profile
   }
   return next
 }
 
 /**
- * The shared settings, directly on the control panel page, split by device:
+ * The shared settings on the control panel's Settings page, split by device:
  * **Axol** (cameras, arm behaviour, teleop & VR, rest pose, kinematics),
- * **Mantis** (tracking source and setup, wrist cameras, CAN), and
+ * **Mantis** (tracking source and setup, trigger calibration, head and wrist cameras, CAN), and
  * **General** (Quest, recording, inference, system, Advanced). Each
  * connection tile opens its own scope. Values persist on the serve host
  * (~/.almond/settings.json) and are folded into every operation start, so
@@ -130,9 +135,17 @@ export function SettingsSection({
   actionBlocker,
   activeCommandSession,
   onCommandSessionChange,
+  axolConnected = false,
+  embedded = false,
+  onDirtyChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Rendered as the body of the Settings page: no collapsible header or
+   *  scope switcher (the page owns those), and nothing while closed. */
+  embedded?: boolean
+  /** Reports whether staged edits are waiting for Save. */
+  onDirtyChange?: (dirty: boolean) => void
   tab: SettingsTab
   onTabChange: (tab: SettingsTab) => void
   /** Server-stored settings + schema; null while loading or on an old host. */
@@ -153,18 +166,26 @@ export function SettingsSection({
   /** Active generic setup/diagnostic session, if any. */
   activeCommandSession: SessionInfo | null
   onCommandSessionChange: (session: SessionInfo | null) => void
+  /** An Axol is connected: its robot model can be picked. */
+  axolConnected?: boolean
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
   const [saving, setSaving] = useState(false)
   const [seedKey, setSeedKey] = useState("")
+  // The stored values the draft was seeded from: what "untouched" means when
+  // the host's values change under a staged draft.
+  const [seedValues, setSeedValues] = useState<Record<string, SettingValue>>({})
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
-    () => (draft ? computePatch(snapshot, cameras, draft, devices) : null),
-    [draft, snapshot, cameras, devices]
+    () => (draft ? computePatch(cameras, draft, devices) : null),
+    [draft, cameras, devices]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
+  useEffect(() => {
+    onDirtyChange?.(dirty)
+  }, [dirty, onDirtyChange])
 
   // Seed / reseed the draft from the stored state ("adjust state when props
   // change" — set during render, not in an effect). Do not seed while the
@@ -173,25 +194,48 @@ export function SettingsSection({
   // which makes `dirty` true and prevents the response from ever reaching the
   // form. On an old host, `supportError` resolves the request and enables the
   // camera-only fallback draft.
-  const seedDraft = (): Draft => ({
-    values: { ...(snapshot?.values ?? {}) },
-    cameras,
-    cameraProfiles: {},
-  })
+  const seedDraft = (): Draft => {
+    const values = { ...(snapshot?.values ?? {}) }
+    return { values, baseValues: { ...values }, cameras, baseCameras: cameras, cameraProfiles: {} }
+  }
   const settingsResolved = snapshot !== null || supportError !== null
   const nextSeedKey = settingsResolved ? JSON.stringify([snapshot?.values, cameras]) : null
-  if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
-    setSeedKey(nextSeedKey)
-    setDraft(seedDraft())
+  if (nextSeedKey !== null && nextSeedKey !== seedKey) {
+    if (draft == null || !dirty) {
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot?.values ?? {})
+      setDraft(seedDraft())
+    } else if (snapshot) {
+      // Saved elsewhere while edits are staged (the main page's robot-model
+      // pick, another client): keys the operator has not touched follow the
+      // host; staged edits stay.
+      setSeedKey(nextSeedKey)
+      setSeedValues(snapshot.values)
+      setDraft({
+        ...draft,
+        values: rebaseValues(draft.values, seedValues, snapshot.values),
+      })
+    }
   }
 
   const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
 
   async function save() {
-    if (!patch) return
+    if (!patch || !draft) return
+    const submitted = patch
+    const submittedCameras = draft.cameras
     setSaving(true)
     try {
-      await onSave(patch)
+      await onSave(submitted)
+      setDraft((d) =>
+        d
+          ? {
+              ...d,
+              baseValues: applySavedSettingValues(d.baseValues, submitted.values ?? {}),
+              baseCameras: submitted.camerasSet ? submittedCameras : d.baseCameras,
+            }
+          : d
+      )
     } catch (e) {
       toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
@@ -202,6 +246,7 @@ export function SettingsSection({
   function discard() {
     if (nextSeedKey === null) return
     setSeedKey(nextSeedKey)
+    setSeedValues(snapshot?.values ?? {})
     setDraft(seedDraft())
   }
 
@@ -226,6 +271,14 @@ export function SettingsSection({
     setValue(key, value)
     try {
       await onSave({ values: { [key]: value } })
+      setDraft((d) =>
+        d
+          ? {
+              ...d,
+              baseValues: applySavedSettingValues(d.baseValues, { [key]: value }),
+            }
+          : d
+      )
     } catch (e) {
       setValue(key, prior === undefined ? null : prior)
       toast.error(String(e).replace(/^Error:\s*/, ""))
@@ -263,6 +316,7 @@ export function SettingsSection({
           if (d.values[key] !== undefined) values[key] = d.values[key]
         }
         return {
+          ...d,
           values,
           cameras: importedCameras,
           cameraProfiles: cameraProfilesAfterEdit(
@@ -274,7 +328,7 @@ export function SettingsSection({
         }
       })
     } catch (e) {
-      toast.error(`Import failed: ${e}`)
+      toast.error(`Couldn't import settings: ${String(e).replace(/^Error:\s*/, "")}`)
     }
   }
 
@@ -285,7 +339,7 @@ export function SettingsSection({
 
   // Tabs within the active scope. Axol: hardware first (cameras), then arm
   // behaviour categories with the pose editor after Teleop & VR. Mantis: the
-  // tracking flow, wrist cameras, CAN. Jelly: the wheels / lift switches and
+  // tracking flow, trigger calibration, cameras, CAN. Jelly: the wheels / lift switches and
   // the drive parameters. General: Quest, the remaining categories, and
   // Advanced.
   const tabs: { key: SettingsTab; label: string }[] = []
@@ -299,6 +353,7 @@ export function SettingsSection({
   } else if (scope === "mantis") {
     tabs.push(
       { key: "mantis-tracking", label: "Tracking" },
+      { key: "mantis-triggers", label: "Triggers" },
       { key: "mantis-cameras", label: "Cameras" },
       { key: "mantis-can", label: "CAN" }
     )
@@ -339,6 +394,8 @@ export function SettingsSection({
   )
   const mantisChannelFields =
     teleopCategory?.settings.filter((s) => MANTIS_CHANNEL_KEYS.includes(s.key)) ?? []
+  const mantisTriggerFields =
+    teleopCategory?.settings.filter((s) => MANTIS_TRIGGER_KEYS.includes(s.key)) ?? []
   const defaultMantisSource = String(mantisSourceField?.default ?? "lighthouse")
   const draftMantisSource = String(draft?.values["mantis.source"] ?? defaultMantisSource)
   const storedMantisSource = String(snapshot?.values["mantis.source"] ?? defaultMantisSource)
@@ -349,12 +406,15 @@ export function SettingsSection({
     mantisSourceSaved &&
     (draftMantisSource !== "quest" || draftQuestTrackerKey === storedQuestTrackerKey)
 
+  if (embedded && !open) return null
+
   return (
     <Card className="gap-0 p-0">
       <div
         className={cn(
           "flex w-full items-center gap-3 px-5 py-3.5",
-          open && "border-b border-white/10"
+          open && "border-b border-white/10",
+          embedded && "hidden"
         )}
       >
         <button
@@ -367,7 +427,7 @@ export function SettingsSection({
             {scopeMeta.title}
           </span>
           <span className="hidden truncate text-xs text-white/35 md:block">
-            shared by all operations on this robot
+            Shared by all operations on this robot
           </span>
         </button>
         <div
@@ -481,15 +541,41 @@ export function SettingsSection({
                   onHostSessionChange={onCommandSessionChange}
                 />
               </div>
+            ) : tab === "mantis-triggers" ? (
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-1.5">
+                  <Label>Full squeeze calibration</Label>
+                  <p className="max-w-prose text-xs leading-relaxed text-white/40">
+                    A fully pressed trigger should close the gripper. If a trigger&apos;s reading
+                    peaks below 1.00, enter its peak here (for example, 0.90). These values apply to
+                    Mantis teleop and to Lighthouse and Ultimate data collection.
+                  </p>
+                </div>
+                {mantisTriggerFields.length > 0 ? (
+                  <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+                    {mantisTriggerFields.map((field) => (
+                      <SettingRow
+                        key={field.key}
+                        field={field}
+                        value={draft.values[field.key]}
+                        onChange={setValue}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-white/40">
+                    Update Axol on the Host Computer to edit trigger calibration.
+                  </p>
+                )}
+              </div>
             ) : tab === "mantis-can" ? (
               <div className="flex flex-col gap-4">
                 <div className="flex flex-col gap-1.5">
-                  <Label>Logical left/right CAN mapping</Label>
+                  <Label>Left and right CAN channels</Label>
                   <p className="max-w-prose text-xs leading-relaxed text-white/40">
-                    Defaults are <span className="font-mono">can_mantis_l</span> and{" "}
-                    <span className="font-mono">can_mantis_r</span>. Swap the two interface values
-                    to swap logical left and right without moving cables; each side&apos;s trigger
-                    reader follows the same channel.
+                    The defaults are <span className="font-mono">can_mantis_l</span> and{" "}
+                    <span className="font-mono">can_mantis_r</span>. To swap left and right without
+                    moving cables, swap the two values. The triggers swap with them.
                   </p>
                 </div>
                 {mantisChannelFields.length > 0 ? (
@@ -505,14 +591,20 @@ export function SettingsSection({
                   </div>
                 ) : (
                   <p className="text-sm text-white/40">
-                    This host does not expose a Mantis CAN mapping; update it to edit the channels.
+                    Update Axol on the Host Computer to edit the CAN channels.
                   </p>
                 )}
               </div>
             ) : tab === "usb" ? (
               <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
             ) : tab === "pose" ? (
-              <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
+              <PosePanel
+                fields={poseFields}
+                values={draft.values}
+                onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
+                gripper={parseGripper(snapshot?.values["axol.gripper"])}
+              />
             ) : tab === "advanced" ? (
               <AdvancedPanel
                 sections={generalAdvancedSections}
@@ -524,9 +616,8 @@ export function SettingsSection({
               jellyParameters ? (
                 <div className="flex flex-col gap-4">
                   <p className="text-xs text-white/45">
-                    How the wheels and lift respond to the sticks: peak speed, rotation weight,
-                    slew, axis snap, the heading hold, and the parked hold. One value here applies
-                    to <span className="text-white/65">every operation</span> that drives Jelly.
+                    How the wheels and lift respond to the sticks. These values apply to{" "}
+                    <span className="text-white/65">every operation</span> that drives Jelly.
                   </p>
                   <FlatSchemaForm
                     nodes={jellyParameters.nodes}
@@ -538,13 +629,12 @@ export function SettingsSection({
                 </div>
               ) : (
                 <p className="text-sm text-white/40">
-                  This host does not expose Jelly&apos;s parameters; update it to edit them here.
+                  Update Axol on the Host Computer to edit Jelly&apos;s parameters.
                 </p>
               )
             ) : tab === "jelly" && !activeCategory ? (
               <p className="text-sm text-white/40">
-                This host does not expose the Jelly wheels / lift switches; update it to edit them
-                here.
+                Update Axol on the Host Computer to edit the wheel and lift switches.
               </p>
             ) : activeCategory ? (
               <CategoryPanel
@@ -552,9 +642,11 @@ export function SettingsSection({
                 schema={schema}
                 values={draft.values}
                 onChange={setValue}
+                robotModel={snapshot?.robotModel ?? "classic"}
+                axolConnected={axolConnected}
                 excludeKeys={
                   activeCategory.key === "teleop"
-                    ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS]
+                    ? [...MANTIS_SOURCE_KEYS, ...MANTIS_CHANNEL_KEYS, ...MANTIS_TRIGGER_KEYS]
                     : [...EXTERNALLY_MANAGED_KEYS]
                 }
               />
@@ -608,7 +700,6 @@ export function SettingsSection({
 
 /** Diff the draft against what's stored, producing the minimal PUT payload. */
 function computePatch(
-  snapshot: SettingsSnapshot | null,
   storedCameras: CameraSpec,
   draft: Draft,
   devices: CameraDevice[] | null
@@ -617,23 +708,14 @@ function computePatch(
 
   // The device selection saves through its own switch, possibly while this
   // draft is dirty; it must never be written (or reset) from here.
-  const before = snapshot?.values ?? {}
-  const valuesPatch: Record<string, SettingValue | null> = {}
-  for (const [k, v] of Object.entries(draft.values)) {
-    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
-    if (JSON.stringify(before[k]) !== JSON.stringify(v)) valuesPatch[k] = v
-  }
-  for (const k of Object.keys(before)) {
-    if (EXTERNALLY_MANAGED_KEYS.has(k)) continue
-    if (!(k in draft.values)) valuesPatch[k] = null
-  }
+  const valuesPatch = diffSettingValues(draft.baseValues, draft.values, EXTERNALLY_MANAGED_KEYS)
   if (Object.keys(valuesPatch).length > 0) patch.values = valuesPatch
 
   // Only materialize after an actual camera edit, and use the layout whose
   // controls produced each slot edit. The operation selected elsewhere is
   // unrelated, and untouched explicit values may encode stereo eyes for the
   // other hardware profile, so they must never be normalized opportunistically.
-  if (JSON.stringify(draft.cameras) !== JSON.stringify(storedCameras)) {
+  if (JSON.stringify(draft.cameras) !== JSON.stringify(draft.baseCameras)) {
     const camerasOut = materializeCameraSpec(draft.cameras, devices, draft.cameraProfiles)
     if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
       patch.cameras = camerasOut
@@ -647,11 +729,11 @@ function computePatch(
 function UpdateRequired({ error }: { error: string }) {
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
-      <span className="font-medium text-amber-300/90">Serve host update required</span>
+      <span className="font-medium text-amber-300/90">Update required</span>
       <p className="text-white/55">
-        This Axol host doesn&apos;t support shared settings yet — update it from the banner on the
-        control panel (or run <span className="font-mono">axol update</span>), then reconnect.
-        Cameras still work in the meantime.
+        Update Axol on the Host Computer to edit these settings. Use the update banner on the
+        control panel or run <span className="font-mono">axol update</span>, then reconnect. Camera
+        settings work without the update.
       </p>
       <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">{error}</code>
     </div>
@@ -679,8 +761,8 @@ function UsbPanel({
       await setQuestProximityDisabled(disabled)
       toast.success(
         disabled
-          ? "Proximity sensor disabled — the headset stays awake until it reboots."
-          : "Proximity sensor restored."
+          ? "Proximity sensor off. The headset stays awake until it restarts."
+          : "Proximity sensor on."
       )
     } catch (e) {
       toast.error(String(e))
@@ -701,7 +783,7 @@ function UsbPanel({
           ? "bg-white/30"
           : "bg-amber-400"
   const label = !usb
-    ? "—"
+    ? "Checking…"
     : !usb.installed
       ? "adb not installed"
       : usb.ready
@@ -715,24 +797,23 @@ function UsbPanel({
               : usb.state
   // Per-state hint, mirroring the help line every other settings field has.
   const hint = !usb
-    ? "Waiting for the host to report the USB link state."
+    ? "Checking for a headset on USB."
     : !usb.installed
-      ? "Install adb on the host, then reconnect the headset."
+      ? "Install adb on the Host Computer, then reconnect the headset."
       : usb.ready
-        ? "Controller poses stream over the cable; a dropped cable fails over to Wi-Fi instantly."
+        ? "Controller poses stream over the cable. If the cable drops, they switch to Wi-Fi."
         : usb.state === "device"
-          ? "Headset detected — the tunnel connects automatically; use Connect to retry."
+          ? "Headset found and connecting. Press Connect to retry."
           : usb.state === "none"
-            ? "Plug the Quest into the Axol host with a USB-C cable."
+            ? "Plug the Quest into the Host Computer with a USB-C cable."
             : usb.state === "unauthorized"
               ? "Put the headset on and accept the “Allow USB debugging?” prompt."
               : "Reconnect the headset's USB cable."
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Stream controller poses over a USB cable instead of Wi-Fi for lower latency. The link is set
-        up automatically when an authorized headset is plugged into the host; camera video keeps
-        using the LAN.
+        Stream controller poses over USB instead of Wi-Fi for lower latency. The link starts when
+        you plug an authorized headset into the Host Computer. Camera video still uses the network.
       </p>
       <div className="flex max-w-xl flex-col gap-1.5">
         <div className="flex items-center justify-between gap-4">
@@ -754,14 +835,13 @@ function UsbPanel({
       </div>
       <div className="flex max-w-xl flex-col gap-1.5">
         <div className="flex items-center justify-between gap-4">
-          <Label>Keep awake (headless)</Label>
+          <Label>Keep headset awake</Label>
           <div className="flex items-center gap-2">
             <Button
               variant="outline"
               size="sm"
               onClick={() => setProximity(true)}
               disabled={!proxReady || proxBusy != null}
-              title="Disable the proximity sensor (adb) so the headset stays awake with nobody wearing it."
             >
               {proxBusy === "off" ? <Loader2 className="animate-spin" /> : <EyeOff />}
               Keep awake
@@ -771,17 +851,16 @@ function UsbPanel({
               size="sm"
               onClick={() => setProximity(false)}
               disabled={!proxReady || proxBusy != null}
-              title="Restore normal proximity-sensor behavior (the headset sleeps when taken off)."
             >
               {proxBusy === "on" ? <Loader2 className="animate-spin" /> : <Eye />}
-              Restore
+              Allow sleep
             </Button>
           </div>
         </div>
         <p className="max-w-prose text-xs text-white/35">
-          Disables the headset's proximity sensor so it keeps running when set down — for sessions
-          driven from this panel with nobody wearing it. Resets when the headset reboots; battery
-          drains at full rate, so keep it charging. Needs the headset plugged in and authorized.
+          Turns off the headset&apos;s proximity sensor so it stays awake when nobody is wearing it.
+          The headset must be plugged in and authorized. The setting resets when the headset
+          restarts. The battery drains fast, so keep it charging.
         </p>
       </div>
     </div>
@@ -795,6 +874,8 @@ function CategoryPanel({
   values,
   onChange,
   excludeKeys = [],
+  robotModel = "classic",
+  axolConnected = false,
 }: {
   category: SettingsCategory
   /** Every category, to resolve the defaults `showWhen` gates read. */
@@ -802,16 +883,32 @@ function CategoryPanel({
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
   excludeKeys?: string[]
+  /** What the host runs now, for the robot-model picker. */
+  robotModel?: AxolModel
+  /** An Axol is connected: the robot-model picker is unlocked. */
+  axolConnected?: boolean
 }) {
-  const fields = category.settings.filter(
+  const shown = category.settings.filter(
     (s) =>
       s.ui.widget !== "pose" &&
       !excludeKeys.includes(s.key) &&
       settingShown(s.ui.showWhen, values, schema)
   )
+  // The robot-model picker gets the full width, above the other controls.
+  const mountFields = shown.filter((s) => s.ui.widget === "mount")
+  const fields = shown.filter((s) => s.ui.widget !== "mount")
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>
+      {mountFields.map((f) => (
+        <MountPicker
+          key={f.key}
+          mount={parseAxolMount(values[f.key] ?? f.default)}
+          robotModel={robotModel}
+          locked={!axolConnected}
+          onSelect={(mount) => onChange(f.key, mount)}
+        />
+      ))}
       <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
         {fields.map((f) => (
           <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />
@@ -956,7 +1053,8 @@ function SettingRow({
   }
 
   const text = set ? String(value) : ""
-  const placeholder = field.default != null ? String(field.default) : (field.defaultText ?? "unset")
+  const placeholder =
+    field.default != null ? String(field.default) : (field.defaultText ?? "Not set")
   return (
     <div className="flex flex-col gap-1.5">
       {labelNode}
@@ -1022,13 +1120,13 @@ function AdvancedPanel({
   const editedCount = Object.keys(overrides).length
 
   if (sections.length === 0) {
-    return <p className="text-sm text-white/40">No advanced settings available on this host.</p>
+    return <p className="text-sm text-white/40">No advanced settings available.</p>
   }
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Everything not covered by the other tabs. One value set here applies to{" "}
-        <span className="text-white/65">every operation</span> that uses the subsystem.
+        Settings not covered by the other tabs. Each value applies to{" "}
+        <span className="text-white/65">every operation</span> that uses it.
       </p>
       <div className="flex flex-wrap items-center gap-3">
         <div className="relative min-w-48 flex-1">
@@ -1036,7 +1134,7 @@ function AdvancedPanel({
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search all config…"
+            placeholder="Search advanced settings…"
             className="pl-9"
           />
         </div>
@@ -1049,7 +1147,7 @@ function AdvancedPanel({
       {matches ? (
         <div className="flex max-w-xl flex-col gap-4">
           {matches.length === 0 ? (
-            <p className="text-sm text-white/35">No matching config.</p>
+            <p className="text-sm text-white/35">No matching settings.</p>
           ) : (
             matches.map((f) => <FieldRow key={f.key} field={f} showPath {...common} />)
           )}

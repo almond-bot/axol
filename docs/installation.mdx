@@ -1,68 +1,75 @@
 ---
 title: "Installation"
-description: "Install Axol on the robot machine with one command, then open the web control panel."
+description: "Install the Axol software on the Host Computer with one command, then open the control panel."
 ---
 
-Axol installs with a single command on the machine wired to the robot (typically a ZED Box / NVIDIA Jetson). It sets up the `axol` CLI and starts the web control panel as a background service — so once it finishes you can drive the robot from a browser, no terminal needed.
+Install the Axol software with one command on the computer connected to Axol. This is usually the Jetson in your Compute Kit. The command installs the `axol` command line and starts the web control panel in the background. When it finishes, you can drive Axol from a browser.
 
 <Note>
-  Working on Axol itself, or running without the install script? See [Development install](/advanced/development-install) in the Advanced section for the clone + `uv sync` path.
+  To work on the Axol software itself, see [Development install](/advanced/development-install).
 </Note>
 
 ## Requirements
 
-- **Axol set up** (if you are installing for an Axol): mounted, powered, and wired to the compute. See [Hardware Setup](/hardware-setup) for your mount.
-- **Linux** with **systemd** (the installer registers a service).
-- **(Optional) NVIDIA Jetson** — a ZED Box Orin NX 16GB, an AGX Orin (32GB / 64GB / Industrial), or a Thor T5000 — required for the GMSL-attached ZED cameras used in data collection and policy inference. The installer runs on any Linux host; the Jetson-specific tuning steps simply no-op elsewhere. On the Advantech MIC-742 Thor, first flash Advantech's image and install its camera driver: see [Advantech Thor (MIC-742)](/hardware-setup/thor).
+- **Axol set up**: mounted, powered and connected to the computer. See [Hardware Setup](/hardware-setup).
+- **Linux** with **systemd**.
+- **An NVIDIA Jetson**, if you use the ZED cameras for data collection or policies. Supported models are the ZED Box Orin NX 16GB, the AGX Orin (32GB, 64GB or Industrial) and the Thor T5000. On other Linux computers the installer skips the Jetson-only steps.
 
-## ZED Box login
+On the Advantech MIC-742 Thor, first install Advantech's image and camera driver. See [Advantech Thor (MIC-742)](/hardware-setup/thor).
 
-If you're setting up a ZED Box from Almond, log in with the default credentials.
+## Default login
 
-| Field | Value |
-|---|---|
-| Username | `user` |
-| Password | `admin` |
+Log in with these default credentials:
+
+| Computer | Username | Password |
+|---|---|---|
+| ZED Box Orin NX 16GB (from Almond) | `user` | `admin` |
+| Advantech Thor (MIC-742) | `mic-742` | `mic-742` |
 
 <Warning>
-  Change the default password after first login if the machine is reachable by anyone else.
+  If other people can reach this computer on the network, change the password after you first log in.
 </Warning>
 
 ## Install
 
-Run this on the robot machine:
+Run this on the Host Computer:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
+The command:
+
+- Installs [`uv`](https://docs.astral.sh/uv/) if it is missing.
+- Installs the latest release of the `axol` command line, with Python 3.13 included.
+- Installs the camera streaming software, `adb` for the [Quest-over-USB](/guides/quest-over-usb) link, and Lighthouse tracking for [Mantis](/mantis/tracking) (see [`axol provision`](/cli/provision)). Steps that need the ZED SDK are skipped when it is not installed.
+- On a **ZED Box** (Duo or Mini), upgrades an outdated GMSL camera driver (see [`zed.driver`](/cli/zed-driver)). If it upgrades the driver, the computer **restarts** at the end of the install and your SSH session closes. Reconnect after a minute or two.
+- On a Jetson, tunes the system for real-time robot control (see [`jetson.setup`](/cli/jetson-setup)). The tuning is applied again at every boot.
+- Starts the control panel as a service named `axol`, which starts at boot and restarts if it stops (see [`axol serve`](/cli/serve)).
+
+If an optional step fails, such as Lighthouse tracking, the install finishes with a warning that names it. Axol works without it. Fix the problem and run the install command again to add it. If a required step fails, the install stops with an error. The control panel then shows the failed step, and you can press **Update** to install a fixed release.
+
 <Warning>
-  On aarch64/Jetson, the pinned PyPI `torch==2.10.0` wheel is CPU-only. Teleoperation, recording, and remote policy inference remain available, but local `run-policy` / `collect-dagger` CUDA inference requires an explicitly managed, JetPack-compatible Torch + Torchvision build (or use `--device cpu`). Reinstalling or updating replaces the environment, so re-apply such a custom build afterwards. Use remote inference until that platform-specific build is managed separately.
+  On a Jetson, the installer sets up PyTorch without GPU support. Teleoperation, recording and remote policy inference all work. To run a policy on the Jetson's GPU with `run-policy` or `collect-dagger`, you must install a PyTorch and Torchvision build for your JetPack version yourself. Each update replaces it, so install it again after updating. Until then, use remote inference, or run on the CPU with `--device cpu`.
 </Warning>
 
-This one command:
+When the install finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the computer. See [First connection](#first-connection) below. From then on, you can do everything in the browser.
 
-- Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already present.
-- Installs the `axol` CLI from PyPI, pinned to the **latest release** (Python 3.13 bundled), with the `lerobot`, `sim`, and `tracker` extras. The reverse-engineered pyvut runtime remains a separate explicit VIVE Ultimate setup step.
-- Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
-- Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
-- On a factory-flashed **ZED Box** (Duo or Mini), upgrades an outdated GMSL camera driver to the release pinned for the ZED SDK ([`zed.driver`](/cli/zed-driver), also via [`axol provision`](/cli/provision)). The new driver only loads at boot, so when it upgrades, the installer **reboots the host** as its last step, which ends the SSH session. Reconnect in a minute or two. A no-op on any other machine.
-- On a Jetson (Orin NX, AGX Orin, Thor), applies the real-time tuning ([`jetson.setup`](/cli/jetson-setup)) as the last [`provision`](/cli/provision) step — power mode, clocks, CAN interrupt, camera daemon — and the systemd unit re-applies it at every boot.
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root. The recording commands also hand each dataset back to that user after every episode save, so you never need `sudo` to read, copy, or upload your own recordings. The installer also puts a default ACL on that folder, so anything the root service creates there, calibration files included, stays read/write for that user. The service is written before provisioning runs, so it still starts if a provisioning step fails. If only optional steps fail (Lighthouse tracking, the patched camera plugins, ...), the installer finishes with a warning naming them; Axol works without them, and re-running the installer once the host is fixed adds them. If the required realtime core fails, the installer exits with an error; the control panel then shows the failing step and can apply a fixed release through **Update**.
+### Where recordings are saved
 
-When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — see the [Web Control Panel guide](/guides/control-panel). From then on, everything happens in the browser.
+Recorded datasets are saved under `~/.cache/huggingface/lerobot` in the home folder of the user who ran the install. The control panel and the command line use the same folder, so you see the same recordings from both. You can change the folder with the control panel's **Dataset root** setting.
 
-<Note>
-  The service runs as root, so privileged steps (CAN bring-up, ZED daemon restarts) need no `sudo` password.
-</Note>
-
-<Note>
-  Both the hosted panel and direct CLI runs store datasets under `~/.cache/huggingface/lerobot` (or the panel's **Dataset root** setting), so recordings made from either are visible in both.
-</Note>
+The service runs as root, but everything it writes in that folder stays readable and writable by your user. You don't need `sudo` to read, copy or upload your recordings. Steps that need root, like starting the CAN bus, run without asking for a password.
 
 ### Staying up to date
 
-Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release.
+Axol updates to each new [release on GitHub](https://github.com/almond-bot/axol/releases). When a new release is out, the control panel shows a banner with your version and the latest one.
+
+- Press **Update** to install it. Axol installs the new release and restarts once no operation is running.
+- Axol never updates until you press **Update**.
+- Running the install command again also updates to the latest release.
+
+To see the service logs or restart the service, run:
 
 ```bash
 journalctl -u axol -f        # follow the service logs
@@ -71,9 +78,11 @@ systemctl restart axol       # restart manually
 
 ## First connection
 
-Open [axol.almond.bot](https://axol.almond.bot) on any machine on the same network and enter the robot machine's IP address. The very first time, your browser will warn about the self-signed certificate — accept it once (the certificate is shared between the control panel and the VR teleop link). See the [Web Control Panel guide](/guides/control-panel) for the full connect flow.
+1. On any computer on the same network, open [axol.almond.bot](https://axol.almond.bot).
+2. Enter the IP address of the Host Computer.
+3. The first time, your browser warns about the robot's security certificate. Accept it. You only do this once, for both the control panel and the VR headset link.
 
-The control panel runs [`can.setup`](/cli/can-setup) for you on first connect, so there's no manual hardware setup on the install path.
+On the first connection, the control panel sets up the connection to Axol's arms for you (see [`can.setup`](/cli/can-setup)). See the [Web Control Panel guide](/guides/control-panel) for the rest of the steps.
 
 ## Next steps
 
@@ -82,6 +91,6 @@ The control panel runs [`can.setup`](/cli/can-setup) for you on first connect, s
     Drive the robot from a VR headset.
   </Card>
   <Card title="Web Control Panel" icon="display" href="/guides/control-panel">
-    The browser UI that drives every operation.
+    Run every operation from a browser.
   </Card>
 </CardGroup>

@@ -111,11 +111,19 @@ def managed_mantis_bridge(
     *,
     left_channel: str | None,
     right_channel: str | None,
+    left_trigger_full_scale: float = 1.0,
+    right_trigger_full_scale: float = 1.0,
     port: int,
     auto_engage: bool = True,
     pose_source_id: str | None = None,
+    lighthouse_quality: str | None = None,
 ) -> Iterator[None]:
-    """Run the selected tracker bridge beside a direct CLI operation."""
+    """Run the selected tracker bridge beside a direct CLI operation.
+
+    ``lighthouse_quality`` pins the Lighthouse policy the operation resolved
+    (``TrackerConfig.lighthouse_quality``) so the bridge and the operation's
+    own gates cannot disagree if the saved setting changes meanwhile.
+    """
     left, right = require_mantis_channels(
         (
             _rig_channel(left_channel, CAN_LEFT, CAN_MANTIS_LEFT),
@@ -143,9 +151,12 @@ def managed_mantis_bridge(
 
     from ..tracker import load_tracker_config
     from ..tracker.bridge import ManagedStdinControls
-    from ..tracker.config import select_tracker_backend
+    from ..tracker.config import select_tracker_backend, validate_lighthouse_quality
+    from ..tracker.trigger import validate_trigger_full_scale
     from .tracker_bridge import run_configured_bridge
 
+    left_trigger_full_scale = validate_trigger_full_scale(left_trigger_full_scale)
+    right_trigger_full_scale = validate_trigger_full_scale(right_trigger_full_scale)
     config = load_tracker_config()
     select_tracker_backend(config, backend)
     if (config.left is None or config.right is None) and not config.allow_single_side:
@@ -160,6 +171,10 @@ def managed_mantis_bridge(
     # can silently leave the trigger controls attached to the old logical side.
     config.trigger_can_left = left
     config.trigger_can_right = right
+    config.trigger_full_scale_left = left_trigger_full_scale
+    config.trigger_full_scale_right = right_trigger_full_scale
+    if lighthouse_quality is not None:
+        config.lighthouse_quality = validate_lighthouse_quality(lighthouse_quality)
 
     stop = threading.Event()
     ready = threading.Event()
@@ -217,14 +232,19 @@ def managed_mantis_bridge(
                 interrupt_owner()
 
     thread = threading.Thread(target=target, name="mantis-tracker-bridge", daemon=True)
+    ready_timeout = _READY_TIMEOUT_S
+    if source == "lighthouse":
+        from ..tracker.lighthouse_validation import LIGHTHOUSE_ACQUISITION_TIMEOUT_S
+
+        ready_timeout = LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
     try:
         # Own cleanup before Thread.start(): an interrupt can arrive after the
         # native thread begins but before start() returns to this owner.
         thread.start()
-        if not ready.wait(_READY_TIMEOUT_S):
+        if not ready.wait(ready_timeout):
             raise RuntimeError(
                 f"{source} tracker bridge did not initialize within "
-                f"{_READY_TIMEOUT_S:.0f}s"
+                f"{ready_timeout:.0f}s"
             )
         bridge_failure = current_failure()
         if bridge_failure is not None:

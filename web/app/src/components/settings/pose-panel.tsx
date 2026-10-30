@@ -1,6 +1,6 @@
 import { lazy, Suspense, useMemo, useState } from "react"
 import { Loader2, RotateCcw } from "lucide-react"
-import type { SettingsField, SettingValue } from "@/lib/supervisor"
+import type { AxolModel, GripperType, SettingsField, SettingValue } from "@/lib/supervisor"
 import { Slider } from "@/components/ui/slider"
 import { Button } from "@/components/ui/button"
 import type { JointLimits } from "./pose-viewer"
@@ -51,7 +51,13 @@ export function PosePanel({
   fields,
   values,
   onChange,
+  robotModel,
+  gripper = "parallel",
 }: {
+  /** Which Axol version to preview the pose on. */
+  robotModel: AxolModel
+  /** The fitted gripper (the mobile Axol has a URDF per gripper). */
+  gripper?: GripperType
   /** The rest-pose settings fields (teleop.rest_pose_left / _right). */
   fields: SettingsField[]
   /** Draft settings values (sparse; unset keys mean "use the default"). */
@@ -91,8 +97,8 @@ export function PosePanel({
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
-        The rest pose is where the arms start from (and return to) in teleop and data collection.
-        Drag the sliders to preview the pose on the robot model, then save.
+        The rest pose is where the arms start and return to in teleoperation and data collection.
+        Drag the sliders to preview it on the robot model, then press Save.
       </p>
 
       <div className="h-72 overflow-hidden rounded-xl border border-white/10 bg-black/30">
@@ -103,7 +109,13 @@ export function PosePanel({
             </div>
           }
         >
-          <PoseViewer jointValues={jointValues} onLoaded={setLimits} />
+          <PoseViewer
+            key={`${robotModel}-${gripper}`}
+            robotModel={robotModel}
+            gripper={gripper}
+            jointValues={jointValues}
+            onLoaded={setLimits}
+          />
         </Suspense>
       </div>
 

@@ -16,7 +16,7 @@ import secrets
 import socket
 import subprocess
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -39,7 +39,8 @@ from ..constants import (
     URDF_PATH,
 )
 from ..motor.errors import MotorError
-from ..robot import lift_firmware
+from ..robot import lift_firmware, mantis_firmware
+from ..settings import resolve_robot_model
 from ..utils import adb, ports
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
@@ -96,16 +97,18 @@ class OpStartRequest(BaseModel):
 
         {
           "serials": {"overhead": 41234567, "left_arm": ..., "right_arm": ...},
-          "mantis_serials": {"left_arm": ..., "right_arm": ...},
+          "mantis_serials": {"overhead": ..., "left_arm": ..., "right_arm": ...},
           "stream_resolution": "HD1200",   # capture res → headset; "off" disables
           "record_resolution": "SVGA",     # dataset downscale; "off" disables
           "stream": {"overhead": "both", "left_arm": true},   # per-slot headset
           "record": {"overhead": "left", "left_arm": false}   # per-slot dataset
         }
 
-    ``mantis_serials`` is a separate two-camera assignment used whenever the
+    ``mantis_serials`` is a separate head/wrist camera assignment used whenever the
     run's ``mantis`` flag is on (the panel sets it from its system-wide device
-    switch); Axol continues to use ``serials``.
+    switch); Axol continues to use ``serials``. Missing Mantis slots fall back
+    to ``serials`` for older saved setups; an explicit empty string unassigns
+    the slot for Mantis only.
     The ``stream`` / ``record`` maps decide per camera whether it takes part in
     each branch: ``false`` opts a camera out, ``true`` opts a mono camera in, and
     an eye name (``"both"`` / ``"left"`` / ``"right"``) opts a stereo camera in
@@ -834,7 +837,7 @@ def _detect_cameras() -> dict[str, Any]:
     except ImportError:
         return {
             "devices": [],
-            "error": "pyzed is not installed — run `axol zed.install` first",
+            "error": "pyzed is not installed. Run `axol zed.install` first.",
         }
     except Exception as exc:  # noqa: BLE001 - SDK errors surface to the UI
         return {"devices": [], "error": f"{type(exc).__name__}: {exc}"}
@@ -1287,7 +1290,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             f"{f['arm']} {f['joint'].lower()} ({f['problem']})" for f in faults
         )
         return JSONResponse(
-            {"error": f"motor fault — fix before starting: {detail}"},
+            {"error": f"Motor fault: {detail}. Fix it before starting."},
             status_code=409,
         )
 
@@ -1364,7 +1367,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Why the host can't be powered off right now, or None when it can."""
         if not _is_idle():
             return JSONResponse(
-                {"error": "an operation or session is running — stop it first"},
+                {"error": "An operation or session is running. Stop it first."},
                 status_code=409,
             )
         if updater.installing:
@@ -1372,8 +1375,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # failing every later install until `dpkg --configure -a`.
             return JSONResponse(
                 {
-                    "error": "the robot is installing an update or system "
-                    "packages — wait for it to finish"
+                    "error": "The robot is installing an update or system "
+                    "packages. Wait for it to finish."
                 },
                 status_code=409,
             )
@@ -1895,12 +1898,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 return JSONResponse({"error": str(exc)}, status_code=400)
             if runner.is_running():
                 return JSONResponse(
-                    {"error": "an operation is running — stop it first"},
+                    {"error": "An operation is running. Stop it first."},
                     status_code=409,
                 )
             if _diagnostic_session_active():
                 return JSONResponse(
-                    {"error": "another session is running — stop it first"},
+                    {"error": "Another session is running. Stop it first."},
                     status_code=409,
                 )
             profile = robot.profile()
@@ -2062,31 +2065,34 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Delete the whole run history (the dashboard's Clear button)."""
         return {"removed": await asyncio.to_thread(runs.clear)}
 
-    # -- lift firmware upload ------------------------------------------------
+    # -- lift and Mantis firmware upload --------------------------------------
     #
     # The dashboard's "Update lift firmware" dialog uploads the raw
     # firmware.bin here first; the validated image is stored on the host and
     # its path filled into the lift.update run's --firmware argument.
 
-    @app.post("/api/lift/firmware", response_model=None)
-    async def upload_lift_firmware(request: Request) -> JSONResponse:
+    async def _upload_firmware(
+        request: Request,
+        parse: Callable[[bytes], lift_firmware.FirmwareImage],
+        store: Callable[[lift_firmware.FirmwareImage], Path],
+    ) -> JSONResponse:
         data = bytearray()
         async for part in request.stream():
             data += part
             if len(data) > lift_firmware.MAX_IMAGE_BYTES:
                 return JSONResponse(
                     {
-                        "error": "the file is larger than a lift firmware "
+                        "error": "the file is larger than a firmware "
                         f"partition ({lift_firmware.MAX_IMAGE_BYTES} bytes)"
                     },
                     status_code=413,
                 )
         try:
-            image = lift_firmware.FirmwareImage.parse(bytes(data))
+            image = parse(bytes(data))
         except lift_firmware.FirmwareUpdateError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         try:
-            path = await asyncio.to_thread(lift_firmware.store_upload, image)
+            path = await asyncio.to_thread(store, image)
         except OSError as exc:
             return JSONResponse(
                 {"error": f"could not store the firmware on the host: {exc}"},
@@ -2100,6 +2106,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "buildId": f"0x{image.build_id:08x}",
                 "size": len(image.data),
             }
+        )
+
+    @app.post("/api/lift/firmware", response_model=None)
+    async def upload_lift_firmware(request: Request) -> JSONResponse:
+        return await _upload_firmware(
+            request, lift_firmware.FirmwareImage.parse, lift_firmware.store_upload
+        )
+
+    # The same for `mantis.update`: only a Mantis firmware.bin passes.
+    @app.post("/api/mantis/firmware", response_model=None)
+    async def upload_mantis_firmware(request: Request) -> JSONResponse:
+        return await _upload_firmware(
+            request, mantis_firmware.parse_image, mantis_firmware.store_upload
         )
 
     @app.get("/api/diagnostics/runs/{run_id}")
@@ -2320,7 +2339,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 data = await asyncio.to_thread(_capture)
             except ImportError:
                 return JSONResponse(
-                    {"error": "pyzed is not installed — run `axol zed.install` first"},
+                    {"error": "pyzed is not installed. Run `axol zed.install` first."},
                     status_code=503,
                 )
             except KeyError as exc:
@@ -2359,11 +2378,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- shared operator settings (see serve/settings.py) --------------------
 
+    def robot_model() -> str:
+        """The Axol version runs on this host would use: mobile when Jelly is on.
+
+        Derived (Jelly attached and not switched off, or an explicit
+        ``kinematics.robot_model``), so the panel's robot viewer shows the same
+        body the IK solver keeps the arms clear of.
+        """
+        try:
+            return resolve_robot_model(store=settings).value
+        except Exception:  # noqa: BLE001 - a bad value must not hide the settings
+            _logger.exception("could not resolve the Axol version; showing classic")
+            return "classic"
+
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
         """Stored shared settings + the schemas describing every category."""
         return {
             **settings.snapshot(),
+            "robotModel": robot_model(),
             "schema": settings_schema(),
             "advancedSchema": advanced_schema(),
         }
@@ -2385,7 +2418,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": "could not securely write the shared settings"},
                 status_code=500,
             )
-        return JSONResponse(snapshot)
+        # The Jelly switches (or an explicit kinematics.robot_model) may have
+        # just changed which Axol version runs.
+        return JSONResponse({**snapshot, "robotModel": robot_model()})
 
     def quest_calibration_key() -> object:
         snapshot = settings.snapshot()
@@ -2437,6 +2472,44 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=400,
             )
         return JSONResponse(result)
+
+    @app.put("/api/tracker/lighthouse/quality", response_model=None)
+    async def put_lighthouse_quality(request: Request) -> JSONResponse:
+        """Choose the standard or strict Lighthouse tracking policy."""
+        from ..tracker.config import (
+            load_tracker_config,
+            save_tracker_config,
+            validate_lighthouse_quality,
+        )
+
+        body, error = await redacted_json_body(request)
+        if error is not None:
+            return error
+        try:
+            mode = validate_lighthouse_quality(body.get("mode"))
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if runner.is_running() or _diagnostic_session_active():
+            # A running bridge resolved its policy at startup; changing it
+            # underneath would make the panel describe a policy not in force.
+            return JSONResponse(
+                {"error": "stop the running operation before changing this"},
+                status_code=409,
+            )
+
+        def save() -> None:
+            config = load_tracker_config()
+            config.lighthouse_quality = mode
+            save_tracker_config(config)
+
+        try:
+            await asyncio.to_thread(save)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not write the tracker configuration"},
+                status_code=400,
+            )
+        return JSONResponse({"mode": mode})
 
     @app.get("/api/tracker/calibration/{source}", response_model=None)
     async def get_tracker_calibration(source: str) -> JSONResponse:
@@ -2526,6 +2599,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
             from ..tracker import load_tracker_config
             from ..tracker.lighthouse_survey import load_lighthouse_survey
+            from ..tracker.lighthouse_validation import (
+                is_lighthouse_serial,
+                validation_snapshot,
+            )
             from ..vr.server import get_last_quest_pose_datum
             from .tracker_setup import TrackerSetupError, calibration_snapshot
 
@@ -2589,6 +2666,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         left
                         and right
                         and left != right
+                        and (
+                            backend != "survive"
+                            or (
+                                is_lighthouse_serial(left)
+                                and is_lighthouse_serial(right)
+                            )
+                        )
                         and (
                             backend != "ultimate"
                             or (
@@ -2668,6 +2752,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "liveDatum": get_last_quest_pose_datum(),
             }
             lighthouse = lighthouse_readiness()
+            lighthouse_survey = load_lighthouse_survey()
+            if lighthouse_survey is not None:
+                lighthouse_survey["expectedBaseStations"] = (
+                    config.expected_base_stations
+                )
             source_status["lighthouse"] = {
                 **lighthouse,
                 "binding": bindings["survive"],
@@ -2675,7 +2764,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 # Last base-station survey (Check base stations / Identify):
                 # libsurvive only logs a shared channel, so this is the panel's
                 # sole view of it. None until a survey has run on this host.
-                "baseStations": load_lighthouse_survey(),
+                "baseStations": lighthouse_survey,
+                "expectedBaseStations": config.expected_base_stations,
+                "qualityMode": config.lighthouse_quality,
+                "validation": validation_snapshot(config),
             }
             ultimate = ultimate_runtime_readiness()
             try:
@@ -2765,6 +2857,36 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "root": str(root),
                 **read_episodes(root).to_dict(),
             }
+
+        try:
+            return await asyncio.to_thread(_read)
+        except DatasetBrowseError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except ImportError as exc:
+            return JSONResponse(
+                {"error": f"dataset preview needs the lerobot extra ({exc})"},
+                status_code=501,
+            )
+
+    @app.get("/api/datasets/episode-data", response_model=None)
+    async def get_dataset_episode_data(
+        repo_id: str, episode: int
+    ) -> Response | JSONResponse:
+        """One saved episode's state, actions, recorded gripper poses and checks.
+
+        For the panel's dataset charts and 3D replay. A recording's control
+        loop shares this process, so this only reads the file: joint-space
+        episodes' gripper poses are worked out in the browser. See
+        ``recording.episode_data``.
+        """
+        from ..recording.dataset_browser import DatasetBrowseError
+        from ..recording.episode_data import read_episode_data, to_json
+
+        def _read() -> Response:
+            data = read_episode_data(_dataset_root(repo_id), episode)
+            # Encoded here, off the event loop and a column at a time.
+            body = to_json({"repoId": repo_id, **data})
+            return Response(body, media_type="application/json")
 
         try:
             return await asyncio.to_thread(_read)
@@ -2938,7 +3060,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 )
             if runner.is_running(ignore_cleanup_lockout=True):
                 return JSONResponse(
-                    {"error": "an operation is still running — stop it first"},
+                    {"error": "An operation is still running. Stop it first."},
                     status_code=409,
                 )
             refusal = await asyncio.to_thread(prove_motors_torque_free, robot)
@@ -2967,8 +3089,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if _diagnostic_session_active():
                 return JSONResponse(
                     {
-                        "error": "a setup or diagnostics session is running — "
-                        "stop it first"
+                        "error": "A setup or diagnostics session is running. "
+                        "Stop it first."
                     },
                     status_code=409,
                 )

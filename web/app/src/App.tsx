@@ -887,7 +887,7 @@ const STATUS_DISPLAY: Partial<Record<AxolState | "pending", { color: string; lab
   [AxolState.Error]: { color: "#f87171", label: "• Error" },
   [AxolState.Recording]: { color: "red", label: "• Recording" },
   [AxolState.Saving]: { color: "orange", label: "• Saving…" },
-  [AxolState.DataCollection]: { color: "blue", label: "• Data Collection" },
+  [AxolState.DataCollection]: { color: "blue", label: "• Data collection" },
 }
 
 function StateDisplay({
@@ -904,7 +904,7 @@ function StateDisplay({
     color: "white",
     label: "• Teleop",
   }
-  const label = viewOnly ? `${stateLabel} • Quest view only` : stateLabel
+  const label = viewOnly ? `${stateLabel} • View only` : stateLabel
 
   return (
     <HudText
@@ -1281,38 +1281,38 @@ function HelpPanel({
   const viewOnly = poseSourceKind === "tracker"
   // Recording only exists in data collection; teleop drops the [A] hint.
   const rightRows = [
-    ...(mode === "teleop" || viewOnly ? [] : ["[A]  Start / Stop Rec"]),
-    "[Trigger]  Move Screen",
-    "[2x Trigger]  Resize",
-    "[B]  Reset Screens",
+    ...(mode === "teleop" || viewOnly ? [] : ["[A]  Start / stop recording"]),
+    "[Trigger]  Move screen",
+    "[2× Trigger]  Resize screen",
+    "[B]  Reset screens",
     ...(viewOnly
       ? []
       : boxMode
         ? [
-            "[Grip]  Lead / Freeze Pair",
-            "[Stick ↑↓]  Width",
-            "[Tap Click]  Flush / Straight",
-            "[Hold Click]  Lift Up",
+            "[Grip]  Lead / freeze both arms",
+            "[Stick up/down]  Width",
+            "[Stick tap]  Flush / straight",
+            "[Stick hold]  Raise lift",
           ]
-        : ["[Grip]  Engage / Freeze Arm", ...(boxAvailable ? ["[Both Clicks]  Box Mode"] : [])]),
+        : ["[Grip]  Engage / freeze arm", ...(boxAvailable ? ["[Both clicks]  Box mode"] : [])]),
   ].join("\n")
   const leftRows = [
     "[Y]  Exit VR",
     ...(viewOnly
-      ? ["[Tracker]  Robot Control"]
+      ? ["[Tracker]  Controls robot"]
       : [
-          "[X]  Reset Pose",
+          "[X]  Reset pose",
           ...(boxMode
             ? [
-                "[Grip]  Lead / Freeze Pair",
-                "[Tap Click]  Flush / Straight",
-                "[Hold Click]  Lift Down",
-                "[Both Clicks]  Box Mode",
+                "[Grip]  Lead / freeze both arms",
+                "[Stick tap]  Flush / straight",
+                "[Stick hold]  Lower lift",
+                "[Both clicks]  Box mode",
               ]
             : [
-                "[Grip]  Engage / Freeze Arm",
-                ...(rampAvailable ? ["[Ramp]  Arm Comes To Hand"] : []),
-                ...(settingsAvailable ? ["[Settings]  Live Tuning"] : []),
+                "[Grip]  Engage / freeze arm",
+                ...(rampAvailable ? ["[Ramp]  Arm comes to hand"] : []),
+                ...(settingsAvailable ? ["[Settings]  Session settings"] : []),
               ]),
         ]),
   ].join("\n")
@@ -1707,7 +1707,7 @@ export default function App() {
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
       setXrError(
-        detail || "The browser refused to enter WebXR. Check headset permissions and try again."
+        detail || "The browser did not allow VR. Check the headset's permissions and try again."
       )
     }
   }
@@ -1743,7 +1743,7 @@ export default function App() {
               <img src="/almond.svg" alt="Almond" className="h-12 w-12" />
               <div>
                 <h1 className="font-heading text-2xl font-bold tracking-tight">Almond Axol</h1>
-                <p className="text-sm text-white/40">VR Teleoperation</p>
+                <p className="text-sm text-white/40">VR teleoperation</p>
               </div>
             </div>
 
@@ -1781,7 +1781,7 @@ export default function App() {
                   htmlFor="vr-host"
                   className="text-xs font-medium tracking-widest text-white/40 uppercase"
                 >
-                  Axol Host Address
+                  Host Computer address
                 </label>
                 <SuggestInput
                   id="vr-host"
@@ -1824,10 +1824,10 @@ export default function App() {
                     )}
                   >
                     {poseStatus === AxolConnectionStatus.Open
-                      ? "controller over cable"
+                      ? "connected"
                       : poseStatus === AxolConnectionStatus.Connecting
-                        ? "connecting USB link… (on WiFi)"
-                        : "WiFi fallback — USB link down"}
+                        ? "connecting, using Wi-Fi for now"
+                        : "not connected, using Wi-Fi"}
                   </span>
                 </p>
                 {poseStatus !== AxolConnectionStatus.Open && (
@@ -1887,7 +1887,7 @@ export default function App() {
                   rows={[
                     ...(vrMode === "teleop" || poseSourceKind === "tracker"
                       ? []
-                      : ([["A", "Start / stop rec"]] as [string, string][])),
+                      : ([["A", "Start / stop recording"]] as [string, string][])),
                     ["Trigger", "Move screen"],
                     ["2× Trigger", "Resize screen"],
                     ["B", "Reset screens"],
@@ -1907,10 +1907,11 @@ export default function App() {
             {status === AxolConnectionStatus.Failed && (
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
-                  Could not connect to <span className="font-mono">{hostname || "the server"}</span>
-                  . Check that <span className="font-mono">axol teleop</span> is running
+                  Could not connect to{" "}
+                  <span className="font-mono">{hostname || "the Host Computer"}</span>. Check that
+                  Teleoperation or Collect data is running on the Host Computer
                   {hostCertAuthorizeVisible(hostname)
-                    ? ", then authorize its self-signed certificate below."
+                    ? ", then authorize its certificate below."
                     : "."}
                 </p>
                 {hostCertAuthorizeVisible(hostname) && (

@@ -1,7 +1,7 @@
 ---
 title: "Data Collection Config Parameters"
 sidebarTitle: "Config Parameters"
-description: "Every setting for axol collect-data — what it does and its default."
+description: "Every setting for axol collect-data, what it does and its default."
 ---
 
 import Robot from "/snippets/config/robot.mdx";
@@ -12,9 +12,20 @@ import Kinematics from "/snippets/config/kinematics.mdx";
 import VRServer from "/snippets/config/vr-server.mdx";
 import Jelly from "/snippets/config/jelly.mdx";
 
-Every setting for `axol collect-data`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+Every setting for `axol collect-data`. Add any flag below to the command, or set it once in the control panel. See [Command configuration](/cli/configuration) for config files and syntax.
 
-In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the same sections appear without this command's wrapper prefixes: `robot_config.axol_config.*` is the file's `axol`, `teleop_config.vr_teleop_config.*` is `teleop`, `teleop_config.kinematics_config.*` is `kinematics`, `teleop_config.vr_server_config.*` is `vr_server`, `teleop_config.jelly.*` is `jelly`, the other `robot_config.*` fields are `lerobot`, and `fps` / `root` / `vcodec` / `push_to_hub` / `rerun_*` live under `recording`.
+The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`) is read by default. It stores these flags in the sections below, without this command's prefixes.
+
+| Flag | Section in the settings file |
+|---|---|
+| `robot_config.axol_config.*` | `axol` |
+| `robot_config.left_channel`, `robot_config.right_channel` | `robot` |
+| Other `robot_config.*` fields | `lerobot` |
+| `teleop_config.vr_teleop_config.*` | `teleop` |
+| `teleop_config.kinematics_config.*` | `kinematics` |
+| `teleop_config.vr_server_config.*` | `vr_server` |
+| `teleop_config.jelly.*` | `jelly` |
+| `fps`, `root`, `vcodec`, `push_to_hub`, `rerun_*` | `recording` |
 
 ```bash
 axol collect-data --repo_id myorg/pick --task "pick up the cup" \
@@ -23,27 +34,27 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 ```
 
 <Warning>
-  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same here and in [Run Policy](/operations/run-policy-config)**. A policy only works with the dynamics it was trained on.
+  Use the **same** stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps` and cameras here and in [Run Policy](/operations/run-policy-config). A policy only works with the settings it was trained on.
 </Warning>
 
 ## Recording
 
 | Flag | Default | Description |
 |---|---|---|
-| `--repo_id` | required | Dataset id, `<user>/<dataset>`. |
+| `--repo_id` | required | Dataset ID, `<user>/<dataset>`. |
 | `--task` | required | Task description stored with every frame. |
-| `--fps` | `30` | Recording rate. Cameras capture at 60 and are decimated to this before encoding; 60 doubles the dataset encode/recorder load on the Jetson. |
+| `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
-| `--dataset_resolution` | `SVGA` | Resolution the recorded video is downscaled to: `SVGA`, `HD1080`, or `HD1200`. The headset stream keeps the capture resolution. |
+| `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. The headset stream keeps the capture resolution. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
-| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
-| `--qa_gate` | `true` | Refuse to save Mantis episodes the quality check marks corrupt. `false` saves anyway. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
+| `--qa_gate` | `true` | Don't save Mantis episodes that fail the quality check. `false` saves them anyway, except takes with a tracking fault under the [strict Lighthouse policy](/cli/tracker#lighthouse-tracking-policy). |
 | `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
-| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
+| `--config_path` | none | Load a JSON or YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. The config file and flags override it. |
 
 ## Mantis
 
@@ -51,14 +62,14 @@ Only used with `--mantis`.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mantis` | `false` | Record with the Mantis handheld rigs instead of the robot: tracked TCP poses plus wrist cameras. |
-| `--mantis_source` | `lighthouse` | Pose source: `quest`, `lighthouse`, or `ultimate`. Defaults to the host's **Mantis settings → Tracking** choice. |
-| `--mantis_allow_uncalibrated` | `false` | Record without a tracker → TCP calibration. Bring-up only; don't train on the result. |
-| `--mantis_smooth_hz` | `10.0` | Low-pass cutoff (Hz) applied to the recorded pose track on save. `0` disables. |
+| `--mantis` | `false` | Record with the Mantis rigs instead of the robot: tracked gripper poses plus head and wrist cameras. |
+| `--mantis_source` | `lighthouse` | Pose source: `quest`, `lighthouse` or `ultimate`. Defaults to the source chosen in **Mantis settings → Tracking**. |
+| `--mantis_allow_uncalibrated` | `false` | Record without a tracker-to-gripper calibration. For bring-up only. Don't train on the result. |
+| `--mantis_smooth_hz` | `10.0` | Smooths the recorded poses when the take is saved (cutoff in Hz). `0` turns it off. |
 
 ## Robot {#robot-config}
 
-CAN buses, cameras, and what goes into observations.
+CAN buses, cameras and what goes into observations.
 
 <LeRobotRobot prefix="robot_config." />
 
@@ -68,7 +79,7 @@ CAN buses, cameras, and what goes into observations.
 
 ### Arm gains {#robot}
 
-Arm stiffness, gripper limits, and per-joint gains.
+Arm stiffness, gripper limits and per-joint gains.
 
 <Robot prefix="robot_config.axol_config." />
 
@@ -92,7 +103,7 @@ The connection the headset streams poses over.
 
 ## Jelly {#jelly}
 
-The optional powered cart, driven from the headset thumbsticks between takes. Jelly motion is never recorded.
+Jelly Mobile, the optional powered base. You drive it from the headset thumbsticks between takes. Jelly motion is never recorded.
 
 <Jelly prefix="teleop_config.jelly." />
 
@@ -101,6 +112,6 @@ The optional powered cart, driven from the headset thumbsticks between takes. Je
 | Flag | Default | Description |
 |---|---|---|
 | `--teleop_config.has_gripper` | `true` | Set automatically from `--robot_config.axol_config.has_gripper`. |
-| `--teleop_config.vr_teleop_config.gripper` | `parallel` | Set automatically from `--robot_config.axol_config.gripper`; box mode exists only with `parcel`. |
-| `--teleop_config.id` | `null` | LeRobot bookkeeping, unused by Axol. |
-| `--teleop_config.calibration_dir` | `null` | LeRobot bookkeeping, unused by Axol. |
+| `--teleop_config.vr_teleop_config.gripper` | `parallel` | Set automatically from `--robot_config.axol_config.gripper`. Box mode is available only with `parcel`. |
+| `--teleop_config.id` | `null` | Used by LeRobot only. Axol ignores it. |
+| `--teleop_config.calibration_dir` | `null` | Used by LeRobot only. Axol ignores it. |

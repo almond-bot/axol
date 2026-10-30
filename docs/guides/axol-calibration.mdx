@@ -1,0 +1,100 @@
+---
+title: "Calibrating Axol"
+description: "Measure each joint's friction and gravity so Axol's arms move smoothly at slow speed."
+---
+
+Axol's arm controllers cancel the friction and gravity at each joint. Every gearbox is slightly different, so each Axol needs its own measurements for smooth slow motion. Calibrate after you set up Axol, and again after you replace a joint or gearbox.
+
+Until you calibrate, Axol uses default values that work on any unit. Slow, precise motion is rougher with the defaults.
+
+## Before you start
+
+- Clear the space around both arms.
+- Keep the E-Stop within reach.
+- Stop any other operation that is using Axol.
+- Plan for about 1.5 hours. Each joint takes about 6 minutes.
+
+## Run the calibration
+
+In a terminal on the Host Computer, run:
+
+```bash
+axol tune.factory
+```
+
+You can also press **Factory calibration (all joints)** in the [diagnostics dashboard](/guides/diagnostics-dashboard).
+
+Axol moves each joint of both arms back and forth at slow and moderate speeds, starting at the wrists. From these sweeps it measures each joint's friction and the weight of the links it carries. To calibrate one arm only, see [`tune.factory`](/cli/tune-factory).
+
+The new calibration takes effect on this computer as soon as the run finishes. It is saved to `~/.almond/calibration.json`.
+
+## After you change the end-effector or add cameras
+
+Gravity compensation needs to know how much the wrist weighs. The gripper and everything mounted on it count as one link, `wrist_3`. That includes wrist cameras, brackets, screws and a different gripper. The default `wrist_3` mass is 0.75&nbsp;kg, for the standard gripper with the Camera Kit wrist camera and its mount.
+
+The calibration measures where each link's weight sits, but it can't measure how heavy the link is. Enter the new mass before you calibrate. Otherwise the extra weight is spread over the wrong links, and the elbow and shoulders are compensated less accurately.
+
+<Steps>
+  <Step title="Weigh the parts">
+    Weigh everything you added to one wrist: camera, bracket, screws, and the cable up to its first tie point on the arm. Also weigh any parts you removed or left off, such as the Camera Kit wrist camera and its mount.
+  </Step>
+  <Step title="Work out the new mass">
+    Start from the current `wrist_3` mass. Add what you added and subtract what you removed. For example, if your camera and bracket weigh 30&nbsp;g more than the Camera Kit wrist camera and mount they replace, the new mass is 0.75 + 0.03 = 0.78&nbsp;kg.
+
+    A Camera Kit wrist camera counts as stock, so you don't need to change the mass for it.
+  </Step>
+  <Step title="Enter the mass">
+    In the control panel, open **General settings → Advanced** and search for `wrist_3`. Set **mass** in the `wrist_3` row of both arms' tables, then press **Save**. Teleop, data collection and the calibration all use this value.
+
+    You can also pass the mass to the calibration instead: `axol tune.factory --mass wrist_3=0.78`. It is saved with the calibration.
+  </Step>
+  <Step title="Route the cables">
+    Tie each camera cable to the arm on both sides of the wrist and elbow joints. Leave a loose loop across each joint, so the cable doesn't pull when the joint turns. A cable that pulls on a joint throws off its calibration.
+  </Step>
+  <Step title="Calibrate">
+    Run `axol tune.factory`.
+  </Step>
+</Steps>
+
+If only one arm changed, set that arm's mass and run `axol tune.factory --arms left` or `--arms right`.
+
+## If a gravity fit is rejected
+
+The run prints `Gravity fit rejected` when the fit would move a joint's center of mass more than 60&nbsp;mm. The joint still gets its friction calibration and keeps its current gravity values. Axol works normally for teleop and data collection.
+
+A few rejected fits are normal, even on a stock Axol. The `elbow` and `wrist_1` links are light, so their fits are often rejected. Up to half of the 14 joints can be rejected.
+
+Look into it only when joints that passed before are rejected after a change:
+
+- **More joints rejected after you added weight to the wrist:** [enter the new mass](#after-you-change-the-end-effector-or-add-cameras) and calibrate again.
+- **Different joints rejected on each run:** check that nothing touches the arm during the sweeps and that no cable catches or pulls.
+
+Each run starts from the last saved values, so a second run can show larger shifts on joints that passed before.
+
+## Share the calibration with other computers
+
+The calibration is stored under the serial number of Axol's hub, which stays with the arms. If the computer has an upload key, the run uploads the calibration when it finishes. Add the key to `.env` on the computer you calibrate from:
+
+```bash
+AXOL_SUPABASE_KEY=<service key with storage write access>
+```
+
+Without a key, the calibration is saved on this computer only, and the run tells you so. To upload it later, run [`axol calibration.push`](/cli/tune-factory#calibration-push). Add `--dry-run` to see what would be uploaded first.
+
+Any computer connected to Axol downloads its calibration when you run [`axol can.setup`](/cli/can-setup). To download it at any other time, run `axol calibration.pull`. Downloading needs no key.
+
+If a value is set in more than one place, a calibration file on the computer overrides the uploaded calibration, and the uploaded calibration overrides the defaults.
+
+## Check the result
+
+Run the slow test motion before and after you calibrate, and compare the shake scores:
+
+```bash
+axol tune.motion --motion slow_osc --arms right --repeat 2
+```
+
+In this motion the right arm is bent up in front of Axol while the shoulder moves slowly back and forth. Each pass prints a shake score from the wrist camera's IMU. A lower score means a smoother arm. Run both measurements in the same session, because the score can drift by 10 to 20% over a day.
+
+<Note>
+  To recalibrate a single joint, use [`tune.friction --profile slow`](/cli/tune-friction) for friction and [`tune.gravity`](/cli/tune-gravity) for gravity. Then upload the result with `axol calibration.push`.
+</Note>

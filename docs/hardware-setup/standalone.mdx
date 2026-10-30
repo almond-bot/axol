@@ -1,20 +1,23 @@
 ---
 title: "Axol Standalone"
-description: "Bolt Axol to your own table or fixture, then fit the cameras, power, and wiring."
+description: "Bolt Axol to your own table or fixture and connect its power."
 ---
 
 import MountAxol from "/snippets/hardware/mount-axol.mdx";
 import Power from "/snippets/hardware/power.mdx";
 
-Axol ships fully assembled. In the standalone configuration you provide the table or fixture: drill or tap its top for Axol's four **M8** mounting holes using the [mounting holes diagram](https://downloads.almond.bot/resources/axol_mounting_holes.pdf), and make sure the surface is rigid enough to take the arms' reaction loads without flexing.
+Axol ships fully assembled. In the Standalone setup you provide the table or fixture. Before you start:
+
+- Drill or tap the top of your table for Axol's four **M8** bolts. The hole positions are in the [mounting holes diagram](https://downloads.almond.bot/resources/axol_mounting_holes.pdf).
+- Make sure the table is stiff enough that it doesn't flex when the arms move.
 
 <Tip>
-  If you're mounting to a T-slot table, the [Owl Mount](/hardware-setup/owl-mount) drops onto 2020, 4040, and 4545 extrusion patterns without drilling.
+  If you have a T-slot table, the [Owl Mount](/hardware-setup/owl-mount) fits 2020, 4040 and 4545 extrusion without drilling.
 </Tip>
 
 ### Tools required
 
-You'll need a hex (Allen) key for the socket head cap screws that hold Axol to your fixture:
+You need a hex (Allen) key for the bolts that hold Axol to your table:
 
 | Screw | Hex key |
 |---|---|
@@ -28,12 +31,12 @@ You'll need a hex (Allen) key for the socket head cap screws that hold Axol to y
 
 <CardGroup cols={2}>
   <Card title="Axol Cameras" icon="camera" href="/hardware-setup/cameras">
-    Mount the Camera Kit's wrist and head cameras and wire them to the compute.
+    Mount the Camera Kit's wrist and head cameras and connect them to the computer.
   </Card>
   <Card title="Installation" icon="download" href="/installation">
-    Install Axol on the robot machine and open the web control panel.
+    Install the software on the Host Computer and open the control panel.
   </Card>
   <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
-    Back to the setup guides for every configuration.
+    Back to the setup guides for every mount.
   </Card>
 </CardGroup>

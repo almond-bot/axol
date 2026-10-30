@@ -1,7 +1,7 @@
 ---
 title: "Teleoperation Config Parameters"
 sidebarTitle: "Config Parameters"
-description: "Every setting for axol teleop — what it does and its default."
+description: "Every setting for axol teleop, what it does and its default."
 ---
 
 import Robot from "/snippets/config/robot.mdx";
@@ -10,9 +10,9 @@ import Kinematics from "/snippets/config/kinematics.mdx";
 import VRServer from "/snippets/config/vr-server.mdx";
 import Jelly from "/snippets/config/jelly.mdx";
 
-Every setting for `axol teleop`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+Every setting for `axol teleop`. Add any flag below to the command, or set it once in the control panel. See [Command configuration](/cli/configuration) for config files and syntax.
 
-In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) the `axol`, `teleop`, `kinematics`, `vr_server` and `jelly` sections below appear under exactly those names — the file is a partial teleop config — while `--left_channel` / `--right_channel` live under `robot` and `--log_level` under `system`.
+The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`) is read by default. In it, the `axol`, `teleop`, `kinematics`, `vr_server` and `jelly` sections use the same names as below. `--left_channel` and `--right_channel` live under `robot`, and `--log_level` under `system`.
 
 ```bash
 axol teleop --axol.left_stiffness 0.8 --teleop.position_multiplier 1.5
@@ -24,15 +24,15 @@ axol teleop --axol.left_stiffness 0.8 --teleop.position_multiplier 1.5
 |---|---|---|
 | `--sim` | `false` | Drive the browser visualiser instead of the robot. Robot gains and CAN channels are ignored. |
 | `--mantis` | `false` | Drive the Mantis rigs' grippers from their triggers instead of the robot. |
-| `--arms` | `true` | Drive the Axol arms. `false` drives only Jelly; the arms are never touched. Also skipped automatically when the arm CAN interfaces are absent while Jelly's are present. |
+| `--arms` | `true` | Drive the Axol arms. `false` drives only Jelly. Axol also skips the arms when only Jelly's CAN interfaces are present. |
 | `--left_channel` | `can_alm_axol_l` | CAN interface for the left arm. `null` disables the arm. |
 | `--right_channel` | `can_alm_axol_r` | CAN interface for the right arm. `null` disables the arm. |
-| `--cameras` | `{}` | Cameras to stream to the headset, as slot → serial: `"{overhead: 41234567, left_arm: 41234568}"`. Empty means no video. |
-| `--camera_eyes` | `{}` | Which eye(s) of each stereo camera to stream: `"{overhead: both, left_arm: left}"`. Default is overhead both, wrists left. |
+| `--cameras` | `{}` | Cameras to stream to the headset, as slot and serial number: `"{overhead: 41234567, left_arm: 41234568}"`. Empty means no video. |
+| `--camera_eyes` | `{}` | Which eyes of each stereo camera to stream: `"{overhead: both, left_arm: left}"`. By default the overhead streams both eyes and the wrists the left eye. |
 | `--resolution` | `null` | Capture resolution for all cameras: `SVGA`, `HD1080`, or `HD1200`. `null` keeps the camera default. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
-| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
+| `--config_path` | none | Load a JSON or YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. The config file and flags override it. |
 
 ## Robot {#robot}
 
@@ -60,6 +60,6 @@ The connection the headset streams poses over.
 
 ## Jelly {#jelly}
 
-The optional powered cart (x-drive base and telescoping lift), driven from the headset thumbsticks.
+Jelly Mobile, the optional powered base with a telescoping lift. You drive it from the headset thumbsticks.
 
 <Jelly prefix="jelly." />

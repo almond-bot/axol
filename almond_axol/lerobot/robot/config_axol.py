@@ -18,6 +18,7 @@ from ...robot.config import AxolConfig
 # Registered with draccus so it decodes/validates on the CLI.
 VideoBackend = register_literal(Literal["auto", "gst", "sdk"])
 ActionSpace = register_literal(Literal["joint", "cartesian"])
+CartesianController = register_literal(Literal["jax", "mink"])
 
 
 @RobotConfig.register_subclass("axol")
@@ -46,6 +47,13 @@ class AxolRobotConfig(RobotConfig):
                           kinematics in send_action. Default False.
         left_channel:     SocketCAN interface for the left arm.
         right_channel:    SocketCAN interface for the right arm.
+        cartesian_controller: IK backend for this robot. "jax" (default) is the
+                          Pyroki/JAX solver; "mink" uses Mink IK followed by
+                          the realtime Rust filters, without a Python joint
+                          shaper, plus MuJoCo FK and Mink reset paths. In
+                          collect-data / collect-dagger it must equal the
+                          teleop's ``kinematics_config.backend``; the control
+                          panel's "IK solver" setting sets both.
     """
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
@@ -55,6 +63,7 @@ class AxolRobotConfig(RobotConfig):
     # None preserves the original coupled layout. An explicit override allows
     # measured joint observations and Cartesian policy targets independently.
     action_space: ActionSpace | None = None
+    cartesian_controller: CartesianController = "jax"
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
     video_backend: VideoBackend = "auto"
@@ -164,3 +173,21 @@ class AxolRobotConfig(RobotConfig):
             else:
                 out[name] = (cfg, None)
         return out
+
+
+def require_matching_ik_backend(
+    robot_config: AxolRobotConfig, kinematics_backend: str
+) -> None:
+    """Refuse a session whose robot and teleop name different IK backends.
+
+    Collection sessions carry the backend twice (the robot's Cartesian
+    controller and the teleop's kinematics config). A mismatch would plan
+    resets, record Cartesian actions and track teleop with different solvers.
+    """
+    if robot_config.cartesian_controller != kinematics_backend:
+        raise ValueError(
+            "IK backend mismatch: robot_config.cartesian_controller="
+            f"{robot_config.cartesian_controller!r} but the teleop's "
+            f"kinematics_config.backend={kinematics_backend!r}. Set both to the "
+            "same value (the control panel's IK solver setting does this)."
+        )

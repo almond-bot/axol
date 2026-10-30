@@ -1,38 +1,38 @@
 ---
 title: "Run Your Own Policy"
 sidebarTitle: "Custom Policy"
-description: "Drive Axol with a model that isn't a LeRobot checkpoint: receive joints and camera frames, return action chunks."
+description: "Drive Axol with your own model by serving it behind a small policy server."
 ---
 
-Run Policy and DAgger collection can drive the arms with **your own model**, whatever framework it uses (JAX, a different torch version, a VLA served elsewhere, or a hand-written controller). Wrap it in a small server with the [`almond_axol.policy`](/api/policy) SDK and select `--policy_type custom`. The robot streams it joint state and camera frames, and executes the action chunks it returns. The robot needs only the state/action layout, camera configuration and timing contract; it never loads the model.
+Run Policy and DAgger collection can drive the arms with **your own model**, in any framework. It can be a JAX model, a different PyTorch version, a VLA served elsewhere or a hand-written controller.
+
+1. Wrap the model in a small server with the [`almond_axol.policy`](/api/policy) SDK.
+2. Start Run Policy or DAgger collection with `--policy_type custom`.
+
+The robot sends your server the arm state and camera frames, and runs the action chunks it returns. The robot never loads the model.
 
 ```mermaid
 flowchart LR
   subgraph robot [Robot host]
-    sensors[Timestamped sensors]
-    client[Observation and network worker]
-    control[Plan scheduler and control loop]
-    motors[IK, execution filters and motors]
+    sensors[Cameras and joint sensors]
+    client[Network client]
+    control[Control loop]
+    motors[IK, speed limits and motors]
     sensors --> client
-    control -->|accepted suffix and dispatch reference| client
+    control -->|current plan| client
     control --> motors
   end
-  endpoint[Remote policy endpoint]
-  client -->|compressed observations and references| endpoint
-  endpoint -->|absolute action plan| client
-  client -->|validated reply| control
+  endpoint[Your policy server]
+  client -->|observations and current plan| endpoint
+  endpoint -->|action plan| client
+  client -->|checked reply| control
 ```
 
-The endpoint (your server) owns preprocessing, inference, instruction selection,
-postprocessing and any model-specific history or ensembling. The robot keeps
-executing its accepted plan while inference runs, then adopts the new plan's
-remaining rows at their original execution times. Network waits do not own
-the motor loop. [Timing and continuity](/api/policy-plan#robot-control-loop)
-explain the boundary contract and its limits.
+Your server handles preprocessing, inference, instructions, postprocessing and any blending between chunks. While the server works on a new plan, the robot keeps running the current one. When the new plan arrives, the robot switches to it at the row that is due, so a slow network doesn't stall the arms. See [Timing and continuity](/api/policy-plan#robot-control-loop) for details.
 
 ## Write the policy
 
-Install `almond-axol` wherever the model runs. The base install is enough; LeRobot and torch aren't needed. Subclass [`Policy`](/api/policy) and start it with `serve()`:
+Install `almond-axol` wherever the model runs. The base install is enough. LeRobot and PyTorch aren't needed. Subclass [`Policy`](/api/policy) and start it with `serve()`:
 
 ```python
 # my_policy.py
@@ -67,14 +67,14 @@ serve(MyPolicy("myorg/my-model", "pick the red cube"), host="127.0.0.1", port=87
 
 `infer` returns `T` future targets, one row per control tick, in `spec.action_names` order. See [Action chunks](/api/policy#action-chunks) for the accepted shapes and [State and action names](/api/policy#state-and-action-names) for the layout. If you trained on a dataset from [Data Collection](/operations/data-collection), the names match its `observation.state` and `action` features.
 
-The robot executes each chunk exactly as published and switches to a new one at the row that's due when it arrives. To keep that hand-over smooth, use one of these:
+The robot runs each chunk as sent and switches to a new one at the row that is due when it arrives. To keep that switch smooth, do one of these:
 
 - **Continue the motion in progress.** Condition on `obs.plan`, or at least start near `obs.plan[0]`.
 - **Ensemble on the server.** Use `serve(..., ensemble=0.01)` for an ACT-style chunked policy trained with temporal ensembling.
 
-`serve()` handles the rest of the [interface](/api/policy-plan): it echoes the session contract, caches published plans for continuation, clears them on reset, and relays exceptions to the operator. To implement the endpoint in another language, follow the [interface reference](/api/policy-plan) directly.
+`serve()` handles the rest of the [interface](/api/policy-plan). It confirms the session settings, keeps the plans it sent so `obs.plan` works, clears them on reset, and shows your exceptions to the operator. To write the server in another language, follow the [interface reference](/api/policy-plan).
 
-The model, checkpoint and instruction live in your policy. On the robot, `--task` only labels recorded episodes, and `--policy_path` is not used for custom policies.
+Your policy chooses the model, checkpoint and instruction. On the robot, `--task` only labels recorded episodes, and `--policy_path` is not used.
 
 ## Check it without the robot
 
@@ -84,7 +84,13 @@ With the server running, play the robot's side of a session against it:
 axol policy.check --delay_steps 3
 ```
 
-[`policy.check`](/cli/policy-check) uses the robot's own scheduler on a virtual clock and simulates 3 ticks of reply latency. It reports late replies that would trigger recovery, the endpoint's round-trip time, and the largest jumps where one plan hands over to the next. Match `--cameras`, `--cartesian` and the chunk settings to your robot configuration. `check_policy()` does the same from Python, for unit tests.
+[`policy.check`](/cli/policy-check) runs the robot's scheduler on a simulated clock, here with 3 ticks of reply delay. It reports:
+
+- replies that arrive too late,
+- the server's round-trip time, and
+- the largest jumps where one plan hands over to the next.
+
+Match `--cameras`, `--cartesian` and the chunk settings to your robot. `check_policy()` does the same from Python, for unit tests.
 
 ## Run on the robot host
 
@@ -98,26 +104,25 @@ axol run-policy --policy_type custom \
     --robot_config.cameras "{overhead: {serial: 41234567}}"
 ```
 
-The command connects to the endpoint; it does not spawn a model server.
-Omitting `--server_host` connects to an endpoint already listening on
-`127.0.0.1`. The robot and endpoint must agree on the selected camera, state
-and action schemas before an episode can start.
+The command connects to your server. It doesn't start one. Without `--server_host`, it connects to `127.0.0.1`. An episode can start only when the robot and the server agree on the cameras, state and actions.
 
-In the control panel, assign cameras, select **Run Policy**, choose policy
-type **custom**, and enter the task label. Configure the endpoint under
-**Settings → Inference** and leave the policy path blank (a blank host
-connects to this machine on the configured port, default 8765). The panel
-does not start the endpoint: launch your `serve()` process before pressing
-**Start**. Select the model and instruction on the endpoint; the task only
-labels recordings. The ordinary episode controls and recording options
-remain available. See
-[`run-policy`](/cli/run-policy) for the command's controls and settings.
+To run it from the control panel:
 
-Custom policies use `plan_config.request_interval` (default 5 rows) to schedule inference and `plan_config.max_adoption_offset_steps` (default 6) as the reply deadline.
-The LeRobot `aggregate_fn`, `chunk_size_threshold`, temporal-ensemble and
-chunk-alignment settings do not alter published custom-policy plans.
-Ensembling belongs at the endpoint; downstream execution filtering remains
-on the robot.
+1. Start your `serve()` process. The panel doesn't start it.
+2. Assign the cameras.
+3. Select **Run policy** and choose policy type **custom**.
+4. Enter the task label and leave the policy path blank.
+5. Set the server's host and port under **Settings → Inference**. A blank host means this computer, on port 8765 by default.
+6. Press **Start**.
+
+The usual episode controls and recording options work. See [`run-policy`](/cli/run-policy) for the controls and settings.
+
+Two settings control timing for custom policies:
+
+- `plan_config.request_interval` (default 5) sets how many actions run between requests.
+- `plan_config.max_adoption_offset_steps` (default 6) sets how late a reply may arrive.
+
+The LeRobot chunk settings (`aggregate_fn`, `chunk_size_threshold`, temporal ensembling and chunk alignment) don't change a custom policy's plans. Do any blending on your server. The robot still limits joint speed and acceleration.
 
 ## Collect corrections with DAgger
 
@@ -130,23 +135,18 @@ axol collect-dagger --policy_type custom \
     --robot_config.cameras "{overhead: {serial: 41234567}}"
 ```
 
-Hold either grip to operate that arm; release both to request a fresh policy
-plan. The robot holds the last operator command while waiting, then blends
-back in joint space after IK. Background predictions can continue during
-operator control, but they never command motors. Source changes retain the
-same dataset episode and fence capture so intervention labels remain aligned.
+- Hold either grip to drive that arm.
+- Release both grips to hand back. The robot holds your last command until the policy's new plan arrives, then blends into it.
+- The policy can keep predicting while you drive, but its predictions never move the arms.
+- Taking over and handing back stay within the same episode, and your frames are labeled as interventions.
 
-DAgger has its own endpoint settings; its shared settings inherit from
-`collect-data`, not the run-policy inference category. See
-[`collect-dagger`](/cli/collect-dagger#remote-policies-through-the-custom-policy-interface)
-for configuration, recording, startup homing and terminal soft shutdown.
+DAgger has separate server settings. It reads its shared settings from data collection, not from the **Inference** settings that Run Policy uses. See [`collect-dagger`](/cli/collect-dagger#remote-policies-through-the-custom-policy-interface) for settings, recording, startup homing and shutdown.
 
 ## Failure behavior
 
-A malformed reply, schema mismatch or transport failure stops the custom
-policy path. Expired plans follow `plan_config.late_policy`: abort or hold
-while obtaining fresh plans after a reset. The robot never retimes an expired
-row to make it executable and does not automatically reconnect to resume
-motion. See [Lifecycle and failure](/api/policy-plan#lifecycle-and-failure)
-for the exact behavior and the distinction between a confirmed send and
-physical tracking.
+- A malformed reply, a mismatch in cameras, state or actions, or a lost connection stops the policy.
+- When the plan runs out, `plan_config.late_policy` decides what happens. The default holds the arms and requests a new plan. `abort` ends the session.
+- The robot never stretches an old plan to fill a gap.
+- The robot doesn't reconnect automatically to resume motion.
+
+See [Lifecycle and failure](/api/policy-plan#lifecycle-and-failure) for details.

@@ -582,8 +582,8 @@ class JellyLink:
         link.device.channel = channel
         if not (_SYS_NET / channel).exists():
             raise RuntimeError(
-                f"Jelly {link.name} bus {channel} not found — is its CAN adapter "
-                "plugged in? Run CAN discovery or `axol can.setup`."
+                f"Jelly {link.name} bus {channel} not found. Check that its CAN "
+                "adapter is plugged in, then run CAN discovery or `axol can.setup`."
             )
         if not iface_up(channel):
             bring_up_interfaces([channel])

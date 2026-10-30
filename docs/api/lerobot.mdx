@@ -3,14 +3,13 @@ title: "almond_axol.lerobot"
 description: "LeRobot-compatible Robot, Teleoperator, and Camera wrappers for the Axol hardware."
 ---
 
-LeRobot-compatible wrappers for the Axol hardware. Requires the `lerobot` extra. These classes implement the LeRobot `Robot`, `Teleoperator`, and `Camera` interfaces so the Axol works with any LeRobot training or data-collection pipeline without modification. The [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) CLI commands are built on top of this layer.
+LeRobot-compatible wrappers for the Axol hardware. They need the `lerobot` extra. These classes implement the LeRobot `Robot`, `Teleoperator` and `Camera` interfaces, so Axol works with any LeRobot training or data-collection pipeline. The [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) commands are built on them.
 
 <Warning>
-  Treat policy checkpoints and existing LeRobot datasets as trusted input. The
-  pinned upstream runtime parses dataset metadata and deserializes model files;
-  it is not a sandbox for arbitrary Hub repositories or directories supplied by
-  someone else. Only load artifacts you created or obtained from a source you
-  trust, especially on a machine connected to robot hardware.
+  Treat policy checkpoints and LeRobot datasets as trusted input. LeRobot
+  reads dataset metadata and loads model files without a sandbox. Only load
+  checkpoints and datasets you created or got from a source you trust,
+  especially on a computer connected to the robot.
 </Warning>
 
 ```python
@@ -21,7 +20,7 @@ from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
 
 ## Use with the stock LeRobot CLIs
 
-`almond-axol` is published to PyPI, and the companion **`lerobot_robot_axol`** plugin registers these wrappers through LeRobot's plugin auto-discovery — so the **stock** LeRobot CLIs (`lerobot-teleoperate`, `lerobot-record`, `lerobot-replay`, …) drive the Axol with no changes to LeRobot itself. Installing the plugin pulls in `almond-axol[lerobot]`; then select the devices by `type`:
+The **`lerobot_robot_axol`** plugin on PyPI registers these wrappers with LeRobot, so the stock LeRobot CLIs (`lerobot-teleoperate`, `lerobot-record`, `lerobot-replay` and others) can drive Axol. Installing the plugin also installs `almond-axol[lerobot]`. Then select the devices by `type`:
 
 ```bash
 pip install lerobot_robot_axol
@@ -42,21 +41,21 @@ lerobot-record \
 | Teleoperator | `axol_vr` | [`AxolVRTeleop`](#axolvrteleop) |
 | Camera | `zed` | [`ZedCamera`](#zedcamera) |
 
-Teleoperation still uses the VR headset — open the [VR app](/operations/teleop) and connect to the robot machine. For the highest-rate data collection (out-of-process ZED capture, on-Jetson NVENC dataset encoding, headset video streaming), prefer the SDK's own [`collect-data`](/cli/collect-data) / [`run-policy`](/cli/run-policy), which are built on these same classes.
+Teleoperation still uses the VR headset: open the [VR app](/operations/teleop) and connect to the Host Computer. For the best data collection performance, use [`collect-data`](/cli/collect-data) and [`run-policy`](/cli/run-policy) instead. They add ZED capture in a separate process, NVENC dataset encoding on the Jetson, and video streaming to the headset.
 
 <Note>
-  Requires the pinned LeRobot 0.6.1 release, Linux, and Python 3.12+ (the hosted installer bundles 3.13) on the robot machine; the `zed` camera additionally needs `pyzed` ([`zed.install`](/cli/zed-install)). See the [plugin README](https://github.com/almond-bot/axol/tree/main/plugins/lerobot_robot_axol) for adding it to an existing one-command-install `axol` environment.
+  The plugin needs LeRobot 0.6.1, Linux and Python 3.12 or later on the Host Computer. The hosted installer includes Python 3.13. The `zed` camera also needs `pyzed` ([`zed.install`](/cli/zed-install)). To add the plugin to an `axol` environment from the one-command installer, see the [plugin README](https://github.com/almond-bot/axol/tree/main/plugins/lerobot_robot_axol).
 </Note>
 
-When installed from PyPI into the hosted Axol environment, the plugin's exact
-version is preserved automatically across installer/control-panel Axol updates.
-A direct, VCS, or otherwise customized plugin install instead blocks the hosted
-force update before mutation; update that deployment manually with an explicit
-plan for the same source.
+If you install the plugin from PyPI into the hosted Axol environment, Axol
+updates from the installer or the control panel keep the same plugin version.
+If you installed it any other way, such as from a local path or a Git URL, the
+hosted update stops before it changes anything. Update that environment by
+hand, from the same source.
 
 ## `AxolRobot`
 
-LeRobot `Robot` wrapping the async `Axol` hardware driver. A background thread runs a dedicated asyncio event loop so motor telemetry keeps streaming while the synchronous `get_observation()` and `send_action()` calls block on the calling thread.
+LeRobot `Robot` that wraps the async `Axol` hardware driver. A background thread runs an asyncio event loop, so motor telemetry keeps streaming while the synchronous `get_observation()` and `send_action()` calls block the calling thread.
 
 ```python
 from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
@@ -71,7 +70,7 @@ config = AxolRobotConfig(
 )
 with AxolRobot(config) as robot:
     obs = robot.get_observation()           # joints + camera frames
-    joint_obs = robot.get_joint_observation()  # joints only — use in tight control loops
+    joint_obs = robot.get_joint_observation()  # joints only, for tight control loops
     robot.send_action(obs)                  # hold current position
 ```
 
@@ -79,27 +78,41 @@ with AxolRobot(config) as robot:
 
 | Field | Default | Description |
 |---|---|---|
-| `cameras` | `{}` | `ZedCameraConfig` instances keyed by name, each opening a locally attached ZED camera by serial number. A camera with `stereo=True` expands into two observation keys, `<name>_left` / `<name>_right`, backed by a single grab (see `ZedStereoCamera` below). |
-| `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
-| `observe_torques` | `False` | Include joint torques in `observation.state` |
-| `observe_cartesian` | `False` | Work in Cartesian end-effector space instead of 16 joint positions: observations report per-arm 6-axis EE poses (+ gripper) via FK, and `send_action()` accepts the same and resolves it to joint targets via IK |
-| `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |
-| `right_channel` | `"can_alm_axol_r"` | SocketCAN interface for the right arm |
-| `video_backend` | `"auto"` | Camera capture backend: `"gst"` (GPU-resident zed-gstreamer pipeline, low latency), `"sdk"` (ZED Python SDK), or `"auto"` (prefer `gst` when its stack is installed, else fall back to the SDK). Collection and inference must use the same backend: the two paths deliver visibly different frames. |
+| `cameras` | `{}` | `ZedCameraConfig` instances keyed by name. Each opens a local ZED camera by serial number. A stereo camera can expose one or both eyes (see [`ZedStereoCamera`](#zedstereocamera)). |
+| `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters passed to the hardware driver. |
+| `observe_torques` | `False` | Include joint torques in `observation.state`. |
+| `observe_cartesian` | `False` | Use each arm's 6-axis end-effector pose and gripper instead of 16 joint positions. Observations come from FK, and `send_action()` resolves poses to joint targets with IK. |
+| `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm. |
+| `right_channel` | `"can_alm_axol_r"` | SocketCAN interface for the right arm. |
+| `video_backend` | `"auto"` | Camera capture backend: `"gst"` (GPU pipeline, low latency), `"sdk"` (ZED Python SDK), or `"auto"` (`gst` when installed, otherwise the SDK). Use the same backend for collection and inference, because their frames look different. |
 
 ### Key methods
 
 | Method | Description |
 |---|---|
-| `get_observation()` | Returns fresh camera frames paired with the nearest sample from the Rust core's 240 Hz timestamped state history (+ torques if enabled) |
-| `get_observation_with_capture_timestamp()` | Returns that synchronized observation plus its median sensor-exposure time on the `perf_counter` clock |
-| `get_joint_observation()` | Returns joint positions only — no camera reads; use in the high-frequency teleop path |
-| `send_action(action)` | Sends joint position targets — or, with `observe_cartesian`, per-arm Cartesian EE poses resolved to joint targets via IK — via impedance control (arm) and position-force control (gripper) |
-| `positions` | `(left, right)` cached arm positions from telemetry, each shape `(8,)` |
+| `get_observation()` | Returns new camera frames with the nearest robot state, plus torques if enabled. See [Frame and state timing](#frame-and-state-timing). |
+| `get_observation_with_capture_timestamp()` | Returns the same observation and its median camera exposure time on the `perf_counter` clock. |
+| `get_joint_observation()` | Returns joint positions only, with no camera reads. Use it in fast teleop loops. |
+| `send_action(action)` | Sends joint position targets, or end-effector poses with `observe_cartesian`. The arms use impedance control and the grippers use position-force control. |
+| `positions` | `(left, right)` arm positions from the latest telemetry, each shape `(8,)`. |
+
+### Frame and state timing
+
+`get_observation()` picks the camera frames first, then the robot state that matches them. It never waits for a new exposure:
+
+1. It finds the newest exposure time that every camera has already delivered.
+2. For each camera, it takes the stored frame nearest that time. Shared-memory readers keep a short history of frames for this (`latest_capture_ts()`, `read_nearest(target, tolerance_s)`). An in-process reader gives its newest frame.
+3. From the realtime core's 240 Hz state history, it takes the joint state nearest the frames' median exposure time. FK, if enabled, runs after this.
+
+It never returns the same frame set twice, so a loop faster than the cameras waits at most one frame period. It raises an error instead of returning mismatched data when:
+
+- a camera has gone silent (its newest frame is a couple of frame periods old),
+- no state samples fall on both sides of the frame time,
+- the cameras and the state are too far apart in time.
 
 ## `AxolVRTeleop`
 
-LeRobot `Teleoperator` wrapping `VRTeleop`. Runs the VR WebSocket server and IK subprocess on a background thread so `get_action()` is non-blocking and safe to call from any thread.
+LeRobot `Teleoperator` that wraps `VRTeleop`. It runs the VR WebSocket server and the IK process on a background thread, so `get_action()` doesn't block and is safe to call from any thread.
 
 ```python
 from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
@@ -117,71 +130,81 @@ while True:
 
 | Field | Default | Description |
 |---|---|---|
-| `vr_teleop_config` | `VRTeleopConfig()` | Rest poses, IK frequency, filter parameters — see [`almond_axol.teleop`](/api/teleop) |
-| `kinematics_config` | `KinematicsConfig()` | IK solver weights — see [`almond_axol.kinematics`](/api/kinematics) |
-| `vr_server_config` | `VRServerConfig()` | WSS port and TLS certificate paths — see [`almond_axol.vr`](/api/vr) |
+| `vr_teleop_config` | `VRTeleopConfig()` | Rest poses, IK rate and filter settings. See [`almond_axol.teleop`](/api/teleop). |
+| `kinematics_config` | `KinematicsConfig()` | IK solver weights. See [`almond_axol.kinematics`](/api/kinematics). |
+| `vr_server_config` | `VRServerConfig()` | WSS port and TLS certificate paths. See [`almond_axol.vr`](/api/vr). |
 
 ### Key methods
 
 | Method | Description |
 |---|---|
-| `get_action()` | Returns the latest smoothed joint positions as a LeRobot `RobotAction` dict |
-| `get_teleop_events()` | Returns and clears latched episode-control events (`start_recording`, `TERMINATE_EPISODE`, `RERECORD_EPISODE`) |
-| `request_reset()` | Triggers a collision-aware trajectory back to the rest pose |
-| `is_resetting` | `True` while the reset move is pending or in progress |
-| `send_feedback_state(state)` | Broadcasts a `VRState` override (e.g. `SAVING`) to all connected VR headsets |
+| `get_action()` | Returns the latest smoothed joint positions as a LeRobot `RobotAction` dict. |
+| `get_teleop_events()` | Returns and clears pending episode events (`start_recording`, `TERMINATE_EPISODE`, `RERECORD_EPISODE`). |
+| `request_reset()` | Starts a collision-aware move back to the rest pose. |
+| `is_resetting` | `True` while the reset move is pending or running. |
+| `send_feedback_state(state)` | Sends a `VRState` override, such as `SAVING`, to all connected headsets. |
 
 ## `ZedCamera`
 
-LeRobot `Camera` for a **locally attached** ZED camera. Opens the camera by serial number via the ZED SDK and grabs frames in a background thread. Requires `pyzed` ([`zed.install`](/cli/zed-install)).
+LeRobot `Camera` for a ZED camera attached to this computer. It opens the camera by serial number through the ZED SDK and grabs frames on a background thread. It needs `pyzed` ([`zed.install`](/cli/zed-install)).
 
 ```python
 from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
 
 cam = ZedCamera(ZedCameraConfig(serial=41234567))
 cam.connect()
-frame = cam.read_latest()   # shape (H, W, 3), non-blocking, returns most recent frame
+frame = cam.read_latest()   # newest frame, shape (H, W, 3), non-blocking
 cam.disconnect()
 ```
 
-Each grabbed frame carries two timestamps on the local `perf_counter` clock: `capture_perf_ts` (when the sensor exposed the frame, derived from `TIME_REFERENCE.IMAGE`) and `receive_perf_ts` (when this process retrieved it). Since capture is local, both live on the same clock — no cross-machine sync needed. The retrieve-vs-capture skew is sampled on `connect()` and a warning is logged if the mean falls outside the expected range.
+Each frame carries two timestamps on the local `perf_counter` clock:
+
+- `capture_perf_ts`: when the sensor exposed the frame (from `TIME_REFERENCE.IMAGE`).
+- `receive_perf_ts`: when this process retrieved it.
+
+On `connect()`, the camera measures the gap between the two and logs a warning if the average is outside the expected range.
 
 | Method | Description |
 |---|---|
-| `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
-| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
-| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Collection retains the returned exposure PTS and selects robot state on that same timeline. |
-
-Policy observations do not sample joints before choosing images. `AxolRobot.get_observation()` never waits for an exposure after "now" (each camera pipeline adds its own latency, and waiting it out per camera is what ran the policy loop at a few Hz): it anchors on the newest exposure every camera has *already* delivered and takes each camera's retained frame nearest that anchor — the relay's shared-memory readers keep a short ring of exposures for this (`latest_capture_ts()` / `read_nearest(target, tolerance_s)`), an in-process reader contributes its newest frame. The same frame set is never served twice, so a loop faster than the cameras blocks for at most one frame period. The Rust realtime core retains a bounded 240 Hz feedback history; the frames' median sensor-exposure time selects the nearest state (in joint space, before optional FK). A silent camera (newest frame a couple of periods old), an unbracketed state, and excessive camera/state skew raise instead of silently producing a train/inference timing mismatch.
+| `read_latest(max_age_ms=500)` | Newest frame, without blocking. Raises `TimeoutError` if it is older than `max_age_ms`. |
+| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the newest frame. |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Blocks until a frame with `capture_perf_ts >= target` is available. |
 
 ## `ZedStereoCamera`
 
-Wrapper for a **stereo ZED X**. Opens one SDK connection and, on every grab, retrieves both eyes — so the camera is grabbed once. The eyes are exposed as `left_view` / `right_view`, which present the same read API as `ZedCamera` so the rest of the pipeline can treat them as ordinary cameras.
+Wrapper for a stereo ZED X. It opens one SDK connection and gets both eyes from each grab. The eyes are exposed as `left_view` and `right_view`, which have the same read methods as `ZedCamera`, so the rest of the pipeline treats them as ordinary cameras.
 
 ```python
 from almond_axol.lerobot.camera import ZedStereoCamera, ZedCameraConfig
 
 stereo = ZedStereoCamera(ZedCameraConfig(serial=41234569, stereo=True))
 stereo.connect()
-left = stereo.left_view.read_latest()    # (H, W, 3) — left eye
-right = stereo.right_view.read_latest()  # (H, W, 3) — right eye
+left = stereo.left_view.read_latest()    # (H, W, 3), left eye
+right = stereo.right_view.read_latest()  # (H, W, 3), right eye
 stereo.disconnect()
 ```
 
-When an `AxolRobot` camera config has `stereo=True`, the observation keys depend on `eyes` (see `AxolRobotConfig.observation_cameras()`): `"both"` expands camera `X` into `X_left` / `X_right` (the head camera records both eyes in the dataset), while `"left"` / `"right"` exposes a single eye under the plain name `X` — indistinguishable downstream from a mono camera (the wrist convention). Stereo is auto-promoted from the serial by `AxolRobotConfig.apply_detected_stereo()` — `collect-data` / `run-policy` call it so a stereo ZED X opens correctly without setting `stereo` by hand.
+When an `AxolRobot` camera has `stereo=True`, its `eyes` setting decides the observation keys (see `AxolRobotConfig.observation_cameras()`):
+
+- `"both"`: camera `X` becomes `X_left` and `X_right`, and the dataset records both eyes. This is the default for the overhead camera.
+- `"left"` or `"right"`: that eye only, under the plain name `X`, so it looks like a mono camera. This is the default for wrist cameras.
+
+You rarely set `stereo` or `eyes` by hand. `collect-data` and `run-policy` call `AxolRobotConfig.apply_detected_stereo()`, which detects a stereo ZED X from its serial and sets `eyes` to `"both"` for the overhead camera and `"left"` for the others.
+
+`stream_eyes` sets which eyes go to the headset, separately from what is recorded. For example, stream `"both"` for depth during teleop while recording only `"left"`.
 
 ### `ZedCameraConfig` fields
 
 | Field | Default | Description |
 |---|---|---|
-| `serial` | `0` | Serial number of the camera to open. `0` is the "unassigned" sentinel: `collect-data` / `run-policy` seed all three slots and drop the ones left at `0` (`AxolRobotConfig.select_assigned_cameras()`), so you only assign the cameras you have (at least one). A real ZED serial is positive. List connected cameras with [`list_zed_devices()`](/api/zed). |
-| `fps` | `60` | Capture frame rate. `None` adopts the camera default on connect. |
-| `width` | `960` | Frame width (SVGA). With `height`, must name a supported ZED resolution (`SVGA` 960×600, `HD1080` 1920×1080, `HD1200` 1920×1200). `None` auto-detects on connect. |
+| `serial` | `0` | Serial number of the camera to open. `0` means unassigned, and `collect-data` and `run-policy` skip it, so set only the cameras you have (at least one). List connected cameras with [`list_zed_devices()`](/api/zed). |
+| `fps` | `60` | Capture frame rate. `None` uses the camera's default. |
+| `width` | `960` | Frame width. With `height`, it must name a supported ZED resolution: `SVGA` 960×600, `HD1080` 1920×1080 or `HD1200` 1920×1200. `None` detects it on connect. |
 | `height` | `600` | Frame height (SVGA). |
 | `color_mode` | `RGB` | Output color channel order. |
-| `warmup_s` | `1` | Seconds to read frames during `connect()` before returning |
-| `stereo` | `False` | Open the camera as a stereo ZED X carrying both eyes on one grab. Auto-detected from the serial at startup (`apply_detected_stereo()`), so it's rarely set by hand. |
-| `eyes` | `"both"` | Which eye(s) of a stereo camera to expose as **recorded** observations: `"both"` → `X_left` and `X_right` (the head convention); `"left"` / `"right"` → that single eye under the **plain** name `X`, so it looks like a mono camera downstream (the wrist convention). `apply_detected_stereo()` sets this to `"both"` for the overhead and `"left"` for any other slot. Ignored when `stereo=False`. |
-| `stream_eyes` | `None` | Which eye(s) of a stereo camera to **stream** to the headset, independently of `eyes`. `None` follows `eyes` (the coupled default); set it to decouple the headset feed from the recording — e.g. stream `"both"` for depth in teleop while recording only `"left"`. Honored by the collect-data / teleop relay only (`run-policy` streams no video). Ignored when `stereo=False`. |
-| `record` | `True` | Whether this camera is recorded to the dataset at all. `False` drops it from `observation_cameras()` while still allowing it to stream. |
-| `stream` | `True` | Whether this camera is streamed to the headset at all. `False` drops it from the relay's encoded feed while still allowing it to be recorded. |
+| `warmup_s` | `1` | Seconds to read frames during `connect()` before returning. |
+| `stereo` | `False` | Open the camera as a stereo ZED X, with both eyes from one grab. Detected from the serial at startup. |
+| `eyes` | `"both"` | Which eyes of a stereo camera to record: `"both"`, `"left"` or `"right"`. See [`ZedStereoCamera`](#zedstereocamera). Ignored when `stereo=False`. |
+| `stream_eyes` | `None` | Which eyes of a stereo camera to stream to the headset. `None` follows `eyes`. Used by `collect-data` and `teleop` only, since `run-policy` streams no video. |
+| `record` | `True` | Whether to record this camera to the dataset. With `False` it can still stream. |
+| `stream` | `True` | Whether to stream this camera to the headset. With `False` it can still be recorded. |

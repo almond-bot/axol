@@ -72,7 +72,8 @@
             "root": "operations/run-policy",
             "pages": [
               "operations/run-policy-config",
-              "operations/custom-policy"
+              "operations/custom-policy",
+              "operations/mink"
             ]
           },
           {
@@ -108,7 +109,7 @@
             ]
           },
           "guides/diagnostics-dashboard",
-          "guides/robot-calibration",
+          "guides/axol-calibration",
           "guides/vr-interface",
           "guides/quest-over-usb",
           "guides/quest-headless"
@@ -143,6 +144,7 @@
                   "cli/serve",
                   "cli/provision",
                   "cli/rt-install",
+                  "cli/ik-warm",
                   "cli/jetson-setup"
                 ]
               },
@@ -184,6 +186,12 @@
                   "cli/zed-driver",
                   "cli/gst-install",
                   "cli/gst-build-zed"
+                ]
+              },
+              {
+                "group": "Mantis",
+                "pages": [
+                  "cli/mantis-update"
                 ]
               },
               {

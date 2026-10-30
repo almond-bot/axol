@@ -38,11 +38,19 @@ _EXPECTED_TRACKERS = 2
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``tracker.lighthouse.check`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "tracker.lighthouse.check",
         help="Check that every Lighthouse base station is seen on its own channel "
         "and both trackers report.",
-    ).set_defaults(func=run_check)
+    )
+    parser.add_argument(
+        "--expected_stations",
+        type=int,
+        choices=range(1, 5),
+        default=None,
+        help="Number of installed base stations (1–4; default: saved count).",
+    )
+    parser.set_defaults(func=run_check)
 
 
 def _result(level: str, label: str, detail: str) -> None:
@@ -140,8 +148,34 @@ def report_survey(survey: LighthouseSurvey) -> int:
     return failures
 
 
+def _source_details(source, survey: LighthouseSurvey) -> list[str]:  # type: ignore[no-untyped-def]
+    """Explain discovery versus localization before stopping the native owner."""
+    details: list[str] = []
+    discover = getattr(source, "discovered_tracker_serials", None)
+    if callable(discover) and len(survey.trackers) < _EXPECTED_TRACKERS:
+        identities = discover()
+        details.append(
+            "Hardware identities detected: " + (", ".join(sorted(identities)) or "none")
+        )
+        if len(identities) >= _EXPECTED_TRACKERS:
+            details.append(
+                "Both trackers were detected, but not both produced a fresh pose. "
+                "Check visibility and calibration; this does not by itself mean "
+                "pairing was lost."
+            )
+    warnings = getattr(source, "warnings", None)
+    if callable(warnings):
+        details.extend(f"Backend warning: {reason}" for reason in warnings()[-6:])
+    quality = getattr(source, "tracking_quality", None)
+    report = quality() if callable(quality) else None
+    if report is not None:
+        details.extend(f"Tracking check: {reason}" for reason in report["reasons"])
+    return details
+
+
 def run_check(_args: object = None) -> None:
     """Survey base stations and trackers, persist it, and fail on a clash."""
+    from ..tracker.config import load_tracker_config, save_tracker_config
     from ..tracker.survive import SurviveSource
     from .mantis_bridge import require_mantis_tracker_readiness
 
@@ -151,7 +185,19 @@ def run_check(_args: object = None) -> None:
         raise SystemExit(str(exc)) from None
 
     print("Lighthouse base-station check", flush=True)
-    source = SurviveSource()
+    config = load_tracker_config()
+    expected_stations = getattr(_args, "expected_stations", None)
+    if expected_stations is not None:
+        config.expected_base_stations = expected_stations
+        save_tracker_config(config)
+    # Standard mode lets libsurvive calibrate a new or re-channelled room
+    # during the check (as Identify and collection do); strict mode keeps the
+    # saved geometry fixed until an explicit Recalibrate.
+    source = SurviveSource(
+        expected_stations=config.expected_base_stations,
+        allow_frame_refinement=True,
+        strict=config.lighthouse_quality == "strict",
+    )
     try:
         source.start()
         print(
@@ -163,16 +209,22 @@ def run_check(_args: object = None) -> None:
             source,
             on_calibrating=lambda live: print(
                 f"{live} base station(s) live but the trackers are not reporting "
-                "yet: libsurvive is calibrating. Keep both trackers still and in "
+                "yet: station identity acquisition or localization is pending. "
+                "Keep both trackers still and in "
                 f"view; listening for up to {_CALIBRATION_S:.0f} s in total...",
                 flush=True,
             ),
         )
+        survey.expected = config.expected_base_stations
+        details = _source_details(source, survey)
     finally:
         source.stop()
 
     save_lighthouse_survey(survey)
     failures = report_survey(survey)
+    if failures:
+        for detail in details:
+            print(f"     {detail}", flush=True)
     print(f"Saved to {LIGHTHOUSE_SURVEY_FILE}", flush=True)
     if failures:
         raise SystemExit(1)

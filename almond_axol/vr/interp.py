@@ -325,10 +325,11 @@ class PoseInterpolator:
             kind, value, worst, count = late_event
             if kind == "late":
                 _logger.warning(
-                    "VR pose stream arriving %.1fs late (network stall between "
-                    "the headset and this host); holding the arms instead of "
-                    "replaying the delayed motion",
+                    "VR pose stream arriving %.1fs late (source=%s; capture "
+                    "or delivery delay); pose timestamps remain unchanged "
+                    "for freshness checks",
                     value,
+                    frame.pose_source_kind or "unspecified",
                 )
             else:
                 _logger.warning(
@@ -604,11 +605,12 @@ class PoseInterpolator:
                     return None
                 # Preserve identity for the IK skip while advancing the
                 # capture heartbeat to this equal-valued rendered sample.
-                # Only timestamp/seq metadata changes; pose/control equality
-                # was proven above.
+                # Diagnostics advance independently of motion; the raw frame
+                # callback also delivers them without waiting for an IK solve.
                 last_out.t = rendered.t
                 last_out.t_host = rendered.t_host
                 last_out.seq = rendered.seq
+                last_out.tracking_quality = rendered.tracking_quality
                 self._tracking_loss_delivered["left"] = max(
                     self._tracking_loss_delivered["left"], loss_seq_l
                 )
@@ -1044,6 +1046,7 @@ def _build_frame(
         r_tracked=r_tracked,
         l_trigger_live=latest.l_trigger_live,
         r_trigger_live=latest.r_trigger_live,
+        tracking_quality=latest.tracking_quality,
         # Cart input is control state, not delayed motion. Preserve the newest
         # thumbstick/click values exactly so interpolation cannot neutralize a
         # drive command or keep a stale lift command alive (the IK worker also

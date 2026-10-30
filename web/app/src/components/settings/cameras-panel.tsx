@@ -2,6 +2,7 @@ import { useState } from "react"
 import { CameraOff, Loader2, RotateCw } from "lucide-react"
 import {
   apiUrl,
+  cameraSerials,
   restartCameraDaemon,
   RESOLUTION_OFF,
   type BranchSel,
@@ -25,6 +26,7 @@ const AXOL_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
 ]
 
 const MANTIS_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
+  { key: "overhead", label: "Head" },
   { key: "left_arm", label: "Left Mantis" },
   { key: "right_arm", label: "Right Mantis" },
 ]
@@ -56,7 +58,7 @@ export function CamerasPanel({
   onRefresh,
 }: {
   spec: CameraSpec
-  /** Show the two-camera Mantis assignment instead of the Axol layout. */
+  /** Show the Mantis head and wrist assignments instead of the Axol layout. */
   mantisMode: boolean
   onChange: (spec: CameraSpec) => void
   /** Detected ZED devices (shared with the badge; null until first detection). */
@@ -78,12 +80,7 @@ export function CamerasPanel({
   }
 
   const cameraSlots = mantisMode ? MANTIS_CAMERA_SLOTS : AXOL_CAMERA_SLOTS
-  const serials: Partial<Record<CameraSlot, string>> = mantisMode
-    ? (spec.mantis_serials ?? {
-        left_arm: spec.serials.left_arm,
-        right_arm: spec.serials.right_arm,
-      })
-    : spec.serials
+  const serials = cameraSerials(spec, mantisMode)
   const streamResolution = spec.stream_resolution || spec.resolution || "SVGA"
   const recordResolution = spec.record_resolution || "SVGA"
   const stream = spec.stream ?? {}
@@ -149,6 +146,7 @@ export function CamerasPanel({
       onChange({
         ...spec,
         mantis_serials: {
+          overhead: next.overhead ?? "",
           left_arm: next.left_arm ?? "",
           right_arm: next.right_arm ?? "",
         },
@@ -169,10 +167,10 @@ export function CamerasPanel({
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
         {mantisMode
-          ? "Assign the two ZED cameras connected to this machine to the left and right Mantis. This mapping is stored separately from the Axol camera layout."
-          : "Assign the ZED cameras connected to this machine to their Axol slots."}{" "}
-        Then choose what each one is used for. Collect data and run policy need at least one camera
-        recording; teleop streams whichever are set to the headset.
+          ? "Assign the cameras connected to this host to the head and to each Mantis. This layout is separate from Axol's."
+          : "Assign the cameras connected to this host to their places on Axol."}{" "}
+        Then choose what each camera does. Collect data and Run policy need at least one camera set
+        to Record. Teleoperation sends the cameras set to Stream to the headset.
       </p>
 
       <div className="flex flex-col gap-2">
@@ -184,7 +182,7 @@ export function CamerasPanel({
               size="sm"
               onClick={refresh}
               disabled={detecting || restarting}
-              title="Re-query the ZED daemon's current device list and grab fresh preview frames. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
+              title="Refresh the camera list and previews."
             >
               {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
               Refresh
@@ -194,10 +192,10 @@ export function CamerasPanel({
               size="sm"
               onClick={restartDaemon}
               disabled={detecting || restarting}
-              title="Restart the ZED X daemon so it re-scans the GMSL links — needed to pick up any camera plugged in or unplugged since boot"
+              title="Restart the camera service to detect cameras you plugged in or unplugged."
             >
               {restarting ? <Loader2 className="animate-spin" /> : null}
-              Restart daemon
+              Restart camera service
             </Button>
           </div>
         </div>
@@ -205,8 +203,8 @@ export function CamerasPanel({
           <p className="text-xs text-white/35">Detecting…</p>
         ) : devices.length === 0 ? (
           <p className="text-xs text-white/35">
-            No cameras detected. Check the GMSL cables, or restart the daemon if a camera was
-            plugged in after boot.
+            No cameras found. Check the camera cables. If you plugged a camera in after startup,
+            press Restart camera service.
           </p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
@@ -242,21 +240,21 @@ export function CamerasPanel({
         <ResolutionSelect
           id="camera-stream-resolution"
           label="Streaming resolution"
-          hint="Capture resolution sent to the headset (Off disables streaming)"
+          hint="Resolution sent to the headset, or Off to stop streaming."
           value={streamResolution}
           onChange={(v) => onChange({ ...spec, stream_resolution: v })}
         />
         <ResolutionSelect
           id="camera-record-resolution"
           label="Recording resolution"
-          hint="Dataset video is downscaled to this (Off disables recording)"
+          hint="Resolution saved in the dataset, or Off to stop recording."
           value={recordResolution}
           onChange={(v) => onChange({ ...spec, record_resolution: v })}
         />
       </div>
 
       <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-        <Label>{mantisMode ? "Mantis cameras" : "Axol Cameras"}</Label>
+        <Label>{mantisMode ? "Mantis cameras" : "Axol cameras"}</Label>
         {cameraSlots.map((slot) => {
           const serial = serials[slot.key]?.trim() ?? ""
           const kind = kindBySerial.get(serial)
@@ -339,8 +337,8 @@ function KindBadge({ kind }: { kind: string }) {
       className="rounded border border-white/15 bg-white/[0.03] px-1.5 py-0.5 text-[10px] tracking-wide text-white/55 uppercase"
       title={
         kind === "stereo"
-          ? "Stereo ZED X (both eyes from one grab) — detected automatically"
-          : "Mono ZED-X One — detected automatically"
+          ? "Stereo camera (ZED X), detected automatically"
+          : "Mono camera (ZED X One), detected automatically"
       }
     >
       {kind}

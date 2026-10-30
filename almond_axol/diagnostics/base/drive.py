@@ -240,15 +240,14 @@ def main(argv: list[str] | None = None) -> None:
         "--hold-kp",
         type=float,
         default=60.0,
-        help="Position stiffness (Nm/rad) of the parked MIT hold; "
-        "0 disables parking (default: 60)",
+        help="Stiffness (Nm/rad) of the position hold; 0 brakes only (default: 60)",
     )
     parser.add_argument(
         "--hold-kd",
         type=float,
         default=1.5,
-        help="Damping (Nm·s/rad) of the parked MIT hold; must be > 0 "
-        "when hold-kp > 0 (default: 1.5)",
+        help="Damping (Nm·s/rad) of the park hold, at most 5; 0 disables parking "
+        "(default: 1.5)",
     )
     parser.add_argument(
         "--joystick",
@@ -269,7 +268,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--lift-channel",
         default=JellyConfig.lift_channel,
-        help="SocketCAN interface carrying the jelly_legs lift controller "
+        help="CAN interface for the Jelly lift controller "
         f"(default: {CAN_CHEST} when that chest bus exists, otherwise the "
         f"wheel bus {CAN_BASE} the lift shares with the motors)",
     )

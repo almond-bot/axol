@@ -1,0 +1,107 @@
+---
+title: "Mink IK"
+description: "Use the Mink IK solver for teleoperation, data collection and custom policies."
+---
+
+Axol ships with two IK solvers: JAX (Pyroki), the default, and Mink, which uses MuJoCo. Every install has both, and you switch between them with one setting. In a Mink session, Mink handles tracking, the move to rest at startup, returns to rest between episodes and parking at shutdown.
+
+## Select the backend
+
+In the control panel, open **Settings → Kinematics → IK solver** and choose `mink`. Choose `jax` to switch back. The setting applies to every operation you start from the panel. It is stored as `kinematics.backend` in `~/.almond/settings.json`.
+
+On the CLI or in a `--config_path` file, set these fields yourself:
+
+| Operation | Fields to set |
+| --- | --- |
+| `teleop` | `kinematics.backend` |
+| `collect-data`, `collect-dagger` | `teleop_config.kinematics_config.backend` and `robot_config.cartesian_controller` |
+| `run-policy`, `replay-dataset` | `robot_config.cartesian_controller` |
+
+For example, `axol teleop --kinematics.backend mink`. Data collection and DAgger refuse to start when `kinematics_config.backend` and `cartesian_controller` differ. In the SDK, pass `KinematicsConfig(backend="mink")` to teleop and `AxolRobotConfig(cartesian_controller="mink")` to `AxolRobot`.
+
+## What changes with Mink
+
+- **Solver settings.** The JAX solver settings don't apply to Mink. These include the position, orientation and elbow weights, `max_joint_delta` and the Mantis profile. A nonzero `elbow_weight` is ignored with a warning, and box mode runs without its elbow hints.
+- **Policy commands.** With Mink, policy commands go straight to the realtime controller, without the extra joint filtering JAX uses. The arms follow the targets as sent. The controller's watchdog and command checks still apply. Expect the arms to move differently than with JAX, and test on the robot after you switch.
+- **Solve rate.** Mink is tuned for 30 Hz by default. `run-policy` and `collect-dagger` pass their `fps` to Mink, and teleop passes its IK rate. In the SDK, pass `AxolRobot(config, mink_solve_hz=60)` for a 60 Hz policy. The rate is fixed when the robot is created. Check on the robot that the solver keeps up at your rate.
+- **Coordinate frames.** Cartesian actions and observations use Axol's world frame and the gripper-link pose.
+
+## Run a Cartesian custom policy
+
+A Cartesian policy needs `robot_config.action_space: "cartesian"`. `observe_cartesian` sets how observations are recorded, separately from the actions. For example, a custom Cartesian policy can use this configuration:
+
+```json
+{
+  "policy_type": "custom",
+  "task": "local recording label",
+  "server_host": "gpu-desktop",
+  "server_port": 8765,
+  "fps": 30,
+  "actions_per_chunk": 30,
+  "episode_time_s": 0,
+  "soft_park_on_quit": true,
+  "reset_torque_threshold": 4.0,
+  "plan_config": {
+    "request_interval": 10,
+    "max_adoption_offset_steps": 6
+  },
+  "robot_config": {
+    "type": "axol",
+    "observe_cartesian": false,
+    "action_space": "cartesian",
+    "cartesian_controller": "mink"
+  }
+}
+```
+
+Add the camera assignments your policy expects. With `soft_park_on_quit: true`, pressing `q` parks the arms through rest and zero before the motors turn off. Other exits, such as an error, keep the motors holding the arms.
+
+For DAgger, also set `hold_to_intervene`, `record_joint_actions`, the Mink teleop backend and a dataset `repo_id`. Rest poses and contact thresholds for DAgger and data collection are under `teleop_config.vr_teleop_config`.
+
+Episodes record actions in the configured action space. For Mink Cartesian actions, run policy and DAgger record the pose of the joint commands that were sent. If the policy asks for a pose the arm can't reach, Axol records the pose it commanded, not the one requested. With `record_joint_actions: true`, DAgger records joint actions instead, whatever the policy's action space.
+
+To reproduce a setup on another robot, write down every setting it uses. Don't rely on defaults. Include:
+
+- camera order and resizing,
+- the world frame,
+- control rates and the request interval,
+- rest poses, gains and gripper torque limits, and
+- contact thresholds.
+
+For example, the configuration above uses a request interval of 10 and a reset contact threshold of 4 Nm. The defaults are 5 and 6 Nm.
+
+## Returning to rest and parking
+
+With Mink, the move to rest at startup, every return to rest and the park at shutdown follow a straight path for the gripper. Axol plans the whole path before anything moves. The path must end in the configured joint pose, not only the right gripper pose.
+
+Axol rejects a path that would:
+
+- pass a joint limit,
+- make the robot collide with itself,
+- aim for a pose the arm can't reach,
+- take too many steps, or
+- stop short of its goal.
+
+Axol never retries a rejected path with the collision checks turned off. The collision model doesn't include objects on the table, so the contact stop still guards every move.
+
+A rejected path moves nothing. What happens next depends on when it is rejected:
+
+- **During a session**, the arms go limp as after a contact, and the prompt reads **Return path rejected**. Guide the arms to a better spot by hand, then return to rest again.
+- **While parking at shutdown**, the park ends.
+- **At startup**, the session doesn't start, and the error gives the reason.
+
+Set the clearance the path must keep with `vr_teleop_config.mink_reset_collision_margin`, or `mink_reset_collision_margin` in `run-policy`. The default is 0.01 m.
+
+If the arms start closer together than that, the path must move them apart. A start in collision is rejected. The JAX settings `reset_collision_margin` and the reset penalty weights don't affect Mink.
+
+Mink plans different return paths than JAX, so test returns to rest on the robot after you switch.
+
+## Test before you deploy
+
+Before you rely on Mink, test these on the robot:
+
+- data collection with one arm and with two arms,
+- DAgger takeover and handback,
+- a remote Cartesian policy,
+- a return to rest that is blocked or interrupted, and
+- parking from rest to zero.

@@ -85,6 +85,17 @@ export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
+/** The startup steps an operation reports while it gets ready. Step keys
+ *  are the host's ids ("arms", "ik", ...); the panel owns their labels. */
+export interface OperationProgress {
+  steps: string[]
+  /** Index into `steps` of the step under way; -1 before the first. */
+  current: number
+  /** When the current step began, in seconds since the epoch. */
+  stepStartedAt: number | null
+  ready: boolean
+}
+
 export interface SessionInfo {
   id: string
   command: string
@@ -94,6 +105,8 @@ export interface SessionInfo {
   error: string | null
   startedAt: number
   pid: number | null
+  /** Older hosts, and operations that report no steps, leave this out. */
+  progress?: OperationProgress | null
 }
 
 /** A submitted form value; vector fields carry one entry per component
@@ -180,7 +193,7 @@ async function json<T>(res: Response): Promise<T> {
   try {
     return (await res.json()) as T
   } catch {
-    throw new Error("the host did not answer like an axol serve host — set the axol host address")
+    throw new Error("this address is not a Host Computer. Check the address.")
   }
 }
 
@@ -367,12 +380,48 @@ export interface RobotStatus {
   hasGripper?: boolean
 }
 
-/** Short display label for a fault, e.g. "L elbow — over temperature (78°C)". */
+/** Short display label for a fault, e.g. "L elbow: over temperature (78°C)". */
 export function motorFaultLabel(f: MotorFault): string {
   const joint = f.joint.replace(/_/g, " ").toLowerCase()
   const temp =
     f.problem.includes("temp") && f.temperature != null ? ` (${Math.round(f.temperature)}°C)` : ""
-  return `${f.arm[0].toUpperCase()} ${joint} — ${f.problem}${temp}`
+  return `${f.arm[0].toUpperCase()} ${joint}: ${f.problem}${temp}`
+}
+
+/**
+ * The "Before you start" lines for a robot's motor faults, grouped so a
+ * powered-off robot reads as one problem instead of one line per motor:
+ * - every motor unreachable: one line to turn the device on;
+ * - every motor of one side unreachable: one line for that arm (or gripper);
+ * - anything else: one line per motor, with `motorFaultLabel`.
+ * `device` is "Axol" or "Mantis".
+ */
+export function motorFaultBlockers(
+  faults: MotorFault[],
+  motors: MotorHealth[],
+  device: "Axol" | "Mantis"
+): string[] {
+  if (faults.length === 0) return []
+  const unreachable = faults.filter((f) => f.problem === "unreachable")
+  if (motors.length > 0 && unreachable.length === motors.length) {
+    return [`${device} isn't answering. Turn on its power.`]
+  }
+  const part = device === "Mantis" ? "gripper" : "arm"
+  const deadSides = new Set<string>()
+  for (const side of new Set(motors.map((m) => m.arm))) {
+    const total = motors.filter((m) => m.arm === side).length
+    const down = unreachable.filter((f) => f.arm === side).length
+    if (total > 1 && down === total) deadSides.add(side)
+  }
+  const lines = [...deadSides].map(
+    (side) =>
+      `${side[0].toUpperCase()}${side.slice(1)} ${part} isn't answering. Check its power and cable.`
+  )
+  for (const f of faults) {
+    if (f.problem === "unreachable" && deadSides.has(f.arm)) continue
+    lines.push(`Fix the motor fault on ${motorFaultLabel(f)}`)
+  }
+  return lines
 }
 
 export async function fetchRobotStatus(): Promise<RobotStatus> {
@@ -488,8 +537,8 @@ export async function discoverCanHardware(force = false): Promise<CanInterfaceIn
 export type JellyDevice = "wheels" | "lift"
 export const JELLY_DEVICES: readonly JellyDevice[] = ["wheels", "lift"]
 export const JELLY_DEVICE_LABELS: Record<JellyDevice, string> = {
-  wheels: "Jelly Wheels",
-  lift: "Jelly Lift",
+  wheels: "Jelly wheels",
+  lift: "Jelly lift",
 }
 
 /** One wheel motor from the idle ping (IDs 1–4, Damiao). */
@@ -584,8 +633,8 @@ export async function jellyDisconnect(device: JellyDevice): Promise<JellyStatus>
   return json(await fetch(apiUrl(`/api/jelly/${device}/disconnect`), { method: "POST" }))
 }
 
-/** A lift firmware image the serve host validated and stored for `lift.update`. */
-export interface LiftFirmwareUpload {
+/** A firmware image the serve host validated and stored for `lift.update` or `mantis.update`. */
+export interface FirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */
   path: string
   version: string
@@ -594,15 +643,25 @@ export interface LiftFirmwareUpload {
   size: number
 }
 
-/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
-export async function uploadLiftFirmware(file: Blob): Promise<LiftFirmwareUpload> {
+export type LiftFirmwareUpload = FirmwareUpload
+
+/** Which board a firmware file is for: the lift (jelly_legs) or the Mantis trigger. */
+export type FirmwareBoard = "lift" | "mantis"
+
+/** Upload a board's firmware.bin; the host rejects any other board's file. */
+export async function uploadFirmware(board: FirmwareBoard, file: Blob): Promise<FirmwareUpload> {
   return json(
-    await fetch(apiUrl("/api/lift/firmware"), {
+    await fetch(apiUrl(`/api/${board}/firmware`), {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       body: file,
     })
   )
+}
+
+/** Upload a jelly_legs firmware.bin; the host rejects anything else. */
+export async function uploadLiftFirmware(file: Blob): Promise<FirmwareUpload> {
+  return uploadFirmware("lift", file)
 }
 
 /** Healthy = reachable on CAN and reporting no error status. */
@@ -622,9 +681,9 @@ export function liftFaultLabel(status: JellyLiftStatus | null | undefined): stri
   if (status.reachable === false) return "Lift board not answering"
   const board = status.status
   if (!board) return null
-  if (board.stallFault) return "Leg stall fault"
+  if (board.stallFault) return "Lift stalled"
   if (board.driverFaultMask) return "Lift driver fault"
-  if (board.vmPresent === false) return "Lift motor power absent"
+  if (board.vmPresent === false) return "No power to lift motors"
   return null
 }
 
@@ -789,6 +848,48 @@ export interface EpisodeBrief {
   grid?: EpisodeBriefGrid
 }
 
+export interface TrackingDiagnostics {
+  enabled: boolean
+  state:
+    | "disabled"
+    | "waiting_for_ready"
+    | "armed"
+    | "capturing"
+    | "saving"
+    | "saved"
+    | "error"
+    | "closed"
+  armed?: boolean
+  capture_count?: number
+  capture_limit?: number
+  pending_capture?: boolean
+  latest_path?: string | null
+  error?: string | null
+  counters?: Record<string, number>
+}
+
+export interface TrackingQuality {
+  /** Automatic fault capture is independent of tracking and episode validity. */
+  diagnostics?: TrackingDiagnostics
+  controlState?: "engaged" | "recovering" | "awaiting_engagement"
+  reengageRequired?: boolean
+  triggersLive?: { left: boolean; right: boolean }
+  pairSkewMs?: number
+  status: "checking" | "ready" | "warning" | "error"
+  reasons: string[]
+  faultCount: number
+  lastFault: string | null
+  /** Persistent setup faults require a new validation, not visibility recovery. */
+  calibrationRequired?: boolean
+  /** The tracking process exited or its reader failed. */
+  nativeFailure?: boolean
+  /** Remains set for the failed take, even after live tracking recovers. */
+  retakeRequired: boolean
+  /** Preserved after rejecting a take, until the next recording starts. */
+  lastEpisodeFault?: string | null
+  trackers?: Record<string, unknown>
+}
+
 export interface PolicyState {
   phase: PolicyPhase
   episodesRecorded: number
@@ -808,6 +909,8 @@ export interface PolicyState {
   /** Why the last episode was not saved (quality-gate rejection, capture or
    *  save failure). Persists until the next episode starts recording. */
   notice?: { level: "error"; message: string }
+  /** Live Mantis pose checks and the current take's latched failure state. */
+  trackingQuality?: TrackingQuality
 }
 
 export interface OpStatus {
@@ -917,6 +1020,45 @@ export interface DatasetEpisodes {
 export async function fetchDatasetEpisodes(repoId: string): Promise<DatasetEpisodes> {
   const q = new URLSearchParams({ repo_id: repoId })
   return json(await fetch(apiUrl(`/api/datasets/episodes?${q}`)))
+}
+
+/** One gripper mount's pose per frame, in the robot model's root frame:
+ *  metres and an axis-angle vector (radians). */
+export type EpisodePose = Record<"x" | "y" | "z" | "rx" | "ry" | "rz", (number | null)[]>
+
+/** One saved episode's robot data (see the host's recording/episode_data.py). */
+export interface EpisodeData {
+  repoId: string
+  episode: number
+  fps: number
+  frames: number
+  /** "cartesian" when the state records gripper poses (Mantis), else joints. */
+  space: "joint" | "cartesian"
+  /** Seconds from the episode's first frame. */
+  t: number[]
+  /** Measured values per feature name ("left_elbow.pos", "left_ee.x", ...). */
+  state: Record<string, (number | null)[]>
+  /** Commanded values per feature name. */
+  action: Record<string, (number | null)[]>
+  /** Measured gripper-mount poses: recorded, or from the joints. */
+  pose: Partial<Record<"left" | "right", EpisodePose>>
+  /** Commanded gripper-mount poses. */
+  actionPose: Partial<Record<"left" | "right", EpisodePose>>
+  /** Mantis datasets: camera-to-tracker skew per frame, in ms. */
+  poseLagMs: (number | null)[] | null
+  /** DAgger datasets: frames where the operator took over. */
+  intervention: boolean[] | null
+  checks: {
+    droppedFrames: number
+    longestGapS: number
+    jointJump: { name: string; deg: number; t: number } | null
+    poseJump: { side: "left" | "right"; m: number; t: number } | null
+  }
+}
+
+export async function fetchEpisodeData(repoId: string, episode: number): Promise<EpisodeData> {
+  const q = new URLSearchParams({ repo_id: repoId, episode: String(episode) })
+  return json(await fetch(apiUrl(`/api/datasets/episode-data?${q}`)))
 }
 
 /** Keep every Nth frame for a preview at `previewFps` (mirrors the host's
@@ -1030,8 +1172,8 @@ export const RESOLUTION_OFF = "off"
  */
 export interface CameraSpec {
   serials: Record<CameraSlot, string>
-  /** Mantis wrist-camera assignment, kept separate from the Axol camera map. */
-  mantis_serials?: Pick<Record<CameraSlot, string>, "left_arm" | "right_arm">
+  /** Mantis camera assignments. Missing slots inherit the legacy Axol map. */
+  mantis_serials?: Partial<Record<CameraSlot, string>>
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
   /** Dataset downscale target (collect-data recording), or `"off"`. */
@@ -1068,7 +1210,7 @@ export async function fetchCommands(): Promise<CommandSpec[]> {
     })
   } catch (e) {
     if (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError")) {
-      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
+      throw new Error(`no response from the Host Computer after ${CONNECT_TIMEOUT_MS / 1000}s`)
     }
     throw e
   }
@@ -1159,13 +1301,54 @@ export interface LighthouseTrackerReadiness {
    * `null` until one has run on this host; absent on older serve hosts.
    */
   baseStations?: LighthouseBaseStationSurvey | null
+  expectedBaseStations?: number
+  /**
+   * Host-wide tracking policy. Only "strict" requires a passed validation
+   * before collection and marks faulty takes for retake. Absent on older
+   * serve hosts, which never enforced it.
+   */
+  qualityMode?: LighthouseQualityMode
+  /** Absent on hosts without stationary tracking validation. */
+  validation?: LighthouseValidation | null
+}
+
+export type LighthouseQualityMode = "standard" | "strict"
+
+export async function saveLighthouseQualityMode(
+  mode: LighthouseQualityMode
+): Promise<{ mode: LighthouseQualityMode }> {
+  return json(
+    await fetch(apiUrl("/api/tracker/lighthouse/quality"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    })
+  )
+}
+
+export interface LighthouseValidation {
+  status: "passed" | "failed" | "stale" | "missing" | "needs_identification"
+  valid: boolean
+  checkedAt?: number | null
+  expiresAt?: number | null
+  expectedBaseStations?: number
+  baseStations?: unknown
+  trackers?: unknown
+  metrics?: Record<string, unknown>
+  problems: string[]
+  calibrated?: boolean
+  /**
+   * Why a passed check went stale: "expired", "refined" (only the native
+   * calibration changed), "setup" or "unverifiable". Absent on older hosts.
+   */
+  staleCauses?: Array<"expired" | "refined" | "setup" | "unverifiable">
 }
 
 export interface LighthouseBaseStationSurvey {
   checkedAt: number
   /**
    * Serials of the base stations a tracker actually received during the check,
-   * keyed by the channel number shown on the station (1–16).
+   * keyed by the channel number reported by the runtime (1–16).
    */
   channels: Record<string, string[]>
   /** Stations libsurvive replayed from its saved calibration; not counted as seen. */
@@ -1345,7 +1528,7 @@ export type SettingValue = string | number | boolean | (number | string)[]
 /** Optional widget hints for a settings field (slider ranges, pose editor,
  * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose" | "toggle-number"
+  widget?: "slider" | "pose" | "toggle-number" | "mount"
   min?: number
   max?: number
   step?: number
@@ -1400,6 +1583,8 @@ export interface SettingsSnapshot {
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
+  /** The Axol version runs use (hosts that predate it only have classic). */
+  robotModel?: AxolModel
   schema: SettingsCategory[]
   advancedSchema: AdvancedSection[]
 }
@@ -1427,24 +1612,70 @@ export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapsh
   return { schema: [], advancedSchema: [], ...res }
 }
 
-/** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */
-export function urdfUrl(): string {
-  return apiUrl("/api/urdf/axol.urdf")
+/**
+ * Which Axol hardware version the host runs: mobile whenever Jelly is enabled
+ * (attached and not switched off in the Robot tab), otherwise the mount picked
+ * in the Robot tab (`kinematics.mount`, legacy `classic` until one is). The
+ * host derives it and reports it with the settings as `robotModel`.
+ */
+export type AxolModel = "classic" | "standalone" | "ox_cart" | "owl" | "mobile"
+
+/** The versions to pick from without Jelly (the `kinematics.mount` options). */
+export type AxolMount = Exclude<AxolModel, "mobile">
+
+export const AXOL_MOUNTS: readonly AxolMount[] = ["classic", "standalone", "ox_cart", "owl"]
+
+const URDF_FILES: Record<AxolModel, string> = {
+  classic: "axol.urdf",
+  standalone: "axol_standalone.urdf",
+  ox_cart: "axol_ox_cart.urdf",
+  owl: "axol_owl.urdf",
+  mobile: "axol_jelly.urdf",
 }
 
-export function cameraSerials(
-  spec: CameraSpec,
-  mantis?: boolean
-): Partial<Record<CameraSlot, string>> {
-  if (mantis === true) {
-    return (
-      spec.mantis_serials ?? {
-        left_arm: spec.serials.left_arm,
-        right_arm: spec.serials.right_arm,
-      }
-    )
+export function parseAxolModel(value: unknown): AxolModel | null {
+  return typeof value === "string" && value in URDF_FILES ? (value as AxolModel) : null
+}
+
+/** A saved `kinematics.mount`, legacy (`classic`) when unset or unknown. */
+export function parseAxolMount(value: unknown): AxolMount {
+  return AXOL_MOUNTS.find((m) => m === value) ?? "classic"
+}
+
+/** The gripper fitted to both arms (the `axol.gripper` setting). */
+export type GripperType = "parallel" | "parcel"
+
+export function parseGripper(value: unknown): GripperType {
+  return value === "parcel" ? "parcel" : "parallel"
+}
+
+/**
+ * URL of an Axol version's URDF (meshes resolve relative to it via /api/urdf/…).
+ * The mobile Axol has one per gripper; the classic one shows the parallel
+ * gripper for either.
+ */
+export function urdfUrl(model: AxolModel = "classic", gripper: GripperType = "parallel"): string {
+  const file =
+    model === "mobile" && gripper === "parcel" ? "axol_jelly_parcel.urdf" : URDF_FILES[model]
+  return apiUrl(`/api/urdf/${file}`)
+}
+
+export function cameraSerials(spec: CameraSpec, mantis?: boolean): Record<CameraSlot, string> {
+  const axol = {
+    overhead: spec.serials?.overhead ?? "",
+    left_arm: spec.serials?.left_arm ?? "",
+    right_arm: spec.serials?.right_arm ?? "",
   }
-  return spec.serials
+  if (mantis === true) {
+    // Wrists fall back to the Axol layout. The Head slot is new to Mantis:
+    // older wrist-only layouts must not inherit Axol's overhead camera.
+    return {
+      overhead: spec.mantis_serials?.overhead ?? "",
+      left_arm: spec.mantis_serials?.left_arm ?? axol.left_arm,
+      right_arm: spec.mantis_serials?.right_arm ?? axol.right_arm,
+    }
+  }
+  return axol
 }
 
 export function cameraCount(spec: CameraSpec, mantis?: boolean): number {
@@ -1678,7 +1909,8 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
     label: "Teleoperation",
-    description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+    description:
+      "Drive Axol from a VR headset. Mantis works with Quest, Lighthouse or Ultimate tracking.",
     fields: ["sim"],
     suggestedFields: [],
     strictFields: [],
@@ -1696,7 +1928,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "gravity-comp",
     label: "Gravity compensation",
-    description: "Hold the arms weightless so they can be moved by hand.",
+    description: "Hold the arms weightless so you can move them by hand.",
     fields: ["free_joints"],
     suggestedFields: [],
     strictFields: [],
@@ -1715,7 +1947,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect data",
     description:
-      "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+      "Record episodes with the ZED cameras. Mantis works with Quest, Lighthouse or Ultimate tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
     strictFields: [],
@@ -1755,8 +1987,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "run-policy",
     label: "Run policy",
-    description:
-      "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
+    description: "Run a trained policy on Axol, on this computer or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],
     suggestedFields: [],
     strictFields: [],
@@ -1879,7 +2110,7 @@ export function perRunFields(
 export const CUSTOM_POLICY_TYPE = "custom"
 
 const CUSTOM_POLICY_PATH_HELP =
-  "Unused for a custom policy. Select the model on your policy server; this path is not sent."
+  "Not used for a custom policy. Choose the model on your policy server."
 
 /** Whether these run args select a custom policy server instead of a LeRobot checkpoint. */
 export function isCustomPolicyRun(values: Record<string, unknown>): boolean {

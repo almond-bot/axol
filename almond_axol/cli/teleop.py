@@ -34,6 +34,7 @@ import os
 import socket
 from typing import TYPE_CHECKING, Any
 
+from .. import progress
 from ..utils import affinity
 from ..utils.logquiet import quiet_noisy_loggers
 from ..utils.network import local_ip
@@ -433,6 +434,8 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
     from ..robot.jelly import Jelly
     from ..vr import VRServer
 
+    progress.plan(["jelly", "headset"])
+    progress.step("jelly")
     jelly = Jelly(jelly_cfg)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
@@ -447,7 +450,9 @@ async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> Non
         "to stop); the arms are untouched"
     )
     try:
+        progress.step("headset")
         async with server:
+            progress.ready()
             await asyncio.Event().wait()  # until Ctrl-C / supervisor stop
     finally:
         if imu_src is not None:
@@ -527,7 +532,12 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
 
         left, right = require_mantis_channels(mantis_rig_channels(cfg))
         print(f"Mantis grippers only (no tracking): left={left} right={right}")
-        await run_grippers_only(left, right)
+        await run_grippers_only(
+            left,
+            right,
+            left_trigger_full_scale=cfg.mantis_left_trigger_full_scale,
+            right_trigger_full_scale=cfg.mantis_right_trigger_full_scale,
+        )
         return
 
     # What this session drives follows the CAN interfaces attached (and the
@@ -538,8 +548,21 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         await _run_jelly_only(cfg, jelly_cfg)
         return
 
+    if not cfg.sim and cfg.kinematics.robot_model is None:
+        # Enabling Jelly means this is the mobile Axol: its URDF (the body the
+        # arms are kept clear of, and its joint limits) follows this session's
+        # own Jelly decision, per-run --jelly.* switches included.
+        from ..settings import resolve_robot_model
+
+        cfg.kinematics.robot_model = resolve_robot_model(
+            jelly_enabled=jelly_cfg is not None, mount=cfg.kinematics.mount
+        ).value
     if cfg.sim:
-        robot = Sim()
+        robot = Sim(
+            robot_model=cfg.kinematics.robot_model,
+            mount=cfg.kinematics.mount,
+            gripper=cfg.axol.gripper,
+        )
     else:
         # The Rust realtime core is the sole hardware control backend. Python
         # owns VR/IK/model math and streams targets; Rust owns both CAN buses.
@@ -566,6 +589,12 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         vr_server_config=cfg.vr_server,
         jelly=jelly,
     )
+    progress.plan(
+        ["headset", "arms"]
+        + (["jelly"] if jelly is not None else [])
+        + ["ik"]
+        + (["cameras"] if cfg.cameras else [])
+    )
     if cfg.cameras:
         # The VR server accepts headsets long before the cameras finish
         # opening (IK compile + relay bring-up can take minutes). Declare
@@ -577,6 +606,8 @@ async def _run_session(cfg: TeleopCmdConfig) -> None:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
         # in-process sources when it isn't applicable.
+        if cfg.cameras:
+            progress.step("cameras")
         stereo_set = await asyncio.to_thread(_stereo_serials_for, cfg)
         relay = await asyncio.to_thread(_start_video_relay, cfg, stereo_set)
         cameras: list[tuple[str, Any]] = []

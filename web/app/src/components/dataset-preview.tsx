@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
+import { createPortal } from "react-dom"
 import { Loader2, Pause, Play, RefreshCw } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -8,10 +9,13 @@ import {
   fetchDatasets,
   previewStep,
   setEpisodeTask,
+  type AxolModel,
   type DatasetEpisode,
   type DatasetEpisodes,
   type DatasetInfo,
+  type GripperType,
 } from "@/lib/supervisor"
+import { EpisodeRobotData } from "@/components/episode-robot-data"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -87,15 +91,23 @@ export function DatasetPreview({
   connected,
   liveDataset,
   episodesRecorded,
+  embedded = false,
+  robot = null,
 }: {
   connected: boolean
+  /** Show each episode's robot data (charts and a 3D replay on this robot
+   *  model) under its videos. Off on the operation screen while recording. */
+  robot?: { model?: AxolModel; gripper?: GripperType } | null
+  /** The body of the Datasets page: always open, with no card header. */
+  embedded?: boolean
   /** The running operation's dataset, if it records one. */
   liveDataset: { repoId: string; root: string } | null
   /** Bumps after every save of the running operation (triggers a refresh). */
   episodesRecorded: number | null
 }) {
   const toast = useToast()
-  const [open, setOpen] = useState(readOpen)
+  const [storedOpen, setOpen] = useState(readOpen)
+  const open = embedded || storedOpen
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   // The operator's explicit pick; null follows the live session (else newest).
   const [chosen, setChosen] = useState<string | null>(null)
@@ -106,6 +118,7 @@ export function DatasetPreview({
   const [chosenEpisode, setChosenEpisode] = useState<number | null>(null)
   const [reloadNonce, setReloadNonce] = useState(0)
   const [previewFps, setPreviewFps] = useState(readPreviewFps)
+  const [robotSlot, setRobotSlot] = useState<HTMLDivElement | null>(null)
 
   // A live dataset is listed under the scanned root's repo id, which differs
   // from the session's own repo id when it records outside that root.
@@ -149,7 +162,7 @@ export function DatasetPreview({
         setError(
           // An older host answers the unknown route with the SPA's generic 404.
           e instanceof ApiRequestError && e.status === 404 && e.message === "not found"
-            ? "This host does not offer dataset preview (update axol)."
+            ? "This Host Computer can't preview datasets. Update the Axol software on the Host Computer."
             : errorText(e)
         )
       })
@@ -190,12 +203,12 @@ export function DatasetPreview({
 
   return (
     <Card>
-      <div className="flex items-start justify-between gap-3">
+      <div className={cn("flex items-start justify-between gap-3", embedded && "hidden")}>
         <CardHeader>
           <CardTitle>Dataset preview</CardTitle>
           <CardDescription>
-            Watch saved episodes and fix their task. Follows the dataset the running operation
-            records into.
+            Watch saved episodes and edit their task. While you record, it shows the dataset you are
+            recording to.
           </CardDescription>
         </CardHeader>
         <Button variant="outline" size="sm" onClick={toggle}>
@@ -236,7 +249,7 @@ export function DatasetPreview({
                     setChosenEpisode(null)
                   }}
                 >
-                  Follow session
+                  Show current recording
                 </Button>
               )}
               <Button
@@ -254,7 +267,7 @@ export function DatasetPreview({
           {error && <p className="text-xs text-red-300/80">{error}</p>}
           {following && (
             <p className="text-xs text-white/45">
-              Recording in progress — a take appears here once it is saved.
+              Recording. Each episode appears here after it is saved.
             </p>
           )}
 
@@ -263,34 +276,41 @@ export function DatasetPreview({
           )}
 
           {shown && episode && (
-            <div className="grid gap-4 lg:grid-cols-[16rem_1fr]">
-              <EpisodeList
-                episodes={episodes}
-                selected={episode.index}
-                onSelect={setChosenEpisode}
-              />
-              <div className="flex min-w-0 flex-col gap-4">
-                <EpisodePlayer
-                  key={`${shown.repoId}:${episode.index}:${previewFps}`}
-                  repoId={shown.repoId}
-                  episode={episode}
-                  cameras={shown.cameras}
-                  datasetFps={shown.fps}
-                  previewFps={previewFps}
-                  onPreviewFps={(fps) => {
-                    writePreviewFps(fps)
-                    setPreviewFps(fps)
-                  }}
+            <>
+              <div className="grid gap-4 lg:grid-cols-[16rem_1fr]">
+                <EpisodeList
+                  episodes={episodes}
+                  selected={episode.index}
+                  onSelect={setChosenEpisode}
                 />
-                <TaskEditor
-                  key={`${shown.repoId}:${episode.index}:${episode.tasks.join("\n")}`}
-                  repoId={shown.repoId}
-                  episode={episode}
-                  knownTasks={shown.tasks}
-                  onRenamed={onRenamed}
-                />
+                <div className="flex min-w-0 flex-col gap-4">
+                  <EpisodePlayer
+                    key={`${shown.repoId}:${episode.index}:${previewFps}`}
+                    repoId={shown.repoId}
+                    episode={episode}
+                    cameras={shown.cameras}
+                    datasetFps={shown.fps}
+                    previewFps={previewFps}
+                    onPreviewFps={(fps) => {
+                      writePreviewFps(fps)
+                      setPreviewFps(fps)
+                    }}
+                    robot={robot}
+                    robotSlot={robotSlot}
+                  />
+                  <TaskEditor
+                    key={`${shown.repoId}:${episode.index}:${episode.tasks.join("\n")}`}
+                    repoId={shown.repoId}
+                    episode={episode}
+                    knownTasks={shown.tasks}
+                    onRenamed={onRenamed}
+                  />
+                </div>
               </div>
-            </div>
+              {/* The episode's robot data, full width under the list and
+                player; the player renders it here so it shares its clock. */}
+              {robot && <div ref={setRobotSlot} />}
+            </>
           )}
         </div>
       )}
@@ -353,6 +373,8 @@ function EpisodePlayer({
   datasetFps,
   previewFps,
   onPreviewFps,
+  robot,
+  robotSlot,
 }: {
   repoId: string
   episode: DatasetEpisode
@@ -360,6 +382,9 @@ function EpisodePlayer({
   datasetFps: number
   previewFps: number
   onPreviewFps: (fps: number) => void
+  robot: { model?: AxolModel; gripper?: GripperType } | null
+  /** Where the robot data goes (below the list and player). */
+  robotSlot: HTMLElement | null
 }) {
   const keys = useMemo(() => cameras.filter((k) => episode.videos[k]), [cameras, episode])
   const sources = useMemo(
@@ -377,6 +402,12 @@ function EpisodePlayer({
           key,
           (el: HTMLVideoElement | null) => {
             if (!el) return
+            // A ref re-run on the same element (React's dev double mount, or
+            // a re-render that swaps this callback) follows the cleanup
+            // below, which cleared src; React won't set an unchanged src
+            // again, so restore it here.
+            const url = sources.get(key)?.url
+            if (url && !el.getAttribute("src")) el.setAttribute("src", url)
             videos.current.set(key, el)
             // Leaving an episode (or the card) must stop its download: a
             // removed <video> keeps loading until its src is cleared, and on a
@@ -391,7 +422,7 @@ function EpisodePlayer({
           },
         ])
       ),
-    [keys]
+    [keys, sources]
   )
   const [playing, setPlaying] = useState(false)
   // The sources the operator has pressed Play on. Until then nothing loads
@@ -491,8 +522,42 @@ function EpisodePlayer({
     }
   }, [playing, keys, sources, duration])
 
+  const robotData =
+    robot &&
+    robotSlot &&
+    createPortal(
+      <EpisodeRobotData
+        repoId={repoId}
+        episode={episode}
+        time={time}
+        onSeek={seek}
+        robotModel={robot.model}
+        gripper={robot.gripper}
+      />,
+      robotSlot
+    )
+
   if (keys.length === 0) {
-    return <p className="text-sm text-white/45">This episode has no video.</p>
+    return (
+      <div className="flex flex-col gap-3">
+        <p className="text-sm text-white/45">This episode has no video.</p>
+        {robotData && (
+          <>
+            <input
+              type="range"
+              min={0}
+              max={duration}
+              step={0.01}
+              value={time}
+              onChange={(e) => seek(Number(e.target.value))}
+              className="w-full accent-[#eff483]"
+              aria-label="Episode time"
+            />
+            {robotData}
+          </>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -567,7 +632,7 @@ function EpisodePlayer({
             onChange={(e) => onPreviewFps(Number(e.target.value))}
             className="h-8 w-32 shrink-0"
             aria-label="Preview quality"
-            title="Lighter previews keep every Nth frame, so they load over slow links"
+            title="Lower frame rates load faster on slow networks"
           >
             {choices.map((fps) => (
               <SelectOption
@@ -579,6 +644,7 @@ function EpisodePlayer({
           </Select>
         )}
       </div>
+      {robotData}
     </div>
   )
 }
@@ -608,9 +674,9 @@ function TaskEditor({
       onRenamed(await setEpisodeTask(repoId, episode.index, text.trim()))
     } catch (e) {
       if (e instanceof ApiRequestError && e.status === 409) {
-        toast.warning("The recorder is saving an episode — try again in a moment.")
+        toast.warning("An episode is being saved. Try again in a moment.")
       } else {
-        toast.error(`Could not rename the task: ${errorText(e)}`)
+        toast.error(`Could not save the task: ${errorText(e)}`)
       }
     } finally {
       setSaving(false)

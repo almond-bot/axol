@@ -1,29 +1,29 @@
 ---
 title: "Quest over USB"
-description: "Stream Quest controller poses to the robot over a USB cable instead of Wi-Fi for a low-latency teleop link."
+description: "Send Quest controller poses to the robot over a USB cable instead of Wi-Fi to cut teleop lag."
 ---
 
-By default the Quest streams controller pose to the robot over Wi-Fi. On some networks the headset's Wi-Fi power-save buffering holds pose packets and releases them in bursts, adding **~150 ms gaps** between updates that show up as stair-stepped, laggy arm motion. **Quest over USB** moves the active pose link onto a USB cable via an [`adb reverse`](https://developer.android.com/tools/adb) tunnel, so the link is wired and deterministic — while keeping Wi-Fi as an automatic standby if the cable drops.
+By default the Quest sends controller poses to the robot over Wi-Fi. On some networks, Wi-Fi power saving holds poses back and releases them in bursts, with gaps of about 150 ms. The arms then move in jerky, delayed steps. **Quest over USB** sends the poses over a USB cable instead.
 
 <Note>
-  USB carries **controller poses only**. Camera video still streams over the LAN — WebRTC can't cross the `adb` TCP forward — so you connect to the robot's address as usual and the cameras keep working over Wi-Fi/Ethernet. USB just takes over the pose link.
+  USB carries controller poses only. Camera video still uses the network, so connect to the robot's address as usual.
 </Note>
 
-When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi with one logical producer id and sequence. The robot accepts whichever copy arrives first and discards the duplicate globally. USB normally wins because it is lower-latency; if the cable drops, the next Wi-Fi copy is accepted immediately with no reconnect, and a restored cable naturally wins again when its copies arrive first. Delayed copies can never rewind controls or enter the jitter buffer.
+With USB on, the headset sends each pose over both the cable and Wi-Fi, and the robot uses whichever copy arrives first. If the cable drops, Wi-Fi takes over with no reconnect. When the cable comes back, USB takes over again.
 
 ## One-time setup
 
 <Steps>
   <Step title="Enable Developer Mode on the Quest">
     1. Open the **Meta Quest** mobile app on your phone, with your headset connected.
-    2. Go to **Menu → Devices →** select your headset **→ Headset Settings → Developer Mode**, and toggle it on (you may be prompted to create a free Meta "organization" first).
+    2. Go to **Menu → Devices**, select your headset, then **Headset Settings → Developer Mode**, and turn it on. The app may ask you to create a free Meta organization first.
     3. Restart the headset.
 
     This is the same Developer Mode used for [remote teleop](/guides/remote-teleop#sideload-tailscale-on-the-quest).
   </Step>
 
   <Step title="Confirm adb is installed on the robot machine">
-    Nothing to do after a [one-command install](/installation) — [`axol provision`](/cli/provision) sets up `adb` and the Quest udev rule for you. On a development install, run `axol provision` once.
+    The [one-command install](/installation) runs [`axol provision`](/cli/provision), which installs `adb` and the Quest USB permissions. On a development install, run `axol provision` once.
   </Step>
 </Steps>
 
@@ -35,37 +35,45 @@ When USB is selected, the headset sends every pose frame over **both** the cable
   </Step>
 
   <Step title="Authorize and connect from the control panel">
-    In the [control panel](/guides/control-panel#quest-usb), the **Quest** tab under **General settings** shows the headset state. The first time, accept the **Allow USB debugging?** prompt in the headset (check **Always allow from this computer**). Once authorized, the tunnels come up **automatically** and the status turns green (*Controller over USB*); the tab's **Connect** button is a manual fallback / reconnect.
+    In the [control panel](/guides/control-panel#quest-usb), open the **Quest** tab under **General settings** to see the headset's state. The first time, put on the headset and accept the **Allow USB debugging?** prompt. Tick **Always allow from this computer**.
+
+    The link then connects on its own and the status turns green: **Controller over USB**. If it doesn't, press **Connect**.
   </Step>
 
   <Step title="Confirm the tunnel on localhost">
-    In the headset browser, open `https://localhost:8001` — the control panel, reached over the cable — and proceed past the certificate warning. If the panel loads, the tunnel is up. This works while nothing else is running, and it also lets you drive the panel from the headset.
+    In the headset browser, open `https://localhost:8001` and accept the certificate warning. This is the control panel, reached over the cable. If it loads, the cable link works. You can also use the control panel from the headset this way.
 
     <Note>
-      Do this before anything else. The browser's override is per-origin (scheme + host + port), so accepting `:8001` does not cover `:8000` — the USB pose link gets its own approval in a later step. Reaching the panel on `localhost` is what proves the cable path works, and it is the origin that is always available.
+      The browser approves each port separately. Accepting the warning on port 8001 doesn't cover port 8000, which you approve in a later step.
     </Note>
   </Step>
 
   <Step title="Enable USB in the VR app">
-    Open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the robot's address as usual, and tick **Quest over USB**. The USB panel and its **Authorize USB certificate** button appear immediately, before you connect.
+    Open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the robot's address as usual, and tick **Quest over USB**. The USB status and the **Authorize USB certificate** button appear right away, before you connect.
   </Step>
 
   <Step title="Authorize the USB certificate">
-    The USB link uses `wss://localhost:8000`. It serves the same certificate you just saw on `:8001`, but the browser's approval is **per-origin**, so this port needs its own. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down*. Tap **Authorize USB certificate** and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser). The status then flips to *controller over cable*.
+    The USB link uses port 8000, which needs its own approval. Until you approve it, the app uses Wi-Fi and shows *Quest over USB: not connected, using Wi-Fi*.
 
-    <Warning>
-      Port 8000 only exists while a teleop or data-collection operation is running — the VR server is started and stopped with the operation, not by `axol serve`. Start the operation from the control panel first, otherwise the certificate page cannot load and the poses stay on Wi-Fi.
-    </Warning>
+    1. Start a teleop or data collection operation from the control panel. Port 8000 is open only while one is running.
+    2. Tap **Authorize USB certificate** and accept the warning. You can also open `https://localhost:8000` in the headset browser.
+
+    The status changes to *Quest over USB: connected*.
   </Step>
 
   <Step title="Enter VR">
-    Press **Enter VR** and teleoperate as usual. You don't have to wait for the USB link — Wi-Fi drives the arm until the cable comes up, then the robot switches to the wired stream automatically.
+    Press **Enter VR** and teleoperate as usual. You don't have to wait for the USB link. Wi-Fi drives the arms until the cable link is up, and then the robot switches to it.
   </Step>
 </Steps>
 
-<Warning>
-  If the **Quest** settings tab shows `unauthorized`, re-accept the prompt in the headset. If it shows no device, replug the cable and confirm Developer Mode is on. A flaky cable is the most common cause of a link that won't come up.
-</Warning>
+## Troubleshooting
+
+| The **Quest** tab shows | Fix |
+|---|---|
+| **Authorize on headset** | Put on the headset and accept the **Allow USB debugging?** prompt. |
+| **No headset** | Plug the cable in again, and check that Developer Mode is on. |
+| **adb not installed** | Run `axol provision` on the Host Computer, then reconnect the headset. |
+| **Headset ready**, but the link doesn't connect | Press **Connect**. If it still fails, try another cable. A faulty cable is the most common cause. |
 
 ## Next steps
 
@@ -77,6 +85,6 @@ When USB is selected, the headset sends every pose frame over **both** the cable
     The WebXR app, camera views, and connection details.
   </Card>
   <Card title="Quest Without Wearing It" icon="eye-slash" href="/guides/quest-headless">
-    Keep the headset awake headless — the same cable also disables the proximity sensor.
+    Keep the headset awake while nobody wears it, using the same cable.
   </Card>
 </CardGroup>

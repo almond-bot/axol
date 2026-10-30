@@ -1,27 +1,35 @@
 ---
 title: "motion.build / motion.list"
-description: "Build reference motions from recorded sessions — teleoperated or hand-guided."
+description: "Build reference motions from recorded teleop or hand-guided sessions."
 ---
 
-Reference motions are uniform-rate, both-arm joint trajectories stored on the robot in `~/.almond/motions/`, so the same motion can be replayed on that robot again and again and the tracking metrics compared 1:1 with [`tune.motion`](/cli/tune-motion). Build one from a recording here, or generate one ([`motion.chirp`](/cli/tune-tf), `scripts/creep_motions.py`). A few are built in — generated in code, the same on every robot, no file needed: `slow_osc` (the slow-motion acceptance test), `fast_swing` (large fast swings), each with a `_left` mirror, and `hold` (40 s still). A file of the same name in `~/.almond/motions/` overrides a built-in.
+A reference motion is a joint trajectory for both arms, stored on the robot in `~/.almond/motions/`. Replay it with [`tune.motion`](/cli/tune-motion) as often as you like and compare the tracking results run to run. Build one from a recording here, or generate one with [`motion.chirp`](/cli/tune-tf) or `scripts/creep_motions.py`.
 
-`motion.build` postprocesses a flight-recorder capture into one, from either recorder:
+A few motions are built in and the same on every robot:
 
-- **Teleop** (`axol teleop --teleop.record PREFIX`): the final guarded command stream (`_cmd` stage), clipped to the engaged span.
-- **Gravity comp** (`axol gravity-comp --record PREFIX`): the measured arm-joint positions of the hand-guided session (`_gc` stage). There is no engage state, so the still lead-in/lead-out is trimmed instead — start and end the demonstration with the arms briefly at rest.
+- `slow_osc`: the slow-motion acceptance test. `slow_osc_left` is its mirror.
+- `fast_swing`: large, fast swings. `fast_swing_left` is its mirror.
+- `hold`: 40 s of holding still.
 
-Either way, the stream is resampled onto a uniform grid, zero-phase low-pass smoothed (keeping the operator's intent, dropping hand tremor and network jitter), and projected waypoint-by-waypoint through the same collision-aware solver the teleop return-to-rest uses — the stored motion is joint-limit- and self-collision-safe by construction.
+A file of the same name in `~/.almond/motions/` replaces a built-in.
+
+`motion.build` turns a recording into a motion. It reads either kind:
+
+- **Teleop** (`axol teleop --teleop.record PREFIX`): the commands sent to the arms (`_cmd`), trimmed to the time tracking was engaged.
+- **Gravity comp** (`axol gravity-comp --record PREFIX`): the measured joint positions while you guided the arms (`_gc`). The still time at the start and end is trimmed, so start and end the demonstration with the arms briefly at rest.
+
+The recording is resampled at an even rate and smoothed to remove hand tremor and network jitter. Each point is then checked with the same collision-aware solver the teleop return to rest uses. The stored motion stays within joint limits and never collides with the robot itself.
 
 | Flag | Description |
 |---|---|
-| `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip) or `axol gravity-comp --record PREFIX` (reads `<prefix>_gc.npz`). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare recording names are written. **Optional**: omitted, the newest recording in that directory is used |
-| `--name NAME` | Motion name; written to `~/.almond/motions/<name>.npz`. **Optional**: defaults to the recording's name |
+| `prefix` | Recording prefix from `--teleop.record` or `gravity-comp --record`. A bare name is looked up in `~/.almond/recordings/`. Optional: defaults to the newest recording there. |
+| `--name NAME` | Motion name, saved as `~/.almond/motions/<name>.npz`. Optional: defaults to the recording's name. |
 | `--out PATH` | Write to an explicit path instead of `~/.almond/motions/` |
-| `--rate HZ` | Uniform playback rate (default: 240 — the production control rate; `tune.motion` replays at the motion's stored rate) |
-| `--cutoff HZ` | Zero-phase low-pass cutoff (default: 6.0 — keeps deliberate motion, drops hand tremor and network jitter) |
+| `--rate HZ` | Playback rate (default: 240, the control rate). `tune.motion` replays at this rate. |
+| `--cutoff HZ` | Smoothing cutoff (default: 6.0). Lower removes more tremor. |
 | `--time-scale X` | Stretch playback time (2.0 = half speed; default: 1.0) |
-| `--no-project` | Skip the collision-aware waypoint projection |
-| `--notes TEXT` | Free-form provenance note stored in the motion metadata |
+| `--no-project` | Skip the collision check |
+| `--notes TEXT` | A note stored with the motion |
 
 ```bash
 axol teleop --teleop.record rec1          # record via teleop, or ...
@@ -31,4 +39,4 @@ axol motion.build rec1 --name reach-slow --time-scale 2.0
 axol motion.list                                 # the built-ins and ~/.almond/motions
 ```
 
-Every build also saves a **before/after tuning-run artifact** (`kind=build`, `~/.almond/diagnostics/tuning/`): the clipped raw command recording and the built motion side by side per joint, with per-joint change RMS/max and peak velocities. The diagnostics dashboard charts it like any other tuning run (zoom / fullscreen), so the effect of the smoothing pass and the collision projection is directly visible before the motion is ever replayed.
+Every build also saves a before-and-after comparison in `~/.almond/diagnostics/tuning/`. It shows the recording and the built motion side by side for each joint, with how much each changed and the peak velocities. Open it in the diagnostics dashboard like any other tuning run to check the motion before you replay it.

@@ -34,7 +34,7 @@ describe("motor parameter presentation", () => {
   it("groups by panel and keeps unknown parameters under Other", () => {
     const sections = groupParams([param("LOW_VOLTAGE"), param("MAX_SPEED"), param("NEW_THING")])
     expect(sections.map((s) => s.title)).toEqual([
-      "Protect parameters",
+      "Protection parameters",
       "Motor parameters",
       "Other",
     ])

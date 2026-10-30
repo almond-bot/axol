@@ -5,16 +5,19 @@ import importlib
 import sys
 
 from ..rt import install as rt_install
+from ..teleop import warm as ik_warm
 from ..utils.dotenv import load_local_env
 from . import calibration as calibration_cmd
 from . import hub as hub_cmd
 from . import (
     mantis_latency,
     mantis_session,
+    mantis_update,
     tracker_bridge,
     tracker_identify,
     tracker_install,
     tracker_lighthouse,
+    tracker_lighthouse_calibrate,
     tracker_pair,
     tracker_ultimate,
 )
@@ -153,11 +156,13 @@ def build_parser() -> argparse.ArgumentParser:
     tracker_identify.add_parser(subparsers)
     tracker_install.add_parser(subparsers)
     tracker_lighthouse.add_parser(subparsers)
+    tracker_lighthouse_calibrate.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
     tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)
+    mantis_update.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
@@ -172,6 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     gst_build_zed.add_parser(subparsers)
     rt_install.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
+    ik_warm.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)

@@ -10,16 +10,18 @@ the hub's version from sysfs (its USB ``bcdDevice``, readable unprivileged)
 and reflashes it over USB when it is older than :data:`FIRMWARE_VERSION`.
 
 Flashing needs root (usbfs control transfer, mounting the bootloader's disk).
-The hosted ``axol serve`` is root; an interactive session escalates through
-``sudo`` like the CAN bring-up does, and a session that cannot escalate keeps
-running on the old firmware with a warning naming ``sudo axol hub.flash``.
+The hosted ``axol serve`` is root; an interactive session (bring-up, or
+``axol hub.flash`` itself) escalates through ``sudo`` like the CAN bring-up
+does, and a bring-up that cannot escalate keeps running on the old firmware
+with a warning naming ``axol hub.flash``.
 
 Reflashing reboots the hub, so both arm buses go silent for a few seconds.
 Motors keep executing their last command meanwhile (the arms set no CAN
 timeout), and the reboot itself discards anything the old firmware had
 queued. A hub whose firmware predates the reflash request (before 2026-08-17)
 cannot be rebooted into its bootloader from the host; it needs one manual
-flash (hold BOOTSEL while plugging it in, then ``sudo axol hub.flash``).
+flash (flip the BOOTSEL switch next to its USB port and replug it, then
+``axol hub.flash``, then flip the switch back and replug it again).
 """
 
 from __future__ import annotations
@@ -144,6 +146,37 @@ def hubs_for_channels(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hub]
         if hub is not None:
             hubs.setdefault(hub.port, hub)
     return list(hubs.values())
+
+
+def _usb_devices(sysfs: Path) -> list[Path]:
+    """Every USB device directory (interfaces like ``1-3:1.0`` excluded)."""
+    root = sysfs / "bus" / "usb" / "devices"
+    return [d for d in sorted(root.glob("*")) if ":" not in d.name]
+
+
+def attached_hubs(*, sysfs: Path = _SYSFS) -> list[Hub]:
+    """Every Axol hub on USB, whether or not its CAN interfaces exist.
+
+    The arm hub and the Mantis hub are the same board on the same firmware,
+    so both are found, as is a hub whose interfaces never came up (no
+    ``gs_usb``, not set up yet) that :func:`hubs_for_channels` cannot see.
+    """
+    hubs = (_hub_at(device) for device in _usb_devices(sysfs))
+    return [hub for hub in hubs if hub is not None]
+
+
+def bootloader_ports(*, sysfs: Path = _SYSFS) -> list[str]:
+    """USB ports of RP2350s sitting in their bootrom.
+
+    A hub is there after a replug with its BOOTSEL switch on, after an
+    interrupted flash, or when it has no firmware. The bootrom carries no
+    identity of its own, so this can be any RP2350 board.
+    """
+    return [
+        device.name
+        for device in _usb_devices(sysfs)
+        if _usb_ids(device) == (BOOT_VID, BOOT_PID)
+    ]
 
 
 def _usb_device(port: str, sysfs: Path = _SYSFS) -> Path:
@@ -301,9 +334,9 @@ def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> in
                 # Stalled: the firmware does not know the request.
                 raise HubFirmwareError(
                     f"the Axol hub at USB port {port} runs firmware too old to "
-                    "update over USB; flash it once by hand: hold its BOOTSEL "
-                    "button while plugging it in, then run `sudo axol hub.flash "
-                    f"--port {port}`"
+                    "update over USB. Flash it once by hand: flip the BOOTSEL "
+                    "switch next to its USB port, replug the hub, then run "
+                    "`axol hub.flash`"
                 ) from exc
             # Otherwise the hub most likely rebooted before the status stage.
         _wait_for(lambda: _in_bootloader(port, sysfs), 10, "the hub's bootloader")
@@ -315,12 +348,14 @@ def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> in
         hub = _wait_for(lambda: _hub_at(device), 20, "the hub to restart")
     except HubFirmwareError:
         if _in_bootloader(port, sysfs):
-            # The bootrom reboots once the image lands; with BOOTSEL still
-            # held (a manual flash) it comes straight back to the bootloader.
+            # The bootrom reboots once the image lands; with the BOOTSEL
+            # switch still on (a manual flash) it comes straight back to the
+            # bootloader, and the switch is only read at power-on.
             raise HubFirmwareError(
                 f"the hub at USB port {port} restarted into its bootloader "
-                "again; if BOOTSEL is still held, release it and replug the "
-                "hub to boot the new firmware, otherwise rerun the flash"
+                "again. If its BOOTSEL switch is on, flip it back and replug "
+                "the hub to start the new firmware. Otherwise run "
+                "`axol hub.flash` again"
             ) from None
         raise
     return hub.version
@@ -384,7 +419,7 @@ def ensure_hub_firmware(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hu
             if os.geteuid() == 0:
                 new_version = flash(hub.port, sysfs=sysfs)
             else:
-                new_version = _flash_via_sudo(hub, sysfs=sysfs)
+                new_version = flash_via_sudo(hub.port, sysfs=sysfs)
         except HubFirmwareError as exc:
             if not _in_bootloader(hub.port, sysfs) and _hub_at(
                 _usb_device(hub.port, sysfs)
@@ -416,22 +451,18 @@ def ensure_hub_firmware(channels: list[str], *, sysfs: Path = _SYSFS) -> list[Hu
     return flashed
 
 
-def _flash_via_sudo(hub: Hub, *, sysfs: Path) -> int:
-    """Run the flash as root through ``sudo`` (prompts on a terminal)."""
+def flash_via_sudo(port: str, *, sysfs: Path = _SYSFS) -> int:
+    """:func:`flash` run as root through ``sudo`` (prompts on a terminal)."""
     from ..utils.sudo import run_root
 
-    proc = run_root(
-        [sys.executable, "-m", "almond_axol.hub", "flash", "--port", hub.port]
-    )
+    proc = run_root([sys.executable, "-m", "almond_axol.hub", "flash", "--port", port])
     if proc.returncode != 0:
         # The flash reports its failure on stderr (``ERROR: ...``), as does
         # sudo when it cannot escalate; either way the last line says why.
         lines = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()]
         detail = lines[-1].removeprefix("ERROR: ") if lines else ""
-        raise HubFirmwareError(
-            detail or f"`sudo axol hub.flash` exited {proc.returncode}"
-        )
-    updated = _hub_at(_usb_device(hub.port, sysfs))
+        raise HubFirmwareError(detail or f"the sudo flash exited {proc.returncode}")
+    updated = _hub_at(_usb_device(port, sysfs))
     if updated is None:
-        raise HubFirmwareError(f"the hub at USB {hub.port} did not come back")
+        raise HubFirmwareError(f"the hub at USB {port} did not come back")
     return updated.version

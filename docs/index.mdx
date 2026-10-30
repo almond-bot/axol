@@ -1,23 +1,28 @@
 ---
 title: "Almond Axol"
-description: "Command-line interface and Python SDK for the Almond Axol dual-arm robot."
+description: "Set up, drive and train the Almond Axol dual-arm robot from a browser or a terminal."
 ---
 
 <img src="/assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
-The Axol SDK runs the Almond Axol dual-arm robot. Every core operation — **teleoperation**, **gravity compensation**, **data collection**, **dataset replay**, **policy inference**, and **DAgger correction** — can be driven two ways: from the **web control panel** in a browser, or from the **`axol` CLI** in a terminal. Each operation page below shows both.
+The Axol software runs the Almond Axol dual-arm robot. You can run every operation in two ways:
+
+- From the **web control panel** in a browser.
+- From the **`axol` command line** in a terminal.
+
+Each operation page below shows both.
 
 <Note>
-  **New here?** [Install in one command](/installation), then head to [Teleoperation](/operations/teleop) to drive the robot from a VR headset.
+  **New here?** Start with [Hardware Setup](/hardware-setup) to mount and power Axol. Then [install the software](/installation) with one command, and go to [Teleoperation](/operations/teleop) to drive the robot from a VR headset.
 </Note>
 
 ## Operations
 
-Each page covers the same task from the **Control Panel** and the **CLI** — pick the tab you prefer.
+Each page has a **Control Panel** tab and a **CLI** tab. Pick the one you prefer.
 
 <CardGroup cols={2}>
   <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
-    Drive the robot live from a VR headset (or in sim, no hardware).
+    Drive the robot live from a VR headset, or try it in simulation without hardware.
   </Card>
   <Card title="Gravity Compensation" icon="hand" href="/operations/gravity-comp">
     Hold the arms weightless so you can move them by hand.
@@ -29,7 +34,7 @@ Each page covers the same task from the **Control Panel** and the **CLI** — pi
     Play a recorded dataset episode back onto the arms.
   </Card>
   <Card title="Run Policy" icon="robot" href="/operations/run-policy">
-    Run a trained policy autonomously — locally or on a remote server.
+    Let a trained policy run the robot, on the Host Computer or on a remote server.
   </Card>
   <Card title="DAgger Collection" icon="hand" href="/operations/dagger">
     Run a policy while correcting it from VR, recording the corrections.
@@ -43,25 +48,25 @@ Each page covers the same task from the **Control Panel** and the **CLI** — pi
     Axol, its mounting options, the Camera Kit, and the Compute Kit.
   </Card>
   <Card title="Hardware Setup" icon="screwdriver-wrench" href="/hardware-setup">
-    Step-by-step setup for each mount (standalone, Owl Mount, Ox Cart, Jelly) and the cameras.
+    Step-by-step setup for each mount and for the cameras.
   </Card>
   <Card title="Installation" icon="download" href="/installation">
-    The one-command install that sets up the robot machine and the web control panel.
+    Install the software on the Host Computer with one command.
   </Card>
   <Card title="Remote Teleop" icon="globe" href="/guides/remote-teleop">
-    Drive the robot over the internet — sideload Tailscale on a Meta Quest.
+    Drive the robot over the internet from a Meta Quest.
   </Card>
   <Card title="Mantis" icon="hand" href="/mantis/hardware">
-    Handheld rigs for collecting demonstrations without moving the robot — hardware and tracking setup.
+    Set up the handheld rigs that record demonstrations without the robot.
   </Card>
   <Card title="Web Control Panel" icon="display" href="/guides/control-panel">
-    Drive Axol from a browser with `axol serve` — no terminal required.
+    Run every operation from a browser, without a terminal.
   </Card>
   <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
-    The in-repo WebXR app that streams Quest pose to the SDK.
+    The headset app you use to drive Axol from a Meta Quest.
   </Card>
   <Card title="CLI Reference" icon="terminal" href="/cli/teleop">
-    Every `axol` command, flag, and example — one page per command.
+    Every `axol` command and flag, with examples.
   </Card>
   <Card title="Python API" icon="code" href="/api/concepts">
     `Axol`, `KinematicsSolver`, `VRTeleop`, and the LeRobot wrappers.

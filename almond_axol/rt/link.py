@@ -50,7 +50,8 @@ _ARM_TIMEOUT_S = 15.0
 #: time, not arm and then silently reject every target. 18 changes no layout:
 #: it requires a core that stops on the arm hub's no-ACK report, because this
 #: package flashes hubs to the firmware that no longer backs up on an e-stop.
-CONFIG_PROTO = 18
+#: 19 adds the optional ``tracking_profile mink`` line (Mink IK sessions).
+CONFIG_PROTO = 19
 
 
 def config_header() -> list[str]:

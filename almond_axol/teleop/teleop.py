@@ -38,10 +38,12 @@ import os
 import signal
 import threading
 import time
+from dataclasses import replace
 
 import numpy as np
 
-from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
+from .. import progress
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, AxolModel
 from ..kinematics import KinematicsConfig
 from ..robot.base import (
     HardwareCleanupError,
@@ -50,6 +52,7 @@ from ..robot.base import (
 )
 from ..robot.control import ContactWatchdog
 from ..robot.jelly import Jelly
+from ..robot.start_pose import check_start_pose
 from ..teleop_activity import TeleopActivityMarker
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -199,6 +202,23 @@ class VRTeleop:
         robot_gripper = getattr(arm, "gripper_type", None)
         if isinstance(robot_gripper, str):
             adopt_robot_gripper(config, robot_gripper)
+        # A session driving Jelly is on the mobile Axol; without one, infer it
+        # (a Sim on a Jelly host still models the mobile body). Resolved once
+        # so the IK worker and the headset overlay agree.
+        from ..settings import resolve_gripper, resolve_robot_model
+
+        robot_model = resolve_robot_model(
+            kinematics_config.robot_model,
+            jelly_enabled=True if jelly is not None else None,
+            mount=kinematics_config.mount,
+        )
+        kinematics_config = replace(kinematics_config, robot_model=robot_model.value)
+        # The mobile Axol has a URDF per gripper: solve with the fitted one.
+        if robot_model is AxolModel.MOBILE:
+            kinematics_config = replace(
+                kinematics_config,
+                gripper=resolve_gripper(kinematics_config.gripper or config.gripper),
+            )
         self._robot = robot
         self._jelly = jelly
         self._config = config
@@ -221,6 +241,7 @@ class VRTeleop:
             self._broadcast_tracking,
             broadcast_mode=lambda key, value: self._live.on_changed(key, value),
             broadcast_json=self._broadcast_json,
+            robot_model=kinematics_config.robot_model,
         )
         # Live session settings (box mode, re-engage, grip force, …): applied
         # from `set` messages off any client, published back as `settings`.
@@ -378,6 +399,7 @@ class VRTeleop:
                 "previous teleop cleanup is incomplete; retry disable() before "
                 "starting another session"
             )
+        progress.step("headset")
         self._vr_stop.clear()
         self._vr_ready.clear()
         self._vr_start_error = None
@@ -394,14 +416,19 @@ class VRTeleop:
         # session settings (their controls mirror the server; see set_announce).
         self._live.announce()
 
+        progress.step("arms")
         await self._robot.enable()
+        pos_l, pos_r = await self._robot.get_positions()
+        # The startup trajectory plays from here to rest unsupervised; refuse
+        # it from far away. __aenter__'s teardown torques the arms back off.
+        check_start_pose((pos_l, pos_r))
         if self._jelly is not None:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
+            progress.step("jelly")
             await self._jelly.enable()
 
-        pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
             pos_l[7] if pos_l is not None else None,
             pos_r[7] if pos_r is not None else None,
@@ -449,6 +476,7 @@ class VRTeleop:
             raise
         child_conn.close()
 
+        progress.step("ik")
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
@@ -913,6 +941,7 @@ class VRTeleop:
             # starting (read-only home, full disk, etc.).
             _logger.warning("could not publish teleop timing boundary: %s", exc)
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
+        progress.ready()
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
         deadline = time.perf_counter()
@@ -1144,6 +1173,7 @@ class VRTeleop:
             ):
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
+        self._core.note_tracking_quality(frame)
         # Box mode splits the stick clicks into grasp taps and lift holds
         # (see VRTeleopCore.box_stick_frame); taps work without Jelly too.
         sticks = self._core.box_stick_frame(frame)
@@ -1187,4 +1217,7 @@ class VRTeleop:
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
             get_measured=lambda: measured_arms(self._robot),
+            get_lift=(
+                (lambda: self._jelly.lift_raised) if self._jelly is not None else None
+            ),
         )

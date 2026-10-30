@@ -88,6 +88,11 @@ _RANGE_SYNC_TIMEOUT_S = 1.0
 # this can't self-suppress off the link's own traffic.
 _EXTERNAL_CMD_FRESH_S = 1.0
 
+# How often the link checks for a passive observer whose proxy died under it
+# (its interface went away: a panel `can.setup` USB-resets the arm hub, a USB
+# drop re-enumerates it) and tries to reopen it once the interface is back up.
+_OBSERVER_REOPEN_INTERVAL_S = 1.0
+
 # State machine surfaced to the UI.
 #   disconnected -> connecting -> connected
 #   connected    -> busy (a task owns the bus)  -> connected
@@ -268,7 +273,11 @@ class _ArmLink:
         self._locks = {}
 
     async def open_observer(self, joints: list[Joint]) -> None:
-        """Start the passive observer socket. Idempotent across reacquires."""
+        """Start the passive observer socket.
+
+        Idempotent across reacquires while its proxy lives; one that died
+        under it (the interface went away mid-task) is replaced.
+        """
         if self.observer is None:
             self.observer = BusObserver(self.channel, joints)
         await self.observer.start()
@@ -500,6 +509,9 @@ class RobotLink:
         # Publishes observer-decoded telemetry while a task owns command; runs
         # from connect to disconnect (it idles while the link owns the bus).
         self._publish_task: asyncio.Task[Any] | None = None
+        # Reopens an observer whose proxy died under it; same lifetime as the
+        # publish loop it keeps fed.
+        self._observer_watch_task: asyncio.Task[Any] | None = None
         # One-shot best-effort observer range sync, fired on connect/reacquire.
         self._sync_task: asyncio.Task[Any] | None = None
         # A caller-side Future timeout only requests cancellation; the loop
@@ -877,6 +889,10 @@ class RobotLink:
                 self._sample_task = asyncio.ensure_future(self._sample_loop())
             if self._publish_task is None or self._publish_task.done():
                 self._publish_task = asyncio.ensure_future(self._publish_loop())
+            if self._observer_watch_task is None or self._observer_watch_task.done():
+                self._observer_watch_task = asyncio.ensure_future(
+                    self._observer_watch_loop()
+                )
             # Range sync happens off the connect path: with the motors powered
             # off, each read runs into its timeout, and 16 motors of that would
             # stall connect for many seconds.
@@ -952,6 +968,8 @@ class RobotLink:
                 failures.append(exc)
             await self._cancel(self._publish_task, failures)
             self._publish_task = None
+            await self._cancel(self._observer_watch_task, failures)
+            self._observer_watch_task = None
             for arm in self._arms:
                 await arm.close_observer()
             if not failures:
@@ -1068,6 +1086,54 @@ class RobotLink:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 _logger.debug("observer publish error: %s", exc)
+
+    async def _observer_watch_loop(self) -> None:
+        """Reopen a passive observer whose proxy died under it.
+
+        The observers outlive any one task, but not their interface: a
+        ``can.setup`` launched from the panel USB-resets the arm hub (and a
+        USB drop re-enumerates it), so the observer's proxy exits on ENETDOWN.
+        Nothing else reopens it — reacquire reuses the observer — so without
+        this the dashboard stays dark for the rest of the task and every one
+        after it, and :meth:`BusObserver.commanded_joints` goes blind to an
+        external control loop. Retries every
+        :data:`_OBSERVER_REOPEN_INTERVAL_S` once the interface is back up.
+        """
+        from ..cli.can.setup import iface_up
+
+        lost: set[str] = set()
+        while True:
+            await asyncio.sleep(_OBSERVER_REOPEN_INTERVAL_S)
+            for arm in self._arms:
+                observer = arm.observer
+                if observer is None or observer.alive:
+                    lost.discard(arm.channel)
+                    continue
+                if arm.channel not in lost:
+                    lost.add(arm.channel)
+                    _logger.warning(
+                        "passive observer for %s lost its proxy; reopening "
+                        "once the interface is back up",
+                        arm.channel,
+                    )
+                if not iface_up(arm.channel):
+                    continue
+                # Serialized with connect/disconnect, which open and close the
+                # observers themselves; one torn down meanwhile is left alone.
+                async with self._lifecycle_lock:
+                    if arm.observer is not observer or observer.alive:
+                        continue
+                    try:
+                        await observer.start()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - retried next tick
+                        _logger.debug(
+                            "reopening %s observer failed: %s", arm.channel, exc
+                        )
+                        continue
+                lost.discard(arm.channel)
+                _logger.info("passive observer for %s reopened", arm.channel)
 
     # -- CAN bring-up -------------------------------------------------------
 

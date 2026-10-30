@@ -255,7 +255,7 @@ class JointConfig:
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
-                  ``*_w2``).
+                  ``*_w2``) and the Camera Kit wrist camera and mount.
         com:      Centre of mass of the same body, in the body's URDF link
                   frame (m).
         j_eff:    Effective scalar inertia (kg·m²) for acceleration

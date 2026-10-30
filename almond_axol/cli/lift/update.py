@@ -54,8 +54,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         type=Path,
         default=None,
         metavar="FIRMWARE_BIN",
-        help="The jelly_legs build's firmware.bin. Omit to only report the "
-        "running firmware.",
+        help="The lift firmware file (firmware.bin). Omit it to only report "
+        "the installed firmware version.",
     )
     p.add_argument(
         "--force",

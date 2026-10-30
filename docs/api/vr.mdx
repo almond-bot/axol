@@ -3,7 +3,7 @@ title: "almond_axol.vr"
 description: "Secure WebSocket server that receives VRFrame messages from the VR app."
 ---
 
-Secure WebSocket server (WSS) that receives `VRFrame` JSON messages from the VR app. A self-signed TLS certificate is auto-generated in `~/.almond/vr/certs/` on first use. This module can be used standalone to read raw VR data without full teleoperation — useful for custom control loops or data collection.
+Secure WebSocket server (WSS) that receives `VRFrame` JSON messages from the VR app. On first use it generates a self-signed TLS certificate in `~/.almond/vr/certs/`. You can use this module on its own to read raw VR data without full teleoperation, for example in a custom control loop or for data collection.
 
 ```python
 from almond_axol.vr import VRServer, VRServerConfig
@@ -37,82 +37,155 @@ async with VRServer() as vr:
 
 ## `VRFrame` fields
 
+### Controller input
+
 | Field | Type | Description |
 |---|---|---|
-| `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position + quaternion) |
-| `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions |
-| `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
-| `l_lock` / `r_lock` | `bool` | Grip button states. Both together (from rest) engage tracking; once engaged each **toggles its own arm** between tracking and frozen — or, with `hold_to_engage`, each holds its own arm while pressed (either alone, from rest too) |
-| `l_tracked` / `r_tracked` | `bool` | Whether each controller's position is optically tracked. `False` means the headset is dead-reckoning it (WebXR `emulatedPosition` — occluded / out of FOV / fast whip), so the pose smoother excludes those frames and holds the last clean pose. Defaults to `True`, so older web builds (which omit the field) keep the previous always-trusted behaviour |
-| `l_trigger_live` / `r_trigger_live` | `bool` | Whether each managed Mantis CAN trigger node is still publishing fresh input. A tracker bridge sets this false on heartbeat loss while holding the last safe command; collection quality checks reject the affected take. Quest/legacy clients default to `True`. |
-| `reset` | `bool` | Rising edge triggers a reset move |
-| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
-| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` / `failure` pulse from a managed trigger gesture. Collection uses it to choose its stop path and logs failure, but the current LeRobot rows do not persist an outcome label. |
-| `episode_end_t_host` | `float \| None` | Host `perf_counter` instant where a saved episode's data should end, sent alongside a successful `episode_outcome`. A local tracker bridge sets it to the moment the end gesture *began* so the collector trims the rows captured during the trigger clicks. `None` keeps every row (Quest / older clients). |
-| `lock_release_id` | `int \| None` | Internal managed-tracker handshake: on an all-locks-false frame the teleop core echoes this id once it has consumed the release, so the bridge can wait for a real re-engage edge even while IK is blocked. |
-| `t` | `float \| None` | Client capture timestamp in ms (`performance.now()`), used by the pose interpolator. `None` falls back to latest-wins |
-| `seq` | `int \| None` | Monotonic frame counter set by a producer. Together with `pose_source_id`, it de-duplicates identical USB/WebRTC/network copies globally; the first delivered copy wins. `None` disables cross-transport de-duplication. |
-| `t_host` | `float \| None` | Server-stamped estimate of when these poses were captured on the *host* clock (`perf_counter`), derived from `t` and the headset↔host clock offset. Dataset rows align to this when the pose stream is the ground truth (Mantis recording). `None` until the interpolator has seen the frame. |
-| `pose_source_id` | `str \| None` | Stable logical producer id shared across every transport and reconnect for one Quest/bridge. This is the scope of sequence de-duplication and exclusive pose ownership. Older clients fall back to a per-connection legacy id. |
-| `pose_source_kind` | `"webxr" \| "tracker" \| None` | Source class used by managed Mantis policy: Quest is `webxr`; Lighthouse/Ultimate bridges are `tracker`. Non-owning clients remain connected to receive video/HUD/URDF state, but their pose frames and HUD controls are ignored. |
-| `l_pose_profile` / `r_pose_profile` | `str \| None` | Most-preferred WebXR input profile for each Quest controller (for example `oculus-touch-v3`). Production Quest calibration is scoped to this value. |
-| `l_pose_space` / `r_pose_space` | `"grip" \| "target-ray" \| None` | Datum used for each Quest pose. Production Mantis requires the calibrated `gripSpace`; `target-ray` is compatibility bring-up only. |
-| `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick axes (right = +1; pushed forward = -1). Drive [Jelly](/guides/vr-interface#jelly)'s translation when one is configured |
-| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right = +1). Drives Jelly's rotation |
-| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (pushed forward = -1). Only read in [box mode](/guides/vr-interface#box-mode), while a grip leads the pair: forward/back sets the grip width (forward = wider); Jelly ignores it |
-| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers Jelly's lift, right raises it. In box mode a click is split by how long it's held: a tap (released within ~0.3 s, the other stick up) switches the grasp while a grip leads, and only a hold past that runs the lift. Both pressed together (within ~0.35 s) toggle [box mode](/guides/vr-interface#box-mode) (the headset sends the `set` message below). Neutral defaults keep older web builds (which omit these fields) compatible |
-| `box_leader` | `"left" \| "right" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: which controller currently leads the pair in box mode |
-| `reengage` | `"clutch" \| "ramp" \| None` | Set by `VRTeleopCore` on the frame it forwards to the IK worker, not by the headset: the session's effective [re-engage behaviour](/guides/vr-interface#re-engaging). Session modes are switched out of band with the `set` message, not through frames |
+| `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position and quaternion). |
+| `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions. |
+| `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands. `0` is closed and `1` is open. |
+| `l_lock` / `r_lock` | `bool` | Grip button states. See [Engage behavior](/api/teleop#engage-behavior). |
+| `l_tracked` / `r_tracked` | `bool` | Whether the headset can see the controller. `False` frames are estimated, so the pose smoother skips them and holds the last good pose. Defaults to `True`. |
+| `reset` | `bool` | A rising edge starts a return to rest. |
+| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION` or `RECORDING`, set by the headset. `SAVING` and `ERROR` are only pushed by the server. |
+| `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick (right is `+1`, forward is `-1`). Drives [Jelly](/guides/vr-interface#jelly)'s translation when one is configured. |
+| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Drives Jelly's rotation. |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Used only in [box mode](/guides/vr-interface#box-mode) while a grip leads, where it sets the grip width. Jelly ignores it. |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Left lowers Jelly's lift and right raises it. See the notes below for box mode. |
 
-### Pose transports & USB/Wi-Fi fallback
+In box mode, the thumbsticks drive Jelly as usual, led or frozen. While a grip leads the pair, a quick tap of either thumbstick click toggles the grasp (`box_grasp`). A tap is released within about 0.3 s, with the other stick up. A longer hold runs the lift.
 
-The headset can stream pose over more than one transport at once — the network WebSocket, a USB `adb reverse` tunnel ([Quest over USB](/guides/quest-over-usb)), and a dedicated WebRTC data channel ([remote teleop](/guides/remote-teleop)). Every copy carries the same `pose_source_id` and `seq`; the server keeps a monotonic high-water mark for that logical producer and processes each frame exactly once, from whichever link delivers it first. A cable drop therefore falls through to the next Wi-Fi copy with no reconnect, while a delayed standby copy can never rewind controls or enter the jitter buffer. The producer state resets after its last carrying client disconnects and on `disable()`, so a reloaded source with a restarted counter is accepted.
+Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
 
-Only one logical producer owns poses at a time. Managed Quest Mantis sets `VRServerConfig.pose_source_kind="webxr"`; managed Lighthouse/Ultimate sets it to `"tracker"` and gives both the owned bridge and server a fresh `expected_pose_source_id` for that operation. A connected source of another kind or ID stays available for signaling, camera video, server-driven HUD, and URDF state but its `VRFrame`s and client-originated HUD controls are view-only and ignored, so a forgotten standalone bridge or connected Quest cannot claim or alter a managed run. Lighthouse/Ultimate worlds are not automatically registered to that viewer's Quest local-floor world, so their URDF state carries `viewer_world_aligned=false` and the client hides the spatial overlay by default. On an unrestricted compatibility server the first producer claims control, except that a tracker bridge may supersede WebXR; once a tracker has claimed it, the server does not silently fail over to a still-connected Quest if the bridge dies.
+The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so a client that leaves them out still works.
 
-The WebRTC pose data channel (`almond_axol.vr.control_channel`) shares the same ICE/TURN path as the camera video, so an operator off your tailnet can drive over a relay. ICE servers are read from the environment (`AXOL_TURN_URL` / `AXOL_TURN_USERNAME` / `AXOL_TURN_PASSWORD`; see `almond_axol.vr.ice`) — on a LAN or plain tailnet they're unset and the direct path is used. If the data channel fails to negotiate (or the peer connection drops), the headset re-requests it after a backoff rather than permanently falling back to the WebSocket.
+### Timing and pose source
 
-## Server → headset feedback
+| Field | Type | Description |
+|---|---|---|
+| `t` | `float \| None` | Client capture time in ms (`performance.now()`), used by the pose interpolator. With `None`, the newest frame wins. |
+| `seq` | `int \| None` | Frame counter set by the producer. With `pose_source_id`, it drops duplicate copies of a frame that arrive over different transports. |
+| `t_host` | `float \| None` | When the poses were captured, on the host's `perf_counter` clock. The server fills it in from `t`. Mantis recordings align dataset rows to it. |
+| `pose_source_id` | `str \| None` | Stable ID of the producer, shared across its transports and reconnects. |
+| `pose_source_kind` | `"webxr" \| "tracker" \| None` | `webxr` for a Quest, `tracker` for a Lighthouse or Ultimate bridge. |
+| `l_pose_profile` / `r_pose_profile` | `str \| None` | WebXR input profile of each Quest controller, such as `oculus-touch-v3`. Quest calibration is stored per profile. |
+| `l_pose_space` / `r_pose_space` | `"grip" \| "target-ray" \| None` | Which WebXR pose each Quest controller reports. Production Mantis needs the calibrated `grip` pose. |
 
-The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. `{"type": "state", "value": "error"}` shows an error indicator in the headset UI. `{"type": "state", "value": "data_collection"}` re-enables controls after saving. The `AxolVRTeleop.send_feedback_state(state)` helper wraps this for all `VRState` values.
+### Mantis episode control
 
-On connect the server also announces its **operating mode** — `{"type": "mode", "value": "teleop" | "data_collection"}` — set via `VRServer.set_mode()`. The web UI uses it to **lock the HUD** to a single mode: [`axol teleop`](/cli/teleop) sends `teleop` (recording controls hidden), while [`axol collect-data`](/cli/collect-data) sends `data_collection` (recording enabled, but no switching back to plain teleop). A separate replayable `{"type": "pose_source_kind", "value": "webxr" | "tracker" | null}` announcement makes a Quest's A/X recording controls view-only in tracker-owned Lighthouse/Ultimate sessions; the server independently rejects HUD control messages from any socket that is not carrying the active WebXR pose source. These messages are pushed once per client in the WebSocket accept handler, so a headset that joins mid-session still gets them.
+| Field | Type | Description |
+|---|---|---|
+| `l_trigger_live` / `r_trigger_live` | `bool` | Whether each Mantis trigger node is still sending input. When it stops, the take fails its quality check. Defaults to `True`. |
+| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` or `failure` signal from a trigger gesture. The outcome is logged but not saved in the dataset. |
+| `episode_end_t_host` | `float \| None` | Host time at which a saved episode should end. The tracker bridge sets it to the start of the end gesture, so the trigger clicks are trimmed from the take. |
+| `lock_release_id` | `int \| None` | Handshake ID for tracker bridges. The teleop core echoes it once it has handled a grip release. |
 
-During data collection the server likewise pushes the current **episode number** — `{"type": "episode", "value": N}` (1-based) — which the headset renders as an `Episode N` HUD readout. [`axol collect-data`](/cli/collect-data) announces it at the start of each episode via `AxolVRTeleop.send_feedback_episode(episode)`, which both stores the value on the server (`VRServer.set_episode()`, re-sent on connect so a mid-session headset shows the right number) and broadcasts a live update to connected clients. Plain teleop never sets it, so the readout stays hidden.
+### Set by the server
 
-Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
+The headset never sets these. The teleop core adds them to the frame it forwards to the IK worker.
 
-Teleop also streams the **arm joint state** at ~20 Hz — `{"type": "joints", "value": {"q": {"<urdf joint>": rad, ...}, "l_grip": 0..1, "r_grip": 0..1, "engaged": bool, "pair": {"aligned": bool, "width": m, "tilt": deg, "grasp": str} | null}}` (measured positions when the robot reports them, else the commanded targets) — for the headset HUD. `pair` is the gripper-pair geometry the IK worker reports a few times a second (`IKWorker.pair_status()`): `aligned` is true when the two grippers already form the box-mode pair — level, the fitted tool's contact face toward each other across a box-mode-sized gap — the HUD's **Box** button shows *(aligned)* then, since switching to [box mode](/guides/vr-interface#box-mode) from that pose costs no alignment blend; `width` is the grip width (the separation the tool's contact faces would have with the mounts where they are), `tilt` the pair's inward tilt trim in degrees and `grasp` (`"flush"` / `"straight"`) the current grasp, both shown on the same button while the mode is on. The URDF and its meshes are served from the same origin under `/urdf/` (`axol.urdf`, `meshes/*.stl`).
+| Field | Type | Description |
+|---|---|---|
+| `box_leader` | `"left" \| "right" \| None` | Which controller leads the pair in box mode. |
+| `reengage` | `"clutch" \| "ramp" \| None` | The session's [re-engage behavior](/api/teleop#re-engaging). |
+
+### Pose transports and USB/Wi-Fi fallback
+
+The headset can stream poses over up to three transports at once:
+
+- the network WebSocket,
+- a USB `adb reverse` tunnel ([Quest over USB](/guides/quest-over-usb)),
+- a WebRTC data channel ([remote teleop](/guides/remote-teleop)).
+
+Every copy carries the same `pose_source_id` and `seq`, and the server handles each frame once, from whichever link delivers it first. If the cable drops, the Wi-Fi copy takes over with no reconnect. A late copy never rewinds the controls. The server forgets a producer's sequence when its last connection closes and on `disable()`, so a reloaded client starts fresh.
+
+Only one producer controls the robot at a time. Other clients stay connected and still receive video, HUD state and the robot model, but the server ignores their frames and HUD controls.
+
+- **Managed Quest Mantis** sets `VRServerConfig.pose_source_kind="webxr"`.
+- **Managed Lighthouse or Ultimate Mantis** sets it to `"tracker"`, and gives the bridge and server a one-run `expected_pose_source_id`.
+- **Without a pose source policy**, the first producer takes control. A tracker bridge can take over from a Quest. Once a tracker has control, the server doesn't fall back to a connected Quest if the bridge stops.
+
+A Lighthouse or Ultimate world isn't registered to the Quest's floor, so the headset hides the 3D robot overlay by default in those sessions.
+
+The WebRTC data channel (`almond_axol.vr.control_channel`) uses the same ICE and TURN path as the camera video, so an operator outside your tailnet can drive through a relay. Set the TURN server with `AXOL_TURN_URL`, `AXOL_TURN_USERNAME` and `AXOL_TURN_PASSWORD`. On a LAN or plain tailnet, leave them unset. If the data channel fails or drops, the headset requests it again after a delay.
+
+## Server to headset feedback
+
+The server pushes JSON messages to the headset over the same socket.
+
+| Message | When | Effect |
+|---|---|---|
+| `{"type": "state", "value": "saving"}` | While an episode is saved | Blocks the recording controls. |
+| `{"type": "state", "value": "error"}` | On an error | Shows an error indicator. |
+| `{"type": "state", "value": "data_collection"}` | After saving | Turns the recording controls back on. |
+| `{"type": "mode", "value": "teleop" \| "data_collection"}` | On connect | Locks the HUD to one mode. `teleop` hides the recording controls. |
+| `{"type": "pose_source_kind", "value": ...}` | On connect | In a tracker-owned session, makes a Quest's recording controls view-only. |
+| `{"type": "episode", "value": N}` | At each episode start | Shows **Episode N** on the HUD. |
+| `{"type": "tracking", "value": true \| false}` | When tracking engages or disengages | The headset lets you move and resize camera screens only while tracking is off. |
+| `{"type": "joints", "value": {...}}` | About 20 times a second | Arm joint state for the HUD. |
+
+Send any of these with `VRServer.broadcast_text()`. `AxolVRTeleop.send_feedback_state(state)` sends the `state` message for any `VRState`.
+
+`VRServer.set_mode()` sets the mode message. [`axol teleop`](/cli/teleop) sends `teleop`, and [`axol collect-data`](/cli/collect-data) sends `data_collection`. `AxolVRTeleop.send_feedback_episode(episode)` stores the episode number with `VRServer.set_episode()` and broadcasts it. Plain teleop never sets an episode, so the HUD hides it. The server sends the mode, pose source kind and episode to each client when it connects, so a headset that joins mid-session is up to date.
+
+The `joints` message has this shape:
+
+```json
+{
+  "type": "joints",
+  "value": {
+    "q": {"<urdf joint>": 0.0},
+    "l_grip": 0.0,
+    "r_grip": 0.0,
+    "engaged": false,
+    "pair": {"aligned": false, "width": 0.3, "tilt": 0.0, "grasp": "straight"}
+  }
+}
+```
+
+- `q` holds measured joint positions in radians when the robot reports them, and commanded targets otherwise. `l_grip` and `r_grip` run from `0` to `1`.
+- `pair` is the gripper pair geometry from `IKWorker.pair_status()`, or `null`.
+  - `aligned` is true when the grippers already form a box-mode pair. The **Box** button then reads *(aligned)*, since switching to [box mode](/guides/vr-interface#box-mode) needs no blend.
+  - `width` is the grip width in metres, between the contact faces.
+  - `tilt` is the pair's inward tilt in degrees, and `grasp` is `"flush"` or `"straight"`.
+
+The server also serves the robot model under `/urdf/` (`axol.urdf` and `meshes/*.stl`).
 
 ### Live session settings
 
-The knobs an operator can turn *mid-session* — box mode, re-engage behaviour, hold-to-engage, grip force, reach scale, arm speed — are exposed as **live settings** (`almond_axol.teleop.live.LiveSettings`) on the same socket, from any client (headset HUD, control panel, SDK):
+Some settings can change during a session from any client: the headset HUD, the control panel or the SDK. They are defined in `almond_axol.teleop.live.LiveSettings` and use three messages on the same socket.
 
-- **client → server** `{"type": "set", "key": "<key>", "value": <value>}` — handled by the callback installed with `VRServer.set_on_setting()`. Values are validated (type, range, choices); a rejected request is logged and simply not echoed. A boolean key also accepts `"value": "toggle"`, flipped against the server's current value — what the headset's both-sticks gesture sends, so a gesture repeated before the echo lands can't re-send a stale state.
-- **client → server** `{"type": "session-config-request"}` — re-sends that client the connect-time session config (`mode`, every `set_announce` entry such as `settings`, `pose_source_kind`, `pose_mode`, `tracking`, `episode`, `hud`). The web client sends it once its message listeners are installed, since those come up a render after the socket opens and the connect-time copy can land before anyone is listening (a headset that missed `settings` would hide every live control, box mode included).
-- **server → clients** `{"type": "settings", "value": {"schema": [...], "values": {"<key>": ...}}}` — sent on connect (`set_announce("settings", ...)`), on `session-config-request`, and after *every* `set`, including no-ops, so all clients converge on the server's state. `schema` is a list of `{key, label, type: "boolean"|"select"|"number", help, options, min, max, step, unit}` entries; both UIs render their controls from it, so a new knob is one entry in `LIVE_SETTINGS`.
+- **Client to server:** `{"type": "set", "key": "<key>", "value": <value>}`. The callback set with `VRServer.set_on_setting()` handles it. The value is checked for type, range and choices, and a rejected request is logged and not echoed. A boolean key also accepts `"value": "toggle"`, which flips the server's current value.
+- **Client to server:** `{"type": "session-config-request"}`. The server re-sends that client the session config it sends on connect: `mode`, `settings`, `pose_source_kind`, `pose_mode`, `tracking`, `episode` and `hud`. Send it once your message listeners are ready, so you don't miss the copy sent on connect.
+- **Server to clients:** `{"type": "settings", "value": {"schema": [...], "values": {"<key>": ...}}}`. Sent on connect, on `session-config-request`, and after every `set`, so all clients show the server's state. Each `schema` entry has `key`, `label`, `type` (`"boolean"`, `"select"` or `"number"`), `help`, `options`, `min`, `max`, `step` and `unit`. Both UIs build their controls from it.
 
-| Key | Type | Applies |
-|-----|------|---------|
-| `box_mode` | boolean | `VRTeleopCore.set_box_mode()` — switching disengages the arms first |
-| `box_grasp` | `"straight"` / `"flush"` | fingers straight forward (the default) vs. the tool's contact face along the box side; a live pair blends over to it |
-| `box_flush_deg` | number, ° | how far the angled (`flush`) grasp turns each gripper inward from the parallel grasp, about the parcel plate's front edge (39°); read at the next engage or grasp switch |
-| `box_face_left` / `box_face_right` | `"auto"` / `"+x"` / `"-x"` | which flat side of each gripper faces the box; next engage |
-| `reengage` | `"clutch"` / `"ramp"` | `VRTeleopCore.set_reengage()` — next grip edge |
-| `hold_to_engage` | boolean | grips as per-arm dead-man switches vs. toggles |
-| `gripper_torque` | number, Nm | both grippers' `torque_limit` (read on every gripper command). Hardware only — hidden in sim |
-| `position_multiplier` | number, × | hand-motion scale (forwarded to the IK worker) |
-| `teleop_max_vel` | number, rev/s | joint velocity cap while tracking |
+| Key | Label | Type | Effect |
+|-----|-------|------|--------|
+| `box_mode` | **Box mode** | boolean | Turns box mode on or off through `VRTeleopCore.set_box_mode()`. |
+| `box_lead_hand` | **Box lead hand** | `"right"` / `"left"` | Which controller leads when box mode turns on. |
+| `box_grasp` | **Box grasp** | `"straight"` / `"flush"` | Fingers straight forward, or turned inward onto the box. A live pair blends to the new grasp. |
+| `box_flush_deg` | **Angled yaw** | number, ° | How far the `flush` grasp turns each gripper inward. Applies at the next engage or grasp switch. |
+| `box_face_left` / `box_face_right` | **Left face** / **Right face** | `"auto"` / `"+x"` / `"-x"` | Which side of each gripper faces the box. Applies at the next engage. |
+| `box_elbow_out` | **Elbows out** | number, ° | How far out the elbows are held in box mode. |
+| `box_squeeze_force` | **Squeeze force** | number, N | Cap on each arm's clamp force. Hardware only. |
+| `box_squeeze_lean` | **Squeeze lean** | number, × | Scale on the inward lean as the clamp builds. Hardware only. |
+| `box_squeeze_trim` | **Squeeze trim** | number, ° | Most extra inward yaw the trim may add. Hardware only. |
+| `box_squeeze_torque` | **Squeeze cap** | number, Nm | Hard shoulder torque cap in box mode. Hardware only. |
+| `reengage` | **Re-engage** | `"clutch"` / `"ramp"` | Calls `VRTeleopCore.set_reengage()`. Applies at the next grip press. |
+| `hold_to_engage` | **Hold to engage** | boolean | Grips act as per-arm dead-man switches instead of toggles. |
+| `gripper_torque` | **Grip force** | number, Nm | Torque limit of both grippers. Hardware only, so it is hidden in sim. |
+| `position_multiplier` | **Reach scale** | number, × | Scale from hand motion to arm motion. |
+| `teleop_max_vel` | **Arm speed** | number, rev/s | Joint velocity cap while tracking. |
 
-The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`, adopted from `AxolConfig.gripper`): with the parallel gripper they are left out of both `schema` and `values` and a `set` of one is rejected, so clients show box mode only when `box_mode` is in `values`.
+See [`VRTeleopConfig` fields](/api/teleop#box-mode) for what each box-mode setting does. The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`). Otherwise they are left out of `schema` and `values`, and a `set` of one is rejected. Clients show box mode only when `box_mode` is in `values`.
 
-Core-side settings are queued (`VRTeleopCore.set_live()`) and applied on the IK thread before the next frame — or while idle, so the panel can change them with no headset connected; IK-worker fields are mirrored to the worker subprocess as `("set", key, value)` messages.
+`VRTeleopCore.set_live()` queues each change and applies it on the IK thread before the next frame, or while the session is idle. Settings that the IK worker reads are passed on to it as `("set", key, value)` messages.
 
-The server also **relays HUD state between clients**. The active WebXR pose client publishes its transient HUD — an armed save/discard confirmation popup and the record-start countdown — as `{"type": "hud", "value": {...}}`; the server stores the latest value, forwards it to every *other* connected client, re-sends it to one that joins mid-dialog, and clears it with a null broadcast when the publisher disconnects. Signaling-only viewers and Quests attached to tracker-owned runs cannot publish this state. The web control panel uses the relay to mirror the in-headset popups so a session can be followed from the dashboard.
+The server also relays HUD state between clients. The active Quest publishes its save or discard confirmation and the recording countdown as `{"type": "hud", "value": {...}}`. The server forwards the latest value to every other client, re-sends it to a client that joins mid-dialog, and clears it when the publisher disconnects. Viewers and Quests in tracker-owned sessions can't publish HUD state. The control panel uses this relay to show the headset's popups.
 
 ## Camera video to the headset
 
-The server can stream camera frames to the headset over **WebRTC**. Register per-camera sources with `set_video_sources()`. A source is either a **pre-encoded** camera (the GPU-resident `gst_zed` pipeline, exposing `subscribe()` / `alive` — its H.264 access units go straight to RTP with no Python encode) or a **raw frame** source. A connected `ZedCamera` (or stereo eye) is registered directly — the relay adapts it — and you can equally pass any object exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)`. The manager picks the right WebRTC track per source automatically:
+The server can stream camera frames to the headset over WebRTC. Register a source per camera with `set_video_sources()`:
 
 ```python
 vr.set_video_sources({
@@ -122,37 +195,60 @@ vr.set_video_sources({
 })
 ```
 
-The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead streams both eyes **packed side-by-side** in one track, `overhead_sbs` — a single decoder session on the headset, since two full-res sessions cap the Quest's render rate — which the VR app renders per-lens through a WebXR media layer; the SDK-fallback path (no gst) instead registers the two per-eye sources `overhead_left` / `overhead_right`. A stereo wrist is registered as a single source under its slot name (one feed, like a mono camera). Dataset **recording** is unaffected — it still stores the two per-eye observation keys.
+A source can be:
 
-Pass `None` or `{}` to turn video off. [`axol teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
+- a pre-encoded camera from the GPU pipeline (`gst_zed`), with `subscribe()` and `alive`. Its H.264 frames go straight to the headset with no encoding in Python.
+- a connected `ZedCamera` or stereo eye, which the relay adapts.
+- any object with fixed `width`, `height` and `fps`, and `wait_next(after_ts, timeout_ms)`.
+
+Pass `None` or `{}` to turn video off. [`axol teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) set this up for you.
+
+Signaling uses the existing `/ws` channel, so no extra ports are needed. The headset sends `webrtc-request`, the server replies with a `webrtc-offer` that has one video track per camera, and the headset answers with `webrtc-answer`.
+
+- A stereo overhead camera streams both eyes side by side in one track, `overhead_sbs`, which the VR app shows per eye. Without GStreamer, the SDK fallback sends two tracks, `overhead_left` and `overhead_right`.
+- A stereo wrist camera streams one feed under its slot name, like a mono camera.
+- Dataset recording still stores both eyes of a stereo overhead camera as two observation keys.
 
 ### Pipeline
 
-Teleop and data collection share one **GPU-resident** camera path (`almond_axol.video.gst_zed`). The zed-gstreamer source elements (`zedxonesrc` mono / `zedsrc` stereo) grab frames straight into NVMM (GPU) memory, and a single in-process GStreamer pipeline tees that one zero-copy buffer to two consumers:
+Teleop and data collection share one camera path that stays on the GPU (`almond_axol.video.gst_zed`). The zed-gstreamer sources (`zedxonesrc` for mono, `zedsrc` for stereo) capture into GPU memory, and one GStreamer pipeline splits each frame into up to three branches:
 
-- a **headset branch** — fixed at 30 fps, `nvv4l2h264enc` (NVENC) → `appsink` — so the whole grab→encode chain stays on the GPU and Python only sees H.264 access units, which **aiortc** forwards as pre-encoded packets;
-- a **dataset branch** — independently rate-limited to the requested recording fps, downscaled by the VIC, and NVENC-encoded. `gdppay` preserves every access unit's sensor-exposure PTS through native `shmsink`/`shmsrc`, so the recorder can pair it with the nearest timestamped robot state and mux it without a raw-frame copy or re-encode;
-- a **raw policy/fallback branch** — `nvvidconv` converts to RGBA for an in-process `appsink` or Python shared-memory fallback. Its exposure PTS is likewise mapped to `time.perf_counter`.
+- **Headset:** 30 fps, encoded by NVENC (`nvv4l2h264enc`). aiortc forwards the H.264 packets to the headset without re-encoding.
+- **Dataset:** paced to the recording fps, downscaled and NVENC-encoded. Each frame keeps its exposure timestamp, so the recorder can pair it with the nearest robot state without copying or re-encoding the frame.
+- **Raw:** converted to RGBA for policies and for the fallback path. Its exposure timestamps are also on the `time.perf_counter` clock.
 
-Both **teleop** and **data collection** run the camera grab/encode/WebRTC pump in a **dedicated subprocess** (`almond_axol.video.video_proc.VideoRelayProcess`, registered via `set_video_manager()`). Teleop builds only the headset branch. Data collection adds the independently paced dataset branch and a second recorder subprocess that owns the `LeRobotDataset`. The control loop publishes joint/action snapshots into a bounded shared-memory history; the recorder selects the entry nearest the median camera exposure. Missing timestamps, stale/repeated frames, excessive camera/state skew, or broken predictive-video continuity discard the episode rather than silently saving a mismatched row. `time.perf_counter` has a process-shared monotonic origin, so relay PTS and control snapshots are directly comparable. If native GDP/shared-memory support is absent, collection uses the strict raw-frame fallback; if the timestamp-patched ZED plugin binary cannot be verified, it falls back to the ZED SDK.
+Camera capture, encoding and WebRTC run in a separate process (`almond_axol.video.video_proc.VideoRelayProcess`), registered with `set_video_manager()`. Teleop builds only the headset branch. Data collection adds the dataset branch and a recorder process that owns the `LeRobotDataset`.
 
-Requires the GPU-resident camera stack the host installer sets up once: the GStreamer + PyGObject support from [`axol gst.install`](/cli/gst-install) plus the patched zed-gstreamer source plugins from [`axol gst.build-zed`](/cli/gst-build-zed) (the NVENC elements themselves ship with the Jetson L4T BSP). The NVENC/VIC engine clocks must also be pinned to their maximum for low-latency encode ([`axol provision`](/cli/provision) does it — see [`jetson.setup`](/cli/jetson-setup) — and the installer's systemd unit re-applies it at boot); the default Jetson devfreq governor scales them for throughput, which otherwise roughly triples per-frame encode latency.
+During collection, the recorder pairs each frame set with the robot state sampled nearest the median camera exposure. It discards the episode instead of saving a mismatched row if any of these happen:
+
+- a timestamp is missing,
+- a frame is stale or repeated,
+- the cameras and robot state are too far apart in time,
+- the predictive video stream breaks.
+
+If shared-memory frame transport isn't available, collection falls back to raw frames. If the patched ZED plugin can't be verified, it falls back to the ZED SDK.
+
+This path needs the GPU camera stack that the host installer sets up:
+
+- GStreamer and PyGObject from [`axol gst.install`](/cli/gst-install).
+- The patched zed-gstreamer plugins from [`axol gst.build-zed`](/cli/gst-build-zed). The NVENC elements come with the Jetson L4T BSP.
+- NVENC and VIC clocks pinned to their maximum. [`axol provision`](/cli/provision) does this (see [`jetson.setup`](/cli/jetson-setup)), and the installer's systemd unit reapplies it at boot. Without it, encode latency per frame roughly triples.
 
 ## `VRServerConfig` fields
 
 | Field | Default | Description |
 |---|---|---|
-| `port` | `8000` | WSS listen port |
-| `certfile` | auto | Path to TLS certificate; `None` uses the auto-generated cert |
-| `keyfile` | auto | Path to TLS private key |
-| `pose_source_kind` | `None` | Optional exclusive source policy: `"webxr"` for Quest Mantis or `"tracker"` for Lighthouse/Ultimate. Other clients remain connected as view-only consumers. `None` retains compatibility ownership rules. |
-| `expected_pose_source_id` | `None` | Optional exact logical producer ID. Managed Lighthouse/Ultimate fills this with a one-run token; other matching-kind bridges remain view-only. |
-| `interp_enabled` | `True` | Enable the adaptive playout buffer that interpolates pose frames using the headset timestamp `t`, smoothing jittery / batched frame arrivals |
-| `interp_min_delay_s` | `0.0` | Minimum playout delay in seconds |
-| `interp_max_delay_s` | `0.15` | Maximum playout delay in seconds — caps how much latency the adaptive jitter buffer may add (spent only while delivery is actually bursty) |
-| `interp_smooth_window_s` | `0.12` | Width of the Gaussian fixed-lag smoothing window rendered around the playout point. Adds a fixed `window / 2` of latency in exchange for zero-phase smoothing and tracking-glitch rejection; `0` disables it (plain two-frame lerp) |
-| `interp_outlier_k` | `4.0` | Hampel outlier threshold (in robust standard deviations) for the glitch rejection inside the smoothing window. Lower is more aggressive; `<= 0` disables rejection |
-| `interp_max_lag_s` | `0.5` | Late-frame gate: a pose frame arriving more than this many seconds later than the stream's normal transit (the minimum over the last 30 s) keeps its control state (locks, reset) but is not played, so after a network stall the arms hold and then follow the current pose instead of replaying the delayed motion. `<= 0` disables the gate |
+| `port` | `8000` | WSS listen port. |
+| `certfile` | auto | Path to the TLS certificate. `None` uses the generated certificate. |
+| `keyfile` | auto | Path to the TLS private key. |
+| `pose_source_kind` | `None` | Which kind of producer may control the robot: `"webxr"` (Quest Mantis) or `"tracker"` (Lighthouse or Ultimate). Other clients stay connected as viewers. |
+| `expected_pose_source_id` | `None` | The one producer ID allowed to control the robot. Managed Lighthouse and Ultimate sessions set it to a one-run token. |
+| `interp_enabled` | `True` | Turns on the playout buffer, which uses the headset timestamp `t` to smooth uneven frame arrival. |
+| `interp_min_delay_s` | `0.0` | Shortest playout delay, in seconds. |
+| `interp_max_delay_s` | `0.15` | Longest playout delay, in seconds. The buffer adds delay only while frames arrive in bursts. |
+| `interp_smooth_window_s` | `0.12` | Width of the smoothing window around the playout point. It adds half its width in latency. `0` turns it off. |
+| `interp_outlier_k` | `4.0` | Outlier threshold for rejecting tracking glitches, in robust standard deviations. Lower rejects more. `0` or less turns it off. |
+| `interp_max_lag_s` | `0.5` | Frames later than this are not played, but their grip and reset buttons still count. After a network stall the arms hold, then follow the current pose. `0` or less turns it off. |
 
 <Warning>
   Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.

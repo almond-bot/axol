@@ -1,21 +1,30 @@
 """
 axol hub.info / axol hub.flash
 
-Inspect and update the Axol arm hub (the RP2350 USB-to-CAN bridge for both
-arms). Bring-up already keeps the hub on the firmware this package ships
-(``almond_axol.hub.ensure_hub_firmware``); these are for checking it by hand,
-for the one manual flash a hub too old to reboot itself needs, and for
+Inspect and update the Axol hubs: the RP2350 USB-to-CAN bridge for both arms,
+and the Mantis hub, which is the same board on the same firmware. Arm
+bring-up already keeps the arm hub on the firmware this package ships
+(``almond_axol.hub.ensure_hub_firmware``); these are for checking a hub by
+hand, for the one manual flash a hub too old to reboot itself needs, and for
 recovering a hub left in its bootloader.
 
+Both commands find hubs on USB rather than through CAN interfaces, so they
+also see a hub whose interfaces never came up.
+
+Flashing needs root: run as a normal user, ``hub.flash`` picks the hubs and
+asks its questions first, then runs each flash through ``sudo`` (one password
+prompt), the same root step the automatic bring-up flash uses.
+
     axol hub.info
-    sudo axol hub.flash                 # every outdated hub on the arm buses
-    sudo axol hub.flash --port 1-3      # one hub by USB port, e.g. in BOOTSEL
-    sudo axol hub.flash --force         # reflash even if already current
+    axol hub.flash                 # every outdated hub, and any hub in its bootloader
+    axol hub.flash --port 1-3      # one hub by USB port
+    axol hub.flash --force         # reflash even if already current
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
@@ -30,14 +39,14 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     info.set_defaults(func=run_info)
 
     flash = subparsers.add_parser(
-        "hub.flash", help="Flash the bundled firmware onto the Axol hub (root)."
+        "hub.flash", help="Flash the bundled firmware onto the Axol hub (sudo)."
     )
     flash.add_argument(
         "--port",
         default=None,
         help="USB port path of the hub (e.g. 1-3, from hub.info); also flashes "
-        "a hub sitting in its RP2350 bootloader. Default: the hub(s) behind "
-        "the configured arm channels.",
+        "a hub sitting in its RP2350 bootloader without asking. Default: every "
+        "outdated hub on USB, plus any RP2350 bootloader you confirm.",
     )
     flash.add_argument(
         "--force",
@@ -47,10 +56,30 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     flash.set_defaults(func=run_flash)
 
 
-def _arm_channels() -> list[str]:
-    from ..settings import load_store
+_NO_HUB = (
+    "No Axol hub found on USB. If the hub's LED is on but it does not show up, "
+    "flip the BOOTSEL switch next to its USB port, replug the hub, then run "
+    "`axol hub.flash`."
+)
 
-    return [ch for ch in load_store().can_channels() if ch]
+
+def _bootloader_line(port: str) -> str:
+    return (
+        f"RP2350 bootloader at USB {port}: a hub there is running no firmware; "
+        f"flash it with `axol hub.flash --port {port}`"
+    )
+
+
+def _confirm_bootloader(port: str) -> bool:
+    """Ask before flashing a bootrom: it does not say which RP2350 board it is."""
+    if not sys.stdin.isatty():
+        print(f"{_bootloader_line(port)} (not flashed without a confirmation)")
+        return False
+    answer = input(
+        f"An RP2350 is in its bootloader at USB {port}. Flash the Axol hub "
+        "firmware onto it? Only if it is the hub [y/N] "
+    )
+    return answer.strip().lower() in ("y", "yes")
 
 
 _CHIP_RESET_BITS = {
@@ -70,10 +99,12 @@ _CHIP_RESET_BITS = {
 
 
 def run_info(args: argparse.Namespace | None = None) -> None:
-    """Print each arm hub's firmware version (and, as root, its last reset)."""
-    hubs = hub_fw.hubs_for_channels(_arm_channels())
+    """Print each hub's firmware version (and, as root, its last reset)."""
+    hubs = hub_fw.attached_hubs()
+    for port in hub_fw.bootloader_ports():
+        print(_bootloader_line(port))
     if not hubs:
-        print("No Axol hub found behind the configured arm channels.")
+        print(_NO_HUB)
         raise SystemExit(1)
     bundled = hub_fw.format_version(hub_fw.FIRMWARE_VERSION)
     for hub in hubs:
@@ -99,18 +130,19 @@ def run_info(args: argparse.Namespace | None = None) -> None:
 
 
 def run_flash(args: argparse.Namespace) -> None:
-    """Flash the bundled image onto one hub (``--port``) or every outdated arm hub."""
+    """Flash the bundled image onto one hub (``--port``) or every hub that needs it."""
     if args.port:
         ports = [args.port]
     else:
-        hubs = hub_fw.hubs_for_channels(_arm_channels())
-        if not hubs:
-            print(
-                "No Axol hub found behind the configured arm channels. A hub in "
-                "its bootloader has no CAN interfaces: pass --port."
-            )
+        hubs = hub_fw.attached_hubs()
+        bootloaders = hub_fw.bootloader_ports()
+        if not hubs and not bootloaders:
+            print(_NO_HUB)
             raise SystemExit(1)
         ports = [hub.port for hub in hubs if hub.outdated or args.force]
+        ports += [port for port in bootloaders if _confirm_bootloader(port)]
+        if not ports and bootloaders:
+            return
         if not ports:
             print(
                 "Axol hub already runs firmware "
@@ -124,7 +156,10 @@ def run_flash(args: argparse.Namespace) -> None:
             f"at USB {port}..."
         )
         try:
-            version = hub_fw.flash(port)
+            if os.geteuid() == 0:
+                version = hub_fw.flash(port)
+            else:
+                version = hub_fw.flash_via_sudo(port)
         except hub_fw.HubFirmwareError as exc:
             # stderr: ensure_hub_firmware reports this line when it runs the
             # flash through sudo.

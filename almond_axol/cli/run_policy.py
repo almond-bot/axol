@@ -35,7 +35,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from lerobot.robots.config import RobotConfig
 
-from ..constants import PARK_TIMEOUT_S
+from .. import progress
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
@@ -52,6 +53,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from ..utils.logquiet import quiet_noisy_loggers
@@ -220,6 +222,13 @@ class RunPolicyConfig:
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 6.0
+    # Hard modeled clearance for the Mink reset planner (metres).
+    mink_reset_collision_margin: float = 0.01
+    # Shutdown park: on stop the arms return to rest and then continue to the
+    # all-zero joint pose — hanging straight down — holding their grasp,
+    # before the motors are released. False stops the park at rest. The
+    # control panel's "Park to zero on stop" (``teleop.park_to_zero``).
+    park_to_zero: bool = True
     # Optional deployment rest goals, in radians (seven arm joints per side).
     # Omitted sides retain the generic teleoperation rest configuration.
     rest_pose_left: list[float] | None = None
@@ -277,8 +286,8 @@ _POLICY_PHASE_CONTROLS: dict[str, tuple[dict[str, Any], ...]] = {
 # show their live gate message, which carries the operator instruction.
 _POLICY_PHASE_MESSAGES: dict[str, str] = {
     "preparing": "Preparing…",
-    "recording": "Episode running — Save to keep it, Discard to re-record.",
-    "deciding": "Time cap reached — Save to keep it, Discard to re-record.",
+    "recording": "Episode running. Press Save to keep it or Discard to redo it.",
+    "deciding": "Time limit reached. Press Save to keep it or Discard to redo it.",
     "resetting": "Returning to rest…",
 }
 
@@ -286,23 +295,23 @@ _POLICY_PHASE_MESSAGES: dict[str, str] = {
 # gravity-comp hold. Shared by both controls so the terminal prompt and the
 # panel's status line say the same thing.
 _CONTACT_PROMPT = (
-    "Contact during return to rest — the arms are limp and free to move. "
-    "Clear them, then continue to replan the return from where they are."
+    "The arms hit something while returning to rest and are now limp. "
+    "Move them clear by hand, then press Return to rest."
 )
 
 # A discarded episode drops the arms into the same limp hold so the operator
 # can untangle/reposition them by hand before anything moves on its own.
 _DISCARD_LIMP_PROMPT = (
-    "Episode discarded — the arms are limp and free to move. "
-    "Reposition them and reset the scene, then return to rest."
+    "Episode discarded. The arms are limp, so you can move them by hand. "
+    "Reset the scene, then press Return to rest."
 )
 
 # The tracking contact watchdog tripped mid-episode (the policy pushed or
 # pulled on something sustained above the threshold), so the rollout was
 # aborted and the arms dropped into the limp hold.
 _EPISODE_CONTACT_PROMPT = (
-    "Contact — torque exceeded the threshold, so the episode stopped and "
-    "the arms are limp and free to move. Clear them, then return to rest."
+    "The arms hit something, so the episode stopped and the arms are now "
+    "limp. Move them clear by hand, then press Return to rest."
 )
 
 # Panel phases a gate can open in (snapshot() renders a single gate button
@@ -2128,7 +2137,13 @@ def _build_axol_robot_client(
             }
             performed = self.robot.send_action(action)
             if self._publisher is not None and performed is not None:
-                self._publisher.publish(performed)
+                recorded = performed
+                if any(key not in recorded for key in self.robot.action_features):
+                    # Mink returns the joint commands actually dispatched. A
+                    # Cartesian dataset needs their FK poses, not the original
+                    # policy targets (which IK may not have reached).
+                    recorded = self.robot.action_to_dataset(performed)
+                self._publisher.publish(recorded)
             # Tracking contact watchdog: a torque residual sustained above
             # the threshold means the policy is pushing/pulling on something
             # beyond legitimate task contact — abort the episode so the
@@ -2861,6 +2876,11 @@ def _run(
         # package may hand in its own control without this hook.
         if (note_dataset := getattr(control, "note_dataset", None)) is not None:
             note_dataset(repo_id, dataset_root)
+        # The upload runs when the session ends; check the login now, not then.
+        if push_to_hub:
+            from ..recording.hub_auth import require_hub_login
+
+            require_hub_login()
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the
@@ -2880,7 +2900,12 @@ def _run(
                 "them in the Cameras dialog."
             )
 
-    robot = AxolRobot(robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(robot_config, **robot_options)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
     # Camera feature shapes must be known before either creating or resuming a
@@ -2909,6 +2934,9 @@ def _run(
     # that the live streams match, so the shapes baked in here stay valid.
     dataset: "LeRobotDataset | None" = None
     resumed_dataset = False
+    # A step the run skips (no dataset, no Cartesian IK to warm up) is
+    # passed over.
+    progress.plan((["dataset"] if repo_id else []) + ["policy", "arms", "ik", "home"])
     if repo_id:
         assert recording_features is not None
         assert dataset_root is not None
@@ -2945,6 +2973,7 @@ def _run(
         from lerobot.configs.video import RGBEncoderConfig
 
         rgb_encoder = RGBEncoderConfig(vcodec=vcodec)
+        progress.step("dataset")
         if is_complete:
             from ..recording.datasets import require_dataset_resume_schema
 
@@ -3006,8 +3035,10 @@ def _run(
     normal_quit = False
     abort_requested = False
     # Disabling raised arms drops them under gravity, so the cleanup below
-    # returns them to rest first — but only when they are somewhere else.
+    # parks them (rest pose, then zero) first — once this session has moved
+    # them, or whenever they are somewhere other than rest.
     arms_at_rest = True
+    arms_moved = False
     try:
         if rerun_ip:
             init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -3021,6 +3052,7 @@ def _run(
         # custom policy is the operator's own, already-running compatible
         # endpoint; nothing is spawned for it.
         custom_policy_url: str | None = None
+        progress.step("policy")
         if custom_policy:
             from ..policy import policy_url
 
@@ -3055,26 +3087,46 @@ def _run(
                 f"Using remote inference server at {server_host}:{server_port}."
             )
 
-        # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
+        # Prepare lifecycle motion using the policy's selected controller.
+        from ..kinematics.config import KinematicsConfig
+
+        reset_options = {}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink":
+            reset_options["vr_teleop_config"] = VRTeleopConfig(
+                mink_reset_collision_margin=cfg.mink_reset_collision_margin
+            )
         reset_controller = IKResetController(
             rest_pose_left=getattr(cfg, "rest_pose_left", None),
             rest_pose_right=getattr(cfg, "rest_pose_right", None),
+            kinematics_config=KinematicsConfig(
+                backend=getattr(cfg.robot_config, "cartesian_controller", "jax")
+            ),
+            **reset_options,
         )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
-        def _return_to_rest_guarded(*, final: bool = False) -> bool:
+        def _return_to_rest_guarded(
+            *, final: bool = False, startup: bool = False
+        ) -> bool:
             """Guarded return to rest; ``False`` when the operator aborted.
 
-            ``final=True`` is the teardown park played on the way out. The
-            stop flag is already set by then, so a deadline bounds the move
-            instead — well inside the caller's stop grace — and there is no
-            operator left to answer a contact retry.
+            ``startup=True`` is the session's first home, played through zero
+            (the arms' natural resting pose) on the way out to rest.
+
+            ``final=True`` is the teardown park played on the way out: rest,
+            then zero, so the torque-off leaves the arms where they would
+            settle anyway. The stop flag is already set by then, so a deadline
+            bounds the move instead and there is no operator left to answer a
+            contact retry.
             """
             nonlocal arms_at_rest
             assert reset_controller is not None
             if final:
+                park_to_zero = bool(getattr(cfg, "park_to_zero", True))
                 deadline = time.perf_counter() + PARK_TIMEOUT_S
+                if park_to_zero:
+                    deadline += PARK_ZERO_TIMEOUT_S
                 contact = threading.Event()
                 arms_at_rest = reset_controller.return_to_rest(
                     robot,
@@ -3086,6 +3138,10 @@ def _run(
                         contact.is_set() or time.perf_counter() >= deadline
                     ),
                     on_contact=contact.set,
+                    path=("rest", "zero") if park_to_zero else None,
+                    # An arm may still be holding something: keep the grasp
+                    # until the torque comes off.
+                    hold_grasp=True,
                 )
                 return arms_at_rest
             arms_at_rest = reset_controller.return_to_rest(
@@ -3094,6 +3150,7 @@ def _run(
                 gravity_comp_kd=cfg.reset_gravity_comp_kd,
                 stopped=stop_event.is_set,
                 wait_retry=control.await_contact_clear,
+                path=("zero", "rest") if startup else None,
             )
             return arms_at_rest
 
@@ -3151,25 +3208,47 @@ def _run(
         if not client.start():
             raise RuntimeError("Failed to connect to policy server / load policy.")
 
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink":
+            rest = VRTeleopConfig()
+            robot.prepare_cartesian_actions()
+            robot.set_cartesian_posture(
+                cfg.rest_pose_left
+                if cfg.rest_pose_left is not None
+                else rest.rest_pose_left,
+                cfg.rest_pose_right
+                if cfg.rest_pose_right is not None
+                else rest.rest_pose_right,
+            )
+
         _logger.info("Connecting robot...")
+        progress.step("arms")
         robot.connect()
         robot_connected = True
+        # The first return to rest plays unsupervised; refuse it from far away.
+        check_start_pose(robot.positions)
 
         # A Cartesian-action policy resolves each action to joints via IK in
         # send_action. Build that solver now, before the control loop, so its
         # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
         # below instead of stalling the first policy action.
-        if getattr(
-            robot.config,
-            "cartesian_actions",
-            getattr(robot.config, "observe_cartesian", False),
+        if (
+            getattr(
+                robot.config,
+                "cartesian_actions",
+                getattr(robot.config, "observe_cartesian", False),
+            )
+            and getattr(cfg.robot_config, "cartesian_controller", "jax") != "mink"
         ):
             _logger.info("Preparing Cartesian action solver (IK)...")
+            progress.step("ik")
             robot.prepare_cartesian_actions()
 
-        _logger.info("Returning to rest pose.")
-        if not _return_to_rest_guarded():
+        _logger.info("Returning to rest pose (through zero).")
+        progress.step("home")
+        arms_moved = True
+        if not _return_to_rest_guarded(startup=True):
             return
+        progress.ready()
         if not control.await_continue("Reset the scene, then start the first episode."):
             return
 
@@ -3630,13 +3709,15 @@ def _run(
             except BaseException as exc:
                 _logger.exception("policy client cleanup failed")
                 cleanup_failures.append(("policy client", exc))
-        # Park before the torque comes off: ``disconnect()`` disables the
-        # motors, and arms left raised drop under gravity.
+        # Park — rest pose, then zero — before the torque comes off:
+        # ``disconnect()`` disables the motors, and arms left raised drop under
+        # gravity; ending at zero leaves them where they would settle anyway.
         #
         # Skipped when the motors are being left energized instead (a custom
         # policy fault, or a failed soft park: preserve_position), after a
         # completed soft park (the arms are parked at zero on purpose), when
-        # the arms are already at rest, when a limp hold left
+        # this session never moved the arms and they are at rest, when a limp
+        # hold left
         # them in the operator's hands, when the bus no longer reports a pose
         # to plan from, or when a live episode worker may still be inside the
         # robot. (``collect-data`` reads the same three states off its teleop
@@ -3652,12 +3733,14 @@ def _run(
                 episode_workers_stopped
                 and not preserve_position
                 and not soft_parked
-                and not arms_at_rest
+                and (arms_moved or not arms_at_rest)
                 and reset_controller is not None
                 and not reset_controller.arms_limp
                 and arms_reporting(robot)
             ):
-                _logger.info("Returning to rest before disabling the arms.")
+                _logger.info(
+                    "Parking the arms (rest pose, then zero) before disabling them."
+                )
                 _return_to_rest_guarded(final=True)
         except BaseException:
             _logger.exception("return to rest before disconnect failed")

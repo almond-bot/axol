@@ -7,6 +7,48 @@
 //! feels is identical whichever side computes it — only the rate and
 //! freshness differ.
 
+/// Select how streamed joint targets advance the command trajectory.
+/// Mink uses literal targets, measured tick spacing (capped on an overrun at
+/// [`MINK_MAX_OVERRUN_PERIODS`]), and continuous command derivatives across
+/// scheduling gaps. Default adds target holdover, advances one nominal period
+/// and resets command derivatives on overruns. Both retain the same target
+/// validation, watchdog, feedback health gates, and fault handling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrackingProfile {
+    #[default]
+    Default,
+    Mink,
+}
+
+/// Longest step, in nominal periods, the Mink profile advances the tracker
+/// across an overrun. The trapezoid's step is only well-behaved for small
+/// `dt`: a long measured gap lets it snap to the target in one tick and keep
+/// a `max_accel·dt` velocity it then overshoots with (0.27 rad past a
+/// 0.35 rad move after a 60 ms gap). The motors held the previous command
+/// for the whole gap anyway, so the lost time is not owed to them.
+pub const MINK_MAX_OVERRUN_PERIODS: f64 = 2.0;
+
+impl TrackingProfile {
+    pub fn command_dt(self, tick_dt: f64, period: f64, overrun: bool) -> f64 {
+        match (self, overrun) {
+            (_, false) => tick_dt,
+            (Self::Default, true) => period,
+            (Self::Mink, true) => tick_dt.min(MINK_MAX_OVERRUN_PERIODS * period),
+        }
+    }
+
+    pub fn reset_derivatives(self, overrun: bool) -> bool {
+        self == Self::Default && overrun
+    }
+
+    pub fn target(self, hold: &Holdover, p: f64, age: f64, cadence: Option<f64>) -> f64 {
+        match self {
+            Self::Default => hold.target(p, age, cadence),
+            Self::Mink => p,
+        }
+    }
+}
+
 /// First-order low-pass differentiator: `a = 1/(1 + dt·ω)`,
 /// `v ← a·v + a·ω·(x − x_prev)`. Unity DC gain as a differentiator, single
 /// pole at `cutoff` rad/s. First update primes the state and returns 0.
@@ -496,6 +538,133 @@ mod tests {
     use super::*;
 
     const DT: f64 = 1.0 / 240.0;
+
+    /// Generated from standalone reference equations, without compiling the
+    /// runtime filters or profile under test. The stream includes 30 Hz joint
+    /// targets, 240 Hz reset targets, a return to 30 Hz, host target gaps, and
+    /// core overruns. Every command and fast feedforward is pinned.
+    #[test]
+    fn mink_matches_reference_trace() {
+        let fixture = include_str!("../tests/data/mink_tracking.csv");
+        for profile in [TrackingProfile::Mink, TrackingProfile::Default] {
+            let mut trk = Trapezoid::new(3.0 * std::f64::consts::PI, 10.5 * std::f64::consts::PI);
+            trk.seed(0.0);
+            let mut hold = Holdover::new(0.080, 0.35);
+            let mut cadence = Cadence::new();
+            let mut v = LpDiff::new(20.0);
+            let mut a = LpDiff::new(20.0);
+            let mut fast = LpDiff::new(80.0);
+            let mut bp = BandPass::new();
+            let mut now = 0.0;
+            let mut accepted = None;
+            let mut changed = 0;
+            for line in fixture.lines().filter(|line| !line.starts_with('#')) {
+                let row: Vec<f64> = line.split(',').map(|x| x.parse().unwrap()).collect();
+                let (tick, dt, target, adopt, overrun) =
+                    (row[0], row[1], row[2], row[3] != 0.0, row[4] != 0.0);
+                now += dt;
+                if adopt {
+                    let gap = accepted.map(|t| now - t);
+                    if let Some(gap) = gap {
+                        cadence.observe(gap);
+                    }
+                    hold.observe(target, gap, cadence.get());
+                    accepted = Some(now);
+                }
+                let p_target =
+                    profile.target(&hold, target, now - accepted.unwrap_or(now), cadence.get());
+                let (p, _, _) = trk.update(p_target, profile.command_dt(dt, DT, overrun));
+                let (vel, acc, vf, friction_ff, inertia_ff, damping_ff) =
+                    if profile.reset_derivatives(overrun) {
+                        v.seed(p);
+                        a.seed(0.0);
+                        fast.seed(p);
+                        bp.reset();
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    } else {
+                        let vel = v.update(p, dt);
+                        let acc = a.update(vel, dt);
+                        let vf = fast.update(p, dt);
+                        let damping = if overrun {
+                            bp.reset();
+                            0.0
+                        } else {
+                            0.7 * bp.update(vf - 0.02 * (tick * 0.03).sin(), 20.0, 0.8, dt)
+                        };
+                        (
+                            vel,
+                            acc,
+                            vf,
+                            friction(vel, 0.6, 250.0, 0.15, 0.02),
+                            0.08 * acc,
+                            damping,
+                        )
+                    };
+                let actual = [p, vel, acc, vf, friction_ff, inertia_ff, damping_ff];
+                for (column, (got, want)) in actual.iter().zip(&row[5..]).enumerate() {
+                    if profile == TrackingProfile::Mink {
+                        assert!(
+                            (got - want).abs() < 1e-12,
+                            "tick {tick} column {column}: {got:e} != {want:e}"
+                        );
+                    } else if (got - want).abs() > 1e-8 {
+                        changed += 1;
+                    }
+                }
+                if overrun && profile == TrackingProfile::Default {
+                    assert_eq!(
+                        [vel, acc, vf, friction_ff, inertia_ff, damping_ff],
+                        [0.0; 6]
+                    );
+                }
+            }
+            if profile == TrackingProfile::Default {
+                // Ensure the fixture distinguishes the two profiles so an
+                // omitted Mink selection cannot silently pass this test.
+                assert!(
+                    changed > 100,
+                    "trace did not exercise the profile differences"
+                );
+            }
+        }
+    }
+
+    /// A long core overrun mid-move must not let the Mink tracker snap to
+    /// the target and overshoot it (the uncapped measured gap did: 0.27 rad
+    /// past a 0.35 rad move after 60 ms at the 7π accel limit).
+    #[test]
+    fn mink_overrun_step_is_capped_and_does_not_overshoot() {
+        assert_eq!(
+            TrackingProfile::Mink.command_dt(0.060, DT, true),
+            MINK_MAX_OVERRUN_PERIODS * DT
+        );
+        assert_eq!(TrackingProfile::Mink.command_dt(0.005, DT, false), 0.005);
+        for accel in [3.0, 7.0] {
+            let mut trk = Trapezoid::new(
+                1.5 * 2.0 * std::f64::consts::PI,
+                accel * std::f64::consts::PI,
+            );
+            trk.seed(0.0);
+            let target = 0.35;
+            let mut max_pos: f64 = 0.0;
+            let mut max_step: f64 = 0.0;
+            let mut last = 0.0;
+            for tick in 0..480 {
+                let overrun = tick == 20;
+                let dt = if overrun { 0.060 } else { DT };
+                let (p, _, _) =
+                    trk.update(target, TrackingProfile::Mink.command_dt(dt, DT, overrun));
+                max_pos = max_pos.max(p);
+                max_step = max_step.max((p - last).abs());
+                last = p;
+            }
+            assert!(
+                max_pos <= target + 1e-9,
+                "accel {accel}π overshoot {max_pos}"
+            );
+            assert!(max_step < 0.05, "accel {accel}π step {max_step}");
+        }
+    }
 
     /// Golden vectors generated from the Python originals
     /// (`almond_axol.robot.control`) at a fixed 240 Hz step with

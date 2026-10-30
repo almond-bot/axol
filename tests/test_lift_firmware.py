@@ -36,6 +36,9 @@ def _image(version=(0, 9), built=b"Oct 10 2026 12:00:00", size=3000) -> bytes:
 class FakeBoard:
     """The firmware's update state machine, driven through CanBus' API."""
 
+    ID_CMD, ID_REPLY, ID_DATA = 0x420, 0x423, 0x424
+    SPEC = lift_firmware.LEGS
+
     def __init__(self, build_id: int = 0x1111, partitioned: bool = True) -> None:
         self.listeners = []
         self.build_id = build_id
@@ -53,14 +56,14 @@ class FakeBoard:
         self.listeners.append(listener)
 
     def _reply(self, data: bytes) -> None:
-        msg = SimpleNamespace(arbitration_id=0x423, data=data.ljust(8, b"\0"))
+        msg = SimpleNamespace(arbitration_id=self.ID_REPLY, data=data.ljust(8, b"\0"))
         for listener in self.listeners:
             listener(msg)
 
     async def _send(self, can_id: int, data: bytes) -> bool:
-        if can_id == 0x420:
+        if can_id == self.ID_CMD:
             self._command(data)
-        elif can_id == 0x424:
+        elif can_id == self.ID_DATA:
             self._data(data)
         return True
 
@@ -86,7 +89,11 @@ class FakeBoard:
             if zlib.crc32(bytes(self.image)) != crc:
                 self._reply(bytes([0x0B, 7]))
                 return
-            new = FirmwareImage.parse(bytes(self.image))
+            try:
+                new = FirmwareImage.parse(bytes(self.image), self.SPEC)
+            except FirmwareUpdateError:
+                self._reply(bytes([0x0B, 8]))  # not this board's firmware
+                return
             self._reply(bytes([0x0B, 0]))
             # Reboot into the new image, on trial.
             self.build_id = new.build_id
@@ -129,7 +136,7 @@ class FirmwareImageTest(unittest.TestCase):
     def test_rejects_wrong_files(self) -> None:
         cases = (
             (b"", "empty"),
-            (b"\0" * 4096, "identity block"),
+            (b"\0" * 4096, "not a Jelly lift firmware file"),
             (b"UF2\n" + _image(), "uf2"),
             (b"\x7fELF" + _image(), "elf"),
             (_image(size=lift_firmware.MAX_IMAGE_BYTES + 1), "at most"),
@@ -306,7 +313,7 @@ class LiftFirmwareUploadApiTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             response = await self._post(b"\0" * 1024, Path(tmp))
             self.assertEqual(response.status_code, 400)
-            self.assertIn("identity block", response.json()["error"])
+            self.assertIn("not a Jelly lift firmware file", response.json()["error"])
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     async def test_rejects_oversized_uploads(self) -> None:

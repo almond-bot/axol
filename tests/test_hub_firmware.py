@@ -128,6 +128,20 @@ class HubDiscoveryTest(unittest.TestCase):
             hub_fw.hubs_for_channels(["can0", "can_missing"], sysfs=self.sysfs.root), []
         )
 
+    def test_attached_hubs_include_one_without_interfaces(self) -> None:
+        # A Mantis hub whose CAN interfaces never came up: no netdev at all.
+        self.sysfs.usb("1-3", version=0x0201)
+        self.sysfs.usb(
+            "1-4", manufacturer="bytewerk", product="candleLight USB to CAN adapter"
+        )
+        self.sysfs.usb("1-5", vid=hub_fw.BOOT_VID, pid=hub_fw.BOOT_PID)
+        (self.sysfs.root / "bus" / "usb" / "devices" / "1-3:1.0").mkdir()
+        self.assertEqual(
+            hub_fw.attached_hubs(sysfs=self.sysfs.root),
+            [hub_fw.Hub(port="1-3", serial="A2418ACCB47A8F12", version=0x0201)],
+        )
+        self.assertEqual(hub_fw.bootloader_ports(sysfs=self.sysfs.root), ["1-5"])
+
     def test_version_format(self) -> None:
         self.assertEqual(hub_fw.format_version(0x0200), "2.00")
         self.assertEqual(hub_fw.format_version(0x0100), "1.00")
@@ -215,14 +229,14 @@ class EnsureFirmwareTest(unittest.TestCase):
 
     def test_a_sudo_flash_reports_the_real_failure(self) -> None:
         # Not root: the flash runs through sudo, and its own error (here the
-        # manual-BOOTSEL instructions) must reach the log, not a generic
+        # BOOTSEL switch instructions) must reach the log, not a generic
         # "could not escalate".
         self._hub(0x0100)
         failed = subprocess.CompletedProcess(
             [],
             1,
             stdout="Flashing Axol hub firmware 2.00 at USB 1-3...\n",
-            stderr="ERROR: firmware too old to update over USB; hold its BOOTSEL\n",
+            stderr="ERROR: firmware too old to update over USB. Flip the BOOTSEL\n",
         )
         with (
             patch.object(hub_fw.os, "geteuid", return_value=1000),
@@ -231,7 +245,7 @@ class EnsureFirmwareTest(unittest.TestCase):
         ):
             hub_fw.ensure_hub_firmware([CAN_LEFT], sysfs=self.sysfs.root)
         output = "\n".join(logs.output)
-        self.assertIn("hold its BOOTSEL", output)
+        self.assertIn("Flip the BOOTSEL", output)
         self.assertNotIn("ERROR: firmware", output)
 
     def test_opt_out(self) -> None:

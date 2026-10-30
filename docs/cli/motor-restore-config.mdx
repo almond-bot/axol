@@ -3,22 +3,29 @@ title: "motor.restore-config"
 description: "Write a saved configuration snapshot back to motors."
 ---
 
-Writes a JSON snapshot produced by [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config) back to the motors it came from, returning them to a known-good configuration. Works for both motor families — each snapshot record carries the motor type it was taken from. This command is CLI-only (it reads a snapshot file from the robot host), so it isn't offered on the diagnostics dashboard.
+Writes a snapshot from [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config) back to the motors it came from. It works with both MyActuator and Damiao motors. The command reads the snapshot from a file on the Host Computer, so it isn't on the diagnostics dashboard.
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
-| `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`); Mantis restores only ID 8 |
-| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
+| `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`). Mantis restores only ID 8 |
+| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
 | `snapshot` | JSON file from `motor.dump-config` (positional, required) |
 | `--id ID` | Restore only this motor CAN ID, hex or decimal. Omit to restore every motor in the snapshot |
-| `--include-protected` | Also write protected parameters — factory calibration, CAN IDs, baud rate (dangerous) |
+| `--include-protected` | Also write protected parameters: factory calibration, CAN IDs and baud rate. Dangerous |
 | `--yes` | Skip the confirmation prompt |
 
-Parameters already holding the saved value are skipped, so restoring onto a matching motor writes nothing. Read-only parameters are always skipped, and protected ones unless `--include-protected` is passed, since rewriting those can leave a motor unable to commutate or unreachable on the bus. A snapshot taken with `--raw` cannot be restored — its bare indices have no known meaning. Parameters the motor's firmware doesn't implement are skipped too.
+The restore writes only the parameters that differ from the snapshot, and reports each one it changed. It always skips:
+
+- parameters that already hold the saved value
+- read-only parameters
+- parameters the motor's firmware doesn't support
+- protected parameters, unless you pass `--include-protected`
+
+A wrong protected value can leave a motor unable to run or unreachable on the bus. You can't restore a snapshot taken with `--raw`.
 
 <Warning>
-  Don't restore a MyActuator snapshot taken with a release before v0.2.12. The older parameter table was mis-indexed for the fleet firmware, so those snapshots store values under names that now address different settings. Take a fresh `motor.dump-config` snapshot instead.
+  Don't restore a MyActuator snapshot taken with an `axol` release older than v0.2.12. Its parameter names point at different settings. Take a fresh `motor.dump-config` snapshot instead.
 </Warning>
 
 ```bash
@@ -28,5 +35,5 @@ axol motor.restore-config --target mantis --l mantis-left.json
 ```
 
 <Note>
-  Pair this with `motor.dump-config`: dump a good motor to a snapshot, then restore that snapshot onto one that has drifted. The restore reports exactly which parameters it changed.
+  To fix a motor whose settings have drifted, dump a good motor to a snapshot, then restore that snapshot onto the drifted one.
 </Note>

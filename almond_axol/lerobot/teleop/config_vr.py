@@ -35,6 +35,9 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
                             features. ``collect-data`` propagates this from
                             ``AxolRobotConfig.axol_config.has_gripper``
                             automatically.
+        record_raw_tcp:     Mantis Cartesian collection: publish calibrated raw
+                            tracker TCP samples independently of virtual IK.
+                            Enabled only by the Mantis collection profile.
     """
 
     vr_teleop_config: VRTeleopConfig = field(default_factory=VRTeleopConfig)
@@ -42,3 +45,4 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
     vr_server_config: VRServerConfig = field(default_factory=VRServerConfig)
     jelly: JellyConfig = field(default_factory=JellyConfig)
     has_gripper: bool = True
+    record_raw_tcp: bool = False

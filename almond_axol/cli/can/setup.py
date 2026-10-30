@@ -1605,7 +1605,7 @@ def _write_udev_rules(
     # exact adapter.
     for label, name, serial in (
         ("Jelly wheel bus", _CAN_B, wheels_serial),
-        ("Chest bus (jelly_legs lift controller)", _CAN_C, chest_serial),
+        ("Chest bus (Jelly lift controller)", _CAN_C, chest_serial),
     ):
         if not serial:
             continue
@@ -3544,9 +3544,9 @@ def _run_locked(args: object = None) -> None:
     if wheels_serial:
         print(f"  Wheels   : {_CAN_B}")
     if chest_serial:
-        print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
+        print(f"  Chest    : {_CAN_C} (Jelly lift)")
     elif lift_on_wheel_bus:
-        print(f"  Lift     : {_CAN_B} (jelly_legs shares the wheel bus)")
+        print(f"  Lift     : {_CAN_B} (Jelly lift shares the wheel bus)")
     if hub_serial or wheels_serial or chest_serial:
         print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
         print(

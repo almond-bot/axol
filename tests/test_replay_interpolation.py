@@ -174,3 +174,47 @@ class ReplayInterpolationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplayTeardownParkTest(unittest.TestCase):
+    """The teardown park is bounded like run-policy's and collect-dagger's."""
+
+    def _park(self, park_to_zero: bool) -> dict:
+        reset = mock.Mock()
+        reset.return_to_rest.return_value = True
+        cfg = replay_dataset.ReplayDatasetConfig(
+            repo_id="local/test", episode=0, park_to_zero=park_to_zero
+        )
+        with mock.patch.object(replay_dataset.time, "perf_counter", return_value=100.0):
+            self.assertTrue(
+                replay_dataset._park_before_torque_off(reset, mock.Mock(), cfg)  # noqa: SLF001
+            )
+        return reset.return_to_rest.call_args.kwargs
+
+    def test_both_legs_are_capped_and_the_grasp_held(self) -> None:
+        kwargs = self._park(park_to_zero=True)
+
+        self.assertEqual(kwargs["path"], ("rest", "zero"))
+        self.assertTrue(kwargs["hold_grasp"])
+        cap = 100.0 + replay_dataset.PARK_TIMEOUT_S + replay_dataset.PARK_ZERO_TIMEOUT_S
+        clock = replay_dataset.time
+        with mock.patch.object(clock, "perf_counter", return_value=cap - 0.01):
+            self.assertFalse(kwargs["stopped"]())
+        with mock.patch.object(clock, "perf_counter", return_value=cap):
+            self.assertTrue(kwargs["stopped"]())
+
+    def test_contact_ends_the_park_at_once(self) -> None:
+        kwargs = self._park(park_to_zero=True)
+
+        with mock.patch.object(replay_dataset.time, "perf_counter", return_value=100.0):
+            self.assertFalse(kwargs["stopped"]())
+            kwargs["on_contact"]()
+            self.assertTrue(kwargs["stopped"]())
+
+    def test_park_to_zero_off_stops_at_rest_within_the_rest_cap(self) -> None:
+        kwargs = self._park(park_to_zero=False)
+
+        self.assertIsNone(kwargs["path"])
+        cap = 100.0 + replay_dataset.PARK_TIMEOUT_S
+        with mock.patch.object(replay_dataset.time, "perf_counter", return_value=cap):
+            self.assertTrue(kwargs["stopped"]())

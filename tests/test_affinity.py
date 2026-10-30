@@ -42,6 +42,7 @@ class PrioritizeCaptureThreadsTest(TestCase):
     def test_elevates_capture_chain_and_sdk_threads_only(self) -> None:
         # "999" is listed but exited before its comm is read; "x" isn't a tid.
         with (
+            patch("almond_axol.utils.jetson.can_irq_cpus", return_value=None),
             patch.object(affinity.os, "cpu_count", return_value=8),
             patch.object(
                 affinity.os, "listdir", return_value=[*self.comms, "999", "x"]

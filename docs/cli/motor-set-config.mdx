@@ -1,25 +1,21 @@
 ---
 title: "motor.set-config"
-description: "Read or write a single motor configuration parameter."
+description: "Read or write one motor configuration parameter."
 ---
 
-Reads or writes a single configuration parameter on either motor family — MyActuator's `0xC0` parameters or Damiao's `0x7FF` registers. The type is inferred from the CAN ID, and parameter names are unique across families. With `--value` the parameter is written and persisted to flash; without it the current value is read back. Use [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config) to list every parameter name at once.
+Reads or writes one configuration parameter on a MyActuator or Damiao motor. With `--value`, it writes the parameter and saves it to the motor's flash. Without `--value`, it prints the current value. The motor type comes from the CAN ID. To list every parameter name, run [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config).
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
 | `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
-| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
+| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
 | `--id ID` | CAN ID of the motor, hex or decimal (required) |
 | `--param NAME` | Parameter to read or write (required) |
-| `--value V` | New value; omit to read the current value without writing |
-| `--type {myactuator,damiao}` | Motor type (inferred from the ID if omitted) |
-| `--force-protected` | Allow writing a protected parameter (factory calibration and identity, CAN ID, baud rate) |
+| `--value V` | New value. Omit to read the current value |
+| `--type {myactuator,damiao}` | Motor type. Inferred from the ID if omitted |
+| `--force-protected` | Allow writing a protected parameter: factory calibration, identity, CAN ID or baud rate |
 | `--yes` | Skip the confirmation prompt |
-
-Read-only parameters (firmware versions, measured winding constants) are always refused. Protected ones — factory calibration, CAN IDs, baud rate — need `--force-protected`, since getting one wrong can leave a motor unable to commutate or unreachable on the bus. Damiao's CAN loss-of-comms timeout is handled in milliseconds here; the underlying register counts 50 µs ticks and the conversion is applied for you.
-
-The MyActuator table follows the V4.0 setup software's Protect / Plan / Motor / Motor-information panels on the fleet firmware (VersionDate `2025070202` and `2026042402`). A few parameters — `MAX_TORQUE`, `VOLTAGE_SAMPLE_RES`, `LPF_CF_FOR_CURRENT`, `LPF_CF_FOR_SPEED`, and `ERROR_DETECTION_LPF_CF` — only exist on `2026042402`; on older firmware the command reports the parameter as unsupported instead of reading junk. Writing `ENABLE_2ND_ENCODER` as mode `2` or `3` also writes the matching `SECOND_ENCODER_RESOLUTION`, as the setup software does. The same table is editable from the [diagnostics dashboard](/guides/diagnostics-dashboard#motor-status)'s **Parameters** tab.
 
 ```bash
 axol motor.set-config --l --id 0x01 --param LOW_VOLTAGE               # read the threshold
@@ -28,6 +24,13 @@ axol motor.set-config --r --id 0x07 --param TIMEOUT --value 1000      # Damiao C
 axol motor.set-config --target mantis --l --id 0x08 --param TIMEOUT   # Mantis gripper
 ```
 
+- Read-only parameters, such as firmware versions and measured winding constants, can't be written.
+- Damiao's `TIMEOUT` (loss of communication) is given in milliseconds.
+- `MAX_TORQUE`, `VOLTAGE_SAMPLE_RES`, `LPF_CF_FOR_CURRENT`, `LPF_CF_FOR_SPEED` and `ERROR_DETECTION_LPF_CF` exist only on MyActuator firmware `2026042402`. On other firmware the command reports them as unsupported.
+- Writing `ENABLE_2ND_ENCODER` as mode `2` or `3` also writes the matching `SECOND_ENCODER_RESOLUTION`.
+
+The MyActuator parameters match the panels of the vendor's V4.0 setup software. You can also edit them in the **Parameters** tab of the [diagnostics dashboard](/guides/diagnostics-dashboard#motor-status).
+
 <Warning>
-  Writing a protected parameter can brick a motor on the bus. `--force-protected` exists for deliberate recovery (e.g. reassigning a baud rate), not routine tuning.
+  A wrong protected value can leave a motor unable to run or unreachable on the bus. Use `--force-protected` only for recovery, such as reassigning a baud rate, never for routine tuning.
 </Warning>

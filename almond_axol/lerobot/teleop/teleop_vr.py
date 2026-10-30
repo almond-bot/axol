@@ -43,6 +43,7 @@ import multiprocessing.connection
 import multiprocessing.context
 import threading
 import time
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -51,9 +52,11 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-from ...constants import Joint
+from ... import progress
+from ...constants import AxolModel, Joint
 from ...robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ...robot.jelly import Jelly, detect_jelly
+from ...settings import resolve_gripper, resolve_robot_model
 from ...teleop.core import (
     TCPPoseSnapshot,
     VRTeleopCore,
@@ -120,6 +123,36 @@ class AxolVRTeleop(Teleoperator):
         self._ik_thread: threading.Thread | None = None
         self._ik_stop = threading.Event()
 
+        # Jelly (x-drive base + telescoping lift), operator-only
+        # mobility on robots that have one: the thumbsticks reposition the
+        # base/lift during a session, exactly as in native teleop. Whether the
+        # robot has Jelly is inferred from the CAN interfaces attached (see
+        # detect_jelly), gated by the jelly.wheels / jelly.lift switches. Jelly
+        # state is NOT part of the action/observation space — it is never
+        # recorded into the dataset and policies never control it.
+        jelly_cfg = detect_jelly(config.jelly)
+        self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
+
+        # Enabling Jelly means this is the mobile Axol: the IK solver and the
+        # headset overlay use its URDF unless the kinematics config names one.
+        # Written back so the session's config records the version it ran.
+        config.kinematics_config = replace(
+            config.kinematics_config,
+            robot_model=resolve_robot_model(
+                config.kinematics_config.robot_model,
+                jelly_enabled=jelly_cfg is not None,
+                mount=config.kinematics_config.mount,
+            ).value,
+        )
+        # The mobile Axol has a URDF per gripper: solve with the fitted one.
+        if config.kinematics_config.robot_model == AxolModel.MOBILE.value:
+            config.kinematics_config = replace(
+                config.kinematics_config,
+                gripper=resolve_gripper(
+                    config.kinematics_config.gripper or config.vr_teleop_config.gripper
+                ),
+            )
+
         # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
         # in the shared core so this flow and native `axol teleop` (VRTeleop)
         # cannot drift apart.
@@ -129,6 +162,8 @@ class AxolVRTeleop(Teleoperator):
             self._broadcast_tracking,
             broadcast_mode=lambda key, value: self._live.on_changed(key, value),
             broadcast_json=self._broadcast_json,
+            robot_model=config.kinematics_config.robot_model,
+            record_raw_tcp=config.record_raw_tcp,
         )
         # Live session settings (box mode, re-engage, reach, speed…) from the
         # headset HUD / control panel. This teleoperator never holds the robot
@@ -139,16 +174,6 @@ class AxolVRTeleop(Teleoperator):
         # VRTeleopCore.run_ik_loop / measured_arms); collect-data sets it
         # once it owns the hardware. None (the default) adds no lean.
         self.measured_robot: object | None = None
-
-        # Jelly (x-drive base + telescoping lift), operator-only
-        # mobility on robots that have one: the thumbsticks reposition the
-        # base/lift during a session, exactly as in native teleop. Whether the
-        # robot has Jelly is inferred from the CAN interfaces attached (see
-        # detect_jelly), gated by the jelly.wheels / jelly.lift switches. Jelly
-        # state is NOT part of the action/observation space — it is never
-        # recorded into the dataset and policies never control it.
-        jelly_cfg = detect_jelly(config.jelly)
-        self._jelly: Jelly | None = Jelly(jelly_cfg) if jelly_cfg is not None else None
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).
@@ -355,11 +380,13 @@ class AxolVRTeleop(Teleoperator):
         # Park early headset video requests until set_video_manager /
         # set_video_sources lands (they run after the caller's camera setup).
         self._vr_server.set_video_expected(self._video_expected)
+        progress.step("headset")
         await self._vr_server.enable()
 
         if self._jelly is not None:
             # Runs on this dedicated event loop, so Jelly's command task
             # lives here too — off the caller's synchronous control loop.
+            progress.step("jelly")
             await self._jelly.enable()
 
         ctx = multiprocessing.get_context("spawn")
@@ -375,6 +402,7 @@ class AxolVRTeleop(Teleoperator):
                     self.config.kinematics_config,
                     q_start_left,
                     q_start_right,
+                    self.config.record_raw_tcp,
                 ),
                 daemon=True,
             )
@@ -405,6 +433,7 @@ class AxolVRTeleop(Teleoperator):
         child_conn.close()
 
         # Receive ready message: ("ready", q_init, left_indices, right_indices, startup_traj)
+        progress.step("ik")
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, wait_for_ik_ready, parent_conn, process)
         _, q_init, left_indices, right_indices, startup_traj = msg
@@ -1209,13 +1238,14 @@ class AxolVRTeleop(Teleoperator):
         return action
 
     def pose_capture_ts(self) -> float | None:
-        """Host-clock capture time of the pose behind the latest action.
+        """Host-clock capture time of the latest recorded pose.
 
         ``time.perf_counter`` seconds, estimated by the VR server's pose
         interpolator (``VRFrame.t_host``). Mantis data collection stamps dataset
         rows with this so image exposure and pose share one capture timeline.
-        ``None`` before the first solve or when the client doesn't stamp
-        capture times.
+        Its raw TCP samples are independent of virtual IK completion. Other
+        modes report the pose behind the latest solved action. ``None`` before
+        a usable pose or when the client doesn't stamp capture times.
         """
         return self._core.last_pose_host_ts
 
@@ -1223,11 +1253,10 @@ class AxolVRTeleop(Teleoperator):
         """Latest base-frame TCP target per side (absolute/Mantis mode only).
 
         ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}`` in the robot
-        base frame — the tracked ground-truth pose the IK solver chased for
-        the latest action. Mantis data collection records this per dataset row
-        so training can use raw TCP trajectories (e.g. Mantis-style relative EE
-        actions) independent of the joint solutions. ``None`` before the
-        first solve or outside absolute mode.
+        base frame. Mantis collection uses the calibrated raw tracker sample
+        at receive cadence, independent of the virtual IK solution and its
+        pose filters. Other absolute-mode callers receive the latest IK
+        target. ``None`` before a usable engage or outside absolute mode.
         """
         snapshot = self._core.last_tcp_snapshot
         if snapshot is None:
@@ -1245,12 +1274,15 @@ class AxolVRTeleop(Teleoperator):
     def recording_pose_snapshot(self) -> TCPPoseSnapshot | None:
         """The pose sample Mantis data collection records this tick.
 
-        While a managed tracker drives an engaged session this is the newest
-        received tracker frame mapped through the engage calibration, stamped
-        with its original capture time (see
-        :meth:`VRTeleopCore.calibrated_pose_snapshot`), so recording never
-        waits on the IK solve. Otherwise it is :meth:`tcp_pose_snapshot`.
+        Mantis collection reads the newest receive-side calibrated tracker
+        sample, with its original capture time and engage epoch. An invalidated
+        anchor returns no sample; it never falls back to an older IK pose.
+        Other callers retain the pull-based calibrated snapshot behavior.
         """
+        if self.config.record_raw_tcp:
+            # Receive-side publication is epoch-fenced and retains capture time;
+            # never fall back to a potentially older IK sample after a fault.
+            return self._core.last_tcp_snapshot
         server = self._vr_server
         frame = server.get_frame() if server is not None else None
         snapshot = self._core.calibrated_pose_snapshot(frame)
@@ -1259,8 +1291,8 @@ class AxolVRTeleop(Teleoperator):
     def tcp_last_change_ts(self) -> float | None:
         """Monotonic time the tracked TCP pose last took a *new* value.
 
-        ``time.perf_counter`` seconds of the last IK reply whose TCP differed
-        from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
+        ``time.perf_counter`` seconds of the last published sample whose TCP
+        differed from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
         This is diagnostic only: a live operator may deliberately hold a
         perfectly still pose, so data-quality checks use the capture heartbeat
         from :meth:`pose_capture_ts` rather than treating unchanged TCP values
@@ -1271,6 +1303,10 @@ class AxolVRTeleop(Teleoperator):
     def tracking_sides(self) -> dict[str, bool]:
         """Whether each controller/tracker contributed a currently live pose."""
         return dict(self._core.last_tracking)
+
+    def tracking_quality(self) -> dict[str, Any] | None:
+        """Live source quality, including faults hidden by filtered/held poses."""
+        return self._core.tracking_quality()
 
     def trigger_sides(self) -> dict[str, bool]:
         """Whether each managed Mantis trigger has a fresh CAN heartbeat.
@@ -1340,6 +1376,8 @@ class AxolVRTeleop(Teleoperator):
 
         # Reset rising edge
         self._core.note_frame_reset(frame.reset)
+        self._core.note_tracking_quality(frame)
+        self._core.note_raw_tcp_frame(frame)
 
         # Box mode splits the stick clicks into grasp taps and lift holds
         # (see VRTeleopCore.box_stick_frame); taps work without Jelly too.
@@ -1415,4 +1453,7 @@ class AxolVRTeleop(Teleoperator):
             self._note_ik_sample,
             # Read live: collect-data hands the robot over after connect().
             get_measured=lambda: measured_arms(self.measured_robot),
+            get_lift=(
+                (lambda: self._jelly.lift_raised) if self._jelly is not None else None
+            ),
         )

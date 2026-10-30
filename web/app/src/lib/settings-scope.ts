@@ -31,7 +31,7 @@ export const JELLY_PARAMETERS_TAB = "jelly-parameters"
 /** The Advanced section key that backs the Jelly → Parameters tab. */
 export const JELLY_ADVANCED_SECTION = "jelly"
 const AXOL_TABS = new Set(["cameras", "pose"])
-const MANTIS_TABS = new Set(["mantis-tracking", "mantis-can", "mantis-cameras"])
+const MANTIS_TABS = new Set(["mantis-tracking", "mantis-triggers", "mantis-can", "mantis-cameras"])
 const JELLY_TABS = new Set([JELLY_PARAMETERS_TAB])
 
 export function settingsScopeForTab(tab: SettingsTab): SettingsScope {
@@ -53,4 +53,9 @@ export function defaultSettingsTab(scope: SettingsScope): SettingsTab {
     default:
       return "usb"
   }
+}
+
+/** The tab where a device's cameras are assigned. */
+export function camerasSettingsTab(device: "axol" | "mantis"): SettingsTab {
+  return device === "mantis" ? "mantis-cameras" : "cameras"
 }

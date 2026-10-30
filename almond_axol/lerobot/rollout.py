@@ -4,8 +4,8 @@ Shared rollout machinery for policy CLIs.
 Pulled out of ``axol run-policy`` so other policy-running CLIs can reuse
 the same episode plumbing without duplicating it:
 
-- :class:`IKResetController` — collision-aware return-to-rest backed by
-  an out-of-process JAX IK worker.
+- :class:`IKResetController` — guarded return-to-rest backed by an
+  out-of-process worker using the selected kinematics backend.
 - :class:`ActionPublisher` — single-slot thread-safe handoff of the most
   recently executed action.
 - :class:`RolloutCaptureThread` — fixed-rate thread that pairs a
@@ -23,7 +23,7 @@ the same episode plumbing without duplicating it:
 
 All four are LeRobot-flavoured: the capture thread depends on
 ``lerobot.datasets.lerobot_dataset.LeRobotDataset``, ``build_dataset_frame``,
-and ``log_rerun_data``; the reset controller talks to the JAX IK worker via
+and ``log_rerun_data``; the reset controller talks to the selected IK worker via
 ``almond_axol.teleop``. The module lives under ``almond_axol/lerobot``
 alongside the other LeRobot adapters.
 """
@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.lerobot_types import RobotAction
 
+    from ..kinematics.config import KinematicsConfig
+    from ..teleop.config import VRTeleopConfig
     from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -66,12 +68,12 @@ class IKResetController:
     """Collision-aware return-to-rest, backed by an IK worker subprocess.
 
     Mirrors the reset path used by ``AxolVRTeleop`` (collect-data) but
-    without the VR server. ``start()`` spawns ``run_ik_worker`` (JAX +
-    JITed solver: ~30 s on a fast host, over a minute on an Orin NX);
+    without the VR server. ``start()`` spawns ``run_ik_worker`` using the
+    selected backend (Mink requires no JAX import or compilation);
     ``wait_ready()`` blocks on the handshake;
-    ``return_to_rest()`` plans a joint-space trajectory and streams its
-    waypoints to the impedance controller. Spawn before ``client.start()``
-    so the IK JIT overlaps with the policy load.
+    ``return_to_rest()`` plans Cartesian paths for Mink, or joint-space paths
+    for JAX, and streams the resolved joint waypoints to the controller.
+    Spawn before ``client.start()`` to overlap preparation with policy load.
 
     ``rest_pose_left`` and ``rest_pose_right`` optionally select each arm's
     seven joint angles in radians, in ``ARM_JOINTS`` order. An omitted arm
@@ -84,6 +86,8 @@ class IKResetController:
         *,
         rest_pose_left: Sequence[float] | None = None,
         rest_pose_right: Sequence[float] | None = None,
+        kinematics_config: KinematicsConfig | None = None,
+        vr_teleop_config: VRTeleopConfig | None = None,
     ) -> None:
         import numpy as np
 
@@ -106,8 +110,22 @@ class IKResetController:
             if pose.shape != (len(ARM_JOINTS),) or not np.isfinite(pose).all():
                 raise ValueError(error)
             overrides[name] = pose
-        self._vr_cfg = VRTeleopConfig(**overrides)
-        self._kin_cfg = KinematicsConfig()
+        # The policy/operator controller and every lifecycle move must use
+        # the same backend. A Mink session must never spawn a JAX worker.
+        from dataclasses import replace
+
+        self._vr_cfg = (
+            VRTeleopConfig(**overrides)
+            if vr_teleop_config is None
+            else replace(vr_teleop_config, **overrides)
+        )
+        self._kin_cfg = (
+            KinematicsConfig()
+            if kinematics_config is None
+            else replace(kinematics_config)
+        )
+        if self._kin_cfg.backend not in {"jax", "mink"}:
+            raise ValueError("kinematics backend must be 'jax' or 'mink'")
         self._proc: Any | None = None
         self._conn: Any | None = None
         self._q_init: Any | None = None
@@ -212,6 +230,8 @@ class IKResetController:
         wait_retry: Callable[[], bool] | None = None,
         stopped: Callable[[], bool] | None = None,
         on_contact: Callable[[], None] | None = None,
+        path: tuple[str, ...] | None = None,
+        hold_grasp: bool = False,
     ) -> bool:
         """Plan and play a guarded collision-aware trajectory to the rest pose.
 
@@ -221,8 +241,10 @@ class IKResetController:
         :class:`~almond_axol.robot.control.ContactWatchdog`) means it hit
         something — a gripper still hooked on the scene, an operator
         grabbing an arm — so the move stops where it is and the arms drop
-        into a limp gravity-comp hold instead of pulling through. What ends
-        the hold depends on the caller:
+        into a limp gravity-comp hold instead of pulling through. A path the
+        planner refuses (Mink rejects paths it cannot validate) takes the
+        same hold, so the operator can guide the arms clear. What ends the
+        hold depends on the caller:
 
         - ``wait_retry`` set (run-policy): it runs in a helper thread while
           the hold streams; return ``True`` to replan from wherever the
@@ -239,17 +261,31 @@ class IKResetController:
             wait_retry: Blocking operator gate; ``True`` = retry.
             stopped: Flow shutdown flag, polled during play and hold.
             on_contact: Announce hook, run once per trip before the hold.
+            path: Named goals to chain through instead of going straight to
+                rest, planned as one trajectory by the IK worker:
+                ``("zero", "rest")`` for a session's first home,
+                ``("rest", "zero")`` for the teardown park. A contact retry
+                replans the whole path from wherever the arms were left.
+            hold_grasp: Keep the grippers at their last commanded grasp for
+                the whole move instead of ramping them open — the teardown
+                park, where an arm may still be holding something.
 
         Returns:
-            ``True`` once the arms reached rest; ``False`` if aborted
-            (stopped, or the operator declined the retry).
+            ``True`` once the arms reached the path's last goal (rest by
+            default); ``False`` if aborted (stopped, or the operator
+            declined the retry).
         """
         if not self.wait_ready(stopped=stopped):
             return False
+        hold = robot.parking_gripper_hold() if hold_grasp else None
         while True:
-            outcome = self._play_to_rest(robot, torque_threshold, stopped)
-            if outcome != "contact":
+            outcome = self._play_to_rest(
+                robot, torque_threshold, stopped, path=path, hold_grippers=hold
+            )
+            if outcome not in ("contact", "blocked"):
                 return outcome == "done"
+            # "blocked": the planner refused the path (Mink validates it whole)
+            # — the same limp hold lets the operator guide the arms clear.
             if on_contact is not None:
                 on_contact()
             if not self._hold_limp(robot, gravity_comp_kd, wait_retry, stopped):
@@ -347,12 +383,15 @@ class IKResetController:
         q_target: Any | None = None,
         deadline: float | None = None,
         hold_grippers: tuple[float, float] | None = None,
+        path: tuple[str, ...] | None = None,
     ) -> str:
         """One play attempt from the current measured positions.
 
-        Plans from the robot's cached positions, then streams the waypoints
-        watching the torque residuals. Returns ``"done"``, ``"contact"``, or
-        ``"stopped"``.
+        Plans from the robot's cached positions — to rest, to ``q_target``,
+        or through the named goals of ``path`` — then streams the waypoints
+        watching the torque residuals. Returns ``"done"``, ``"contact"``,
+        ``"blocked"`` (the planner refused the path; nothing moved — a park
+        raises instead), or ``"stopped"``.
         """
         import numpy as np
 
@@ -389,9 +428,12 @@ class IKResetController:
         for i, gi in enumerate(self._right_indices):
             q_current[gi] = float(pos_r[i])
 
-        request = ("reset", q_current)
-        if q_target is not None:
-            request += (q_target,)
+        if path is not None:
+            request: tuple[Any, ...] = ("reset_path", q_current, path)
+        else:
+            request = ("reset", q_current)
+            if q_target is not None:
+                request += (q_target,)
         self._conn.send(request)
         if parking:
             while not self._conn.poll(0.05):
@@ -399,6 +441,16 @@ class IKResetController:
                 robot.parking_positions()
             check_park()
         result = self._conn.recv()
+        if isinstance(result, tuple) and result[0] == "reset_error":
+            if parking:
+                # park() preserves torque on any failure.
+                raise RuntimeError(f"Reset trajectory refused: {result[1]}")
+            # Nothing moved. Like a contact, hand the arms to the operator
+            # (limp hold) to guide them somewhere the planner accepts.
+            _logger.warning(
+                "Return-to-rest path rejected: %s — holding the arms limp", result[1]
+            )
+            return "blocked"
         if not (isinstance(result, tuple) and result[0] == "reset_traj"):
             raise RuntimeError(f"Unexpected IK worker response: {result!r}")
         _, q_goal, traj = result

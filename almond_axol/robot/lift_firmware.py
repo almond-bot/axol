@@ -21,6 +21,11 @@ The flow is fail-safe by construction:
   power, or this host disappears) reverts to the previous one within 15 s.
 - The saved lift position and homing live outside both partitions and
   survive the update.
+
+The Almond Safety board on the same bus runs the same protocol on its own
+IDs (0x440 / 0x443 / 0x444). Everything that differs between the two
+boards is a :class:`BoardSpec`; :mod:`almond_axol.robot.safety_firmware`
+holds the safety board's.
 """
 
 from __future__ import annotations
@@ -36,10 +41,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..motor import CanBus
-
-_ID_CMD = 0x420
-_ID_UPDATE_REPLY = 0x423
-_ID_UPDATE_DATA = 0x424
 
 _OP_SET_RATE = 0x05
 _OP_FW_INFO = 0x09
@@ -58,25 +59,59 @@ STATE_PARTITIONED = 0x02
 STATE_PARTITION_B = 0x04
 STATE_UPDATING = 0x08
 
-_STATUS_NAMES = (
-    "ok",
-    "busy (moving, homing, or a position save pending - which needs 24 V)",
-    "no partition table",
-    "bad size",
-    "bad state",
-    "chunk out of sequence",
-    "flash verify failed",
-    "image CRC mismatch",
-    "not a Jelly Legs firmware image",
-    "no image on trial",
-    "bootrom explicit_buy failed",
-)
 _STATUS_OK = 0
 _STATUS_BUSY = 1
 _STATUS_FLASH = 6
 
-IDENT_MAGIC = b"jelly_legs-fwid\0"
-_IDENT_SIZE = 40  # fw_ident_t in firmware.c
+_IDENT_SIZE = 40  # fw_ident_t in firmware.c (16-byte magic, version, date)
+
+
+@dataclass(frozen=True)
+class BoardSpec:
+    """What differs between boards that speak the CAN firmware-update protocol."""
+
+    name: str  # file name prefix for stored uploads, e.g. "jelly_legs"
+    board: str  # in messages: "the lift board"
+    file_kind: str  # in messages: "Jelly lift firmware file"
+    ident_magic: bytes  # the firmware identity block's 16-byte magic
+    min_version: str  # first firmware with the updater
+    id_cmd: int
+    id_reply: int
+    id_data: int
+    busy: str  # what status 1 (busy) means on this board
+    trial_lock: str  # what is locked while a new image is on trial
+
+    def status_name(self, code: int) -> str:
+        names = (
+            "ok",
+            self.busy,
+            "no partition table",
+            "bad size",
+            "bad state",
+            "chunk out of sequence",
+            "flash verify failed",
+            "image CRC mismatch",
+            f"not a {self.file_kind}",
+            "no image on trial",
+            "bootrom explicit_buy failed",
+        )
+        return names[code] if code < len(names) else f"status {code}"
+
+
+LEGS = BoardSpec(
+    name="jelly_legs",
+    board="the lift board",
+    file_kind="Jelly lift firmware file",
+    ident_magic=b"jelly_legs-fwid\0",
+    min_version="0.9",
+    id_cmd=0x420,
+    id_reply=0x423,
+    id_data=0x424,
+    busy="busy (moving, homing, or a position save pending - which needs 24 V)",
+    trial_lock="motion locked",
+)
+
+IDENT_MAGIC = LEGS.ident_magic
 # One A/B partition (partition_table.json): the largest image that fits.
 MAX_IMAGE_BYTES = 1016 * 1024
 
@@ -97,35 +132,41 @@ class FirmwareUpdateError(Exception):
 
 
 def status_name(code: int) -> str:
-    return _STATUS_NAMES[code] if code < len(_STATUS_NAMES) else f"status {code}"
+    return LEGS.status_name(code)
 
 
 @dataclass(frozen=True)
 class FirmwareImage:
-    """A Jelly Legs ``firmware.bin`` and the identity block it carries."""
+    """A board's ``firmware.bin`` and the identity block it carries."""
 
     data: bytes
     version: str
     built: str
     build_id: int  # CRC32 of the identity block, as FW_INFO reports it
     crc: int  # CRC32 of the whole image, checked by UPDATE_FINISH
+    spec: BoardSpec = LEGS
 
     @classmethod
-    def parse(cls, data: bytes) -> FirmwareImage:
-        """Validate a candidate image; raises :class:`FirmwareUpdateError`."""
+    def parse(cls, data: bytes, spec: BoardSpec = LEGS) -> FirmwareImage:
+        """Validate a candidate image; raises :class:`FirmwareUpdateError`.
+
+        Only an image carrying ``spec``'s identity block passes, so one
+        board's firmware is never sent to another.
+        """
         if not data:
             raise FirmwareUpdateError("the firmware file is empty")
         if len(data) > MAX_IMAGE_BYTES:
             raise FirmwareUpdateError(
-                f"the firmware file is {len(data)} bytes; a lift firmware "
+                f"the firmware file is {len(data)} bytes; a firmware "
                 f"partition holds at most {MAX_IMAGE_BYTES}"
             )
         if data.startswith(b"UF2\n") or data[:4] == b"\x7fELF":
             raise FirmwareUpdateError(
                 "this is a .uf2/.elf file; upload the build's firmware.bin"
             )
+        magic = spec.ident_magic
         for off in range(0, len(data) - _IDENT_SIZE + 1, 4):
-            if data[off : off + len(IDENT_MAGIC)] == IDENT_MAGIC:
+            if data[off : off + len(magic)] == magic:
                 ident = data[off : off + _IDENT_SIZE]
                 return cls(
                     data=data,
@@ -133,10 +174,10 @@ class FirmwareImage:
                     built=ident[18:].rstrip(b"\0").decode(errors="replace"),
                     build_id=zlib.crc32(ident),
                     crc=zlib.crc32(data),
+                    spec=spec,
                 )
         raise FirmwareUpdateError(
-            "not a Jelly Legs firmware image (no identity block); upload the "
-            "jelly_legs build's firmware.bin"
+            f"This is not a {spec.file_kind}. Upload the board's firmware.bin."
         )
 
     def describe(self) -> str:
@@ -155,12 +196,13 @@ def store_upload(image: FirmwareImage, directory: Path | None = None) -> Path:
     directory = UPLOAD_DIR if directory is None else directory
     directory.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(image.data).hexdigest()[:16]
-    path = directory / f"jelly_legs-{image.version}-{digest}.bin"
+    prefix = image.spec.name
+    path = directory / f"{prefix}-{image.version}-{digest}.bin"
     tmp = path.with_suffix(".tmp")
     tmp.write_bytes(image.data)
     os.replace(tmp, path)  # also bumps the mtime of a re-uploaded build
     uploads = sorted(
-        directory.glob("jelly_legs-*.bin"),
+        directory.glob(f"{prefix}-*.bin"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -203,11 +245,12 @@ class FirmwareInfo:
         return f"firmware {self.version}, build 0x{self.build_id:08x}, {where}{extra}"
 
 
-class LiftFirmwareUpdater:
+class BoardFirmwareUpdater:
     """Request/response firmware-update client on an open :class:`CanBus`.
 
-    Construct it, then :meth:`attach` it to the bus *before* ``start()`` (the
-    listener sees every frame on the bus and keeps only 0x423 replies)::
+    Subclasses set :attr:`spec`. Construct one *before* the bus' ``start()``
+    (the listener sees every frame on the bus and keeps only this board's
+    update replies)::
 
         bus = CanBus(channel)
         updater = LiftFirmwareUpdater(bus)
@@ -215,14 +258,22 @@ class LiftFirmwareUpdater:
         await updater.flash(FirmwareImage.parse(data))
     """
 
+    spec: BoardSpec = LEGS
+
     def __init__(self, bus: CanBus) -> None:
         self._bus = bus
         self._replies: asyncio.Queue[bytes] = asyncio.Queue()
         bus._add_listener(self._on_message)
 
     def _on_message(self, msg) -> None:  # noqa: ANN001 - can.Message
-        if msg.arbitration_id == _ID_UPDATE_REPLY and len(msg.data) >= 6:
+        if msg.arbitration_id == self.spec.id_reply and len(msg.data) >= 6:
             self._replies.put_nowait(bytes(msg.data).ljust(8, b"\x00"))
+
+    async def _before_begin(self, log: Callable[[str], None]) -> None:
+        """Get the board ready to take an update (subclass hook)."""
+
+    async def _while_busy(self) -> None:
+        """Called between UPDATE_BEGIN attempts the board refused as busy."""
 
     async def _send(self, can_id: int, data: bytes) -> None:
         if await self._bus._send(can_id, data) is False:
@@ -231,7 +282,7 @@ class LiftFirmwareUpdater:
             )
 
     async def _cmd(self, op: int, payload: bytes = b"") -> None:
-        await self._send(_ID_CMD, bytes([op]) + payload)
+        await self._send(self.spec.id_cmd, bytes([op]) + payload)
 
     def _drain(self) -> None:
         while not self._replies.empty():
@@ -243,7 +294,7 @@ class LiftFirmwareUpdater:
         timeout: float,
         match: Callable[[bytes], bool] | None = None,
     ) -> bytes | None:
-        """The next 0x423 reply of type ``op`` within ``timeout``, else None."""
+        """The next update reply of type ``op`` within ``timeout``, else None."""
         deadline = time.monotonic() + timeout
         while True:
             left = deadline - time.monotonic()
@@ -272,7 +323,7 @@ class LiftFirmwareUpdater:
         await self._cmd(_OP_SET_RATE, struct.pack("<H", 0))
 
     async def info(self, timeout: float = 0.3, retries: int = 3) -> FirmwareInfo | None:
-        """FW_INFO, or None (board offline, or firmware older than v0.9)."""
+        """FW_INFO, or None (board offline, or firmware without the updater)."""
         r = await self._request(_OP_FW_INFO, timeout=timeout, retries=retries)
         if r is None:
             return None
@@ -314,7 +365,7 @@ class LiftFirmwareUpdater:
             )
             return
         if r[1] != _STATUS_OK:
-            raise FirmwareUpdateError(f"confirm failed: {status_name(r[1])}")
+            raise FirmwareUpdateError(f"confirm failed: {self.spec.status_name(r[1])}")
 
     async def _send_chunk(self, offset: int, chunk: bytes) -> None:
         header = struct.pack("<BIH", _HEADER_INDEX, offset, len(chunk))
@@ -324,17 +375,19 @@ class LiftFirmwareUpdater:
 
         for _ in range(_CHUNK_RETRIES):
             self._drain()
-            await self._send(_ID_UPDATE_DATA, header)
+            await self._send(self.spec.id_data, header)
             for i in range(0, len(chunk), _FRAME_BYTES):
                 await self._send(
-                    _ID_UPDATE_DATA,
+                    self.spec.id_data,
                     bytes([i // _FRAME_BYTES]) + chunk[i : i + _FRAME_BYTES],
                 )
             r = await self._wait_reply(_REPLY_CHUNK, _CHUNK_ACK_TIMEOUT_S, is_ack)
             if r is None:
                 continue  # lost frame or ack: re-send the whole chunk
             if r[1] != _STATUS_OK:
-                raise FirmwareUpdateError(f"chunk at {offset}: {status_name(r[1])}")
+                raise FirmwareUpdateError(
+                    f"chunk at {offset}: {self.spec.status_name(r[1])}"
+                )
             return
         raise FirmwareUpdateError(
             f"chunk at {offset}: no ack after {_CHUNK_RETRIES} tries"
@@ -372,12 +425,19 @@ class LiftFirmwareUpdater:
         it turns true the session is aborted on the board (nothing was
         installed) and :class:`asyncio.CancelledError` is raised.
         """
+        spec = self.spec
+        if image.spec != spec:
+            # Never stream one board's firmware at another on the shared bus.
+            raise FirmwareUpdateError(
+                f"this is a {image.spec.file_kind}, not a {spec.file_kind}"
+            )
         await self.quiet_status()
         info = await self.info()
         if info is None:
             raise FirmwareUpdateError(
-                "no FW_INFO reply: the lift board is offline, or runs firmware "
-                "older than 0.9 (install 0.9 over USB once first)"
+                f"no FW_INFO reply: {spec.board} is offline, or runs firmware "
+                f"older than {spec.min_version} (install {spec.min_version} over "
+                "USB once first)"
             )
         log(f"board: {info.describe()}")
         if not info.partitioned:
@@ -394,6 +454,7 @@ class LiftFirmwareUpdater:
             log("the board already runs this build - nothing to do")
             return None
 
+        await self._before_begin(log)
         deadline = time.monotonic() + _BUSY_WAIT_S
         while True:
             r = await self._request(_OP_BEGIN, struct.pack("<I", len(image.data)), 1.0)
@@ -401,9 +462,10 @@ class LiftFirmwareUpdater:
                 raise FirmwareUpdateError("no reply to UPDATE_BEGIN")
             if r[1] == _STATUS_BUSY and time.monotonic() < deadline:
                 await asyncio.sleep(0.5)  # wait out a move or a position save
+                await self._while_busy()
                 continue
             if r[1] != _STATUS_OK:
-                raise FirmwareUpdateError(f"update refused: {status_name(r[1])}")
+                raise FirmwareUpdateError(f"update refused: {spec.status_name(r[1])}")
             break
         log(f"target partition: {struct.unpack_from('<I', r, 2)[0] // 1024} KB")
 
@@ -432,7 +494,7 @@ class LiftFirmwareUpdater:
                 pass
             raise
         if r is not None and r[1] != _STATUS_OK:
-            raise FirmwareUpdateError(f"image rejected: {status_name(r[1])}")
+            raise FirmwareUpdateError(f"image rejected: {spec.status_name(r[1])}")
         if r is None:
             # The board may have accepted it and rebooted before the reply
             # got out; the build ID after the reboot tells.
@@ -451,7 +513,7 @@ class LiftFirmwareUpdater:
             raise FirmwareUpdateError("the new image is not on trial (unexpected)")
         if not confirm:
             log(
-                "left on trial (motion locked); it reverts unless confirmed "
+                f"left on trial ({spec.trial_lock}); it reverts unless confirmed "
                 "within 15 s of booting"
             )
             return info
@@ -459,3 +521,9 @@ class LiftFirmwareUpdater:
         final = await self.info()
         log(f"confirmed: {final.describe() if final else 'no FW_INFO reply'}")
         return final
+
+
+class LiftFirmwareUpdater(BoardFirmwareUpdater):
+    """Firmware updates for the jelly_legs lift board."""
+
+    spec = LEGS

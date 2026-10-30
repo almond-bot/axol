@@ -1,9 +1,13 @@
 import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
+  ChevronRight,
+  CircleAlert,
+  CircleCheck,
   ExternalLink,
   Loader2,
   Play,
+  Plug,
   RotateCcw,
   Settings2,
   Square,
@@ -18,7 +22,7 @@ import {
   isCustomPolicyRun,
   isRobotFreeRun,
   isSimRun,
-  motorFaultLabel,
+  motorFaultBlockers,
   perRunFields,
   recordingCameraCount,
   type CameraSpec,
@@ -31,8 +35,10 @@ import {
   type OperationMeta,
   type PolicyState,
   type RobotStatus,
+  type OperationProgress,
   type SessionInfo,
   type TrackerSourceReadiness,
+  type TrackingQuality,
 } from "@/lib/supervisor"
 import { CuratedForm } from "@/components/config-form"
 import type { FieldSuggestion } from "@/components/suggest-input"
@@ -40,12 +46,16 @@ import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { EpisodeBriefCard } from "@/components/episode-brief"
 import { SessionSettings } from "@/components/session-settings"
-import { Card, CardContent } from "@/components/ui/card"
+import { Card } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { cn, sentenceCase } from "@/lib/utils"
 import { useVrSocket } from "@/lib/vr-socket"
+import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
+import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
+import { useStartupView } from "@/lib/operation-progress"
+import type { CatalogEntry } from "@/lib/operation-catalog"
 
 const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
 
@@ -53,14 +63,21 @@ function isMantisTrackerSource(value: string): value is MantisTrackerSource {
   return MANTIS_TRACKER_SOURCES.has(value as MantisTrackerSource)
 }
 
+/** A way to fix one "before you start" item from where it is listed. */
+export type BlockerFix = { label: string; onClick: () => void }
+
 /**
- * One operation's panel: just its per-run inputs (dataset / task / policy
- * identity) and Start/Stop. Everything reusable across runs — cameras, arm
- * behaviour, recording, inference — lives in the shared Settings and is folded
- * in server-side at start. Which hardware the run targets is the panel-wide
- * device selection, not a per-operation toggle.
+ * One operation's screen: a header with its Start/Stop, the checks still in
+ * the way, its per-run inputs (dataset / task / policy identity), and while it
+ * runs, the operator's live view. Everything reusable across runs — cameras,
+ * arm behaviour, recording, inference — lives in the shared Settings and is
+ * folded in server-side at start. Which hardware the run targets is the
+ * panel-wide device selection, not a per-operation toggle.
  */
 export function OperationPanel({
+  entry,
+  fixFor,
+  onConnect,
   meta,
   spec,
   settings,
@@ -81,13 +98,23 @@ export function OperationPanel({
   viewerPort,
   vrPort,
   startPhase,
+  progress,
   hostBlocker,
+  needsMount = false,
+  simRobot,
+  onSimRobotChange,
   connected,
   policy,
   onStart,
   onStop,
   onEpisode,
 }: {
+  /** How the app presents the operation: its icon and name. */
+  entry: CatalogEntry
+  /** The button that fixes a "before you start" item, when there is one. */
+  fixFor?: (blocker: string) => BlockerFix | null
+  /** Opens the connection dialog, offered while no host is connected. */
+  onConnect?: () => void
   meta: OperationMeta
   spec: CommandSpec | null
   settings: Record<string, FormValue>
@@ -113,8 +140,17 @@ export function OperationPanel({
   vrPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** The run's startup steps, from the status poll. */
+  progress?: OperationProgress | null
   /** Active setup/diagnostic or other operation that owns the host. */
   hostBlocker: string | null
+  /** No robot model picked yet (`kinematics.mount`): a run that drives the
+   *  Axol arms waits for the "What is Axol mounted on?" pick above the settings
+   *  (sim and arms-off runs keep the legacy default). */
+  needsMount?: boolean
+  /** The robot a sim run simulates (sent as its kinematics.robot_model). */
+  simRobot?: SimRobot
+  onSimRobotChange?: (next: SimRobot) => void
   /** False while disconnected or validating a replacement host. */
   connected: boolean
   /** run-policy episode phase/count (null unless run-policy is the live op). */
@@ -163,6 +199,7 @@ export function OperationPanel({
   const wantsDatasets = runFields.some((f) => f.key === "repo_id")
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   const [trackerReadiness, setTrackerReadiness] = useState<TrackerSourceReadiness | null>(null)
+  const [trackerCheckedAt, setTrackerCheckedAt] = useState(() => Date.now() / 1000)
   const [trackerReadinessState, setTrackerReadinessState] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle")
@@ -183,9 +220,11 @@ export function OperationPanel({
     if (!connected || !mantisMode || !trackerSource || live) return
     let cancelled = false
     const refresh = () => {
+      setTrackerCheckedAt(Date.now() / 1000)
       fetchTrackerBindings()
         .then((snapshot) => {
           if (cancelled) return
+          setTrackerCheckedAt(Date.now() / 1000)
           setTrackerReadinessSource(mantisSource)
           if (snapshot.sources) {
             setTrackerReadiness(snapshot.sources)
@@ -298,6 +337,10 @@ export function OperationPanel({
 
   // Sim is an Axol run mode: hidden and ignored on Mantis.
   const isSim = !mantisMode && isSimRun(meta, effectiveSettings)
+  const startup = useStartupView(live ? progress : null, {
+    device: mantisMode ? "Mantis" : "Axol",
+    sim: isSim,
+  })
   // Teleop with the Robot tab's "Axol arms" switch off drives only Jelly: the
   // arms and their CAN bus are never touched. A live run is described by its
   // merged args alone (a default-on flag is omitted from them, so the saved
@@ -329,17 +372,16 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (!live && hostBlocker) blockers.push(`Wait: ${hostBlocker}`)
+  if (!live && needsMount && !mantisMode && meta.requiresRobot && !robotFree) {
+    blockers.push("Choose what Axol is mounted on")
+  }
   if (meta.requiresRobot && mantisMode && !mantisOk) {
     blockers.push(
-      robotOk && robot?.profile !== "mantis"
-        ? "Connect Mantis (the current hardware link is Axol)"
-        : "Connect Mantis"
+      robotOk && robot?.profile !== "mantis" ? "Connect Mantis instead of Axol" : "Connect Mantis"
     )
   } else if (meta.requiresRobot && !robotFree && !axolOk) {
     blockers.push(
-      robotOk && robot?.profile === "mantis"
-        ? "Connect Axol (the current hardware link is Mantis)"
-        : "Connect Axol"
+      robotOk && robot?.profile === "mantis" ? "Connect Axol instead of Mantis" : "Connect Axol"
     )
   }
   // A faulted motor on the active hardware profile blocks the run (the server
@@ -348,9 +390,13 @@ export function OperationPanel({
   // faults remain actionable.
   const checkActiveProfileFaults = mantisMode ? mantisOk : !robotFree && axolOk
   if (checkActiveProfileFaults) {
-    for (const f of robot?.faults ?? []) {
-      blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
-    }
+    blockers.push(
+      ...motorFaultBlockers(
+        robot?.faults ?? [],
+        robot?.motors ?? [],
+        mantisMode ? "Mantis" : "Axol"
+      )
+    )
   }
   // Tracker setup gates a Mantis *collection* (the server refuses it too).
   // Mantis teleop never tracks — it drives the grippers from the rig
@@ -358,38 +404,54 @@ export function OperationPanel({
   const trackerGated = mantisMode && meta.id !== "teleop"
   const trackerIssues: string[] = []
   if (trackerGated && !trackerSource) {
-    trackerIssues.push("Choose a valid tracking source in Mantis settings → Tracking")
+    trackerIssues.push("Choose a tracking source on the Tracking tab of Mantis settings")
   } else if (trackerGated && currentTrackerReadinessState !== "ready") {
     trackerIssues.push(
       currentTrackerReadinessState === "error"
-        ? "Mantis tracker readiness is unavailable — reconnect the host or update Axol"
-        : "Checking Mantis tracker readiness…"
+        ? "Can't check the Mantis trackers. Reconnect the Host Computer, or update it."
+        : "Checking the Mantis trackers…"
     )
   }
   if (trackerGated && trackerSource && currentTrackerReadiness) {
     const ready = currentTrackerReadiness[trackerSource]
     if (trackerSource === "lighthouse") {
       const status = currentTrackerReadiness.lighthouse
-      if (!status.available) trackerIssues.push("Install libsurvive in Mantis settings")
+      if (!status.available) trackerIssues.push("Install Lighthouse support in Mantis settings")
       else if (!status.installed) trackerIssues.push("Repair Lighthouse support in Mantis settings")
-      if (!status.udevReady) trackerIssues.push("Install the Lighthouse Vive USB permissions rule")
-      if (!status.binding.complete) trackerIssues.push("Identify left + right Lighthouse trackers")
+      if (!status.udevReady) trackerIssues.push("Install the Lighthouse USB rule")
+      if (!status.binding.complete)
+        trackerIssues.push("Identify the left and right Lighthouse trackers")
+      const validation = status.validation
+      // Mirrors collect-data: only the strict policy requires a passed,
+      // unexpired validation, and a bring-up capture is exempt.
+      if (
+        status.qualityMode === "strict" &&
+        meta.id === "collect-data" &&
+        !settings.mantis_allow_uncalibrated &&
+        (!validation?.valid ||
+          validation.status !== "passed" ||
+          (validation.expiresAt != null && validation.expiresAt <= trackerCheckedAt))
+      ) {
+        trackerIssues.push("Validate Lighthouse tracking in Mantis settings")
+      }
     } else if (trackerSource === "ultimate") {
       const status = currentTrackerReadiness.ultimate
-      if (!status.nativeDependencies)
-        trackerIssues.push("Install the Ultimate native HID libraries")
+      if (!status.nativeDependencies) trackerIssues.push("Install the Ultimate HID libraries")
       if (!status.pythonHid || !status.apiCompatible)
-        trackerIssues.push("Install the supported Ultimate Python runtime")
-      else if (!status.pinnedPyvut) trackerIssues.push("Reinstall the pinned pyvut revision")
-      if (!status.logSuppression)
-        trackerIssues.push("Install pyvut with credential-log suppression support")
-      if (!status.udevReady) trackerIssues.push("Install the Ultimate USB permissions rule")
-      if (!status.operatorAccess) trackerIssues.push("Grant this operator Ultimate dongle access")
+        trackerIssues.push("Install Ultimate support in Mantis settings")
+      else if (!status.pinnedPyvut) trackerIssues.push("Repair Ultimate support in Mantis settings")
+      // An old pyvut that logs credentials is fixed by the same repair.
+      if (!status.logSuppression && !trackerIssues.some((i) => i.includes("Ultimate support")))
+        trackerIssues.push("Repair Ultimate support in Mantis settings")
+      if (!status.udevReady) trackerIssues.push("Install the Ultimate USB rule")
+      if (!status.operatorAccess) trackerIssues.push("Give this user access to the Ultimate dongle")
       if (!status.dongleConnected) trackerIssues.push("Connect the Ultimate wireless dongle")
       else if (status.endpointStatus !== "accessible")
-        trackerIssues.push("Make Ultimate HID interface 0 accessible")
-      if (status.wifiConfig !== "valid") trackerIssues.push("Fix Ultimate shared-map Wi-Fi setup")
-      if (!status.binding.complete) trackerIssues.push("Identify left + right Ultimate trackers")
+        trackerIssues.push("Reconnect the Ultimate dongle and close other apps that use it")
+      if (status.wifiConfig !== "valid")
+        trackerIssues.push("Fix the Ultimate Wi-Fi settings in Mantis settings")
+      if (!status.binding.complete)
+        trackerIssues.push("Identify the left and right Ultimate trackers")
     }
 
     const productionCollection = meta.id === "collect-data" && !settings.mantis_allow_uncalibrated
@@ -399,7 +461,7 @@ export function OperationPanel({
       )
       if (!transformReady) {
         blockers.push(
-          "Provide approved factory or measured tracker-to-TCP transforms in Mantis settings"
+          "Add a tracker-to-gripper transform for both sides to ~/.almond/mantis/tcp_transform.json"
         )
       }
       if (
@@ -407,9 +469,7 @@ export function OperationPanel({
         (currentTrackerReadiness.quest.datumStatus !== "configured" ||
           currentTrackerReadiness.quest.poseSpace !== "grip")
       ) {
-        blockers.push(
-          "Choose one quest:<WebXR-profile>:grip calibration key in Mantis settings → Tracking"
-        )
+        blockers.push("Finish the Headset step on the Tracking tab of Mantis settings")
       }
     }
   }
@@ -419,8 +479,8 @@ export function OperationPanel({
   if (meta.requiresCameras && camCount < 1) {
     blockers.push(
       mantisMode
-        ? "Assign a camera and enable Record in Mantis settings → Cameras"
-        : "Assign a camera and enable Record in Axol settings → Cameras"
+        ? "Assign a camera and turn on Record on the Cameras tab of Mantis settings"
+        : "Assign a camera and turn on Record on the Cameras tab of Axol settings"
     )
   }
   for (const f of runFields) {
@@ -440,182 +500,269 @@ export function OperationPanel({
   // Sim models the arms, so it cannot run with them switched off (the server
   // refuses the start too); say so before the Start button instead of after.
   if (isSim && armsOff) {
-    blockers.push("Sim needs the arms — turn on Axol arms in Robot settings or disable sim")
+    blockers.push(
+      "Sim needs the arms. Turn on Axol arms on the Robot tab of Axol settings, or turn off sim."
+    )
   }
 
   const editedCount = Object.keys(settings).length
   const available = spec?.available ?? false
 
+  const running = live && session?.status === "running"
+  const ready = available && blockers.length === 0
+
   return (
-    <div className="flex min-w-0 flex-col gap-6">
-      <Card className="gap-0 p-0">
-        <div className="flex flex-col gap-4 border-b border-white/10 p-5 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
+    <div className="flex min-w-0 flex-col gap-5">
+      <section
+        className={cn(
+          "flex flex-col gap-5 rounded-2xl border p-5 sm:flex-row sm:items-center",
+          live
+            ? "border-emerald-400/25 bg-gradient-to-br from-emerald-400/[0.06] to-transparent"
+            : "border-white/10 bg-gradient-to-br from-white/[0.04] to-transparent"
+        )}
+      >
+        <div className="flex min-w-0 flex-1 items-start gap-4">
+          <OperationIcon entry={entry} size="lg" running={live} />
+          <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-heading text-lg font-semibold">{meta.label}</h2>
+              <h2 className="font-heading text-xl font-semibold">{meta.label}</h2>
               {/* Which hardware this run targets — the system-wide device
                   selection, or the device a live run was started on. */}
               <Badge
                 variant="neutral"
-                title={
-                  mantisMode
-                    ? "Runs on the handheld Mantis rigs (selected device)."
-                    : "Runs on the Axol arms."
-                }
+                title={mantisMode ? "Runs on the Mantis rigs." : "Runs on the Axol arms."}
               >
                 {mantisMode ? "Mantis" : "Axol"}
               </Badge>
-              <StatusBadge session={live ? session : null} />
+              {isSim && <Badge variant="neutral">Sim</Badge>}
             </div>
-            <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {/* Only Mantis collection owns a tracker bridge to reset;
-                Mantis teleop is grippers-only. */}
-            {live && mantisMode && mantisSource !== "quest" && meta.id === "collect-data" && (
-              <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
-                <RotateCcw /> Reset
-              </Button>
+            <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-white/55">
+              {meta.description}
+            </p>
+            {live && session && startup && (
+              <div className="mt-3 max-w-md">
+                <StartupBar view={startup} />
+              </div>
             )}
-            {stopping ? (
-              <Button variant="destructive" disabled>
-                <Loader2 className="animate-spin" />
-                Stopping…
-              </Button>
-            ) : live ? (
-              <Button variant="destructive" onClick={onStop} disabled={busy}>
-                {busy ? <Loader2 className="animate-spin" /> : <Square />}
-                Stop
-              </Button>
-            ) : (
-              <Button onClick={onStart} disabled={busy || !available || blockers.length > 0}>
-                {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                {busy && startPhase ? startPhase : "Start"}
-              </Button>
+            {live && session && !startup && (
+              <p className="mt-2 flex items-center gap-2 text-sm">
+                <StatusBadge session={session} />
+                {running && (
+                  <span className="text-white/70">
+                    <ElapsedTime startedAt={session.startedAt} />
+                  </span>
+                )}
+              </p>
             )}
           </div>
         </div>
-
-        <CardContent className="gap-5 p-5">
-          {!available ? (
-            <Unavailable spec={spec} />
-          ) : (
-            <>
-              {runFields.length > 0 && (
-                <>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
-                      This run
-                    </span>
-                    {editedCount > 0 && !live && (
-                      <button
-                        type="button"
-                        onClick={onResetAll}
-                        className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
-                      >
-                        <RotateCcw className="size-3" />
-                        Reset
-                      </button>
-                    )}
-                  </div>
-                  {textFields.length > 0 && (
-                    <CuratedForm
-                      fields={textFields}
-                      suggestions={suggestions}
-                      strictKeys={strictKeys}
-                      overrides={settings}
-                      disabled={live}
-                      onChange={onChange}
-                      onReset={onReset}
-                    />
-                  )}
-                  {customPolicy && (
-                    <p className="text-xs leading-relaxed text-white/45">
-                      Custom policy: start your policy server (
-                      <code className="font-mono text-white/60">almond_axol.policy.serve</code>)
-                      before pressing Start. Run Policy uses the host and port in Settings →
-                      Inference; a blank host connects to this machine on the configured port
-                      (default 8765). Select the model and instruction on the endpoint; the task
-                      labels recordings.
-                    </p>
-                  )}
-                  {!live &&
-                    suggestionNotes.map((note) => (
-                      <p key={note.key} className="text-xs leading-relaxed text-white/45">
-                        {note.strict
-                          ? `${sentenceCase(note.label)} options unavailable — the host cannot read its list, so this field cannot be set.`
-                          : `${sentenceCase(note.label)} suggestions unavailable — type the value.`}{" "}
-                        <span className="break-words text-white/35">{note.error}</span>
-                      </p>
-                    ))}
-                  {jointField && (
-                    <ArmJointPicker
-                      value={settings[jointField.key]}
-                      disabled={live}
-                      onChange={(v) => onChange(jointField.key, v)}
-                      onReset={() => onReset(jointField.key)}
-                    />
-                  )}
-                </>
-              )}
-
-              <button
-                type="button"
-                onClick={onOpenSettings}
-                className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
-              >
-                <Settings2 className="size-3.5" />
-                {runFields.length > 0
-                  ? "Cameras, arm behaviour, recording and everything else live in Settings"
-                  : "No per-run inputs — configure everything in Settings, then press Start"}
-              </button>
-
-              {blockers.length > 0 && !live && (
-                <div className="flex flex-col gap-1 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-                  <span className="font-medium">Before you can start:</span>
-                  <ul className="list-inside list-disc">
-                    {blockers.map((b) => (
-                      <li key={b}>{b}</li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              {/* Everything the operator watches during a session — episode
-                  status/controls, the mirrored headset popups, and the live
-                  camera feeds — grouped so it can expand to a fullscreen
-                  operator view (the headset-off replacement for the HUD). */}
-              {/* Sim has the browser viewer, an arms-off run has no video relay, and
-                  Mantis teleop is grippers-only (no cameras). Mantis collection
-                  still relays its configured wrist-camera feeds even when
-                  Lighthouse/Ultimate make the headset unnecessary. */}
-              {live && (meta.episodeControl || showFeeds || showSettings) && (
-                <OperatorDeck
-                  label={meta.label}
-                  episodeControl={meta.episodeControl}
-                  showFeeds={showFeeds}
-                  showSettings={showSettings}
-                  policy={policy}
-                  onEpisode={onEpisode}
-                  host={host}
-                  vrPort={vrPort}
-                />
-              )}
-
-              <RunningHints
-                usesHeadset={meta.usesHeadset}
-                mantisMode={mantisMode}
-                mantisSource={mantisSource}
-                dataCollection={meta.id === "collect-data"}
-                session={live ? session : null}
-                isSim={isSim}
-                host={host}
-                viewerPort={viewerPort}
-              />
-            </>
+        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
+          {/* Only Mantis collection owns a tracker bridge to reset;
+              Mantis teleop is grippers-only. */}
+          {live && mantisMode && mantisSource !== "quest" && meta.id === "collect-data" && (
+            <Button
+              variant="outline"
+              size="lg"
+              onClick={() => onEpisode("bridge-reset")}
+              disabled={busy}
+            >
+              <RotateCcw /> Reset
+            </Button>
           )}
-        </CardContent>
-      </Card>
+          {stopping ? (
+            <Button variant="destructive" size="lg" disabled>
+              <Loader2 className="animate-spin" />
+              Stopping…
+            </Button>
+          ) : live ? (
+            <Button variant="destructive" size="lg" onClick={onStop} disabled={busy}>
+              {busy ? <Loader2 className="animate-spin" /> : <Square />}
+              Stop
+            </Button>
+          ) : (
+            <Button size="lg" className="min-w-32" onClick={onStart} disabled={busy || !ready}>
+              {busy ? <Loader2 className="animate-spin" /> : <Play />}
+              {busy && startPhase ? startPhase : "Start"}
+            </Button>
+          )}
+        </div>
+      </section>
+
+      {!available ? (
+        connected ? (
+          <Unavailable spec={spec} />
+        ) : (
+          <ConnectPrompt onConnect={onConnect} />
+        )
+      ) : (
+        <>
+          {!live && <ReadyChecklist blockers={blockers} fixFor={fixFor} />}
+
+          {/* Everything the operator watches during a session — episode
+              status/controls, the mirrored headset popups, and the live
+              camera feeds — grouped so it can expand to a fullscreen
+              operator view (the headset-off replacement for the HUD). */}
+          {/* Sim has the browser viewer, an arms-off run has no video relay, and
+              Mantis teleop is grippers-only (no cameras). Mantis collection
+              still relays its configured camera feeds even when
+              Lighthouse/Ultimate make the headset unnecessary. */}
+          {live && (meta.episodeControl || showFeeds || showSettings) && (
+            <OperatorDeck
+              label={meta.label}
+              episodeControl={meta.episodeControl}
+              showFeeds={showFeeds}
+              showSettings={showSettings}
+              policy={policy}
+              onEpisode={onEpisode}
+              host={host}
+              vrPort={vrPort}
+            />
+          )}
+
+          <RunningHints
+            usesHeadset={meta.usesHeadset}
+            mantisMode={mantisMode}
+            mantisSource={mantisSource}
+            dataCollection={meta.id === "collect-data"}
+            session={live ? session : null}
+            isSim={isSim}
+            host={host}
+            viewerPort={viewerPort}
+          />
+
+          <Card className="gap-5">
+            {(runFields.length > 0 || (isSim && simRobot && onSimRobotChange)) && (
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="font-heading text-sm font-semibold">Run details</h3>
+                {editedCount > 0 && !live && (
+                  <button
+                    type="button"
+                    onClick={onResetAll}
+                    className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
+                  >
+                    <RotateCcw className="size-3" />
+                    Reset
+                  </button>
+                )}
+              </div>
+            )}
+            {textFields.length > 0 && (
+              <CuratedForm
+                fields={textFields}
+                suggestions={suggestions}
+                strictKeys={strictKeys}
+                overrides={settings}
+                disabled={live}
+                onChange={onChange}
+                onReset={onReset}
+              />
+            )}
+            {customPolicy && (
+              <p className="text-xs leading-relaxed text-white/45">
+                Custom policy: start your policy server (
+                <code className="font-mono text-white/60">almond_axol.policy.serve</code>) before
+                you press Start. Run policy connects to the host and port on the Inference tab of
+                General settings. A blank host means this computer, and the default port is 8765.
+                Choose the model and instruction on your policy server. The task only labels the
+                recordings.
+              </p>
+            )}
+            {!live &&
+              suggestionNotes.map((note) => (
+                <p key={note.key} className="text-xs leading-relaxed text-white/45">
+                  {note.strict
+                    ? `${sentenceCase(note.label)} options couldn't be loaded, so you can't set this field.`
+                    : `${sentenceCase(note.label)} suggestions couldn't be loaded. Type the value.`}{" "}
+                  <span className="break-words text-white/35">{note.error}</span>
+                </p>
+              ))}
+            {jointField && (
+              <ArmJointPicker
+                value={settings[jointField.key]}
+                disabled={live}
+                onChange={(v) => onChange(jointField.key, v)}
+                onReset={() => onReset(jointField.key)}
+              />
+            )}
+            {isSim && simRobot && onSimRobotChange && (
+              <SimRobotPicker value={simRobot} onChange={onSimRobotChange} disabled={live} />
+            )}
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              className="group flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2.5 text-left text-sm text-white/60 transition-colors hover:border-white/20 hover:text-white/85"
+            >
+              <Settings2 className="size-4 shrink-0 text-white/40" />
+              <span className="min-w-0 flex-1">
+                {runFields.length > 0
+                  ? "Cameras, arm behavior and recording are in Settings."
+                  : "Nothing to set for each run. Cameras, arm behavior and recording are in Settings."}
+              </span>
+              <ChevronRight className="size-4 shrink-0 text-white/25 group-hover:text-white/60" />
+            </button>
+          </Card>
+        </>
+      )}
+    </div>
+  )
+}
+
+/** What still stands between the operator and Start, each with its fix when
+ *  the app knows one; a green line once nothing does. */
+function ReadyChecklist({
+  blockers,
+  fixFor,
+}: {
+  blockers: string[]
+  fixFor?: (blocker: string) => BlockerFix | null
+}) {
+  if (blockers.length === 0) {
+    return (
+      <div className="flex items-center gap-2.5 rounded-xl border border-emerald-400/20 bg-emerald-400/[0.04] px-4 py-3 text-sm text-emerald-200/90">
+        <CircleCheck className="size-4 shrink-0 text-emerald-300" />
+        Ready to start.
+      </div>
+    )
+  }
+  return (
+    <section className="flex flex-col overflow-hidden rounded-xl border border-amber-400/20 bg-amber-400/[0.03]">
+      <h3 className="border-b border-amber-400/15 px-4 py-2.5 text-sm font-medium text-amber-200/90">
+        Before you start
+      </h3>
+      <ul className="flex flex-col divide-y divide-white/[0.06]">
+        {blockers.map((b) => {
+          const fix = fixFor?.(b) ?? null
+          return (
+            <li key={b} className="flex flex-wrap items-center gap-3 px-4 py-2.5">
+              <CircleAlert className="size-4 shrink-0 text-amber-300/80" />
+              <span className="min-w-0 flex-1 text-sm text-white/75">{b}</span>
+              {fix && (
+                <Button variant="outline" size="sm" onClick={fix.onClick}>
+                  {fix.label}
+                </Button>
+              )}
+            </li>
+          )
+        })}
+      </ul>
+    </section>
+  )
+}
+
+/** Shown in place of an operation's inputs until the Host Computer is
+ *  connected: the app knows the operation, but only the host can run it. */
+function ConnectPrompt({ onConnect }: { onConnect?: () => void }) {
+  return (
+    <div className="flex flex-col items-start gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-5 sm:flex-row sm:items-center">
+      <Plug className="size-5 shrink-0 text-white/40" />
+      <p className="min-w-0 flex-1 text-sm text-white/60">
+        Connect to the Host Computer to set up and start this operation.
+      </p>
+      {onConnect && (
+        <Button size="sm" onClick={onConnect}>
+          Connect
+        </Button>
+      )}
     </div>
   )
 }
@@ -641,15 +788,15 @@ function legacyControls(phase: string): EpisodeControlSpec[] {
 function legacyStatus(phase: string): string {
   switch (phase) {
     case "recording":
-      return "Recording — Save to keep, Discard to re-record."
+      return "Recording. Press Save to keep it or Discard to record again."
     case "deciding":
-      return "Time cap reached — Save to keep, Discard to re-record."
+      return "Time limit reached. Press Save to keep it or Discard to record again."
     case "ready":
       return "Reset the scene, then start the episode."
     case "resetting":
       return "Returning to rest…"
     case "parking":
-      return "Parking the arms (rest, then zero) before releasing the motors…"
+      return "Moving the arms to rest, then to zero, before turning off the motors…"
     default:
       return "Preparing…"
   }
@@ -679,7 +826,7 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       kind: "pulse",
     },
     deciding: {
-      label: "Decide",
+      label: "Time up",
       cls: "border-amber-400/50 bg-amber-400/10 text-amber-200",
       kind: "pulse",
     },
@@ -719,7 +866,7 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       kind: "spin",
     },
     parking: {
-      label: "Parking",
+      label: "Parking arms",
       cls: "border-sky-400/40 bg-sky-400/10 text-sky-200",
       kind: "spin",
     },
@@ -781,8 +928,8 @@ function ConfirmPopup({
         <AlertTriangle className="size-7 text-amber-300" />
         <p className="font-heading text-2xl font-semibold">{confirmLabel(action, policy)}?</p>
         <p className="text-sm leading-relaxed text-white/60">
-          Press the same controller button again to confirm — the other button cancels and keeps
-          recording.
+          Press the same controller button again to confirm. Press the other button to cancel and
+          keep recording.
         </p>
       </div>
     </div>
@@ -880,7 +1027,7 @@ function OperatorDeck({
     <div className="fixed inset-0 z-50 flex flex-col gap-3 overflow-hidden bg-[#0a0a0a] p-4 sm:p-5">
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
-          {label} — operator view
+          {label}: operator view
         </span>
         <Button variant="outline" size="sm" onClick={toggleFullscreen}>
           Exit fullscreen
@@ -907,6 +1054,13 @@ export function EpisodeControls({
   // the built-in run-policy set otherwise.
   const controls = policy?.controls ?? legacyControls(phase)
   const status = policy?.message ?? legacyStatus(phase)
+  const quality = policy?.trackingQuality
+  const controlBlocked = (command: string) =>
+    ((command === "s" || command === "save") && Boolean(quality?.retakeRequired)) ||
+    (command === "start" &&
+      phase !== "countdown" &&
+      quality !== undefined &&
+      (quality.status === "checking" || quality.status === "error"))
   // Which confirm-gated command is armed and awaiting its second click — the
   // panel's stand-in for the headset's double-press save/discard confirmation.
   const [armed, setArmed] = useState<string | null>(null)
@@ -942,7 +1096,7 @@ export function EpisodeControls({
   const vrCounting = vrCountdownS != null && vrCountdownS > 0 && phase !== "recording"
   const displayPhase = vrCounting ? "countdown" : phase
   const displayStatus = vrCounting
-    ? `Recording starts in ${vrCountdownS} s — controller countdown; press A again to cancel.`
+    ? `Recording starts in ${vrCountdownS} s. Press A again to cancel.`
     : status
 
   // Auto-submitting inputs register a flush, so a button clicked inside the
@@ -950,6 +1104,7 @@ export function EpisodeControls({
   const flushes = useRef(new Map<string, () => void>())
 
   function click(control: EpisodeControlSpec) {
+    if (controlBlocked(control.command)) return
     for (const flush of flushes.current.values()) flush()
     if (control.confirm && armed !== control.command) {
       setArmed(control.command)
@@ -986,6 +1141,7 @@ export function EpisodeControls({
           {policy.notice.message}
         </div>
       )}
+      {quality && <TrackingQualityStatus quality={quality} recording={phase === "recording"} />}
       <span className="text-sm text-white/60">{displayStatus}</span>
       {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
@@ -995,6 +1151,7 @@ export function EpisodeControls({
               variant={armed === c.command ? "destructive" : i === 0 ? "default" : "outline"}
               size="sm"
               onClick={() => click(c)}
+              disabled={controlBlocked(c.command)}
             >
               {armed === c.command ? `Confirm: ${c.label}?` : c.label}
             </Button>
@@ -1011,6 +1168,138 @@ export function EpisodeControls({
           flushes={flushes}
         />
       ))}
+    </div>
+  )
+}
+
+function TrackingQualityStatus({
+  quality,
+  recording,
+}: {
+  quality: TrackingQuality
+  recording: boolean
+}) {
+  const failed = quality.retakeRequired || quality.status === "error"
+  const ready = quality.status === "ready" && !failed
+  const controlPaused = quality.controlState === "recovering" || quality.reengageRequired
+  const reasons = quality.reasons.length
+    ? quality.reasons
+    : quality.retakeRequired && quality.lastFault
+      ? [quality.lastFault]
+      : []
+  const nativeFailure =
+    quality.nativeFailure ||
+    reasons.some((reason) =>
+      /survive-cli exited|libsurvive reader (?:failed|stopped)|pysurvive stopped/.test(reason)
+    )
+  return (
+    <div
+      role={failed ? "alert" : "status"}
+      aria-live={failed ? "assertive" : "polite"}
+      className={cn(
+        "flex flex-col gap-1 rounded-md border p-3 text-sm",
+        failed
+          ? "border-red-400/40 bg-red-400/10 text-red-200"
+          : ready && !controlPaused
+            ? "border-emerald-400/25 bg-emerald-400/5 text-emerald-200"
+            : "border-amber-400/25 bg-amber-400/5 text-amber-200"
+      )}
+    >
+      <p className="font-medium">
+        {quality.retakeRequired
+          ? "Tracking fault: retake required"
+          : failed
+            ? "Tracking quality failed"
+            : ready
+              ? controlPaused
+                ? "Gripper control paused"
+                : "Live tracking checks passed"
+              : quality.status === "checking"
+                ? "Checking tracking quality…"
+                : "Tracking quality warning"}
+      </p>
+      {reasons.map((reason, index) => (
+        <p key={`${index}:${reason}`}>{reason}</p>
+      ))}
+      {quality.retakeRequired && <p>This take cannot be saved. Discard and retake.</p>}
+      {quality.controlState === "recovering" ? (
+        <p>Gripper control is paused until the trackers and triggers recover.</p>
+      ) : quality.reengageRequired ? (
+        <p>
+          Tracking has recovered, but gripper control is still off.{" "}
+          {recording || quality.retakeRequired
+            ? "Discard this take. When Mantis is ready, squeeze both triggers, then release them to start a new take."
+            : "Squeeze both triggers, then release them to start a new take."}
+        </p>
+      ) : null}
+      {quality.triggersLive && !quality.triggersLive.left && (
+        <p>No signal from the left trigger. Check its power and CAN cable.</p>
+      )}
+      {quality.triggersLive && !quality.triggersLive.right && (
+        <p>No signal from the right trigger. Check its power and CAN cable.</p>
+      )}
+      {nativeFailure ? (
+        <p>
+          Tracking stopped. Stop this session and start it again. If tracking keeps stopping, repair
+          Lighthouse support in Mantis settings and save the session log.
+        </p>
+      ) : quality.calibrationRequired ? (
+        <p>
+          Lighthouse needs recalibrating. Stop collection, then press Recalibrate Lighthouse on the
+          Tracking tab of Mantis settings. This also runs the validation needed before recording.
+          Waiting for the trackers to come back into view won&apos;t clear this fault.
+        </p>
+      ) : quality.status === "warning" ? (
+        <p>You can still record. Check the warning and keep both trackers in view.</p>
+      ) : quality.status === "checking" ? (
+        <p>Keep both trackers in view while the tracking checks run.</p>
+      ) : !ready ? (
+        <p>Bring both trackers back into view and wait for the checks to pass before you record.</p>
+      ) : (
+        <p className="text-xs">These checks measure tracking consistency, not absolute accuracy.</p>
+      )}
+      {quality.faultCount > 0 && (
+        <p className="text-xs">
+          {quality.faultCount} tracking {quality.faultCount === 1 ? "fault" : "faults"} since
+          tracking started, including setup and idle time.
+        </p>
+      )}
+      {!quality.retakeRequired && quality.lastEpisodeFault && (
+        <p className="text-amber-200">Previous take needs a retake: {quality.lastEpisodeFault}</p>
+      )}
+      {quality.diagnostics && <TrackingDiagnosticStatus diagnostics={quality.diagnostics} />}
+    </div>
+  )
+}
+
+function TrackingDiagnosticStatus({
+  diagnostics,
+}: {
+  diagnostics: NonNullable<TrackingQuality["diagnostics"]>
+}) {
+  const { state, latest_path: path, error } = diagnostics
+  const message =
+    error || state === "error"
+      ? "Diagnostic capture unavailable."
+      : state === "capturing"
+        ? "Capturing tracking diagnostics. Keep this session open for 3 seconds."
+        : state === "saving"
+          ? "Saving tracking diagnostics. Keep this session open."
+          : path
+            ? "Tracking diagnostics saved. Stop this session and share the file below."
+            : state === "armed"
+              ? "Automatic fault capture is ready. Collect normally until a tracking fault occurs."
+              : state === "waiting_for_ready"
+                ? "Automatic fault capture is waiting for live tracking."
+                : null
+  if (!message) return null
+  return (
+    <div className="mt-1 border-t border-current/15 pt-2 text-xs">
+      <p>{message}</p>
+      {error && <p className="break-words">{error}</p>}
+      {path && state !== "capturing" && state !== "saving" && (
+        <p className="mt-1 break-all font-mono">{path}</p>
+      )}
     </div>
   )
 }
@@ -1132,9 +1421,9 @@ function RunningHints({
     <div className="flex flex-col gap-3">
       {grippersOnly && (
         <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
-          Grippers only: once both triggers read live and released, the grippers calibrate against
-          their open stops (jaws move fully open — keep them clear), then each trigger closes its
-          gripper proportionally. No tracking runs; Stop disables both grippers.
+          Grippers only, with no tracking. When both triggers are connected and released, the
+          grippers open fully to calibrate, so keep the jaws clear. Then each trigger closes its
+          gripper as far as you squeeze it. Stop turns off both grippers.
         </p>
       )}
       {isSim && viewerUrl && (
@@ -1164,8 +1453,9 @@ function RunningHints({
           </p>
           {dataCollection && (
             <p>
-              Use the Quest&apos;s A button to start or save a take and X to discard it (each stop
-              asks for the same button again), or use the episode controls above.
+              Press A on the controller to start or save a take, and X to discard it. Press the same
+              button again to confirm a save or discard. You can also use the episode controls
+              above.
             </p>
           )}
         </div>
@@ -1173,20 +1463,19 @@ function RunningHints({
       {managedMantis && (
         <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           <p>
-            This run uses headset-free {trackerLabel} tracking. Power both bound trackers and keep
-            them tracking. Once both trackers and trigger channels are live, hold both Mantis rigs
-            where the session should begin, squeeze both triggers together, then release both to
-            engage at that pose{dataCollection ? " and start a take" : ""}.
+            This run uses {trackerLabel} tracking, with no headset. Turn on both trackers and keep
+            them in view. When both trackers and triggers are live, hold the rigs where you want to
+            start. Squeeze both triggers, then release them to engage
+            {dataCollection ? " and start a take" : ""}.
           </p>
           <p>
-            If either tracker loses lock, motion holds. After both sides recover, repeat the
-            both-squeeze-then-release gesture to re-engage; Reset above explicitly returns to rest.
+            If a tracker loses tracking, motion pauses. When both trackers recover, squeeze and
+            release both triggers again to re-engage. Press Reset above to return to rest.
           </p>
           {dataCollection && (
             <p className="text-white/65">
-              While recording, rapidly fully squeeze and release either Mantis trigger 3 times to
-              save the take, or 4 times to discard it. Start recording above requires an engaged
-              rig.
+              While recording, fully squeeze either trigger 3 times quickly to save the take, or 4
+              times to discard it. Engage the rigs before you press Start recording.
             </p>
           )}
         </div>
@@ -1218,11 +1507,11 @@ function Unavailable({ spec }: { spec: CommandSpec | null }) {
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
       <div className="flex items-center gap-2 font-medium text-amber-300/90">
         <AlertTriangle className="size-4" />
-        Not available on this server
+        Not available on this robot
       </div>
       <p className="text-white/55">
-        This operation needs dependencies that aren&apos;t installed on the connected machine (e.g.
-        the <span className="font-mono">lerobot</span> / ZED extras, or Axol hardware).
+        This operation needs software or hardware that the Host Computer doesn&apos;t have, such as
+        LeRobot, the ZED SDK or the Axol arms.
       </p>
       {spec?.error && (
         <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">

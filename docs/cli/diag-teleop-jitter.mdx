@@ -1,26 +1,44 @@
 ---
 title: "diag.teleop-jitter"
-description: "Attribute teleop jitter to a pipeline stage from a flight-recorder capture."
+description: "Find which stage of the teleop pipeline adds jitter, from a teleop recording."
 ---
 
-Analyzes a teleop flight-recorder capture and reports where in the pipeline the jitter enters. Record a session first by passing `--teleop.record` with a file prefix — recording costs one buffer copy per tick and is entirely inert when the flag is unset:
+Analyzes a teleop recording and shows where in the pipeline jitter enters. First record a session by passing `--teleop.record` with a file prefix. Recording has almost no cost, and nothing is recorded without the flag.
 
 ```bash
 axol teleop --teleop.record /tmp/jit
-# engage, reproduce the jitter, disengage — the files are written at disengage
+# engage, reproduce the jitter, then disengage to write the files
 axol diag.teleop-jitter /tmp/jit
 ```
 
-The recorder writes four time-synchronized files: `_ik`, `_cmd`, `_meas`, and `_rt`. They span raw VR pose through filtered pose, IK output, smoothed Python target, the Rust core's actual 240 Hz motor command and torque terms, and measured joints. Recording covers the **latest engage→disengage segment**: it starts at engagement (no rest-pose lead-in), re-engaging starts the segment over, and `_rt` is compacted when the core disarms. The analyzer clips to the longest engaged stretch, splits every signal into three bands — below 3 Hz (intentional motion), 3-15 Hz (the **JITTER** column, the band the arm's structure responds to), above 15 Hz (noise the mechanics filter out) — and prints band-RMS tables at every stage boundary, including Rust target→motor-command→measurement and per-term torque attribution.
+The recording is four time-aligned files: `_ik`, `_cmd`, `_meas` and `_rt`. Together they cover every stage, from the raw VR pose through the filters, the IK output and the smoothed target, to the motor command and the measured joints.
 
-To read the output, walk each joint down its stage list and find the first stage where the JITTER column jumps well above the previous stage:
+The recording holds the most recent engaged stretch. It starts when you engage, and engaging again starts a new one. The analyzer uses the longest engaged stretch in the files.
+
+## Reading the output
+
+The analyzer splits every signal into three frequency bands:
+
+| Band | Meaning |
+|---|---|
+| Below 3 Hz | Intentional motion |
+| 3–15 Hz | The **JITTER** column: the band the arm's structure responds to |
+| Above 15 Hz | Noise the mechanics filter out |
+
+It prints a table for each stage, and splits the motor torque into its parts. Walk each joint down its stages and find the first stage where the JITTER column jumps well above the stage before it:
 
 | Jump at | Points to |
 | --- | --- |
-| `raw -> filt` | VR tracking noise / pose filter |
-| `filt -> ik_q` | the IK solver (e.g. null-space churn) |
-| `tgt -> ema -> out` | the smoothing stages |
-| `out -> meas` | the arm ringing — control/damping territory |
+| `raw -> filt` | VR tracking noise or the pose filter |
+| `filt -> ik_q` | The IK solver, for example joints drifting without moving the hand |
+| `tgt -> ema -> out` | The smoothing stages |
+| `out -> meas` | The arm ringing: a control or damping problem |
+
+| Flag | Description |
+|---|---|
+| `prefix` | The `--teleop.record` prefix used for the recording |
+| `--joints NAME ...` | Show only these joints |
+| `--full` | Analyze the whole recording, not only the longest engaged stretch |
 
 ```bash
 axol diag.teleop-jitter /tmp/jit --joints elbow wrist_2   # restrict the tables

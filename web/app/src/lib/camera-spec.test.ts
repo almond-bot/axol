@@ -43,7 +43,7 @@ describe("camera specification", () => {
       })
     ).toEqual({
       serials: { overhead: "101", left_arm: "202", right_arm: "" },
-      mantis_serials: { left_arm: "202", right_arm: "" },
+      mantis_serials: { overhead: "", left_arm: "202", right_arm: "" },
       stream_resolution: "HD1200",
       record_resolution: "SVGA",
       stream: { overhead: "both", left_arm: false },
@@ -66,8 +66,61 @@ describe("camera specification", () => {
       devices,
       { left_arm: "mantis" }
     )
-    expect(out.mantis_serials).toEqual({ left_arm: "303", right_arm: "" })
+    expect(out.mantis_serials).toEqual({ overhead: "", left_arm: "303", right_arm: "" })
     expect(out.stream).toEqual({ left_arm: false })
     expect(out.record).toEqual({ overhead: "right", left_arm: "left" })
+  })
+
+  it("uses the Mantis head camera kind and saves both stereo eyes by default", () => {
+    const out = materializeCameraSpec(
+      {
+        ...spec,
+        mantis_serials: { overhead: " 303 ", left_arm: "202", right_arm: "" },
+        stream: {},
+        record: {},
+      },
+      [
+        { serial: 101, model: "ZED X One", kind: "mono" },
+        { serial: 303, model: "ZED X Mini", kind: "stereo" },
+      ],
+      { overhead: "mantis" }
+    )
+    expect(out.serials.overhead).toBe("101")
+    expect(out.mantis_serials?.overhead).toBe("303")
+    expect(out.stream).toEqual({ overhead: "both" })
+    expect(out.record).toEqual({ overhead: "both" })
+  })
+
+  it("preserves an explicitly unassigned Mantis head instead of inheriting Axol", () => {
+    const out = materializeCameraSpec(
+      { ...spec, mantis_serials: { overhead: "" }, stream: {}, record: {} },
+      [{ serial: 101, model: "ZED X Mini", kind: "stereo" }],
+      { overhead: "mantis" }
+    )
+    expect(out.mantis_serials?.overhead).toBe("")
+    expect(out.stream).toEqual({})
+    expect(out.record).toEqual({})
+  })
+
+  it("does not save a duplicate inherited head for legacy Mantis wrist assignments", () => {
+    const out = materializeCameraSpec(
+      { ...spec, mantis_serials: { left_arm: "101", right_arm: "" }, stream: {}, record: {} },
+      [{ serial: 101, model: "ZED X Mini", kind: "stereo" }],
+      { overhead: "mantis", left_arm: "mantis" }
+    )
+    expect(out.mantis_serials).toEqual({ overhead: "", left_arm: "101", right_arm: "" })
+    expect(out.stream).toEqual({ left_arm: "left" })
+    expect(out.record).toEqual({ left_arm: "left" })
+  })
+
+  it("can save a partial legacy head-only camera map without inheriting it into Mantis", () => {
+    const out = materializeCameraSpec(
+      { serials: { overhead: "101" } } as CameraSpec,
+      [{ serial: 101, model: "ZED X Mini", kind: "stereo" }],
+      { overhead: "mantis" }
+    )
+    expect(out.serials).toEqual({ overhead: "101", left_arm: "", right_arm: "" })
+    expect(out.mantis_serials).toEqual({ overhead: "", left_arm: "", right_arm: "" })
+    expect(out.record).toEqual({})
   })
 })

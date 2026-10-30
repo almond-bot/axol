@@ -1,0 +1,548 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index b2e49d2..ea2ef8c 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -34,6 +34,7 @@ SET(SURVIVE_SRCS ${SURVIVE_SRCS}
+         ./generated/common_math.gen.h
+     survive_optimizer.c
+     survive_recording.c
++    survive_diagnostics.c
+     survive_plugins.c
+     survive_process.c
+     survive_process_gen2.c
+diff --git a/src/driver_vive.c b/src/driver_vive.c
+index 04c2fe5..c94e163 100755
+--- a/src/driver_vive.c
++++ b/src/driver_vive.c
+@@ -16,6 +16,7 @@
+ 
+ #include "json_helpers.h"
+ #include "survive_config.h"
++#include "survive_diagnostics.h"
+ #include "survive_default_devices.h"
+ #include "survive_str.h"
+ #include "driver_vive.h"
+diff --git a/src/driver_vive.hidapi.h b/src/driver_vive.hidapi.h
+index ebcc491..1716a5f 100644
+--- a/src/driver_vive.hidapi.h
++++ b/src/driver_vive.hidapi.h
+@@ -85,7 +85,14 @@ static void *HAPIReceiver(void *v) {
+ 	SurviveUSBInterface *iface = v;
+ 	USB_INTERFACE_HANDLE *hp = &iface->uh;
+ 
+-	if ((iface->actual_len = hid_read(*hp, iface->buffer, sizeof(iface->swap_buffer[0]) )) > 0) {
++    iface->actual_len = hid_read(*hp, iface->buffer, sizeof(iface->swap_buffer[0]));
++    if (iface->actual_len != 0 && survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("input", iface->assoc_obj ? iface->assoc_obj->codename : "",
++            ",\"transport\":\"hidapi\",\"interface\":%u,\"status\":%d,\"bytes\":%d,\"report_id\":%d",
++            (unsigned)iface->which_interface_am_i, iface->actual_len < 0 ? -1 : 0, iface->actual_len,
++            iface->actual_len > 0 ? iface->buffer[0] : -1);
++    }
++	if (iface->actual_len > 0) {
+ 		// if( iface->actual_len  == 52 ) continue;
+ 		iface->packet_count++;
+ 		survive_data_cb(OGGetAbsoluteTimeUS(), iface);
+diff --git a/src/driver_vive.libusb.h b/src/driver_vive.libusb.h
+index 25007de..7a3a0b9 100644
+--- a/src/driver_vive.libusb.h
++++ b/src/driver_vive.libusb.h
+@@ -211,6 +211,12 @@ static void handle_transfer(struct libusb_transfer *transfer) {
+ 	uint64_t time = OGGetAbsoluteTimeUS();
+ 
+ 	SurviveUSBInterface *iface = transfer->user_data;
++    if (survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("input", iface->assoc_obj ? iface->assoc_obj->codename : "",
++            ",\"transport\":\"libusb\",\"interface\":%u,\"status\":%d,\"bytes\":%d,\"report_id\":%d,\"receipt_wall_us\":%llu",
++            (unsigned)iface->which_interface_am_i, (int)transfer->status, transfer->actual_length,
++            transfer->actual_length > 0 ? transfer->buffer[0] : -1, (unsigned long long)time);
++    }
+ 	SurviveContext *ctx = iface->ctx;
+ 	if (!iface->shutdown && transfer->status == LIBUSB_TRANSFER_TIMED_OUT) {
+         iface->consecutive_timeouts++;
+diff --git a/src/survive_diagnostics.c b/src/survive_diagnostics.c
+new file mode 100644
+index 0000000..9b3b984
+--- /dev/null
++++ b/src/survive_diagnostics.c
+@@ -0,0 +1,143 @@
++/* Optional Axol diagnostics. The caller owns the inherited pipe and its reader.
++ * Never wait for a reader, a writer lock, or retry a failed write. The sequence
++ * orders attempted writes; drops also accounts for lock contention. Device tick
++ * clocks are per device, NOT a synchronized clock shared by the trackers. */
++#include "survive_diagnostics.h"
++#ifndef _WIN32
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++static int diagnostic_fd = -2;
++static unsigned char writing;
++static uint64_t sequence, dropped;
++
++bool survive_diagnostic_enabled(void) {
++    int fd = __atomic_load_n(&diagnostic_fd, __ATOMIC_ACQUIRE);
++    if (fd != -2) return fd >= 0;
++    /* Initialization is nonblocking too: competing callers skip this event. */
++    if (__atomic_test_and_set(&writing, __ATOMIC_ACQUIRE)) return false;
++    if (diagnostic_fd == -2) {
++        int candidate = -1;
++        const char *env = getenv("AXOL_SURVIVE_DIAGNOSTIC_FD");
++        if (env && *env) {
++            char *end;
++            long value = strtol(env, &end, 10);
++            struct stat st;
++            if (!*end && value > STDERR_FILENO && value <= INT_MAX &&
++                fstat((int)value, &st) == 0 && S_ISFIFO(st.st_mode)) {
++                int flags = fcntl((int)value, F_GETFL);
++                /* Refuse a blocking fd; parent configures O_NONBLOCK. */
++                if (flags >= 0 && (flags & O_NONBLOCK) &&
++                    (flags & O_ACCMODE) != O_RDONLY) candidate = (int)value;
++            }
++        }
++        __atomic_store_n(&diagnostic_fd, candidate, __ATOMIC_RELEASE);
++    }
++    fd = diagnostic_fd;
++    __atomic_clear(&writing, __ATOMIC_RELEASE);
++    return fd >= 0;
++}
++
++static void json_identifier(char *out, size_t capacity, const char *value) {
++    size_t p = 0;
++    if (!value) value = "";
++    for (; *value && p + 2 < capacity; value++) {
++        unsigned char c = (unsigned char)*value;
++        if (c == '"' || c == '\\') out[p++] = '\\';
++        out[p++] = c >= 32 && c < 127 ? c : '?';
++    }
++    out[p] = 0;
++}
++
++/* JSON has no NaN/Infinity. Preserve the failed value as null, rather than
++ * making a complete fault record unparsable. Format strings are internal. */
++static size_t json_finite_numbers(char *out, const char *in, size_t length) {
++    size_t i = 0, p = 0;
++    bool quoted = false, escaped = false;
++    while (i < length) {
++        char c = in[i];
++        if (!quoted && (c == 'n' || c == 'i' || c == '-')) {
++            size_t n = 0;
++            if (i + 4 <= length && (!strncmp(in + i, "-nan", 4) || !strncmp(in + i, "-inf", 4))) n = 4;
++            else if (i + 3 <= length && (!strncmp(in + i, "nan", 3) || !strncmp(in + i, "inf", 3))) n = 3;
++            if (n && (i == 0 || strchr(":,[ \t", in[i - 1])) &&
++                (i + n == length || strchr(",]} \t", in[i + n]))) {
++                memcpy(out + p, "null", 4); p += 4; i += n; continue;
++            }
++        }
++        out[p++] = c; i++;
++        if (c == '"' && !escaped) quoted = !quoted;
++        escaped = quoted && c == '\\' && !escaped;
++    }
++    return p;
++}
++
++void survive_diagnostic_emit(const char *kind, const char *device, const char *fields, ...) {
++    int saved_errno = errno;
++    if (!survive_diagnostic_enabled()) { errno = saved_errno; return; }
++    if (__atomic_test_and_set(&writing, __ATOMIC_ACQUIRE)) {
++        __atomic_add_fetch(&dropped, 1, __ATOMIC_RELAXED);
++        errno = saved_errno; return;
++    }
++    /* <= PIPE_BUF makes each successful nonblocking pipe write atomic. Reserve
++     * space for replacing 3-byte nan/inf tokens by 4-byte JSON null tokens. */
++    char record[PIPE_BUF], body[PIPE_BUF / 2], safe_kind[96], safe_device[96];
++    json_identifier(safe_kind, sizeof(safe_kind), kind);
++    json_identifier(safe_device, sizeof(safe_device), device);
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    uint64_t seq = ++sequence;
++    int header_len = snprintf(record, sizeof(record),
++        "{\"v\":1,\"seq\":%llu,\"t\":%lld.%09ld,\"kind\":\"%s\",\"device\":\"%s\",\"drops\":%llu",
++        (unsigned long long)seq, (long long)now.tv_sec, now.tv_nsec, safe_kind, safe_device,
++        (unsigned long long)__atomic_load_n(&dropped, __ATOMIC_RELAXED));
++    va_list args;
++    va_start(args, fields);
++    int body_len = vsnprintf(body, sizeof(body), fields, args);
++    va_end(args);
++    if (header_len < 0 || body_len < 0 || (size_t)body_len >= sizeof(body) ||
++        (size_t)header_len + 2 * (size_t)body_len + 2 >= sizeof(record)) goto drop;
++    size_t length = header_len;
++    length += json_finite_numbers(record + length, body, body_len);
++    record[length++] = '}'; record[length++] = '\n';
++
++    /* A dead reader must not kill tracking with SIGPIPE. Mask only this write,
++     * consume only our newly generated SIGPIPE, and restore the caller's mask. */
++    sigset_t pipe_signal, previous, pending;
++    sigemptyset(&pipe_signal); sigaddset(&pipe_signal, SIGPIPE);
++    if (pthread_sigmask(SIG_BLOCK, &pipe_signal, &previous)) goto drop;
++    bool already_pending = sigpending(&pending) == 0 && sigismember(&pending, SIGPIPE);
++    ssize_t written = write(diagnostic_fd, record, length);
++    int write_errno = errno;
++    if (written < 0 && write_errno == EPIPE && !already_pending) {
++        struct timespec no_wait = {0};
++        sigtimedwait(&pipe_signal, 0, &no_wait);
++    }
++    pthread_sigmask(SIG_SETMASK, &previous, 0);
++    if (written != (ssize_t)length) {
++        if (write_errno == EPIPE || write_errno == EBADF)
++            __atomic_store_n(&diagnostic_fd, -1, __ATOMIC_RELEASE);
++        goto drop;
++    }
++    goto done;
++drop:
++    __atomic_add_fetch(&dropped, 1, __ATOMIC_RELAXED);
++done:
++    __atomic_clear(&writing, __ATOMIC_RELEASE);
++    errno = saved_errno;
++}
++#else
++bool survive_diagnostic_enabled(void) { return false; }
++void survive_diagnostic_emit(const char *kind, const char *device, const char *fields, ...) {}
++#endif
+diff --git a/src/survive_diagnostics.h b/src/survive_diagnostics.h
+new file mode 100644
+index 0000000..e4348df
+--- /dev/null
++++ b/src/survive_diagnostics.h
+@@ -0,0 +1,13 @@
++/* Axol's optional, loss-accounted diagnostic side channel; no solver configuration. */
++#ifndef SURVIVE_DIAGNOSTICS_H
++#define SURVIVE_DIAGNOSTICS_H
++#include <stdbool.h>
++#if defined(__GNUC__)
++#define SURVIVE_DIAGNOSTIC_API __attribute__((visibility("default")))
++#else
++#define SURVIVE_DIAGNOSTIC_API
++#endif
++SURVIVE_DIAGNOSTIC_API bool survive_diagnostic_enabled(void);
++SURVIVE_DIAGNOSTIC_API void survive_diagnostic_emit(const char *kind, const char *device,
++                                                   const char *fields, ...);
++#endif
+diff --git a/src/survive_kalman_tracker.c b/src/survive_kalman_tracker.c
+index 484cf8c..98b4754 100644
+--- a/src/survive_kalman_tracker.c
++++ b/src/survive_kalman_tracker.c
+@@ -1,4 +1,5 @@
+ #include "survive_kalman_tracker.h"
++#include "survive_diagnostics.h"
+ #include "generated/imu_model.gen.h"
+ #include "generated/kalman_kinematics.gen.h"
+ #include "linmath.h"
+@@ -1617,6 +1618,29 @@ void survive_kalman_tracker_lost_tracking(SurviveKalmanTracker *tracker, bool al
+ 	}
+ }
+ 
++/* Frequent expected rate-limit/configuration returns are coalesced to <=20 Hz
++ * per device and reason. occurrences counts calls since the previous record;
++ * covariance/invalid/startup/nonmonotonic suppressions are never coalesced. */
++static void diagnostic_suppression(PoserData *pd, SurviveKalmanTracker *tracker,
++                                   const char *reason, int rate_slot, double variance) {
++    if (!survive_diagnostic_enabled()) return;
++    unsigned long long occurrences = 1;
++    if (rate_slot >= 0) {
++        double t = pd->timecode / (double)tracker->so->timebase_hz;
++        uint64_t *count = &tracker->diagnostic_suppressed_count[rate_slot];
++        (*count)++;
++        double last = tracker->diagnostic_suppressed_t[rate_slot];
++        if (last > 0 && t >= last && t - last < .05) return;
++        tracker->diagnostic_suppressed_t[rate_slot] = t;
++        occurrences = *count; *count = 0;
++    }
++    survive_diagnostic_emit("pose_suppressed", tracker->so->codename,
++        ",\"reason\":\"%s\",\"device_tick64\":%llu,\"timebase_hz\":%d,\"occurrences\":%llu,\"variance\":%.9g,\"variance_threshold\":%.9g,\"light_residual\":%.9g,\"configured\":%s,\"last_report_device_s\":%.17g,\"min_report_s\":%.9g",
++        reason, (unsigned long long)pd->timecode, tracker->so->timebase_hz, occurrences,
++        variance, (double)tracker->report_threshold_var, (double)tracker->light_residuals_all,
++        tracker->so->conf ? "true" : "false", (double)tracker->last_report_time, (double)tracker->min_report_time);
++}
++
+ bool survive_kalman_tracker_check_valid(SurviveKalmanTracker *tracker) {
+ 	bool isValid =
+ 		tracker->light_error_threshold <= 0 || tracker->light_residuals_all < tracker->light_error_threshold ||
+@@ -1627,6 +1651,14 @@ bool survive_kalman_tracker_check_valid(SurviveKalmanTracker *tracker) {
+ 	}
+ 
+ 	if (!isValid) {
++        if (survive_diagnostic_enabled()) {
++            survive_diagnostic_emit("state_invalid", tracker->so->codename,
++                ",\"light_residual\":%.9g,\"light_error_threshold\":%.9g,\"p\":[%.9g,%.9g,%.9g],\"q_wxyz\":[%.9g,%.9g,%.9g,%.9g]",
++                (double)tracker->light_residuals_all, (double)tracker->light_error_threshold,
++                (double)tracker->state.Pose.Pos[0], (double)tracker->state.Pose.Pos[1], (double)tracker->state.Pose.Pos[2],
++                (double)tracker->state.Pose.Rot[0], (double)tracker->state.Pose.Rot[1],
++                (double)tracker->state.Pose.Rot[2], (double)tracker->state.Pose.Rot[3]);
++        }
+ 		survive_kalman_tracker_lost_tracking(tracker, tracker->use_error_for_lh_pos);
+ 		return false;
+ 	}
+@@ -1649,6 +1681,7 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
+ 	SV_DATA_LOG("model_state", (const FLT *)&tracker->state, tracker->model.state_cnt);
+ 
+ 	if (tracker->so->conf == 0) {
++        diagnostic_suppression(pd, tracker, "no_configuration", 0, NAN);
+ 		return;
+ 	}
+ 
+@@ -1660,10 +1693,12 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
+ 	}
+ 
+ 	if (t - tracker->last_report_time < tracker->min_report_time) {
++        diagnostic_suppression(pd, tracker, "report_interval", 1, NAN);
+ 		return;
+ 	}
+ 
+ 	if (!survive_kalman_tracker_check_valid(tracker)) {
++        diagnostic_suppression(pd, tracker, "invalid", -1, NAN);
+ 		tracker->stats.dropped_poses++;
+ 		return;
+ 	}
+@@ -1678,6 +1713,9 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
+ 
+ 	if ((tracker->report_threshold_var > 0 && p_threshold >= tracker->report_threshold_var) ||
+ 		(tracker->report_ignore_start > tracker->report_ignore_start_cnt)) {
++        diagnostic_suppression(pd, tracker,
++            tracker->report_threshold_var > 0 && p_threshold >= tracker->report_threshold_var ? "covariance" : "startup",
++            -1, p_threshold);
+ 		tracker->stats.dropped_poses++;
+ 		addnd(tracker->stats.dropped_var, var_diag, tracker->stats.dropped_var, state_cnt);
+ 		tracker->report_ignore_start_cnt++;
+@@ -1747,7 +1785,9 @@ void survive_kalman_tracker_report_state(PoserData *pd, SurviveKalmanTracker *tr
+ 	SV_VERBOSE(110, "%s confidence %7.7f", survive_colorize_codename(so), 1. / p_threshold);
+ 	if (so->OutPose_timecode < pd->timecode) {
+ 		SURVIVE_INVOKE_HOOK_SO(imupose, so, pd->timecode, &pose);
+-	}
++	} else {
++        diagnostic_suppression(pd, tracker, "nonmonotonic_tick", -1, p_threshold);
++    }
+ 	if(tracker->stats.imu_count > 100) {
+         SURVIVE_INVOKE_HOOK_SO(velocity, so, pd->timecode, &velocity);
+     }
+diff --git a/src/survive_kalman_tracker.h b/src/survive_kalman_tracker.h
+index 5f06495..ec56f96 100644
+--- a/src/survive_kalman_tracker.h
++++ b/src/survive_kalman_tracker.h
+@@ -148,6 +148,10 @@ typedef struct SurviveKalmanTracker {
+ 
+ 	size_t state_variance_count;
+ 
++    /* Diagnostic bookkeeping only; does not participate in the filter state. */
++    double diagnostic_suppressed_t[2];
++    uint64_t diagnostic_suppressed_count[2];
++
+ 	struct variance_tracker imu_variance, pose_variance;
+ 	struct variance_tracker light_variance[NUM_GEN2_LIGHTHOUSES][SENSORS_PER_OBJECT][2];
+ } SurviveKalmanTracker;
+diff --git a/src/survive_process.c b/src/survive_process.c
+index 1d1bf10..e9002dd 100644
+--- a/src/survive_process.c
++++ b/src/survive_process.c
+@@ -2,6 +2,7 @@
+ //All MIT/x11 Licensed Code in this file may be relicensed freely under the GPL or LGPL licenses.
+ 
+ #include "survive_config.h"
++#include "survive_diagnostics.h"
+ #include "survive_default_devices.h"
+ #include "survive_recording.h"
+ #include <assert.h>
+@@ -46,6 +47,15 @@ void survive_default_imupose_process(SurviveObject *so, survive_long_timecode ti
+ void survive_default_pose_process(SurviveObject *so, survive_long_timecode timecode, const SurvivePose *pose) {
+ 	so->OutPose = *pose;
+ 	so->OutPose_timecode = timecode;
++    if (survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("pose", so->codename,
++            ",\"device_tick64\":%llu,\"timebase_hz\":%d,\"p\":[%.9g,%.9g,%.9g],\"q_wxyz\":[%.9g,%.9g,%.9g,%.9g],\"runtime_offset_us\":%.17g,\"mapped_runtime_us\":%llu",
++            (unsigned long long)timecode, so->timebase_hz,
++            (double)pose->Pos[0], (double)pose->Pos[1], (double)pose->Pos[2],
++            (double)pose->Rot[0], (double)pose->Rot[1], (double)pose->Rot[2], (double)pose->Rot[3],
++            (double)so->activations.runtime_offset,
++            (unsigned long long)SurviveSensorActivations_runtime(&so->activations, timecode));
++    }
+ 	survive_recording_raw_pose_process(so, timecode, pose);
+ }
+ void survive_default_velocity_process(SurviveObject *so, survive_long_timecode timecode,
+@@ -341,6 +351,13 @@ static void calibrate_gyro(SurviveObject *so, FLT *agm) {
+ }
+ 
+ void survive_default_raw_imu_process(SurviveObject *so, int mask, const FLT *accelgyromag, uint32_t timecode, int id) {
++    if (survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("raw_imu", so->codename,
++            ",\"device_tick32\":%u,\"timebase_hz\":%d,\"mask\":%d,\"sample_id\":%d,\"accel_counts\":[%.9g,%.9g,%.9g],\"gyro_counts\":[%.9g,%.9g,%.9g]",
++            timecode, so->timebase_hz, mask, id,
++            (double)accelgyromag[0], (double)accelgyromag[1], (double)accelgyromag[2],
++            (double)accelgyromag[3], (double)accelgyromag[4], (double)accelgyromag[5]);
++    }
+ 	SurviveContext *ctx = so->ctx;
+ 
+ 	FLT agm[9] = {0};
+@@ -370,6 +387,13 @@ void survive_default_set_imu_scale_modes(SurviveObject *so, int gyro_scale_mode,
+ }
+ void survive_default_imu_process(SurviveObject *so, int mask, const FLT *accelgyromag, uint32_t timecode, int id) {
+ 	survive_long_timecode longTimecode = SurviveSensorActivations_long_timecode_imu(&so->activations, timecode);
++    if (survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("imu", so->codename,
++            ",\"device_tick32\":%u,\"device_tick64\":%llu,\"timebase_hz\":%d,\"mask\":%d,\"accel\":[%.9g,%.9g,%.9g],\"gyro\":[%.9g,%.9g,%.9g]",
++            timecode, (unsigned long long)longTimecode, so->timebase_hz, mask,
++            (double)accelgyromag[0], (double)accelgyromag[1], (double)accelgyromag[2],
++            (double)accelgyromag[3], (double)accelgyromag[4], (double)accelgyromag[5]);
++    }
+ 	PoserDataIMU imu = {
+ 		.hdr = {.pt = POSERDATA_IMU, .timecode = longTimecode},
+ 		.datamask = mask,
+diff --git a/src/survive_sensor_activations.c b/src/survive_sensor_activations.c
+index bdc3ee2..3e85cb0 100644
+--- a/src/survive_sensor_activations.c
++++ b/src/survive_sensor_activations.c
+@@ -1,4 +1,5 @@
+ #include "string.h"
++#include "survive_diagnostics.h"
+ #include <assert.h>
+ #include <math.h>
+ #include <survive.h>
+@@ -86,6 +87,12 @@ void SurviveSensorActivations_register_runtime(SurviveSensorActivations *self, s
+ 	else {
+ 		self->runtime_offset = self->runtime_offset * .90 + .1 * runtime_offset;
+ 	}
++    if (survive_diagnostic_enabled()) {
++        survive_diagnostic_emit("clock_map", self->so ? self->so->codename : "",
++            ",\"device_tick64\":%llu,\"receipt_wall_us\":%llu,\"runtime_offset_us\":%.17g,\"mapped_runtime_us\":%.17g,\"clock_scope\":\"per_device_arrival_estimate\"",
++            (unsigned long long)tc, (unsigned long long)runtime_clock_us,
++            (double)self->runtime_offset, (double)self->runtime_offset + (double)(uint64_t)(tc * 0.0208333333));
++    }
+ }
+ 
+ survive_us SurviveSensorActivations_runtime(SurviveSensorActivations *self, survive_long_timecode tc) {
+diff --git a/src/test_cases/diagnostics_smoke.py b/src/test_cases/diagnostics_smoke.py
+new file mode 100644
+index 0000000..0adfde6
+--- /dev/null
++++ b/src/test_cases/diagnostics_smoke.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""No-hardware tests of the diagnostic writer. Run from any working directory."""
++import json
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++import time
++
++SOURCE = r'''
++#include "survive_diagnostics.h"
++#include <assert.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <math.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++static int channel[2];
++static void drain(void) {
++    char buf[4096];
++    ssize_t n;
++    while ((n=read(channel[0],buf,sizeof(buf)))>0) assert(write(1,buf,n)==n);
++}
++static void *produce(void *argument) {
++    for(int i=0;i<500;i++)
++        survive_diagnostic_emit("thread", "WM0", ",\"value\":%d", i);
++    return 0;
++}
++int main(int argc, char **argv) {
++    assert(argc == 2);
++    assert(pipe(channel) == 0);
++    assert(fcntl(channel[0],F_SETFL,O_NONBLOCK)==0);
++    if (strcmp(argv[1],"blocking")) assert(fcntl(channel[1],F_SETFL,O_NONBLOCK)==0);
++    char fd[20]; snprintf(fd,sizeof(fd),"%d",channel[1]);
++    assert(setenv("AXOL_SURVIVE_DIAGNOSTIC_FD",fd,1)==0);
++    if (!strcmp(argv[1],"disabled")) assert(unsetenv("AXOL_SURVIVE_DIAGNOSTIC_FD")==0);
++    if (!strcmp(argv[1],"blocking") || !strcmp(argv[1],"disabled")) {
++        assert(!survive_diagnostic_enabled());
++        survive_diagnostic_emit("disabled","WM0",",\"value\":1");
++        char c; assert(read(channel[0],&c,1)==-1 && errno==EAGAIN);
++        return 0;
++    }
++    assert(survive_diagnostic_enabled());
++    if (!strcmp(argv[1],"normal")) {
++        errno=EDOM;
++        survive_diagnostic_emit("test","WM\"\\\n0",",\"finite\":%.9g,\"bad\":[%.9g,%.9g,%.9g],\"label\":\"nan inf\"",1.5,NAN,INFINITY,-INFINITY);
++        assert(errno==EDOM);
++        drain(); return 0;
++    }
++    if (!strcmp(argv[1],"broken")) {
++        assert(signal(SIGPIPE,SIG_DFL)!=SIG_ERR);
++        close(channel[0]);
++        survive_diagnostic_emit("broken","WM0",",\"value\":1");
++        assert(!survive_diagnostic_enabled());
++        sigset_t blocked; pthread_sigmask(SIG_SETMASK,0,&blocked);
++        assert(!sigismember(&blocked,SIGPIPE));
++        return 0;
++    }
++    if (!strcmp(argv[1],"full")) {
++        char fill[4096]; memset(fill,'x',sizeof(fill));
++        while (write(channel[1],fill,sizeof(fill))>0) {}
++        assert(errno==EAGAIN);
++        for(int i=0;i<10000;i++) survive_diagnostic_emit("lost","WM0",",\"value\":%d",i);
++        while(read(channel[0],fill,sizeof(fill))>0) {}
++        survive_diagnostic_emit("recovered","WM0",",\"value\":1");
++        drain(); return 0;
++    }
++    if (!strcmp(argv[1],"oversized")) {
++        char text[8000]; memset(text,'a',sizeof(text)-1); text[sizeof(text)-1]=0;
++        survive_diagnostic_emit("oversized","WM0",",\"value\":\"%s\"",text);
++        survive_diagnostic_emit("recovered","WM0",",\"value\":1");
++        drain(); return 0;
++    }
++    assert(!strcmp(argv[1],"threads"));
++    pthread_t workers[4];
++    for(int i=0;i<4;i++) assert(!pthread_create(&workers[i],0,produce,0));
++    for(int i=0;i<4;i++) assert(!pthread_join(workers[i],0));
++    drain();
++    survive_diagnostic_emit("finished","WM0",",\"value\":1");
++    drain();
++    return 0;
++}
++'''
++
++
++def main():
++    root = Path(__file__).resolve().parents[2]
++    with tempfile.TemporaryDirectory(prefix="survive-diagnostic-test-") as directory:
++        source = Path(directory) / "smoke.c"
++        binary = Path(directory) / "smoke"
++        source.write_text(SOURCE)
++        subprocess.run(
++            [os.environ.get("CC", "cc"), "-std=gnu99", "-O2", "-Wall", "-Wextra", "-Werror",
++             "-Wno-unused-parameter", "-pthread", "-I", str(root / "src"), str(source),
++             str(root / "src/survive_diagnostics.c"), "-o", str(binary)], check=True
++        )
++        for mode in ("normal", "disabled", "blocking", "full", "broken", "oversized", "threads"):
++            started = time.monotonic()
++            result = subprocess.run([str(binary), mode], capture_output=True, text=True, check=True, timeout=5)
++            rows = [json.loads(line) for line in result.stdout.splitlines()]
++            assert all(row["v"] == 1 and row["t"] > 0 for row in rows)
++            assert all(len(line.encode()) + 1 <= 4096 for line in result.stdout.splitlines())
++            assert [row["seq"] for row in rows] == sorted(set(row["seq"] for row in rows))
++            if mode == "normal":
++                assert rows[0]["finite"] == 1.5 and rows[0]["bad"] == [None, None, None]
++                assert rows[0]["label"] == "nan inf" and rows[0]["device"] == 'WM"\\?0'
++            elif mode == "full":
++                assert len(rows) == 1 and rows[0]["drops"] == 10000 and rows[0]["seq"] == 10001
++            elif mode == "oversized":
++                assert len(rows) == 1 and rows[0]["drops"] == 1
++            elif mode == "threads":
++                assert len(rows) + rows[-1]["drops"] == 2001
++            print(f"PASS {mode}: {len(rows)} events, {time.monotonic() - started:.3f}s")
++
++
++if __name__ == "__main__":
++    main()

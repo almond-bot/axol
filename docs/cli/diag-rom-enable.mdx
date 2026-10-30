@@ -1,15 +1,15 @@
 ---
 title: "diag.rom-enable"
-description: "Range-of-motion soak test: sweep every joint for two hours."
+description: "Run a two-hour range-of-motion soak test that sweeps every joint."
 ---
 
-Enables the motors, eases to home, then loops a full range-of-motion sweep of every joint for two hours. `wrist_2` and `wrist_3` stop 5° short of each limit so those motors are never driven into the ends of travel; every other joint sweeps to its full limit. On a full-robot run it first prompts to clamp each gripper onto an item and holds it for the duration; when the soak finishes (or on Ctrl-C) the robot returns home with the item still gripped and the motors left enabled — run [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) afterwards to release it and power down.
+Enables the motors, moves to home, then sweeps every joint through its range of motion for two hours. `wrist_2` and `wrist_3` stop 5° short of each limit, so their motors are never driven into the ends of travel. Every other joint sweeps to its full limit.
 
-The arms are driven through the Rust realtime core — the same control path as [`teleop`](/cli/teleop) — so the soak exercises exactly the controller the robot ships with: the core owns the CAN buses, renders the streamed sweep at 240 Hz, and runs the host damping against fresh feedback.
+On a full-robot run, the command first asks you to clamp each gripper onto an item, and the grippers hold it for the whole test. When the test finishes, or when you press Ctrl-C, the robot returns home with the item still gripped and the motors still enabled. Run [`diag.rom-disable`](/cli/diag-rom-disable) afterwards to release the item and power down.
 
-Joint positions and torques are captured to a CSV under `~/.almond/diagnostics/captures` at 5 Hz so the run can be charted in the [diagnostics dashboard](https://docs.almond.bot/guides/diagnostics-dashboard)'s run history.
+The arms run on the same controller as [`teleop`](/cli/teleop), so the test exercises the controller Axol ships with. Joint positions and torques are saved to a CSV under `~/.almond/diagnostics/captures` five times a second. You can chart the run in the [diagnostics dashboard](/guides/diagnostics-dashboard)'s run history.
 
-With `--target mantis`, the same soak machinery exercises only the two grippers at ID 8 on `can_mantis_l` / `can_mantis_r`; arm-joint and grasp-hold steps do not apply.
+With `--target mantis`, the test cycles only the two Mantis grippers, ID 8 on `can_mantis_l` and `can_mantis_r`. The arm-joint and grip steps don't apply.
 
 ```bash
 axol diag.rom-enable
@@ -22,12 +22,30 @@ axol diag.rom-enable --no-right --left-channel can0      # one arm on a non-hub 
 axol diag.rom-enable --target mantis                     # both Mantis grippers
 ```
 
-`--joints` selects which joints are *swept*; every other joint holds home. Before bring-up each bus is probed for which motors answer: every selected joint must be there (a missing one fails the run by name), while an *unselected* joint that does not answer is treated as absent and left out of bring-up — so a partially populated bench arm (say a wrist assembly on a single adapter) can run `--joints wrist_2,wrist_3,gripper`. Every motor that does answer is brought up and held, and the skipped joints are printed at startup; make sure they really are not attached, since an unpowered motor looks the same as an absent one. A full-robot run still requires every motor. A subset run skips the grasp step — if the gripper is among the selected joints it is cycled open↔close holding nothing.
+| Flag | Description |
+|---|---|
+| `--joints LIST` | Comma-separated joints to sweep. Every other joint holds home. |
+| `--payload-kg KG` | Mass of the item each gripper holds (default: 2). See below. |
+| `--target axol\|mantis` | What to test (default: `axol`) |
+| `--no-left` / `--no-right` | Leave out one arm |
+| `--left-channel IFACE` / `--right-channel IFACE` | CAN interface for each side (default: set by `--target`). With a single-channel adapter, combine an override with `--no-left` or `--no-right`. |
+| `--web-prompts` | Show each hands-on gripper step as a **Continue** button in the dashboard instead of a terminal prompt. The dashboard sets this for you. |
+| `--no-capture` | Don't save the telemetry CSV |
 
-A partial arm is off the robot, so it is driven as plain soft PD (the hand-guidable end of the stiffness slider) with the gravity, friction, inertia and host-damping feedforwards off — those are all modelled against the full arm in the robot's mounting orientation, and the production gains vibrate on a wrist kit clamped to a bench. The run prints `Partial arm — bench gains` when this applies. Only missing *arm joints* count: a joint subset swept on a fully populated arm is still the robot and keeps the production gains, and so is a mounted arm whose gripper does not answer.
+## Testing part of an arm
 
-On a full-robot run, `--payload-kg` (default 2) is the mass of the item each gripper holds. It is added to the gravity model at the fingertips as each gripper closes on it, so the arms carry the item on feedforward instead of sagging behind the sweep on the position spring — an unmodelled 2 kg item leaves several degrees of sag on the shoulders with the arm held out, and makes them buzz. Set it to the item's real mass (`0` for none); the dashboard shows it as **Payload kg per gripper**. A joint-subset run holds no item and ignores it.
+With `--joints`, the command first checks which motors answer on each bus.
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each side. Defaults are the Axol pair for `--target axol` and the Mantis pair for `--target mantis`. With a single-channel adapter, combine a channel override with `--no-left` / `--no-right`.
+- Every selected joint must answer, or the run fails and names the missing joint.
+- A joint you didn't select that doesn't answer is treated as absent and left out. This lets a partly built arm on the bench run, for example `--joints wrist_2,wrist_3,gripper`.
+- Every motor that answers is enabled and held, and the skipped joints are printed at the start. Make sure they really aren't attached, because an unpowered motor looks the same as a missing one.
 
-By default each hands-on gripper step is an interactive `input()` prompt on the terminal. `--web-prompts` instead emits a `[prompt] …` marker and blocks on stdin, so the web dashboard can turn the step into a **Continue** button (it's set automatically when launched from the dashboard).
+A full-robot run still needs every motor. A run with `--joints` skips the grip step. If the gripper is selected, it opens and closes with nothing in it.
+
+When arm joints are missing, the arm isn't on the robot, so the command drives it with soft gains and turns off gravity, friction, inertia and host damping. These are all set up for a full arm mounted on the robot, and the normal gains vibrate on a wrist clamped to a bench. The command prints `Partial arm — bench gains` when this applies. A fully built arm with only some joints selected keeps the normal gains, and so does a mounted arm whose gripper doesn't answer.
+
+## Payload
+
+On a full-robot run, `--payload-kg` is the mass of the item each gripper holds. It is added to the gravity model as each gripper closes, so the arms carry the item without sagging.
+
+An item heavier than the setting makes the shoulders sag and buzz when the arm is held out. Set it to the item's real mass, or `0` for none. The dashboard shows it as **Payload kg per gripper**. Runs with `--joints` hold no item and ignore it.

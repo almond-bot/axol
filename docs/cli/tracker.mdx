@@ -1,21 +1,28 @@
 ---
 title: "tracker.*"
-description: "Reference for the Mantis tracker commands — bridge, pair, identify, install, lighthouse.check, ultimate.install, ultimate.check — and their files."
+description: "Commands and configuration files for Mantis tracking, including Lighthouse validation and recalibration."
 ---
 
-The `axol tracker.*` commands are the CLI side of [Mantis Tracking](/mantis/tracking): the control panel's **Mantis settings → Tracking** flow runs the same commands on the host. This page is the flag and file-format reference; the setup walkthrough for each source lives on the tracking page.
+The `axol tracker.*` commands set up and check the trackers for [Mantis Tracking](/mantis/tracking). The **Tracking** section of the control panel's **Mantis settings** runs the same commands. This page lists their flags and file formats. For the setup walkthrough, see [Mantis Tracking](/mantis/tracking).
 
 | Command | Purpose | Panel equivalent |
 |---|---|---|
-| [`tracker.bridge`](#axol-trackerbridge) | Stream hardware-tracker poses and trigger values to the VR server. | Started and stopped automatically by a Mantis collect-data run. |
+| [`tracker.bridge`](#axol-trackerbridge) | Stream tracker poses and trigger values to the VR server. | Started and stopped by a Mantis collect-data run. |
 | [`tracker.identify`](#axol-trackeridentify) | Bind the powered trackers to the left and right rig. | **Identify trackers** |
 | [`tracker.pair`](#axol-trackerpair) | Pair a VIVE Tracker 3.0 with its Watchman dongle. | **Pair tracker** |
-| [`tracker.install`](#axol-trackerinstall) | Build the pinned libsurvive runtime and Vive udev rule. | **Install Lighthouse support** |
-| [`tracker.lighthouse.check`](#axol-trackerlighthousecheck) | Survey base-station channels and reporting trackers. | **Check base stations** |
-| [`tracker.ultimate.install`](#axol-trackerultimateinstall) | Install the pinned pyvut runtime, HID binding, and dongle udev rule. | **Install / Repair Ultimate support** |
-| [`tracker.ultimate.check`](#axol-trackerultimatecheck) | Non-invasive Ultimate host readiness check. | — (CLI only) |
+| [`tracker.install`](#axol-trackerinstall) | Install libsurvive and the Vive udev rule. | **Install Lighthouse support** |
+| [`tracker.lighthouse.check`](#axol-trackerlighthousecheck) | Check which base stations and trackers are reporting. | **Check base stations** |
+| [`tracker.lighthouse.validate`](#axol-trackerlighthousevalidate) | Check tracking quality with guided holds and a sweep. | **Validate tracking** |
+| [`tracker.lighthouse.calibrate`](#axol-trackerlighthousecalibrate) | Recalibrate the base stations, then validate. | **Recalibrate Lighthouse** |
+| [`tracker.ultimate.install`](#axol-trackerultimateinstall) | Install the VIVE Ultimate Tracker runtime and dongle udev rule. | **Install Ultimate support** |
+| [`tracker.ultimate.check`](#axol-trackerultimatecheck) | Check that the computer is ready for Ultimate trackers. | None (CLI only) |
 
-Direct `axol collect-data --mantis true` runs inherit the source, channel map, bindings, and (for Quest) calibration key saved by the panel, own their bridge, and enforce the same readiness gates. Do **not** launch a second `tracker.bridge` beside a managed run — it stays view-only and cannot win pose control. (`axol teleop --mantis` never tracks: it drives the grippers from the rig triggers over CAN and starts no bridge.)
+When you run `axol collect-data --mantis true` from the command line, it uses the tracking source, bindings and Quest calibration saved in the panel. It starts the bridge and runs the same readiness checks as the panel.
+
+- Don't start a second `tracker.bridge` next to a collection run. It can't take control of the poses.
+- `axol teleop --mantis` doesn't use tracking. It drives the grippers from the rig triggers over CAN.
+- Quest uses none of these commands. The headset is the pose source, and you choose its calibration in the panel.
+- Collect DAgger and Run Policy don't support Mantis.
 
 ```bash
 # One-time per tracker family: bind physical trackers to sides.
@@ -27,39 +34,44 @@ axol collect-data --mantis true --repo_id myorg/bringup --task test \
     --mantis_allow_uncalibrated true   # bring-up capture only, not training data
 ```
 
-Quest uses none of these commands: the headset's WebXR client is the pose source, and its calibration key is selected in the panel. Mantis is not supported by Collect DAgger or Run Policy.
-
 ## `axol tracker.bridge`
 
-Streams a hardware tracker backend's poses (and each side's trigger value) to the VR server in the standard `VRFrame` format.
+Streams each tracker's pose and each side's trigger value to the VR server as `VRFrame` messages.
 
 | Flag | Description |
 |---|---|
-| `--backend {survive,ultimate,synthetic,static}` | Tracker backend. Default: the saved config (`~/.almond/tracker/config.json`), else `survive`. `synthetic` streams generated motion; `static` holds fixed poses for standalone protocol tests without tracker hardware. |
-| `--left KEY` / `--right KEY` | Override the saved device binding (Lighthouse tracker serial like `LHR-E0FCD01B`, or an Ultimate tracker MAC). |
-| `--host HOST` | VR server host — the machine running teleop/collect-data. Default: `localhost`. |
+| `--backend {survive,ultimate,synthetic,static}` | Tracker backend. Default: the saved config, else `survive`. `synthetic` streams generated motion and `static` holds fixed poses, for tests without trackers. |
+| `--left KEY` / `--right KEY` | Override the saved binding: a Lighthouse serial such as `LHR-E0FCD01B`, or an Ultimate MAC address. |
+| `--host HOST` | VR server host, the computer running teleop or collect-data. Default: `localhost`. |
 | `--port INT` | VR server port. Default: 8000. |
-| `--hz FLOAT` | Frame streaming rate. Default: 120. |
-| `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | SocketCAN interface of that side's trigger node; overrides the saved config, which defaults to `can_mantis_l` / `can_mantis_r`. The node publishes its analog trigger position at 100 Hz on CAN ID `0x009`. |
+| `--hz FLOAT` | Frame rate. Default: 120. |
+| `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | CAN interface of that side's trigger. Default: the saved config, else `can_mantis_l` / `can_mantis_r`. |
 
-With the `survive` backend, an unexpected `survive-cli` exit (a crash) no longer ends the bridge: it is restarted after about a second, and since its calibration is saved both trackers report again a few seconds later; the rigs freeze meanwhile as for any tracking loss. More than 3 exits within a minute is treated as a crash loop and fails the source, and the exit report names the signal and the last lines of `survive-cli`'s stderr. libsurvive only enumerates USB devices at startup, so when a tracker drops off the bus (or a fresh process leaves one silent) the bridge restarts `survive-cli` and re-checks every 5 seconds, for up to 60 seconds, until every tracker seen earlier reports again.
+How the bridge handles problems:
 
-A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its last good pose and logs a warning rather than feeding IK a glitch. A stale trigger node (no frames for ~250 ms) likewise holds the last grip command and logs the dropout. A managed bridge freezes motion, waits for both trackers to become fresh, then requires the two-trigger start gesture before it re-anchors; the standalone bridge keeps its manual controls: **Enter** toggles engage, **r** returns to rest, **q** quits. A standalone bridge warns and continues fully open when a configured trigger is absent; a managed production run fails readiness instead.
+- **A tracker loses tracking.** That side holds its last good pose and logs a warning.
+- **A trigger stops sending** for about 250 ms. That side holds its last grip command and logs the dropout.
+- **`survive-cli` crashes.** The bridge restarts it after about a second. The rigs hold still until both trackers report again. More than 3 crashes in a minute stops the bridge, and the error shows the last lines of `survive-cli`'s output.
+- **A tracker drops off USB.** The bridge restarts `survive-cli` every 5 seconds, for up to 60 seconds, until every tracker reports again.
+
+After tracking comes back in a collection run, the bridge waits for both trackers, then for the two-trigger start gesture, before the arms follow again. If a trigger is missing, the collection run fails its readiness check.
+
+A bridge you start yourself has keyboard controls: **Enter** engages or disengages, **r** returns to rest, and **q** quits. If a trigger is missing, it warns and keeps that gripper fully open.
 
 ### Hardware-free protocol demo
 
-To exercise the absolute-mapping protocol without a Mantis source, run a generic sim server and a standalone static bridge:
+To try the bridge without Mantis, run the sim and a static bridge:
 
 ```bash
 axol teleop --sim --teleop.absolute_mode true  # terminal 1
 axol tracker.bridge --backend static            # terminal 2
 ```
 
-Press **Enter** in the bridge terminal to engage; the simulated arms remain at the static poses. Prefer `static` over `synthetic` when isolating engage/reset plumbing. This proves only the JSON/IK/input path — it selects no Mantis source, resolves no tracker→TCP transform, and is not [acceptance](/mantis/tracking#acceptance). Both hardware-free backends bind their own devices and need no `tracker.identify`.
+Press **Enter** in the bridge terminal to engage. The simulated arms stay at the static poses. This tests only the connection to the VR server and IK. It is not an [acceptance check](/mantis/tracking#acceptance). The `static` and `synthetic` backends don't need `tracker.identify`.
 
 ## `axol tracker.identify`
 
-Discovers the powered-on trackers, then asks you to move each rig in turn; the device with the most motion is bound to that side. For Lighthouse it runs the same channel check as `tracker.lighthouse.check` after discovery and refuses to bind while a clash is present. Bindings are kept separately per family so the panel can switch between Lighthouse and Ultimate.
+Finds the powered trackers, then asks you to move each rig in turn. The tracker that moves most is bound to that side. For Lighthouse, it first runs the same check as `tracker.lighthouse.check` and won't bind while two base stations share a channel. Lighthouse and Ultimate bindings are saved separately, so you can switch between them in the panel.
 
 | Flag | Description |
 |---|---|
@@ -77,68 +89,121 @@ Saves `~/.almond/tracker/config.json`:
     "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
   },
   "ultimate_quat_order": "wxyz",
-  "ultimate_up_axis": "z"
+  "ultimate_up_axis": "z",
+  "expected_base_stations": 2,
+  "lighthouse_quality": "standard"
 }
 ```
 
-Lighthouse trackers are bound by serial number. libsurvive's own device names (`WM0`, `WM1`) number the Watchman dongles in the order they are opened and can swap between runs, so releases before 0.2.25, which saved those names, could bind each rig to the other's tracker. A saved binding that is still a libsurvive name is cleared on load; run **Identify trackers** once to bind by serial.
+**Check base stations** sets `expected_base_stations` (`--expected_stations`). `lighthouse_quality` is the [Lighthouse tracking policy](#lighthouse-tracking-policy).
+
+Lighthouse trackers are bound by serial number. libsurvive's device names (`WM0`, `WM1`) can swap between runs, so Axol clears a saved binding that uses one. Run **Identify trackers** once to bind by serial.
 
 ## `axol tracker.pair`
 
-Pairs one VIVE Tracker 3.0 with its Watchman dongle through `survive-cli --pair-device 1` (which needs the libusb backend `tracker.install` builds). The tracker must be unplugged from USB and blinking blue. Run it once per tracker/dongle pair.
+Pairs one VIVE Tracker 3.0 with its Watchman dongle. Unplug the tracker from USB and make sure it is blinking blue. Run it once for each tracker and dongle.
 
-libsurvive only opens pairing mode on a dongle that has no tracker connected. If every connected dongle already brings up a powered tracker, the command says they are already paired instead of waiting; to pair a different tracker to a dongle, switch off the tracker currently paired to it first.
+A dongle can pair only when no tracker is connected to it. If every dongle already has a powered tracker, the command says they are already paired. To pair a different tracker to a dongle, switch off the tracker that is paired to it first.
 
 ## `axol tracker.install`
 
-Installs the tested [libsurvive](https://github.com/collabora/libsurvive) commit `f1e6eddb669320f2a30760f4b42936bdb4306da0` with seven fixes applied on top: build dependencies, `survive-cli` built with Eigen and the native Linux libusb backend (not OpenBLAS or HIDAPI), and the Vive udev rule. The fixes ship in the package (`almond_axol/tracker/libsurvive_patches/`; the timestamp, base-station, scene-solver and solver-stack fixes carry a regression test in libsurvive's own suite):
-
-- **Timestamps across the tracker clock rollover.** The tracker's 48 MHz clock wraps every ~89 s; a laser measurement taken just before the wrap was stamped ~350 ms in the future, which could stall pose output while tracker data kept arriving.
-- **Solver buffer overflow with more base stations.** Upstream libsurvive's fix (`df22f2d`, backported verbatim): the MPFIT poser copied the solver's covariance into a fixed 28×28 buffer, which overflows once the tracker pose, per-station corrections and stations being re-solved exceed 28 parameters. That is reachable with four base stations and can crash `survive-cli`.
-- **Scene-solver crash.** libsurvive's global scene solver keeps 32 calibration scenes; once a long session filled that ring, the loops after each solve read one past its end and crashed `survive-cli` (SIGSEGV), ending the session. Setups with more base stations fill it sooner. Those loops are now bounded, and scenes of a disconnected tracker are compacted without mixing up the remaining scenes' measurements.
-- **Solver stack overflow.** The optimizer (mpfit) put its work arrays, including the Jacobian, on the stack. A global solve over a full scene ring with four base stations needs several megabytes for it, which overflowed the solver thread's stack and crashed `survive-cli`. They are now heap-allocated.
-- **Smaller fixes.** A data race on the scene solver's "solve needed" flag, a mis-indexed measurement count in the optional per-station correction setup (off by default), and a read past the end of an empty config file's parse.
-- **Poses delivered as they are produced.** `survive-cli --record-stdout` never flushed its output, so through a pipe the poses arrived in 4 KB blocks: about 50 ms late at the median and up to about 110 ms with two trackers. The stream is now line-buffered.
-- **Base-station identity through every tracker.** Each base station's OOTX broadcast (its identity and calibration) was decoded only through the first tracker that saw it; if that tracker received it poorly, the other tracker's clean copy was ignored and calibration could stall. Every tracker now decodes it, and the first valid packet wins.
-
-A build from before these fixes is rebuilt, not re-attested. `axol provision` runs it automatically; rerun it directly to repair. When the machine-wide install proof under `/var/lib/almond/` is missing or in an older format but the local build cache already holds the pinned build with the same options (for example after updating Axol), the command only refreshes the udev rule and re-attests the installed files instead of rebuilding. The proof is machine-wide, so root provisioning/serve and an operator CLI agree even though their writable build caches differ.
+Installs a tested build of [libsurvive](https://github.com/collabora/libsurvive) (commit `f1e6eddb669320f2a30760f4b42936bdb4306da0`) with Almond's fixes, plus the Vive udev rule. [`axol provision`](/cli/provision) runs it for you. Run it again to repair the install.
 
 ```bash
 axol tracker.install
 ```
 
-Manual fallback from the same upstream source:
+Almond's fixes are in `almond_axol/tracker/libsurvive_patches/`. They fix crashes with three or four base stations and during long sessions, deliver poses without delay, and add the [strict tracking policy](#lighthouse-tracking-policy). Under the standard policy, libsurvive tracks as it normally does.
+
+If the build is already current, `tracker.install` only refreshes the udev rule and checks the installed files.
+
+After you update Axol, stop collection, install the updated runtime, and restart the service:
 
 ```bash
-sudo apt install build-essential cmake zlib1g-dev libx11-dev libusb-1.0-0-dev \
-                 freeglut3-dev liblapacke-dev libhidapi-dev libudev-dev
-git clone https://github.com/collabora/libsurvive.git && cd libsurvive
-git checkout f1e6eddb669320f2a30760f4b42936bdb4306da0
-# Axol's fixes, from the installed almond_axol package
-git apply /path/to/almond_axol/tracker/libsurvive_patches/*.patch
-# udev rules so the trackers are readable without root
-sudo cp ./useful_files/81-vive.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
-cmake -B build -DUSE_HIDAPI=OFF -DUSE_EIGEN=ON -DUSE_OPENBLAS=OFF && cmake --build build -j
-sudo cmake --install build
-# optional, preferred: the Python bindings (the bridge falls back to
-# parsing a survive-cli subprocess when these aren't importable)
-uv pip install ./bindings/python
+axol tracker.install
+sudo systemctl restart axol
 ```
 
+**Install Lighthouse support** in the control panel runs the same installer. If you use the [strict tracking policy](#lighthouse-tracking-policy), run **Recalibrate Lighthouse** and complete its validation before you collect. A libsurvive you build yourself, or separately installed Python bindings, won't work in its place.
+
 <Note>
-  On ARM, avoid linking libsurvive against OpenBLAS (known instability/CPU blowups); `-DUSE_EIGEN=ON` sidesteps it. Close SteamVR if one is somehow present — it competes for the devices.
+  Close SteamVR if it is running, because it competes for the trackers.
 </Note>
+
+## Lighthouse tracking policy
+
+`lighthouse_quality` in [`~/.almond/tracker/config.json`](#axol-trackeridentify) sets how strictly Axol checks Lighthouse tracking. In the control panel it is **Tracking policy**, under **Mantis settings**. It applies to collection, the tracker bridge, **Check base stations** and **Identify trackers** on this computer.
+
+| | `standard` (default) | `strict` |
+| --- | --- | --- |
+| Base station calibration | libsurvive keeps refining it and saves it. A new or moved setup calibrates during **Check base stations** and **Identify trackers**. | Changes only during **Recalibrate Lighthouse**. |
+| Before collecting | **Validate tracking** is optional. | A passing validation from the last 12 hours is required. |
+| While collecting | The episode QA gate (`--qa_gate`) judges each take. | Axol watches tracking live. Any tracking fault marks the take for a retake, even with `--qa_gate false`. |
+
+Under `standard`, a passed check shows as **Last check passed 10 min ago. Calibration refined since then.**, because libsurvive keeps refining the calibration.
+
+Choose `strict` for a fixed installation whose base stations never move, where you'd rather retake than keep a slightly worse take. Choose `standard` for portable setups, rooms with two base stations, and bring-up. Change the policy only while no operation is running.
 
 ## `axol tracker.lighthouse.check`
 
 ```bash
-axol tracker.lighthouse.check
+axol tracker.lighthouse.check --expected_stations 3
 ```
 
-Listens to libsurvive for about 20 seconds with both trackers powered and in view. When base stations are live but the trackers are not reporting yet, libsurvive is still calibrating: it reports no pose until it has every live station's identity and position, which can take a minute or more on a new host or after stations are added or re-channelled. The check then keeps listening, up to 150 seconds in total, until both trackers report; keep them still and in view meanwhile. It then reports one line per base-station channel a tracker actually received (with the station serials once decoded) and the trackers that are reporting. It fails when two stations share a channel, fewer than two base stations are seen, or fewer than two trackers report; each failure line ends with the fix. Stations replayed from libsurvive's saved calibration are not counted as seen, so a station that was re-channelled or unplugged since the last session cannot mask the problem; if the station now on a channel is not the one saved there last time, the check says so — with two stations that means both are on that channel, since libsurvive can only lock onto one station per channel. The survey is saved to `~/.almond/tracker/lighthouse_survey.json` and gates the **Trackers** step of the panel flow.
+Hold both trackers still and in view of the base stations. The check listens for about 20 seconds. On a new computer, or after you add or re-channel a base station, it can take a minute or more for the trackers to start reporting. The check keeps listening for up to 150 seconds until both do.
 
-Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's calibration file `~/.config/libsurvive/config.json` (under `$XDG_CONFIG_HOME` when set) of the account it runs as; the root service uses `/root/.config/libsurvive/config.json`. Releases before 0.2.25 let the service, which runs without `HOME`, write it to `/config.json`; the first run adopts that file so existing base-station positions are kept.
+It prints each base station channel the trackers received, with the station serial numbers, and the trackers that are reporting. It fails, and says how to fix it, when:
+
+- two base stations share a channel
+- it sees fewer base stations than you expect
+- fewer than two trackers report
+
+Only base stations heard during the check count. If the station on a channel isn't the one that was there last time, the check says so. With two base stations, that means both are set to that channel.
+
+The result is saved to `~/.almond/tracker/lighthouse_survey.json`. The panel needs a passing check before the **Trackers** step.
+
+Under the strict policy, the check never calibrates. On a new computer, or after you add or re-channel a base station, run **Recalibrate Lighthouse** first.
+
+The base station calibration lives in libsurvive's file `~/.config/libsurvive/config.json`, or under `$XDG_CONFIG_HOME` when that is set. The service, which runs as root, uses `/root/.config/libsurvive/config.json`.
+
+## `axol tracker.lighthouse.validate`
+
+```bash
+axol tracker.lighthouse.validate --expected_stations 3
+```
+
+Stop collection and any other tracker command first. Then:
+
+1. Put both identified rigs **still on the table**, with their trackers in view.
+2. Follow the prompts: a **5-second hold**, a **12-second slow sweep** through the workspace (at least **10 cm and 15° per rig**), and a **5-second hold** at another position. Move only during the sweep.
+
+The check covers base station reception, how steady each tracker is when still, and smooth tracking through the workspace. It doesn't certify absolute accuracy, or that tracking will stay reliable later.
+
+Before the measurements start, the trackers can take **up to two minutes** to pick up every base station. Keep both trackers in view and let the check continue. Restarting it starts that wait over. If it times out, it says what is missing and leaves the calibration unchanged.
+
+| Flag | Description |
+|---|---|
+| `--expected_stations INT` | Number of base stations, 1 to 4. Saved for future checks. Default: the saved setting. |
+| `--web-prompts` | Use the control panel's prompts. The panel passes this for you. |
+
+Under the [strict policy](#lighthouse-tracking-policy), validate before the first session each day. A report expires after **12 hours**, or sooner if the setup changes. If validation fails, fix the visibility, base station or identity problem and run it again. If the report asks for recalibration, run **Recalibrate Lighthouse**, because validation alone can't clear that fault. This command never changes the calibration.
+
+## `axol tracker.lighthouse.calibrate`
+
+```bash
+axol tracker.lighthouse.calibrate --expected_stations 3
+```
+
+Run it after a base station or tripod moves, or when tracking seems wrong. It takes the same flags as `tracker.lighthouse.validate`.
+
+1. Rest both rigs at **three different positions and orientations, for eight seconds each**, when prompted. Keep the tracker sensors in view.
+2. Complete the same hold, sweep and hold as `tracker.lighthouse.validate`.
+
+The new calibration replaces the old one only if the validation passes. If any step fails, the procedure stops, the previous calibration stays, and the error names the failed step. With both sides already identified, a passing recalibration counts as a validation, so you don't need to validate again.
+
+If **Identify trackers** can't finish because tracking is unstable, you can recalibrate before you identify sides. It must find two trackers. When it succeeds, the panel shows **Calibration saved. Identify sides, then validate tracking.** Recording stays blocked until **Identify sides** and **Validate tracking** pass.
+
+Recalibrating changes the base station calibration, not the tracker-to-gripper transform. It doesn't change recordings you already made. Run the dynamic [acceptance checks](/mantis/tracking#acceptance) before your next collection.
 
 ## `axol tracker.ultimate.install`
 
@@ -146,11 +211,11 @@ Every Axol `survive-cli` run (tracking, the check, pairing) uses libsurvive's ca
 axol tracker.ultimate.install
 ```
 
-Installs pyvut commit `fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a`, the `hid>=1.0.5` Python binding (not the unrelated `hidapi` package), system HID libraries, and a persistent udev rule for dongle `0bb4:0350`. Safe to rerun; do not replace it with an unpinned `uv pip install` or a one-off `chmod /dev/hidraw*`. The Windows pairing and mapping steps that must precede it are on the [tracking page](/mantis/tracking).
+Installs the VIVE Ultimate Tracker runtime: pyvut (commit `fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a`), the `hid>=1.0.5` Python package (not the unrelated `hidapi`), the system HID libraries and a udev rule for dongle `0bb4:0350`. It is safe to run again. Don't replace it with `uv pip install` or a `chmod` of `/dev/hidraw*`. The Windows pairing and mapping steps you do first are on the [tracking page](/mantis/tracking).
 
 ### Ultimate Wi-Fi file
 
-`ultimate_wifi.json` is the private shared-map AP configuration the panel's **Wi-Fi** step writes. For a CLI/manual setup, create `~/.almond/tracker/ultimate_wifi.json` (or `$ALMOND_HOME/tracker/ultimate_wifi.json`) with this shape and `chmod 600` it:
+The panel's **Wi-Fi** step writes `ultimate_wifi.json`, the network settings for the trackers' shared map. To set it up by hand, create `~/.almond/tracker/ultimate_wifi.json` (or `$ALMOND_HOME/tracker/ultimate_wifi.json`) in this shape, then `chmod 600` it:
 
 ```json
 {
@@ -161,7 +226,7 @@ Installs pyvut commit `fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a`, the `hid>=1.0.
 }
 ```
 
-All four fields are required by upstream pyvut. With the USB-dongle transport the tracker firmware reports the active SLAM-host SSID/password/frequency and pyvut relays those to the other tracker; only `country` is consumed directly, so the SSID/password/frequency are fallback configuration, not a promise of the active broadcast network. Choose a country and frequency valid for the workspace. The readiness check reports only validity, never credential values.
+All four fields are required. The trackers report the network they actually use, so `ssid`, `pass` and `freq` are only a fallback. Choose a `country` and `freq` that are valid where you work. The readiness check reports whether the file is valid, never the values in it.
 
 ## `axol tracker.ultimate.check`
 
@@ -169,11 +234,11 @@ All four fields are required by upstream pyvut. With the USB-dongle transport th
 axol tracker.ultimate.check
 ```
 
-Non-invasive dependency, USB, permission, binding, pose-convention, and redacted AP-config check — the same state the operation Start gate uses. Missing or insecure AP config, inaccessible HID, or absent operator access makes it fail. It deliberately does not open the dongle or claim live tracking; run `tracker.identify` again when you need to prove live poses.
+Checks that the computer is ready for Ultimate trackers, the same way the panel does before an operation starts. It checks the installed packages, USB and HID access, bindings, pose settings and the Wi-Fi file. It fails if the Wi-Fi file is missing or insecure, or if your account can't open the HID device. It doesn't connect to the dongle or check live tracking. To check live poses, run `tracker.identify` again.
 
 ## Transform file
 
-`~/.almond/mantis/tcp_transform.json` holds measured tracker→TCP transforms, keyed per side by the identified device. The built-in factory values for the standard Tracker 3.0 and Ultimate flat-back mounts apply automatically when no conflicting entry exists; a saved entry is a higher-priority override. Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`) have a factory value too, used only when no Quest entry is saved; other Quest controllers have none and need an entry for both sides.
+`~/.almond/mantis/tcp_transform.json` holds measured tracker-to-gripper transforms for each side, keyed by the identified device. Axol has built-in factory values for the standard Tracker 3.0 and Ultimate mounts, and for Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`). It uses a factory value when no conflicting entry is saved. A saved entry overrides the factory value. Other Quest controllers have no factory value and need an entry for both sides.
 
 ```json
 {
@@ -187,7 +252,7 @@ Non-invasive dependency, USB, permission, binding, pose-convention, and redacted
     "quest:oculus-touch-v3:grip": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
   },
   "right": {
-    "survive:T21": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
+    "survive:LHR-87654321": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
     "ultimate:AA:BB:CC:DD:EE:02": {
       "pos": [0.0, 0.0, 0.0],
       "quat": [0.0, 0.0, 0.0, 1.0],
@@ -198,38 +263,55 @@ Non-invasive dependency, USB, permission, binding, pose-convention, and redacted
 }
 ```
 
-Replace every placeholder with the exact identifiers from `~/.almond/tracker/config.json` (or the Quest key the panel reports) and the measured values; the identity values above are schema placeholders, not a usable calibration. `pos` is the gripper TCP origin in the tracker's local frame in **metres**; `quat` is the TCP orientation in that frame as **`[qx, qy, qz, qw]`**, normalized on load. The file can also be written through `PUT /api/tracker/calibration/<source>`; the control panel does not edit it.
+The values above are placeholders, not a usable calibration. Replace each key with the identifier from `~/.almond/tracker/config.json`, or the Quest key the panel shows, and each value with your measurement.
 
-Rules the loader enforces:
+- `pos` is the gripper TCP origin in the tracker's frame, in **metres**.
+- `quat` is the TCP orientation in the tracker's frame, as **`[qx, qy, qz, qw]`**. It is normalized when loaded.
 
-- **Quest** production collection accepts only a `quest:<reported-profile>:grip` entry on both sides, or the built-in Quest 3 factory value for `quest:meta-quest-touch-plus:grip`. A bare `quest` key, a different Touch profile, missing profile metadata, or a `target-ray` entry fails closed. A saved Quest entry always takes precedence; the factory key is selected only when none is saved.
-- **Ultimate** entries must carry `ultimate_pose_convention` matching both the convention used during the measurement and the active `ultimate_quat_order` / `ultimate_up_axis`. A convention-less or mismatched entry is not authoritative and suppresses the factory fallback for that side until fixed or removed, because it may represent a non-standard mount.
-- An old unkeyed entry, a bare `survive` / `ultimate` key, or a same-family entry left behind after rebinding also suppresses the factory value for that side until it is re-keyed or deleted.
-- A standalone Advanced/CLI transform can support a bring-up capture, but production `collect-data` requires an active device-keyed override or an approved factory value on both sides; `--mantis_allow_uncalibrated true` is only for a calibration capture that will not be used for training.
+You can also write the file with `PUT /api/tracker/calibration/<source>`. The control panel doesn't edit it.
+
+Rules Axol applies when it loads the file:
+
+- **Quest** collection needs a `quest:<reported-profile>:grip` entry on both sides, or the built-in Quest 3 Touch Plus value. A bare `quest` key, a different controller profile, missing profile details or a `target-ray` entry is refused.
+- **Ultimate** entries need an `ultimate_pose_convention` that matches the active `ultimate_quat_order` and `ultimate_up_axis`. An entry without one, or with a different one, blocks the factory value for that side until you fix or remove it.
+- An unkeyed entry, a bare `survive` or `ultimate` key, or an entry for a tracker you no longer use also blocks the factory value for that side until you re-key or delete it.
+- Production `collect-data` needs a saved device entry or a factory value on both sides. Use `--mantis_allow_uncalibrated true` only for a calibration capture that won't be used for training.
 
 ### Vive factory values
 
-Both Vive families sit flat on top of the rig, behind the gripper motor, and share the mount rotation **`Ry(180°)`**, stored as the quaternion `[0, 1, 0, 0]`: the bridge-reported tracker +z lies along the gripper's finger direction (gripper −z) and the tracker's +x along the gripper's −x, with the y axis shared. In the gripper frame (origin at the centre of the gripper motor's mounting face) the Tracker 3.0 origin is at `[0, −35, 47]` mm, 47 mm behind the motor face and 35 mm above it, so the stored value (the gripper origin in the tracker frame) is `[0, 0.035, 0.047, 0, 1, 0, 0]` for both sides.
+Both Vive tracker types sit flat on top of the rig, behind the gripper motor. Both use the rotation **`Ry(180°)`**, stored as the quaternion `[0, 1, 0, 0]`. The tracker's +z axis points along the gripper fingers (gripper −z), its +x axis along the gripper's −x, and the y axes match.
+
+Positions are given in the gripper frame, whose origin is the center of the gripper motor's mounting face:
+
+| Tracker | Tracker origin in the gripper frame | Stored value, both sides |
+|---|---|---|
+| Tracker 3.0 | `[0, −35, 47]` mm: 47 mm behind and 35 mm above the motor face | `[0, 0.035, 0.047, 0, 1, 0, 0]` |
+| Ultimate | `[0, −46, 47]` mm: 11 mm higher than the Tracker 3.0 | `[0, 0.046, 0.047, 0, 1, 0, 0]` |
 
 <Warning>
-axol ≤ 0.2.4 shipped `Rx(+90°)` (`[0.7071068, 0, 0, 0.7071068]`) here. That rotation is the mount-CAD frame convention, not the bridge's device frame, so every recorded gripper orientation was pitched ~90° from where the operator actually held the rig and Axol could not replay Mantis datasets. Repair datasets recorded with it using [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation). Datasets recorded from 0.2.5 on carry a `mantis_tcp_transform` record in `meta/axol.json`, and `collect-data` refuses to append new episodes to an unrepaired dataset.
+  Datasets recorded with `axol` 0.2.4 or older store gripper orientations rotated about 90° from how the rig was held, and Axol can't replay them. Repair them with [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation). `collect-data` won't add episodes to a dataset that hasn't been repaired.
+
+  Datasets recorded with `axol` 0.2.5 to 0.2.16 place the tracker 92 mm in front of the gripper instead of 47 mm behind it. Their `meta/axol.json` records `vive-flat-back-ry180-v0.2.5` as the `mantis_tcp_transform` id, and `collect-data` won't add episodes to them.
 </Warning>
-
-The Ultimate's origin sits 11 mm higher on the same mount, at `[0, −46, 47]` mm in the gripper frame, so its value is `[0, 0.046, 0.047, 0, 1, 0, 0]` for both sides; the tracker-local axes and flat-back orientation match V3, so there is no additional rotation.
-
-axol 0.2.5–0.2.16 shipped `[0, 0.0355, -0.092]` / `[0, 0.0465, -0.092]` as the translation, which put the tracker 92 mm in front of the gripper instead of 47 mm behind it. Those datasets record `vive-flat-back-ry180-v0.2.5` as their `mantis_tcp_transform` id, and `collect-data` refuses to append to them under the current constants.
 
 ### Quest factory value
 
-Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`) in the standard cradles have their WebXR grip origin at `[0, −45, 62]` mm in the gripper frame, 62 mm behind and 45 mm above the motor face, with the grip axes rotated 180° about the gripper's z axis plus a ~10° cradle tilt. The left cradle is the right one's mirror image, so the tilt mirrors between sides:
+Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`) sit in standard cradles. Their grip origin is at `[0, −45, 62]` mm in the gripper frame, 62 mm behind and 45 mm above the motor face. The grip axes are turned 180° about the gripper's z axis, with a cradle tilt of about 10°. The left cradle mirrors the right, so the tilt mirrors too:
 
 | Side | Stored value |
 |---|---|
 | Right | `[-0.00942, -0.03804, -0.06583, 0.06655, -0.05350, 0.99629, 0.01054]` |
 | Left | `[0.00942, -0.03804, -0.06583, 0.06655, 0.05350, -0.99629, 0.01054]` |
 
-Other controller generations still need a measured entry.
+Other controllers need a measured entry.
 
 ### Deriving a missing constant
 
-If a source transform is missing — a Quest controller other than the Quest 3 Touch Plus, or an Ultimate run under a non-factory parser convention — first pass the [acceptance checks](/mantis/tracking#acceptance) for side, scale, and recovery, then run a short capture with `--mantis_allow_uncalibrated true`, inspect it to derive the constant, install it under the exact source/device key, and repeat the loss/recovery check. Normal `collect-data --mantis` stays blocked until both transforms resolve; never mix an uncalibrated capture into training data.
+If you have no transform for your source, such as a Quest controller other than the Touch Plus or an Ultimate with a non-standard pose setting:
+
+1. Pass the [acceptance checks](/mantis/tracking#acceptance) for side, scale and recovery.
+2. Record a short capture with `--mantis_allow_uncalibrated true`.
+3. Work out the transform from that capture, and save it under the exact source and device key.
+4. Repeat the loss and recovery check.
+
+`collect-data --mantis` stays blocked until both sides have a transform. Never use an uncalibrated capture as training data.

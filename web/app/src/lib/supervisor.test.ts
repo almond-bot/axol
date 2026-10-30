@@ -5,6 +5,7 @@ import {
   CUSTOM_POLICY_TYPE,
   applyPolicyTypeRules,
   cameraCount,
+  cameraSerials,
   computeArgs,
   curatedFields,
   defaultString,
@@ -23,6 +24,7 @@ import {
   participatingCameraSerials,
   perRunFields,
   previewStep,
+  recordingCameraCount,
   runFieldVisible,
   saveLocalHardwareProfile,
   saveOpSettings,
@@ -37,6 +39,7 @@ import {
   type SchemaField,
   type SchemaNode,
   type SettingsCategory,
+  motorFaultBlockers,
 } from "./supervisor"
 
 const required: SchemaField = {
@@ -83,7 +86,8 @@ describe("supervisor pure helpers", () => {
     expect(missingCameraSerials(cameras, [{ serial: 2, model: "one", kind: "mono" }])).toEqual([
       "1",
     ])
-    // Mantis reuses the Axol wrist serials unless it has its own.
+    // Mantis reuses the Axol wrist serials unless it has its own; its Head
+    // slot never inherits the Axol overhead camera.
     expect(cameraCount(cameras, true)).toBe(1)
     // A camera disabled on the stream branch still participates via recording.
     expect(participatingCameraSerials({ ...cameras, stream: { left_arm: false } })).toEqual([
@@ -97,6 +101,88 @@ describe("supervisor pure helpers", () => {
         record: { left_arm: false },
       })
     ).toEqual(["1"])
+  })
+
+  it("does not inherit the Axol overhead into a legacy Mantis layout", () => {
+    // A wrist-only layout saved before the Head slot existed must not start
+    // recording (or requiring) a third camera after an upgrade.
+    const cameras: CameraSpec = {
+      serials: { overhead: "101", left_arm: "102", right_arm: "103" },
+      mantis_serials: { left_arm: "202", right_arm: "203" },
+    }
+    expect(cameraSerials(cameras, true)).toEqual({
+      overhead: "",
+      left_arm: "202",
+      right_arm: "203",
+    })
+    expect(recordingCameraCount(cameras, true)).toBe(2)
+    expect(
+      missingCameraSerials(
+        cameras,
+        [
+          { serial: 202, model: "ZED X One", kind: "mono" },
+          { serial: 203, model: "ZED X One", kind: "mono" },
+        ],
+        true
+      )
+    ).toEqual([])
+  })
+
+  it("allows head-only Mantis recording and honors its disabled branches", () => {
+    const cameras: CameraSpec = {
+      serials: { overhead: "101", left_arm: "102", right_arm: "103" },
+      mantis_serials: { overhead: "201", left_arm: "", right_arm: "" },
+      stream: { overhead: false },
+    }
+    expect(recordingCameraCount(cameras, true)).toBe(1)
+    expect(participatingCameraSerials(cameras, true)).toEqual(["201"])
+    expect(recordingCameraCount({ ...cameras, record: { overhead: false } }, true)).toBe(0)
+    expect(participatingCameraSerials({ ...cameras, record_resolution: "off" }, true)).toEqual([])
+    expect(
+      cameraSerials(
+        { ...cameras, mantis_serials: { ...cameras.mantis_serials, overhead: "" } },
+        true
+      ).overhead
+    ).toBe("")
+    expect(cameraSerials(cameras, false).overhead).toBe("101")
+  })
+
+  it.each(["left_arm", "right_arm"] as const)(
+    "does not inherit the Axol head already assigned to the Mantis %s",
+    (wrist) => {
+      const cameras: CameraSpec = {
+        serials: { overhead: " 101 ", left_arm: "102", right_arm: "103" },
+        mantis_serials: { [wrist]: "101" },
+      }
+      expect(cameraSerials(cameras, true).overhead).toBe("")
+      expect(cameraSerials(cameras, true)[wrist]).toBe("101")
+      expect(recordingCameraCount(cameras, true)).toBe(2)
+      // Explicit choices remain authoritative, including clearing the head.
+      for (const overhead of ["101", "201", ""]) {
+        expect(
+          cameraSerials(
+            { ...cameras, mantis_serials: { ...cameras.mantis_serials, overhead } },
+            true
+          ).overhead
+        ).toBe(overhead)
+      }
+    }
+  )
+
+  it("fills missing slots in partial legacy camera maps before resolving Mantis", () => {
+    const headOnly = { serials: { overhead: "101" } } as CameraSpec
+    expect(cameraSerials(headOnly, true)).toEqual({
+      overhead: "",
+      left_arm: "",
+      right_arm: "",
+    })
+    const wristOnly = { serials: { left_arm: "202" } } as CameraSpec
+    expect(cameraSerials(wristOnly, true)).toEqual({
+      overhead: "",
+      left_arm: "202",
+      right_arm: "",
+    })
+    expect(cameraSerials(wristOnly, false)).toEqual(cameraSerials(wristOnly, true))
   })
 
   it("flattens and filters nested schemas", () => {
@@ -352,5 +438,47 @@ describe("showWhen gates", () => {
       "teleop.frequency",
       "teleop.box_flush_deg",
     ])
+  })
+})
+
+describe("motorFaultBlockers", () => {
+  const joints = ["shoulder_1", "elbow", "gripper"]
+  const motors = ["left", "right"].flatMap((arm) =>
+    joints.map((joint) => ({
+      arm,
+      joint,
+      reachable: false,
+      status: null,
+      temperature: null,
+      voltage: null,
+    }))
+  )
+  const fault = (arm: string, joint: string, problem = "unreachable") => ({
+    arm,
+    joint,
+    problem,
+    temperature: null,
+  })
+
+  it("names the whole robot when no motor answers", () => {
+    const faults = motors.map((m) => fault(m.arm, m.joint))
+    expect(motorFaultBlockers(faults, motors, "Axol")).toEqual([
+      "Axol isn't answering. Turn on its power.",
+    ])
+  })
+
+  it("names one arm when only its motors are unreachable", () => {
+    const faults = [...joints.map((j) => fault("left", j)), fault("right", "elbow", "overheat")]
+    expect(motorFaultBlockers(faults, motors, "Axol")).toEqual([
+      "Left arm isn't answering. Check its power and cable.",
+      "Fix the motor fault on R elbow: overheat",
+    ])
+  })
+
+  it("lists single faults per motor", () => {
+    expect(motorFaultBlockers([fault("right", "gripper")], motors, "Mantis")).toEqual([
+      "Fix the motor fault on R gripper: unreachable",
+    ])
+    expect(motorFaultBlockers([], motors, "Axol")).toEqual([])
   })
 })

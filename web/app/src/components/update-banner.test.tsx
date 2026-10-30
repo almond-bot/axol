@@ -59,7 +59,7 @@ describe("UpdateBanner", () => {
 
   it.each([
     ["upgrading", "Upgrading…"],
-    ["provisioning", "Installing deps…"],
+    ["provisioning", "Installing packages…"],
     ["restarting", "Restarting…"],
     ["rebooting", "Rebooting host…"],
   ] as const)("labels the %s phase while updating", (phase, label) => {

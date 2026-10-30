@@ -16,8 +16,28 @@ from pathlib import Path
 from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..utils.paths import almond_path
 from ..utils.state_files import secure_atomic_write_json, secure_read_text
+from .lighthouse_survey import validate_expected_stations
+from .trigger import validate_trigger_full_scale
 
 TRACKER_CONFIG_FILE = almond_path("tracker", "config.json")
+
+LIGHTHOUSE_QUALITY_MODES = ("standard", "strict")
+
+
+def validate_lighthouse_quality(value: object) -> str:
+    """Return a supported Lighthouse quality mode or raise ``ValueError``."""
+    if value not in LIGHTHOUSE_QUALITY_MODES:
+        raise ValueError(
+            f"lighthouse_quality must be one of {', '.join(LIGHTHOUSE_QUALITY_MODES)}"
+        )
+    return str(value)
+
+
+def lighthouse_strict(config: TrackerConfig | None = None) -> bool:
+    """Whether Lighthouse runs use the strict fixed-installation policy."""
+    if config is None:
+        config = load_tracker_config()
+    return config.lighthouse_quality == "strict"
 
 
 @dataclass
@@ -47,14 +67,26 @@ class TrackerConfig:
             node, defaulting to the Mantis rig's left gripper bus — the
             only bus a trigger node ever sits on. Set it to ``None`` for a
             rig with no trigger; grip then streams as 1.0 (open), as it
-            does when the interface is absent. The node self-calibrates,
-            so there are no calibration fields.
+            does when the interface is absent.
         trigger_can_right: SocketCAN interface of the right rig's trigger
             node, or ``None``.
+        trigger_full_scale_left: Normalized left trigger position reached at
+            full physical squeeze; values below 1.0 extend the input to a
+            fully closed grip command.
+        trigger_full_scale_right: Equivalent endpoint for the right trigger.
         allow_single_side: Let the bridge run with only one side's
             tracker bound. Off by default: absolute-mode (Mantis) engagement
             fits the base transform from BOTH controller positions, so
             the placeholder pose streamed for an unbound side corrupts it.
+        expected_base_stations: Number of installed Lighthouse base stations.
+        lighthouse_quality: How strictly Lighthouse tracking is policed (see
+            :data:`LIGHTHOUSE_QUALITY_MODES`). ``"standard"`` runs libsurvive
+            with its own background calibration and leaves take acceptance to
+            the episode QA gate. ``"strict"`` is for fixed installations: the
+            room geometry is frozen outside an explicit Recalibrate, collection
+            requires a passed, unexpired Lighthouse validation, optical support
+            and pose discontinuities are monitored live, and a tracking fault
+            marks the take for retake regardless of ``qa_gate``.
     """
 
     backend: str = "survive"
@@ -65,7 +97,11 @@ class TrackerConfig:
     ultimate_up_axis: str = "z"
     trigger_can_left: str | None = CAN_MANTIS_LEFT
     trigger_can_right: str | None = CAN_MANTIS_RIGHT
+    trigger_full_scale_left: float = 1.0
+    trigger_full_scale_right: float = 1.0
     allow_single_side: bool = False
+    expected_base_stations: int = 2
+    lighthouse_quality: str = "standard"
 
 
 # A libsurvive codename (``WM0``, ``T20``…) rather than a tracker serial
@@ -100,6 +136,19 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
 
     known = {f for f in TrackerConfig.__dataclass_fields__}
     config = TrackerConfig(**{k: v for k, v in data.items() if k in known})
+    config.expected_base_stations = validate_expected_stations(
+        config.expected_base_stations
+    )
+    config.trigger_full_scale_left = validate_trigger_full_scale(
+        config.trigger_full_scale_left
+    )
+    config.trigger_full_scale_right = validate_trigger_full_scale(
+        config.trigger_full_scale_right
+    )
+    if config.lighthouse_quality not in LIGHTHOUSE_QUALITY_MODES:
+        # A hand-edited typo must not silently select the strict gate.
+        config.lighthouse_quality = "standard"
+        migrated = True
     if not isinstance(config.bindings, dict):
         config.bindings = {}
         migrated = True
@@ -138,6 +187,14 @@ def save_tracker_config(
     config: TrackerConfig, path: Path = TRACKER_CONFIG_FILE
 ) -> None:
     """Persist the config as pretty JSON, creating parent directories."""
+    validate_expected_stations(config.expected_base_stations)
+    validate_lighthouse_quality(config.lighthouse_quality)
+    config.trigger_full_scale_left = validate_trigger_full_scale(
+        config.trigger_full_scale_left
+    )
+    config.trigger_full_scale_right = validate_trigger_full_scale(
+        config.trigger_full_scale_right
+    )
     if config.backend in {"survive", "ultimate"}:
         config.bindings[config.backend] = {
             "left": config.left,

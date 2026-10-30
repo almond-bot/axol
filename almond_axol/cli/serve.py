@@ -89,6 +89,11 @@ def run(args: argparse.Namespace) -> None:
 
     mark_privileged_service()
 
+    # Before anything imports huggingface_hub: it reads HF_TOKEN_PATH once.
+    from ..recording.hub_auth import use_operator_hub_login
+
+    use_operator_hub_login()
+
     # The ZED SDK caches calibration files as whoever opens a camera first. A
     # root service and an operator's dev `axol serve` share one box, so make
     # the cache group-shared up front (root: always; operator: only when a

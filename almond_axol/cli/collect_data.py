@@ -22,7 +22,8 @@ At save time each episode passes a data-quality gate (see
 :func:`evaluate_episode_qa`): episodes with a mid-recording re-engage, too
 many frozen-TCP/disengaged/untracked frames, or a stale Mantis trigger
 heartbeat are discarded and re-recorded instead of silently saved
-(``--qa_gate false`` disables the refusal; the QA summary is always logged).
+(``--qa_gate false`` disables the refusal, except for a tracking fault under the
+strict Lighthouse policy; the QA summary is always logged).
 
 After an episode ends the arms return to rest automatically, but *guarded*:
 a torque-residual watchdog compares measured torque against the gravity
@@ -67,6 +68,7 @@ import signal
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -74,15 +76,17 @@ from typing import TYPE_CHECKING, Any
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S, Joint
 from ..lerobot.camera.configuration_zed import (
     ZED_RESOLUTION_DIMS,
     ZedCameraConfig,
     resolution_for_dims,
 )
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import arms_reporting
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from ..mantis.quality import EpisodeTrackingQuality, quality_ready
 from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
@@ -93,6 +97,7 @@ from ..recording import (
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import adopt_robot_gripper
 from ..teleop.core import TCPPoseSnapshot
 from ..teleop.recorder import resolve_prefix
@@ -168,14 +173,9 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
             kwargs["left_channel"] = CAN_MANTIS_LEFT
         if kwargs.get("right_channel") == CAN_RIGHT:
             kwargs["right_channel"] = CAN_MANTIS_RIGHT
-        # The rig has no overhead camera; drop the placeholder slot so the
-        # camera dialog / CLI surface matches the hardware (an explicitly
-        # assigned serial is kept — someone may rig a scene camera).
-        cameras = dict(kwargs.get("cameras") or {})
-        overhead = cameras.get("overhead")
-        if overhead is not None and int(getattr(overhead, "serial", 0) or 0) <= 0:
-            cameras.pop("overhead")
-        kwargs["cameras"] = cameras
+        # Keep the same head/wrist camera slots as Axol. Recording preparation
+        # prunes unassigned placeholders for both hardware profiles.
+        kwargs["cameras"] = dict(kwargs.get("cameras") or {})
         cfg.robot_config = MantisRobotConfig(**kwargs)
 
     if isinstance(cfg.robot_config, MantisRobotConfig):
@@ -202,6 +202,9 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
             cfg.teleop_config.jelly.wheels = False
             cfg.teleop_config.jelly.lift = False
         cfg.teleop_config.has_gripper = True
+        # Recording consumes calibrated tracker TCPs, so publishing them must
+        # not wait for the virtual arm's IK solve.
+        cfg.teleop_config.record_raw_tcp = True
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.hold_to_engage or tc.ik_alpha != 1.0:
             _logger.info(
@@ -739,7 +742,7 @@ class CollectDataConfig:
     0.8``) or supply a whole-config file with ``--config_path``.
 
     ``--mantis true`` records with the Mantis instead of the robot:
-    grippers on ``can_mantis_l/r``, wrist cameras only, absolute
+    grippers on ``can_mantis_l/r``, head and wrist cameras, absolute
     (world-anchored) pose mapping, dataset rows stamped with the VR pose
     capture time, and the Cartesian EE-pose schema (state/action are absolute
     base-frame poses from the tracker, same schema as on-robot
@@ -751,9 +754,12 @@ class CollectDataConfig:
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
     # Record with the Mantis handheld rig instead of the robot: its grippers
-    # on can_mantis_l/r, wrist cameras only, absolute pose mapping, and the
+    # on can_mantis_l/r, head and wrist cameras, absolute pose mapping, and the
     # Cartesian EE-pose dataset schema. The Axol arms are not involved.
     mantis: bool = False
+    # Normalized trigger position at full squeeze, calibrated per handheld rig.
+    mantis_left_trigger_full_scale: float = 1.0
+    mantis_right_trigger_full_scale: float = 1.0
     mantis_source: MantisSource = "lighthouse"
     """Pose source for Mantis mode. Direct Mantis runs inherit the host's
     Settings → Mantis choice when saved; otherwise Lighthouse is the default.
@@ -808,7 +814,8 @@ class CollectDataConfig:
     # escape hatch (debugging the gate, or deliberately recording unusual
     # sessions) — the per-episode QA summary is still logged, the bad episode
     # is just saved anyway. Only Mantis episodes can fail the gate; on-robot
-    # episodes read poses from joint encoders and always pass.
+    # episodes read poses from joint encoders and always pass. A tracking
+    # fault under the strict Lighthouse policy is refused regardless.
     qa_gate: bool = True
     rerun_ip: str | None = None
     rerun_port: int = 9876
@@ -844,6 +851,8 @@ class EpisodeQAStats:
 
     # Control ticks recorded (denominator for the fractions below).
     total_frames: int = 0
+    tracking_quality_faults: list[str] = field(default_factory=list)
+    tracking_quality_report: dict[str, Any] | None = None
     # Ticks where the pose behind the latest action was older than
     # _QA_STALE_POSE_S: tracker transport or IK output stalled. A live hand
     # holding perfectly still continues to advance its equal-pose heartbeat.
@@ -922,6 +931,42 @@ def _newer_pose(
     return snapshot.pose_host_ts >= previous.pose_host_ts
 
 
+def _tracking_capture_reason(
+    stats: "EpisodeQAStats", capture_failure: str | None
+) -> str | None:
+    """The tracking loss behind a capture failure, when there was one.
+
+    A Mantis row is stamped with its pose's capture time. Under the strict
+    Lighthouse policy a held pose is never restamped, so once tracking stops
+    delivering fresh samples the recorder has no robot-state row to pair with
+    later camera exposures and reports a stalled control loop. Name the
+    tracking failure instead, so the operator is not sent to debug cameras.
+    """
+    from ..recording.record_proc import ROBOT_STATE_STALLED
+
+    if capture_failure is None or ROBOT_STATE_STALLED not in capture_failure:
+        return None
+    faults = stats.tracking_quality_faults
+    if faults:
+        # The first fault is the cause; later ones are usually the same loss
+        # re-measured (e.g. a growing left/right skew). Keep the notice short.
+        more = (
+            f"; {len(faults) - 1} more in the tracking report"
+            if len(faults) > 1
+            else ""
+        )
+        return f"tracking failed mid-take ({faults[0]}{more})"
+    lost = stats.untracked_frames + stats.disengaged_frames + stats.stale_frames
+    if lost:
+        return (
+            "tracking was lost mid-take "
+            f"({stats.untracked_frames} untracked, "
+            f"{stats.disengaged_frames} disengaged and "
+            f"{stats.stale_frames} stale control ticks)"
+        )
+    return None
+
+
 def _row_observation(
     robot: Any, live: dict[str, Any], pose_ts: float | None
 ) -> dict[str, Any]:
@@ -935,7 +980,9 @@ def _row_observation(
     """
     if pose_ts is None:
         return live
-    at = getattr(robot, "joint_observation_at", None)
+    at = getattr(robot, "gripper_observation_at", None)
+    if at is None:
+        at = getattr(robot, "joint_observation_at", None)
     measured = at(pose_ts) if at is not None else None
     return measured if measured is not None else live
 
@@ -957,7 +1004,7 @@ def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     hardware; the caller decides what the verdict means (save vs. discard —
     see ``CollectDataConfig.qa_gate``).
     """
-    reasons: list[str] = []
+    reasons: list[str] = list(stats.tracking_quality_faults)
     if stats.reengaged_while_recording:
         reasons.append(
             "tracking re-engaged mid-recording — the world-to-base transform "
@@ -966,9 +1013,10 @@ def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
         )
     if stats.stale_fraction > _QA_MAX_STALE_FRACTION:
         reasons.append(
-            f"{100 * stats.stale_fraction:.1f}% of frames had a stale pose "
-            f"heartbeat (limit {100 * _QA_MAX_STALE_FRACTION:.0f}%; tracker "
-            "transport or IK stall)"
+            f"{100 * stats.stale_fraction:.1f}% of control samples used a pose "
+            f"older than {_QA_STALE_POSE_S * 1000:.0f} ms "
+            f"(limit {100 * _QA_MAX_STALE_FRACTION:.0f}%; "
+            f"peak pose age {stats.max_pose_lag_s * 1000:.0f} ms)"
         )
     if stats.disengaged_fraction > _QA_MAX_DISENGAGED_FRACTION:
         reasons.append(
@@ -1068,6 +1116,9 @@ class _NullCollectControl:
     def note_dataset(self, repo_id: str, root: Path) -> None:
         pass
 
+    def note_tracking_quality(self, quality: dict[str, Any] | None) -> None:
+        pass
+
 
 class _QueueCollectControl:
     """Web episode control for ``collect-data``: panel-driven recording.
@@ -1102,6 +1153,8 @@ class _QueueCollectControl:
         # message it survives the return to "ready", so a refused take can't
         # read as a quiet success; the next take's recording start clears it.
         self._rejection: str | None = None
+        self._tracking_quality: dict[str, Any] | None = None
+        self._last_episode_fault: str | None = None
 
     # -- serve API surface --------------------------------------------------
 
@@ -1128,7 +1181,30 @@ class _QueueCollectControl:
                 snap["dataset"] = dict(self._dataset)
             if self._rejection is not None:
                 snap["notice"] = {"level": "error", "message": self._rejection}
+            if self._tracking_quality is not None:
+                quality = dict(self._tracking_quality)
+                if self._last_episode_fault:
+                    quality["lastEpisodeFault"] = self._last_episode_fault
+                snap["trackingQuality"] = quality
+                if quality.get("retakeRequired"):
+                    snap["controls"] = [
+                        c for c in snap["controls"] if c["command"] != "s"
+                    ]
+                if not quality_ready(quality):
+                    snap["controls"] = [
+                        c
+                        for c in snap["controls"]
+                        if c["command"] != "start" or phase == "countdown"
+                    ]
             return snap
+
+    def note_tracking_quality(self, quality: dict[str, Any] | None) -> None:
+        with self._lock:
+            self._tracking_quality = dict(quality) if quality is not None else None
+            if quality and quality.get("retakeRequired"):
+                self._last_episode_fault = (
+                    quality.get("lastFault") or "Tracking failed."
+                )
 
     def note_dataset(self, repo_id: str, root: Path) -> None:
         """The dataset this session records into (the snapshot's ``dataset``)."""
@@ -1178,7 +1254,8 @@ class _QueueCollectControl:
     def note_recording(self) -> None:
         with self._lock:
             self._rejection = None
-        self._set("recording", "Recording — save or discard the episode to end it.")
+            self._last_episode_fault = None
+        self._set("recording", "Recording. Save or discard the episode to end it.")
 
     def note_saving(self) -> None:
         self._set("saving", "Saving episode…")
@@ -1186,13 +1263,13 @@ class _QueueCollectControl:
     def note_saved(self) -> None:
         with self._lock:
             self._episodes_recorded += 1
+            self._rejection = None
 
     def note_contact(self) -> None:
         self._set(
             "contact",
-            "Contact — torque exceeded the threshold, so the arms are limp "
-            "and free to move. Clear them, then press reset on the controller "
-            "(or return to rest here) to replan from where they are.",
+            "The arms hit something and are now limp. Move them clear by hand, "
+            "then press reset on the controller or Return to rest here.",
         )
 
     def note_returning(self) -> None:
@@ -1211,6 +1288,94 @@ class _QueueCollectControl:
 
 
 Control = _NullCollectControl | _QueueCollectControl
+
+
+def _preserve_interrupted_tracking_attempt(
+    attempts: list[EpisodeTrackingQuality],
+    dataset_root: Path,
+    *,
+    episode_index: int,
+    reason: str,
+    termination: str,
+    setup_validation: dict[str, Any] | None,
+    captured_rows: int | None = None,
+) -> None:
+    """Retain failed-take evidence without replacing the original failure.
+
+    A process failure or Stop can bypass the normal post-take QA/save path.
+    This writes diagnostics only; partial dataset rows still follow the
+    existing discard/cleanup transaction.
+    """
+    if not attempts:
+        return
+    monitor = attempts[-1]
+    if not monitor.required or monitor.started_at is None:
+        return
+    try:
+        from ..utils.state_files import secure_atomic_write_json
+
+        # Native exception text can include a long log tail. Keep the attempt
+        # bounded while preserving its failure category and leading evidence.
+        reason = reason[:1000]
+        monitor.reject(reason)
+        report = monitor.report()
+        report.update(
+            episodeIndex=episode_index,
+            capturedRows=captured_rows,
+            saveRequested=False,
+            episodeQAPassed=False,
+            episodeQAReasons=list(monitor.faults),
+            termination=termination,
+            terminationReason=reason,
+            setupValidation=setup_validation,
+        )
+        secure_atomic_write_json(
+            dataset_root / "meta" / "tracking_quality" / f"{uuid.uuid4().hex}.json",
+            report,
+        )
+    except Exception:
+        _logger.exception("Could not preserve interrupted tracking-attempt diagnostics")
+
+
+def _resolve_lighthouse_quality(cfg: CollectDataConfig) -> str:
+    """The host's Lighthouse policy, resolved once for the whole session.
+
+    Every entry point (this CLI and the control panel's runner) shares the
+    first resolution, and its managed bridge is pinned to the same value.
+    """
+    quality = getattr(cfg, "_lighthouse_quality", None)
+    if quality is None:
+        from ..tracker.config import load_tracker_config
+
+        quality = load_tracker_config().lighthouse_quality
+        cfg._lighthouse_quality = quality
+    return quality
+
+
+def _strict_lighthouse(cfg: CollectDataConfig, *, mantis: bool | None = None) -> bool:
+    """Whether this run records under the strict Lighthouse policy."""
+    if mantis is None:
+        mantis = cfg.mantis
+    return (
+        mantis
+        and cfg.mantis_source == "lighthouse"
+        and _resolve_lighthouse_quality(cfg) == "strict"
+    )
+
+
+def _require_mantis_tracking_validation(cfg: CollectDataConfig) -> None:
+    """Check persisted setup evidence before any managed tracker is opened.
+
+    Only the strict Lighthouse policy requires a passed validation; standard
+    hosts may still run one, and its result is reported in the panel.
+    """
+    if not _strict_lighthouse(cfg):
+        return
+    if cfg.mantis_allow_uncalibrated:
+        return
+    from ..tracker.lighthouse_validation import require_lighthouse_validation
+
+    cfg._lighthouse_validation_report = require_lighthouse_validation()
 
 
 def main(argv: list[str]) -> None:
@@ -1247,6 +1412,8 @@ def main(argv: list[str]) -> None:
         # a dongle, starting libsurvive, or waiting for live tracker inputs.
         _prepare_mantis_collection(cfg)
         _prepare_recording_cameras(cfg)
+        lighthouse_quality = _resolve_lighthouse_quality(cfg)
+        _require_mantis_tracking_validation(cfg)
         from .mantis_bridge import managed_mantis_bridge, set_managed_pose_source_id
 
         pose_source_id = (
@@ -1257,8 +1424,11 @@ def main(argv: list[str]) -> None:
             cfg.mantis_source,
             left_channel=cfg.robot_config.left_channel,
             right_channel=cfg.robot_config.right_channel,
+            left_trigger_full_scale=cfg.mantis_left_trigger_full_scale,
+            right_trigger_full_scale=cfg.mantis_right_trigger_full_scale,
             port=cfg.teleop_config.vr_server_config.port,
             pose_source_id=pose_source_id,
+            lighthouse_quality=lighthouse_quality,
         ):
             _run(cfg)
     else:
@@ -1428,6 +1598,12 @@ def _run_session(
     if (note_dataset := getattr(control, "note_dataset", None)) is not None:
         note_dataset(repo_id, dataset_root)
 
+    # The upload runs when the session ends; check the login now, not then.
+    if push_to_hub:
+        from ..recording.hub_auth import require_hub_login
+
+        require_hub_login()
+
     # Flag physically-stereo ZED X before the relay/robot opens the cameras so
     # the relay and in-process fallback both use the stereo grab path. The pure
     # assigned/recording validation above already pruned placeholder slots.
@@ -1439,6 +1615,15 @@ def _run_session(
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     mantis_mode = isinstance(cfg.robot_config, MantisRobotConfig)
+
+    # Axol and Mantis alike: the robot and the teleop IK worker must name the
+    # same backend (MantisRobotConfig is an AxolRobotConfig).
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
 
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
@@ -1575,6 +1760,12 @@ def _run_session(
     # memory, so the control loops stay as fast as `axol teleop`. Only use it
     # when it exported raw frames for every observation camera; otherwise tear
     # it down and fall back to the in-process camera path (robot owns cameras).
+    progress.plan(
+        ["cameras", "arms"]
+        + (["grippers"] if mantis_mode else [])
+        + ["headset", "ik", "dataset"]
+    )
+    progress.step("cameras")
     relay = _start_video_relay(cfg, dataset_resolution)
     expected = set(cfg.robot_config.observation_cameras().keys())
     use_relay = relay is not None and expected <= set(relay.raw_cameras)
@@ -1672,12 +1863,18 @@ def _run_session(
         return hardware_failure
 
     try:
+        progress.step("arms")
         robot.connect()
+        if not mantis_mode:
+            # The teleop's startup move to rest plays unsupervised; refuse it
+            # from far away (a Mantis rig has no arm joints to check).
+            check_start_pose(robot.positions)
         if mantis_mode:
             # Open both grippers all the way (this is also the one-time
             # hard-stop calibration), then drop torque again, so the jaws are
             # already wide when the first take starts instead of finishing
             # their sweep in-shot. See _preopen_mantis_grippers.
+            progress.step("grippers")
             _preopen_mantis_grippers(robot, stop_event, _logger.info)
 
         # The dataset lives in the recorder (subprocess or in-process), not here.
@@ -1805,6 +2002,7 @@ def _run_session(
         )
         if is_complete:
             _logger.info(f"Resuming existing dataset at {dataset_root}.")
+        progress.step("dataset")
         if use_relay:
             recorder: DatasetRecorderProcess | InProcessRecorder = (
                 DatasetRecorderProcess(
@@ -2037,6 +2235,10 @@ def _run_session(
         control.note_ready(episode, message)
         return message
 
+    # The outer failure/Stop paths need the active take's evidence even when
+    # the episode coroutine cannot return its normal QA result.
+    tracking_attempt: list[EpisodeTrackingQuality] = []
+
     # The hot control loop runs *on the robot's event loop* (see
     # AxolRobot.event_loop) so motion_control is awaited inline — cooperatively
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
@@ -2055,11 +2257,36 @@ def _run_session(
         # Reset when recording actually starts so the pre-record phase never
         # pollutes the verdict.
         stats = EpisodeQAStats()
-        # Latest tracked TCP poses, held across ticks so a slow IK reply
-        # never reverts a row to FK-of-joints mid-stream. ``None`` until the
-        # first IK solve (those early rows fall back to FK, which the worker
-        # seeds from the rest pose anyway).
+        quality_monitor = EpisodeTrackingQuality(
+            required=_strict_lighthouse(cfg, mantis=mantis_mode)
+        )
+        tracking_attempt[:] = [quality_monitor]
+
+        def live_quality() -> dict[str, Any] | None:
+            getter = getattr(teleop, "tracking_quality", None)
+            return getter() if callable(getter) else None
+
+        def _check_tracking_quality() -> None:
+            if not quality_monitor.required:
+                return
+            before = len(quality_monitor.faults)
+            quality = quality_monitor.update(live_quality(), recording=recording)
+            if recording:
+                stats.tracking_quality_faults = list(quality_monitor.faults)
+                if len(quality_monitor.faults) > before:
+                    _logger.error(
+                        "Tracking failed — RETAKE REQUIRED: %s",
+                        "; ".join(quality_monitor.faults),
+                    )
+            control.note_tracking_quality(quality)
+
+        # A Mantis row always uses a real tracked TCP and its capture timestamp.
+        # Hold that immutable sample across ticks without restamping it; before
+        # the first usable engage sample, publish no dataset row at all.
         last_tcp: TCPPoseSnapshot | None = None
+        # Newest timestamp handed to the recorder (Mantis): rows must never
+        # step backwards, including when a held pose was restamped.
+        last_row_ts: float | None = None
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
         # Capture-health ack: ~2 s into recording, poll the recorder's row
@@ -2088,7 +2315,7 @@ def _run_session(
         async def _tracking_tick() -> None:
             """Run one normal teleop tick without consuming boundary events."""
             nonlocal capture_failure, last_robot_act, last_dataset_act
-            nonlocal last_tcp, was_engaged
+            nonlocal last_tcp, last_row_ts, was_engaged
             if _stopped() and last_robot_act is not None:
                 # Ctrl+C/Stop during recorder startup must drain the bounded
                 # worker before teardown, but must not keep following a moving
@@ -2097,20 +2324,29 @@ def _run_session(
                 return
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
+            _check_tracking_quality()
             # Keep a recording's trace open after the headset drops tracking:
             # terminate/SAVING may arrive before the outer loop consumes it.
             robot.set_control_trace_active(
                 recording or teleop.is_tracking or teleop.is_resetting
             )
 
-            joint_obs = robot.get_joint_observation()
+            joint_obs = (
+                robot.get_gripper_observation()
+                if mantis_mode
+                else robot.get_joint_observation()
+            )
             t_obs = time.perf_counter()
             teleop.send_feedback(joint_obs)
             act = teleop.get_action()
             t_act = time.perf_counter()
             act_processed = teleop_action_proc((act, joint_obs))
             robot_act = robot_action_proc((act_processed, joint_obs))
-            dataset_act = robot.action_to_dataset(act_processed)
+            dataset_act = (
+                robot.gripper_action_to_dataset(act_processed)
+                if mantis_mode
+                else robot.action_to_dataset(act_processed)
+            )
             t_proc = time.perf_counter()
             _sync_spring_caps()
             await robot.send_action_async(robot_act)
@@ -2146,6 +2382,14 @@ def _run_session(
                 if pose_ts is not None:
                     row_ts = pose_ts
                     lag = t0 - pose_ts
+                    if lag > _QA_STALE_POSE_S and not quality_monitor.required:
+                        # Standard policy, as before strict Lighthouse
+                        # checks: while no fresh sample arrives (tracking
+                        # lost, disengaged), keep rows on the control clock
+                        # so camera exposures stay paired, and let the QA
+                        # gate judge the stale/untracked ticks. Strict never
+                        # restamps a held pose; its retake latch decides.
+                        row_ts = t0
                     if lag > max_pose_lag["v"]:
                         max_pose_lag["v"] = lag
                     if recording and lag > stats.max_pose_lag_s:
@@ -2175,12 +2419,22 @@ def _run_session(
 
             last_robot_act = robot_act
             last_dataset_act = dataset_act
-            recorder.publish(joint_obs, dataset_act, row_ts)
+            if not mantis_mode:
+                recorder.publish(joint_obs, dataset_act, row_ts)
+            elif (
+                last_tcp is not None
+                and pose_ts is not None
+                and (last_row_ts is None or row_ts >= last_row_ts)
+            ):
+                # A fresh capture after a restamped hold is older than the
+                # hold's last row; skip it until capture time passes it.
+                recorder.publish(joint_obs, dataset_act, row_ts)
+                last_row_ts = row_ts
 
             # Per-episode QA counters (Mantis only — encoder-FK poses can't go
-            # stale). Frozen TCPs and disengaged spans record a motionless
-            # pose under fresh timestamps; a re-engage re-fits the world→base
-            # transform and shifts the frame of every later row.
+            # stale). Held TCPs retain their last capture timestamp; a
+            # re-engage re-fits the world→base transform and shifts the frame
+            # of every later row.
             if mantis_mode and recording and capture_ready:
                 stats.total_frames += 1
                 engaged = teleop.is_engaged()
@@ -2234,13 +2488,44 @@ def _run_session(
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
             robot.set_control_trace_active(True)
-            joint_obs = robot.get_joint_observation()
+            joint_obs = (
+                robot.get_gripper_observation()
+                if mantis_mode
+                else robot.get_joint_observation()
+            )
             teleop.send_feedback(joint_obs)
             _sync_spring_caps()
             await robot.send_action_async(last_robot_act)
             # Capture is already being stopped on the worker thread. Publishing
             # keeps the nearest-state history fresh for any final in-flight AU.
-            recorder.publish(joint_obs, last_dataset_act, t0)
+            if mantis_mode:
+                _publish_mantis_boundary(joint_obs)
+            else:
+                recorder.publish(joint_obs, last_dataset_act, t0)
+
+        def _publish_mantis_boundary(gripper_obs: dict[str, Any]) -> None:
+            # Closing capture may still consume final camera exposures. Their
+            # pose must stay on its real timeline; an idle/held tick must not
+            # invent fresh TCP data or silently switch back to virtual FK.
+            nonlocal last_row_ts
+            if last_tcp is None or last_tcp.pose_host_ts is None:
+                return
+            row_ts = last_tcp.pose_host_ts
+            now = time.perf_counter()
+            if now - row_ts > _QA_STALE_POSE_S and not quality_monitor.required:
+                # Standard policy: same control-clock hold as the take.
+                row_ts = now
+            if last_row_ts is not None and row_ts < last_row_ts:
+                return
+            last_row_ts = row_ts
+            observation = dict(gripper_obs)
+            for keys, pose in (
+                (_LEFT_EE_KEYS, last_tcp.left),
+                (_RIGHT_EE_KEYS, last_tcp.right),
+            ):
+                pose6 = [*pose[:3], *quat_xyzw_to_rotvec(np.asarray(pose[3:7]))]
+                observation.update(zip(keys, pose6))
+            recorder.publish(observation, last_dataset_act, row_ts)
 
         async def _idle_tick() -> None:
             """Mantis boundary tick: publish state, command nothing.
@@ -2254,9 +2539,9 @@ def _run_session(
                 return
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
-            joint_obs = robot.get_joint_observation()
+            joint_obs = robot.get_gripper_observation()
             teleop.send_feedback(joint_obs)
-            recorder.publish(joint_obs, last_dataset_act, t0)
+            _publish_mantis_boundary(joint_obs)
 
         def _start_capture() -> None:
             recorder.start_episode(task)
@@ -2287,6 +2572,13 @@ def _run_session(
             """
             nonlocal recording, capture_ready, stats, recording_started_at
             nonlocal capture_checked, was_engaged
+            if quality_monitor.required and not quality_ready(live_quality()):
+                quality = quality_monitor.update(live_quality(), recording=False)
+                control.note_tracking_quality(quality)
+                _logger.warning(
+                    "Cannot start: restore live Lighthouse tracking checks."
+                )
+                return False
             if mantis_mode:
                 tracking = teleop.tracking_sides()
                 if not all(tracking.values()):
@@ -2368,6 +2660,17 @@ def _run_session(
                 if mantis_mode:
                     await robot.disable_grippers_async()
                 return False
+            if quality_monitor.required:
+                # Recheck after gripper preparation, then include the whole
+                # recorder-start transaction in the fault latch.
+                current_quality = live_quality()
+                if not quality_ready(current_quality):
+                    await robot.disable_grippers_async()
+                    control.note_tracking_quality(
+                        quality_monitor.update(current_quality, recording=False)
+                    )
+                    return False
+                quality_monitor.begin(current_quality)
             recording = True
             # From here until the take is over every tick must publish
             # state on time: hold cyclic GC (the previous take's garbage
@@ -2391,6 +2694,7 @@ def _run_session(
             )
             capture_ready = True
             stats = EpisodeQAStats()
+            stats.tracking_quality_faults = list(quality_monitor.faults)
             recording_started_at = time.perf_counter()
             capture_checked = False
             was_engaged = teleop.is_engaged()
@@ -2538,6 +2842,12 @@ def _run_session(
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
+        # A fault may arrive while the last send_action or recorder-start
+        # await yields, immediately before Save/Stop ends the loop. Account
+        # for it before freezing the last command and beginning shutdown.
+        # Boundary ticks only publish that frozen command; subsequent tracker
+        # loss while the operator sets the rigs down is outside the take.
+        _check_tracking_quality()
         if contact:
             # The limp hold that follows ticks through the gravity step, which
             # carries no heartbeat: stop judging the tick now.
@@ -2576,6 +2886,11 @@ def _run_session(
             if disable_task is not None:
                 await disable_task
         tick_watchdog.suspend()
+        if recording and quality_monitor.required:
+            # Finish can wait for camera/encoder shutdown. Preserve the fault
+            # history of the captured interval; recovery cannot clear it.
+            stats.tracking_quality_faults = list(quality_monitor.faults)
+            stats.tracking_quality_report = quality_monitor.report()
         return recording, rerecord, contact, captured_rows, capture_failure, stats
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
@@ -2756,10 +3071,18 @@ def _run_session(
         rerecord: bool,
         captured_rows: int,
         capture_failure: str | None,
+        tracking_reason: str | None = None,
     ) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
-        if capture_failure is not None:
+        if capture_failure is not None and tracking_reason is not None:
+            _reject_take(
+                f"Episode {episode_idx + 1} was not saved: {tracking_reason}; "
+                "the camera frames after it had no tracked pose to pair with. "
+                "Record it again."
+            )
+            _discard_episode()
+        elif capture_failure is not None:
             _reject_take(
                 f"Episode {episode_idx + 1} was not saved: camera capture "
                 f"failed ({capture_failure})."
@@ -2778,6 +3101,7 @@ def _run_session(
             # produced row zero.  That is a valid empty take, not a session
             # failure; LeRobot's save_episode intentionally rejects it.
             _logger.info("No frames were captured this episode; discarding.")
+            _reject_take("No frames were captured in this take.")
             _discard_episode()
         elif recording:
             _logger.info("Saving episode…")
@@ -2829,6 +3153,7 @@ def _run_session(
             # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
             _logger.info(_note_ready(episode_idx + 1))
+            progress.ready()
 
             try:
                 (
@@ -2839,7 +3164,17 @@ def _run_session(
                     capture_failure,
                     qa,
                 ) = _run_on_robot_loop(_episode_loop())
-            except BaseException:
+            except BaseException as exc:
+                _preserve_interrupted_tracking_attempt(
+                    tracking_attempt,
+                    dataset_root,
+                    episode_index=episode_idx,
+                    reason=f"Collection failed: {type(exc).__name__}: {exc}",
+                    termination="error",
+                    setup_validation=getattr(
+                        cfg, "_lighthouse_validation_report", None
+                    ),
+                )
                 # A failure after a recording start must not leave the handheld
                 # grippers powered while the rest of collection unwinds.
                 try:
@@ -2852,6 +3187,17 @@ def _run_session(
 
             if _stopped():
                 if recording:
+                    _preserve_interrupted_tracking_attempt(
+                        tracking_attempt,
+                        dataset_root,
+                        episode_index=episode_idx,
+                        reason="Collection stopped before the take was saved.",
+                        termination="stopped",
+                        setup_validation=getattr(
+                            cfg, "_lighthouse_validation_report", None
+                        ),
+                        captured_rows=captured_rows,
+                    )
                     _discard_episode()
                 break
 
@@ -2862,6 +3208,7 @@ def _run_session(
                 if recording:
                     _discard_episode()
                     _logger.info("Episode discarded (contact).")
+                    _reject_take("Contact interrupted the take and disengaged control.")
                 _run_on_robot_loop(_contact_hold_loop())
                 # Drain VR events fired during the hold/return, then unblock
                 # the headset for the next take.
@@ -2897,6 +3244,29 @@ def _run_session(
             # unless the gate is disabled (cfg.qa_gate — escape hatch).
             if recording and mantis_mode:
                 qa_ok, qa_reasons = evaluate_episode_qa(qa)
+                if qa.tracking_quality_report is not None:
+                    from ..utils.state_files import secure_atomic_write_json
+
+                    report = dict(qa.tracking_quality_report)
+                    report.update(
+                        episodeIndex=episode_idx,
+                        capturedRows=captured_rows,
+                        saveRequested=not rerecord,
+                        episodeQAPassed=qa_ok,
+                        episodeQAReasons=qa_reasons,
+                        setupValidation=getattr(
+                            cfg, "_lighthouse_validation_report", None
+                        ),
+                    )
+                    # One file per attempt: failed retakes share an episode
+                    # index and must never overwrite each other's evidence.
+                    secure_atomic_write_json(
+                        dataset_root
+                        / "meta"
+                        / "tracking_quality"
+                        / f"{uuid.uuid4().hex}.json",
+                        report,
+                    )
                 _logger.info(
                     "episode QA: control_frames=%d captured_rows=%d stale=%d "
                     "(%.1f%%) disengaged=%d (%.1f%%) untracked=%d (%.1f%%) "
@@ -2933,7 +3303,7 @@ def _run_session(
                         _reach_soft_start_m(cfg),
                     )
                 if not qa_ok and not rerecord and capture_failure is None:
-                    if cfg.qa_gate:
+                    if cfg.qa_gate or qa.tracking_quality_faults:
                         _reject_take(
                             f"Episode {episode_idx + 1} was REJECTED by the "
                             "quality gate and discarded: "
@@ -2976,6 +3346,9 @@ def _run_session(
                     rerecord,
                     captured_rows,
                     capture_failure,
+                    _tracking_capture_reason(qa, capture_failure)
+                    if recording and mantis_mode
+                    else None,
                 )
                 home_future.result()
             except BaseException:

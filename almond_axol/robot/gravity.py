@@ -10,6 +10,12 @@ Gravity is evaluated by setting the joint positions on a MuJoCo model loaded
 from the bundled URDF and reading ``qfrc_bias`` with ``qvel=0`` (which equals
 the gravitational generalized force vector — Coriolis terms drop out).
 
+The model is always loaded from the classic URDF: every Axol version shares
+the same arm link frames, joint axes and (placeholder) inertials — the mobile
+URDF copies them verbatim, and ``tests/test_urdf_contract.py`` checks it — so
+gravity torques, and the ``mass`` / ``com`` parameters tuned for them, are the
+same on both versions.
+
 The bundled URDF has placeholder Onshape masses on every link (sub-gram
 values that are basically zero). The mass and centre-of-mass of each link is
 therefore overridden at load time from each :class:`JointConfig`'s ``mass``
@@ -282,6 +288,11 @@ class GravityCompensator:
         # Scratch buffer for expanding MuJoCo's sparse qM into a dense matrix
         # (see gravity_and_inertia_arm). nv is small (14), so this is cheap.
         self._m_full = np.zeros((self._model.nv, self._model.nv))
+        # 3.10 moved mj_fullM's sparse input behind MjData; 3.11 removed qM.
+        # Select once, rather than probing/catching exceptions in every tick.
+        self._full_mass_uses_data = tuple(
+            int(part) for part in mujoco.__version__.split(".")[:2]
+        ) >= (3, 10)
         # Gripper mount frame (see mount_jacobian): the wrist body it is
         # fused into, its fixed offset, and Jacobian scratch buffers.
         self._mount_offset = _gripper_mount_offsets(_load_urdf_text())
@@ -477,9 +488,10 @@ class GravityCompensator:
         gravity = self.gravity_arm(arm_q, is_left=is_left)
         # mj_fwdPosition (run inside gravity()) already computed the sparse
         # factorized mass matrix; expand it and pull this arm's diagonal.
-        # MuJoCo 3.10 changes this call's signature and 3.11 drops qM: the
-        # pyproject `mujoco<3.10` bound is what keeps this valid.
-        mujoco.mj_fullM(self._model, self._m_full, self._data.qM)
+        if self._full_mass_uses_data:
+            mujoco.mj_fullM(self._model, self._data, self._m_full)
+        else:
+            mujoco.mj_fullM(self._model, self._m_full, self._data.qM)
         dof_idx = self._left_dof_idx if is_left else self._right_dof_idx
         inertia = np.array([self._m_full[i, i] for i in dof_idx], dtype=np.float32)
         return gravity, inertia

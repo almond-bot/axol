@@ -32,6 +32,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             vcodec="h264",
             repo_id="local/dagger",
             root=str(root),
+            push_to_hub=False,
             rerun_ip=None,
             rerun_port=9876,
             robot_config=object(),
@@ -347,6 +348,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         performed = {"left.pos": 0.9}
         live_joints = {"left.pos": 0.85}
         control_loop.robot = SimpleNamespace(
+            action_features={"left.pos": float},
             send_action=mock.Mock(return_value=performed),
             get_joint_observation=mock.Mock(return_value=live_joints),
             get_observation_with_capture_timestamp=mock.Mock(
@@ -367,6 +369,35 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             live_joints, performed, 42.0
         )
 
+    def test_mink_policy_tick_records_fk_of_the_dispatched_joints(self) -> None:
+        # Mink's send_action returns the joint command it dispatched; a
+        # Cartesian dataset must record that command's FK pose (as
+        # run-policy does), not joint keys it has no column for.
+        control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
+        control_loop.shutdown_event = threading.Event()
+        dispatched = {"left_shoulder_1.pos": 0.3}
+        fk_pose = {"left_ee.x": 0.41}
+        control_loop.robot = SimpleNamespace(
+            action_features={"left_ee.x": float},
+            send_action=mock.Mock(return_value=dispatched),
+            action_to_dataset=mock.Mock(return_value=fk_pose),
+            get_joint_observation=mock.Mock(return_value={}),
+            get_observation_with_capture_timestamp=mock.Mock(
+                return_value=({"left_ee.x": 0.4}, 1.0)
+            ),
+        )
+        control_loop.policy = SimpleNamespace(
+            act=mock.Mock(return_value={"left_ee.x": 0.42})
+        )
+        control_loop.limiter = None
+        control_loop.spring_caps = mock.Mock()
+        control_loop.recorder = SimpleNamespace(publish=mock.Mock())
+
+        control_loop._policy_tick(2.0)  # noqa: SLF001
+
+        control_loop.robot.action_to_dataset.assert_called_once_with(dispatched)
+        control_loop.recorder.publish.assert_called_once_with({}, fk_pose, 2.0)
+
     def test_cartesian_dagger_intervention_records_converted_joint_action(self) -> None:
         control_loop = object.__new__(collect_dagger._DaggerControlLoop)  # noqa: SLF001
         control_loop.shutdown_event = threading.Event()
@@ -377,6 +408,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             get_joint_observation=mock.Mock(return_value=joint_observation),
             send_action=mock.Mock(return_value=human_joint_action),
             action_to_dataset=mock.Mock(return_value=cartesian_action),
+            reset_cartesian_seed=mock.Mock(),
         )
         recorder = SimpleNamespace(
             publish=mock.Mock(), poll_capture_error=mock.Mock(return_value=None)
@@ -431,6 +463,7 @@ class DaggerResumeSchemaTest(unittest.TestCase):
             get_joint_observation=mock.Mock(return_value=joint_observation),
             send_action=mock.Mock(return_value=human_joint_action),
             action_to_dataset=mock.Mock(return_value=cartesian_action),
+            reset_cartesian_seed=mock.Mock(),
         )
         recorder = SimpleNamespace(
             publish=mock.Mock(),
@@ -481,6 +514,9 @@ class DaggerResumeSchemaTest(unittest.TestCase):
         self.assertNotIn(
             "left_shoulder_pitch.pos", recorder.publish.call_args_list[1].args[1]
         )
+        # Mink's seed is re-anchored when the loop starts and again at the
+        # handback, so the policy resumes from the operator's correction.
+        self.assertEqual(robot.reset_cartesian_seed.call_count, 2)
 
 
 if __name__ == "__main__":

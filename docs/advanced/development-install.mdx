@@ -1,13 +1,13 @@
 ---
 title: "Development install"
-description: "Install Axol from a clone with uv for working on the SDK — optional extras, the headset-video stack, and building the web UI."
+description: "Install Axol from a source checkout with uv to work on the software or build the web UI."
 ---
 
-The [one-command install](/installation) is the right path for running Axol on the robot machine. This page is for **working on Axol itself** — installing from a clone, picking optional dependency extras, and building the web UI locally. If you just want to use the robot, you don't need any of this.
+This page is for **working on the Axol software itself**: installing from a source checkout, choosing optional extras and building the web UI. To run Axol on the robot, use the [one-command install](/installation) instead.
 
 ## Install from a clone
 
-Install the package from a checkout using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
+In your checkout, install the package with [`uv`](https://docs.astral.sh/uv/). Every dependency comes from PyPI:
 
 ```bash
 uv sync
@@ -20,12 +20,12 @@ source .venv/bin/activate
 ```
 
 <Tip>
-  You need to activate the environment in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+  Activate the environment in every new shell. Or start each command with `uv run` (for example, `uv run axol can.setup`) and skip activation.
 </Tip>
 
 ## Optional extras
 
-Install optional dependency groups as needed (the install script includes `lerobot`, `sim`, and `tracker`):
+Add optional extras as you need them. The install script includes `lerobot`, `sim` and `tracker`.
 
 | Extra | Contents | When to use |
 |---|---|---|
@@ -33,20 +33,20 @@ Install optional dependency groups as needed (the install script includes `lerob
 | `sim` | viser | `teleop --sim` |
 
 ```bash
-uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
+uv sync --extra lerobot --extra sim --extra tracker   # same extras as the install script
 ```
 
 <Warning>
-  PyPI's `torch==2.10.0` wheel is CPU-only on aarch64. On a Jetson, an exact `uv sync` also replaces an out-of-band Torch build with that locked CPU wheel. If local policy inference needs CUDA, manage a JetPack-compatible Torch + Torchvision build explicitly after dependency sync, and do not exact-sync that deployed environment again without a restoration plan. Remote inference and `--device cpu` work with the hosted dependency set.
+  On a Jetson, the PyTorch package from PyPI has no GPU support. `uv sync` also replaces any GPU build of PyTorch you installed yourself. To run policies on the Jetson's GPU, install a PyTorch and Torchvision build for your JetPack version after each `uv sync`. Remote inference and `--device cpu` work without it.
 </Warning>
 
 <Note>
-  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer + camera stack, installed via [`axol provision`](/cli/provision) (see [Headset-video stack](#headset-video-stack) below).
+  Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) is not an extra. It needs system packages that [`axol provision`](/cli/provision) installs. See [Headset-video stack](#headset-video-stack) below.
 </Note>
 
 ## ZED Python bindings
 
-The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately, after the ZED SDK is installed:
+The ZED Python bindings (`pyzed`) are not on PyPI. Install the ZED SDK first, then run:
 
 ```bash
 axol zed.install
@@ -56,31 +56,41 @@ See [`zed.install`](/cli/zed-install) for details.
 
 ## Headset-video stack
 
-Relaying the ZED cameras to the headset grabs and **NVENC**-encodes frames on the GPU via the zed-gstreamer pipeline (`zedxonesrc` / `zedsrc`) and sends them over WebRTC with **aiortc** (a normal Python dependency). The encode path needs the system GStreamer + GObject-introspection packages, **PyGObject**, and the patched ZED source elements — none of which are PyPI extras.
-
-[`axol provision`](/cli/provision) installs all of them idempotently in one step (the same command the install script and the `axol serve` self-updater run):
+Streaming the ZED cameras to the headset needs GStreamer, **PyGObject** and Axol's patched ZED GStreamer plugins. None of these come from PyPI. [`axol provision`](/cli/provision) installs them all, and it is safe to run again. The install script and the updater run the same command:
 
 ```bash
 axol provision
 ```
 
-This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) GMSL camera-driver upgrade (ZED Box Duo / Mini, ZED Link Duo on an AGX Orin), the board-IMU group access (`gyro.install`, [Jelly](/guides/vr-interface#jelly)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / Stereolabs camera driver / board IMU). You can also run them individually.
+Its main steps are listed below, in the order they run. Each optional step is skipped on hardware it doesn't apply to. You can also run most of them on their own.
 
-Its last step applies the host's real-time tuning: on a Jetson (Orin NX, AGX Orin, Thor) it selects the max power mode, pins the NVENC/VIC/GPU and CPU clocks, steers the CAN adapters' interrupt onto a CAN core, and schedules the Argus camera daemon real-time — see [`jetson.setup`](/cli/jetson-setup) for each. It's a no-op on other hosts. The tuning resets at reboot; the install script's systemd unit re-applies it at every boot with `axol provision --boot`, and on a dev checkout without that unit you can run the same command after a reboot.
+| Step | What it does |
+|---|---|
+| Quest over USB | Installs `adb` for the [Quest-over-USB](/guides/quest-over-usb) link. |
+| [`tracker.install`](/cli/tracker#axol-trackerinstall) | Installs Lighthouse tracking for [Mantis](/mantis/tracking). |
+| [`zed.driver`](/cli/zed-driver) | Upgrades the GMSL camera driver on a ZED Box Duo or Mini, or a ZED Link Duo on an AGX Orin. |
+| `gyro.install` | Gives access to the board's motion sensor, which [Jelly](/guides/vr-interface#jelly) uses to hold its heading. |
+| [`zed.install`](/cli/zed-install) | Installs the ZED Python bindings. |
+| [`gst.install`](/cli/gst-install) | Installs GStreamer and PyGObject. |
+| [`gst.build-zed`](/cli/gst-build-zed) | Builds the patched ZED GStreamer plugins. |
+| `rt.install` | Installs the realtime core that controls the arms. This step is required. |
+| [`jetson.setup`](/cli/jetson-setup) | On a Jetson, tunes power, clocks and scheduling for real-time control. |
+
+The Jetson tuning resets when the computer restarts. The install script's service applies it again at every boot with `axol provision --boot`. On a development checkout without that service, run `axol provision --boot` yourself after each restart.
 
 ## First-run hardware setup
 
-Before using any motor or robot commands, initialize the CAN hardware once:
+Before you run any motor or robot command, set up the CAN bus once:
 
 ```bash
 axol can.setup
 ```
 
-`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures — including the hotplug service that brings the interfaces back up on its own after a mid-session replug — and [`can.enable`](/cli/can-enable) for re-running the bring-up manually.
+The command asks for `sudo` when it needs it. It also installs a service that brings the CAN interfaces back up when you unplug and replug an adapter. See [`can.setup`](/cli/can-setup) for details, and [`can.enable`](/cli/can-enable) to bring the interfaces up again by hand.
 
 ## Build the web UI
 
-`axol serve` looks for the built web bundle at `web/app/dist`. To serve the control panel and VR interface from your own machine, build it once:
+`axol serve` serves the web UI from `web/app/dist`. To serve the control panel and VR interface from your own computer, build it once:
 
 ```bash
 cd web
@@ -95,13 +105,13 @@ Then start the server and open the printed URL:
 axol serve
 ```
 
-`axol serve` works without this step (the API is still available) — the hosted UI at [axol.almond.bot](https://axol.almond.bot) connects to it directly. See [`serve`](/cli/serve) and the [Web Control Panel guide](/guides/control-panel).
+You can skip the build. Without it, `axol serve` still runs, and the hosted UI at [axol.almond.bot](https://axol.almond.bot) connects to it. See [`serve`](/cli/serve) and the [Web Control Panel guide](/guides/control-panel).
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="CLI Reference" icon="terminal" href="/cli/configuration">
-    Every `axol` command, flag, and the draccus config model.
+    Every `axol` command and flag, and how configuration works.
   </Card>
   <Card title="Python API" icon="code" href="/api/concepts">
     `Axol`, the kinematics solver, VR teleop, and the LeRobot wrappers.

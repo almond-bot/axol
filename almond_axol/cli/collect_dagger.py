@@ -94,9 +94,10 @@ from typing import TYPE_CHECKING, Any, Protocol
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..constants import PARK_TIMEOUT_S
+from .. import progress
+from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
-from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig, require_matching_ik_backend
 from ..lerobot.rollout import (
     IKResetController,
     PolicyActionLimiter,
@@ -112,6 +113,7 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
+from ..robot.start_pose import check_start_pose
 from ..teleop.config import adopt_robot_gripper
 from ..utils import affinity
 from ..utils.control_loop import run_blocking_with_sync_control_ticks
@@ -658,6 +660,11 @@ class _DaggerControlLoop(threading.Thread):
         performed = self.robot.send_action(action_dict)
         if self.shutdown_event.is_set():
             return None
+        recorded = performed if performed is not None else action_dict
+        if any(key not in recorded for key in self.robot.action_features):
+            # Mink returns the joint commands actually dispatched; a Cartesian
+            # dataset records their FK poses (as run-policy does).
+            recorded = self.robot.action_to_dataset(recorded)
         # Snapshot the live joint state at this tick, dated at the tick, like
         # the teleop and frozen states (and collect-data) do: the recorder
         # pairs every 60 Hz exposure with the nearest snapshot, and those must
@@ -665,11 +672,7 @@ class _DaggerControlLoop(threading.Thread):
         # observation is not that snapshot any more — its ring runs below
         # --fps and the frame set (with the joints selected at its exposure)
         # is re-served between ring frames, so its timestamp repeats.
-        self.recorder.publish(
-            self.robot.get_joint_observation(),
-            performed if performed is not None else action_dict,
-            t0,
-        )
+        self.recorder.publish(self.robot.get_joint_observation(), recorded, t0)
         return action_dict
 
     def run(self) -> None:
@@ -697,6 +700,10 @@ class _DaggerControlLoop(threading.Thread):
             # the fault boundary so startup failures reach the supervisor.
             if self.limiter is not None:
                 self.limiter.seed(*self.robot.positions)
+            # Mink seeds each solve from its previous command: anchor it at
+            # the last joint send (the return-to-rest that opened the
+            # episode), not the previous episode's final policy command.
+            self.robot.reset_cartesian_seed()
 
             while not self.shutdown_event.is_set():
                 t0 = time.perf_counter()
@@ -757,6 +764,10 @@ class _DaggerControlLoop(threading.Thread):
                         # jump away from where the operator left the arms.
                         if self.limiter is not None:
                             self.limiter.seed(*self.robot.positions)
+                        # Likewise re-anchor Mink's seed at the operator's
+                        # last joint command, or a correction smaller than its
+                        # resync threshold would be walked back.
+                        self.robot.reset_cartesian_seed()
                         _logger.info("Intervention over — policy resumes.")
                     elif self.state == _STATE_POLICY and frozen_press:
                         self.state = _STATE_FROZEN
@@ -1262,6 +1273,14 @@ def _run(
         _check_training_fps(cfg)
     if episode_time_s < 0 or fps <= 0 or teleop_hz <= 0:
         raise ValueError("Invalid episode duration or control rate")
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        # Local and remote alike: the teleop IK worker also plans the
+        # policy-side resets, so one backend must drive both.
+        require_matching_ik_backend(
+            cfg.robot_config, cfg.teleop_config.kinematics_config.backend
+        )
 
     # Resolve and validate the destination before camera enumeration, workers,
     # the relay, or the robot can start. LeRobotDataset.resume keeps the existing
@@ -1273,6 +1292,11 @@ def _run(
     # package may hand in its own control without this hook.
     if (note_dataset := getattr(control, "note_dataset", None)) is not None:
         note_dataset(repo_id, dataset_root)
+    # The upload runs when the session ends; check the login now, not then.
+    if cfg.push_to_hub:
+        from ..recording.hub_auth import require_hub_login
+
+        require_hub_login()
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (
@@ -1378,7 +1402,12 @@ def _run(
             cfg.teleop_config.vr_teleop_config, cfg.robot_config.axol_config.gripper
         )
 
-    robot = AxolRobot(cfg.robot_config)
+    robot_options = (
+        {"mink_solve_hz": fps}
+        if getattr(cfg.robot_config, "cartesian_controller", "jax") == "mink"
+        else {}
+    )
+    robot = AxolRobot(cfg.robot_config, **robot_options)
     teleop = DaggerVRTeleop(cfg.teleop_config)
     teleop.set_hold_to_intervene(cfg.hold_to_intervene)
     from ..recording.datasets import (
@@ -1405,6 +1434,16 @@ def _run(
         # survives. Repair only after the full schema proves this is the
         # current run's intended dataset.
         check_resume_consistency(dataset_root)
+    # A remote policy warms the reset IK worker before the arms connect; a
+    # local one waits for it while moving to the start pose.
+    homes = cfg.home_on_start or not cfg.start_from_current_pose
+    progress.plan(
+        ["policy", "cameras"]
+        + (["ik_reset"] if remote_policy else [])
+        + ["arms", "headset", "ik", "dataset"]
+        + (["home"] if homes else [])
+    )
+    progress.step("policy")
     if remote_policy:
         from ..policy.plan_client import policy_url
         from ..policy.plan_dagger import PlanDaggerPolicy
@@ -1448,17 +1487,29 @@ def _run(
         if rerun_ip:
             init_rerun(session_name="axol_dagger", ip=rerun_ip, port=rerun_port)
 
-        # Start the IK reset worker once the policy schema has been proven. Its
-        # JAX JIT overlaps with robot connect and the teleop's own IK worker
-        # JIT. It owns collision-aware homing between episodes.
+        # Start the selected reset worker once the policy schema has been
+        # proven, overlapping preparation with robot and teleop startup.
         if remote_policy:
             vr_cfg = cfg.teleop_config.vr_teleop_config
             reset_controller = IKResetController(
                 rest_pose_left=vr_cfg.rest_pose_left,
                 rest_pose_right=vr_cfg.rest_pose_right,
+                kinematics_config=cfg.teleop_config.kinematics_config,
+                vr_teleop_config=vr_cfg,
             )
         else:
-            reset_controller = IKResetController()
+            reset_controller = IKResetController(
+                kinematics_config=(
+                    cfg.teleop_config.kinematics_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+                vr_teleop_config=(
+                    cfg.teleop_config.vr_teleop_config
+                    if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+                    else None
+                ),
+            )
         reset_controller.start()
         _logger.info("Started IK reset worker (collision-aware return-to-rest).")
 
@@ -1467,6 +1518,7 @@ def _run(
         # (mux only) and a second ring branch, decimated to --policy_fps,
         # gives this policy process readable frames; without gst's shm plugin
         # both fall back to pyshm.
+        progress.step("cameras")
         relay = _start_video_relay(
             cfg,
             dataset_resolution,
@@ -1546,26 +1598,37 @@ def _run(
     control_thread: _DaggerControlLoop | None = None
     control_worker_stopped = True
     # Disabling raised arms drops them under gravity, so the cleanup below
-    # returns them to rest first — but only when they are somewhere else.
+    # parks them (rest pose, then zero) first — once this session owns them
+    # (past the start check), or whenever they are somewhere other than rest.
     arms_at_rest = True
+    arms_moved = False
 
     def _return_to_rest_guarded(
-        wait_retry: Callable[[], bool] | None, *, final: bool = False
+        wait_retry: Callable[[], bool] | None,
+        *,
+        final: bool = False,
+        startup: bool = False,
     ) -> bool:
         """Guarded ``IKResetController`` home; ``False`` when aborted.
+
+        ``startup=True`` is the session's first home, played through zero
+        (the arms' natural resting pose) on the way out to rest.
 
         Plays with the torque watchdog live; on contact the arms drop into a
         limp gravity-comp hold until ``wait_retry`` answers (``True`` =
         replan from wherever they were hand-guided to) or the run stops.
 
-        ``final=True`` is the teardown park played on the way out. The stop
-        flag is already set by then, so a deadline bounds the move instead —
-        well inside the caller's stop grace — and there is no operator left
-        to answer a contact retry.
+        ``final=True`` is the teardown park played on the way out: rest,
+        then zero, so the torque-off leaves the arms where they would settle
+        anyway. The stop flag is already set by then, so a deadline bounds the
+        move instead and there is no operator left to answer a contact retry.
         """
         nonlocal arms_at_rest
         if final:
+            park_to_zero = bool(cfg.teleop_config.vr_teleop_config.park_to_zero)
             deadline = time.perf_counter() + PARK_TIMEOUT_S
+            if park_to_zero:
+                deadline += PARK_ZERO_TIMEOUT_S
             contact = threading.Event()
             arms_at_rest = reset_controller.return_to_rest(
                 robot,
@@ -1575,6 +1638,10 @@ def _run(
                 # limp until the deadline: the torque-off follows either way.
                 stopped=lambda: contact.is_set() or time.perf_counter() >= deadline,
                 on_contact=contact.set,
+                path=("rest", "zero") if park_to_zero else None,
+                # An arm may still be holding something: keep the grasp
+                # until the torque comes off.
+                hold_grasp=True,
             )
             return arms_at_rest
         arms_at_rest = reset_controller.return_to_rest(
@@ -1583,6 +1650,7 @@ def _run(
             gravity_comp_kd=reset_gravity_comp_kd,
             stopped=stop_event.is_set,
             wait_retry=wait_retry,
+            path=("zero", "rest") if startup else None,
         )
         return arms_at_rest
 
@@ -1652,9 +1720,9 @@ def _run(
             else control.note_gate
         )
         announce_gate(
-            "Contact during return to rest — the arms are limp and free to "
-            "move. Clear them, then press the VR reset button, or return to "
-            "rest here.",
+            "The arms hit something while returning to rest and are now limp. "
+            "Move them clear by hand, then press reset in VR or Return to rest "
+            "here.",
             "Return to rest",
             phase=_GATE_CONTACT,
         )
@@ -1692,6 +1760,7 @@ def _run(
             # consumes this handshake. Always prove reset/parking readiness
             # before enabling motors, including quit before the first episode.
             _logger.info("Waiting for the collision-aware reset worker...")
+            progress.step("ik_reset")
             if not reset_controller.wait_ready(stopped=stop_event.is_set):
                 return
             if cfg.robot_config.cartesian_actions:
@@ -1700,8 +1769,23 @@ def _run(
                 # policy dispatch cannot stall an armed control loop.
                 robot.prepare_cartesian_actions()
         _logger.info("Connecting robot...")
+        progress.step("arms")
         robot.connect()
         robot_connected = True
+        if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+            # Local policies run Mink Cartesian actions too: pin the same
+            # rest attractor rather than Mink's all-zero default.
+            vr_cfg = cfg.teleop_config.vr_teleop_config
+            robot.set_cartesian_posture(vr_cfg.rest_pose_left, vr_cfg.rest_pose_right)
+        if cfg.home_on_start or not cfg.start_from_current_pose:
+            # The start-of-session home plays unsupervised; refuse it from far
+            # away. A current-pose session never homes on start, so it may
+            # begin anywhere.
+            check_start_pose(robot.positions)
+        # Past the start check the session owns the arms — homing, idle
+        # teleop, episodes — so the teardown parks them whatever the last
+        # move was. A refused start raises above and never parks.
+        arms_moved = True
 
         # Connect the VR teleop stack: the position source lets takeovers
         # sync the IK worker to the robot's measured pose, and the current
@@ -1728,6 +1812,7 @@ def _run(
         # this process. Mirrors collect-data.
         if is_complete:
             _logger.info(f"Resuming existing dataset at {dataset_root}.")
+        progress.step("dataset")
         recorder = DatasetRecorderProcess(
             raw_cond=relay.raw_cond,
             raw_meta=relay.raw_meta,
@@ -1758,8 +1843,9 @@ def _run(
         episode_idx = recorder.episode_count()
 
         if cfg.home_on_start or not cfg.start_from_current_pose:
-            _logger.info("Returning to rest pose.")
-            if not _return_to_rest_guarded(_gate_retry):
+            _logger.info("Returning to rest pose (through zero).")
+            progress.step("home")
+            if not _return_to_rest_guarded(_gate_retry, startup=True):
                 return
         else:
             # Starting from wherever the arms are: until a home proves
@@ -1781,6 +1867,7 @@ def _run(
             teleop.send_feedback_episode(episode_idx + 1)
             control.note_episode(episode_idx + 1)
             control.begin_gate(_idle_gate_message())
+            progress.ready()
             # Drop events latched during the reset/save phase so a stale
             # record press can't auto-start the episode, then arm the
             # grips + reset button for between-episode scene-reset teleop.
@@ -2238,12 +2325,13 @@ def _run(
             _cleanup("policy pause", policy.pause)
         else:
             _cleanup("policy", policy.close)
-        # Park before the torque comes off: ``disconnect()`` disables the
-        # motors, and arms left raised drop under gravity.
+        # Park — rest pose, then zero — before the torque comes off:
+        # ``disconnect()`` disables the motors, and arms left raised drop under
+        # gravity; ending at zero leaves them where they would settle anyway.
         #
         # Local policies only: a remote policy's disconnect_plan_robot below
-        # owns its own park-or-preserve decision. Skipped when the arms are
-        # already at rest, when a limp hold left
+        # owns its own park-or-preserve decision. Skipped when this session
+        # never moved the arms and they are at rest, when a limp hold left
         # them in the operator's hands, when the bus no longer reports a pose
         # to plan from, or when a live control worker may still be inside the
         # robot (a wedged worker also means the episode boundary already
@@ -2258,11 +2346,13 @@ def _run(
             if (
                 not remote_policy
                 and control_worker_stopped
-                and not arms_at_rest
+                and (arms_moved or not arms_at_rest)
                 and not reset_controller.arms_limp
                 and arms_reporting(robot)
             ):
-                _logger.info("Returning to rest before disabling the arms.")
+                _logger.info(
+                    "Parking the arms (rest pose, then zero) before disabling them."
+                )
                 _return_to_rest_guarded(None, final=True)
         except BaseException:
             _logger.exception("return to rest before disconnect failed")

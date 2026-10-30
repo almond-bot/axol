@@ -247,6 +247,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
     def test_axol_pin_is_not_preserved_when_serial_now_enumerates_single(self) -> None:
         with (
             patch.object(setup, "_detect_serials", return_value=[]),
+            patch.object(setup, "_configured_profile_usb_serials", return_value={}),
             patch.object(
                 setup, "_configured_serial", side_effect=self._configured_axol_only
             ),
@@ -1006,7 +1007,7 @@ class CanSetupAssignmentTest(unittest.TestCase):
         configure_mantis.assert_not_called()
         self.assertIn(f"Wheels   : {setup._CAN_B}", output.getvalue())
         self.assertIn(
-            f"Lift     : {setup._CAN_B} (jelly_legs shares the wheel bus)",
+            f"Lift     : {setup._CAN_B} (Jelly lift shares the wheel bus)",
             output.getvalue(),
         )
         self.assertNotIn(setup._CAN_C, output.getvalue())

@@ -242,7 +242,7 @@ function GridRow({ row, grid }: { row: EpisodeBriefGrid["rows"][number]; grid: E
 
 function Placement({ placement }: { placement: EpisodeBriefPlacement }) {
   const s = roleStyle(placement.role)
-  const title = [placement.label, placement.detail].filter(Boolean).join(" — ")
+  const title = [placement.label, placement.detail].filter(Boolean).join(": ")
   return (
     <div
       title={title}

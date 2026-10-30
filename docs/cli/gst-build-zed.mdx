@@ -1,27 +1,34 @@
 ---
 title: "gst.build-zed"
-description: "Build and install the patched zed-gstreamer plugins (sensor-accurate timestamps) on a Jetson."
+description: "Build the patched ZED GStreamer camera plugins on a Jetson."
 ---
 
-Builds and installs the **patched** Stereolabs zed-gstreamer source plugins (`zedxonesrc` mono / `zedsrc` stereo) that the GPU-resident camera pipeline ([`almond_axol.video.gst_zed`](/api/vr)) uses for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). This is the companion to [`gst.install`](/cli/gst-install): `gst.install` sets up the host GStreamer support and PyGObject, while `gst.build-zed` provides the ZED **source elements** themselves.
+Builds and installs Almond's patched version of the Stereolabs ZED GStreamer plugins (`zedxonesrc` for mono cameras, `zedsrc` for stereo). The fast camera pipeline for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) uses them. [`gst.install`](/cli/gst-install) installs GStreamer itself, and this command adds the ZED camera plugins.
 
 ```bash
 axol gst.build-zed
 ```
 
-It exists rather than relying on a stock plugin install for two reasons:
+The [one-command install](/installation) and [`axol provision`](/cli/provision) run it for you, right after [`gst.install`](/cli/gst-install). It is safe to run again. It skips the build when the installed plugins are already current.
 
-- **A fresh Jetson has no zed-gstreamer plugins at all.** Without them the GPU-resident camera path silently falls back to the slower ZED SDK grab; building them makes the fast path available.
-- **The stock `zedxonesrc` / `zedsrc` stamp each frame's PTS at host-receive time** (a software clock sampled right after `grab()` returns), which lags the true sensor exposure by the camera delivery latency. The vendored patch instead stamps the PTS at the sensor-exposure instant (`TIME_REFERENCE::IMAGE`), so a frame lines up with the joint sample taken on the same exposure clock as the SDK [`ZedCamera`](/api/lerobot#zedcamera) path. Without it, collected datasets pair each image with proprioception that is ~delivery-latency too new — and that offset differs from inference (which uses the SDK), i.e. a train/inference mismatch.
+## Why the patched plugins
 
-A second vendored patch builds `zedxonesrc` on L4T releases newer than 36 (JetPack 7, e.g. a Jetson AGX Orin on L4T 39.2). Upstream only adds it for L4T 35.3/35.4 and 36.3+, so without it the build silently leaves `zedxonesrc` out there and the install check fails.
+- **A fresh Jetson has no ZED GStreamer plugins.** Without them, Axol falls back to the slower ZED SDK camera path.
+- **Accurate timestamps.** The stock plugins stamp each frame when the computer receives it, which is later than when the sensor captured it. The patched plugins use the capture time, so each recorded image lines up with the joint positions from the same moment. This matches what policies see at inference time.
+- **Newer JetPack.** The patched plugins also build `zedxonesrc` on JetPack 7 (L4T newer than 36), where the stock build leaves it out.
 
-The command clones upstream at a pinned commit (the exact ref the patches were generated against), applies both patches in order, and builds + installs with CMake. It installs the required compiler/linker packages first, including `libblas-dev` required by the ZED SDK's CMake package and `nvidia-l4t-jetson-multimedia-api` for the `nvbufsurface.h` header the plugins include (a minimal JetPack flash, e.g. on an AGX Thor, leaves it out). The [one-command install](/installation) runs it for you once, right after [`gst.install`](/cli/gst-install).
+## Requirements
 
-<Note>
-  Requires an NVIDIA **Jetson/L4T** host, the **ZED SDK** at `/usr/local/zed`, and the Jetson build toolchain. Idempotent: its root-owned manifest records the pinned ref, a digest over the vendored patches, the ZED SDK version the plugins were built against, and the SHA-256 + resolved path of both source-plugin binaries proven to come from that build's CMake install manifest. Collection and policy re-hash the exact binary GStreamer selects, so a later stock upgrade or `GST_PLUGIN_PATH` override safely falls back to the SDK until this command is rerun. Best-effort: it cleanly skips on non-Jetson hosts and machines without the SDK / toolchain — the camera path then uses the ZED SDK fallback. Installing packages and the system GStreamer plugin needs root: run as root, or you'll be prompted for `sudo` once.
-</Note>
+- An NVIDIA Jetson
+- The ZED SDK at `/usr/local/zed`
+- Root, to install packages and the plugins. Run as root, or it asks for your `sudo` password once.
+
+`gst.build-zed` installs the compiler and other packages it needs before it builds. On a computer that isn't a Jetson, or that has no ZED SDK, it skips the build and Axol uses the ZED SDK camera path.
+
+If the installed plugins are later replaced or overridden, Axol falls back to the ZED SDK camera path until you run `gst.build-zed` again.
 
 ## After a ZED SDK upgrade
 
-The plugins link the SDK's `libsl_zed.so` directly, so upgrading the SDK in place (running a new Stereolabs `.run` installer) leaves plugins that GStreamer still lists but can no longer load (`undefined symbol: _ZN2sl9CameraOne8isOpenedEv…`). Teleop and `collect-data` detect this at startup, log a warning naming this command, and fall back to the SDK camera path rather than failing. Re-run `axol gst.build-zed` (or [`axol provision`](/cli/provision), which the `axol serve` self-updater runs) to restore the GPU path: it notices the SDK version changed — or that a plugin no longer loads — and rebuilds against the installed SDK. Run [`zed.install`](/cli/zed-install) as well so `pyzed` matches the new SDK.
+The plugins are built against a specific ZED SDK version. After you install a new SDK, GStreamer still lists the plugins but can't load them (`undefined symbol: _ZN2sl9CameraOne8isOpenedEv…`). Teleop and `collect-data` log a warning that names this command, and use the ZED SDK camera path instead.
+
+To restore the fast path, run `axol gst.build-zed` or [`axol provision`](/cli/provision). Both detect the new SDK and rebuild. Also run [`zed.install`](/cli/zed-install), so `pyzed` matches the new SDK.

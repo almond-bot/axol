@@ -1,27 +1,43 @@
 ---
 title: "hub.flash"
-description: "Flash the bundled firmware onto the Axol arm hub."
+description: "Install the bundled firmware on the Axol Hub and Mantis Hub."
 ---
 
-Flashes the firmware image that ships with this package (`almond_axol/hub/axol_hub.uf2`) onto the Axol arm hub. The hub reboots into its RP2350 bootloader, the image is copied onto the bootloader's USB disk, and the command waits for the hub to come back as a CAN adapter and report the new version. Both arm buses go quiet for a few seconds while it reboots. Needs root.
+Installs the firmware that ships with `axol` (`almond_axol/hub/axol_hub.uf2`) on the Axol Hub or the Mantis Hub. Both hubs are the same board and run the same firmware. The hub restarts into its bootloader, takes the new image and comes back as a CAN adapter. Both of its buses go quiet for a few seconds while it restarts.
+
+Flashing needs root. Run the command as your normal user: it finds the hubs and asks its questions first, then asks for your `sudo` password.
 
 | Flag | Description |
 |---|---|
-| `--port PORT` | USB port path of the hub to flash (e.g. `1-3`, as printed by [`hub.info`](/cli/hub-info)). Also flashes a hub that is sitting in its bootloader, which has no CAN interfaces to find it by. Default: every outdated hub behind the configured arm channels |
+| `--port PORT` | USB port of the hub to flash, such as `1-3`, as printed by [`hub.info`](/cli/hub-info). Also flashes a hub in its bootloader without asking. Default: every outdated hub, plus any bootloader you confirm at the prompt |
 | `--force` | Flash even when the hub already runs the bundled version |
 
 ```bash
-sudo axol hub.flash
-sudo axol hub.flash --port 1-3
-sudo axol hub.flash --force
+axol hub.flash
+axol hub.flash --port 1-3
+axol hub.flash --force
 ```
 
 <Note>
-  You normally never need this: every arm bring-up (teleop, data collection, policy runs and control-panel operations — whatever connects the arms through `Axol`) checks the hub's firmware version and reflashes an outdated hub automatically before any bus is opened. The hosted `axol serve` is root and flashes directly; a manual session asks for `sudo`. If it cannot escalate, the session keeps running on the old firmware and logs an error naming `sudo axol hub.flash`. Set `AXOL_HUB_FLASH=0` to skip the automatic update.
+  You rarely need this command for the Axol Hub. Every operation that connects the arms, such as teleop, data collection, policy runs and control panel operations, checks the hub's firmware and updates an outdated hub before it opens a bus. If the update can't get root, the operation runs on the old firmware and logs an error that names `axol hub.flash`. Set `AXOL_HUB_FLASH=0` to turn off the automatic update.
+
+  The Mantis Hub is not updated automatically. Plug it in and run `axol hub.flash`.
 </Note>
 
 <Warning>
-  A hub whose firmware predates 2026-08-17 cannot be rebooted into its bootloader from the host, so it needs **one manual flash**: unplug it, hold its BOOTSEL button while plugging it back in, then run `sudo axol hub.flash --port <port>`. After that, updates are automatic. A hub left in its bootloader by an interrupted flash fails the bring-up; re-running `hub.flash --port` recovers it.
+  If `hub.flash` says the hub's firmware is too old to update over USB, flash it once by hand:
+
+  1. Unplug the hub.
+  2. Flip the **BOOTSEL** switch next to the hub's USB port.
+  3. Plug the hub back in. It starts in its bootloader.
+  4. Run `axol hub.flash`. It reports that the hub restarted into its bootloader.
+  5. Flip the **BOOTSEL** switch back, then unplug the hub and plug it back in. The hub starts the new firmware.
+
+  The hub reads the switch only when it powers on, so replug the hub after each flip. After this manual flash, updates are automatic.
+
+  The same steps recover a hub whose LED is on but that never shows a CAN interface in `ip link show`. If a flash was interrupted and the hub is stuck in its bootloader, arm bring-up fails. Run `hub.flash` again to recover it.
 </Warning>
 
-The hub's firmware decides what happens to motor commands when the bus dies. Since firmware 2.00, a USB reset ends the hub's CAN session and discards anything it had queued, and a frame that cannot be sent within 50 ms is dropped, so a command parked behind an emergency stop can no longer reach the motors when power returns. Firmware 2.01 also reports when nothing on a bus acknowledges frames, which is how the realtime core now detects a cut motor supply (see [`can.setup`](/cli/can-setup)).
+A bootloader doesn't identify itself, so it could belong to any RP2350 board. `hub.flash` asks before it flashes one. Without a terminal it prints the `--port` command instead. Pass `--port` to flash it without asking.
+
+The hub firmware drops queued motor commands when a bus stops responding. A command sent right before an emergency stop can't reach the motors when power returns. The firmware also reports when nothing on a bus acknowledges frames, which is how Axol detects that motor power was cut. See [`can.setup`](/cli/can-setup#recovery-after-an-emergency-stop).

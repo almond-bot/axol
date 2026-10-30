@@ -136,9 +136,9 @@ def _validate_controller(status: LiftStatus, context: str) -> None:
     )
     if any(value is None for value in driver_fields):
         raise DiagnosticFailure(
-            f"{context}: the controller returned a legacy six-byte status "
-            "without driver/interlock health; flash the current (v0.8) Jelly Legs "
-            "firmware before running this diagnostic"
+            f"{context}: the lift firmware is too old to report driver health. "
+            "Update it to v0.8 or newer with axol lift.update, then run this "
+            "test again."
         )
     if status.driver_fault_mask:
         raise DiagnosticFailure(
@@ -146,8 +146,9 @@ def _validate_controller(status: LiftStatus, context: str) -> None:
         )
     if status.flash_interlock:
         raise DiagnosticFailure(
-            f"{context}: the saved-position flash interlock is active; reboot "
-            "the Jelly Legs controller before moving"
+            f"{context}: the lift controller has locked motion (saved-position "
+            "flash interlock). Power-cycle the Jelly lift controller, then try "
+            "again."
         )
     if not status.vm_present:
         raise DiagnosticFailure(f"{context}: the 24 V motor supply is not present")
@@ -361,8 +362,8 @@ async def _move_lift(
         # an endurance cycle to continue.
         if status.pos_move and status.save_pending is not True:
             raise DiagnosticFailure(
-                f"{label}: controller did not report the v0.8 position-save "
-                "state; flash the current Jelly Legs firmware before cycling"
+                f"{label}: the lift firmware is too old to report its position "
+                "saves. Update it to v0.8 or newer with axol lift.update."
             )
         now = time.monotonic()
         if now >= deadline:
@@ -407,8 +408,8 @@ async def _open_lift(channel: str) -> Lift:
             await asyncio.sleep(0.05)
         if lift.status is None:
             raise DiagnosticFailure(
-                f"no Jelly Legs status on {channel}; check that the base is "
-                "powered and the lift controller is connected"
+                f"The Jelly lift controller did not answer on {channel}. Check "
+                "that Jelly is powered on and the lift is connected."
             )
         _require_fresh_status(lift, "initial status")
         first_stamp = lift.last_status_monotonic
@@ -1197,21 +1198,22 @@ def _add_arguments(
         type=int,
         required=cycles_required,
         default=None,
-        help="Positive number of complete down/up cycles; prompts when omitted.",
+        help="Number of full down-and-up cycles. The command asks for it if you "
+        "leave it out.",
     )
     parser.add_argument(
         "--lift-channel",
         default=None,
         metavar="IFACE",
-        help="SocketCAN interface carrying Jelly Legs (default: "
-        f"{CAN_CHEST} when that chest bus exists, otherwise the shared wheel "
-        f"bus {CAN_BASE}).",
+        help="CAN interface for the Jelly lift (default: "
+        f"{CAN_CHEST} if it exists, otherwise the wheel bus {CAN_BASE}).",
     )
     parser.add_argument(
         "--speed",
         type=_speed_value,
         default=0,
-        help="Lift speed cap in counts/s: 0 for full speed, or 250-65535.",
+        help="Lift speed limit in encoder counts per second. 0 means full speed. "
+        "Otherwise use 250 to 65535.",
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
@@ -1233,7 +1235,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     """Register ``diag.lift-cycle`` for dashboard schema introspection."""
     parser = subparsers.add_parser(
         "diag.lift-cycle",
-        help="Move S1 to clearance, then cycle the lift down/up.",
+        help="Raise shoulder_1 for clearance, then run the lift down and up.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -1256,7 +1258,7 @@ def run_cli(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="axol diag.lift-cycle",
-        description="Cycle Jelly Legs with the mounted Axol arms at clearance.",
+        description="Run the Jelly lift down and up with the Axol arms raised clear.",
     )
     _add_arguments(parser, cycles_required=False)
     run_cli(parser.parse_args(argv))

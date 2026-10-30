@@ -24,6 +24,7 @@ from typing import Any
 
 import numpy as np
 
+from .. import progress
 from ..constants import ARM_JOINTS
 from ..robot.base import HardwareCleanupError
 from ..rt import Mantis
@@ -93,7 +94,9 @@ async def run_grippers_only(
     left_channel: str,
     right_channel: str,
     *,
-    reader_factory: Callable[[str], Any] = TriggerReader,
+    left_trigger_full_scale: float = 1.0,
+    right_trigger_full_scale: float = 1.0,
+    reader_factory: Callable[..., Any] = TriggerReader,
     robot_factory: Callable[..., Any] = _rt_mantis,
     wait_timeout: float = _TRIGGER_WAIT_TIMEOUT_S,
     poll_interval: float = _CONTROL_INTERVAL_S,
@@ -108,23 +111,31 @@ async def run_grippers_only(
     command.
     """
     channels = {"left": left_channel, "right": right_channel}
+    full_scales = {
+        "left": left_trigger_full_scale,
+        "right": right_trigger_full_scale,
+    }
     readers: dict[str, Any] = {}
     robot: Any | None = None
     status_started = False
 
     try:
         for side, channel in channels.items():
-            readers[side] = reader_factory(channel)
+            readers[side] = reader_factory(channel, full_scale=full_scales[side])
 
         # Deferred mode lets us establish a known torque-off state before the
         # input preflight. No gripper is enabled until both trigger streams are
         # demonstrably live and released.
+        progress.plan(["arms", "triggers", "grippers"])
+        progress.step("arms")
         robot = robot_factory(
             left_channel=left_channel,
             right_channel=right_channel,
             defer_gripper_enable=True,
         )
         await robot.connect()
+
+        progress.step("triggers")
 
         print("Waiting for fresh, released trigger frames ...")
         await _wait_for_released_triggers(
@@ -138,6 +149,7 @@ async def run_grippers_only(
             "Calibrating the grippers against their open stops (both jaws move "
             "fully open — keep hands and objects clear) ..."
         )
+        progress.step("grippers")
         await robot.enable_grippers()
 
         # Calibration may take several seconds. Require the safety condition
@@ -150,6 +162,7 @@ async def run_grippers_only(
         )
 
         print("Ready. Squeeze either trigger; Stop / Ctrl-C ends the run.")
+        progress.ready()
         target_size = len(ARM_JOINTS) + 1
         left_target = np.zeros(target_size, dtype=np.float32)
         right_target = np.zeros(target_size, dtype=np.float32)

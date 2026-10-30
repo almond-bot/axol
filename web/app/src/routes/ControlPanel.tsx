@@ -1,13 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, RefreshCw } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
+import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
+  parseAxolModel,
+  parseGripper,
   JELLY_DEVICES,
   JELLY_DEVICE_LABELS,
   OPERATIONS,
+  fetchDatasets,
   cameraCount,
+  cameraSerials,
   canDiscoveryRequestCanRetry,
   clearOperationLockout,
   detectCameras,
@@ -47,15 +52,16 @@ import {
   type CameraSpec,
   type CanDeviceInventory,
   type CanDiscoveryState,
+  type AxolMount,
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
+  type DatasetInfo,
   type FormValue,
   type HardwareProfile,
   type JellyDevice,
   type JellyStatus,
   type OperationId,
-  type OperationMeta,
   type PolicyState,
   type RobotStatus,
   type ServerInfo,
@@ -87,23 +93,94 @@ import { UpdateBanner } from "@/components/update-banner"
 import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
 import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
-import { OperationPanel } from "@/components/operation-panel"
+import { OperationPanel, type BlockerFix } from "@/components/operation-panel"
+import { OperationLauncher, type LauncherItem } from "@/components/operation-launcher"
+import {
+  AttentionList,
+  ConnectHero,
+  DevicesRow,
+  HardwareNoticeCard,
+  type DeviceSummary,
+  QuickStart,
+  RecentDatasets,
+  RunningCard,
+  type AttentionItem,
+} from "@/components/control-home"
+import {
+  catalogEntry,
+  catalogMeta,
+  launcherEntries,
+  operationStatus,
+  quickStartOperations,
+  recentOperations,
+  rememberOperation,
+} from "@/lib/operation-catalog"
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
+import { DataCollectionOffer } from "@/components/data-collection-offer"
+import { RequestPage } from "@/components/request-data"
+import { requestSource } from "@/lib/data-collection"
+import {
+  deviceErrorText,
+  discoveryNeedsRecheck,
+  discoveryNotice,
+  jellyPresentOnCan,
+  nextRecheckDelay,
+  useSettledDiscovery,
+} from "@/lib/hardware-status"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
+import { useStartupView } from "@/lib/operation-progress"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
-import { defaultSettingsTab, type SettingsScope, type SettingsTab } from "@/lib/settings-scope"
+import { MountChooser, MountRequired } from "@/components/settings/mount-required"
+import {
+  SETTINGS_SCOPES,
+  camerasSettingsTab,
+  defaultSettingsTab,
+  settingsScopeForTab,
+  type SettingsScope,
+  type SettingsTab,
+} from "@/lib/settings-scope"
 import { loadHostHistory, recordHost } from "@/lib/host-history"
-import { SiteNav } from "@/components/site-nav"
+import { AppShell, type HostSummary, type NavBadges } from "@/components/app-shell"
+import { jellyDeviceView, type StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
 import { Button } from "@/components/ui/button"
+import type { SimRobot } from "@/components/sim-robot-picker"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
+/** The pages of the control panel, one per sidebar item. */
+type ControlView =
+  | "overview"
+  | "operations"
+  | "datasets"
+  | "request-data"
+  | "request-teleoperator"
+  | "devices"
+  | "settings"
+  | "logs"
+
+const CONTROL_VIEWS: Record<string, ControlView> = {
+  "": "overview",
+  operations: "operations",
+  datasets: "datasets",
+  "request-data": "request-data",
+  "request-teleoperator": "request-teleoperator",
+  devices: "devices",
+  settings: "settings",
+  logs: "logs",
+}
+
+/** `/control/settings/cameras` → `{ view: "settings", rest: "cameras" }`. */
+function parseControlPath(pathname: string): { view: ControlView | null; rest: string | null } {
+  const [section = "", rest] = pathname.replace(/^\/control\/?/, "").split("/")
+  return { view: CONTROL_VIEWS[section] ?? null, rest: rest ? decodeURIComponent(rest) : null }
+}
+
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
-  mantis_serials: { left_arm: "", right_arm: "" },
+  mantis_serials: { overhead: "", left_arm: "", right_arm: "" },
   stream_resolution: "SVGA",
   record_resolution: "SVGA",
   stream: {},
@@ -115,17 +192,12 @@ function loadCameras(): CameraSpec {
     const raw = localStorage.getItem("axolCameraSpec")
     if (raw) {
       const parsed = JSON.parse(raw)
+      const serials = { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) }
       return {
         ...DEFAULT_CAMERAS,
         ...parsed,
-        serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
-        mantis_serials: {
-          ...DEFAULT_CAMERAS.mantis_serials,
-          ...(parsed.mantis_serials ?? {
-            left_arm: parsed.serials?.left_arm ?? "",
-            right_arm: parsed.serials?.right_arm ?? "",
-          }),
-        },
+        serials,
+        mantis_serials: cameraSerials({ serials, mantis_serials: parsed.mantis_serials }, true),
         // Migrate the legacy single `resolution` to the streaming resolution.
         stream_resolution:
           parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
@@ -149,9 +221,43 @@ function persistLocalCameras(spec: CameraSpec) {
   }
 }
 
+const SIM_ROBOT_KEY = "axolSimRobot"
+
+/** The sim robot this browser last picked, if it is still a valid one. */
+function loadSimRobot(): SimRobot | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(SIM_ROBOT_KEY) ?? "null")
+    const model = parseAxolModel(raw?.model)
+    return model ? { model, gripper: parseGripper(raw?.gripper) } : null
+  } catch {
+    return null
+  }
+}
+
 export default function ControlPanel() {
   const toast = useToast()
+  const location = useLocation()
+  const navigate = useNavigate()
+  const { view, rest: pathRest } = parseControlPath(location.pathname)
   const [commands, setCommands] = useState<CommandSpec[]>([])
+
+  // Back from Stripe's checkout page for a Teleop Data Collection request: confirm
+  // the outcome once, then drop the marker from the address.
+  const handledCheckoutRef = useRef<string | null>(null)
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const outcome = params.get("data_collection")
+    if (!outcome || handledCheckoutRef.current === location.search) return
+    handledCheckoutRef.current = location.search
+    if (outcome === "paid") {
+      toast.success("Payment received. Almond will email you to schedule the work.", 12000)
+    } else if (outcome === "cancelled") {
+      toast.info("Request cancelled. You weren't charged.")
+    }
+    params.delete("data_collection")
+    const search = params.toString()
+    navigate({ pathname: location.pathname, search: search ? `?${search}` : "" }, { replace: true })
+  }, [location.pathname, location.search, navigate, toast])
   const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
     () => localStorage.getItem("axolServerHost") ?? ""
@@ -178,6 +284,7 @@ export default function ControlPanel() {
   const [updatePhase, setUpdatePhase] = useState<UpdatePhase | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
+  const [simRobotChoice, setSimRobotChoice] = useState<SimRobot | null>(loadSimRobot)
   const [robotBusy, setRobotBusy] = useState(false)
   // A backend restart can leave the tab's old auto-connect latch intact. A
   // failed status poll followed by recovery starts a new connection epoch,
@@ -221,7 +328,6 @@ export default function ControlPanel() {
   // The backend owns the real single-flight. This per-tab latch prevents the
   // 2s inventory poll from sending duplicate requests for one hardware epoch.
   const automaticCanDiscoveryAttemptsRef = useRef(new Set<string>())
-  const canDiscoveryNoticesRef = useRef(new Set<string>())
   // A successful response without profile summaries identifies an older host;
   // retain its historical selected-profile auto-connect behavior.
   const [legacyCanInventory, setLegacyCanInventory] = useState(false)
@@ -242,7 +348,6 @@ export default function ControlPanel() {
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
-  const [settingsOpen, setSettingsOpen] = useState(() => cameraCount(loadCameras()) === 0)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
   // until fetched. settingsError marks a host too old for the settings API —
   // cameras then fall back to the legacy localStorage flow.
@@ -292,10 +397,18 @@ export default function ControlPanel() {
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("cameras")
-  // Anchor for the on-page settings card, so "…live in Settings" links can
-  // scroll to it.
-  const settingsRef = useRef<HTMLDivElement>(null)
+  // The settings tab lives in the URL (/control/settings/<tab>) so it can be
+  // linked and survives a reload; the last one seen reopens from the sidebar.
+  const urlSettingsTab = view === "settings" ? pathRest : null
+  const [lastSettingsTab, setLastSettingsTab] = useState<SettingsTab>("cameras")
+  const settingsTab = urlSettingsTab ?? lastSettingsTab
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (urlSettingsTab) setLastSettingsTab(urlSettingsTab)
+  }, [urlSettingsTab])
+  // Staged, unsaved settings edits: flagged on the sidebar so they aren't lost
+  // track of on another page (the draft itself survives page changes).
+  const [settingsDirty, setSettingsDirty] = useState(false)
   // Every API helper targets the module-level server base. A slow response
   // from the previous host must therefore never update this host's UI (or
   // trigger the legacy camera-settings migration against the new host).
@@ -303,14 +416,6 @@ export default function ControlPanel() {
   const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
-
-  const hasConfiguredCamera = cameraCount(cameras) > 0
-  useEffect(() => {
-    // Keep setup in view until the first camera is assigned. Later camera
-    // presence changes drive the default state, but manual toggles stay put.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSettingsOpen(!hasConfiguredCamera)
-  }, [hasConfiguredCamera])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -401,7 +506,6 @@ export default function ControlPanel() {
       voidCanInventoryPolls(canInventoryPollRef.current)
       setLegacyCanInventory(false)
       automaticCanDiscoveryAttemptsRef.current.clear()
-      canDiscoveryNoticesRef.current.clear()
       setUsb(null)
       setUsbBusy(false)
       setSession(null)
@@ -678,7 +782,6 @@ export default function ControlPanel() {
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     // The Jelly links restart disconnected with their manual-disconnect pause
     // forgotten too, so this tab's latches must not outlive the process.
     autoJellyAttemptsRef.current.clear()
@@ -777,7 +880,6 @@ export default function ControlPanel() {
     canInventoryKnownRef.current = false
     sessionInventoryKnownRef.current = false
     automaticCanDiscoveryAttemptsRef.current.clear()
-    canDiscoveryNoticesRef.current.clear()
     resetAutoRobotRetry()
     manualRobotOverrideRef.current = false
     previousDesiredProfileRef.current = null
@@ -790,9 +892,19 @@ export default function ControlPanel() {
   }
 
   function openSettings(tab: SettingsTab = "cameras") {
-    setSettingsTab(tab)
-    setSettingsOpen(true)
-    settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    navigate(`/control/settings/${encodeURIComponent(tab)}`)
+  }
+
+  function openOperation(op: OperationId) {
+    selectOp(op)
+    navigate(`/control/operations/${encodeURIComponent(op)}`)
+  }
+
+  // Back to the live run: its own panel, with its episode controls and Stop,
+  // whatever operation was selected before.
+  function openRunningOperation() {
+    if (runningOp) openOperation(runningOp)
+    else navigate("/control/operations")
   }
 
   // A connection tile opens its own settings scope on that scope's first tab.
@@ -811,6 +923,9 @@ export default function ControlPanel() {
   const hardwareProfile: HardwareProfile = hostStoresHardwareProfile
     ? (parseHardwareProfile(settingsSnap?.values[HARDWARE_PROFILE_SETTING]) ?? "axol")
     : localHardwareProfile
+  // Axol and Mantis keep separate camera layouts: the prompt to assign cameras
+  // is about the selected device's.
+  const selectedHasCamera = cameraCount(cameras, hardwareProfile === "mantis") > 0
 
   // Resolves false only when the host rejected the save (the optimistic
   // selection was reverted), so the automatic selection can retry it.
@@ -885,14 +1000,14 @@ export default function ControlPanel() {
       if (changedDesiredProfile) manualRobotOverrideRef.current = false
       const label =
         changedChannelProfiles.length === 2
-          ? "CAN mappings"
-          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN mapping`
+          ? "CAN channels"
+          : `${changedChannelProfiles[0] === "mantis" ? "Mantis" : "Axol"} CAN channels`
       if (!changedDesiredProfile) {
-        toast.info(`${label} saved. It will apply the next time that hardware connects.`)
+        toast.info(`${label} saved. They apply the next time that hardware connects.`)
       } else if (isLive || robot?.state === "busy") {
-        toast.info(`${label} saved. The link will reconnect when this run stops.`)
+        toast.info(`${label} saved. The robot reconnects when this run stops.`)
       } else {
-        toast.info(`${label} saved. Reconnecting the link when its configured bus is detected…`)
+        toast.info(`${label} saved. Reconnecting when the CAN bus is detected…`)
       }
     }
   }
@@ -911,11 +1026,40 @@ export default function ControlPanel() {
       ? all.filter((o) => o.supportsMantis || o.id === liveCommand)
       : all
   }, [commands, hardwareProfile, liveCommand])
+  // An operation's own screen (/control/operations/<id>) decides which
+  // operation is selected; the launcher and other pages keep the last one.
+  const routeOp = view === "operations" ? pathRest : null
+  const currentOp = routeOp ?? selectedOp
   const meta = useMemo(
-    () => operations.find((o) => o.id === selectedOp) ?? operations[0],
-    [operations, selectedOp]
+    () => operations.find((o) => o.id === currentOp) ?? catalogMeta(currentOp) ?? operations[0],
+    [operations, currentOp]
   )
   const opId = meta.id
+  // The host's own description of this operation, when it has one: the app's
+  // catalog name and icon otherwise.
+  const hostOffersOp = operations.some((o) => o.id === opId)
+  useEffect(() => {
+    if (!routeOp) return
+    localStorage.setItem("axolOp", routeOp)
+    rememberOperation(routeOp)
+  }, [routeOp])
+
+  // The newest datasets on the host, for Home; read again on each visit.
+  const [recentDatasets, setRecentDatasets] = useState<DatasetInfo[] | null>(null)
+  useEffect(() => {
+    if (conn.state !== "ok" || view !== "overview") return
+    let active = true
+    fetchDatasets()
+      .then((found) => {
+        if (active) setRecentDatasets(found.slice(0, 4))
+      })
+      .catch(() => {
+        if (active) setRecentDatasets(null)
+      })
+    return () => {
+      active = false
+    }
+  }, [conn.state, view, connectionGeneration])
 
   function selectOp(op: OperationId) {
     setSelectedOp(op)
@@ -927,7 +1071,57 @@ export default function ControlPanel() {
   // The device selection is system-wide: a Mantis-capable operation runs on
   // Mantis whenever it is selected, and the idle link auto-connects to it.
   const mantisMode = meta.supportsMantis && hardwareProfile === "mantis"
+  // An Axol is connected: its robot model can be picked (until then the
+  // picker previews only, like the Jelly card until Jelly is attached).
+  const axolConnected = robot?.state === "connected" && (robot?.profile ?? "axol") === "axol"
+  // No robot model picked yet: a host that offers the pick (kinematics.mount)
+  // and has none saved, on Axol without Jelly (Jelly is detected, never
+  // picked). The pick shows above the settings and gates Axol runs until saved.
+  //
+  // It waits for CAN discovery to settle: hardware still being identified
+  // may be the Jelly, which would make the pick moot. (Hosts that predate
+  // discovery report none: settled.)
+  const canDiscoverySettled =
+    canDiscovery == null || canDiscovery.status === "ready" || canDiscovery.status === "configured"
+  //
+  // Jelly's CAN interfaces being present is enough: Axol sits on Jelly even
+  // with its wheels and lift switched off in settings (which makes the host
+  // report the mount-derived model instead of "mobile").
+  const needsMount =
+    conn.state === "ok" &&
+    canDiscoverySettled &&
+    !settingsError &&
+    hardwareProfile !== "mantis" &&
+    settingsSnap?.robotModel !== "mobile" &&
+    jellyPresentOnCan(canDevices) !== true &&
+    (settingsSnap?.schema ?? []).some((c) =>
+      c.settings.some((f) => f.key === "kinematics.mount")
+    ) &&
+    settingsSnap?.values["kinematics.mount"] == null
   const desiredHardwareProfile: HardwareProfile = hardwareProfile
+  // The robot sim runs simulate: this browser's last pick, else the robot this
+  // host is (its model and fitted gripper).
+  const simRobot: SimRobot = simRobotChoice ?? {
+    model: settingsSnap?.robotModel ?? "classic",
+    gripper: parseGripper(settingsSnap?.values["axol.gripper"]),
+  }
+
+  // The host derives the robot model (robotModel) from whether Jelly's CAN
+  // interfaces are present — but the panel only fetches it with the
+  // settings. Follow the 2 s CAN inventory instead of a one-off answer:
+  // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
+  // that comes up a moment after the panel connects turns the robot into
+  // Axol on Jelly (and drops the "What is Axol mounted on?" pick) without a reload.
+  const jellyPresent = jellyPresentOnCan(canDevices)
+  const robotModelInputs = conn.state === "ok" ? `${jellyPresent}:${canDiscoverySettled}` : null
+  const robotModelInputsRef = useRef<string | null>(null)
+  useEffect(() => {
+    const prev = robotModelInputsRef.current
+    robotModelInputsRef.current = robotModelInputs
+    if (prev !== null && robotModelInputs !== null && prev !== robotModelInputs) {
+      void loadSettings()
+    }
+  }, [robotModelInputs, loadSettings])
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -963,14 +1157,18 @@ export default function ControlPanel() {
           return null
         setRobot(status)
         if (!status.connected) {
-          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+          throw new Error(
+            status.error ?? `Could not connect to ${profile === "mantis" ? "Mantis" : "Axol"}.`
+          )
         }
         if (!automatic) manualRobotOverrideRef.current = true
         return true
       } catch (e) {
         if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
           return null
-        if (!automatic) toast.error(String(e))
+        if (!automatic) {
+          toast.error(deviceErrorText(String(e), profile === "mantis" ? "Mantis" : "Axol"))
+        }
         return false
       } finally {
         if (autoRobotMountedRef.current && generation === connectionGenerationRef.current)
@@ -993,7 +1191,7 @@ export default function ControlPanel() {
       if (generation !== connectionGenerationRef.current) return
       setRobot(status)
       if (status.state !== "disconnected") {
-        throw new Error(status.error ?? "Could not disconnect the robot CAN link")
+        throw new Error(status.error ?? "Could not disconnect the robot.")
       }
       manualRobotOverrideRef.current = true
     } catch (e) {
@@ -1016,7 +1214,7 @@ export default function ControlPanel() {
         setJelly(status)
         if (!status[device].connected) {
           throw new Error(
-            status[device].error ?? `Could not connect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not connect to ${JELLY_DEVICE_LABELS[device]}.`
           )
         }
         return true
@@ -1043,7 +1241,7 @@ export default function ControlPanel() {
         setJelly(status)
         if (status[device].state !== "disconnected") {
           throw new Error(
-            status[device].error ?? `Could not disconnect the ${JELLY_DEVICE_LABELS[device]} link`
+            status[device].error ?? `Could not disconnect from ${JELLY_DEVICE_LABELS[device]}.`
           )
         }
       } catch (e) {
@@ -1083,6 +1281,15 @@ export default function ControlPanel() {
     (best, s) => (best && rank(best) >= rank(s) ? best : s),
     null
   )
+  // Startup steps come from the status poll: the logs WebSocket sends its
+  // session once, when the run starts, so its copy never advances.
+  const runProgress =
+    session && session.id === effectiveStatus?.id ? session.progress : effectiveStatus?.progress
+  // What the running operation is doing while it starts (null once ready).
+  const runningStartup = useStartupView(runProgress, {
+    device: effectiveStatus?.args?.[HARDWARE_PROFILE_ARG] ? "Mantis" : "Axol",
+    sim: Boolean(effectiveStatus?.args?.sim),
+  })
   const isLive =
     sources.some(
       (s) => s.status === "running" || s.status === "starting" || s.status === "stopping"
@@ -1092,6 +1299,10 @@ export default function ControlPanel() {
   // disabled "Stopping…" until a terminal status flips the op back to idle.
   const isStopping = isLive && sources.some((s) => s.status === "stopping")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
+  // Names shown to the operator: the command's label, not its id.
+  const commandLabel = (id: string | null | undefined) =>
+    id ? (commands.find((c) => c.id === id)?.label ?? id) : null
+  const runningLabel = commandLabel(runningOp)
   const selectedLive = isLive && runningOp === opId
   const selectedStopping = isStopping && runningOp === opId
 
@@ -1104,11 +1315,10 @@ export default function ControlPanel() {
   // Shared by the update banner and the host tile's power confirmations.
   const hostBusy = isLive || hardwareSessionBusy || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
-  const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
-  const canDiscoveryNeedsRetry =
-    canDiscovery?.status === "partial" ||
-    canDiscovery?.status === "unidentified" ||
-    canDiscovery?.status === "error"
+  const updateBusyReason = isLive ? "Stop the running operation" : "The Host Computer is busy"
+  const settledCanDiscovery = useSettledDiscovery(canDiscovery)
+  const canDiscoveryNeedsRetry = discoveryNeedsRecheck(settledCanDiscovery)
+  const canDiscoveryChecking = canDiscoveryRetryBusy || canDiscovery?.status === "running"
 
   // Bring up each detected Jelly device once per (device, interface, server
   // epoch), the way the Axol/Mantis link auto-connects: only from an idle
@@ -1152,7 +1362,11 @@ export default function ControlPanel() {
     sessionInventoryReady,
   ])
 
-  const retryCanIdentification = useCallback(async () => {
+  // Check plugged-in hardware that hasn't answered again. Quiet: the notice
+  // on Overview and Devices says what is wrong until it answers, so neither
+  // a pass that still finds it silent nor a refused request is news.
+  const [recheckTick, setRecheckTick] = useState(0)
+  const recheckCanHardware = useCallback(async () => {
     if (canDiscoveryRetryBusy) return
     const hostGeneration = connectionGenerationRef.current
     setCanDiscoveryRetryBusy(true)
@@ -1161,24 +1375,43 @@ export default function ControlPanel() {
       if (!autoRobotMountedRef.current || hostGeneration !== connectionGenerationRef.current) return
       canInventoryKnownRef.current = true
       installCanInventory(inventory)
-      const result = inventory.discovery
-      if (result?.status === "configured" || result?.status === "ready") {
-        toast.success("CAN hardware identified")
-      } else if (result?.status === "partial") {
-        toast.warning(result.message ?? "Some CAN hardware still needs identification")
-      } else {
-        toast.error(result?.message ?? "CAN hardware could not be identified")
-      }
-    } catch (error) {
-      if (hostGeneration === connectionGenerationRef.current) {
-        toast.error(`CAN identification failed: ${String(error)}`)
-      }
+    } catch {
+      // Busy, rate-limited or unreachable: the next check tries again.
     } finally {
       if (hostGeneration === connectionGenerationRef.current) {
         setCanDiscoveryRetryBusy(false)
+        setRecheckTick((n) => n + 1)
       }
     }
-  }, [canDiscoveryRetryBusy, installCanInventory, toast])
+  }, [canDiscoveryRetryBusy, installCanInventory])
+
+  // Hardware that is plugged in but silent is nearly always switched off, and
+  // turning it on changes nothing the host can see. So check it again on its
+  // own, backing off from 5 s to a minute, while nothing could be disturbed:
+  // the host idle and neither Axol nor Mantis connected (a check may briefly
+  // take an idle link down). With a link up, "Check again" does it by hand.
+  const recheckDelayRef = useRef<number | null>(null)
+  const robotLinkFree = !robot || robot.state === "disconnected" || robot.state === "error"
+  const canRecheckOnItsOwn =
+    conn.state === "ok" &&
+    canDiscoveryNeedsRetry &&
+    robotLinkFree &&
+    !hostBusy &&
+    !activeCommandSession &&
+    !robotBusy &&
+    !canDiscoveryChecking
+  useEffect(() => {
+    if (!canDiscoveryNeedsRetry) recheckDelayRef.current = null
+  }, [canDiscoveryNeedsRetry])
+  useEffect(() => {
+    if (!canRecheckOnItsOwn) return
+    const delay = nextRecheckDelay(recheckDelayRef.current)
+    const timer = window.setTimeout(() => {
+      recheckDelayRef.current = delay
+      void recheckCanHardware()
+    }, delay)
+    return () => window.clearTimeout(timer)
+  }, [canRecheckOnItsOwn, recheckTick, recheckCanHardware])
 
   // A fresh Axol/Mantis hub or Jelly base/lift adapter initially appears only
   // as anonymous canX devices. Ask the server to probe and persist its role
@@ -1227,10 +1460,8 @@ export default function ControlPanel() {
           // the cross-tab single-flight and per-hardware rate-limit authority.
           automaticCanDiscoveryAttemptsRef.current.delete(attemptKey)
         }
-        const noticeKey = `request:${attemptKey}`
-        if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-        canDiscoveryNoticesRef.current.add(noticeKey)
-        toast.error(`Automatic CAN discovery failed: ${String(error)}`)
+        // Otherwise the result stands as the discovery state, which the
+        // hardware notice turns into what to do.
       })
   }, [
     activeCommandSession,
@@ -1245,29 +1476,6 @@ export default function ControlPanel() {
     robotBusy,
     toast,
   ])
-
-  // Silent, ambiguous, or only partially identified hardware requires an
-  // operator decision. Surface the server's actionable result once per
-  // hardware generation, not every poll.
-  useEffect(() => {
-    if (
-      conn.state !== "ok" ||
-      !canDiscovery ||
-      (canDiscovery.status !== "partial" &&
-        canDiscovery.status !== "unidentified" &&
-        canDiscovery.status !== "error")
-    )
-      return
-    const noticeKey = `${connectionGenerationRef.current}:${currentCanServerEpoch()}:${canDiscovery.generation}:${canDiscovery.status}`
-    if (canDiscoveryNoticesRef.current.has(noticeKey)) return
-    canDiscoveryNoticesRef.current.add(noticeKey)
-    const fallback =
-      canDiscovery.status === "unidentified"
-        ? "Power the attached hardware, then use Retry CAN identification below."
-        : "Run axol can.setup in a terminal if the problem continues."
-    if (canDiscovery.status === "partial") toast.warning(canDiscovery.message ?? fallback)
-    else toast.error(canDiscovery.message ?? fallback)
-  }, [canDiscovery, canServerInstanceId, conn.state, currentCanServerEpoch, toast])
 
   // Pick from hardware actually present on the host. If only one configured
   // profile exists, connect it; if both exist, the selected operation wins.
@@ -1549,7 +1757,9 @@ export default function ControlPanel() {
           setUpdateAbandoned(true)
           setStartingUpdate(false)
           setUpdatePhase(null)
-          toast.error("The robot has not come back from the update. Reload to retry.")
+          toast.error(
+            "The robot did not come back online after the update. Reload the page to try again."
+          )
         }
         return
       }
@@ -1596,7 +1806,12 @@ export default function ControlPanel() {
     toast.warning(updateWarning)
   }, [canServerInstanceId, conn.state, connectionGeneration, toast, updateWarning])
 
-  const spec = useMemo(() => commands.find((c) => c.id === opId) ?? null, [commands, opId])
+  // Only an operation the host offers on the selected device can run: a
+  // Mantis host's Axol-only operation opened by its address stays off.
+  const spec = useMemo(
+    () => (hostOffersOp ? (commands.find((c) => c.id === opId) ?? null) : null),
+    [commands, opId, hostOffersOp]
+  )
 
   // Stop the running task (if any) and wait for it to actually exit before
   // returning, so a disconnect never tears the host/robot link down mid-cleanup.
@@ -1639,7 +1854,7 @@ export default function ControlPanel() {
       // never be blocked by camera detection, and sim never touches hardware.
       const mantisSelected = mantisMode
       if (hardwareProfile === "mantis" && !meta.supportsMantis) {
-        toast.error(`${meta.label} runs on Axol only — select the Axol tile first.`)
+        toast.error(`${meta.label} runs on Axol only. Select the Axol tile first.`)
         return
       }
       // Sim is an Axol run mode; it is hidden (and ignored) on Mantis, so only
@@ -1663,7 +1878,7 @@ export default function ControlPanel() {
           detErr = detect.error
         }
         if (detErr) {
-          toast.error(`Can't verify cameras: ${detErr}`)
+          toast.error(`Could not check the cameras: ${detErr}`)
           return
         }
         const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected, {
@@ -1674,7 +1889,7 @@ export default function ControlPanel() {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
               ", "
-            )}. Reconnect, then Refresh (or Restart daemon) in the Cameras dialog.`
+            )}. Reconnect the camera, then restart the camera service in Cameras settings.`
           )
           return
         }
@@ -1699,6 +1914,13 @@ export default function ControlPanel() {
       if (mantisSelected) {
         args[HARDWARE_PROFILE_ARG] = true
         if (meta.id === "collect-data") args.mantis_source = mantisSource
+      }
+      // A sim run simulates the robot picked for it (the "Sim robot" roster),
+      // which may differ from the robot's saved model; a run's args override
+      // the shared settings.
+      if (isSimSelected) {
+        args["kinematics.robot_model"] = simRobot.model
+        if (simRobot.model === "mobile") args["axol.gripper"] = simRobot.gripper
       }
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
@@ -1752,7 +1974,7 @@ export default function ControlPanel() {
       await clearOperationLockout()
       if (generation !== connectionGenerationRef.current) return
       setLockout(false)
-      toast.success("Motors read torque-free — the robot is available again.")
+      toast.success("The motors are off. The robot is available again.")
       fetchRobotStatus()
         .then((value) => {
           if (generation === connectionGenerationRef.current) setRobot(value)
@@ -1788,7 +2010,7 @@ export default function ControlPanel() {
       if (generation !== connectionGenerationRef.current) return
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
-      toast.error(`Update failed to start: ${e}`)
+      toast.error(`Could not start the update: ${e}`)
       setStartingUpdate(false)
       setUpdatePhase(null)
       return
@@ -1820,82 +2042,620 @@ export default function ControlPanel() {
     [conn.state, hostInfo]
   )
 
-  return (
-    <div className="min-h-screen">
-      <SiteNav current="control" />
-      <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
-        {update?.updateAvailable && (
-          <UpdateBanner
-            update={update}
-            updating={updating}
-            phase={updatePhase}
-            blocked={hostBusy}
-            busyReason={updateBusyReason}
-            onUpdate={handleUpdate}
-          />
-        )}
+  // An unknown /control/... path lands on the overview instead of a blank page.
+  if (view === null) return <Navigate to="/control" replace />
 
-        {mismatch && !updating && !update?.updateAvailable && (
-          <VersionMismatchBanner mismatch={mismatch} />
-        )}
+  const connected = conn.state === "ok"
 
-        <ConnectionsBar
-          conn={conn.state}
-          host={serverHost}
-          hostName={hostInfo?.hostname}
-          version={update?.version ?? hostInfo?.version ?? null}
-          onOpenSetup={() => setSetupOpen(true)}
-          onHostDisconnect={hostDisconnectClick}
-          opRunning={hostBusy}
-          hostInstalling={update?.installing ?? false}
-          robot={robot}
-          robotBusy={robotBusy}
-          canProfiles={canProfiles}
-          onRobotConnect={robotConnectClick}
-          onRobotDisconnect={robotDisconnectClick}
-          jelly={jelly}
-          jellySupported={jellySupported}
-          jellyBusy={jellyBusy}
-          canDevices={canDevices}
-          onJellyConnect={(device) => void jellyConnectClick(device)}
-          onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
-          selectedProfile={hardwareProfile}
-          onSelectProfile={(profile) => void selectHardwareProfile(profile)}
-          selectDisabled={isLive || hardwareProfileSaving}
-          selectDisabledReason={isLive ? "Stop the running operation to change the device." : null}
-          selectSaving={hardwareProfileSaving}
-          onOpenSettings={openSettingsScope}
+  const hostDot: StatusDot =
+    conn.state === "ok"
+      ? "ok"
+      : conn.state === "err"
+        ? "err"
+        : conn.state === "idle"
+          ? "idle"
+          : "warn"
+  const deviceLabel = hardwareProfile === "mantis" ? "Mantis" : "Axol"
+  const robotUp = robot?.state === "connected" || robot?.state === "busy"
+  const host: HostSummary = {
+    dot: hostDot,
+    label:
+      conn.state === "ok"
+        ? hostInfo?.hostname || serverHost || "Connected"
+        : conn.state === "err"
+          ? "Can't reach the robot"
+          : conn.state === "idle"
+            ? "Not connected"
+            : "Connecting…",
+    detail: connected ? `${deviceLabel} ${robotUp ? "connected" : "not connected"}` : null,
+    version: connected ? (update?.version ?? hostInfo?.version ?? null) : null,
+    // Before a host answers, the pill connects; after, it opens the devices.
+    onClick: connected ? () => navigate("/control/devices") : () => setSetupOpen(true),
+  }
+
+  const badges: NavBadges = {
+    "/control/devices": needsMount || lockout || canDiscoveryNeedsRetry ? "attention" : undefined,
+    "/control/operations": isLive ? "running" : undefined,
+    "/control/settings": settingsDirty ? "attention" : undefined,
+  }
+
+  // A live run follows the operator around the app: every other page shows
+  // what is running, with a way back to it.
+  const runningChip =
+    isLive && !(view === "operations" && routeOp === runningOp) ? (
+      <Link
+        to={
+          runningOp ? `/control/operations/${encodeURIComponent(runningOp)}` : "/control/operations"
+        }
+        className="flex h-8 items-center gap-2 rounded-full border border-emerald-400/30 bg-emerald-400/[0.08] px-3 text-xs text-emerald-200 transition-colors hover:bg-emerald-400/[0.14]"
+      >
+        <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+        <span className="max-w-40 truncate">
+          {isStopping
+            ? "Stopping"
+            : runningStartup
+              ? `Starting ${runningStartup.percent}%`
+              : "Running"}
+          : {runningLabel}
+        </span>
+      </Link>
+    ) : null
+
+  // Alerts that apply wherever the operator is: an update, a version skew, a
+  // robot held after a failed shutdown, and hardware still to identify. Not on
+  // Request data or Request teleoperator, which work without the robot. The connection itself shows
+  // in the header pill, and on the pages that need it.
+  const notices = (
+    <>
+      {update?.updateAvailable && (
+        <UpdateBanner
+          update={update}
+          updating={updating}
+          phase={updatePhase}
+          blocked={hostBusy}
+          busyReason={updateBusyReason}
+          onUpdate={handleUpdate}
         />
+      )}
 
-        {conn.state === "ok" && canDiscoveryNeedsRetry && (
-          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3">
-            <p className="min-w-0 flex-1 text-xs text-amber-100/80">
-              {canDiscovery?.message ??
-                "CAN hardware is attached but its Axol, Mantis, or Jelly base/lift role is not yet proven."}{" "}
-              Power the hardware, then connect it or retry identification. An idle robot link may
-              disconnect briefly while it is probed.
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => void retryCanIdentification()}
-              disabled={
-                canDiscoveryRetryBusy || hostBusy || activeCommandSession !== null || robotBusy
+      {mismatch && !updating && !update?.updateAvailable && (
+        <VersionMismatchBanner mismatch={mismatch} />
+      )}
+
+      {lockout && (
+        <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
+          <p>
+            The robot is locked because the last operation could not confirm that the motors are
+            off. Cut motor power with the E-Stop, then press Re-check motors.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={lockoutBusy}
+            onClick={handleClearLockout}
+          >
+            {lockoutBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            Re-check motors
+          </Button>
+        </div>
+      )}
+    </>
+  )
+
+  const saveMount = async (mount: AxolMount) => {
+    await handleSettingsSave(
+      { values: { "kinematics.mount": mount } },
+      renderedConnectionGeneration
+    )
+    toast.success("Mount saved. You can change it in Axol settings → Robot.")
+  }
+  const mountCard = needsMount && <MountRequired locked={!axolConnected} onSave={saveMount} />
+
+  const page: Record<ControlView, { title: string; description?: string }> = {
+    overview: { title: "Overview" },
+    operations: { title: "Operations" },
+    datasets: {
+      title: "Datasets",
+      description: "Watch recorded episodes, check their robot data and fix their task text.",
+    },
+    "request-data": {
+      title: "Request data",
+      description: "Get a LeRobot dataset of your task, recorded by Almond and ready for training.",
+    },
+    "request-teleoperator": {
+      title: "Request teleoperator",
+      description: "Have an Almond operator control your Axol remotely to finish a task for you.",
+    },
+    devices: {
+      title: "Devices",
+      description: "The Host Computer and the hardware connected to it.",
+    },
+    settings: {
+      title: "Settings",
+      description: "Settings here apply to every operation on this robot and to every browser.",
+    },
+    logs: { title: "Logs" },
+  }
+
+  const settingsScope = settingsScopeForTab(settingsTab)
+
+  // The operations as tiles: the app's catalog, with what the host says.
+  const launcherItems: LauncherItem[] = launcherEntries({
+    hostOperations: operations,
+    connected,
+    mantis: hardwareProfile === "mantis",
+  }).map((entry) => {
+    const hostMeta = operations.find((o) => o.id === entry.id) ?? null
+    return {
+      entry,
+      status: operationStatus({
+        entry,
+        hostMeta,
+        available: commands.find((c) => c.id === entry.id)?.available ?? false,
+        connected,
+        running: runningOp === entry.id,
+        otherRunning: isLive && runningOp !== entry.id,
+        needsMount,
+        hasCameras: selectedHasCamera,
+      }),
+    }
+  })
+  const quickEntries = quickStartOperations(
+    launcherItems.map((i) => i.entry),
+    recentOperations()
+  )
+  const currentEntry = catalogEntry(opId, meta)
+  // The app's own one-line summary leads the operation's screen; the host's
+  // wording only for an operation the app doesn't know.
+  const displayMeta =
+    currentEntry.summary && currentEntry.summary !== meta.description
+      ? { ...meta, description: currentEntry.summary }
+      : meta
+  const runningEntry = runningOp
+    ? catalogEntry(
+        runningOp,
+        operations.find((o) => o.id === runningOp)
+      )
+    : null
+
+  // What Home asks the operator to sort out, each with the page that fixes it.
+  const attention: AttentionItem[] = []
+  if (needsMount) {
+    attention.push(
+      axolConnected
+        ? {
+            key: "mount",
+            text: "Choose what Axol is mounted on, so the arms don't hit it.",
+            content: <MountChooser onSave={saveMount} />,
+          }
+        : {
+            key: "mount",
+            text: "Connect Axol, then choose what it is mounted on.",
+            action: "Connect Axol",
+            onAction: () => connectDevice("axol"),
+          }
+    )
+  }
+  if (connected && !selectedHasCamera && settingsSnap !== null) {
+    attention.push({
+      key: "cameras",
+      text: "No cameras are assigned. Collect data and Run policy need at least one.",
+      action: "Assign cameras",
+      onAction: () => openSettings(camerasSettingsTab(hardwareProfile)),
+    })
+  }
+
+  // The devices at a glance on Home. Mantis and Jelly show once they are
+  // plugged in (or selected), so an Axol-only setup sees just Axol.
+  const hardwareNotice = connected ? discoveryNotice(settledCanDiscovery) : null
+  const deviceSummaries: DeviceSummary[] = [
+    {
+      key: "host",
+      name: "Host Computer",
+      dot: hostDot,
+      status: connected
+        ? `${hostInfo?.hostname || serverHost || "Connected"}`
+        : conn.state === "err"
+          ? "Can't reach it"
+          : conn.state === "idle"
+            ? "Not connected"
+            : "Connecting…",
+      connectable: !connected,
+    },
+  ]
+  if (connected) {
+    const linkProfile = robot?.profile ?? "axol"
+    for (const profile of ["axol", "mantis"] as const) {
+      const name = profile === "mantis" ? "Mantis" : "Axol"
+      const present = canProfiles?.[profile].present ?? false
+      const active = linkProfile === profile
+      const state = active ? (robot?.state ?? "disconnected") : "disconnected"
+      if (profile === "mantis" && !present && !active && hardwareProfile !== "mantis") continue
+      const faults = active ? (robot?.faults ?? []) : []
+      const canConnect = (state === "disconnected" || state === "error") && present && !isLive
+      deviceSummaries.push({
+        key: profile,
+        name,
+        dot:
+          state === "connected"
+            ? faults.length
+              ? "err"
+              : "ok"
+            : state === "busy"
+              ? "busy"
+              : state === "connecting"
+                ? "warn"
+                : state === "error"
+                  ? "err"
+                  : present
+                    ? "warn"
+                    : "idle",
+        status:
+          state === "connected"
+            ? faults.length
+              ? "Motor fault"
+              : "Connected"
+            : state === "busy"
+              ? "In use"
+              : state === "connecting"
+                ? "Connecting…"
+                : state === "error"
+                  ? deviceErrorText(robot?.error, name)
+                  : present
+                    ? "Plugged in"
+                    : "Not plugged in",
+        detail: state === "error" ? robot?.error : null,
+        connectable: canConnect,
+        connectBusy: robotBusy,
+      })
+    }
+    if (jellySupported) {
+      const views = JELLY_DEVICES.map((device) => ({
+        device,
+        view: jellyDeviceView(device, jelly, canDevices?.[device], jellySupported),
+        present: canDevices?.[device]?.present ?? false,
+      }))
+      const live = views.filter((v) => v.view.state === "connected" || v.view.state === "busy")
+      const plugged = views.filter(
+        (v) => v.present && (v.view.state === "disconnected" || v.view.state === "error")
+      )
+      if (live.length || views.some((v) => v.present)) {
+        deviceSummaries.push({
+          key: "jelly",
+          name: "Jelly",
+          dot: views.some((v) => v.view.dot === "err") ? "err" : live.length ? "ok" : "warn",
+          status:
+            live.length === views.length
+              ? "Wheels and lift connected"
+              : live.length
+                ? `${live[0].device === "wheels" ? "Wheels" : "Lift"} connected`
+                : "Plugged in",
+          connectable: plugged.length > 0 && !isLive,
+          connectBusy: plugged.some((v) => jellyBusy[v.device]),
+        })
+      }
+    }
+  }
+  // A row's Connect: the host dialog, the Axol/Mantis link, or every Jelly
+  // device that is plugged in but not connected.
+  function connectDevice(key: string) {
+    if (key === "host") setSetupOpen(true)
+    else if (key === "axol" || key === "mantis") void robotConnectClick(key)
+    else if (key === "jelly") {
+      for (const device of JELLY_DEVICES) {
+        const state = jelly?.[device]?.state ?? "disconnected"
+        if (canDevices?.[device]?.present && (state === "disconnected" || state === "error")) {
+          void jellyConnectClick(device)
+        }
+      }
+    }
+  }
+
+  // Checking by hand is only offered where the panel won't check on its own.
+  const hardwareCheck =
+    hardwareNotice && !robotLinkFree && !isLive ? () => void recheckCanHardware() : undefined
+  const hardwareNoticeCard = hardwareNotice && (
+    <HardwareNoticeCard
+      notice={hardwareNotice}
+      onCheckAgain={hardwareCheck}
+      checking={canDiscoveryChecking}
+    />
+  )
+
+  // The button beside each "before you start" item on an operation's screen.
+  function fixFor(blocker: string): BlockerFix | null {
+    if (blocker === "Choose what Axol is mounted on") {
+      return { label: "Choose mount", onClick: () => navigate("/control/devices") }
+    }
+    if (/^Connect (Axol|Mantis)/.test(blocker)) {
+      return { label: "Open Devices", onClick: () => navigate("/control/devices") }
+    }
+    if (blocker.startsWith("Wait:") && runningOp && runningOp !== opId) {
+      return { label: "Open it", onClick: openRunningOperation }
+    }
+    if (blocker.includes("Cameras tab of Mantis settings")) {
+      return { label: "Assign cameras", onClick: () => openSettings("mantis-cameras") }
+    }
+    if (blocker.includes("Cameras tab of Axol settings")) {
+      return { label: "Assign cameras", onClick: () => openSettings("cameras") }
+    }
+    if (blocker.includes("Robot tab of Axol settings")) {
+      return { label: "Open Axol settings", onClick: () => openSettings("robot") }
+    }
+    if (blocker.includes("Mantis settings") || blocker.includes("Mantis trackers")) {
+      return { label: "Open Mantis settings", onClick: () => openSettings("mantis-tracking") }
+    }
+    if (blocker.startsWith("Fix the motor fault") || blocker.includes("isn't answering")) {
+      return { label: "Open Diagnostics", onClick: () => navigate("/diagnostics") }
+    }
+    return null
+  }
+
+  // The newest run's error, if its output reported one after it started. The
+  // log isn't on screen by default, so the operation page surfaces it.
+  const lastStart = lastLineIndex(lines, "[serve] starting")
+  const lastErrorAt = lastLineIndex(lines, "[serve] error:")
+  const runError =
+    lastErrorAt > lastStart ? lines[lastErrorAt].replace(/^\[serve\] error:\s*/, "") : null
+
+  return (
+    <>
+      <AppShell
+        title={page[view].title}
+        back={routeOp ? "/control/operations" : undefined}
+        description={page[view].description}
+        actions={runningChip}
+        notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
+        badges={badges}
+        host={host}
+      >
+        {view === "overview" && (
+          <>
+            {hardwareNoticeCard}
+
+            <AttentionList items={attention} />
+
+            {(conn.state === "idle" || conn.state === "err") && (
+              <ConnectHero failed={conn.state === "err"} onConnect={() => setSetupOpen(true)} />
+            )}
+
+            {isLive && runningEntry && (
+              <RunningCard
+                entry={runningEntry}
+                startedAt={effectiveStatus?.status === "running" ? effectiveStatus.startedAt : null}
+                startup={runningStartup}
+                stopping={isStopping}
+                busy={busy}
+                onOpen={openRunningOperation}
+                onStop={() => void handleStop()}
+              />
+            )}
+
+            {connected && <DevicesRow devices={deviceSummaries} onConnect={connectDevice} />}
+
+            <QuickStart entries={quickEntries} onOpen={openOperation} />
+
+            {!isLive && <DataCollectionOffer operation="overview" />}
+
+            {connected && recentDatasets && <RecentDatasets datasets={recentDatasets} />}
+          </>
+        )}
+
+        {view === "devices" && (
+          <>
+            {hardwareNoticeCard}
+
+            <ConnectionsBar
+              conn={conn.state}
+              host={serverHost}
+              hostName={hostInfo?.hostname}
+              version={update?.version ?? hostInfo?.version ?? null}
+              onOpenSetup={() => setSetupOpen(true)}
+              onHostDisconnect={hostDisconnectClick}
+              opRunning={hostBusy}
+              hostInstalling={update?.installing ?? false}
+              robot={robot}
+              robotBusy={robotBusy}
+              canProfiles={canProfiles}
+              onRobotConnect={robotConnectClick}
+              onRobotDisconnect={robotDisconnectClick}
+              jelly={jelly}
+              jellySupported={jellySupported}
+              jellyBusy={jellyBusy}
+              canDevices={canDevices}
+              onJellyConnect={(device) => void jellyConnectClick(device)}
+              onJellyDisconnect={(device) => void jellyDisconnectClick(device)}
+              selectedProfile={hardwareProfile}
+              onSelectProfile={(profile) => void selectHardwareProfile(profile)}
+              selectDisabled={isLive || hardwareProfileSaving}
+              selectDisabledReason={
+                isLive ? "Stop the running operation to change the device." : null
               }
-            >
-              {canDiscoveryRetryBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              Retry CAN identification
-            </Button>
+              selectSaving={hardwareProfileSaving}
+              onOpenSettings={openSettingsScope}
+            />
+
+            {mountCard}
+
+            {connected && !selectedHasCamera && settingsSnap !== null && (
+              <div className="flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4">
+                <Camera className="size-4 shrink-0 text-white/40" />
+                <p className="min-w-0 flex-1 text-sm text-white/60">
+                  No cameras are assigned. Collect data and Run policy need at least one.
+                </p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => openSettings(camerasSettingsTab(hardwareProfile))}
+                >
+                  Assign cameras
+                </Button>
+              </div>
+            )}
+          </>
+        )}
+
+        {view === "operations" && !routeOp && (
+          <OperationLauncher items={launcherItems} onOpen={openOperation} />
+        )}
+
+        {view === "operations" && routeOp && (
+          <div className="flex min-w-0 flex-col gap-4">
+            <OperationPanel
+              key={renderedConnectionGeneration}
+              entry={currentEntry}
+              fixFor={fixFor}
+              onConnect={() => setSetupOpen(true)}
+              meta={displayMeta}
+              spec={spec}
+              settings={settings}
+              hardwareProfile={hardwareProfile}
+              mantisSource={mantisSource}
+              sharedValues={settingsSnap?.values ?? null}
+              onChange={setSetting}
+              onReset={resetSetting}
+              onResetAll={resetAll}
+              onOpenSettings={() => openSettingsScope(hardwareProfile)}
+              cameras={cameras}
+              robot={robot}
+              live={selectedLive}
+              stopping={selectedStopping}
+              busy={busy}
+              session={selectedLive ? effectiveStatus : null}
+              progress={selectedLive ? runProgress : null}
+              host={viewerHost}
+              viewerPort={viewerPort}
+              vrPort={hostInfo?.vrPort ?? 8000}
+              startPhase={startPhase}
+              hostBlocker={
+                activeCommandSession
+                  ? `${commandLabel(activeCommandSession.command)} is running`
+                  : isLive && !selectedLive
+                    ? `${runningLabel ?? "Another operation"} is running`
+                    : null
+              }
+              needsMount={needsMount}
+              simRobot={simRobot}
+              onSimRobotChange={(next) => {
+                setSimRobotChoice(next)
+                try {
+                  localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
+                } catch {
+                  // Private mode / storage off: the choice lasts this page view.
+                }
+              }}
+              connected={connected}
+              policy={selectedLive ? policy : null}
+              onStart={handleStart}
+              onStop={handleStop}
+              onEpisode={handleEpisode}
+            />
+
+            {lines.length > 0 && (
+              <LogPeek
+                line={lines[lines.length - 1]}
+                failure={
+                  runError && effectiveStatus?.command === opId
+                    ? `${commandLabel(opId)} stopped with an error: ${runError}`
+                    : null
+                }
+              />
+            )}
+
+            {(meta.id === "teleop" || meta.id === "collect-data") && !isLive && (
+              <DataCollectionOffer operation={meta.id} />
+            )}
+
+            {showsDatasetPreview(meta.id) && connected && (
+              <Link
+                to="/control/datasets"
+                className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
+              >
+                Review recorded episodes in Datasets
+                <ArrowRight className="size-3.5" />
+              </Link>
+            )}
           </div>
         )}
 
-        {conn.state === "ok" && (
-          <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
+        {view === "datasets" &&
+          (connected ? (
+            <DatasetPreview
+              key={`datasets-${renderedConnectionGeneration}`}
+              connected
+              embedded
+              robot={{
+                model: settingsSnap?.robotModel,
+                gripper: parseGripper(settingsSnap?.values["axol.gripper"]),
+              }}
+              liveDataset={policy?.dataset ?? null}
+              episodesRecorded={policy?.episodesRecorded ?? null}
+            />
+          ) : (
+            <EmptyState onConnect={() => setSetupOpen(true)}>
+              Connect to the Host Computer to see its datasets.
+            </EmptyState>
+          ))}
+
+        {(view === "request-data" || view === "request-teleoperator") && (
+          <RequestPage
+            key={view}
+            service={view === "request-teleoperator" ? "task" : "dataset"}
+            source={requestSource(
+              new URLSearchParams(location.search).get("from"),
+              view === "request-teleoperator" ? "task" : "dataset"
+            )}
+          />
+        )}
+
+        {view === "settings" && !connected && (
+          <EmptyState onConnect={() => setSetupOpen(true)}>
+            Connect to the Host Computer to see its settings.
+          </EmptyState>
+        )}
+
+        {view === "settings" && connected && (
+          <div
+            role="tablist"
+            aria-label="Settings for"
+            className="flex w-full gap-1 overflow-x-auto rounded-xl border border-white/10 bg-white/[0.02] p-1 sm:w-fit"
+          >
+            {SETTINGS_SCOPES.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                role="tab"
+                aria-selected={s.key === settingsScope}
+                onClick={() => {
+                  if (s.key !== settingsScope) openSettings(defaultSettingsTab(s.key))
+                }}
+                className={cn(
+                  "flex-1 rounded-lg px-4 py-1.5 text-sm whitespace-nowrap transition-colors sm:flex-none",
+                  s.key === settingsScope
+                    ? "bg-[#eff483]/10 text-[#eff483]"
+                    : "text-white/55 hover:bg-white/[0.05] hover:text-white/85"
+                )}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Mounted on every page so staged edits survive a trip elsewhere;
+            only its body is dropped while another page shows. */}
+        {connected && (
+          <div hidden={view !== "settings"}>
             <SettingsSection
-              open={settingsOpen}
-              onOpenChange={setSettingsOpen}
+              open={view === "settings"}
+              embedded
+              onOpenChange={() => {}}
               tab={settingsTab}
-              onTabChange={setSettingsTab}
+              onTabChange={(tab) =>
+                navigate(`/control/settings/${encodeURIComponent(tab)}`, { replace: true })
+              }
+              onDirtyChange={setSettingsDirty}
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
@@ -1908,12 +2668,13 @@ export default function ControlPanel() {
               onUsbConnect={() => void usbConnectClick(renderedConnectionGeneration)}
               actionBlocker={
                 isLive
-                  ? `${runningOp ?? "An operation"} is running`
+                  ? `${runningLabel ?? "An operation"} is running`
                   : activeCommandSession
-                    ? `${activeCommandSession.command} is running`
+                    ? `${commandLabel(activeCommandSession.command)} is running`
                     : null
               }
               activeCommandSession={activeCommandSession}
+              axolConnected={axolConnected}
               onCommandSessionChange={(next) => {
                 if (connectionGenerationRef.current === renderedConnectionGeneration) {
                   setActiveCommandSession(next)
@@ -1923,88 +2684,17 @@ export default function ControlPanel() {
           </div>
         )}
 
-        <OperationSelector
-          operations={operations}
-          selected={opId}
-          runningOp={runningOp}
-          onSelect={selectOp}
-        />
-
-        {isLive && !selectedLive && (
-          <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-            <span className="font-mono text-amber-200">{runningOp}</span> is currently running. Stop
-            it before starting another operation.
-          </p>
-        )}
-
-        {lockout && (
-          <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
-            <p>
-              The last operation could not confirm it disabled the motors, and a probe afterwards
-              found at least one still answering under torque (or could not read them), so the robot
-              stays reserved. Cut motor power (the PSU e-stop), then re-check the motors to release
-              it.
+        {view === "logs" && (
+          <>
+            <p className="-mt-1 text-sm text-white/50">
+              {effectiveStatus
+                ? `Output from ${commandLabel(effectiveStatus.command)}${isLive ? ", which is running" : ""}.`
+                : "Output from the next operation you start shows here."}
             </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="shrink-0"
-              disabled={lockoutBusy}
-              onClick={handleClearLockout}
-            >
-              {lockoutBusy ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              Re-check motors
-            </Button>
-          </div>
+            <LogConsole lines={lines} fill />
+          </>
         )}
-
-        <OperationPanel
-          key={renderedConnectionGeneration}
-          meta={meta}
-          spec={spec}
-          settings={settings}
-          hardwareProfile={hardwareProfile}
-          mantisSource={mantisSource}
-          sharedValues={settingsSnap?.values ?? null}
-          onChange={setSetting}
-          onReset={resetSetting}
-          onResetAll={resetAll}
-          onOpenSettings={() => openSettingsScope(hardwareProfile)}
-          cameras={cameras}
-          robot={robot}
-          live={selectedLive}
-          stopping={selectedStopping}
-          busy={busy}
-          session={selectedLive ? effectiveStatus : null}
-          host={viewerHost}
-          viewerPort={viewerPort}
-          vrPort={hostInfo?.vrPort ?? 8000}
-          startPhase={startPhase}
-          hostBlocker={
-            activeCommandSession
-              ? `${activeCommandSession.command} setup/diagnostic is running`
-              : isLive && !selectedLive
-                ? `${runningOp ?? "Another operation"} is running`
-                : null
-          }
-          connected={conn.state === "ok"}
-          policy={selectedLive ? policy : null}
-          onStart={handleStart}
-          onStop={handleStop}
-          onEpisode={handleEpisode}
-        />
-
-        {showsDatasetPreview(meta.id) && (
-          <DatasetPreview
-            key={`datasets-${renderedConnectionGeneration}`}
-            connected={conn.state === "ok"}
-            liveDataset={policy?.dataset ?? null}
-            episodesRecorded={policy?.episodesRecorded ?? null}
-          />
-        )}
-
-        <LogConsole lines={lines} />
-      </main>
+      </AppShell>
 
       <SetupDialog
         open={setupOpen}
@@ -2015,62 +2705,60 @@ export default function ControlPanel() {
         conn={conn}
         onConnect={() => loadServer(serverHost)}
       />
+    </>
+  )
+}
+
+/** Index of the last line starting with `prefix`, or -1. */
+function lastLineIndex(lines: string[], prefix: string): number {
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].startsWith(prefix)) return i
+  return -1
+}
+
+/** A page that needs the Host Computer, before one is connected. */
+function EmptyState({ children, onConnect }: { children: ReactNode; onConnect?: () => void }) {
+  return (
+    <div className="flex min-h-56 flex-col items-center justify-center gap-4 rounded-2xl border border-dashed border-white/10 p-6 text-center">
+      <span className="flex size-11 items-center justify-center rounded-2xl bg-white/[0.04] text-white/40">
+        <Plug className="size-5" />
+      </span>
+      <p className="max-w-sm text-sm text-white/55">{children}</p>
+      {onConnect && <Button onClick={onConnect}>Connect</Button>}
     </div>
   )
 }
 
-/** One column per operation on wide screens, spelled out so Tailwind emits the
- *  classes; a host offering more than five wraps rather than shrinking. */
-const WIDE_COLUMNS: Record<number, string> = {
-  1: "lg:grid-cols-1",
-  2: "lg:grid-cols-2",
-  3: "lg:grid-cols-3",
-  4: "lg:grid-cols-4",
-  5: "lg:grid-cols-5",
-}
-
-function OperationSelector({
-  operations,
-  selected,
-  runningOp,
-  onSelect,
-}: {
-  operations: OperationMeta[]
-  selected: OperationId
-  runningOp: OperationId | null
-  onSelect: (op: OperationId) => void
-}) {
+/** The newest log line under the operation, linking to the full log. A run
+ *  that failed shows its error instead, so it is seen without the log open. */
+function LogPeek({ line, failure }: { line: string; failure: string | null }) {
   return (
-    <div
+    <Link
+      to="/control/logs"
       className={cn(
-        "grid grid-cols-2 gap-3 sm:grid-cols-3",
-        WIDE_COLUMNS[Math.min(operations.length, 5)]
+        "group flex min-w-0 items-center gap-3 rounded-lg border px-3 py-2 transition-colors",
+        failure
+          ? "border-red-400/25 bg-red-400/[0.05] hover:border-red-400/40"
+          : "border-white/10 bg-white/[0.02] hover:border-white/20"
       )}
     >
-      {operations.map((op) => {
-        const active = op.id === selected
-        const running = op.id === runningOp
-        return (
-          <button
-            key={op.id}
-            type="button"
-            onClick={() => onSelect(op.id)}
-            className={cn(
-              "rounded-xl border p-3 text-left transition-all",
-              active
-                ? "border-[#eff483]/40 bg-[#eff483]/10"
-                : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
-            )}
-          >
-            <div className="flex items-center gap-2">
-              <span className={cn("text-sm font-medium", !active && "text-white/85")}>
-                {op.label}
-              </span>
-              {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
-            </div>
-          </button>
-        )
-      })}
-    </div>
+      {failure ? (
+        <CircleAlert className="size-4 shrink-0 text-red-300" />
+      ) : (
+        <ScrollText className="size-4 shrink-0 text-white/35" />
+      )}
+      {failure ? (
+        <span className="line-clamp-2 min-w-0 flex-1 text-xs text-red-200/85" title={failure}>
+          {failure}
+        </span>
+      ) : (
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-white/50" title={line}>
+          {line}
+        </span>
+      )}
+      <span className="flex shrink-0 items-center gap-1 text-xs text-white/45 group-hover:text-white/80">
+        View logs
+        <ArrowRight className="size-3.5" />
+      </span>
+    </Link>
   )
 }

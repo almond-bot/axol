@@ -3,7 +3,9 @@ title: "almond_axol.robot"
 description: "Hardware controllers for Axol and Jelly, simulation, configuration, and gravity compensation."
 ---
 
-Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. Once enabled, the 240 Hz control loop runs in the Rust realtime core (`axol-rt`), which owns the CAN buses for the session; Python keeps the model math and streams `motion_control` targets to it. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
+`Axol` controls both arms. On entry it opens the CAN bus of each arm, enables all 16 motors, and calibrates each gripper's open stop. While Axol is enabled, the 240 Hz control loop runs in the Rust realtime core (`axol-rt`), which owns the CAN buses. Python computes the model terms and streams `motion_control` targets to the core.
+
+`Sim` has the same interface and renders the robot in a browser with viser. It requires the `sim` extra.
 
 ```python
 from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointConfig, FrictionParams, Jelly, JellyConfig, Sim
@@ -21,17 +23,26 @@ Axol(
 )
 ```
 
-Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`. `left_joints` / `right_joints` restrict an arm to the motors actually on its bus, for a partial bench arm (e.g. `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly); absent joints are never constructed or enabled, every `(8,)` array keeps its Joint-enum shape, and their elements read `0.0` with commands ignored.
+Pass `left_channel=None` or `right_channel=None` to run one arm only. Both arms start up in parallel in `__aenter__`.
 
-This is the same object every CLI flow uses — `axol teleop`, `axol gravity-comp`, `axol waypoints`, the control panel — so code written against `Axol` exercises exactly the controller the robot ships with.
+For a partial bench arm, pass `left_joints` or `right_joints` with the motors that are on its bus, for example `{Joint.WRIST_2, Joint.WRIST_3, Joint.GRIPPER}` for a wrist assembly. Missing joints are never created or enabled. Every `(8,)` array keeps its full shape: missing joints read `0.0`, and commands to them are ignored.
+
+Every CLI flow uses this class, including `axol teleop`, `axol gravity-comp`, `axol waypoints` and the control panel. Code written against `Axol` runs the same controller the robot ships with.
 
 ### Shared settings
 
-`Axol()` with no arguments is configured exactly as the [control panel](/guides/control-panel#settings) and `axol teleop` configure the robot: `config` is built from the robot's shared settings file — `~/.almond/settings.json`, the file the panel edits — over the calibrated defaults, and the CAN channels come from its `robot.left_channel` / `robot.right_channel` values. Stiffness, per-joint gains, link masses and centres of mass, gripper limits and `has_gripper` saved once therefore drive an SDK session too (so, for example, SDK gravity compensation runs the same gravity model as the panel's). The file's `axol` section *is* an `AxolConfig` (same field names, nested the same way), so what you read in `settings.json` is what `Axol()` runs with — `shared_axol_config(load_store())` below returns that very object; see the [Settings File](/guides/control-panel-settings) page for the layout.
+`Axol()` with no arguments runs with the same configuration as the [control panel](/guides/control-panel#settings) and `axol teleop`. It builds `config` from the shared settings file, `~/.almond/settings.json`, on top of the calibrated defaults. The CAN channels come from `robot.left_channel` and `robot.right_channel` in the same file.
 
-Every argument overrides its setting: `Axol(config=AxolConfig())` runs the bare calibrated defaults, `Axol(right_channel=None)` disables the right arm regardless of the file. The same rule applies to `Mantis` (its channels come from `mantis.left_channel` / `mantis.right_channel`), [`Jelly`](#jelly) (`jelly.*`), and [`VRTeleop`](/api/teleop) (`teleop.*`, `kinematics.*`, `vr_server.*`).
+The file's `axol` section has the same fields and nesting as `AxolConfig`. Stiffness, per-joint gains, link masses and centres of mass, gripper limits and `has_gripper` saved there apply to SDK sessions too. For example, SDK gravity compensation uses the same gravity model as the panel. `shared_axol_config(load_store())` returns that `AxolConfig`, and the [Settings File](/guides/control-panel-settings) page shows the layout.
 
-The helpers behind this live in `almond_axol.settings` if you need them directly:
+Every argument overrides its setting:
+
+- `Axol(config=AxolConfig())` runs the calibrated defaults and ignores the file's `axol` section.
+- `Axol(right_channel=None)` disables the right arm whatever the file says.
+
+The same rule applies to `Mantis` (`mantis.left_channel`, `mantis.right_channel`), [`Jelly`](#jelly) (`jelly.*`) and [`VRTeleop`](/api/teleop) (`teleop.*`, `kinematics.*`, `vr_server.*`).
+
+The helpers are in `almond_axol.settings`:
 
 ```python
 from almond_axol.settings import load_store, shared_axol_config, shared_config, shared_overlay
@@ -67,28 +78,40 @@ asyncio.run(main())
 
 | Method | Description |
 |---|---|
-| `connect()` | Open the CAN buses only — nothing is actuated; all read APIs (`get_holding()`, `get_positions()`, ...) become usable for inspecting a robot of unknown state |
-| `enable(hold=True)` | Bring every motor up. Idempotent per motor: joints already holding keep holding (reads only, gripper keeps its grasp); cold joints get the full bring-up incl. gripper calibration. With `hold=True` (default) the realtime core then takes the buses and the robot finishes actively holding its measured pose (gravity feedforward and damping included) — see [Reconnecting to a live robot](#reconnecting-to-a-live-robot). With `hold=False` freshly brought-up joints are left enabled but limp and Python keeps the bus (no core) — for flows that manage control modes themselves |
-| `disable()` | Disable all motors and close CAN buses. After a core `fault` or `limp` the motors are deliberately **left holding** (or limp) instead — see [Faults and limp](#faults-and-limp) |
-| `disconnect()` | Close CAN buses leaving motor torque exactly as it is — the robot keeps holding for a later process to reconnect |
-| `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors. While enabled this is a no-op: the core already streams position, velocity, and torque for every motor each tick |
-| `wait_for_telemetry(timeout=5.0)` | Block until every motor has reported a position; call after `start_telemetry` before the first cached `positions` read |
-| `stop_telemetry()` | Stop background polling |
-| `clear_errors()` | Clear latched error flags on all motors |
-| `set_control_mode(mode)` | Set `ControlMode` on all motors. **MyActuator motors reboot to switch modes (torque off ~2 s)** — never call it while the arms hold a load; use `enable(hold=False)` in flows that manage modes themselves (Damiao takes a live mode flip in stride — it is a plain register write) |
+| `connect()` | Open the CAN buses without actuating anything. The read APIs (`get_holding()`, `get_positions()`, ...) then work, so you can inspect a robot in an unknown state. |
+| `enable(hold=True)` | Bring every motor up. Joints that are already holding keep holding (see [Reconnecting to a live robot](#reconnecting-to-a-live-robot)). |
+| `disable()` | Disable all motors and close the CAN buses. After a core `fault` or `limp`, the motors stay holding or limp instead (see [Faults and limp](#faults-and-limp)). |
+| `disconnect()` | Close the CAN buses without changing motor torque. The robot keeps holding, so a later process can reconnect. |
+| `start_telemetry(hz, torque=False)` | Start a background polling loop on all motors. Does nothing while enabled, because the core already streams position, velocity and torque. |
+| `wait_for_telemetry(timeout=5.0)` | Wait until every motor has reported a position. Call it after `start_telemetry` and before the first cached `positions` read. |
+| `stop_telemetry()` | Stop background polling. |
+| `clear_errors()` | Clear latched error flags on all motors. |
+| `set_control_mode(mode)` | Set the `ControlMode` of all motors. **MyActuator motors reboot to switch modes, with torque off for about 2 s**, so never call it while the arms hold a load. |
+
+`enable()` gives cold joints the full bring-up, including the gripper calibration. Then:
+
+- With `hold=True` (the default), the realtime core takes the buses and the arms actively hold their measured pose, with gravity feedforward and damping.
+- With `hold=False`, newly enabled joints stay enabled but limp, and Python keeps the buses with no core running. Use this when your code manages control modes itself.
+
+Damiao motors switch control modes with a register write and don't reboot.
 
 <Note>
-**Who owns the bus.** Between `enable()` and `disable()` / `disconnect()` the realtime core owns the CAN buses. `get_positions()`, `get_velocities()`, `get_torques()`, `left.positions`, `left.torques`, and `torque_residuals()` keep working — they read the caches the core's telemetry fills, sending no CAN from Python. Register-level calls (`connect()`, `get_temperatures()`, `get_holding()`, `get_gains()`, `clear_errors()`, `set_control_mode()`, every `set_*` except `motion_control`) raise `MotorError` while enabled; use them on a `connect()`-ed robot before `enable()`, or after `disable()`. `motion_control()` and `gravity_compensate()` require an enabled robot.
+**Who owns the bus.** The realtime core owns the CAN buses from `enable()` until `disable()` or `disconnect()`. During that time:
+
+- `get_positions()`, `get_velocities()`, `get_torques()`, `left.positions`, `left.torques` and `torque_residuals()` keep working. They read caches that the core's telemetry fills, and send nothing on the bus.
+- Register-level calls raise `MotorError`: `connect()`, `get_temperatures()`, `get_holding()`, `get_gains()`, `clear_errors()`, `set_control_mode()` and every `set_*` method that writes to the motors except `motion_control`. Call them before `enable()` or after `disable()`.
+- `motion_control()` and `gravity_compensate()` work only while the robot is enabled.
 </Note>
 
 ### Reconnecting to a live robot
 
-If a controlling process dies (or disconnects) while the robot is torqued on, the motors keep holding their last commanded pose. Startup code does not need to know whether that happened: `enable()` queries each motor and converges —
+If a controlling process exits or crashes while the robot is torqued on, the motors keep holding their last commanded pose. Your startup code doesn't need to know whether that happened, because `enable()` checks each motor:
 
-- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its end-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that closes and then opens the jaws;
-- **cold** joints get the classic full bring-up;
-- a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
-- with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
+- A joint that is **already holding** is attached with reads only and is never reset. A reset reboots a MyActuator motor and drops the arm for about 2 s.
+- A holding gripper keeps its grasp. Its end-stop calibration is restored from the last full bring-up instead of running the sweep again, which would close and open the jaws.
+- A **cold** joint gets the full bring-up.
+- On a mixed robot, for example one whose last session died during `enable()`, only the cold joints are brought up.
+- With `hold=True` (the default), `enable()` ends by commanding the measured pose once, with the configured gains and gravity feedforward. The arm is already there, so nothing moves. An enabled robot is always actively holding.
 
 ```python
 import asyncio
@@ -115,21 +138,24 @@ asyncio.run(main())
 
 Notes:
 
-- `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting. A process that must never actuate can `connect()`, check `get_holding()`, and only proceed when every joint is already holding.
-- Custom control modes: pass `enable(hold=False)` to leave freshly brought-up joints enabled but limp, then pick your mode with `set_control_mode()` (position/velocity/force) and drive with `set_positions_velocity()` / `set_velocity()`. The bus stays in Python and no core is started, so `motion_control()` is unavailable until a later `enable()`. The reconnect machinery targets the impedance workflow — a session that died in another control mode is asked to `disable()` and re-enable rather than being reattached.
-- To force a fresh bring-up of a live robot (re-run gripper calibration, reset motors), call `disable()` first, then `enable()`.
-- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws closed and open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
-- `enable()` also refuses (raising `MotorError`) if any arm joint's encoder reading is implausible for a zero at its calibration end stop — the zero was never set, or is stale, and bringing the robot up on garbage joint-frame values is unsafe. The gate runs **before anything is actuated** (`connect()` and the read APIs still work, for inspecting such a robot); run `axol motor.set-zero-pos --guided` to (re)zero. See [`motor.set-zero-pos`](/cli/motor-set-zero-pos).
-- `disconnect()` closes the buses without touching torque, so the robot keeps holding and a later process can reconnect. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
+- `connect()` is optional, because `enable()` opens the buses itself. Call it to inspect state first (`get_holding()`, positions, temperatures). A process that must never move the robot can call `connect()`, check `get_holding()`, and continue only when every joint is already holding.
+- For other control modes, call `enable(hold=False)`, pick a mode with `set_control_mode()`, and drive the arms with `set_positions_velocity()` or `set_velocity()`. No core runs in this case, so `motion_control()` is unavailable until a later `enable()`.
+- Reconnecting works for the impedance workflow only. A session that died in another control mode is not reattached: call `disable()`, then `enable()`.
+- To force a fresh bring-up of a live robot (gripper calibration, motor reset), call `disable()` and then `enable()`.
+- `enable()` raises `MotorError` if a gripper is holding but has no valid saved calibration. Measuring it again would close and open the jaws and drop what it holds. Empty the gripper, then call `disable()` and `enable()`.
+- `enable()` also raises `MotorError` if an arm joint's encoder reading doesn't fit a zero set at its calibration end stop. This means the zero was never set or is stale. The check runs before anything moves, and `connect()` and the read APIs still work. Run `axol motor.set-zero-pos --guided` to set the zero (see [`motor.set-zero-pos`](/cli/motor-set-zero-pos)).
+- `disconnect()` closes the buses and leaves torque on, so a later process can reconnect. Call `disable()` only when you want to turn torque off, with the arms in a safe pose.
 
 ### Faults and limp
 
 | Attribute | Meaning |
 |---|---|
-| `fault` | The core's latched `fault: ...` (dead bus, protocol error), or `None`. The core has stopped streaming and the motors hold their last command; `disable()` leaves them that way |
-| `limp` | Why the core went limp (`limp: ...` — a motor silent for a second, control timing lost), or `None`. Every arm joint is at kp = 0 with gravity feedforward for the rest of the session; `motion_control` streams gravity comp instead of tracking so the operator can hand-guide the arms to rest and stop |
+| `fault` | The core's latched `fault: ...` message (for example a dead bus or a protocol error), or `None`. The core has stopped streaming and the motors hold their last command. |
+| `limp` | Why the core went limp (`limp: ...`, for example a motor silent for a second or lost control timing), or `None`. Every arm joint runs at kp = 0 with gravity feedforward for the rest of the session. |
 
-Faults never drop the arms: a disabled arm falls, a holding or limp arm waits for the operator.
+After a fault, `disable()` leaves the motors holding. While the core is limp, `motion_control` streams gravity compensation instead of tracking, so the operator can guide the arms to rest by hand and stop.
+
+Faults never drop the arms. A disabled arm would fall, so a holding or limp arm waits for the operator instead.
 
 ### State reads
 
@@ -143,37 +169,36 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 | `get_temperatures()` | °C |
 | `get_voltages()` | V |
 | `get_error_codes()` | `list[MotorStatus]` |
-| `get_holding()` | `list[bool]` — enabled-and-holding per motor (read-only; usable right after `connect()`) |
+| `get_holding()` | `list[bool]`: whether each motor is enabled and holding. Read-only, and works right after `connect()`. |
 | `get_gains()` | `list[MotorGains]` |
 
 ### State writes
 
 | Method | Description |
 |---|---|
-| `motion_control(left, right)` | Impedance (arm) + position-force (gripper: `[0, 1]` over the calibrated stroke, so `1` is always the open stop the enable-time sweep found); primary control method. Python runs the model math (limits, gravity, pose-scheduled feedforward coefficients); the core renders the trajectory at 240 Hz |
-| `gravity_compensate(kd, free_joints, gripper_targets)` | One gravity-comp cycle — the arms go limp and hand-guidable, held up by feedforward |
+| `motion_control(left, right)` | The main control method: impedance control for the arm joints and position-force control for the gripper. |
+| `gravity_compensate(kd, free_joints, gripper_targets)` | Run one gravity-compensation cycle. The arms go limp and can be guided by hand, held up by feedforward. |
 | `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
 | `set_velocity(left, right)` | Motor built-in speed controller |
-| `set_gains(left, right)` | Write PID gains; persisted to flash |
-| `set_zero_position(left, right)` | Save current shaft position as encoder zero (calibrated at a mechanical end stop, not the rest position) |
+| `set_gains(left, right)` | Write PID gains. They are saved to the motor's flash. |
+| `set_zero_position(left, right)` | Save the current shaft position as the encoder zero. Set it at a mechanical end stop, not the rest pose. |
 | `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
-| `set_payload(side, mass, com=(0, 0, 0))` | Tell the gravity model what a gripper is holding — see [Payloads](#payloads). Model state only (no CAN), so it works enabled or not |
-| `payload(side)` | The payload currently set on `"left"` or `"right"`: `(mass_kg, com_m)` |
+| `set_payload(side, mass, com=(0, 0, 0))` | Tell the gravity model what a gripper is holding (see [Payloads](#payloads)). It changes model state only, so it works whether or not the robot is enabled. |
+| `payload(side)` | The payload currently set on `"left"` or `"right"`, as `(mass_kg, com_m)`. |
+
+The gripper target in `motion_control` is in `[0, 1]` over the calibrated stroke, so `1` is always the open stop found at enable. Python computes the limits, gravity and pose-dependent feedforward terms, and the core runs the trajectory at 240 Hz.
 
 Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.
 
 <Note>
-The Mantis rig (`almond_axol.robot.Mantis`) has the same shape: `Mantis(config, left_channel, right_channel, *, defer_gripper_enable)`, the same lifecycle, and the gripper slot of each `motion_control` target reaching the hardware.
+The Mantis rig (`almond_axol.robot.Mantis`) works the same way: `Mantis(config, left_channel, right_channel, *, defer_gripper_enable)`, with the same lifecycle. `motion_control` sends the gripper element of each target to the hardware.
 </Note>
 
 ## `Jelly`
 
-`Jelly` controls the Jelly mobile base and telescoping lift. `JellyConfig`
-contains its wheel, lift, heading-hold, and command-safety settings.
-`detect_jelly` narrows a config to the Jelly hardware actually attached (the
-wheel bus `can_alm_axol_b`, the lift bus) and returns `None` when there is
-none — the same inference `axol teleop` and data collection use, so nothing
-is ever enabled by hand.
+`Jelly` controls the Jelly mobile base and its telescoping lift. `JellyConfig` holds the wheel, lift, heading-hold and command-safety settings.
+
+`detect_jelly` narrows a config to the Jelly hardware that is attached: the wheel bus `can_alm_axol_b` and the lift bus. It returns `None` when neither is attached. `axol teleop` and data collection detect Jelly the same way, so you never enable it by hand.
 
 ```python
 from almond_axol.robot import Jelly, JellyConfig, detect_jelly
@@ -188,14 +213,15 @@ if cfg is not None:
 
 ### Battery
 
-Jelly's charge is estimated from the 24 V rail that the jelly_legs lift
-controller measures (its `GET_POWER` telemetry). The estimate uses the resting
-LiFePO4 curve of the two 24 V 50 Ah packs wired in parallel (8S, 100 Ah).
-While Jelly is enabled with its lift, `jelly.battery` updates about once a
-second. It returns `None` before the first reading, with no pack connected (the
-board is running from USB), or on firmware that doesn't answer `GET_POWER`.
-`read_battery()` takes a single reading without enabling anything. It never
-sends a motion command.
+Jelly estimates its charge from the 24 V rail that its lift controller measures (the `GET_POWER` telemetry). The estimate uses the resting voltage curve of its two 24 V 50 Ah LiFePO4 packs, wired in parallel (8S, 100 Ah).
+
+While Jelly is enabled with its lift, `jelly.battery` updates about once a second. It is `None`:
+
+- before the first reading
+- when no pack is connected and the board runs from USB
+- on firmware that doesn't answer `GET_POWER`
+
+`read_battery()` takes a single reading without enabling anything. It never sends a motion command.
 
 ```python
 import asyncio
@@ -214,22 +240,18 @@ async def main():
 asyncio.run(main())
 ```
 
-Both return a `BatteryStatus`:
+`jelly.battery` and `read_battery()` return a `BatteryStatus`:
 
 | Field | Description |
 |---|---|
-| `percent` | State of charge, 0–100, from the published LiFePO4 resting-voltage curve (EVE's per-cell chart, times 8). Jelly never fully rests, so it can read well below the packs' own BMS on the flat middle of the curve |
-| `voltage` | Pack voltage (smoothed while resting) |
-| `charging` | Rail above any resting voltage (≥ 27.1 V, clearing below 27.05 V): a charger is connected; `percent` reads near full and is meaningless while charging. Early in a charge a low pack can stay under the threshold, so `False` does not rule a charger out |
-| `under_load` | Only a reading taken while the lift or wheels were moving exists, so the estimate reads low |
+| `percent` | State of charge from 0 to 100, from the LiFePO4 resting voltage curve. Jelly never fully rests, so in the middle of the curve it can read well below the packs' own BMS. |
+| `voltage` | Pack voltage, smoothed while resting. |
+| `charging` | `True` when the rail is above any resting voltage (27.1 V, clearing below 27.05 V), which means a charger is connected. Early in a charge a low pack can stay below the threshold, so `False` doesn't rule out a charger. |
+| `under_load` | `True` when the only reading was taken while the lift or wheels were moving, so the estimate reads low. |
 
-`battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity.
+`battery.remaining_ah` converts `percent` into amp-hours of the 100 Ah capacity. While `charging` is `True`, `percent` reads near full and doesn't reflect the charge.
 
-The curve is EVE's published LiFePO4 resting-voltage chart per cell (3.40 V
-full, 3.26 V half, 3.20 V at 20%), times eight for Jelly's 8S packs. LiFePO4
-voltage barely moves through the middle of its charge (about 0.16 V across the
-pack from 40% to 60%), so treat `percent` as a band. The estimate also can't be
-better than the board's ADC, which can be off by a few hundred millivolts.
+The curve is EVE's published resting voltage chart per cell (3.40 V full, 3.26 V half, 3.20 V at 20%), times eight for the 8S packs. LiFePO4 voltage barely changes in the middle of the charge, about 0.16 V across the pack from 40% to 60%, so treat `percent` as a range. The board's ADC can also be off by a few hundred millivolts.
 
 ## `Sim`
 
@@ -252,12 +274,14 @@ asyncio.run(main())
 Open `http://localhost:8002` in a browser to view the robot.
 
 <Note>
-  `Sim` renders whatever *you* command with `motion_control`. Running [`axol teleop --sim`](/cli/teleop) instead wraps a `Sim` in the full teleop stack — with no headset connected the arms just hold the rest pose. To drive them without a headset (e.g. in a test), stream [`VRFrame`](/api/vr) messages to the teleop VR WebSocket at `wss://localhost:8000/ws` (self-signed cert — disable TLS verification) with both `l_lock` and `r_lock` set `true` to engage tracking.
+  `Sim` renders whatever *you* command with `motion_control`. [`axol teleop --sim`](/cli/teleop) instead wraps a `Sim` in the full teleop stack, and with no headset connected the arms hold the rest pose.
+
+  To drive them without a headset, for example in a test, stream [`VRFrame`](/api/vr) messages to the teleop VR WebSocket at `wss://localhost:8000/ws`. Set both `l_lock` and `r_lock` to `true` to engage tracking. The certificate is self-signed, so turn off TLS verification.
 </Note>
 
-## Configuration — `AxolConfig`, `ArmConfig`, `JointConfig`
+## Configuration: `AxolConfig`, `ArmConfig`, `JointConfig`
 
-Each arm joint is configured with a single `JointConfig` carrying its impedance gains, friction-comp model, and the inertial of the body it drives:
+Each arm joint has one `JointConfig` with its impedance gains, friction model, and the mass properties of the link it drives:
 
 ```python
 from almond_axol.robot import Axol, AxolConfig, FrictionParams
@@ -270,7 +294,7 @@ config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
 async with Axol(config=config) as axol: ...
 ```
 
-Or build a fully custom arm with `dataclasses.replace` (start from the `AxolConfig` defaults so you keep the per-side friction values that get injected at construction):
+To build a custom arm, use `dataclasses.replace` on the `AxolConfig` defaults. Starting from the defaults keeps each side's friction values, which are added when the config is built:
 
 ```python
 from dataclasses import replace
@@ -290,52 +314,92 @@ left = replace(
 
 | Field | Type | Description |
 |---|---|---|
-| `kp` | `float` (`[0, 500]`) | Impedance position stiffness |
-| `kd` | `float` | Impedance velocity damping, encoded against `[0, 5]` on every motor family and firmware. (The MyActuator V4.4 changelog claims a widened 0–50 range, but hardware decodes the field against 0–5 on all versions; historical kd values tuned under the 0–50 encoding are 10× inflated — the loader migrates saved calibration values automatically.) Values above 5 are clamped by the command encoding, with a warning at arm construction — never converted into host damping. |
-| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(0.1·k·v) + fv·v + fo` (see `compute_friction` in `robot/control.py`) |
-| `mass` | `float` | Mass of the URDF body this joint drives (kg). For `wrist_3` this includes the gripper. |
-| `com` | `tuple[float, float, float]` | Centre-of-mass of the same body in its URDF link frame (m). Used by gravity comp. |
-| `j_eff` | `float` (default `0.0`) | Effective scalar inertia (kg·m²) for acceleration feedforward `τ = j_eff · q̈_des`. |
-| `kd_host` | `float` (default `0.0`) | Host-side velocity damping (Nm·s/rad): `τ = kd_host · (v_des − v_meas)` added to `t_ff`, with `v_meas` differentiated from measured positions at the command rate. Needed on the high-inertia shoulders, where the motor firmware's velocity estimate is too filtered to damp the ~2 Hz closed-loop resonance (firmware `kd` delivers ~10× less damping than nominal there); the elbow uses a small dose for the same reason. Zero for the wrists and `shoulder_3`, whose firmware `kd` works. Never raise it past the highest value verified stable on hardware — the shipped shoulder 45s are that ceiling; host damping runs on a one-cycle-stale velocity and destabilizes joints that ring above ~10 Hz. A `kd` beyond the firmware's 0–5 range is clamped by the command encoding (with a warning at arm construction), never converted into host damping. |
-| `kd_host_hz` | `float \| None` (default `None`) | Centre frequency (Hz) of the band-pass that confines `kd_host` to the joint's resonance band — a damper centred on the wrong mode arrives rolled-off and out of phase. `None` makes the centre track the pose (the shoulders' impedance mode `√(kp/J(q))` moves ~2.2 → 5.4 Hz between rest and raised-to-the-side); set an explicit value for structural modes that √(kp/J) can't predict (the elbow rings at 6.7–12.5 Hz under load, so it pins 9.5 Hz). The control internals convert to rad/s once at arm construction. |
-| `kd_host_q` | `float \| None` (default `None`) | Quality factor of that band-pass (bandwidth = centre/q). `None` uses the shared 0.8, about an octave wide either side — right for a pose-tracked centre that only estimates the mode, but wide enough to reach into the sub-1.5 Hz intentional-motion band when the centre sits low, where the damping drags the joint's final approach (measured on shoulder_1 as a step that never enters its settle band — a sub-Hz wander, not a ring). When `kd_host_hz` is pinned on a *measured* ring frequency, q ≈ 2–3 confines the damping to the ring and releases the approach. |
-| `torque_limit` | `float` (default `inf`) | Cap (Nm) on the impedance *spring* torque a joint may develop against whatever blocks it. The realtime core enforces it every tick by never sending a position more than `torque_limit / kp` from the last measured one, so `kp · error` is bounded however far the operator's target runs ahead of a blocked joint (at the wrists' `kp=130`, 5 Nm is a ~2.2° window). Gravity feedforward is outside the cap — holding the arm's own weight is not pressing — and the friction / inertia / host-damping feedforwards are derived from the capped command, so they fall to zero while the joint is held. `inf` (the default on every joint) leaves a joint uncapped; box mode caps the wrists for its session instead (`VRTeleopConfig.box_wrist_torque`, 5 Nm). Override per joint: `--axol.left.wrist_2.torque_limit 2.0`. |
+| `kp` | `float` (`[0, 500]`) | Impedance position stiffness. |
+| `kd` | `float` (`[0, 5]`) | Impedance velocity damping in the motor firmware. Values above 5 are clamped, with a warning when the arm is created. |
+| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` of the friction model `fc·tanh(0.1·k·v) + fv·v + fo` (see `compute_friction` in `robot/control.py`). |
+| `mass` | `float` | Mass (kg) of the URDF link this joint drives. For `wrist_3` it includes the gripper. |
+| `com` | `tuple[float, float, float]` | Centre of mass (m) of the same link, in its URDF link frame. Used by gravity compensation. |
+| `j_eff` | `float` (default `0.0`) | Effective inertia (kg·m²) for the acceleration feedforward `τ = j_eff · q̈_des`. |
+| `kd_host` | `float` (default `0.0`) | Velocity damping (Nm·s/rad) computed on the host and added to the feedforward: `τ = kd_host · (v_des − v_meas)`. See [Host damping](#host-damping). |
+| `kd_host_hz` | `float \| None` (default `None`) | Centre frequency (Hz) of the band-pass that limits `kd_host` to the joint's resonance. `None` makes the centre follow the pose. |
+| `kd_host_q` | `float \| None` (default `None`) | Quality factor of that band-pass (bandwidth = centre / q). `None` uses 0.8. |
+| `torque_limit` | `float` (default `inf`) | Cap (Nm) on the spring torque the joint can build up against an obstacle. See [Torque limit](#torque-limit). |
 
-Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
+Gravity feedforward is computed from the URDF with each joint's `mass` and `com` (see [Gravity compensation](#gravity-compensation)).
 
-`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+### Host damping
 
-Which gripper is fitted is `AxolConfig.gripper` (below): `"parallel"`, the stock two-finger gripper, or `"parcel"`, the hinged-plate parcel gripper. It sets the sign of the motor rotation that closes each jaw (`gripper_close_direction(gripper, is_left)`): both parallel jaws close toward positive motor angles, while the parcel gripper's right motor is mounted the other way round and closes toward negative ones.
+The motor firmware's velocity estimate is too filtered to damp the shoulders' closed-loop resonance near 2 Hz, because the shoulders carry a lot of inertia. `kd_host` adds that damping on the host, from velocity differentiated from measured positions at the command rate. The elbow uses a small amount for the same reason. The wrists and `shoulder_3` use `0`, because their firmware `kd` is enough.
 
-The gripper's stroke is not hardcoded. On every cold `enable()` it is calibrated against its own hardware: the jaw is swept closed (in its close direction) until it stalls on the closed stop, then swept back until it stalls on the open stop, so it finishes **open**. The two measured stops define the `[0 = closed, 1 = open]` normalisation for that session and are persisted for reconnects. The measured stroke is then checked against the configured type — about 290° for the parallel gripper, 185° for the parcel gripper — and a stroke nearer the other type's fails the bring-up with a `MotorError` naming the right setting (a wrong type would leave the parcel gripper's right jaw closed after calibration).
+Raise `kd_host` with care. Host damping uses a velocity that is one cycle old, so it destabilizes joints that ring above about 10 Hz. A `kd` above the firmware's 0 to 5 range is clamped and is never moved into host damping.
+
+The band-pass keeps the damping on the joint's resonance. With `kd_host_hz` at `None`, the centre follows the shoulders' impedance mode `√(kp/J(q))`, which moves from about 2.2 Hz at rest to 5.4 Hz with the arm raised to the side. Set an explicit centre for structural modes that this can't predict.
+
+The default `kd_host_q` of 0.8 is about an octave wide on each side, which suits a centre that follows the pose. When the centre sits low, that band reaches into intended motion below 1.5 Hz and slows the joint's final approach. When you set `kd_host_hz` to a measured ring frequency, a q of 2 to 3 keeps the damping on the ring.
+
+### Torque limit
+
+The realtime core enforces `torque_limit` every tick. It never sends a position more than `torque_limit / kp` from the last measured one, so `kp · error` stays bounded however far the target runs ahead of a blocked joint. At the wrists' `kp=130`, 5 Nm is a window of about 2.2°.
+
+Gravity feedforward is not capped, because holding the arm's own weight isn't pressing. The friction, inertia and host-damping feedforwards follow the capped command, so they fall to zero while the joint is blocked.
+
+Every joint defaults to `inf`, which leaves it uncapped. Box mode caps the wrists for its session instead (`VRTeleopConfig.box_wrist_torque`, 5 Nm). To cap one joint from the CLI, pass `--axol.left.wrist_2.torque_limit 2.0`.
+
+### Grippers
+
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s). The gripper joint is fixed in the model, so the gripper's mass is included in `wrist_3.mass`.
+
+`AxolConfig.gripper` (below) sets which gripper is fitted: `"parallel"`, the stock two-finger gripper, or `"parcel"`, the hinged-plate parcel gripper. It sets which way each jaw's motor turns to close (`gripper_close_direction(gripper, is_left)`). Both parallel jaws close toward positive motor angles. The parcel gripper's right motor is mounted the other way round, so it closes toward negative angles.
+
+The gripper's stroke is measured, not fixed. On every cold `enable()`, each jaw closes until it stalls on the closed stop, then opens until it stalls on the open stop, so it ends **open**. The two stops define `0` (closed) and `1` (open) for that session and are saved for reconnects.
+
+The measured stroke is then checked against the configured gripper: about 290° for the parallel gripper and 185° for the parcel gripper. If the stroke is closer to the other type's, the bring-up fails with a `MotorError` that names the right setting. A wrong type would leave the parcel gripper's right jaw closed after calibration.
+
+### `AxolConfig` fields
 
 `AxolConfig` also exposes top-level parameters:
 
 | Field | Default | Description |
 |---|---|---|
-| `has_gripper` | `True` | Whether this robot is the gripper-equipped SKU. Set `False` for the gripperless SKU: the gripper motors are never constructed, enabled, or calibrated; the gripper element of every `(8,)` joint array is ignored on write and reported as `0.0` on read (array shapes are unchanged). LeRobot datasets recorded on a gripperless robot carry 7 channels per arm instead of 8. |
-| `gripper` | `"parallel"` | Which gripper is fitted to both arms: `"parallel"` (the stock two-finger gripper) or `"parcel"` (the hinged-plate parcel gripper). Sets each jaw's close direction for the end-stop calibration, which refuses a measured stroke that belongs to the other type. Teleop's box mode exists only with `"parcel"`. CLI `--axol.gripper parcel`; control panel **Robot → Gripper**. |
-| `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
-| `left_stiffness` | `1.0` | Compliance blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `1.0` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=350`) — the stiffest the hardware was measured to support, so lower values only *add compliance*, down to the hand-guidable `_SOFT_GAINS` at `0` (`shoulder_1` `kp=40`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness), with a damping-ratio-consistent soft endpoint so every slider position stays as well damped as the tuned gains; `j_eff` is unchanged by the blend; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
+| `has_gripper` | `True` | Set `False` on the gripperless model. The gripper motors are never created, enabled or calibrated, and the gripper element of every `(8,)` array is ignored on write and reads `0.0`. |
+| `gripper` | `"parallel"` | Which gripper is fitted to both arms: `"parallel"` or `"parcel"` (see [Grippers](#grippers)). Teleop's box mode works only with `"parcel"`. |
+| `max_step_rad` | `0.5` | Largest change (rad) allowed in any arm joint between two `motion_control` calls. Larger commands are dropped with a warning, and `float("inf")` turns the check off. |
+| `left_stiffness` | `1.0` | Compliance of the **left** arm: a scalar in `[0, 1]` for every joint, or a 7-tuple with one value per joint. `1.0` runs the tuned gains, and `0` the soft, hand-guidable gains. |
 | `right_stiffness` | `1.0` | Same, for the **right** arm. |
+
+Notes:
+
+- With `has_gripper=False`, the array shapes don't change, and LeRobot datasets record 7 channels per arm instead of 8.
+- Set the gripper type with `--axol.gripper parcel` on the CLI, or with the **Gripper** setting on the control panel's **Robot** tab.
+- At 30 Hz, a `max_step_rad` of 0.5 is about 15 rad/s, roughly 2.5 times the teleop speed limit.
+
+### Stiffness
+
+A 7-tuple lists the joints in the order `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`. The gripper isn't included. Values below `1.0` only add compliance. At `0` the arm runs the soft gains, for example `kp=40` on `shoulder_1` against `kp=250` tuned.
+
+`kp` and `kd` blend geometrically (in log space), which matches how stiffness feels. The soft end keeps a consistent damping ratio, so every setting is as well damped as the tuned gains. `j_eff` doesn't change, and `kd_host` scales with `√(kp(s)/kp)`.
+
+`AxolConfig.resolved()` applies the blend to the `left` and `right` gains once, when `Axol` is created. The stiffness fields keep the values you set, so a saved config loads back unchanged.
 
 ```python
 config = AxolConfig()                                          # tuned gains (s=1, default)
-config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 118
+config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp = 100
 config = AxolConfig(                                           # per-joint, left only
     left_stiffness=[1.0, 1.0, 0.8, 0.8, 0.5, 0.5, 0.2],
 )
 ```
 
-Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. The built production config sets `shoulder_1.kd_host_q=3` symmetrically: it keeps the shoulder damper centred on its pose-tracked impedance mode while excluding the separate 12.5–13.6 Hz mast/forearm mode seen in hardware traces. Other joints with `kd_host_q=None` use the shared 0.8. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
+Both arms share the `ArmConfig` defaults for gains and masses. The right arm's centres of mass are mirrored across X by `ArmConfig.mirror_to_right()`. Friction is measured separately for each arm, because the left and right motors differ (see `_LEFT_FRICTION` and `_RIGHT_FRICTION` in `almond_axol/robot/config.py`). Pass an explicit `left=` or `right=` to override either side.
+
+`shoulder_1` sets `kd_host_q=3` on both arms. This keeps its damper on the impedance mode and off a separate 12.5 to 13.6 Hz mode of the mast and forearm. Other joints leave `kd_host_q` at `None`, which uses 0.8.
 
 ## Gravity compensation
 
-`almond_axol.robot.gravity.GravityCompensator` builds a MuJoCo model from the bundled URDF and computes per-joint gravity torques as `qfrc_bias` with `qvel=0` (Coriolis terms vanish). Because the URDF is the full kinematic chain, each parent joint's gravity load includes the contribution of every child link — this is the main improvement over the previous per-joint `ga·cos(q) + gb·sin(q)` model, which silently ignored child-link mass.
+`almond_axol.robot.gravity.GravityCompensator` builds a MuJoCo model from the bundled URDF. It computes each joint's gravity torque as `qfrc_bias` with zero velocity, so the Coriolis terms drop out. Each joint's load includes the weight of every link after it in the chain.
 
-Per-link masses are not taken from the bundled URDF — the Onshape exporter leaves placeholder sub-gram values that produce essentially zero gravity. Real per-link mass and CoM live on each `JointConfig.mass` / `JointConfig.com` in `almond_axol/robot/config.py` (CoMs come from the CAD inertial origins; masses are tuned in place against measured joint torques and are typically lower than the CAD values, since Onshape often over-assigns aluminum-class densities to parts that are hollow / 3D-printed).
+Link masses don't come from the URDF file, whose exported values are placeholders. They come from each joint's `JointConfig.mass` and `JointConfig.com` in `almond_axol/robot/config.py`. The centres of mass come from CAD, and the masses are tuned against measured joint torques.
 
-If the arms sag or push back in gravity-comp mode, tune the relevant joint's `mass` and `com` on `AxolConfig` and pass it to `Axol`:
+If the arms sag or push back in gravity-comp mode, tune the joint's `mass` and `com` on `AxolConfig` and pass it to `Axol`:
 
 ```python
 from almond_axol.robot import AxolConfig, Axol
@@ -346,13 +410,13 @@ config.left.elbow.com = (-0.025, 0.0, -0.07)
 async with Axol(config=config) as axol: ...
 ```
 
-See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.
+To hold the arms in gravity compensation interactively, use the [`gravity-comp`](/cli/gravity-comp) command.
 
-The same model also serves the arm's kinematics on the control side: `GravityCompensator.mount_jacobian(arm_q, is_left=...)` returns the gripper mount's pose (the URDF gripper link — the frame the IK solver targets) and its `(6, 7)` geometric Jacobian at any joint configuration, from `mj_kinematics` alone.
+The same model also provides the arm's kinematics. `GravityCompensator.mount_jacobian(arm_q, is_left=...)` returns the pose of the gripper mount and its `(6, 7)` geometric Jacobian at any joint configuration. The gripper mount is the URDF gripper link, the frame the IK solver targets.
 
 ### Payloads
 
-The link masses above describe the robot itself. Whatever a gripper picks up is added at runtime with `set_payload`, so the arm carrying it holds its commanded pose instead of sagging by `unmodelled torque / kp`, gravity-comp hand-guiding stays weightless, and `torque_residuals()` does not read the load as a contact:
+The link masses describe the robot itself. Add whatever a gripper picks up at runtime with `set_payload`. The arm then holds its commanded pose instead of sagging, hand-guiding in gravity comp stays weightless, and `torque_residuals()` doesn't read the load as a contact:
 
 ```python
 import asyncio
@@ -372,8 +436,20 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-The payload is a point mass rigidly attached to the gripper: `com` is in metres in the gripper link frame — the end-effector frame forward kinematics reports — and `GRIPPER_TIP_OFFSET` is where the fingers close. Use `"both"` for one object carried between the two grippers, giving each arm its share of the mass. The feedforward changes on the next control cycle, so call it when the grasp actually closes and clear it when it opens: a payload the gripper is not yet carrying lifts the arm slightly until it is. Masses above 5 kg (and CoMs more than 0.5 m from the gripper) are refused as unit slips. A payload is not persisted; a permanently heavier end-effector belongs in the calibration instead ([`tune.factory --mass wrist_3=<kg>`](/cli/tune-factory)). `Sim.set_payload` validates the same arguments and changes nothing, so a script runs identically in sim.
+The payload is a point mass fixed to the gripper:
+
+- `com` is in metres, in the gripper link frame that forward kinematics reports. `GRIPPER_TIP_OFFSET` is where the fingers close.
+- Use `"both"` for one object carried by both grippers. Each arm takes its share of the mass.
+- The feedforward changes on the next control cycle. Set the payload when the grasp closes and clear it when it opens, because a payload the gripper isn't carrying lifts the arm slightly.
+- Masses above 5 kg and centres of mass more than 0.5 m from the gripper are refused as likely unit mistakes.
+- The payload isn't saved. For a permanently heavier end-effector, update the calibration with [`tune.factory --mass wrist_3=<kg>`](/cli/tune-factory).
+- `Sim.set_payload` checks the same arguments and changes nothing, so a script runs the same way in sim.
 
 ## Squeeze lean (box mode)
 
-The force side of [box mode](/guides/vr-interface#box-mode) lives in the IK worker, not the robot (`almond_axol.teleop.box.squeeze_lean`; see [`box_squeeze_lean`](/api/teleop#vrteleopconfig)). What the robot contributes is the model: `GravityCompensator.mount_jacobian` above, and `AxolArm.kp` — each arm's impedance stiffness per joint (Nm/rad, after the stiffness blend), which with the Jacobian gives the arm's Cartesian compliance at the mount, `J diag(1/kp) J^T`. The teleop core reads both arms' cached measured positions and `kp` before every box-mode frame (`almond_axol.teleop.core.measured_arms`) and forwards them to the worker, which offsets the gripper *targets* so the run-ahead the operator jogs becomes a pure force through the tool's contact points. Nothing on the robot's command path is touched: the arms are position controlled as ever, and the realtime core sees ordinary targets. (An earlier version reshaped every command on the robot from its measured pose; it worked on the bench and cost the pair its alignment on the robot, and is gone.)
+The force control of [box mode](/guides/vr-interface#box-mode) runs in the IK worker, not on the robot (`almond_axol.teleop.box.squeeze_lean`, see [`box_squeeze_lean`](/api/teleop#box-mode)). The robot provides the model it needs:
+
+- `GravityCompensator.mount_jacobian`, described above.
+- `AxolArm.kp`, each arm's impedance stiffness per joint (Nm/rad), after the stiffness blend.
+
+From these the worker gets the arm's Cartesian compliance at the mount, `J diag(1/kp) J^T`. Before every box-mode frame, teleop passes both arms' measured positions and `kp` to the worker. The worker offsets the gripper targets so that jogging the grippers past the box becomes an even squeeze through the tool's contact points. The arms stay position controlled, and the realtime core receives ordinary targets.

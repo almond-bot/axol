@@ -162,7 +162,7 @@ class CollectDataAffinityIntegrityTest(unittest.TestCase):
                 action_features={},
                 observation_features={},
                 cameras={},
-                positions=([], []),
+                positions=([0.0] * 8, [0.0] * 8),
                 name="test-robot",
             )
             robot.get_joint_observation.return_value = {}
@@ -438,6 +438,7 @@ class LeRobotVRStartupIntegrityTest(unittest.TestCase):
             vr_server_config=object(),
             vr_teleop_config=SimpleNamespace(absolute_mode=False),
             kinematics_config=object(),
+            record_raw_tcp=False,
         )
         teleop._loop = None
         teleop._loop_thread = None

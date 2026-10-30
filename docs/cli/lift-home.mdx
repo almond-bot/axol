@@ -1,9 +1,9 @@
 ---
 title: "lift.home"
-description: "One-time calibration (homing) of the telescoping lift."
+description: "Calibrate (home) Jelly's telescoping lift once, before you move it."
 ---
 
-Calibrates the telescoping lift by running the lift controller's two-ended homing sequence: the legs drive up until they reach the top stop, then down to the bottom stop. On success the controller rebases its position counters (bottom = 0), sets soft limits a margin inside the hard stops, and saves everything to its flash — establishing the height scale that [`lift.goto`](/cli/lift-goto) and the teleop height display use.
+Calibrates Jelly's telescoping lift. The legs drive up to the top stop, then down to the bottom stop. When homing succeeds, the lift board sets the bottom as zero, sets soft limits a little inside the stops, and saves them. [`lift.goto`](/cli/lift-goto) and the teleop height display use this calibration.
 
 ```bash
 axol lift.home                  # legs together (default, legs on the robot)
@@ -12,21 +12,21 @@ axol lift.home --independent    # each leg to its own stops (loose legs only)
 
 There are two modes:
 
-- **Together** (default) — for legs bolted to the robot, with or without the robot on top. The legs move as one, and the first leg to reach a stop stops both, so the frame is never racked. Whatever height offset the legs start with is kept.
-- **Independent** (`--independent`, or the **Independent** toggle in the dashboard dialog) — for loose legs off the robot, e.g. before mounting or after swapping a leg. Each leg runs to its own top and bottom stops and is zeroed at its own bottom, so legs that start at different heights end up level.
+- **Together** (default): for legs bolted to the base, with or without Axol on top. The legs move as one, and when the first leg reaches a stop, both stop, so the frame is never twisted. Any height difference the legs start with is kept.
+- **Independent** (`--independent`, or the **Independent** toggle in the dashboard dialog): for loose legs, for example before mounting or after you replace a leg. Each leg runs to its own stops and is zeroed at its own bottom, so legs that start at different heights end up level.
 
 <Warning>
-  Never home independently with the legs mounted: after the first leg reaches its stop, the other keeps pushing alone against the frame until its own stall cut fires.
+  Never home independently with the legs mounted. After the first leg reaches its stop, the other keeps pushing against the frame until its stall protection cuts it off.
 </Warning>
 
-Lift firmware before v0.9 ignores the mode and always homes each leg independently.
+Lift firmware older than v0.9 ignores the mode and always homes each leg independently.
 
-The sequence takes **1–2 minutes** and intentionally touches both end stops. Progress streams as status lines; Ctrl-C (or **Stop** in the control panel) aborts safely — an interrupted homing rolls back to the previous calibration, so the lift is never left half-homed.
+Homing takes 1 to 2 minutes and touches both end stops on purpose. Progress prints as it runs. Press Ctrl-C, or **Stop** in the control panel, to stop safely. An interrupted homing goes back to the previous calibration, so the lift is never left half-homed.
 
 <Info>
-  Homing normally happens **once ever**, not per boot: the legs are self-locking (they cannot move unpowered), so the saved position stays valid across power cycles. Re-home only if the columns were turned by hand or the controller died mid-move.
+  You normally home the lift only once, not on every boot. The legs can't move without power, so the saved position stays valid across power cycles. Home again only if the columns were turned by hand or the lift lost power during a move.
 </Info>
 
 <Note>
-  Requires the lift's CAN bus (named by [`can.setup`](/cli/can-setup)) and a powered lift board. By default the command uses the chest bus `can_alm_axol_c` when that interface exists, otherwise the wheel bus `can_alm_axol_b` the lift shares with the motors; pass `--channel` to use a different interface. Also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Home the lift**.
+  The lift's CAN bus must be set up with [`can.setup`](/cli/can-setup), and the lift board must have power. The command uses the chest bus `can_alm_axol_c` if it exists, otherwise the wheel bus `can_alm_axol_b`. Pass `--channel` to use a different interface. You can also run this command from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Home the lift**.
 </Note>

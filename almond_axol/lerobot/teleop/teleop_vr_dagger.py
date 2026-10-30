@@ -50,7 +50,10 @@ class DaggerVRTeleop(AxolVRTeleop):
         # Replace the stock core built by the base __init__ before anything
         # runs (connect starts the threads that use it).
         self._core: DaggerTeleopCore = DaggerTeleopCore(
-            config.vr_teleop_config, _logger, self._broadcast_tracking
+            config.vr_teleop_config,
+            _logger,
+            self._broadcast_tracking,
+            robot_model=config.kinematics_config.robot_model,
         )
         self._position_source: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
 

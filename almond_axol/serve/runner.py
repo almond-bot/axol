@@ -42,6 +42,7 @@ import threading
 import time
 from typing import Any
 
+from .. import progress
 from ..constants import PARK_TIMEOUT_S, PARK_ZERO_TIMEOUT_S
 from ..motor.bus import STALL_DETECT_S, stalled_channels
 from ..robot.base import HardwareCleanupError, is_hardware_cleanup_uncertain
@@ -782,7 +783,11 @@ class OperationRunner:
                 )
             if mantis_mode:
                 if op_id == "collect-data":
-                    from ..cli.collect_data import _prepare_mantis_collection
+                    from ..cli.collect_data import (
+                        _prepare_mantis_collection,
+                        _require_mantis_tracking_validation,
+                        _resolve_lighthouse_quality,
+                    )
                     from ..cli.mantis_bridge import (
                         require_mantis_tracker_readiness,
                         set_managed_pose_source_id,
@@ -791,6 +796,11 @@ class OperationRunner:
                     # Fail missing/ambiguous tracker→TCP calibration before
                     # releasing CAN or opening the managed tracker backend.
                     _prepare_mantis_collection(cfg)
+                    # Resolve the Lighthouse policy once: the validation gate,
+                    # the episode's live checks and the managed bridge started
+                    # below all follow this value.
+                    _resolve_lighthouse_quality(cfg)
+                    _require_mantis_tracking_validation(cfg)
                     # Quest is checked live by the WebXR handshake. External
                     # sources must pass the same supported-runtime/access gate
                     # as direct CLI commands before releasing CAN or opening
@@ -898,8 +908,8 @@ class OperationRunner:
         session.emit(f"[serve] starting {op_id} (in-process)")
         if grippers_only:
             session.emit(
-                "[serve] teleop: Mantis grippers only — the rig triggers "
-                "drive the grippers and no tracking starts"
+                "[serve] teleop: Mantis grippers only. The rig triggers "
+                "drive the grippers, and the rigs are not tracked."
             )
 
         if needs_robot and self._robot_link is not None:
@@ -946,6 +956,7 @@ class OperationRunner:
         mantis_source = str(getattr(cfg, "mantis_source", "lighthouse"))
         manage_bridge = mantis_mode and mantis_source != "quest" and not grippers_only
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
+        session.progress = progress.begin()
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
         )
@@ -997,8 +1008,8 @@ class OperationRunner:
                 stalled_since = now
             elif now - stalled_since >= STALL_DETECT_S:
                 session.emit(
-                    "[serve] motor power lost — no motor is answering on the CAN "
-                    "bus; stopping the operation"
+                    "[serve] Motor power lost: no motor is answering on the CAN "
+                    "bus. Stopping the operation."
                 )
                 _logger.warning(
                     "motor power lost during %s; stopping", session.command_id
@@ -1082,9 +1093,8 @@ class OperationRunner:
         thread.join(timeout=grace)
         if thread.is_alive():
             session.emit(
-                f"[serve] still stopping after {grace:.0f}s — "
-                "force-killing the operation's child processes (sparing the "
-                "dataset recorder)"
+                f"[serve] Still stopping after {grace:.0f}s. Force-stopping the "
+                "operation's child processes, except the dataset recorder."
             )
             spared = self._kill_op_children(session, spare={_RECORDER_PROC_NAME})
             if spared and thread.is_alive():
@@ -1102,8 +1112,8 @@ class OperationRunner:
             # still owns the CAN bus, so the session stays "running"/"stopping"
             # and is_running() keeps a new op from clobbering it.
             session.emit(
-                "[serve] operation did not exit after force-kill and is now "
-                "abandoned — restart axol serve if it persists"
+                "[serve] The operation did not exit after a force stop. "
+                "Restart axol serve if this keeps happening."
             )
 
     def _kill_op_children(
@@ -1140,7 +1150,7 @@ class OperationRunner:
             if spare and child.name in spare:
                 session.emit(
                     f"[serve] sparing child process {child.name} "
-                    f"(pid {child.pid}) — dataset finalize in progress"
+                    f"(pid {child.pid}) while the dataset finishes saving"
                 )
                 spared_any = True
                 continue
@@ -1209,9 +1219,11 @@ class OperationRunner:
     ) -> dict[str, Any] | None:
         """Select the saved camera assignment for the active hardware profile.
 
-        Axol uses the normal overhead/left-arm/right-arm map. Mantis has its
-        own two-camera map so changing gripper cameras does not overwrite the
-        Axol rig. Older saved specs fall back to the Axol left/right entries.
+        Both profiles support an overhead/head camera and two wrist cameras.
+        Mantis keeps its own assignments so changing them does not overwrite
+        the Axol rig. Missing slots in older saved specs fall back to Axol's
+        entries; an explicitly blank serial keeps that Mantis slot unassigned.
+        An inherited head camera must not already occupy a Mantis wrist slot.
         """
         if not cameras:
             return cameras
@@ -1230,14 +1242,15 @@ class OperationRunner:
         axol_serials = cameras.get("serials") or {}
         raw_mantis = cameras.get("mantis_serials")
         mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
+        # Wrist slots fall back to the Axol layout as before. The Head slot is
+        # new to Mantis: a layout saved before it existed recorded wrists
+        # only, so never inherit Axol's overhead camera into it (that would
+        # silently add a third camera, or block Start when it is not attached).
         selected["serials"] = {
-            "overhead": "",
-            "left_arm": mantis_serials.get(
-                "left_arm", axol_serials.get("left_arm", "")
-            ),
-            "right_arm": mantis_serials.get(
-                "right_arm", axol_serials.get("right_arm", "")
-            ),
+            slot: mantis_serials.get(
+                slot, "" if slot == "overhead" else axol_serials.get(slot, "")
+            )
+            for slot in _CAMERA_SLOTS
         }
         return selected
 
@@ -1476,7 +1489,9 @@ class OperationRunner:
     def _start_tracker_bridge(self, session: Session, cfg: Any, op_id: str) -> None:
         """Start the selected tracker bridge and wait for initialization."""
         from ..tracker import load_tracker_config
-        from ..tracker.config import select_tracker_backend
+        from ..tracker.config import select_tracker_backend, validate_lighthouse_quality
+        from ..tracker.lighthouse_validation import LIGHTHOUSE_ACQUISITION_TIMEOUT_S
+        from ..tracker.trigger import validate_trigger_full_scale
 
         config = load_tracker_config()
         source = str(getattr(cfg, "mantis_source", "lighthouse"))
@@ -1486,6 +1501,14 @@ class OperationRunner:
                 f"Mantis source {source!r} does not use a tracker bridge"
             )
         select_tracker_backend(config, backend)
+        # Lighthouse must receive fresh station identity broadcasts before it
+        # reports ready. Give the child its full acquisition window plus spawn
+        # overhead; Ultimate retains its existing startup budget.
+        ready_timeout = (
+            LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
+            if backend == "survive"
+            else _BRIDGE_READY_TIMEOUT_S
+        )
         server = getattr(cfg, "vr_server", None)
         if server is None:
             teleop = getattr(cfg, "teleop_config", None)
@@ -1501,6 +1524,17 @@ class OperationRunner:
         # could leave its controls attached to the old logical side after a hub
         # swap, so managed trigger readers always follow the run config.
         _bind_managed_mantis_trigger_channels(config, cfg)
+        config.trigger_full_scale_left = validate_trigger_full_scale(
+            getattr(cfg, "mantis_left_trigger_full_scale", 1.0)
+        )
+        config.trigger_full_scale_right = validate_trigger_full_scale(
+            getattr(cfg, "mantis_right_trigger_full_scale", 1.0)
+        )
+        # Pin the policy collect-data resolved so its gates and the bridge
+        # cannot disagree if the saved setting changes meanwhile.
+        quality = getattr(cfg, "_lighthouse_quality", None)
+        if quality is not None:
+            config.lighthouse_quality = validate_lighthouse_quality(quality)
         if (
             config.left is None or config.right is None
         ) and not config.allow_single_side:
@@ -1538,10 +1572,9 @@ class OperationRunner:
             process.start()
             child_conn.close()
             try:
-                if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
+                if not parent_conn.poll(ready_timeout):
                     raise RuntimeError(
-                        "tracker bridge did not initialize within "
-                        f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+                        f"tracker bridge did not initialize within {ready_timeout:.0f}s"
                     )
                 result = parent_conn.recv()
                 if not result.get("ok"):
@@ -1805,6 +1838,8 @@ class OperationRunner:
         *,
         cleanup_uncertain: bool = False,
     ) -> None:
+        if session.progress is not None:
+            progress.end(session.progress)
         if cleanup_uncertain:
             # The operation could not confirm it torqued the motors off.  Do
             # not make the operator prove it by hand: look now, and only

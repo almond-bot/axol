@@ -1,16 +1,24 @@
 ---
 title: "Run Policy Config Parameters"
 sidebarTitle: "Config Parameters"
-description: "Every setting for axol run-policy — what it does and its default."
+description: "Every setting for axol run-policy, what it does and its default."
 ---
 
 import Robot from "/snippets/config/robot.mdx";
 import LeRobotRobot from "/snippets/config/lerobot-robot.mdx";
 import Cameras from "/snippets/config/cameras.mdx";
 
-Every setting for `axol run-policy`. Add any flag below to the command, or set it once in the control panel — see [Command configuration](/cli/configuration) for config files and syntax details.
+Every setting for `axol run-policy`. Add any flag below to the command, or set it once in the control panel. See [Command configuration](/cli/configuration) for config files and syntax.
 
-In the [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`, read by default) `robot_config.axol_config.*` is the file's `axol` section, the other `robot_config.*` fields are `lerobot`, `--left_channel` / `--right_channel` live under `robot`, the recording fields under `recording`, and the inference and action-chunking fields (plus `policy_torque_threshold`) under `inference`.
+The [shared settings file](/guides/control-panel-settings) (`~/.almond/settings.json`) is read by default. It stores these flags in the sections below.
+
+| Flag | Section in the settings file |
+|---|---|
+| `robot_config.axol_config.*` | `axol` |
+| `robot_config.left_channel`, `robot_config.right_channel` | `robot` |
+| Other `robot_config.*` fields | `lerobot` |
+| Recording flags | `recording` |
+| Inference and action chunking flags, and `policy_torque_threshold` | `inference` |
 
 ```bash
 axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up the cup" \
@@ -18,73 +26,71 @@ axol run-policy --policy_path myorg/pick-act --policy_type act --task "pick up t
 ```
 
 <Warning>
-  Stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps`, and the camera set must be the **same as in [Data Collection](/operations/data-collection-config)**. A policy only works with the dynamics it was trained on.
+  Use the **same** stiffness, gripper torque, `observe_torques`, `observe_cartesian`, `fps` and cameras as in [Data Collection](/operations/data-collection-config). A policy only works with the settings it was trained on.
 </Warning>
 
 ## Policy
 
 | Flag | Default | Description |
 |---|---|---|
-| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, `groot`, or `custom` ([your own model](/operations/custom-policy)). |
-| `--policy_path` | required for LeRobot policies | Policy checkpoint — a HuggingFace Hub repo id or local path (reachable from the inference server when remote). Unused for `custom`; model selection stays at the endpoint. |
-| `--task` | required | Task description stored with recorded frames. Sent to LeRobot policies; custom policies choose instructions at the endpoint. |
-| `--device` | `cuda` | `cuda`, `cpu`, or `mps` (LeRobot policies only). |
+| `--policy_type` | required | `act`, `smolvla`, `diffusion`, `tdmpc`, `vqbet`, `pi0`, `pi05`, `groot` or `custom` ([your own model](/operations/custom-policy)). |
+| `--policy_path` | required for LeRobot policies | Checkpoint, as a HuggingFace Hub repo ID or a local path. A remote inference server must be able to reach it. Not used with `custom`. |
+| `--task` | required | Task description saved with recorded frames and sent to LeRobot policies. A custom policy chooses instructions on its server. |
+| `--device` | `cuda` | `cuda`, `cpu` or `mps`. LeRobot policies only. |
 | `--episode_time_s` | `120` | Maximum episode length (s). |
-| `--fps` | `30` | Control rate. Must match the training fps unless `--allow_fps_mismatch true` (a checkpoint trained on 60 fps data needs `--fps 60`). |
-| `--allow_fps_mismatch` | `false` | Start even if `fps` differs from the training fps. Experiments only. |
-| `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one locally for LeRobot policies. With `custom`, connects to an existing endpoint (`null` = this machine); no server is spawned. |
-| `--server_port` | `8765` | Inference server port (or your custom policy server's). |
+| `--fps` | `30` | Control rate. Must match the training rate, so a policy trained on 60 fps data needs `--fps 60`. |
+| `--allow_fps_mismatch` | `false` | Start even if `fps` differs from the training rate. For experiments only. |
+| `--server_host` | `null` (local) | Address of a remote [`inference-server`](/cli/inference-server). `null` starts one on this computer for LeRobot policies. With `custom`, the address of your running endpoint (`null` means this computer). |
+| `--server_port` | `8765` | Port of the inference server or custom policy endpoint. |
 
 ## Action chunking
 
-Custom policies use the [custom policy interface](/api/policy-plan): the endpoint
-publishes the final plan, and the robot adopts its remaining rows without
-altering that plan. LeRobot policies retain robot-side chunk aggregation.
-Execution filtering applies downstream of either path.
+A custom policy's endpoint sends the final plan, and the robot runs the rest of it unchanged. LeRobot policies use the chunk-blending settings below. The speed and acceleration limits apply to both.
 
 | Flag | Default | Description |
 |---|---|---|
 | `--actions_per_chunk` | `50` | Maximum actions requested from the policy per call. |
-| `--plan_config.request_interval` | `5` | Custom policies: dispatch this many rows between requests. |
-| `--plan_config.max_adoption_offset_steps` | `6` | Custom policies: maximum reply age in control steps from the saved request origin. Must be inside the action horizon. |
-| `--plan_config.late_policy` | `blocking_refresh` | Custom policies: hold and request reset plans on expiry, or select `abort` to fail the session. |
+| `--plan_config.request_interval` | `5` | Custom policies: run this many actions between requests. |
+| `--plan_config.max_adoption_offset_steps` | `6` | Custom policies: how many control steps a reply may arrive after its request. Must be shorter than the chunk. |
+| `--plan_config.late_policy` | `blocking_refresh` | Custom policies: when the plan runs out, hold and request a new one. `abort` ends the session instead. |
 | `--chunk_size_threshold` | `0.9` | LeRobot policies: request the next chunk when the queue drops below this fraction. |
-| `--aggregate_fn` | `temporal_ensemble` | LeRobot policies: combine overlapping chunks using `temporal_ensemble`, `weighted_average`, `latest_only`, `average`, or `conservative`. |
+| `--aggregate_fn` | `temporal_ensemble` | LeRobot policies: how to combine overlapping chunks. `temporal_ensemble`, `weighted_average`, `latest_only`, `average` or `conservative`. |
 | `--temporal_ensemble_coeff` | `0.01` | LeRobot policies: weight decay for `temporal_ensemble`. |
-| `--ensemble_blend_s` | `0.2` | LeRobot policies: fade (s) at the end of each chunk so coverage expiry does not step the ensemble. `0` disables. |
-| `--align_fade_s` | `1.0` | LeRobot policies: fade (s) over which each new chunk's offset from current motion is blended in. `0` disables. |
-| `--exec_max_vel` | `6.283` | Joint speed limit (rad/s) on commands sent to the arms. `0` disables. |
-| `--exec_max_accel` | `9.42` | Joint acceleration limit (rad/s²). `0` disables. |
+| `--ensemble_blend_s` | `0.2` | LeRobot policies: fade-out time (s) at the end of each chunk, so the motion doesn't step when a chunk ends. `0` turns it off. |
+| `--align_fade_s` | `1.0` | LeRobot policies: time (s) to blend each new chunk in from the current motion. `0` turns it off. |
+| `--exec_max_vel` | `6.283` | Joint speed limit (rad/s) on commands sent to the arms. `0` turns it off. |
+| `--exec_max_accel` | `9.42` | Joint acceleration limit (rad/s²). `0` turns it off. |
 
 ## Recording
 
-Optional — the rollout is recorded to a dataset when `--repo_id` is set.
+Optional. Set `--repo_id` to record the episodes to a dataset.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--repo_id` | `null` | Dataset id, `<user>/<dataset>`. Set it to record the rollout. |
+| `--repo_id` | `null` | Dataset ID, `<user>/<dataset>`. Set it to record the episodes. |
 | `--vcodec` | per platform | Dataset video codec: `h264` on Jetson, `auto` elsewhere. |
 | `--root` | `null` | Local dataset directory. Default is the LeRobot cache, `~/.cache/huggingface/lerobot`. |
-| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. |
+| `--push_to_hub` | `false` | Upload the dataset to the HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
 | `--rerun_ip` | `null` (off) | Stream live visualisation to a [Rerun](https://rerun.io) viewer at this address. |
 | `--rerun_port` | `9876` | Rerun viewer port. |
 | `--log_level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
-| `--config_path` | — | Load a JSON/YAML config file. Flags override it. |
-| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file) / ignore it. Applies beneath `--config_path` and the flags. |
+| `--config_path` | none | Load a JSON or YAML config file. Flags override it. |
+| `--settings_path` / `--no_settings` | `~/.almond/settings.json` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. The config file and flags override it. |
 
 ## Contact safety
 
-A contact stop trips when a joint's torque is higher than the gravity model expects — the arm hit something. The arms then go limp instead of pushing through.
+A contact stop trips when a joint pushes harder than the arm's weight explains, which means the arm hit something. The arms then go limp instead of pushing through.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--reset_torque_threshold` | `6.0` | Contact stop during return-to-rest (Nm). `0` disables. |
-| `--policy_torque_threshold` | `0` (off) | Contact stop while the policy drives (Nm). A trip aborts the episode. The control panel arms it at `16`. |
+| `--reset_torque_threshold` | `6.0` | Contact stop during a return to rest (Nm). `0` turns it off. |
+| `--policy_torque_threshold` | `0` (off) | Contact stop while the policy drives (Nm). A trip drops the episode. The control panel suggests `16`. |
 | `--reset_gravity_comp_kd` | `0.25` | Damping (Nm·s/rad) of the limp hold. |
+| `--park_to_zero` | `true` | On stop, move to rest and then to zero, holding the grasp, before the motors turn off. `false` stops at rest. |
 
 ## Robot {#robot-config}
 
-CAN buses, cameras, and what goes into observations.
+CAN buses, cameras and what goes into observations.
 
 <LeRobotRobot prefix="robot_config." />
 
@@ -94,6 +100,6 @@ CAN buses, cameras, and what goes into observations.
 
 ### Arm gains {#robot}
 
-Arm stiffness, gripper limits, and per-joint gains.
+Arm stiffness, gripper limits and per-joint gains.
 
 <Robot prefix="robot_config.axol_config." />

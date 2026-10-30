@@ -14,6 +14,8 @@ def _frame(left: bool, right: bool, release_id: int | None = None) -> SimpleName
     return SimpleNamespace(
         l_lock=left,
         r_lock=right,
+        l_tracked=True,
+        r_tracked=True,
         l_grip=0.5,
         r_grip=0.5,
         lock_release_id=release_id,
@@ -116,6 +118,42 @@ class EngageBlockTest(unittest.TestCase):
         core.block_engage()
         core.update_engage(_frame(False, False, release_id=7))
         self.assertEqual(sent, [{"type": "lock_release", "value": 7}])
+
+    def test_blocked_engage_request_is_rejected_once_per_high_edge(self) -> None:
+        core, sent = self._core()
+        core.block_engage()
+
+        # The managed bridge holds both lock bits high until an engage ACK.
+        # Rejection must break that wait without flooding its WebSocket.
+        core.update_engage(SQUEEZE)
+        core.update_engage(SQUEEZE)
+        self.assertFalse(core.teleop_enabled)
+        self.assertEqual(sent, [{"type": "engage_rejected", "reason": "blocked"}])
+
+        # A later request after a low frame is a distinct attempt.
+        core.update_engage(RELEASE)
+        core.update_engage(SQUEEZE)
+        self.assertEqual(
+            sent,
+            [
+                {"type": "engage_rejected", "reason": "blocked"},
+                {"type": "engage_rejected", "reason": "blocked"},
+            ],
+        )
+
+    def test_absolute_tracking_gate_rejects_high_after_forced_disengage(self) -> None:
+        core, sent = self._core(absolute_mode=True)
+        core.update_engage(SQUEEZE)
+        self.assertTrue(core.teleop_enabled)
+        core._disengage_all()
+        self.assertFalse(core.teleop_enabled)
+
+        # The absolute-mode tracking gate drops this high frame before it
+        # reaches update_engage. It must still tell the managed bridge to
+        # withdraw its held-high request and provide a fresh low frame.
+        self.assertFalse(core._accept_tracking_frame(SQUEEZE))
+        self.assertFalse(core._accept_tracking_frame(SQUEEZE))
+        self.assertEqual(sent, [{"type": "engage_rejected", "reason": "blocked"}])
 
 
 if __name__ == "__main__":

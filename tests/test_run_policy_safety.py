@@ -189,6 +189,9 @@ class RunPolicySafetyTest(unittest.TestCase):
                 stack.enter_context(
                     mock.patch.object(run_policy, "_check_training_fps")
                 )
+                hub_login = stack.enter_context(
+                    mock.patch("almond_axol.recording.hub_auth.require_hub_login")
+                )
                 stack.enter_context(
                     mock.patch(
                         "almond_axol.utils.state_files.privileged_service_active",
@@ -227,6 +230,7 @@ class RunPolicySafetyTest(unittest.TestCase):
                     )
                 )
                 stack.enter_context(mock.patch.object(run_policy, "_wait_for_port"))
+                stack.enter_context(mock.patch.object(run_policy, "check_start_pose"))
                 stack.enter_context(
                     mock.patch(
                         "lerobot.async_inference.configs.RobotClientConfig",
@@ -302,6 +306,7 @@ class RunPolicySafetyTest(unittest.TestCase):
         # The write is counted for recovery, so a successful finalization may
         # push it; only the live operator acknowledgement remains suppressed.
         dataset.push_to_hub.assert_called_once_with()
+        hub_login.assert_called_once_with()
         control.note_saved.assert_not_called()
         self.assertFalse(
             any(
