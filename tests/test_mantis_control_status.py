@@ -41,6 +41,9 @@ class _Trigger:
     def grip(self):
         return self.value
 
+    def button(self):
+        return None
+
     def is_stale(self):
         return self.stale
 
