@@ -30,6 +30,25 @@ export function canDiscoveryBlocksAutoConnect(
 }
 
 /**
+ * Whether discovery may take the idle robot link. A disconnected or failed
+ * link qualifies, and so does one still connected to hardware the inventory
+ * no longer shows: RobotLink keeps reporting `connected` after its device is
+ * unplugged, and swapping Mantis for Axol (or back) puts discovery in
+ * `needed`, which holds auto-connect and the device auto-select. Without
+ * this, both waited on a manual Disconnect that the panel never asked for.
+ * A link a task borrowed (`busy`) or one still connecting is never taken.
+ */
+export function robotLinkReleasable(
+  robotState: RobotState | undefined,
+  robotProfile: HardwareProfile | undefined,
+  profiles: CanProfileInventory | null | undefined
+): boolean {
+  if (robotState === "disconnected" || robotState === "error") return true
+  if (robotState !== "connected" || !profiles) return false
+  return !profiles[robotProfile ?? "axol"].present
+}
+
+/**
  * Start discovery only from one coherent idle snapshot. A failed earlier
  * connect may leave RobotLink in `error`; the backend retries disconnect and
  * independently proves the link is fully released before touching setup.
@@ -37,16 +56,11 @@ export function canDiscoveryBlocksAutoConnect(
  */
 export function shouldStartCanDiscovery(
   discovery: CanDiscoveryState | null | undefined,
-  robotState: RobotState | undefined,
+  linkReleasable: boolean,
   pollStateKnown: boolean,
   hardwareIdle: boolean
 ): boolean {
-  return (
-    discovery?.status === "needed" &&
-    (robotState === "disconnected" || robotState === "error") &&
-    pollStateKnown &&
-    hardwareIdle
-  )
+  return discovery?.status === "needed" && linkReleasable && pollStateKnown && hardwareIdle
 }
 
 /** One automatic request per server-owned unresolved-hardware generation. */

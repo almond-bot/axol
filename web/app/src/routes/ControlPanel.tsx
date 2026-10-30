@@ -86,6 +86,7 @@ import {
   issueCanInventoryPoll,
   newCanInventoryPollSequence,
   nextAutoConnectAttempt,
+  robotLinkReleasable,
   shouldStartCanDiscovery,
   voidCanInventoryPolls,
 } from "@/lib/can-auto-connect"
@@ -1388,10 +1389,11 @@ export default function ControlPanel() {
   // Hardware that is plugged in but silent is nearly always switched off, and
   // turning it on changes nothing the host can see. So check it again on its
   // own, backing off from 5 s to a minute, while nothing could be disturbed:
-  // the host idle and neither Axol nor Mantis connected (a check may briefly
-  // take an idle link down). With a link up, "Check again" does it by hand.
+  // the host idle and neither Axol nor Mantis connected, or the connected one
+  // unplugged (a check may briefly take an idle link down). With a link up to
+  // hardware that is still there, "Check again" does it by hand.
   const recheckDelayRef = useRef<number | null>(null)
-  const robotLinkFree = !robot || robot.state === "disconnected" || robot.state === "error"
+  const robotLinkFree = !robot || robotLinkReleasable(robot.state, robot.profile, canProfiles)
   const canRecheckOnItsOwn =
     conn.state === "ok" &&
     canDiscoveryNeedsRetry &&
@@ -1427,7 +1429,12 @@ export default function ControlPanel() {
     const idle = !hostBusy && !activeCommandSession && !robotBusy
     if (
       signature === null ||
-      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), idle)
+      !shouldStartCanDiscovery(
+        canDiscovery,
+        robotLinkReleasable(robot?.state, robot?.profile, canProfiles),
+        autoRobotPollStateKnown(),
+        idle
+      )
     )
       return
 
@@ -1471,7 +1478,9 @@ export default function ControlPanel() {
     conn.state,
     currentCanServerEpoch,
     hostBusy,
+    canProfiles,
     installCanInventory,
+    robot?.profile,
     robot?.state,
     robotBusy,
     toast,
