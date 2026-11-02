@@ -238,6 +238,30 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         ),
     ),
     LiveSettingDef(
+        key="haptics",
+        label="Haptics",
+        type="boolean",
+        help=(
+            "Vibrates a controller while its arm is engaged: ticks that speed "
+            "up as the arm gets close to Axol's body, and a rumble while the "
+            "arm pushes on something."
+        ),
+    ),
+    LiveSettingDef(
+        key="haptic_torque",
+        label="Haptic push",
+        type="number",
+        min=0.0,
+        max=30.0,
+        step=1.0,
+        unit="Nm",
+        help=(
+            "Unexpected joint torque at which a controller starts to rumble. "
+            "Raise it if normal moves rumble. 0 turns the rumble off. "
+            "Hardware only."
+        ),
+    ),
+    LiveSettingDef(
         key="gripper_torque",
         label="Grip force",
         type="number",
@@ -350,6 +374,9 @@ class LiveSettings:
             return not self._has_gripper_torque()
         if d.key == "box_squeeze_torque":
             return not self._has_spring_caps()
+        if d.key == "haptic_torque":
+            # The rumble reads torque feedback, which only the hardware has.
+            return not callable(getattr(self._robot, "torque_residuals", None))
         if d.key in ("box_squeeze_lean", "box_squeeze_trim", "box_squeeze_force"):
             # The lean reads the arms' measured joints and stiffness; only
             # a robot with AxolArm sides (the hardware Axol) has them.

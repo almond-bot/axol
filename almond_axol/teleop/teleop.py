@@ -1130,6 +1130,7 @@ class VRTeleop:
         if out is None:
             return None, None
         self._core.maybe_broadcast_joints(out, self._robot)
+        self._core.maybe_broadcast_haptics(self._robot)
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:

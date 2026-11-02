@@ -122,6 +122,19 @@ These bindings are for Axol. For the Mantis gestures used in data collection, se
 
 To move an arm only while you hold its grip, turn on **Hold grips to engage** (`--teleop.hold_to_engage`). Each grip then engages the arm on its side, from rest too, and releasing the grip freezes that arm. After a forced disengage, release any grip you were still holding before it engages again.
 
+### Controller haptics
+
+While an arm is engaged, its controller vibrates to tell you what the arm feels.
+
+| You feel | What it means |
+|---|---|
+| Short ticks that speed up | The arm is getting close to Axol's body or mount. At the fastest ticks, the arm stops following your hand toward the body. |
+| A steady rumble | The arm is pushing on something, such as the table or a held object. The harder it pushes, the stronger the rumble. Real robot only. |
+
+A frozen arm's controller stays quiet. Turn haptics off with **Controller haptics** in **Axol settings → Teleop & VR** (`--teleop.haptics false`), or with **Haptics** in the headset's session settings.
+
+The rumble starts when a joint meets 6 Nm of unexpected torque and is strongest at 2.5 times that. If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to keep only the ticks.
+
 ## Safety behavior
 
 ### Starting

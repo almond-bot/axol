@@ -701,6 +701,27 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
             ),
             SettingDef(
+                key="teleop.haptics",
+                label="Controller haptics",
+                type="boolean",
+                help=(
+                    "Vibrates a Quest controller while its arm is engaged. It ticks "
+                    "faster as the arm gets close to Axol's body, and rumbles while "
+                    "the arm pushes on something. Turn off for silent controllers."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_torque",
+                label="Haptic push torque (Nm)",
+                type="number",
+                help=(
+                    "How much unexpected joint torque (Nm) makes a controller start "
+                    "to rumble. The rumble is strongest at 2.5 times this value. "
+                    "Raise it if the controllers rumble during normal moves, or set 0 "
+                    "to keep only the ticks near Axol's body."
+                ),
+            ),
+            SettingDef(
                 key="teleop.park_to_zero",
                 label="Park to zero on stop",
                 type="boolean",
