@@ -75,8 +75,39 @@ class SelectHardwareTest(unittest.TestCase):
         self.assertEqual(jelly.channel, CAN_BASE)
 
     def test_arms_off_without_jelly_is_refused(self) -> None:
-        with self.assertRaisesRegex(ValueError, "nothing to drive"):
+        with self.assertRaises(ValueError) as caught:
             self._select((CAN_LEFT, CAN_RIGHT), TeleopCmdConfig(arms=False))
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("Nothing to drive."))
+        self.assertIn("Axol arms is off, but the arm hub is attached.", message)
+        self.assertIn(f"Jelly wheels is on, but {CAN_BASE} is not attached.", message)
+        self.assertIn("Turn on Axol arms in Settings (or pass --arms true)", message)
+
+    def test_every_switch_off_names_the_attached_hardware(self) -> None:
+        # Jelly's wheel bus is plugged in but every switch is off: the error
+        # points at the switches, not at missing hardware. The lift shares
+        # the wheel bus when there is no chest bus.
+        cfg = TeleopCmdConfig(arms=False, jelly=JellyConfig(wheels=False, lift=False))
+        with self.assertRaises(ValueError) as caught:
+            self._select((CAN_BASE,), cfg)
+        message = str(caught.exception)
+        self.assertIn("Axol arms is off.", message)
+        self.assertIn(f"Jelly wheels is off, but {CAN_BASE} is attached.", message)
+        self.assertIn(f"Jelly lift is off, but {CAN_BASE} is attached.", message)
+        self.assertIn(
+            "Turn on Jelly wheels or Jelly lift in Settings "
+            "(or pass --jelly.wheels true or --jelly.lift true)",
+            message,
+        )
+        self.assertNotIn("Connect Jelly", message)
+
+    def test_nothing_attached_asks_to_connect_hardware(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            self._select((), TeleopCmdConfig(arms=False))
+        message = str(caught.exception)
+        self.assertIn(f"Jelly lift is on, but {CAN_CHEST} is not attached.", message)
+        self.assertIn("Connect Jelly or the arm hub", message)
+        self.assertIn("axol can.setup", message)
 
     def test_wheels_and_lift_switches_narrow_jelly(self) -> None:
         cfg = TeleopCmdConfig(jelly=JellyConfig(wheels=False))

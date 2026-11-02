@@ -188,6 +188,8 @@ To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift fal
 
 `--arms false` drives only Jelly. Teleop doesn't start the arms or open the Axol hub's CAN bus, so the arms don't need to be connected. Teleop does the same, with a warning, when the arms' CAN interfaces are missing and Jelly's are present.
 
+If the switches leave nothing to drive, teleop stops with an error that starts with `Nothing to drive.` It lists each switch and whether its hardware is attached. When a switch is off but its hardware is attached, the error names that switch and its flag. Turn it on, then start teleop again.
+
 <Note>
   This command takes its config through draccus. Field names use underscores, nested fields are separated by dots, `None` is `null`, and lists use `[a,b,c]`. See [Command configuration](/cli/configuration).
 </Note>

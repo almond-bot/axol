@@ -48,6 +48,7 @@ import {
   issueCanInventoryPoll,
   newCanInventoryPollSequence,
   nextAutoConnectAttempt,
+  robotLinkReleasable,
   shouldStartCanDiscovery,
   voidCanInventoryPolls,
 } from "@/lib/can-auto-connect"
@@ -733,7 +734,12 @@ export default function Diagnostics() {
     const hardwareIdle = !activeRun && !hardwareSessionBusy && !launchBusy && !robotBusy
     if (
       signature === null ||
-      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), hardwareIdle)
+      !shouldStartCanDiscovery(
+        canDiscovery,
+        robotLinkReleasable(robot?.state, robot?.profile, canProfiles),
+        autoRobotPollStateKnown(),
+        hardwareIdle
+      )
     )
       return
 
@@ -761,7 +767,9 @@ export default function Diagnostics() {
     currentCanServerEpoch,
     hardwareSessionBusy,
     installCanInventory,
+    canProfiles,
     launchBusy,
+    robot?.profile,
     robot?.state,
     robotBusy,
     serverOk,

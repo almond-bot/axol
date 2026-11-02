@@ -119,6 +119,8 @@ The panel finds the CAN adapters plugged into the host and connects the selected
 
 If the automatic connection fails twice, press **Connect** on the card. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
 
+**Switching between Axol and Mantis.** Unplug one and plug in the other. The panel sees that the connected device is gone, identifies the new one and connects it. You don't need to press **Disconnect** first.
+
 **If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
 To change which CAN interface each side uses, go to **Axol settings → Robot** or **Mantis settings → CAN**.

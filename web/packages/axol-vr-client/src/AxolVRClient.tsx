@@ -6,6 +6,8 @@ import {
   stepBothStickClick,
   type BothStickClickState,
 } from "./bothStickClick"
+import { sendPose } from "./poseBackpressure"
+import type { PoseSink } from "./poseBackpressure"
 import { initialPoseSequence, nextPoseSequence } from "./poseSequence"
 import type { PoseSequence } from "./poseSequence"
 import { webxrCanControlPose, webxrCanControlRecording } from "./sessionAuthority"
@@ -14,10 +16,6 @@ import type { AxolMode, AxolPoseMode, AxolPoseSourceKind, ConfirmAction } from "
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
-
-// Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
-// the minimal shape AxolVRClient needs to ship a frame.
-type PoseSink = { send: (data: string) => void }
 
 const POSE_SOURCE_ID_KEY = "axol.webxr.pose-source-id.v2"
 // A current host replays pose_mode as soon as the signaling listener is
@@ -613,9 +611,12 @@ export function AxolVRClient({
       // jittery/relayed link, so teleop stays smooth instead of stuttering.
       t: performance.now(),
     })
-    usbSink?.send(payload)
-    netSink?.send(payload)
-    if (netSink === wsRef.current) signalingPoseEstablishedRef.current = true
+    // A transport that is still backed up skips this frame (see
+    // poseBackpressure): queued poses only add latency. A reset is a one-frame
+    // pulse the next frame won't repeat, so it always goes out.
+    sendPose(usbSink, payload, reset)
+    const netSent = sendPose(netSink, payload, reset)
+    if (netSent && netSink === wsRef.current) signalingPoseEstablishedRef.current = true
 
     // Publish the HUD-only state (armed confirmation popup, record countdown)
     // to the server whenever it changes, so a dashboard can mirror what this

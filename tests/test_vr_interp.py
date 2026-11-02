@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from starlette.testclient import TestClient
 
 from almond_axol.video.video_proc import VideoRelayProcess
+from almond_axol.vr import interp as interp_module
 from almond_axol.vr.config import VRServerConfig
 from almond_axol.vr.interp import PoseInterpolator
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
@@ -295,6 +296,51 @@ def _stalled_stream(interp: PoseInterpolator) -> list[float]:
     return rendered
 
 
+def _creeping_stream(
+    interp: PoseInterpolator, *, drain_at: float | None = None, end: float = 90.0
+) -> list[tuple[float, float]]:
+    """Stream a hand moving steadily (x = capture time / 10) at 100 Hz over a
+    link that, from 10 s on, carries slightly less than the stream: the
+    headset's send queue grows by 0.67 s per minute and never drains, as on a
+    long, lossy path where SCTP congestion control backs off. At ``drain_at``
+    the backlog is dropped and frames are on time again. Returns
+    ``(now, behind_s)`` for every 50 ms sample at which the rendered arm
+    moved, where ``behind_s`` is how long ago the rendered pose was
+    captured."""
+    creep = 1.0 / 90.0
+    arrivals = []
+    for seq in range(int(end * 100)):
+        cap = 0.01 * seq
+        late = creep * max(0.0, cap - 10.0)
+        if drain_at is not None and cap >= drain_at:
+            late = 0.0
+        arrive = cap + 0.02 + late
+        if drain_at is not None and cap < drain_at and arrive > drain_at + 0.02:
+            continue  # dropped with the backlog
+        arrivals.append((arrive, seq))
+    arrivals.sort()
+
+    moving = []
+    pending = iter(arrivals)
+    nxt = next(pending, None)
+    last_x = None
+    for tick in range(int(end * 100)):
+        now = 0.01 * tick
+        while nxt is not None and nxt[0] <= now:
+            interp.push(_frame(nxt[1], x=0.001 * nxt[1]), now=nxt[0])
+            nxt = next(pending, None)
+        if tick % 5:
+            continue
+        frame = interp.sample(now=now)
+        if frame is None:
+            continue
+        x = frame.l_ee.position.x
+        if last_x is not None and abs(x - last_x) > 1e-9:
+            moving.append((now, now - x * 10.0))
+        last_x = x
+    return moving
+
+
 class PoseInterpolatorLateStreamTest(unittest.TestCase):
     def test_a_stalled_stream_is_held_not_replayed(self) -> None:
         # The lift (1.2-1.7 s) and the return (2.0-2.3 s) both happen while
@@ -334,6 +380,36 @@ class PoseInterpolatorLateStreamTest(unittest.TestCase):
             assert frame is not None
             peak = max(peak, frame.l_ee.position.x)
         self.assertGreater(peak, 0.25)
+
+    def test_a_slowly_growing_backlog_is_held_not_followed(self) -> None:
+        # A send queue that grows a little every second (0.67 s per minute,
+        # under the 0.5 s-per-30 s that a plain 30 s window would notice) must
+        # not leave the arm following the operator further and further behind.
+        # Once the backlog passes max_lag_s the arm holds. Before that it
+        # trails by at most max_lag_s plus the playout delay and smoothing.
+        moving = _creeping_stream(PoseInterpolator())
+
+        self.assertLess(max(behind for _, behind in moving), 0.9)
+        self.assertLess(moving[-1][0], 65.0)  # held well before the run ends
+
+    def test_without_the_rise_limit_a_growing_backlog_is_followed(self) -> None:
+        # The behaviour the rise limit prevents: the on-time baseline follows
+        # the growing backlog, so the arm keeps moving ever later.
+        with mock.patch.object(interp_module, "_LAG_BASELINE_RISE_PER_S", math.inf):
+            moving = _creeping_stream(PoseInterpolator(), end=120.0)
+
+        self.assertGreater(max(behind for _, behind in moving), 1.2)
+        self.assertGreater(moving[-1][0], 119.0)
+
+    def test_the_arm_follows_again_once_the_backlog_clears(self) -> None:
+        # When the backlog is dropped (the headset skips queued frames, or a
+        # reconnect), on-time frames resume and the arm follows the current
+        # pose straight away.
+        moving = _creeping_stream(PoseInterpolator(), drain_at=70.0, end=75.0)
+
+        resumed = [behind for now, behind in moving if now >= 70.5]
+        self.assertTrue(resumed)
+        self.assertLess(max(resumed), 0.4)
 
     def test_late_frames_still_carry_their_control_state(self) -> None:
         interp = PoseInterpolator()
