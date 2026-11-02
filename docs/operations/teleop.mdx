@@ -206,6 +206,8 @@ If teleoperation feels too slow, change one setting at a time, in this order, an
   The network buffer only adds delay while the network is bursty. For network lag, a [USB connection](/guides/quest-over-usb) and the [router settings](#network-tip) help more than any setting here.
 
   If the headset's Wi-Fi stalls and then delivers a backlog, the arms don't replay the late motion. They hold, then move to your current pose when on-time frames resume. A frame counts as late when it arrives more than `--vr_server.interp_max_lag_s` behind (default `0.5` s, `0` turns this off). The log shows `VR pose stream arriving … late` when a stall starts and `VR pose stream on time again after …` when it ends.
+
+  The arms also hold when the delay creeps up over a long session, as can happen on a slow link between continents. If they stay held, press **Y** to exit VR, then enter it again.
 </Note>
 
 ## Next steps

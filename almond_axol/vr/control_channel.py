@@ -32,6 +32,16 @@ _logger = logging.getLogger(__name__)
 # Matches the label the browser listens for in `useAxolControlChannel`.
 _POSE_CHANNEL_LABEL = "pose"
 
+# Partial-reliability lifetime (ms) for pose messages. The headset's SCTP stack
+# discards a message it hasn't sent within this time, including one still
+# waiting in its send queue, and never retransmits one older than it. Without
+# a lifetime (``maxRetransmits=0`` only bounds retransmissions), a link whose
+# congestion window falls below the pose rate queues frames on the headset
+# without limit, and control latency grows for the rest of the session. The
+# browser also skips frames while the channel is backed up (see
+# AxolVRClient's ``sinkHasRoom``); this bound covers what is already queued.
+POSE_MAX_PACKET_LIFETIME_MS = 100
+
 
 class ControlChannelManager:
     """Per-client peer connections that carry pose frames on a data channel.
@@ -64,10 +74,14 @@ class ControlChannelManager:
         pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pcs[client_id] = pc
 
-        # Unreliable + unordered: drop a late/lost pose rather than stall the
-        # stream behind a retransmit (freshness beats completeness for teleop).
+        # Unordered with a short lifetime: drop a late/lost pose rather than
+        # stall the stream behind a retransmit or a send backlog (freshness
+        # beats completeness for teleop). WebRTC allows a lifetime or a
+        # retransmit limit, not both.
         channel = pc.createDataChannel(
-            _POSE_CHANNEL_LABEL, ordered=False, maxRetransmits=0
+            _POSE_CHANNEL_LABEL,
+            ordered=False,
+            maxPacketLifeTime=POSE_MAX_PACKET_LIFETIME_MS,
         )
 
         @channel.on("message")

@@ -129,7 +129,13 @@ def test_control_channel_offer_messages_answer_and_close(monkeypatch) -> None:
     async def exercise() -> None:
         assert await manager.create_offer(7) == "offer-sdp"
         peer = peers[0]
-        assert peer.channel_args == ("pose", {"ordered": False, "maxRetransmits": 0})
+        assert peer.channel_args == (
+            "pose",
+            {
+                "ordered": False,
+                "maxPacketLifeTime": control_channel.POSE_MAX_PACKET_LIFETIME_MS,
+            },
+        )
         peer.channel.handlers["message"]("pose-json")
         peer.channel.handlers["message"](b"ignored")
         assert received == [(7, "pose-json")]
@@ -148,3 +154,40 @@ def test_control_channel_offer_messages_answer_and_close(monkeypatch) -> None:
         assert all(item.closed for item in peers)
 
     asyncio.run(exercise())
+
+
+def test_pose_channel_expires_queued_frames_instead_of_holding_them(
+    monkeypatch,
+) -> None:
+    # The pose channel must carry a lifetime: maxRetransmits alone never
+    # discards a frame still waiting in the headset's send queue, so a
+    # congested link would queue poses without limit. Build the channel with
+    # the manager's own arguments on a real aiortc peer, which rejects
+    # combinations WebRTC doesn't allow (a lifetime plus a retransmit limit).
+    from aiortc import RTCPeerConnection
+
+    captured: list[tuple[str, dict]] = []
+
+    class Recorder(_Peer):
+        def createDataChannel(self, label, **kwargs):
+            captured.append((label, kwargs))
+            return super().createDataChannel(label, **kwargs)
+
+    monkeypatch.setattr(control_channel, "RTCPeerConnection", Recorder)
+    monkeypatch.setattr(control_channel, "ice_servers", lambda: [])
+    manager = control_channel.ControlChannelManager(lambda *_: None)
+    asyncio.run(manager.create_offer(1))
+
+    label, kwargs = captured[0]
+
+    async def build() -> None:
+        pc = RTCPeerConnection()
+        try:
+            channel = pc.createDataChannel(label, **kwargs)
+            assert channel.maxPacketLifeTime == 100
+            assert channel.maxRetransmits is None
+            assert channel.ordered is False
+        finally:
+            await pc.close()
+
+    asyncio.run(build())
