@@ -410,15 +410,65 @@ def select_hardware(cfg: TeleopCmdConfig) -> tuple[bool, "JellyConfig | None"]:
         )
         arms = False
     if not arms and jelly is None:
-        raise ValueError(
-            "nothing to drive: the arms are switched off (--arms false) and no "
-            "Jelly CAN interface is attached (wheels: "
-            f"{cfg.jelly.channel or 'off'}, lift: "
-            f"{'on' if cfg.jelly.lift else 'off'}). Plug Jelly in (the control "
-            "panel pins its adapters; or run `axol can.setup`) or turn the arms "
-            "back on."
-        )
+        raise ValueError(_nothing_to_drive(cfg))
     return arms, jelly
+
+
+def _nothing_to_drive(cfg: TeleopCmdConfig) -> str:
+    """Why :func:`select_hardware` found nothing to drive, and what to flip.
+
+    Reports each switch against its interface separately, so a switch turned
+    off with its hardware attached (the usual cause) is named as the fix
+    rather than reading as missing hardware.
+    """
+    from ..robot.jelly import _iface_exists
+    from ..robot.lift import resolve_lift_channel
+
+    status: list[str] = []
+    # (UI label, CLI flag) of each switched-off part whose hardware is attached.
+    switch_on: list[tuple[str, str]] = []
+
+    if _arm_channels_present(cfg):
+        status.append("Axol arms is off, but the arm hub is attached.")
+        switch_on.append(("Axol arms", "--arms true"))
+    else:
+        status.append("Axol arms is off.")
+
+    wheels_bus = cfg.jelly.channel
+    if not cfg.jelly.wheels:
+        if wheels_bus is not None and _iface_exists(wheels_bus):
+            status.append(f"Jelly wheels is off, but {wheels_bus} is attached.")
+            switch_on.append(("Jelly wheels", "--jelly.wheels true"))
+        else:
+            status.append("Jelly wheels is off.")
+    elif wheels_bus is None:
+        status.append("Jelly wheels has no CAN interface set.")
+    else:
+        status.append(f"Jelly wheels is on, but {wheels_bus} is not attached.")
+
+    lift_bus = resolve_lift_channel(cfg.jelly.lift_channel)
+    if not cfg.jelly.lift:
+        if _iface_exists(lift_bus):
+            status.append(f"Jelly lift is off, but {lift_bus} is attached.")
+            switch_on.append(("Jelly lift", "--jelly.lift true"))
+        else:
+            status.append("Jelly lift is off.")
+    else:
+        status.append(f"Jelly lift is on, but {lift_bus} is not attached.")
+
+    if switch_on:
+        labels = " or ".join(label for label, _ in switch_on)
+        flags = " or ".join(flag for _, flag in switch_on)
+        action = (
+            f"Turn on {labels} in Settings (or pass {flags}), then start teleop again."
+        )
+    else:
+        action = (
+            "Connect Jelly or the arm hub, turn on its switch in Settings "
+            "(Axol arms, Jelly wheels or Jelly lift), then start teleop again. "
+            "Run `axol can.setup` if the CAN adapter does not appear."
+        )
+    return " ".join(["Nothing to drive.", *status, action])
 
 
 async def _run_jelly_only(cfg: TeleopCmdConfig, jelly_cfg: "JellyConfig") -> None:
