@@ -105,7 +105,7 @@ Set the startup default with the control panel's **Re-engage** setting or `--tel
   Box mode needs the parcel gripper. Set **Robot → Gripper** to `parcel` in the control panel, or pass `--axol.gripper parcel`. With the standard parallel gripper, box mode and its settings are hidden in the headset and the control panel.
 </Note>
 
-Box mode carries a box with both arms. The grippers press on opposite sides of the box, like two flat hands, and hold it by friction. One controller moves both arms together as a pair. The pair follows your hand's position and its turn about the vertical axis, and stays level whatever the hand's pitch and roll.
+Box mode carries a box with both arms. The grippers press on opposite sides of the box, like two flat hands, and hold it by friction. One controller moves both arms together as a pair. The pair follows your hand's position, and turning your hand about any axis turns the pair about its center. Line the pair up with a box, then tip or tilt it once it's held.
 
 ### Turn box mode on
 
@@ -129,20 +129,21 @@ On engage, the arms first move into a parallel pair over about 1.5 s. They keep 
 
 | Control | Action |
 |---|---|
-| Leading controller | Move it to move the pair. Turn it about the vertical axis to turn the pair about its center. Pitch and roll do nothing. |
+| Leading controller | Move it to move the pair. Turn, tip or roll it to turn the pair about its center. |
 | Leading grip | Freeze the pair. Press either grip to lead again. |
 | Other grip | Hand the lead to that controller. |
 | Left trigger | Close the left gripper, whichever hand leads. |
 | Right trigger | Close the right gripper, whichever hand leads. |
-| Thumbstick left or right | Change the grip width. Right is wider, left is narrower. |
-| Thumbstick forward or back | Move the elbows out (forward) or in (back). See [Elbows](#box-elbows). |
-| Thumbstick click | Switch between the straight and flush grasp. See [Grasps](#box-grasp). |
+| Right thumbstick, forward or back | Change the grip width. Forward is wider, back is narrower. |
+| Thumbstick click, quick tap | Switch between the straight and flush grasp. See [Grasps](#box-grasp). |
+| Thumbstick click, held | Move Jelly's lift, as outside box mode. |
+| Other thumbstick directions | Drive [Jelly](#jelly), as outside box mode. |
 | Both thumbstick clicks | Leave box mode. |
 | X | Return to rest and leave box mode. |
 
-Both thumbsticks do the same thing. They shape the grasp but never move the pair. A push counts only along its main direction, so widening the grip never moves the elbows.
+The width stick works only while a grip leads, and it never moves the pair. A tap is a click released within about 0.3 s, with the other stick not pressed. Hold a click longer and the lift starts moving, so one press never does both.
 
-To clamp a box, lead the pair to it. Then push a thumbstick left until the gripper faces close on the box's sides. The width is the gap between the two contact faces, from 0.02 m to 0.70 m.
+To clamp a box, lead the pair to it. Then pull the right thumbstick back until the gripper faces close on the box's sides. The width is the gap between the two contact faces, up to 0.70 m. The parcel gripper's faces can close all the way together, so thin parcels clamp too.
 
 <a id="box-grasp"></a>
 
@@ -153,7 +154,7 @@ To clamp a box, lead the pair to it. Then push a thumbstick left until the gripp
 | `straight` (default) | Fingers point straight forward. The parcel gripper's folded plate lies flat on the box. |
 | `flush` | Each gripper turns 39° inward about the front edge of its plate. The plate's chamfer and the tip of the fixed blade both touch the box. Release the triggers before you close the width. |
 
-Click either thumbstick while leading to switch. The arms move to the other grasp over about 1.5 s, and you can switch with a box already clamped. The **Box** button shows the current grasp, for example **Box: ON (straight)**. Set the flush angle with **Angled yaw** and the starting grasp with `--teleop.box_grasp`.
+Tap either thumbstick while leading to switch, or set **Box grasp** in [session settings](#session-settings). The arms move to the other grasp over about 1.5 s, and you can switch with a box already clamped. The **Box** button shows the current grasp, for example **Box: ON (straight)**. Set the flush angle with **Angled yaw** and the starting grasp with `--teleop.box_grasp`.
 
 <a id="box-tool"></a>
 
@@ -167,13 +168,16 @@ Each gripper turns whichever flat side is closer toward the box, so the wrist ne
 
 ### Driving with the box
 
-While a grip leads the pair, the thumbsticks shape the grasp and Jelly stays still. Freeze the pair to drive [Jelly](#jelly) with the normal controls.
+The thumbsticks drive [Jelly](#jelly) with the normal controls the whole time box mode is on, whether the pair is led or frozen. Only the right thumbstick's forward and back sets the width instead. You can carry a box across the room while you lead the pair.
+
+For a long drive, freeze the pair:
 
 1. Clamp the box.
-2. Click the leading grip to freeze the pair. The arms hold the box where it is, with the grippers closed.
-3. Let go of both thumbsticks. The sticks start driving Jelly once both are released.
-4. Drive to where you need to go.
-5. Squeeze both triggers, then press a grip to lead the pair again.
+2. Click the leading grip to freeze the pair. The arms hold the box where it is, with the grippers closed, whatever your hands do.
+3. Drive to where you need to go.
+4. Squeeze both triggers, then press a grip to lead the pair again.
+
+A pair you have tipped keeps its tilt when you freeze it, hand over the lead or switch the grasp. Only turning box mode on again squares the grippers up level.
 
 <Warning>
   When a grip takes the lead, each gripper follows its trigger again. If the triggers are released at that moment, the grippers open and the box drops.
@@ -183,9 +187,9 @@ While a grip leads the pair, the thumbsticks shape the grasp and Jelly stays sti
 
 ### Elbows
 
-Push a thumbstick forward or back to set **Elbows out**. It goes from 0° (hanging below the line from shoulder to wrist) to 90° (level), and starts at 30°. Bring the elbows in to pass a doorway, or out for a wide box. The value is kept for the next engage.
+Set **Elbows out** in [session settings](#session-settings). It goes from 0° (hanging below the line from shoulder to wrist) to 90° (level), and starts at 30°. Bring the elbows in to pass a doorway, or out for a wide box.
 
-If closing the width would bring an arm too close to the torso, the width stops closing. To turn off elbow control, pass `--teleop.box_elbow_weight 0`. The elbows then rest where they fall, and forward or back on the stick does nothing.
+If closing the width would bring an arm too close to the torso, the width stops closing. To turn off elbow control, pass `--teleop.box_elbow_weight 0`. The elbows then rest where they fall, and **Elbows out** does nothing.
 
 ### Clamp force
 
@@ -198,7 +202,7 @@ The clamp gets harder the further you push the width past the box, by about 6 N 
 | **Squeeze trim** | 5° | The most extra inward turn added while pressing, so each gripper face ends up flat on the box. 0 turns it off. |
 | **Squeeze cap** | 0 (off) | Caps the shoulder torque that squeezes the box. Leave it off unless you need it, because it also slows an arm moving toward the other and skews the pair. |
 
-The wrists also limit the clamp to about 31 N per arm in a typical carrying pose. To clamp harder, raise `--teleop.box_wrist_torque` (default 5 Nm). The wrist motors then run hotter.
+With **Squeeze force** off, nothing limits the clamp. Past about 39 N per arm, the blade tip can lift and the plate's chamfer takes the whole load. Set **Squeeze force** to keep the clamp below that.
 
 While the grippers press, the **Box** button shows the clamp force and trim, for example **Box: ON (straight, 6 N, 2° in)**. The teleop log prints a `box clamp:` line every second.
 
@@ -255,7 +259,8 @@ On Axol on Jelly, the thumbsticks drive the base, so you can move Axol without l
 | Right thumbstick click, held | Raise the lift. |
 
 - Jelly moves only while you push a stick, and stops smoothly when you let go. This works whether or not arm tracking is engaged.
-- In box mode, the sticks drive Jelly only while the pair is frozen. See [Driving with the box](#driving-with-the-box).
+- Speed follows how far you push the stick. The first part of the travel is slow, for creeping up on a spot, and a full push is full speed. Set the curve with `--jelly.stick_expo` (default `0.6`, `0` is linear).
+- In box mode, the sticks still drive Jelly. The right thumbstick's forward and back sets the grip width instead, and a held click must last about 0.3 s before the lift moves. See [Driving with the box](#driving-with-the-box).
 - If the headset link drops while you drive, Jelly stops. A parked Jelly keeps holding its position.
 - After several minutes of driving mostly one way, a parked Jelly brakes its wheels instead of holding them, and it can creep slowly on a slope. Power Jelly off and on to restore the full hold.
 - If a parked wheel turns fast or moves too far, Jelly turns its wheels off and stops parking until you restart the session.

@@ -108,12 +108,11 @@ Joint velocities and accelerations are set in rad/s and rad/s². The defaults be
 | `box_flush_deg` | `39`° | How far the `"flush"` grasp turns each gripper inward, about the front edge of the parcel plate. Live setting (**Angled yaw**). |
 | `box_face_left` / `box_face_right` | `"auto"` | Which side of each gripper (`"+x"` or `"-x"`) faces the box. `"auto"` picks the side that needs the smaller wrist turn. Live settings (**Left face**, **Right face**). |
 | `box_grip_tilt` | `0`° | Fixed inward yaw trim of each gripper. Positive turns the fingertips toward the box, negative splays them out. |
-| `box_width_speed` | `0.08` m/s | Rate at which a thumbstick changes the grip width at full deflection. |
-| `box_width_min` / `box_width_max` | `0.02` / `0.70` m | Limits on the grip width, measured between the contact faces. The minimum is raised where needed so the two grippers never touch. |
+| `box_width_speed` | `0.08` m/s | Rate at which the right thumbstick's forward and back changes the grip width at full deflection. |
+| `box_width_min` / `box_width_max` | `0` / `0.70` m | Limits on the grip width, measured between the contact faces. The minimum is raised where needed so the gripper bodies never touch. The parcel gripper's faces can close all the way together. |
 | `box_align_duration` | `1.5` s | Time to blend the grippers into the parallel pair when box mode engages or the grasp changes. |
 | `box_elbow_out` | `30`° | How far out the elbows are held, from `0` (straight down) to `90` (level). Live setting (**Elbows out**). |
-| `box_elbow_weight` | `10` | IK weight that holds the elbows at `box_elbow_out`. `0` turns it off, and the thumbsticks then don't move the elbows. |
-| `box_elbow_speed` | `30` °/s | Rate at which a thumbstick changes `box_elbow_out` at full deflection. |
+| `box_elbow_weight` | `10` | IK weight that holds the elbows at `box_elbow_out`. `0` turns it off, and `box_elbow_out` then does nothing. |
 | `box_wrist_torque` | `5` Nm | Cap on the spring torque of `wrist_2` and `wrist_3` in box mode, which keeps the wrist motors from overheating. `0` turns it off. |
 | `box_squeeze_force` | `0` N (off) | Cap on how hard each arm clamps the box. Live setting (**Squeeze force**). |
 | `box_squeeze_lean` | `1` | Scale on the squeeze lean, which angles each gripper into the box as the clamp builds. `0` turns it off. Live setting (**Squeeze lean**). |
@@ -126,19 +125,23 @@ Box mode needs the [parcel gripper](/guides/vr-interface#box-tool). Set the grip
 - `box_mode` starts off, with a warning,
 - `VRTeleopCore.set_box_mode(True)` raises `ValueError`.
 
-In box mode one grip drives both arms by position and heading. The pair follows the hand's movement and its turn about vertical, and stays level whatever the hand's pitch and roll. While a grip leads, either thumbstick shapes the grasp:
+In box mode one grip drives both arms by position and rotation. The pair follows the hand's movement, and the hand's yaw, pitch and roll since the engage turn the pair about its center, scaled by `rotation_multiplier`. Engaging into box mode starts the pair level. A re-snap inside box mode, such as a lead handover, a re-lead after a freeze or a grasp switch, keeps a tipped pair's tilt while both grippers still sit in its frame.
 
-- Left and right change the grip width. Right is wider.
-- Forward and back move the elbows. Forward is farther apart.
-- A click toggles between the two grasps.
+The thumbsticks drive [Jelly](/guides/vr-interface#jelly) as usual throughout box mode, led or frozen. While a grip leads:
 
-Freeze the pair and the thumbsticks drive [Jelly](/guides/vr-interface#jelly) instead. Box mode switches from the headset's **Box** button, both thumbstick clicks together, the control panel, or `VRTeleopCore.set_box_mode()`. The switch engages right away: into box mode led by `box_lead_hand`, or out of it with both arms. If no VR frame arrives within a second of the switch, or a return to rest ends box mode, nothing engages.
+- The right thumbstick's forward and back changes the grip width. Forward is wider. Jelly doesn't read this axis.
+- A quick tap of either thumbstick click toggles between the two grasps. A tap is released within 0.3 s, with the other stick up.
+- A click held longer than that runs Jelly's lift, from then until release.
+
+`VRTeleopCore.box_stick_frame()` splits the clicks into taps and holds, and hands Jelly a copy of the frame with the clicks cleared until a hold is recognised. A tap queues `set_live("box_grasp", "toggle")`.
+
+Box mode switches from the headset's **Box** button, both thumbstick clicks together, the control panel, or `VRTeleopCore.set_box_mode()`. The switch engages right away: into box mode led by `box_lead_hand`, or out of it with both arms. If no VR frame arrives within a second of the switch, or a return to rest ends box mode, nothing engages.
 
 #### The squeeze
 
 When you jog the grip width past the box, the arms' joint springs turn the extra distance into clamp force, about 6 N per centimetre. These settings shape the clamp:
 
-- **Squeeze force** (`box_squeeze_force`) caps the clamp force per arm, at any pose. Try `8` N. Whatever it is set to, the clamp stays under about 31 N a side, the most the wrists can press evenly at the default `box_wrist_torque`.
+- **Squeeze force** (`box_squeeze_force`) caps the clamp force per arm, at any pose. Try `8` N. With it off, nothing limits the clamp. Past about 39 N a side, `wrist_2` saturates at the default `box_wrist_torque` and the tip can unload onto the facet.
 - **Squeeze lean** (`box_squeeze_lean`) yaws each gripper inward about 1.3° per centimetre of clamp depth, so the tip and root of the gripper press evenly. Raise it if the tip lifts as you squeeze. Lower it if the face near the wrist lifts.
 - **Squeeze trim** (`box_squeeze_trim`) adds inward yaw from the measured gripper angle until each face sits parallel to the box. It corrects for backlash and flex that the lean doesn't model, and acts only once the pair has held still for 0.3 s.
 - **Squeeze cap** (`box_squeeze_torque`) is a hard torque cap on the two shoulder joints. It also slows any move toward the other arm, so the pair can skew. Leave it at `0` unless you need it.
