@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
 import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { DEFAULT_CAMERAS, loadCachedCameras, persistCachedCameras } from "@/lib/camera-cache"
+import { isLiveSession, operationToFollow } from "@/lib/session-follow"
 import {
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
@@ -12,7 +14,6 @@ import {
   OPERATIONS,
   fetchDatasets,
   cameraCount,
-  cameraSerials,
   canDiscoveryRequestCanRetry,
   clearOperationLockout,
   detectCameras,
@@ -179,49 +180,6 @@ function parseControlPath(pathname: string): { view: ControlView | null; rest: s
   return { view: CONTROL_VIEWS[section] ?? null, rest: rest ? decodeURIComponent(rest) : null }
 }
 
-const DEFAULT_CAMERAS: CameraSpec = {
-  serials: { overhead: "", left_arm: "", right_arm: "" },
-  mantis_serials: { overhead: "", left_arm: "", right_arm: "" },
-  stream_resolution: "SVGA",
-  record_resolution: "SVGA",
-  stream: {},
-  record: {},
-}
-
-function loadCameras(): CameraSpec {
-  try {
-    const raw = localStorage.getItem("axolCameraSpec")
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      const serials = { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) }
-      return {
-        ...DEFAULT_CAMERAS,
-        ...parsed,
-        serials,
-        mantis_serials: cameraSerials({ serials, mantis_serials: parsed.mantis_serials }, true),
-        // Migrate the legacy single `resolution` to the streaming resolution.
-        stream_resolution:
-          parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
-        record_resolution: parsed.record_resolution ?? DEFAULT_CAMERAS.record_resolution,
-        // Migrate the earlier per-eye maps to the per-branch participation maps.
-        stream: { ...(parsed.stream ?? parsed.stream_eyes ?? {}) },
-        record: { ...(parsed.record ?? parsed.record_eyes ?? {}) },
-      }
-    }
-  } catch {
-    // ignore malformed storage
-  }
-  return DEFAULT_CAMERAS
-}
-
-function persistLocalCameras(spec: CameraSpec) {
-  try {
-    localStorage.setItem("axolCameraSpec", JSON.stringify(spec))
-  } catch {
-    // ignore storage failures
-  }
-}
-
 const SIM_ROBOT_KEY = "axolSimRobot"
 
 /** The sim robot this browser last picked, if it is still a valid one. */
@@ -348,7 +306,11 @@ export default function ControlPanel() {
   }, [])
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
-  const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  // The camera spec of the connected host. The host's settings are the source
+  // of truth; this browser's per-host copy fills in while they load.
+  const [cameras, setCameras] = useState<CameraSpec>(() => loadCachedCameras(serverHost))
+  // The host the camera spec belongs to, for this browser's per-host copy.
+  const cameraHostRef = useRef(serverHost)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
   // until fetched. settingsError marks a host too old for the settings API —
   // cameras then fall back to the legacy localStorage flow.
@@ -417,6 +379,12 @@ export default function ControlPanel() {
   const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
+  // The session on screen, read by the session poll to spot a run started
+  // from another browser.
+  const shownSessionIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    shownSessionIdRef.current = session?.id ?? null
+  }, [session?.id])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -438,39 +406,25 @@ export default function ControlPanel() {
     }
   }, [])
 
-  // Pull the shared settings from the serve host. A host whose stored camera
-  // spec is empty gets this browser's legacy localStorage spec migrated up
-  // once, so nobody has to re-enter serials after updating.
+  // Pull the shared settings from the serve host. Its camera spec is used as
+  // is: a host with none stored gets no cameras. This browser's spec is never
+  // written to a host on connect, since it may belong to another robot.
   const loadSettings = useCallback(async (generation = connectionGenerationRef.current) => {
     if (generation !== connectionGenerationRef.current) return
+    const host = cameraHostRef.current
     try {
       const snap = await fetchSettings()
       if (generation !== connectionGenerationRef.current) return
       setSettingsError(null)
-      if (snap.cameras) {
-        setCameras(snap.cameras)
-        persistLocalCameras(snap.cameras)
-        setSettingsSnap(snap)
-      } else {
-        const local = loadCameras()
-        if (cameraCount(local) > 0) {
-          try {
-            if (generation !== connectionGenerationRef.current) return
-            await saveSettings({ cameras: local, camerasSet: true })
-            if (generation !== connectionGenerationRef.current) return
-            setSettingsSnap({ ...snap, cameras: local })
-          } catch {
-            if (generation !== connectionGenerationRef.current) return
-            setSettingsSnap(snap)
-          }
-        } else {
-          setSettingsSnap(snap)
-        }
-      }
+      const hostCameras = snap.cameras ?? DEFAULT_CAMERAS
+      setCameras(hostCameras)
+      persistCachedCameras(host, hostCameras)
+      setSettingsSnap(snap)
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
-      // Old serve host without /api/settings: keep the localStorage camera
-      // flow; the settings dialog explains the needed update.
+      // Old serve host without /api/settings: it never stored cameras, so it
+      // runs with this browser's copy. The settings dialog explains the update.
+      setCameras(loadCachedCameras(host, { legacy: true }))
       setSettingsSnap(null)
       setSettingsError(String(e).replace(/^Error:\s*/, ""))
     }
@@ -481,6 +435,7 @@ export default function ControlPanel() {
       const generation = ++connectionGenerationRef.current
       setConnectionGeneration(generation)
       setServerBase(host)
+      cameraHostRef.current = host
       setConn({ state: "loading" })
       // Hide all state owned by the previous host immediately. The generation
       // checks below also stop its in-flight responses from repopulating it.
@@ -516,6 +471,7 @@ export default function ControlPanel() {
       setPolicy(null)
       setBusy(false)
       setStartPhase(null)
+      setCameras(loadCachedCameras(host))
       setCameraDevices(null)
       setCameraDetectError(null)
       setCameraDetecting(false)
@@ -688,12 +644,17 @@ export default function ControlPanel() {
       fetchSessions()
         .then((sessions) => {
           if (!active) return
-          const liveSessions = sessions.filter(
-            (candidate) =>
-              candidate.status === "starting" ||
-              candidate.status === "running" ||
-              candidate.status === "stopping"
-          )
+          const liveSessions = sessions.filter(isLiveSession)
+          // Another browser may have started a run on this host: show it here
+          // too. Marking the runner busy hands it to the op-status poll, which
+          // then tracks it (episode controls, stop, lockout) like a local run.
+          const follow = operationToFollow(sessions, operationIds, shownSessionIdRef.current)
+          if (follow) {
+            shownSessionIdRef.current = follow.id
+            setSession(follow)
+            setSelectedOp(follow.command as OperationId)
+            setOpBusy(true)
+          }
           sessionInventoryKnownRef.current = true
           setSessionInventoryReady(true)
           setHardwareSessionBusy(liveSessions.length > 0)
@@ -962,8 +923,8 @@ export default function ControlPanel() {
     }
   }
 
-  // Persist a settings-dialog save: cameras also mirror to localStorage (the
-  // fallback for old hosts / offline), everything else goes to the serve host.
+  // Persist a settings-dialog save to the serve host. Cameras are also copied
+  // to this browser's per-host cache, the only store on hosts too old to have one.
   async function handleSettingsSave(
     patch: SettingsPatch,
     generation = connectionGenerationRef.current
@@ -981,7 +942,7 @@ export default function ControlPanel() {
       .map(([profile]) => profile)
     if (patch.cameras) {
       setCameras(patch.cameras)
-      persistLocalCameras(patch.cameras)
+      persistCachedCameras(cameraHostRef.current, patch.cameras)
     }
     if (settingsError) {
       // Old host: only the cameras section is editable, and it saved locally.
