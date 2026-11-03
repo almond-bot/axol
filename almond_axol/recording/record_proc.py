@@ -2684,6 +2684,46 @@ def trim_episode_after(
     return removed
 
 
+def _maybe_align_episode(
+    dataset: "LeRobotDataset", config: dict, row_times: list[float]
+) -> None:
+    """Resample the buffered episode's EE poses onto its camera exposure times.
+
+    Active only when the recorder config sets ``align_ee_to_exposure`` —
+    collect-data sets it for Mantis sessions, where each row's pose was sampled
+    ``pose_lag`` away from its image. Runs before smoothing (which assumes
+    evenly spaced samples). Best-effort: a failure logs and leaves the episode
+    as recorded rather than discarding the take. See
+    :func:`almond_axol.mantis.alignment.align_episode_ee_poses`.
+    """
+    if not config.get("align_ee_to_exposure"):
+        return
+    try:
+        from ..mantis.alignment import align_episode_ee_poses
+
+        stats = align_episode_ee_poses(
+            dataset.writer.episode_buffer,
+            dataset.meta.features,
+            row_times,
+            config["fps"],
+        )
+    except Exception:
+        _logger.exception("pose alignment failed; saving the episode as recorded")
+        return
+    if stats is None:
+        return
+    _logger.info(
+        "aligned %d of %d rows' tracked poses to their camera frames "
+        "(pose lag p95 %.1f ms, max %.1f ms; largest correction %.1f mm, %.2f deg)",
+        stats.aligned,
+        stats.rows,
+        stats.lag_abs_p95_ms,
+        stats.lag_abs_max_ms,
+        stats.max_shift_mm,
+        stats.max_shift_deg,
+    )
+
+
 def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
     """Zero-phase low-pass the buffered episode's EE pose track before save.
 
@@ -3499,6 +3539,7 @@ class InProcessRecorder:
                 "with its rows; episode discarded."
             )
         try:
+            _maybe_align_episode(self._dataset, self._config, self._row_times)
             _maybe_smooth_episode(self._dataset, self._config)
             _prepare_streaming_episode(self._dataset)
         except Exception:
@@ -4097,6 +4138,7 @@ def _recorder_main(
                         # streaming video. Finalize/cache all supported mux
                         # results first so an EOS/count failure cannot leave
                         # orphan row data.
+                        _maybe_align_episode(dataset, config, row_times)
                         _maybe_smooth_episode(dataset, config)
                         _prepare_streaming_episode(dataset)
                     except Exception as exc:  # safe: row commit has not begun

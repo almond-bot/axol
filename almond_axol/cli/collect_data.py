@@ -1989,6 +1989,10 @@ def _run_session(
         # Tracked (VR) poses carry measurement noise the robot's encoder FK
         # doesn't — smooth only Mantis episodes (see record_proc._maybe_smooth_episode).
         "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
+        # Mantis rows pair each image with the nearest tracker pose; resample
+        # the pose track onto the exposure times before smoothing (see
+        # record_proc._maybe_align_episode).
+        "align_ee_to_exposure": mantis_mode,
         # Which tracker→gripper transforms the recorded poses were mapped
         # through (meta/axol.json). A later constant change is migrated from
         # this record instead of guessed (see migrate-dataset).

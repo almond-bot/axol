@@ -281,6 +281,8 @@ Axol and Mantis episodes can go in one dataset. For each Axol run:
 
 A dataset started on Mantis may have an `observation.pose_lag` column, which Axol fills in automatically. A dataset started on Axol without that column keeps its layout, and Mantis leaves the column out.
 
+When Mantis saves an episode, it moves each tracked pose to the moment its camera frame was taken. The `observation.pose_lag` column then reads 0 on those rows. A row that can't be moved keeps its pose and its original lag, for example the first and last rows or a row after a tracking dropout.
+
 ## Next steps
 
 <CardGroup cols={2}>
