@@ -28,6 +28,7 @@ import {
   formatSettingValue,
   nextSettingValue,
   useAxolControlChannel,
+  useAxolHaptics,
   useAxolJoints,
   useAxolPoseSocket,
   useAxolSettings,
@@ -837,6 +838,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
 const hudBg = { backgroundColor: "#000000", backgroundOpacity: 0.5, padding: 0.006 } as object
 
+/** Plays the server's haptics on the controllers (see useAxolHaptics). */
+function ControllerHaptics({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+  useAxolHaptics(wsRef)
+  return null
+}
+
 function XRHud({ children }: { children: ReactNode }) {
   const session = useXR((s) => s.session)
   const groupRef = useRef<THREE.Group>(null)
@@ -1290,9 +1297,9 @@ function HelpPanel({
       : boxMode
         ? [
             "[Grip]  Lead / freeze both arms",
-            "[Stick left/right]  Width",
-            "[Stick up/down]  Elbows",
-            "[Stick click]  Flush / straight",
+            "[Stick up/down]  Width",
+            "[Stick tap]  Flush / straight",
+            "[Stick hold]  Raise lift",
           ]
         : ["[Grip]  Engage / freeze arm", ...(boxAvailable ? ["[Both clicks]  Box mode"] : [])]),
   ].join("\n")
@@ -1305,10 +1312,8 @@ function HelpPanel({
           ...(boxMode
             ? [
                 "[Grip]  Lead / freeze both arms",
-                "[Stick left/right]  Width",
-                "[Stick up/down]  Elbows",
-                "[Stick click]  Flush / straight",
-                "[Frozen: sticks]  Drive Jelly",
+                "[Stick tap]  Flush / straight",
+                "[Stick hold]  Lower lift",
                 "[Both clicks]  Box mode",
               ]
             : [
@@ -1862,8 +1867,8 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick", "← → width, ↑ ↓ elbows"],
-                                ["Stick click", "Flush / straight grasp"],
+                                ["Stick tap", "Flush / straight grasp"],
+                                ["Stick hold", "Lower lift"],
                               ] as [string, string][])
                             : ([
                                 ["Grip", "Engage / freeze arm"],
@@ -1896,8 +1901,9 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick", "← → width, ↑ ↓ elbows"],
-                          ["Stick click", "Flush / straight grasp"],
+                          ["Stick", "↑ ↓ grip width"],
+                          ["Stick tap", "Flush / straight grasp"],
+                          ["Stick hold", "Raise lift"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}
@@ -1956,6 +1962,7 @@ export default function App() {
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
+            <ControllerHaptics wsRef={wsRef} />
             <XRHud>
               <ExitButton />
               <HelpIcon

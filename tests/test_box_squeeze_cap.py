@@ -145,19 +145,6 @@ class WristCapTest(unittest.TestCase):
             },
         )
 
-    def test_clamp_force_limit_reads_the_box_wrist_cap(self) -> None:
-        # The squeeze lean's automatic clamp limit (joint_force_limit) works
-        # from box mode's effective caps, not the (uncapped) robot config.
-        from almond_axol.teleop.worker import box_joint_caps
-
-        caps = box_joint_caps(AxolConfig(), VRTeleopConfig())
-        for side in ("left", "right"):
-            for i, joint in enumerate(ARM_JOINTS):
-                want = 5.0 if joint in BOX_WRIST_JOINTS else float("inf")
-                self.assertEqual(caps[side][i], want, (side, joint))
-        off = box_joint_caps(AxolConfig(), VRTeleopConfig(box_wrist_torque=0.0))
-        self.assertTrue(np.all(np.isinf(off["left"])))
-
     def test_zero_disables_the_wrist_cap(self) -> None:
         self.assertIsNone(self._core(box_mode=True, box_wrist_torque=0.0).spring_caps())
 

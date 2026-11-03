@@ -25,6 +25,12 @@ _logger = logging.getLogger(__name__)
 
 Pose = tuple[np.ndarray, np.ndarray]
 
+# How far outside the QP's minimum distance the proximity cue starts (m),
+# matching the JAX solver's lead, and the narrowest distance over which it
+# rises from 0 to 1.
+_PROXIMITY_LEAD = 0.02
+_PROXIMITY_SPAN_MIN = 0.01
+
 
 def _world_position(position: np.ndarray) -> np.ndarray:
     return _ROOT_ORIGIN + _WORLD_TO_MODEL_R.T @ (position - _ROOT_ORIGIN)
@@ -101,6 +107,35 @@ class MinkKinematicsSolver:
             )
             for is_left in (True, False)
         ]
+        # Proximity cue (see collision_proximity): each torso<->arm pair the
+        # QP constrains reads 0 from _PROXIMITY_LEAD outside the minimum
+        # distance (capped at the detection distance and the home clearance;
+        # see set_proximity_reference) and 1 at the minimum distance, or
+        # _PROXIMITY_SPAN_MIN inside the onset for pairs that start close.
+        ik_config = self._ik.config
+        self._proximity_pairs = list(self._ik.tracker.collision_pairs)
+        self._proximity_side = np.array(
+            [
+                str(
+                    mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[arm])
+                    )
+                ).startswith("left_")
+                for _torso, arm in self._proximity_pairs
+            ],
+            dtype=bool,
+        )
+        self._proximity_onset = np.full(
+            len(self._proximity_pairs),
+            min(
+                float(ik_config.mink_collision_detection_distance),
+                float(ik_config.mink_collision_min_distance) + _PROXIMITY_LEAD,
+            ),
+        )
+        self._proximity_full = np.full(
+            len(self._proximity_pairs), float(ik_config.mink_collision_min_distance)
+        )
+        self.set_proximity_reference(np.zeros(self.num_joints, dtype=np.float32))
         # Freeze inactive arms inside the QP, so their freedom cannot help
         # satisfy a constraint before a later output splice undoes that move.
         base_constraints = list(self._ik.tracker._constraints)
@@ -166,6 +201,53 @@ class MinkKinematicsSolver:
             for body in self._elbow_ids
         ]
         return positions[0], positions[1]
+
+    def _pair_distances(self, q: np.ndarray, distmax: np.ndarray) -> np.ndarray:
+        """Distance of each proximity pair at ``q``, capped at ``distmax``."""
+        data = self._fk_data
+        data.qpos[:] = 0.0
+        data.qpos[self._qpos_indices] = self._q(q)
+        mujoco.mj_kinematics(self._ik.model, data)
+        fromto = np.empty(6)
+        return np.array(
+            [
+                mujoco.mj_geomDistance(
+                    self._ik.model, data, torso, arm, float(cap), fromto
+                )
+                for (torso, arm), cap in zip(self._proximity_pairs, distmax)
+            ]
+        )
+
+    def set_proximity_reference(self, q: np.ndarray) -> None:
+        """Make ``q`` read as clear in :meth:`collision_proximity`.
+
+        Same contract as :meth:`KinematicsSolver.set_proximity_reference`.
+        """
+        if not self._proximity_pairs:
+            return
+        d = self._pair_distances(q, self._proximity_onset)
+        self._proximity_onset = np.minimum(self._proximity_onset, d)
+        self._proximity_full = np.minimum(
+            self._proximity_full, self._proximity_onset - _PROXIMITY_SPAN_MIN
+        )
+
+    def collision_proximity(self, q: np.ndarray) -> dict[str, float] | None:
+        """How close each arm is to the torso collision boundary at ``q``.
+
+        Same contract as :meth:`KinematicsSolver.collision_proximity`:
+        ``{"left": p, "right": p}`` with ``p`` in ``[0, 1]``, 1 where the QP's
+        minimum distance holds the arm off the body. ``None`` when the
+        tracker has no collision rows.
+        """
+        if not self._proximity_pairs:
+            return None
+        d = self._pair_distances(q, self._proximity_onset)
+        span = self._proximity_onset - self._proximity_full
+        level = np.clip((self._proximity_onset - d) / span, 0.0, 1.0)
+        return {
+            "left": float(level[self._proximity_side].max(initial=0.0)),
+            "right": float(level[~self._proximity_side].max(initial=0.0)),
+        }
 
     def ik(
         self,

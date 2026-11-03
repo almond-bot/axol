@@ -46,6 +46,7 @@ import numpy as np
 
 from ..constants import ARM_JOINTS, AxolModel, Joint, urdf_path
 from ..robot.control import ContactWatchdog
+from ..robot.gravity import GravityCompensator
 from ..settings import resolve_gripper, resolve_robot_model
 from .absolute_pose import AbsoluteCalibration
 from .config import VRTeleopConfig
@@ -55,6 +56,7 @@ from .filter import (
     ResetInterpolator,
     TrapezoidalFilter,
 )
+from .held_load import HeldLoad, load_regressor
 from .recorder import make as _recorder_make
 from .tcp import AbsoluteTCPMapping
 
@@ -117,13 +119,33 @@ def measured_arms(robot: object) -> MeasuredArms | None:
 # negligible next to the pose stream.
 JOINT_BROADCAST_HZ = 20.0
 
+# Haptics push (``{"type": "haptics"}``, see VRTeleopCore.maybe_broadcast_haptics):
+# its rate, the time constant (s) of the low-pass on the torque residuals
+# (a hard stop or a quick swing spikes them for a few ms; contact lasts), the
+# residual (as a multiple of ``config.haptic_torque``) at which the force cue
+# reaches full strength, and the collision-proximity level below which an
+# arm reads as clear (so drifting a few mm closer than rest stays quiet).
+HAPTICS_BROADCAST_HZ = 30.0
+_HAPTIC_TORQUE_TAU_S = 0.08
+_HAPTIC_TORQUE_FULL = 2.5
+_HAPTIC_NEAR_DEADBAND = 0.2
+# Held-load estimate (see HeldLoad): the commanded gripper opening (0 closed,
+# 1 open) below which a gripper counts as holding, the fraction of
+# ``config.haptic_torque`` a held-load fit may leave unexplained on a joint,
+# the time constant (s) of its slow estimate, and the joint speed (rad/s)
+# above which the arm's dynamics would bias that estimate.
+_HELD_GRIP_CLOSED = 0.5
+_HELD_FIT_TOL = 0.5
+_HELD_LEARN_TAU_S = 0.3
+_HELD_SLOW_RAD_S = 1.0
 
-# Thumbstick deflection below which a stick counts as released — the same
-# deadzone box mode and Jelly apply, so "neutral" here means neither would act.
-_STICK_NEUTRAL = 0.15
+
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
 # worker's re-blend to the straight grasp starts a frame after the request.
 _BOX_EXIT_MARGIN_S = 0.25
+# Box mode's stick clicks (see VRTeleopCore.box_stick_frame): a click
+# released sooner than this is a grasp tap; one held longer runs the lift.
+_BOX_TAP_S = 0.3
 # How long after a box-mode switch the next VR frame may arrive and still
 # engage the arms at once (see VRTeleopCore._maybe_auto_engage). Longer than
 # a frame gap under load; far shorter than the walk from the panel to the
@@ -133,18 +155,6 @@ _AUTO_ENGAGE_WINDOW_S = 1.0
 # zero-leg trajectory's ends and the pose it was planned from / its goal. A
 # plan outside it is refused rather than played (``_check_park_plan``).
 _PARK_PLAN_TOLERANCE_RAD = 0.05
-
-
-def _sticks_neutral(frame: object) -> bool:
-    """True when both thumbsticks are centred and neither is clicked."""
-    return (
-        abs(float(frame.l_stick_x)) < _STICK_NEUTRAL
-        and abs(float(frame.l_stick_y)) < _STICK_NEUTRAL
-        and abs(float(frame.r_stick_x)) < _STICK_NEUTRAL
-        and abs(float(frame.r_stick_y)) < _STICK_NEUTRAL
-        and not frame.l_stick_click
-        and not frame.r_stick_click
-    )
 
 
 @dataclass(frozen=True)
@@ -402,6 +412,21 @@ class VRTeleopCore:
         self.last_tcp_change_ts: float | None = None
         self._last_urdf_broadcast = 0.0
         self._last_joint_broadcast = 0.0
+        # Haptics (see maybe_broadcast_haptics): the worker's latest
+        # per-arm collision proximity, the low-passed torque residuals and
+        # their last sample time, the part of them left once what each
+        # gripper holds is explained away (the push cue), the held-load
+        # estimates with the kinematics they need and each arm's last
+        # measured joint positions, and whether the last push was non-zero.
+        self.collision_near: dict[str, float] | None = None
+        self._torque_lp: dict[str, np.ndarray] = {}
+        self._torque_lp_t: float | None = None
+        self._push: dict[str, np.ndarray] = {}
+        self.held_loads: dict[str, HeldLoad] = {}
+        self._held_kinematics: GravityCompensator | None = None
+        self._held_q: dict[str, np.ndarray] = {}
+        self._last_haptics_broadcast = 0.0
+        self._haptics_playing = False
         self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
         self.right_indices: list[int] = []
@@ -478,13 +503,13 @@ class VRTeleopCore:
             )
         self.box_mode: bool = bool(config.box_mode) and self.box_available
         self._box_leader: str | None = None
-        # Box mode hands the thumbsticks back to Jelly while nobody leads
-        # (the pair is frozen holding the box) — but not until the operator
-        # has let the sticks go after the freeze, so a width change
-        # in progress when the leader's grip was clicked can't turn into a
-        # base command. Set when the lead drops, cleared by the first neutral
-        # frame; see :attr:`pair_owns_sticks`.
-        self._box_sticks_held: bool = False
+        # Box mode's stick-click split (VR thread, see box_stick_frame): when
+        # each stick went down (None while up), whether that press can still
+        # be a grasp tap, and the last frame in with the one handed on.
+        self._click_down: dict[str, float | None] = {"l": None, "r": None}
+        self._click_tap: dict[str, bool] = {"l": False, "r": False}
+        self._sticks_in: object | None = None
+        self._sticks_out: object | None = None
 
         # Re-engage behaviour ("clutch": the controller matches the arm,
         # "ramp": the arm ramps out to the controller — see
@@ -508,10 +533,9 @@ class VRTeleopCore:
         # Read by the adapter for the headset; ``grasp`` and ``elbow`` are
         # mirrored into the config (see ``_mirror_worker_field``).
         self.pair_status: dict | None = None
-        # Config fields the worker owns while a pair is live (a stick click
-        # toggles the grasp, the sticks jog the elbows): a change sent *to*
-        # the worker is pending until it reports the value back, see
-        # _mirror_worker_field.
+        # Config fields the worker reports back while a pair is live (the
+        # grasp, the elbows-out angle): a change sent *to* the worker is
+        # pending until it reports the value back, see _mirror_worker_field.
         self._worker_pending: dict[str, object] = {}
         # A box-mode-off request taken while the led pair held the angled
         # grasp: the grasp is switched back to straight first and the exit
@@ -882,7 +906,15 @@ class VRTeleopCore:
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
     _LIVE_CORE_FIELDS = frozenset(
-        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_lead_hand"}
+        {
+            "hold_to_engage",
+            "teleop_max_vel",
+            "box_squeeze_torque",
+            "box_lead_hand",
+            "haptics",
+            "haptic_near",
+            "haptic_torque",
+        }
     )
     _LIVE_WORKER_FIELDS = frozenset(
         {
@@ -899,7 +931,6 @@ class VRTeleopCore:
             "box_grip_tilt",
             "box_elbow_out",
             "box_elbow_weight",
-            "box_elbow_speed",
             "box_squeeze_lean",
             "box_squeeze_trim",
             "box_squeeze_force",
@@ -1075,21 +1106,65 @@ class VRTeleopCore:
         """True while at least one arm is engaged (tracking)."""
         return self.left_enabled or self.right_enabled
 
-    @property
-    def pair_owns_sticks(self) -> bool:
-        """True while the thumbsticks belong to the arm pair, not to Jelly.
+    def box_stick_frame(self, frame: Any, now: float | None = None) -> Any:
+        """The frame to hand Jelly, box mode's stick clicks split into tap and hold.
 
-        In :attr:`box_mode` the sticks set the pair's width whenever a
-        grip is leading it. Once the leader freezes the pair (nobody leads), they go
-        back to driving the base with the ordinary mapping — so the operator
-        grabs the box, freezes, drives across the room, and leads again to
-        adjust — after one frame with every stick released (see
-        ``_box_sticks_held``). Outside box mode the sticks are always
-        Jelly's. Read by the frame handler (VR thread) to gate
-        ``Jelly.apply_vr_frame``; a frame of lag against the IK thread that
-        writes the state is harmless.
+        Outside box mode the frame comes back as is. In box mode a stick
+        click does one of two things, told apart by how long it is held:
+        a **tap** — one stick pressed and released within ``_BOX_TAP_S``,
+        the other stick up throughout — switches the grasp
+        (``box_grasp``: straight / flush) while a grip leads the pair, and
+        never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
+        lift as outside box mode, from then until the release. Until a press
+        has lasted that long its click is cleared from the frame Jelly gets
+        (a copy; the sticks' axes are untouched). Both sticks pressed
+        together — the box-mode toggle gesture — are never a tap.
+
+        Call once per received frame (VR thread), before Jelly; the same
+        frame object handed over again returns the same result, so Jelly's
+        stale-frame check still holds. The grasp switch is queued
+        (:meth:`set_live`) and flipped against the session's value on the
+        IK thread.
         """
-        return self.box_mode and (self._box_leader is not None or self._box_sticks_held)
+        if frame is self._sticks_in:
+            return self._sticks_out
+        now = time.perf_counter() if now is None else now
+        held: dict[str, bool] = {}
+        for side, other in (("l", "r"), ("r", "l")):
+            pressed = bool(getattr(frame, f"{side}_stick_click", False))
+            other_pressed = bool(getattr(frame, f"{other}_stick_click", False))
+            down = self._click_down[side]
+            if pressed:
+                if down is None:
+                    self._click_down[side] = down = now
+                    self._click_tap[side] = not other_pressed
+                elif other_pressed:
+                    self._click_tap[side] = False
+                held[side] = now - down >= _BOX_TAP_S
+                continue
+            if (
+                down is not None
+                and self._click_tap[side]
+                and now - down < _BOX_TAP_S
+                and self.box_mode
+                and self._box_leader is not None
+            ):
+                self._logger.info("Box grasp: switching (stick tap)")
+                self.set_live("box_grasp", "toggle")
+            self._click_down[side] = None
+            self._click_tap[side] = False
+            held[side] = False
+        out = frame
+        if self.box_mode:
+            masked = {
+                f"{side}_stick_click": False
+                for side in ("l", "r")
+                if getattr(frame, f"{side}_stick_click", False) and not held[side]
+            }
+            if masked:
+                out = frame.model_copy(update=masked)
+        self._sticks_in, self._sticks_out = frame, out
+        return out
 
     def spring_caps(self) -> dict[Joint, float] | None:
         """Per-joint spring-torque caps the arms should run under right now.
@@ -1134,8 +1209,6 @@ class VRTeleopCore:
         self._l_inhibit = True
         self._r_inhibit = True
         self._engage_time = None
-        if self._box_leader is not None:
-            self._box_sticks_held = True
         self._box_leader = None
         if self.config.absolute_mode:
             # A forced stop invalidates the absolute world→base anchor. This
@@ -1187,6 +1260,10 @@ class VRTeleopCore:
                     )
                 self._notify_mode("reengage", mode)
             else:
+                if key == "box_grasp" and value == "toggle":
+                    if self._box_exit_deadline is not None:
+                        continue  # leaving box mode: the exit owns the grasp
+                    value = "straight" if self.config.box_grasp == "flush" else "flush"
                 field_type = type(getattr(self.config, key))
                 coerced = (
                     field_type(value) if field_type in (bool, int, float) else value
@@ -1259,7 +1336,6 @@ class VRTeleopCore:
         if self.box_mode:
             leader = self._lead_hand()
             self._box_leader = leader
-            self._box_sticks_held = False
             self._logger.info(
                 "Teleop enabled (box mode, %s hand leads — switched on)", leader
             )
@@ -1498,17 +1574,14 @@ class VRTeleopCore:
         while the other still holds). Each gripper follows its own
         controller's trigger while the pair is engaged, whichever hand leads.
 
-        The thumbsticks set the grip width while someone leads and
-        drive Jelly while nobody does (:attr:`pair_owns_sticks`); the switch
-        to Jelly waits for a frame with the sticks released so a stick held
-        for the grasp can't carry over into base motion.
+        The right thumbstick's forward/back sets the grip width while
+        someone leads; the rest of the sticks drive Jelly's wheels and lift
+        throughout, led or not, with the ordinary mapping.
         """
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
         was_enabled = self.teleop_enabled
         leader = self._box_leader
-        if leader is None and self._box_sticks_held and _sticks_neutral(frame):
-            self._box_sticks_held = False
 
         if self.config.hold_to_engage:
             if l_lock or r_lock:
@@ -1554,8 +1627,6 @@ class VRTeleopCore:
         elif was_enabled and not enabled:
             self._logger.info("Teleop disabled (box pair frozen)")
             self._broadcast(False)
-            # Hand the sticks to Jelly only once they've been released.
-            self._box_sticks_held = not _sticks_neutral(frame)
 
         self._prev_both = l_lock and r_lock
         self._prev_l_lock = l_lock
@@ -1568,20 +1639,24 @@ class VRTeleopCore:
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
 
-        The worker answers a frame with ``(q, status)`` where ``status`` is
-        ``None`` or a small dict it refreshes a few times a second (see
-        :meth:`IKWorker.pair_status`); a bare array is accepted too. The
+        The worker answers a frame with ``(q, status, near)`` where
+        ``status`` is ``None`` or a small dict it refreshes a few times a
+        second (see :meth:`IKWorker.pair_status`) and ``near`` the per-arm
+        collision proximity, published on :attr:`collision_near` for the
+        haptics (see :meth:`IKWorker.collision_proximity`); a bare array or
+        a ``(q, status)`` pair is accepted too. The
         status is published on :attr:`pair_status` for the adapter's
-        headset feedback (the "arms aligned" cue). The worker owns the
-        box-mode grasp (a stick click toggles it) and the elbows-out angle
-        (the sticks jog it) while a pair is live, so the ``grasp`` and
-        ``elbow`` it reports are mirrored into :attr:`config` (and announced
-        as live setting changes) when they differ — the settings panel then
-        shows what the arms are doing, and the values survive the next
-        engage.
+        headset feedback (the "arms aligned" cue). The ``grasp`` and
+        ``elbow`` it reports (the box-mode grasp and elbows-out angle in
+        force) are mirrored into :attr:`config` (and announced as live
+        setting changes) when they differ, so the settings panel shows
+        what the arms are doing.
         """
         if isinstance(result, tuple):
-            q, status = result
+            q, status = result[:2]
+            near = result[2] if len(result) > 2 else None
+            if near is not None:
+                self.collision_near = near
             if status is not None:
                 self.pair_status = status
                 if isinstance(status, dict):
@@ -1594,8 +1669,8 @@ class VRTeleopCore:
             return q
         return result
 
-    # Config fields the worker changes on its own from stick input and
-    # reports back through pair_status (see _unpack_solution).
+    # Config fields the worker reports back through pair_status (see
+    # _unpack_solution); a request sent to it is held until it lands.
     _WORKER_OWNED = frozenset({"box_grasp", "box_elbow_out"})
 
     def _mirror_worker_field(self, key: str, value: object) -> None:
@@ -1610,7 +1685,7 @@ class VRTeleopCore:
         if value != getattr(self.config, key):
             setattr(self.config, key, value)
             if key == "box_grasp":
-                self._logger.info("Box grasp: %s (stick click)", value)
+                self._logger.info("Box grasp: %s", value)
             self._notify_mode(key, value)
 
     def _accept_tracking_frame(self, frame: object) -> bool:
@@ -2616,6 +2691,171 @@ class VRTeleopCore:
                     "pair": self.pair_status,
                 },
             }
+        )
+
+    def maybe_broadcast_haptics(self, robot: object) -> None:
+        """Push each controller's haptic levels to the headset, throttled.
+
+        Call from the control loop next to :meth:`maybe_broadcast_joints`.
+        Every call feeds the torque-residual low-pass (hardware only: a
+        ``robot`` with ``torque_residuals()``); pushes go out at
+        :data:`HAPTICS_BROADCAST_HZ` while any level is non-zero, plus one
+        all-zero push when they stop. See :meth:`haptic_levels` for the
+        message.
+        """
+        now = time.perf_counter()
+        self._update_torque_lp(robot, now)
+        if not self.teleop_enabled:
+            # The worker stops reporting proximity once both arms let go;
+            # don't replay the last reading at the next engage.
+            self.collision_near = None
+        if now - self._last_haptics_broadcast < 1.0 / HAPTICS_BROADCAST_HZ:
+            return
+        dt = now - self._last_haptics_broadcast
+        self._last_haptics_broadcast = now
+        self._update_push(robot, dt)
+        if self._broadcast_json is None:
+            return
+        levels = self.haptic_levels()
+        playing = any(v > 0.0 for side in levels.values() for v in side.values())
+        if not playing and not self._haptics_playing:
+            return
+        self._haptics_playing = playing
+        self._broadcast_json({"type": "haptics", "value": levels})
+
+    def haptic_levels(self) -> dict[str, dict[str, float]]:
+        """Haptic levels per controller, ``{"left": {"near", "force"}, "right": ...}``.
+
+        Each level is 0 to 1. ``near`` is how close that arm is to the IK
+        collision boundary (:attr:`collision_near`), ``force`` how far its
+        largest low-passed torque residual (measured minus model gravity,
+        less what its gripper holds: :attr:`held_loads`) is past
+        ``config.haptic_torque``, full at
+        ``_HAPTIC_TORQUE_FULL`` times it. Only an engaged arm plays, and
+        nothing plays with ``config.haptics`` off or during a return to
+        rest, and ``near`` stays 0 with ``config.haptic_near`` off. In
+        box mode both arms follow the leading controller, so it
+        plays the stronger of the two and the other controller is quiet.
+        """
+        levels = {side: {"near": 0.0, "force": 0.0} for side in ("left", "right")}
+        if not self.config.haptics or self.is_resetting:
+            return levels
+        near = self.collision_near or {}
+        start = float(self.config.haptic_torque)
+        for side, engaged in (
+            ("left", self.left_enabled),
+            ("right", self.right_enabled),
+        ):
+            if not engaged:
+                continue
+            raw = float(near.get(side, 0.0)) if self.config.haptic_near else 0.0
+            levels[side]["near"] = round(
+                max(0.0, (raw - _HAPTIC_NEAR_DEADBAND) / (1.0 - _HAPTIC_NEAR_DEADBAND)),
+                3,
+            )
+            push = self._push.get(side)
+            if start > 0.0 and push is not None and push.size:
+                peak = float(np.max(np.abs(push)))
+                force = (peak - start) / (start * (_HAPTIC_TORQUE_FULL - 1.0))
+                levels[side]["force"] = round(min(max(force, 0.0), 1.0), 3)
+        if self.box_mode and self._box_leader in ("left", "right"):
+            leader = self._box_leader
+            other = "right" if leader == "left" else "left"
+            levels[leader] = {
+                key: max(levels[leader][key], levels[other][key])
+                for key in ("near", "force")
+            }
+            levels[other] = {"near": 0.0, "force": 0.0}
+        return levels
+
+    def _update_torque_lp(self, robot: object, now: float) -> None:
+        """Feed one torque-residual sample into the haptics low-pass."""
+        read = getattr(robot, "torque_residuals", None)
+        if not callable(read):
+            return
+        try:
+            residuals = read()
+        except Exception:  # noqa: BLE001 - haptics must never break the loop
+            return
+        dt = 0.0 if self._torque_lp_t is None else now - self._torque_lp_t
+        self._torque_lp_t = now
+        alpha = 1.0 - float(np.exp(-max(dt, 0.0) / _HAPTIC_TORQUE_TAU_S))
+        for side, res in zip(("left", "right"), residuals):
+            if res is None:
+                self._torque_lp.pop(side, None)
+                continue
+            # a4 joints can report NaN torque; they add nothing.
+            sample = np.nan_to_num(
+                np.asarray(res, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            lp = self._torque_lp.get(side)
+            if lp is None or lp.shape != sample.shape:
+                self._torque_lp[side] = sample
+            else:
+                lp += alpha * (sample - lp)
+
+    def _update_push(self, robot: object, dt: float) -> None:
+        """Refresh the push cue: each arm's low-passed residual less its held load.
+
+        Runs at the haptics rate rather than every control tick: the
+        held-load fit costs a few hundred microseconds per arm.
+        """
+        self._push = {
+            side: lp - self._held_torque(robot, side, lp, dt)
+            for side, lp in self._torque_lp.items()
+        }
+
+    def _held_torque(
+        self, robot: object, side: str, residual: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """The part of one arm's low-passed ``residual`` its gripper's load explains.
+
+        A gripper holds something while its command is closed, or while box
+        mode clamps the box between both grippers (which also squeezes it).
+        Opening the gripper, or leaving box mode, drops the estimate (see
+        :class:`~almond_axol.teleop.held_load.HeldLoad`). Zero while nothing
+        is held, with ``config.haptic_held_load`` off, or without measured
+        joint positions to evaluate the load at.
+        """
+        zero = np.zeros_like(residual)
+        grip = self.l_grip if side == "left" else self.r_grip
+        box = self.box_mode and self.teleop_enabled
+        start = float(self.config.haptic_torque)
+        holding = box or float(grip) < _HELD_GRIP_CLOSED
+        if (
+            not holding
+            or not self.config.haptic_held_load
+            or start <= 0.0
+            or residual.shape != (len(ARM_JOINTS),)
+        ):
+            self.held_loads.pop(side, None)
+            self._held_q.pop(side, None)
+            return zero
+        try:
+            q = np.asarray(getattr(robot, side).positions, dtype=np.float64)[:7]
+        except Exception:  # noqa: BLE001 - no arm or no reading yet
+            return zero
+        if q.shape != (len(ARM_JOINTS),) or not np.all(np.isfinite(q)):
+            return zero
+        held = self.held_loads.get(side)
+        if held is None or held.squeeze != box:
+            held = self.held_loads[side] = HeldLoad(squeeze=box)
+        if self._held_kinematics is None:
+            self._held_kinematics = GravityCompensator()
+        _, rot, jac = self._held_kinematics.mount_jacobian(q, is_left=side == "left")
+        last_q = self._held_q.get(side)
+        self._held_q[side] = q
+        slow = (
+            last_q is not None
+            and dt > 0.0
+            and float(np.max(np.abs(q - last_q))) <= _HELD_SLOW_RAD_S * dt
+        )
+        learn = 1.0 - float(np.exp(-dt / _HELD_LEARN_TAU_S)) if slow else 0.0
+        return held.explain(
+            load_regressor(jac, rot, squeeze=box),
+            residual,
+            tol=_HELD_FIT_TOL * start,
+            learn=learn,
         )
 
     def _maybe_broadcast_urdf_state(self) -> None:

@@ -701,6 +701,45 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
             ),
             SettingDef(
+                key="teleop.haptics",
+                label="Controller haptics",
+                type="boolean",
+                help=(
+                    "Vibrates a Quest controller while its arm is engaged and pushes "
+                    "on something. Turn off for silent controllers."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_near",
+                label="Ticks near the body",
+                type="boolean",
+                help=(
+                    "Also ticks a controller, faster as its arm gets close to "
+                    "Axol's body."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_torque",
+                label="Haptic push torque (Nm)",
+                type="number",
+                help=(
+                    "How much unexpected joint torque (Nm) makes a controller start "
+                    "to rumble. The rumble is strongest at 2.5 times this value. "
+                    "Raise it if the controllers rumble during normal moves. Set 0 "
+                    "to turn the rumble off."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_held_load",
+                label="Ignore held weight",
+                type="boolean",
+                help=(
+                    "Keeps the weight of what a gripper holds, and the squeeze on a "
+                    "box in box mode, from making its controller rumble. Pushing on "
+                    "something still rumbles."
+                ),
+            ),
+            SettingDef(
                 key="teleop.park_to_zero",
                 label="Park to zero on stop",
                 type="boolean",
@@ -724,11 +763,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box mode at startup",
                 type="boolean",
                 help=(
-                    "Start sessions in box mode. The grippers clamp a box between them "
-                    "like two flat hands, and one controller moves both arms while "
-                    "keeping them level. The thumbsticks set the clamp width while you "
-                    "lead, and drive the base while the arms are frozen. Toggle it "
-                    "from the headset menu or by clicking both thumbsticks, which "
+                    "Start sessions in box mode, where the grippers clamp a box like two "
+                    "flat hands and one controller moves and turns both arms. "
+                    "While you lead, push the right thumbstick forward or back to set the "
+                    "clamp width. The rest of the thumbsticks drive the base as usual. "
+                    "Toggle it from the headset menu or by clicking both thumbsticks, which "
                     "engages the arms right away."
                 ),
                 targets={
