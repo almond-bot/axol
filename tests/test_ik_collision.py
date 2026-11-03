@@ -1,10 +1,10 @@
-"""The fitted IK collision model of Axol on Jelly.
+"""The fitted IK collision model of every Axol version.
 
-The Jelly URDFs' ``<ik_collision>`` are boxes and capsules fitted to each
-part's hull (``scripts/build_urdfs.py``, ``ik_primitives``). They must enclose
-every part (IK's clearance is never more than the real one) while staying
-close to it, the capsule-box distance must be exact, and the fingers must
-follow the gripper opening.
+Each URDF's ``<ik_collision>`` are boxes and capsules fitted to each part's
+hull (``scripts/build_urdfs.py``). They must enclose every part (IK's
+clearance is never more than the real one) while staying close to it, the
+capsule-box distance must be exact, and the fingers must follow the gripper
+opening.
 """
 
 from __future__ import annotations
@@ -22,15 +22,24 @@ import trimesh
 import yourdfpy
 from pyroki.collision import Box, Capsule
 
-from almond_axol.constants import AxolModel, urdf_path
+from almond_axol.constants import URDF_DIR, AxolModel, urdf_path
 from almond_axol.kinematics.collision import capsule_box_distance
 from almond_axol.kinematics.config import KinematicsConfig
-from almond_axol.kinematics.model import shared_robot_collision
-from almond_axol.kinematics.solver import KinematicsSolver, body_collision_distance
+from almond_axol.kinematics.model import shared_robot, shared_robot_collision
+from almond_axol.kinematics.solver import (
+    KinematicsSolver,
+    body_collision_distance,
+    shift_links,
+)
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 
 _GRIPPERS = ("parallel", "parcel")
+# Every bundled URDF: (version, gripper).
+_MODELS = (
+    *((AxolModel.MOBILE, g) for g in _GRIPPERS),
+    *((m, "parallel") for m in AxolModel if m is not AxolModel.MOBILE),
+)
 
 
 def _brute_capsule_box(p0, p1, radius, half, n: int = 4001) -> float:
@@ -123,53 +132,75 @@ def _volume(kind: str, size) -> float:
     return float(np.pi * radius**2 * length + 4 / 3 * np.pi * radius**3)
 
 
-class FittedShapesTest(unittest.TestCase):
-    """Each IK shape encloses its part's hull, and not by much."""
+def _mesh_path(path, filename: str):
+    # The classic URDF's meshes are package paths; the others' are relative.
+    prefix = "package://assembly/"
+    if filename.startswith(prefix):
+        return URDF_DIR / filename[len(prefix) :]
+    return path.parent / filename
 
-    def _check(self, gripper: str) -> None:
+
+class FittedShapesTest(unittest.TestCase):
+    """Every part IK should see is inside an IK shape, and each shape is
+    close to the part it is fitted to (everything in the world frame, every
+    joint at zero)."""
+
+    def _check(self, model: AxolModel, gripper: str) -> None:
         from xml.etree import ElementTree
 
-        path = urdf_path(AxolModel.MOBILE, gripper=gripper)
+        path = urdf_path(model, gripper=gripper)
         root = ElementTree.parse(path).getroot()
         full = yourdfpy.URDF.load(
             str(path), build_collision_scene_graph=False, load_meshes=False
         )
         full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
-        links = {ln.get("name"): ln for ln in root.findall("link")}
-        checked = 0
-        for name, link in links.items():
-            shapes = _ik_shapes(link)
-            # The parcel plate's sweep is fitted over its whole motion.
-            if not shapes or name.endswith("_fingers"):
-                continue
-            # The part's hulls; the deck's is on the Jelly base link.
-            owner = "jelly" if name == "deck" else name
-            hulls = []
-            for col in links[owner].findall("collision"):
+        shapes, hulls = [], []
+        for link in root.findall("link"):
+            name = link.get("name")
+            world = full.get_transform(name)
+            for kind, pose, size in _ik_shapes(link):
+                shapes.append((name, kind, world @ pose, size))
+            for col in link.findall("collision"):
                 ref = col.find("geometry/mesh").get("filename")
-                if (name == "deck") != ("deck" in ref):
+                # Out of the arms' reach: the wheels and the Ox cart's caster
+                # frame (IK holds the lifts fully raised).
+                if name.startswith("wheel_") or "cart_frame" in ref:
                     continue
-                hull = trimesh.load(path.parent / ref, force="mesh")
-                to_link = np.linalg.inv(full.get_transform(name)) @ full.get_transform(
-                    owner
+                hull = trimesh.load(_mesh_path(path, ref), force="mesh").convex_hull
+                o = col.find("origin")
+                pose = np.eye(4)
+                if o is not None:
+                    pose = trimesh.transformations.euler_matrix(
+                        *(float(v) for v in o.get("rpy").split()), axes="sxyz"
+                    )
+                    pose[:3, 3] = [float(v) for v in o.get("xyz").split()]
+                hulls.append((ref, hull.apply_transform(world @ pose)))
+        for ref, hull in hulls:
+            with self.subTest(model=model.value, gripper=gripper, part=ref):
+                self.assertTrue(
+                    any(_encloses(k, p, sz, hull.vertices) for _, k, p, sz in shapes)
                 )
-                hulls.append(hull.apply_transform(to_link))
-            pts = np.vstack([h.vertices for h in hulls])
-            hull = trimesh.util.concatenate(hulls).convex_hull
-            with self.subTest(gripper=gripper, link=name):
-                ((kind, pose, size),) = shapes
-                self.assertTrue(_encloses(kind, pose, size, pts))
-                # Tight: the old fits were 2-24 times their part's volume.
-                ratio = _volume(kind, size) / hull.volume
-                self.assertLess(ratio, 2.0 if kind == "box" else 5.0)
-                checked += 1
-        self.assertGreater(checked, 20)
+        for name, kind, pose, size in shapes:
+            # The parcel plate's sweep covers its whole motion.
+            if name.endswith("_fingers"):
+                continue
+            with self.subTest(model=model.value, gripper=gripper, link=name):
+                inside = [
+                    h for _, h in hulls if _encloses(kind, pose, size, h.vertices)
+                ]
+                self.assertTrue(inside)
+                # Tight: one capsule per link was 2-24 times its part's volume.
+                # The Owl foot is a thin plate with a sloping rib: its hull is
+                # a wedge, a third of its box.
+                limit = 2.0 if kind == "box" else 5.0
+                if name == "foot":
+                    limit = 3.0
+                ratio = _volume(kind, size) / max(h.volume for h in inside)
+                self.assertLess(ratio, limit)
 
-    def test_parallel_gripper(self) -> None:
-        self._check("parallel")
-
-    def test_parcel_gripper(self) -> None:
-        self._check("parcel")
+    def test_every_version(self) -> None:
+        for model, gripper in _MODELS:
+            self._check(model, gripper)
 
 
 class FingerSlideTest(unittest.TestCase):
@@ -220,23 +251,74 @@ class FingerSlideTest(unittest.TestCase):
         s.set_gripper(0.0, 0.0)
         np.testing.assert_array_equal(np.asarray(s.link_shift), before)
 
+    def test_fingers_follow_the_urdf_on_every_parallel_gripper(self) -> None:
+        # The exports freeze the fingers at different points of their
+        # stroke (closed on Jelly, open or part way on the others): the
+        # shift must put them where the full URDF does.
+        expected = {
+            AxolModel.MOBILE: (0.0, 0.0588),
+            AxolModel.STANDALONE: (0.0, -0.044),
+            AxolModel.OX_CART: (0.0, -0.044),
+            AxolModel.OWL: (0.011, -0.044),
+        }
+        for model, (closed_q, stroke) in expected.items():
+            with self.subTest(model=model.value):
+                s = KinematicsSolver(KinematicsConfig(robot_model=model.value))
+                names = list(s.robot.links.names)
+                full = yourdfpy.URDF.load(
+                    str(urdf_path(model)),
+                    build_collision_scene_graph=False,
+                    load_meshes=False,
+                )
+                poses = s.robot.forward_kinematics(
+                    jnp.zeros(s.robot.joints.num_actuated_joints)
+                )
+                for grip in (0.0, 0.4, 1.0):
+                    s.set_gripper(grip, 1.0 - grip)
+                    shifted = np.asarray(shift_links(poses, s.link_shift))
+                    cfg = {n: 0.0 for n in full.actuated_joint_names}
+                    cfg["left_finger_1_joint"] = closed_q + grip * stroke
+                    cfg["right_finger_1_joint"] = closed_q + (1.0 - grip) * stroke
+                    full.update_cfg(cfg)
+                    for side in ("left", "right"):
+                        for k in (1, 2):
+                            link = f"{side}_finger_{k}"
+                            want = full.get_transform(link, "root")[:3, 3]
+                            got = shifted[names.index(link), 4:]
+                            np.testing.assert_allclose(got, want, atol=2e-4)
+
+    def test_classic_gripper_is_rigid(self) -> None:
+        s = KinematicsSolver(KinematicsConfig(robot_model="classic"))
+        before = np.asarray(s.link_shift)
+        s.set_gripper(0.0, 0.0)
+        np.testing.assert_array_equal(np.asarray(s.link_shift), before)
+
 
 class ShapesTest(unittest.TestCase):
-    def test_jelly_collides_boxes_and_capsules(self) -> None:
-        for gripper in _GRIPPERS:
-            with self.subTest(gripper=gripper):
-                rc = shared_robot_collision(AxolModel.MOBILE, gripper=gripper)
-                self.assertGreater(len(rc.box_link), 0)
+    def test_every_version_collides_boxes_and_capsules(self) -> None:
+        for model, gripper in _MODELS:
+            with self.subTest(model=model.value, gripper=gripper):
+                rc = shared_robot_collision(model, gripper=gripper)
+                # The shoulder bar at least is a box.
+                self.assertIn("s1", {rc.link_names[k] for k in rc.box_link})
                 # Every arm shape is a capsule: no box is on an arm link.
                 for k in rc.box_link:
                     self.assertFalse(rc.link_names[k].startswith(("left_", "right_")))
+                # Each arm shape mirrors the other side's (bar the fingers):
+                # both arms see the body alike.
+                names = [rc.link_names[k] for k in rc.capsule_link]
+                arm = [n for n in names if n.startswith("left_")]
+                self.assertEqual(
+                    sorted(n.replace("left_", "right_") for n in arm),
+                    sorted(n for n in names if n.startswith("right_")),
+                )
 
-    def test_other_versions_keep_one_capsule_per_link(self) -> None:
-        for model in (AxolModel.CLASSIC, AxolModel.OWL):
-            with self.subTest(model=model.value):
-                rc = shared_robot_collision(model)
-                self.assertEqual(rc.box_link, ())
-                self.assertEqual(len(rc.capsule_link), len(rc.link_names))
+    def test_robot_link_order(self) -> None:
+        for model, gripper in _MODELS:
+            with self.subTest(model=model.value, gripper=gripper):
+                rc = shared_robot_collision(model, gripper=gripper)
+                robot = shared_robot(model, gripper=gripper)
+                self.assertEqual(rc.link_names, tuple(robot.links.names))
 
 
 class WorkerForwardTest(unittest.TestCase):

@@ -26,12 +26,7 @@ the viewers and physics simulators (Isaac Sim, MuJoCo) all load:
 - **Two collision sets** (see ``MODEL_NOTE``): one convex hull per part in
   ``<collision>``, for physics, and the custom ``<ik_collision>``, which IK
   (``almond_axol.kinematics.model``) collides with every joint but the arms'
-  frozen. On Jelly (``Body.ik_primitives``) these are a box or capsule
-  fitted to each part (see IK primitives); elsewhere, capsule-friendly
-  pieces pyroki fits one capsule per link to: the shoulder bar, the
-  head-camera mount, the lift column's top plate and each section, the Owl
-  foot plate as strips, and each gripper's jaws as one body over their
-  whole motion.
+  frozen: a box or capsule fitted to each part (see IK primitives).
 - **Masses and drives** from :class:`~almond_axol.robot.config.AxolConfig`
   for the arms (wrist_3's lump split across the gripper parts), estimates
   elsewhere (``Body.masses``); friction and impedance gains on the arm
@@ -58,12 +53,12 @@ reuse its meshes::
         jelly/almond_urdf parcel/almond_urdf axol/almond_urdf \\
         owl/almond_urdf ox_cart/almond_urdf
 
-Without the exports, ``--refit-ik`` refits a generated URDF's IK shapes from
-its own part hulls (see :func:`refit_ik`)::
+Without the exports, ``--refit-ik`` refits a URDF's IK shapes from its own
+part hulls (see :func:`refit_ik`; for the classic ``axol.urdf``, from its
+meshes, see :func:`refit_classic_ik`)::
 
     uv run python scripts/build_urdfs.py --refit-ik \\
-        almond_axol/kinematics/urdf/axol_jelly.urdf \\
-        almond_axol/kinematics/urdf/axol_jelly_parcel.urdf
+        almond_axol/kinematics/urdf/axol*.urdf
 """
 
 from __future__ import annotations
@@ -121,8 +116,8 @@ ARM_ANCHORS: dict[str, str] = {
 # rigidly attached to with an identity origin (their meshes are placed in the
 # parent's frame). Each Body and Variant adds its own.
 HEAD_LINKS: dict[str, str] = {"head": "s1"}
-# IK models only: collision-only link per gripper holding its jaws' swept
-# volume (see Collision.finger_cylinder / plate_sweep).
+# The parcel gripper's IK model only: a collision-only link per gripper
+# holding its plate's swept volume (see Collision.plate_sweep).
 FINGER_LINKS: dict[str, str] = {
     "left_fingers": "left_gripper",
     "right_fingers": "right_gripper",
@@ -157,12 +152,8 @@ _ALL = ((-_INF,) * 3, (_INF,) * 3)
 Split = tuple[tuple[float, ...], tuple[float, ...], str, str]
 
 # Collision body specs: a hull over pieces, a cylinder along a link axis over
-# pieces (``stroke``: include the fingers fully open), or deck strips.
+# pieces (``stroke``: include the fingers fully open).
 _ARM_PARTS = ("s2", "s3", "e1", "e2", "w0", "w1", "w2", "gripper")
-# A flat part (the Jelly deck, 0.6 x 0.6 m, ~0.24 m tall; the Owl mount's
-# foot) as strips across the robot for capsule collision: one capsule over it
-# would swallow the arms; three along y stay within a few cm of it.
-DECK_STRIPS = 3
 
 
 @dataclass(frozen=True)
@@ -173,7 +164,7 @@ class Body:
     unless ``splits`` splits it by a mesh-local box ``(lo, hi)`` into the
     piece inside and the piece outside it. Each link gets two collision
     sets: ``sim_hulls`` (one convex hull per part, for physics) and
-    ``ik_hulls`` + ``strips`` (capsule-friendly, for IK; see IK_NOTE).
+    ``ik_hulls`` (a box or capsule per piece, for IK; see IK primitives).
     """
 
     key: str  # AxolModel value
@@ -185,10 +176,8 @@ class Body:
     # when it stands on it).
     frame_links: tuple[str, ...]
     splits: dict[str, Split]
-    # IK body hulls besides s1 and head: link -> pieces (one hull).
+    # IK body parts besides s1 and head: link -> pieces (a shape each).
     ik_hulls: dict[str, tuple[str, ...]]
-    # IK: flat pieces as strips: piece -> (parent link, strip prefix, count).
-    strips: dict[str, tuple[str, str, int]]
     # Physics: link -> its parts' hulls (each a tuple of pieces).
     sim_hulls: dict[str, tuple[tuple[str, ...], ...]]
     # The lift: its export joints (equal stages, 0 = fully raised, lowering
@@ -206,15 +195,12 @@ class Body:
     # the arms hang.
     floor: bool
     title: str  # what the URDF's header calls the robot
-    note: str  # what IK keeps the arms clear of, for the header
+    # What IK keeps the arms clear of and how it treats the body's joints,
+    # for the header (IK_SHAPES_NOTE follows it).
+    note: str
     # The Jelly base drives in the plane: base_x / base_y / base_yaw joints
     # a simulator can drive.
     planar: bool = False
-    # IK collides shapes fitted to each part (see IK primitives) rather than
-    # meshes pyroki turns into one capsule per link: ik_hulls name the body
-    # links' pieces, flat parts need no strips, and the parallel gripper's
-    # fingers collide on their own links (IK moves them by the live opening).
-    ik_primitives: bool = False
 
 
 _TORSO_MASSES = {"s1": 3.0, "head": 0.3}
@@ -272,7 +258,6 @@ JELLY = Body(
         "jelly": ("column_stub",),
         "deck": ("deck",),
     },
-    strips={},
     sim_hulls={
         "lift_plate": (("lift_plate",),),
         "base": (("column_top",),),
@@ -297,17 +282,12 @@ JELLY = Body(
     note=(
         "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
         "mount (head), the lift column's top plate (lift_plate) and its three "
-        "sections (base, lift_stage, jelly), and the deck (deck): a box or "
-        "capsule fitted to each part, against a capsule fitted to each arm "
-        "part (ik_collision cylinders are capsules: the radius, and the "
-        "straight section's length along the origin's z). IK freezes the "
-        "base and lift at zero, the lift fully raised, and moves the parts "
-        "the lift leaves behind (the deck and the lower column) up to the "
-        "arms by the live lift height; it freezes the fingers closed and "
-        "moves them by the live gripper opening."
+        "sections (base, lift_stage, jelly), and the deck (deck). It freezes "
+        "the base and lift at zero, the lift fully raised, and moves the "
+        "parts the lift leaves behind (the deck and the lower column) up to "
+        "the arms by the live lift height."
     ),
     planar=True,
-    ik_primitives=True,
 )
 
 # Axol on its own: the shoulder bar and head, nothing below them.
@@ -320,7 +300,6 @@ STANDALONE = Body(
     frame_links=(),
     splits={},
     ik_hulls={},
-    strips={},
     sim_hulls={},
     lift_joints=(),
     lift_links=(),
@@ -338,15 +317,14 @@ OWL = Body(
     key="owl",
     marker="owl_base",
     anchors={"owl_base": "base"},
-    extra_links={},
+    # The foot plate is its own link, so the upper-arm hard stop can leave it
+    # out (see almond_axol.constants.upper_arm_guard_links).
+    extra_links={"foot": "base"},
     moving={},
     frame_links=(),
     # The foot plate (255 x 275 mm, 22 mm thick) at the bottom of the column.
     splits={"Owl_Base.stl": ((-_INF, -_INF, -0.37), (_INF,) * 3, "base", "foot")},
-    ik_hulls={"base": ("base",)},
-    # Six strips: the capsule round each is ~24 mm for the 22 mm plate (three
-    # would be 44 mm, and swallow the upper arms at the rest pose).
-    strips={"foot": ("base", "foot", 6)},
+    ik_hulls={"base": ("base",), "foot": ("foot",)},
     sim_hulls={"base": (("base",), ("foot",))},
     lift_joints=(),
     lift_links=(),
@@ -355,8 +333,7 @@ OWL = Body(
     title="Axol on the Owl mount",
     note=(
         "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
-        "mount (head), the mount's column (base) and its foot plate "
-        "(foot_0..5)."
+        "mount (head), the mount's column (base) and its foot plate (foot)."
     ),
 )
 
@@ -390,13 +367,12 @@ OX_CART = Body(
             "cart_frame",
         ),
     },
-    # IK freezes the lift fully raised: one hull over the column and the
-    # stub it rides on (in the torso's frame, valid at that height).
+    # IK freezes the lift fully raised: the column and the stub it rides on
+    # (in the torso's frame, valid at that height).
     ik_hulls={
         "lift_plate": ("lift_plate",),
         "base": ("column_top", "column_stub"),
     },
-    strips={},
     sim_hulls={
         "lift_plate": (("lift_plate",),),
         "base": (("column_top",),),
@@ -431,8 +407,6 @@ PROJECTION_CENTRE_Z = 0.010696
 # "Plastron v2" cover (the 22 x 22 x 1 mm part the export carries too).
 HEAD_PROJECTION_BEHIND_COVER = 0.007205
 
-_CYLINDER_RPY = {0: "0 1.5707963267948966 0", 1: "-1.5707963267948966 0 0", 2: "0 0 0"}
-
 # Frame at the ground under the robot (the export's root).
 FLOOR_LINK = "floor"
 
@@ -460,6 +434,20 @@ MODEL_NOTE = (
     "convention (+z forward, +x right, +y down); an Isaac Sim camera "
     "attached with ROS camera axes needs no extra rotation. Mesh paths are "
     "relative to this file."
+)
+# How IK collides, after each body's note.
+IK_SHAPES_NOTE = (
+    "Each body part is a box or capsule fitted to it, against a capsule "
+    "fitted to each arm part (ik_collision cylinders are capsules: the "
+    "radius, and the straight section's length along the origin's z)."
+)
+FINGER_IK_NOTE = (
+    "IK freezes the finger joints at zero and moves the fingers by the live "
+    "gripper opening."
+)
+PLATE_IK_NOTE = (
+    "IK freezes the plate, so each gripper's collides as one body over its "
+    "whole swing (left_fingers / right_fingers)."
 )
 # Per body: its joints, and what a simulator should know about them.
 BODY_JOINTS_NOTE = {
@@ -537,13 +525,8 @@ class Variant:
 
     @property
     def all_extra_links(self) -> dict[str, str]:
-        # The parallel gripper's fingers collide on their own links where IK
-        # collides fitted shapes (Body.ik_primitives).
-        fingers = (
-            {}
-            if self.body.ik_primitives and self.gripper == "parallel"
-            else FINGER_LINKS
-        )
+        # The parallel gripper's fingers collide on their own links.
+        fingers = {} if self.gripper == "parallel" else FINGER_LINKS
         return {
             **HEAD_LINKS,
             **self.body.extra_links,
@@ -649,6 +632,12 @@ def _mount(body: Body) -> Variant:
         output=URDF_DIR / f"axol_{body.key}.urdf",
         mesh_subdir=f"meshes/{body.key}",
         share_subdir=MESH_SUBDIR,
+        # These exports place the fingers elsewhere in their stroke than
+        # Jelly's.
+        gripper_joints=(
+            "each gripper's fingers (left_finger_1 / right_finger_1, the second "
+            "finger mimics; over the export's range, 0 = the export's pose)"
+        ),
     )
 
 
@@ -927,20 +916,12 @@ class Frames:
         self.jelly_center = tf[:3, 3].copy()
         # The floor link's pose, if the body stands on the floor; set by build().
         self.floor: np.ndarray | None = None
-        # Strip links (see Body.strips) -> the link they are fixed to.
-        self.strip_parent = {
-            f"{prefix}_{i}": parent
-            for parent, prefix, count in variant.body.strips.values()
-            for i in range(count)
-        }
 
     def __call__(self, link: str) -> np.ndarray:
-        if link in self.variant.body.frame_links or link.startswith("deck"):
+        if link in self.variant.body.frame_links or link == "deck":
             frame = np.eye(4)
             frame[:3, 3] = self.jelly_center
             return frame
-        if link in self.strip_parent:
-            return self(self.strip_parent[link])
         moving = self.variant.all_moving
         if link in moving:
             return self.tf @ self.export.get_transform(
@@ -1244,30 +1225,11 @@ def camera_frames(
 Spec = tuple  # ("mesh", path) | ("cylinder", radius, length, xyz, rpy) | ("box", size, xyz, rpy)
 
 
-def _fit_cylinder(pts: np.ndarray, axis: int) -> tuple[float, float, np.ndarray]:
-    """Smallest capsule along link axis ``axis`` enclosing ``pts``.
-
-    Returned as the URDF cylinder pyroki turns into that capsule: its radius,
-    its length (the capsule's straight section) and its centre.
-    """
-    others = [i for i in range(3) if i != axis]
-    centre = (pts.min(axis=0) + pts.max(axis=0)) / 2
-    rho = np.linalg.norm(pts[:, others] - centre[others], axis=1)
-    radius = float(rho.max())
-    # A point beyond the straight section is covered by the hemispherical
-    # cap as long as its axial overhang is within sqrt(r^2 - rho^2).
-    overhang = np.abs(pts[:, axis] - centre[axis]) - np.sqrt(
-        np.maximum(radius**2 - rho**2, 0.0)
-    )
-    half = max(float(overhang.max()), 0.0)
-    return round(radius, 5), round(2 * half, 5), centre
-
-
 # -- IK primitives ----------------------------------------------------------
-# Where Body.ik_primitives is set, IK collides explicit shapes fitted to each
-# part's convex hull instead of a mesh pyroki turns into one capsule per link
-# (its bounding cylinder with a hemisphere added on each end, which overshoots
-# every part by a radius at both ends and swallows flat ones):
+# IK collides explicit shapes fitted to each part's convex hull rather than a
+# mesh pyroki turns into one capsule per link (its bounding cylinder with a
+# hemisphere added on each end, which overshoots every part by a radius at
+# both ends and swallows flat ones):
 # - arm links: capsules (<cylinder>: radius, and the straight section's
 #   length along the origin's z), the axis searched for the smallest one;
 # - body links: boxes (<box>, the hull's smallest oriented box) or capsules,
@@ -1437,70 +1399,35 @@ class Collision:
             )
         return ("mesh", self.written[key])
 
-    def finger_cylinder(self, link: str, fingers: tuple[str, ...]) -> Spec:
-        """One cylinder along the gripper's jaw axis over both fingers, closed
-        and fully open (fingers move along their joint axis, in their frame)."""
-        pts = []
-        for finger in fingers:
-            closed = np.vstack(self.pieces[finger][1])
-            joint = self.export.joint_map[
-                self.frames.variant.moving[finger].export_joint
-            ]
-            # The export's pose is anywhere in the stroke: take both ends.
-            ends = [
-                closed + np.asarray(joint.axis) * float(q)
-                for q in (joint.limit.lower, joint.limit.upper, 0.0)
-            ]
-            rel = self.frames.relative(link, finger)
-            pts += [trimesh.transform_points(p, rel) for p in ends]
-        radius, length, centre = _fit_cylinder(np.vstack(pts), 0)
-        return ("cylinder", radius, length, centre, _CYLINDER_RPY[0])
-
-    def plate_sweep(self, link: str, plate: str, steps: int = 37) -> Spec:
-        """One cylinder over a hinged plate's whole sweep (it turns about its
-        joint axis through its frame's origin), along the link axis that
-        gives the smallest capsule."""
-        rest = np.vstack(self.pieces[plate][1])
+    def plate_sweep(self, link: str, plate: str) -> Spec:
+        """A capsule over a hinged plate's whole sweep, in ``link``'s frame
+        (see :func:`plate_sweep`)."""
         joint = self.export.joint_map[self.frames.variant.moving[plate].export_joint]
         rel = self.frames.relative(link, plate)
-        pts = []
-        for angle in np.linspace(joint.limit.lower, joint.limit.upper, steps):
-            turn = trimesh.transformations.rotation_matrix(angle, joint.axis)
-            pts.append(trimesh.transform_points(rest, rel @ turn))
-        pts = np.vstack(pts)
-        fits = [(_fit_cylinder(pts, axis), axis) for axis in range(3)]
-        (radius, length, centre), axis = min(
-            fits, key=lambda f: f[0][0] ** 2 * (f[0][1] + 4 / 3 * f[0][0])
+        return plate_sweep(
+            np.vstack(self.pieces[plate][1]),
+            lambda angle: rel
+            @ trimesh.transformations.rotation_matrix(angle, joint.axis),
+            (joint.limit.lower, joint.limit.upper),
         )
-        return ("cylinder", radius, length, centre, _CYLINDER_RPY[axis])
 
-    def deck_strips(
-        self,
-        parent: str = "jelly",
-        piece: str = "deck",
-        prefix: str = "deck",
-        count: int = DECK_STRIPS,
-    ) -> dict[str, list[Spec]]:
-        """``piece`` as ``count`` strips, cut front to back (along world x)
-        and each a cylinder across the robot (along world y), in ``parent``'s
-        frame — so the strips mirror left to right like the arms."""
-        # The deck mesh is a box with vertices only at its edges, so strip
-        # its bounding box rather than binning vertices.
-        pts = self.points(parent, (piece,))
-        rot = self.frames(parent)[:3, :3]
-        cut, along = (int(np.argmax(np.abs(rot[k]))) for k in (0, 1))
-        lo, hi = pts.min(axis=0), pts.max(axis=0)
-        edges = np.linspace(lo[cut], hi[cut], count + 1)
-        out = {}
-        for i in range(count):
-            ranges = [(lo[k], hi[k]) for k in range(3)]
-            ranges[cut] = (edges[i], edges[i + 1])
-            corners = np.array(list(itertools.product(*ranges)))
-            radius, length, centre = _fit_cylinder(corners, along)
-            out[f"{prefix}_{i}"] = [
-                ("cylinder", radius, length, centre, _CYLINDER_RPY[along])
-            ]
-        return out
+
+def plate_sweep(
+    rest: np.ndarray,
+    at: Callable[[float], np.ndarray],
+    limits: tuple[float, float],
+    steps: int = 37,
+) -> Spec:
+    """The smallest capsule over a hinged plate's whole sweep: its points
+    ``rest`` (plate frame) placed by ``at(angle)`` over ``limits``. IK
+    freezes the plate, so it collides as this one body."""
+    pts = [
+        trimesh.transform_points(rest, at(angle))
+        for angle in np.linspace(*limits, steps)
+    ]
+    # The steps are 5 degrees apart: a plate edge 0.1 m out sags 0.1 mm
+    # between them, inside the pad.
+    return fit_ik_shape([trimesh.PointCloud(np.vstack(pts)).convex_hull], ("capsule",))
 
 
 def _spec_pose(spec: Spec) -> np.ndarray:
@@ -1535,33 +1462,28 @@ def _mirrored_capsule(
 
 
 def ik_primitive_plan(
-    variant: Variant,
+    body_parts: dict[str, tuple[str, ...]],
+    arm_parts: tuple[str, ...],
     hulls_of: Callable[[str, tuple[str, ...]], list[trimesh.Trimesh]],
     pose_of: Callable[[str], np.ndarray],
 ) -> dict[str, list[Spec]]:
-    """The IK shapes (link -> specs) of a body with ``ik_primitives``: a box
-    or capsule per body part, a capsule per arm part and (parallel gripper)
-    per finger. ``hulls_of(link, pieces)`` gives the pieces' convex hulls in
-    ``link``'s frame, ``pose_of(link)`` the link's pose in the torso frame
-    with every joint at zero. The right arm's capsules are the left's
-    mirrored, so the two sides clear the body alike; a right part the mirror
-    does not enclose (a finger) gets its own fit. The parcel gripper's plate
-    sweep is the caller's."""
-    body = variant.body
+    """The IK shapes (link -> specs): a box or capsule per body piece
+    (``body_parts``: link -> pieces) and a capsule per arm part (``arm_parts``,
+    each a ``left_`` / ``right_`` link pair). ``hulls_of(link, pieces)`` gives
+    the pieces' convex hulls in ``link``'s frame, ``pose_of(link)`` the link's
+    pose in the torso frame with every joint at zero. The right arm's
+    capsules are the left's mirrored, so the two sides clear the body alike;
+    a right part the mirror does not enclose (a finger) gets its own fit."""
     plan: dict[str, list[Spec]] = {}
-    for link, pieces in {
-        "s1": ("s1",),
-        **{h: (h,) for h in HEAD_LINKS},
-        **body.ik_hulls,
-    }.items():
-        plan[link] = [fit_ik_shape(hulls_of(link, pieces), ("box", "capsule"))]
-    arm = [*_ARM_PARTS, *variant.hulls]
-    if variant.gripper == "parallel":
-        arm += [n.split("_", 1)[1] for n in variant.moving if n.startswith("left_")]
-    for part in arm:
+    for link, pieces in body_parts.items():
+        plan[link] = [
+            fit_ik_shape(hulls_of(link, (piece,)), ("box", "capsule"))
+            for piece in pieces
+        ]
+    for part in arm_parts:
         link = f"left_{part}"
         plan[link] = [fit_ik_shape(hulls_of(link, (link,)), ("capsule",))]
-    for part in arm:
+    for part in arm_parts:
         left, right = f"left_{part}", f"right_{part}"
         hulls = hulls_of(right, (right,))
         mirrored = _mirrored_capsule(
@@ -1576,12 +1498,47 @@ def ik_primitive_plan(
     return plan
 
 
+def variant_ik_parts(
+    variant: Variant,
+) -> tuple[dict[str, tuple[str, ...]], tuple[str, ...]]:
+    """A generated model's :func:`ik_primitive_plan` parts: the shoulder bar,
+    head and body's pieces, and the arm parts (with the parallel gripper's
+    fingers, which IK moves by the live opening). The parcel gripper's plate
+    sweep is the caller's."""
+    body_parts = {
+        "s1": ("s1",),
+        **{h: (h,) for h in HEAD_LINKS},
+        **variant.body.ik_hulls,
+    }
+    arm = [*_ARM_PARTS, *variant.hulls]
+    if variant.gripper == "parallel":
+        arm += [n.split("_", 1)[1] for n in variant.moving if n.startswith("left_")]
+    return body_parts, tuple(arm)
+
+
 def collision_plan(kind: str, col: Collision) -> dict[str, list[Spec]]:
-    """The model's collision bodies (link -> specs): ``"ik"`` the
-    capsule-friendly set IK collides (<ik_collision>), ``"sim"`` one hull per
-    part for physics (<collision>)."""
+    """The model's collision bodies (link -> specs): ``"ik"`` the fitted
+    shapes IK collides (<ik_collision>), ``"sim"`` one hull per part for
+    physics (<collision>)."""
     variant = col.frames.variant
     body = variant.body
+    # Each gripper's moving parts (fingers or plate).
+    jaws = {
+        side: tuple(n for n in variant.moving if n.startswith(f"{side}_"))
+        for side in ("left", "right")
+    }
+    if kind == "ik":
+        plan = ik_primitive_plan(
+            *variant_ik_parts(variant),
+            lambda link, pieces: [
+                trimesh.PointCloud(col.points(link, pieces)).convex_hull
+            ],
+            col.frames,
+        )
+        if variant.gripper == "parcel":
+            for side, parts in jaws.items():
+                plan[f"{side}_fingers"] = [col.plate_sweep(f"{side}_gripper", *parts)]
+        return plan
     hulls = (
         *(
             f"{side}_{part}"
@@ -1592,44 +1549,13 @@ def collision_plan(kind: str, col: Collision) -> dict[str, list[Spec]]:
         "s1",
     )
     plan: dict[str, list[Spec]] = {link: [col.hull(link, (link,))] for link in hulls}
-    # Each gripper's moving parts (fingers or plate).
-    jaws = {
-        side: tuple(n for n in variant.moving if n.startswith(f"{side}_"))
-        for side in ("left", "right")
-    }
-    if kind == "ik" and body.ik_primitives:
-        plan = ik_primitive_plan(
-            variant,
-            lambda link, pieces: [
-                trimesh.PointCloud(col.points(link, pieces)).convex_hull
-            ],
-            col.frames,
-        )
-        if variant.gripper == "parcel":
-            for side, parts in jaws.items():
-                plan[f"{side}_fingers"] = [col.plate_sweep(f"{side}_gripper", *parts)]
-        return plan
-    if kind == "ik":
-        for link, pieces in body.ik_hulls.items():
-            plan[link] = [col.hull(link, pieces)]
-        for piece, (parent, prefix, count) in body.strips.items():
-            plan.update(col.deck_strips(parent, piece, prefix, count))
-        # IK freezes the jaws, so each gripper's collide as one body over
-        # their whole motion.
-        for side, parts in jaws.items():
-            plan[f"{side}_fingers"] = [
-                col.plate_sweep(f"{side}_gripper", *parts)
-                if variant.gripper == "parcel"
-                else col.finger_cylinder(f"{side}_gripper", parts)
-            ]
-    else:
-        for link, parts in body.sim_hulls.items():
-            plan[link] = [col.hull(link, pieces) for pieces in parts]
-        for parts in jaws.values():
-            for part in parts:
-                plan[part] = [col.hull(part, (part,))]
-        for wheel in body.moving:
-            plan[wheel] = [col.hull(wheel, (wheel,))]
+    for link, parts in body.sim_hulls.items():
+        plan[link] = [col.hull(link, pieces) for pieces in parts]
+    for parts in jaws.values():
+        for part in parts:
+            plan[part] = [col.hull(part, (part,))]
+    for wheel in body.moving:
+        plan[wheel] = [col.hull(wheel, (wheel,))]
     return plan
 
 
@@ -1842,7 +1768,13 @@ def _header(variant: Variant) -> str:
     model_note = MODEL_NOTE.format(
         body_joints=BODY_JOINTS_NOTE.get(body.key, ""),
         gripper_joints=variant.gripper_joints,
-        ik=body.note,
+        ik=" ".join(
+            (
+                body.note,
+                IK_SHAPES_NOTE,
+                PLATE_IK_NOTE if variant.gripper == "parcel" else FINGER_IK_NOTE,
+            )
+        ),
         wrist_parts=variant.wrist_parts_note,
         sim=SIM_BODY_NOTE.get(body.key, ""),
     )
@@ -1895,9 +1827,6 @@ def write_urdf(
         link(name)
     for name, (parent, pose) in cameras.items():
         _joint(robot, f"{name}_0", "fixed", parent, name, pose)
-    for strip, parent in frames.strip_parent.items():
-        link(strip)
-        _joint(robot, f"{strip}_0", "fixed", parent, strip)
 
     # A body the torso rides on: world -> (planar base ->) the body's base
     # link -> lift stages -> the torso root (the classic tree). At every
@@ -2017,7 +1946,7 @@ def write_urdf(
 
     virtual = {"base_x_link", "base_y_link"} & set(links)
     for name, element in links.items():
-        for tag in ("visual", "collision", "inertial"):
+        for tag in ("visual", "collision", "ik_collision", "inertial"):
             for el in element.findall(tag):
                 element.remove(el)
         if name in inertials:
@@ -2134,27 +2063,45 @@ def build(args: argparse.Namespace, export_dir: Path) -> None:
 # -- refit ----------------------------------------------------------------------
 
 
+def _origin_pose(element: ET.Element | None) -> np.ndarray:
+    """An ``<origin>`` element's pose (identity if absent)."""
+    pose = np.eye(4)
+    if element is not None:
+        pose = trimesh.transformations.euler_matrix(
+            *(float(v) for v in element.get("rpy", "0 0 0").split()), axes="sxyz"
+        )
+        pose[:3, 3] = [float(v) for v in element.get("xyz", "0 0 0").split()]
+    return pose
+
+
+# Links of earlier IK models that the fitted shapes replace: the Jelly deck
+# and Owl foot plate strips (refit_ik also drops the parallel gripper's
+# FINGER_LINKS, which collide on the fingers' own links).
+_LEGACY_IK_LINKS = frozenset(
+    (*(f"deck_{i}" for i in range(3)), *(f"foot_{i}" for i in range(6)))
+)
+
+
 def refit_ik(path: Path) -> None:
-    """Rewrite a generated URDF's IK collision as its body's
+    """Rewrite a generated URDF's IK collision as its
     :func:`ik_primitive_plan`, fitted to the file's own part hulls
     (``<collision>``), without the Onshape export. Everything else in the
-    file is left as it is, except the links the plan adds or drops (the deck
-    strips become one ``deck`` link; the parallel gripper's ``*_fingers``
-    link goes) and the header."""
+    file is left as it is, except the links the plan adds or drops (strips
+    become one link per part; the parallel gripper's ``*_fingers`` link
+    goes) and the header."""
+    if path.resolve() == CLASSIC_URDF:
+        refit_classic_ik()
+        return
     variant = next((v for v in VARIANTS if v.output == path.resolve()), None)
-    if variant is None or not variant.body.ik_primitives:
-        raise SystemExit(f"{path}: not a generated URDF whose body has ik_primitives")
+    if variant is None:
+        raise SystemExit(f"{path}: not a generated URDF")
     text = path.read_text()
     root = ET.fromstring(text[text.index("-->") + 4 :])
-    full = yourdfpy.URDF.load(
-        str(path), build_collision_scene_graph=False, load_meshes=False
-    )
-    full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
 
-    # Every part hull in the file, by the pieces it was built from (see
+    # Every part hull in the file, by the piece it was built from (see
     # Collision.hull: "<link>__<pieces>_collision.stl", or "<link>_collision.stl"
     # for a link's own part).
-    hulls: dict[tuple[str, ...], tuple[str, trimesh.Trimesh]] = {}
+    hulls: dict[str, tuple[str, trimesh.Trimesh]] = {}
     for link in root.findall("link"):
         name = link.get("name")
         for col in link.findall("collision"):
@@ -2162,36 +2109,25 @@ def refit_ik(path: Path) -> None:
             if mesh is None:
                 continue
             stem = Path(mesh.get("filename")).name.removesuffix("_collision.stl")
-            pieces = (
-                tuple(stem.split("__", 1)[1].split("_")) if "__" in stem else (stem,)
-            )
+            piece = stem.split("__", 1)[1] if "__" in stem else stem
             hull = trimesh.load(path.parent / mesh.get("filename"), force="mesh")
-            origin = col.find("origin")
-            pose = np.eye(4)
-            if origin is not None:
-                pose = trimesh.transformations.euler_matrix(
-                    *(float(v) for v in origin.get("rpy", "0 0 0").split()), axes="sxyz"
-                )
-                pose[:3, 3] = [float(v) for v in origin.get("xyz", "0 0 0").split()]
-            hulls[pieces] = (name, hull.apply_transform(pose))
-    by_name = {"_".join(k): v for k, v in hulls.items()}
-
-    def hulls_of(link: str, pieces: tuple[str, ...]) -> list[trimesh.Trimesh]:
-        owner, hull = by_name["_".join(pieces)]
-        to_link = np.linalg.inv(full.get_transform(link)) @ full.get_transform(owner)
-        return [hull.copy().apply_transform(to_link)]
+            hulls[piece] = (
+                name,
+                hull.apply_transform(_origin_pose(col.find("origin"))),
+            )
 
     # The links the plan adds and drops.
-    dropped = {f"deck_{i}" for i in range(DECK_STRIPS)}
+    dropped = set(_LEGACY_IK_LINKS)
     if variant.gripper == "parallel":
         dropped |= set(FINGER_LINKS)
-    added = {n: p for n, p in variant.all_extra_links.items() if n not in full.link_map}
+    names = {ln.get("name") for ln in root.findall("link")}
+    added = {n: p for n, p in variant.all_extra_links.items() if n not in names}
     for el in list(root):
         if el.tag == "link" and el.get("name") in dropped:
             root.remove(el)
         elif el.tag == "joint" and el.find("child").get("link") in dropped:
             root.remove(el)
-    anchor = list(root).index(root.find("link[@name='world']"))
+    anchor = next(i for i, el in enumerate(root) if el.tag == "joint")
     for name, parent in added.items():
         root.insert(anchor, ET.Element("link", name=name))
         joint = ET.Element("joint", name=f"{name}_0", type="fixed")
@@ -2208,11 +2144,40 @@ def refit_ik(path: Path) -> None:
     )
     full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
 
-    plan = ik_primitive_plan(variant, hulls_of, full.get_transform)
-    links = {ln.get("name"): ln for ln in root.findall("link")}
-    for name, link in links.items():
-        if name.endswith("_fingers"):
-            continue  # the parcel plate's sweep needs the export: kept
+    def hulls_of(link: str, pieces: tuple[str, ...]) -> list[trimesh.Trimesh]:
+        out = []
+        for piece in pieces:
+            owner, hull = hulls[piece]
+            to_link = np.linalg.inv(full.get_transform(link)) @ full.get_transform(
+                owner
+            )
+            out.append(hull.copy().apply_transform(to_link))
+        return out
+
+    plan = ik_primitive_plan(*variant_ik_parts(variant), hulls_of, full.get_transform)
+    if variant.gripper == "parcel":
+        for side in ("left", "right"):
+            plate, gripper = f"{side}_plate", f"{side}_gripper"
+            joint = full.joint_map[f"{plate}_joint"]
+
+            def at(angle: float, plate=plate, gripper=gripper, joint=joint):
+                cfg = {n: 0.0 for n in full.actuated_joint_names}
+                cfg[joint.name] = angle
+                full.update_cfg(cfg)
+                return np.linalg.inv(full.get_transform(gripper)) @ full.get_transform(
+                    plate
+                )
+
+            plan[f"{side}_fingers"] = [
+                plate_sweep(
+                    hulls_of(plate, (plate,))[0].vertices,
+                    at,
+                    (float(joint.limit.lower), float(joint.limit.upper)),
+                )
+            ]
+        full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
+    for link in root.findall("link"):
+        name = link.get("name")
         for el in link.findall("ik_collision"):
             link.remove(el)
         for spec in plan.get(name, []):
@@ -2221,6 +2186,59 @@ def refit_ik(path: Path) -> None:
     path.write_text(_header(variant) + ET.tostring(root, encoding="unicode") + "\n")
     report(path.name, plan)
     print(f"refit {path.resolve().relative_to(REPO)}")
+
+
+# The classic model's body links (it has no head-camera mount).
+CLASSIC_BODY = {"base": ("base",), "s1": ("s1",)}
+
+
+def refit_classic_ik() -> None:
+    """Add IK shapes (:func:`ik_primitive_plan`) to the classic ``axol.urdf``,
+    fitted to its collision meshes: the column (base), the shoulder bar (s1)
+    and each arm part, its gripper with the fingers as the export placed
+    them. Only the ``<ik_collision>`` elements change; the rest of the file
+    (the Onshape export this script builds on) stays byte for byte."""
+    text = CLASSIC_URDF.read_text()
+    text = re.sub(r"\n[ \t]*<ik_collision>.*?</ik_collision>", "", text, flags=re.S)
+    urdf = yourdfpy.URDF.load(
+        io.StringIO(text), build_collision_scene_graph=False, load_meshes=False
+    )
+    urdf.update_cfg({n: 0.0 for n in urdf.actuated_joint_names})
+
+    def hulls_of(link: str, pieces: tuple[str, ...]) -> list[trimesh.Trimesh]:
+        out = []
+        for piece in pieces:
+            for col in urdf.link_map[piece].collisions:
+                name = Path(col.geometry.mesh.filename).name
+                mesh = trimesh.load(URDF_DIR / "meshes" / name, force="mesh")
+                pose = np.eye(4) if col.origin is None else np.asarray(col.origin)
+                to_link = np.linalg.inv(urdf.get_transform(link)) @ urdf.get_transform(
+                    piece
+                )
+                out.append(mesh.convex_hull.apply_transform(to_link @ pose))
+        return out
+
+    plan = ik_primitive_plan(CLASSIC_BODY, _ARM_PARTS, hulls_of, urdf.get_transform)
+    for name, specs in plan.items():
+        link = ET.Element("link")
+        for spec in specs:
+            _collision(link, "ik_collision", spec)
+        ET.indent(link, space="    ", level=1)
+        block = "".join(
+            "        " + ET.tostring(el, encoding="unicode").rstrip() + "\n"
+            for el in link
+        )
+        # Before the link's closing tag.
+        match = re.search(
+            rf'<link name="{re.escape(name)}">.*?(\n[ \t]*</link>)', text, flags=re.S
+        )
+        if match is None:
+            raise SystemExit(f"axol.urdf: no link {name}")
+        at = match.start(1) + 1
+        text = text[:at] + block + text[at:]
+    CLASSIC_URDF.write_text(text)
+    report(CLASSIC_URDF.name, plan)
+    print(f"refit {CLASSIC_URDF.relative_to(REPO)}")
 
 
 def main() -> None:
@@ -2254,8 +2272,8 @@ def main() -> None:
         nargs="+",
         default=[],
         metavar="URDF",
-        help="refit these generated URDFs' IK collision from their own part "
-        "hulls instead of building from exports (see refit_ik)",
+        help="refit these URDFs' IK collision from their own part hulls "
+        "instead of building from exports (see refit_ik)",
     )
     args = ap.parse_args()
     if not args.export_dirs and not args.refit_ik:

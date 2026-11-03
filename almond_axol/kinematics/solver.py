@@ -253,10 +253,10 @@ def _self_collision_residual(
     This prevents the collision boundary itself from injecting a joint-
     acceleration impulse while the arm approaches the base.
 
-    The activation/ramp decoupling lets pairs whose conservative capsules
-    already interpenetrate at the home pose use a *negative* activation start
+    The activation/ramp decoupling lets pairs whose fitted shapes already
+    interpenetrate at the home pose use a *negative* activation start
     (activate only when the pose gets closer than home). Pyroki's stock cost
-    bottoms out at zero, which kept the ``base <-> e2`` gradient permanently
+    bottoms out at zero, which would keep such a pair's gradient permanently
     active during ordinary front-of-torso work (see
     :func:`.model.collision_cost_params`). ``link_shift``: see
     :func:`body_collision_distance`.
@@ -297,8 +297,8 @@ def _base_collision_safe_step(
     cross a pair's calibrated floor, remove only the inward component of the
     joint step using the clearance Jacobian; tangential motion survives, so
     the arm can slide/reconfigure around the base rather than freezing. A
-    negative floor is valid for conservative capsules that overlap at the
-    physically safe home pose. Both the proposed step and any clearance
+    negative floor is valid for fitted shapes that overlap, or come within
+    the guard's slack, at the physically safe home pose. Both the proposed step and any clearance
     correction are scaled along their full joint-space direction to stay
     within the per-call delta budget and the robot's joint limits, after
     dropping any component that pushes a joint already on its limit outward.
@@ -894,15 +894,18 @@ class KinematicsSolver:
         )
         # The lift (see set_lift): IK freezes it fully raised; the collision
         # checks move what it leaves behind by its live height. The fingers
-        # (see set_gripper): IK freezes them closed; the checks move them by
-        # the live opening, open until the first call.
+        # (see set_gripper): IK freezes their joints at zero; the checks move
+        # them by the live opening, open until the first call.
         self._lift_shift, self._lift_travel = lift_link_shift(
             self.robot_model, gripper=self.gripper
         )
         self._lift_lowered = 0.0
-        self._finger_axis, self._finger_side, self._finger_travel = finger_slide(
-            self.robot_model, gripper=self.gripper
-        )
+        (
+            self._finger_axis,
+            self._finger_side,
+            self._finger_closed,
+            self._finger_stroke,
+        ) = finger_slide(self.robot_model, gripper=self.gripper)
         self._grip = (1.0, 1.0)
         self._link_shift = self._make_link_shift()
         if self.robot_coll is not None:
@@ -1062,13 +1065,13 @@ class KinematicsSolver:
     def set_gripper(self, left: float, right: float) -> None:
         """Place the fingers for the live gripper opening.
 
-        IK freezes the fingers closed; each slides along its joint axis as
-        the gripper opens. ``left`` / ``right`` are the openings as fractions
+        IK freezes the finger joints at zero; each finger slides along its
+        joint axis to where the opening puts it (:func:`.model.finger_slide`). ``left`` / ``right`` are the openings as fractions
         (0 = closed, 1 = fully open, as teleop commands them). Until the
         first call the grippers are taken as fully open. No effect on a
         gripper without sliding fingers (the parcel gripper).
         """
-        if self._finger_travel <= 0.0:
+        if self._finger_stroke == 0.0:
             return
         grip = tuple(min(max(float(g), 0.0), 1.0) for g in (left, right))
         if max(abs(a - b) for a, b in zip(grip, self._grip)) < 1e-3:
@@ -1105,7 +1108,8 @@ class KinematicsSolver:
             np.asarray(grip, dtype=np.float32)[np.maximum(self._finger_side, 0)],
             0.0,
         )
-        local = self._finger_axis * (opening * self._finger_travel)[:, None]
+        q = self._finger_closed + opening * self._finger_stroke
+        local = self._finger_axis * np.where(self._finger_side >= 0, q, 0.0)[:, None]
         return jnp.asarray(
             np.concatenate([self._lift_shift * lowered, local], axis=1),
             dtype=jnp.float32,

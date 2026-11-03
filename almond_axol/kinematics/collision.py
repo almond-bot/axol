@@ -4,15 +4,10 @@ Every Axol arm is a serial chain on a static body (the shoulder bar, head
 mount, lift column, deck, ...), and the only contacts IK guards against are
 an arm part against a body part (see :mod:`.model`). :class:`ArmBodyCollision`
 holds the shapes of both sides in their link frames and the pairs to check:
-
-- **Fitted primitives** (URDFs whose ``<ik_collision>`` are all ``<box>`` /
-  ``<cylinder>``, written by ``scripts/build_urdfs.py`` where the body has
-  ``ik_primitives``): any number of shapes per link. An ik_collision
-  cylinder is a capsule: its radius, and the straight section's length along
-  the origin's z. Arm parts are capsules; body parts are boxes or capsules.
-- **Legacy meshes** (the other URDFs): pyroki's one capsule per link, fitted
-  to the link's meshes (:meth:`ArmBodyCollision.from_pyroki`), checked
-  exactly as pyroki checks them.
+each URDF's ``<ik_collision>`` boxes and cylinders, fitted to each part by
+``scripts/build_urdfs.py``, any number per link. An ik_collision cylinder is
+a capsule: its radius, and the straight section's length along the origin's
+z. Arm parts are capsules; body parts are boxes or capsules.
 
 Distances are signed (negative: overlap). Capsule-capsule pairs use pyroki's
 distance. Capsule-box pairs use :func:`capsule_box_distance`, which is exact:
@@ -127,10 +122,10 @@ class ArmBodyCollision:
 
     @property
     def solid_links(self) -> frozenset[str]:
-        """Links with any shape (a zero-radius legacy capsule is none)."""
-        radius = np.asarray(self.capsules.radius)
-        caps = {self.link_names[k] for k, r in zip(self.capsule_link, radius) if r > 0}
-        return frozenset(caps | {self.link_names[k] for k in self.box_link})
+        """Links with any shape."""
+        return frozenset(
+            self.link_names[k] for k in (*self.capsule_link, *self.box_link)
+        )
 
     def shapes_at(self, link_poses: jax.Array) -> tuple[Capsule, Box | None]:
         """The shapes placed by ``link_poses`` (``(*batch, num_links, 7)``,
@@ -171,22 +166,6 @@ class ArmBodyCollision:
         return self.distances(robot.forward_kinematics(cfg))
 
     # -- builders ------------------------------------------------------------
-
-    @staticmethod
-    def from_pyroki(
-        rc: pk.collision.RobotCollision,
-    ) -> ArmBodyCollision:
-        """pyroki's one-capsule-per-link model, its active pairs as is."""
-        n = rc.num_links
-        return ArmBodyCollision(
-            link_names=tuple(rc.link_names),
-            capsules=rc.coll,
-            capsule_link=tuple(range(n)),
-            boxes=None,
-            box_link=(),
-            capsule_pairs=tuple(zip(rc.active_idx_i, rc.active_idx_j)),
-            box_pairs=(),
-        )
 
     @staticmethod
     def from_primitives(

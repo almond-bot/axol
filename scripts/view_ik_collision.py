@@ -2,11 +2,10 @@
 Show the IK collision shapes over the robot model in a browser.
 
 The Pyroki IK backend (the default) keeps each arm's shapes off the body's
-(:func:`almond_axol.kinematics.model.shared_robot_collision`): on Axol on
-Jelly, a capsule fitted to each arm part and finger against a box or capsule
-fitted to each body part; on the other versions, pyroki's one capsule per
-link. This viewer draws exactly that model on top of the full visual URDF,
-so you can see where the boundaries sit relative to the real parts:
+(:func:`almond_axol.kinematics.model.shared_robot_collision`): a capsule
+fitted to each arm part and finger against a box or capsule fitted to each
+body part. This viewer draws exactly that model on top of the full visual
+URDF, so you can see where the boundaries sit relative to the real parts:
 
 - body shapes (the links in :func:`almond_axol.constants.torso_links`) in
   blue, arm shapes in green, links IK never checks (the shoulder mounts) in
@@ -139,14 +138,17 @@ def main() -> None:
     robot = shared_robot(model, gripper=gripper)
     rc = shared_robot_collision(model, gripper=gripper)
     lift_shift, travel = lift_link_shift(model, gripper=gripper)
-    finger_axis, finger_side, finger_travel = finger_slide(model, gripper=gripper)
+    finger_axis, finger_side, finger_closed, finger_stroke = finger_slide(
+        model, gripper=gripper
+    )
 
     def link_shift(lowered: float, grip: tuple[float, float]) -> jnp.ndarray:
         # As KinematicsSolver._make_link_shift.
         opening = np.where(
             finger_side >= 0, np.asarray(grip)[np.maximum(finger_side, 0)], 0.0
         )
-        local = finger_axis * (opening * finger_travel)[:, None]
+        q = np.where(finger_side >= 0, finger_closed + opening * finger_stroke, 0.0)
+        local = finger_axis * q[:, None]
         return jnp.asarray(
             np.concatenate([lift_shift * lowered, local], axis=1), dtype=jnp.float32
         )
@@ -262,7 +264,7 @@ def main() -> None:
                 )
                 for side in ("left", "right")
             ]
-            if finger_travel > 0.0
+            if finger_stroke != 0.0
             else []
         )
     sliders: list[viser.GuiInputHandle[float]] = []
@@ -297,8 +299,6 @@ def main() -> None:
     for shape, li in shape_link.items():
         name = names[li]
         kind, k = shape
-        if kind == "c" and cap_size[k, 0] <= 0.0:
-            continue  # a frame-only link's zero capsule (legacy model)
         mesh = shape_mesh(shape)
         shape_handles[shape] = server.scene.add_mesh_simple(
             f"/ik/shapes/{name}_{kind}{k}",
@@ -364,7 +364,7 @@ def main() -> None:
                 cfg[vi] = lowered
             for g, side in zip(grip, ("left", "right")):
                 if name == finger_joints.get(side):
-                    cfg[vi] = g * finger_travel
+                    cfg[vi] = finger_closed + g * finger_stroke
         viser_urdf.update_cfg(cfg)
         viser_urdf.show_visual = show_robot.value
         full_cfg = {n: 0.0 for n in full.actuated_joint_names}
