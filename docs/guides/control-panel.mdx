@@ -66,6 +66,8 @@ The **Devices** page has a card each for the **Host Computer**, **Axol**, **Mant
   Closing the browser tab, or disconnecting from the host, does **not** stop anything. The robot connection and any running operation keep going in `axol serve`. Press **Stop** to end an operation.
 </Warning>
 
+Every browser connected to the same host sees the same running operation. An operation started from another browser or a phone shows up within a couple of seconds, and you can stop it from here.
+
 ### Host Computer
 
 The **Host Computer** is the computer running `axol serve`. Press **Connect** on its card and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
@@ -205,7 +207,7 @@ Recording fps above 60 raises the cameras' capture rate to match. The ZED X supp
 
 ### Cameras
 
-Data collection and policies need ZED cameras on the host. Assign Axol's cameras under **Axol settings → Cameras** (overhead, left arm, right arm). Assign Mantis cameras under **Mantis settings → Cameras** (Head, Left Mantis, Right Mantis). The two layouts are saved separately.
+Data collection and policies need ZED cameras on the host. Assign Axol's cameras under **Axol settings → Cameras** (overhead, left arm, right arm). Assign Mantis cameras under **Mantis settings → Cameras** (Head, Left Mantis, Right Mantis). The two layouts are saved separately. Camera assignments are saved on the host, so each robot keeps its own. A host with no cameras assigned shows none until you assign them.
 
 Each panel lists the cameras plugged into the host, with serial number, type (stereo ZED X or mono ZED X One), model and a preview frame. Use the preview to tell which camera is which.
 
