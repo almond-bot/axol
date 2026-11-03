@@ -809,7 +809,7 @@ _COLLISION_DISTANCE = jax.jit(body_collision_distance)
 # How far outside a pair's soft-cost activation the proximity cue starts
 # (see KinematicsSolver.collision_proximity). Capped per pair at its home
 # clearance, so a pose as clear as home never reads as near.
-_PROXIMITY_LEAD = 0.03
+_PROXIMITY_LEAD = 0.02
 # Narrowest distance (m) over which a pair's proximity cue rises from 0 to 1
 # (see KinematicsSolver.set_proximity_reference).
 _PROXIMITY_SPAN_MIN = 0.01

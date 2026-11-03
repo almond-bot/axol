@@ -28,7 +28,7 @@ Pose = tuple[np.ndarray, np.ndarray]
 # How far outside the QP's minimum distance the proximity cue starts (m),
 # matching the JAX solver's lead, and the narrowest distance over which it
 # rises from 0 to 1.
-_PROXIMITY_LEAD = 0.03
+_PROXIMITY_LEAD = 0.02
 _PROXIMITY_SPAN_MIN = 0.01
 
 
