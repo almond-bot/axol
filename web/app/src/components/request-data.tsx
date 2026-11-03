@@ -18,6 +18,7 @@ import {
   type ExampleKind,
 } from "@/lib/data-collection"
 import { startDataCollectionCheckout, useDataCollectionPrice } from "@/lib/data-collection-api"
+import { checkoutProperties, track } from "@/lib/analytics"
 import { cn } from "@/lib/utils"
 
 /** The current page without a `data_collection` result, for Stripe to
@@ -187,7 +188,9 @@ function RequestForm({
     setError(null)
     setSubmitting(true)
     try {
-      window.location.assign(await startDataCollectionCheckout(checked.value))
+      const url = await startDataCollectionCheckout(checked.value)
+      track("checkout_started", checkoutProperties(checked.value, price))
+      window.location.assign(url)
     } catch (err) {
       setError(String(err).replace(/^Error:\s*/, ""))
       setSubmitting(false)

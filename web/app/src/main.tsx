@@ -8,6 +8,7 @@ import "@fontsource-variable/inter/index.css"
 import "@fontsource-variable/geist/index.css"
 import "./index.css"
 import { isHeadsetBrowser } from "./lib/headset"
+import { initAnalytics } from "./lib/analytics"
 import { ToastProvider } from "./components/ui/toast"
 
 // Lazy-loaded so the control panel route doesn't pull in the heavy
@@ -30,6 +31,9 @@ function RouteFallback() {
     </div>
   )
 }
+
+// Off without VITE_POSTHOG_KEY, and in dev builds.
+initAnalytics()
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

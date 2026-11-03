@@ -25,7 +25,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "json-summary"],
       include: [
-        "app/src/lib/{camera-spec,headset,supervisor,telemetry,utils,version}.ts",
+        "app/src/lib/{analytics,camera-spec,headset,supervisor,telemetry,utils,version}.ts",
         "packages/axol-vr-client/src/serverUrl.ts",
       ],
       thresholds: {

@@ -148,6 +148,7 @@ import { loadHostHistory, recordHost } from "@/lib/host-history"
 import { AppShell, type HostSummary, type NavBadges } from "@/components/app-shell"
 import { jellyDeviceView, type StatusDot } from "@/lib/jelly-view"
 import { useToast } from "@/components/ui/toast"
+import { forgetRobot, identifyRobot, track, versionMismatchProperties } from "@/lib/analytics"
 import { Button } from "@/components/ui/button"
 import type { SimRobot } from "@/components/sim-robot-picker"
 
@@ -214,8 +215,10 @@ export default function ControlPanel() {
     handledCheckoutRef.current = location.search
     if (outcome === "paid") {
       toast.success("Payment received. Almond will email you to schedule the work.", 12000)
+      track("checkout_returned", { outcome })
     } else if (outcome === "cancelled") {
       toast.info("Request cancelled. You weren't charged.")
+      track("checkout_returned", { outcome })
     }
     params.delete("data_collection")
     const search = params.toString()
@@ -521,6 +524,7 @@ export default function ControlPanel() {
         if (generation !== connectionGenerationRef.current) return
         setCommands([])
         setConn({ state: "err", message: String(e) })
+        track("host_connect_failed", { error: String(e) })
         return
       }
       void refreshCameras(generation)
@@ -530,6 +534,12 @@ export default function ControlPanel() {
           if (generation !== connectionGenerationRef.current) return
           setViewerPort(info.viewerPort)
           setHostInfo(info)
+          identifyRobot(info)
+          track("host_connected", {
+            host_version: info.version ?? null,
+            host_commit: info.commit ?? null,
+            release_install: info.releaseInstall ?? null,
+          })
         })
         .catch(() => {})
       // Force a synchronous remote check on connect/page load so the banner
@@ -833,6 +843,7 @@ export default function ControlPanel() {
     // touching server state. Other control panels on the network may be
     // driving the same host, so never stop a running op from here.
     connectionGenerationRef.current += 1
+    forgetRobot()
     setConnectionGeneration(connectionGenerationRef.current)
     setConn({ state: "idle" })
     setCommands([])
@@ -1157,10 +1168,17 @@ export default function ControlPanel() {
           )
         }
         if (!automatic) manualRobotOverrideRef.current = true
+        track("robot_connected", {
+          device: profile,
+          automatic,
+          motor_count: status.motorCount,
+          reachable_count: status.reachableCount,
+        })
         return true
       } catch (e) {
         if (!autoRobotMountedRef.current || generation !== connectionGenerationRef.current)
           return null
+        track("robot_connect_failed", { device: profile, automatic, error: String(e) })
         if (!automatic) {
           toast.error(deviceErrorText(String(e), profile === "mantis" ? "Mantis" : "Axol"))
         }
@@ -1189,6 +1207,7 @@ export default function ControlPanel() {
         throw new Error(status.error ?? "Could not disconnect the robot.")
       }
       manualRobotOverrideRef.current = true
+      track("robot_disconnected", {})
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
@@ -1300,6 +1319,30 @@ export default function ControlPanel() {
   const runningLabel = commandLabel(runningOp)
   const selectedLive = isLive && runningOp === opId
   const selectedStopping = isStopping && runningOp === opId
+
+  // One `operation_ended` per run this page saw live, so a session that
+  // finished before the page loaded is not reported again.
+  const liveSessionRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!effectiveStatus) return
+    if (isLive) {
+      liveSessionRef.current = effectiveStatus.id
+      return
+    }
+    const ended = effectiveStatus.status === "exited" || effectiveStatus.status === "error"
+    if (!ended || liveSessionRef.current !== effectiveStatus.id) return
+    liveSessionRef.current = null
+    track("operation_ended", {
+      operation: effectiveStatus.command,
+      status: effectiveStatus.status,
+      exit_code: effectiveStatus.exitCode,
+      duration_s: effectiveStatus.startedAt
+        ? Math.max(0, Math.round(Date.now() / 1000 - effectiveStatus.startedAt))
+        : null,
+      error: effectiveStatus.error,
+      sim: Boolean(effectiveStatus.args?.sim),
+    })
+  }, [isLive, effectiveStatus])
 
   // Whether the host is currently unsafe to restart / power off / update.
   // `isLive` is the immediate local operation signal and the shared session
@@ -1935,10 +1978,16 @@ export default function ControlPanel() {
       const result = await startOperation(opId, args, camSpec)
       if (generation !== connectionGenerationRef.current) return
       setSession(result)
+      track("operation_started", {
+        operation: opId,
+        sim: isSimSelected,
+        device: mantisSelected ? "mantis" : "axol",
+      })
       // Fresh run — clear any stale phase; the live poll repopulates it.
       setPolicy(null)
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
+      track("operation_start_failed", { operation: opId, error: String(e) })
       toast.error(String(e))
     } finally {
       if (generation === connectionGenerationRef.current) {
@@ -2011,6 +2060,10 @@ export default function ControlPanel() {
     try {
       await startUpdate()
       if (generation !== connectionGenerationRef.current) return
+      track("update_started", {
+        from_version: hostInfo?.version ?? null,
+        to_version: update.remoteVersion,
+      })
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
       toast.error(`Could not start the update: ${e}`)
@@ -2044,6 +2097,9 @@ export default function ControlPanel() {
     () => (conn.state === "ok" ? versionMismatch(hostInfo) : null),
     [conn.state, hostInfo]
   )
+  useEffect(() => {
+    if (mismatch) track("version_mismatch_shown", versionMismatchProperties(mismatch))
+  }, [mismatch])
 
   // An unknown /control/... path lands on the overview instead of a blank page.
   if (view === null) return <Navigate to="/control" replace />

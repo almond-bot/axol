@@ -298,6 +298,27 @@ When the server has video sources registered (`VRServer.set_video_sources`, see 
 
 The **control panel** joins the same `/ws` as one more **view-only** WebRTC client (`app/src/components/camera-feeds.tsx`, via `useAxolVideo`) to mirror these feeds in the panel — a headset-off operator view for headset-driven operations, with an optional fullscreen layout. There's no extra backend video path; the relay's encoders are shared. A side-by-side track is displayed cropped to its left eye, and a repeatedly-failing connection offers the same certificate-authorize flow the VR app uses.
 
+## Analytics (`app/src/lib/analytics.ts`)
+
+The control panel reports to PostHog, in the same project as almond.bot: pageviews on every route change, a short list of explicit events, uncaught exceptions, and session replay with every input masked (camera canvases are never recorded). The browser stays anonymous; the robot it drives is a PostHog **group** (`robot`, keyed by the serve host's hostname, with its version). Autocapture is off.
+
+| Event                                                              | When                                                                           |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| `host_connected` / `host_connect_failed`                           | The panel reached, or could not reach, a serve host.                           |
+| `robot_connected` / `robot_connect_failed` / `robot_disconnected`  | The Axol or Mantis link, with the motor counts.                                |
+| `operation_started` / `operation_start_failed` / `operation_ended` | A run, with the operation, sim flag, exit status and duration.                 |
+| `checkout_started` / `checkout_returned`                           | Request data and Request teleoperator, shaped like the site's checkout events. |
+| `version_mismatch_shown`, `update_started`                         | The UI/backend mismatch banner and the self-update.                            |
+
+It is **off** without a key and in dev builds, so sim sessions and local checkouts send nothing. Set these at build time (Vercel environment variables for the hosted panel; a robot that builds its own bundle sends nothing unless they are set there too):
+
+| Variable            | Value                                                              |
+| ------------------- | ------------------------------------------------------------------ |
+| `VITE_POSTHOG_KEY`  | The PostHog project API key (`phc_…`), the same one the site uses. |
+| `VITE_POSTHOG_HOST` | Optional ingest host. Defaults to `https://us.i.posthog.com`.      |
+
+Session replay also has to be switched on in the PostHog project settings; the key alone only sends events.
+
 ## Teleop Data Collection checkout (`api/`)
 
 The **Request teleoperator** page (`/control/request-teleoperator`, with a card leading to it on the Overview and Teleoperation pages) and the **Request data** page (`/control/request-data`, with a card on the Collect data page) pay through Stripe Checkout. The Stripe key never reaches a robot: the panel calls Vercel functions in `api/`, deployed with axol.almond.bot, from any origin (including `axol serve` on a robot).
