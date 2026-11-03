@@ -310,7 +310,7 @@ The control panel reports to PostHog, in the same project as almond.bot: pagevie
 | `checkout_started` / `checkout_returned`                           | Request data and Request teleoperator, shaped like the site's checkout events. |
 | `version_mismatch_shown`, `update_started`                         | The UI/backend mismatch banner and the self-update.                            |
 
-It is **off** without a key and in dev builds, so sim sessions and local checkouts send nothing. Set these at build time (Vercel environment variables for the hosted panel; a robot that builds its own bundle sends nothing unless they are set there too):
+It is **off** without a key and in dev builds, so sim sessions and local checkouts send nothing, and the SDK is a separate chunk that is only fetched when a key is set, so an offline robot or a headset never downloads it. Set these at build time (Vercel environment variables for the hosted panel; a robot that builds its own bundle sends nothing unless they are set there too):
 
 | Variable            | Value                                                              |
 | ------------------- | ------------------------------------------------------------------ |

@@ -63,7 +63,7 @@ describe("analyticsConfig", () => {
 describe("initAnalytics", () => {
   it("does nothing without a key, and every call stays a no-op", async () => {
     const a = await load()
-    expect(a.initAnalytics({})).toBe(false)
+    expect(await a.initAnalytics({})).toBe(false)
     expect(a.analyticsEnabled()).toBe(false)
     a.track("robot_disconnected", {})
     a.identifyRobot(info)
@@ -76,7 +76,7 @@ describe("initAnalytics", () => {
 
   it("starts PostHog with explicit events only and masked replay", async () => {
     const a = await load()
-    expect(a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })).toBe(true)
+    expect(await a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })).toBe(true)
     expect(a.analyticsEnabled()).toBe(true)
     expect(init).toHaveBeenCalledWith(
       "phc_x",
@@ -95,9 +95,25 @@ describe("initAnalytics", () => {
       throw new Error("blocked")
     })
     const a = await load()
-    expect(a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })).toBe(false)
+    expect(await a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })).toBe(false)
+    expect(a.analyticsEnabled()).toBe(false)
     a.track("robot_disconnected", {})
     expect(capture).not.toHaveBeenCalled()
+  })
+
+  it("starts once, and queues calls made while the SDK loads", async () => {
+    const a = await load()
+    const first = a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })
+    expect(a.analyticsEnabled()).toBe(true)
+    a.identifyRobot(info)
+    a.track("robot_disconnected", {})
+    expect(capture).not.toHaveBeenCalled()
+    expect(a.initAnalytics({ VITE_POSTHOG_KEY: "phc_y" })).toBe(first)
+    expect(await first).toBe(true)
+    expect(init).toHaveBeenCalledTimes(1)
+    expect(group).toHaveBeenCalledWith("robot", "axol-7", expect.anything())
+    expect(capture).toHaveBeenCalledWith("robot_disconnected", {})
+    expect(group.mock.invocationCallOrder[0]).toBeLessThan(capture.mock.invocationCallOrder[0])
   })
 })
 
@@ -105,7 +121,7 @@ describe("with analytics on", () => {
   let a: Analytics
   beforeEach(async () => {
     a = await load()
-    a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })
+    await a.initAnalytics({ VITE_POSTHOG_KEY: "phc_x" })
   })
 
   it("sends events with their properties", () => {

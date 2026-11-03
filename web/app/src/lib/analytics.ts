@@ -1,4 +1,4 @@
-import posthog from "posthog-js"
+import type { PostHog } from "posthog-js"
 import type { ServerInfo, SessionStatus } from "@/lib/supervisor"
 import type {
   CollectionMethod,
@@ -19,8 +19,10 @@ import type { VersionMismatch } from "@/lib/version"
  * every input, and camera canvases are never recorded.
  *
  * Nothing here runs without `VITE_POSTHOG_KEY` at build time, or in a dev
- * build, so sim sessions and local checkouts send nothing. Every call is a
- * no-op when analytics are off, so callers never guard.
+ * build, so sim sessions and local checkouts send nothing. The SDK is a
+ * separate chunk, fetched only when analytics are on, so an offline robot or a
+ * headset never downloads it. Every call is a no-op when analytics are off, so
+ * callers never guard; calls made while the SDK is still loading are queued.
  */
 
 export const DEFAULT_ANALYTICS_HOST = "https://us.i.posthog.com"
@@ -41,32 +43,56 @@ export function analyticsConfig(
   return { key, host: env.VITE_POSTHOG_HOST?.trim() || DEFAULT_ANALYTICS_HOST }
 }
 
-let enabled = false
+let client: PostHog | null = null
+let starting: Promise<boolean> | null = null
+/** Calls made before the SDK finished loading, run in order once it has. */
+const pending: ((posthog: PostHog) => void)[] = []
 
-/** Starts PostHog once, at app boot. Returns whether analytics are on. */
-export function initAnalytics(env?: AnalyticsEnv): boolean {
-  const config = analyticsConfig(env)
-  if (!config) return false
+function run(posthog: PostHog, call: (posthog: PostHog) => void): void {
   try {
-    posthog.init(config.key, {
-      api_host: config.host,
-      // The panel is a single-page app: count every route change as a view.
-      capture_pageview: "history_change",
-      capture_pageleave: true,
-      autocapture: false,
-      capture_exceptions: true,
-      person_profiles: "identified_only",
-      session_recording: { maskAllInputs: true },
-    })
-    enabled = true
+    call(posthog)
   } catch {
-    enabled = false
+    // Analytics never break the panel.
   }
-  return enabled
 }
 
+function withClient(call: (posthog: PostHog) => void): void {
+  if (client) run(client, call)
+  else if (starting) pending.push(call)
+}
+
+/** Starts PostHog once, at app boot. Resolves to whether analytics are on. */
+export function initAnalytics(env?: AnalyticsEnv): Promise<boolean> {
+  if (starting) return starting
+  const config = analyticsConfig(env)
+  if (!config) return Promise.resolve(false)
+  starting = import("posthog-js")
+    .then(({ default: posthog }) => {
+      posthog.init(config.key, {
+        api_host: config.host,
+        // The panel is a single-page app: count every route change as a view.
+        capture_pageview: "history_change",
+        capture_pageleave: true,
+        autocapture: false,
+        capture_exceptions: true,
+        person_profiles: "identified_only",
+        session_recording: { maskAllInputs: true },
+      })
+      client = posthog
+      for (const call of pending.splice(0)) run(posthog, call)
+      return true
+    })
+    .catch(() => {
+      starting = null
+      pending.length = 0
+      return false
+    })
+  return starting
+}
+
+/** Whether analytics are on, or still starting. */
 export function analyticsEnabled(): boolean {
-  return enabled
+  return client != null || starting != null
 }
 
 /** Every event the panel sends, with its properties. */
@@ -113,37 +139,24 @@ export function track<E extends keyof AnalyticsEvents>(
   event: E,
   properties: AnalyticsEvents[E]
 ): void {
-  if (!enabled) return
-  try {
-    posthog.capture(event, properties)
-  } catch {
-    // Analytics never break the panel.
-  }
+  withClient((posthog) => posthog.capture(event, properties))
 }
 
 /** Files this browser's events under the robot it is driving. */
 export function identifyRobot(info: ServerInfo): void {
-  if (!enabled) return
-  try {
+  withClient((posthog) =>
     posthog.group("robot", info.hostname, {
       name: info.hostname,
       version: info.version ?? null,
       commit: info.commit ?? null,
       release_install: info.releaseInstall ?? null,
     })
-  } catch {
-    // Analytics never break the panel.
-  }
+  )
 }
 
 /** Drops the robot group, when the panel moves to another host. */
 export function forgetRobot(): void {
-  if (!enabled) return
-  try {
-    posthog.resetGroups()
-  } catch {
-    // Analytics never break the panel.
-  }
+  withClient((posthog) => posthog.resetGroups())
 }
 
 export interface CheckoutProperties {

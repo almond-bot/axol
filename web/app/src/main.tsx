@@ -32,8 +32,9 @@ function RouteFallback() {
   )
 }
 
-// Off without VITE_POSTHOG_KEY, and in dev builds.
-initAnalytics()
+// Off without VITE_POSTHOG_KEY, and in dev builds; otherwise loads the SDK
+// as its own chunk while the app renders.
+void initAnalytics()
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
