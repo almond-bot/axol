@@ -183,6 +183,9 @@ function parseControlPath(pathname: string): { view: ControlView | null; rest: s
 
 const SIM_ROBOT_KEY = "axolSimRobot"
 
+/** How long to wait before asking a host that failed to send its settings again. */
+const SETTINGS_RETRY_MS = 3000
+
 /** The sim robot this browser last picked, if it is still a valid one. */
 function loadSimRobot(): SimRobot | null {
   try {
@@ -313,8 +316,8 @@ export default function ControlPanel() {
   // The host the camera spec belongs to, for this browser's per-host copy.
   const cameraHostRef = useRef(serverHost)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
-  // until fetched. settingsError marks a host too old for the settings API —
-  // cameras then fall back to the legacy localStorage flow.
+  // until fetched. settingsError marks a host too old for the settings API
+  // (it answers 404); cameras then fall back to the legacy localStorage flow.
   const [settingsSnap, setSettingsSnap] = useState<SettingsSnapshot | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
   // The system-wide device selection (Axol or Mantis) that every operation
@@ -410,29 +413,54 @@ export default function ControlPanel() {
   // Pull the shared settings from the serve host. Its camera spec is used as
   // is: a host with none stored gets no cameras. This browser's spec is never
   // written to a host on connect, since it may belong to another robot.
-  const loadSettings = useCallback(async (generation = connectionGenerationRef.current) => {
-    if (generation !== connectionGenerationRef.current) return
-    const host = cameraHostRef.current
-    try {
-      const snap = await fetchSettings()
-      if (generation !== connectionGenerationRef.current) return
-      setSettingsError(null)
-      const hostCameras = snap.cameras ?? DEFAULT_CAMERAS
-      setCameras(hostCameras)
-      persistCachedCameras(host, hostCameras)
-      setSettingsSnap(snap)
-    } catch (e) {
-      if (generation !== connectionGenerationRef.current) return
-      // A host that answers 404 predates the settings store: it never held
-      // cameras, so it runs with this browser's copy (the settings dialog
-      // explains the update). Any other failure is a current host that did
-      // not answer, so only its own per-host copy may stand in.
-      const oldHost = e instanceof ApiRequestError && e.status === 404
-      setCameras(loadCachedCameras(host, { legacy: oldHost }))
-      setSettingsSnap(null)
-      setSettingsError(String(e).replace(/^Error:\s*/, ""))
-    }
+  const settingsRetryRef = useRef<number | null>(null)
+  const cancelSettingsRetry = useCallback(() => {
+    if (settingsRetryRef.current !== null) window.clearTimeout(settingsRetryRef.current)
+    settingsRetryRef.current = null
   }, [])
+  useEffect(() => cancelSettingsRetry, [cancelSettingsRetry])
+  const loadSettings = useCallback(
+    async (generation = connectionGenerationRef.current): Promise<void> => {
+      if (generation !== connectionGenerationRef.current) return
+      cancelSettingsRetry()
+      const host = cameraHostRef.current
+      try {
+        const snap = await fetchSettings()
+        if (generation !== connectionGenerationRef.current) return
+        setSettingsError(null)
+        const hostCameras = snap.cameras ?? DEFAULT_CAMERAS
+        setCameras(hostCameras)
+        persistCachedCameras(host, hostCameras)
+        setSettingsSnap(snap)
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
+        // A host that answers 404 predates the settings store: it never held
+        // cameras, so it runs with this browser's copy (the settings dialog
+        // explains the update). Any other failure is a current host that did
+        // not answer, so only its own per-host copy may stand in.
+        const oldHost = e instanceof ApiRequestError && e.status === 404
+        setCameras(loadCachedCameras(host, { legacy: oldHost }))
+        setSettingsSnap(null)
+        if (oldHost) {
+          setSettingsError(String(e).replace(/^Error:\s*/, ""))
+          return
+        }
+        // A current host that did not answer is not treated as an old one:
+        // settings stay loading (and saves stay off) until a retry gets them.
+        setSettingsError(null)
+        settingsRetryRef.current = window.setTimeout(() => {
+          settingsRetryRef.current = null
+          void loadSettingsRef.current(generation)
+        }, SETTINGS_RETRY_MS)
+      }
+    },
+    [cancelSettingsRetry]
+  )
+  // The retry timer calls the latest loadSettings through this ref.
+  const loadSettingsRef = useRef(loadSettings)
+  useEffect(() => {
+    loadSettingsRef.current = loadSettings
+  }, [loadSettings])
 
   const loadServer = useCallback(
     async (host: string) => {
@@ -475,6 +503,7 @@ export default function ControlPanel() {
       setPolicy(null)
       setBusy(false)
       setStartPhase(null)
+      cancelSettingsRetry()
       setCameras(loadCachedCameras(host))
       setCameraDevices(null)
       setCameraDetectError(null)
@@ -536,7 +565,7 @@ export default function ControlPanel() {
         })
         .catch(() => {})
     },
-    [refreshCameras, loadSettings]
+    [refreshCameras, loadSettings, cancelSettingsRetry]
   )
 
   useEffect(() => {
