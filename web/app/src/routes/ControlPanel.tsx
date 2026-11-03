@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils"
 import { DEFAULT_CAMERAS, loadCachedCameras, persistCachedCameras } from "@/lib/camera-cache"
 import { isLiveSession, operationToFollow } from "@/lib/session-follow"
 import {
+  ApiRequestError,
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
   parseAxolModel,
@@ -422,9 +423,12 @@ export default function ControlPanel() {
       setSettingsSnap(snap)
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
-      // Old serve host without /api/settings: it never stored cameras, so it
-      // runs with this browser's copy. The settings dialog explains the update.
-      setCameras(loadCachedCameras(host, { legacy: true }))
+      // A host that answers 404 predates the settings store: it never held
+      // cameras, so it runs with this browser's copy (the settings dialog
+      // explains the update). Any other failure is a current host that did
+      // not answer, so only its own per-host copy may stand in.
+      const oldHost = e instanceof ApiRequestError && e.status === 404
+      setCameras(loadCachedCameras(host, { legacy: oldHost }))
       setSettingsSnap(null)
       setSettingsError(String(e).replace(/^Error:\s*/, ""))
     }
