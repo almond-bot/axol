@@ -92,6 +92,7 @@ Joint velocities and accelerations are set in rad/s and rad/s². The defaults be
 | `hold_to_engage` | `False` | `True` makes each grip a dead-man switch: its arm tracks only while the grip is held. Live setting (**Hold to engage**). |
 | `haptics` | `True` | Vibrates the controller of each engaged arm: ticks near the IK's arm/body collision boundary, and a rumble while the arm pushes on something. See [Haptics](/api/vr#haptics). Live setting (**Haptics**). |
 | `haptic_torque` | `6.0` Nm | Low-passed torque residual (measured minus modeled gravity) at which the rumble starts. It is strongest at 2.5 times this. `0` turns the rumble off. Hardware only. Live setting (**Haptic push**). |
+| `haptic_held_load` | `True` | While a gripper is commanded closed, or box mode is on, fits its arm's torque residual as a held point mass (plus the box squeeze in box mode) and leaves it out of the rumble. The fit uses the gripper mount, so it works with either gripper. Opening the gripper clears it. See `almond_axol.teleop.held_load`. Hardware only. |
 | `reengage` | `"clutch"` | What a grip does when it re-engages an arm: `"clutch"` or `"ramp"`. See [Re-engaging](#re-engaging). Live setting (**Re-engage**). |
 | `reengage_ramp_speed` | `0.15` m/s | Speed of the `"ramp"` blend. A 30 cm gap takes at least 2 s. |
 | `reengage_ramp_min_s` | `0.75` s | Shortest `"ramp"` blend, so a small correction is eased rather than stepped. |

@@ -722,6 +722,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
             ),
             SettingDef(
+                key="teleop.haptic_held_load",
+                label="Ignore held weight",
+                type="boolean",
+                help=(
+                    "Keeps the weight of what a gripper holds, and the squeeze on a "
+                    "box in box mode, from making its controller rumble. Pushing on "
+                    "something still rumbles."
+                ),
+            ),
+            SettingDef(
                 key="teleop.park_to_zero",
                 label="Park to zero on stop",
                 type="boolean",

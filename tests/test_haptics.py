@@ -17,9 +17,11 @@ import numpy as np
 
 from almond_axol.kinematics.config import KinematicsConfig
 from almond_axol.kinematics.solver import KinematicsSolver
+from almond_axol.robot.gravity import GravityCompensator
 from almond_axol.teleop import core as core_module
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
+from almond_axol.teleop.held_load import HeldLoad, load_regressor
 from almond_axol.teleop.live import LiveSettings
 
 
@@ -180,6 +182,150 @@ class LiveSettingTest(unittest.TestCase):
         core._apply_live_requests()
         self.assertFalse(core.config.haptics)
         self.assertEqual(core.config.haptic_torque, 9.0)
+
+
+# An arm reaching forward, elbow bent: a carrying pose.
+_CARRY_Q = np.array([0.4, 0.3, 0.0, 1.2, 0.0, 0.3, 0.0])
+_GRAVITY = GravityCompensator()
+
+
+def _payload_torque(q: np.ndarray, mass: float, com=(0.0, 0.0, -0.12)) -> np.ndarray:
+    """What holding ``mass`` at ``com`` (gripper frame) costs the left arm."""
+    base = _GRAVITY.gravity_arm(q, is_left=True).astype(np.float64)
+    _GRAVITY.set_payload(mass, com, is_left=True)
+    try:
+        return _GRAVITY.gravity_arm(q, is_left=True) - base
+    finally:
+        _GRAVITY.set_payload(0.0, is_left=True)
+
+
+def _tip_force_torque(q: np.ndarray, force) -> np.ndarray:
+    """What a force (N, base frame) on the left gripper mount costs the arm."""
+    _, _, jac = _GRAVITY.mount_jacobian(q, is_left=True)
+    return -(jac[:3].T @ np.asarray(force, dtype=np.float64))
+
+
+class HeldLoadTest(unittest.TestCase):
+    def _regressor(self, q, *, squeeze=False):
+        _, rot, jac = _GRAVITY.mount_jacobian(q, is_left=True)
+        return load_regressor(jac, rot, squeeze=squeeze)
+
+    def test_regressor_matches_the_gravity_model_payload(self) -> None:
+        a = self._regressor(_CARRY_Q)
+        com = np.array([0.02, -0.01, -0.12])
+        np.testing.assert_allclose(
+            a @ np.r_[1.5, 1.5 * com], _payload_torque(_CARRY_Q, 1.5, com), atol=1e-4
+        )
+
+    def test_a_held_weight_is_explained_and_a_push_is_not(self) -> None:
+        held = HeldLoad(squeeze=False)
+        a = self._regressor(_CARRY_Q)
+        weight = _payload_torque(_CARRY_Q, 2.0)
+        for _ in range(50):
+            explained = held.explain(a, weight, tol=3.0, learn=0.1)
+        np.testing.assert_allclose(explained, weight, atol=1e-3)
+        self.assertAlmostEqual(held.mass, 2.0, places=2)
+        # Pushing sideways or up from below: the push stays in the cue and
+        # the held weight is still explained underneath it.
+        for force in ((0.0, 25.0, 0.0), (0.0, 0.0, 40.0)):
+            push = _tip_force_torque(_CARRY_Q, force)
+            explained = held.explain(a, weight + push, tol=3.0, learn=0.1)
+            np.testing.assert_allclose(explained, weight, atol=0.05)
+        self.assertAlmostEqual(held.mass, 2.0, places=2)
+
+    def test_the_weight_follows_the_arm_to_a_new_pose(self) -> None:
+        held = HeldLoad(squeeze=False)
+        held.explain(
+            self._regressor(_CARRY_Q),
+            _payload_torque(_CARRY_Q, 2.0),
+            tol=3.0,
+            learn=1.0,
+        )
+        lowered = _CARRY_Q + np.array([0.6, 0.0, 0.5, -0.8, 0.4, 0.2, 0.3])
+        push = _tip_force_torque(lowered, (0.0, 25.0, 0.0))
+        explained = held.explain(
+            self._regressor(lowered),
+            _payload_torque(lowered, 2.0) + push,
+            tol=3.0,
+            learn=0.0,
+        )
+        np.testing.assert_allclose(explained, _payload_torque(lowered, 2.0), atol=0.05)
+
+    def test_box_squeeze_is_explained_but_not_a_push_along_the_fingers(self) -> None:
+        _, rot, _ = _GRAVITY.mount_jacobian(_CARRY_Q, is_left=True)
+        a = self._regressor(_CARRY_Q, squeeze=True)
+        held = HeldLoad(squeeze=True)
+        squeeze = _tip_force_torque(_CARRY_Q, 12.0 * rot[:, 0])
+        load = squeeze + _payload_torque(_CARRY_Q, 1.0)
+        np.testing.assert_allclose(
+            held.explain(a, load, tol=3.0, learn=1.0), load, atol=1e-3
+        )
+        poke = _tip_force_torque(_CARRY_Q, -30.0 * rot[:, 2])
+        np.testing.assert_allclose(
+            held.explain(a, load + poke, tol=3.0, learn=0.0), load, atol=0.05
+        )
+
+
+class _Arm:
+    def __init__(self, q: np.ndarray) -> None:
+        self.positions = np.r_[q, 0.0]
+
+
+class _HoldingRobot:
+    """A left arm at the carrying pose, holding ``mass`` plus a ``push``."""
+
+    def __init__(self, mass: float, push=(0.0, 0.0, 0.0)) -> None:
+        self.left = _Arm(_CARRY_Q)
+        self.right = _Arm(np.zeros(7))
+        self.residual = _payload_torque(_CARRY_Q, mass) + _tip_force_torque(
+            _CARRY_Q, push
+        )
+
+    def torque_residuals(self):
+        return self.residual, np.zeros(7)
+
+
+class HeldLoadHapticsTest(unittest.TestCase):
+    def _force(self, robot, *, grip: float, **config) -> float:
+        core = _core(haptic_torque=4.0, **config)
+        core.left_enabled = True
+        core.l_grip = grip
+        _feed(core, robot, 1.0)
+        return core.haptic_levels()["left"]["force"]
+
+    def test_a_held_object_does_not_rumble(self) -> None:
+        heavy = _HoldingRobot(mass=2.0)
+        self.assertGreater(self._force(heavy, grip=1.0), 0.0)
+        self.assertEqual(self._force(heavy, grip=0.2), 0.0)
+        self.assertGreater(self._force(heavy, grip=0.2, haptic_held_load=False), 0.0)
+
+    def test_pushing_while_holding_still_rumbles(self) -> None:
+        core = _core(haptic_torque=4.0)
+        core.left_enabled = True
+        core.l_grip = 0.2
+        robot = _HoldingRobot(mass=2.0)
+        _feed(core, robot, 1.0)
+        self.assertEqual(core.haptic_levels()["left"]["force"], 0.0)
+        robot.residual = robot.residual + _tip_force_torque(_CARRY_Q, (0, 30.0, 0))
+        _feed(core, robot, 0.5)
+        self.assertGreater(core.haptic_levels()["left"]["force"], 0.3)
+        self.assertAlmostEqual(core.held_loads["left"].mass, 2.0, places=1)
+        # Opening the gripper forgets the load.
+        core.l_grip = 1.0
+        _feed(core, robot, 0.1)
+        self.assertNotIn("left", core.held_loads)
+
+    def test_box_mode_squeeze_does_not_rumble(self) -> None:
+        _, rot, _ = _GRAVITY.mount_jacobian(_CARRY_Q, is_left=True)
+        robot = _HoldingRobot(mass=1.0, push=15.0 * rot[:, 0])
+        self.assertGreater(self._force(robot, grip=1.0), 0.0)
+        core = _core(haptic_torque=4.0, gripper="parcel", box_mode=True)
+        core.left_enabled = core.right_enabled = True
+        core._box_leader = "left"
+        core.l_grip = 1.0
+        _feed(core, robot, 1.0)
+        self.assertTrue(core.held_loads["left"].squeeze)
+        self.assertEqual(core.haptic_levels()["left"]["force"], 0.0)
 
 
 class SolverProximityTest(unittest.TestCase):

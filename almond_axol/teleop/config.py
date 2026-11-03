@@ -106,6 +106,13 @@ class VRTeleopConfig:
             low-passed over ~80 ms so swings and hard stops don't buzz.
             ``0`` turns the force cue off and keeps the proximity ticks.
             Defaults to ``6.0`` (the return-to-rest contact stop).
+        haptic_held_load: Keep what a gripper holds out of the rumble.
+            ``True`` (default): while a gripper is closed, or box mode
+            clamps a box, its arm's torque residual is fit as a held weight
+            (and box mode's squeeze), so carrying a heavy object or box
+            stays quiet while pushing on something still rumbles. Works
+            with any gripper; opening it forgets the load. See
+            :mod:`almond_axol.teleop.held_load`.
         park_to_zero: Shutdown park. ``True`` (default): when a hardware
             session stops (**Stop** in the control panel, ``Ctrl+C``), the
             arms return to rest and then continue to the all-zero joint
@@ -584,6 +591,7 @@ class VRTeleopConfig:
     hold_to_engage: bool = False
     haptics: bool = True
     haptic_torque: float = 6.0
+    haptic_held_load: bool = True
     park_to_zero: bool = True
     reengage: ReengageMode = "clutch"
     reengage_ramp_speed: float = 0.15

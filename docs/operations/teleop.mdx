@@ -129,11 +129,18 @@ While an arm is engaged, its controller vibrates to tell you what the arm feels.
 | You feel | What it means |
 |---|---|
 | Short ticks that speed up | The arm is getting close to Axol's body or mount. At the fastest ticks, the arm stops following your hand toward the body. |
-| A steady rumble | The arm is pushing on something, such as the table or a held object. The harder it pushes, the stronger the rumble. Real robot only. |
+| A steady rumble | The arm is pushing on something, such as the table or a wall. The harder it pushes, the stronger the rumble. Real robot only. |
 
 A frozen arm's controller stays quiet. Turn haptics off with **Controller haptics** in **Axol settings → Teleop & VR** (`--teleop.haptics false`), or with **Haptics** in the headset's session settings.
 
 The rumble starts when a joint meets 6 Nm of unexpected torque and is strongest at 2.5 times that. If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to keep only the ticks.
+
+The weight of what a gripper holds doesn't make its controller rumble, with either gripper. In box mode, the squeeze on the box doesn't either.
+
+- Axol treats a gripper as holding something while you hold its trigger past halfway, or while box mode is on.
+- It learns the weight as you lift. Opening the gripper or leaving box mode clears it.
+- Pushing the held object down onto a surface, or pressing the box sideways into something, doesn't rumble, because Axol can't tell that push from extra weight or squeeze.
+- To feel the full load instead, turn off **Ignore held weight** (`--teleop.haptic_held_load false`).
 
 ## Safety behavior
 
