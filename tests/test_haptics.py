@@ -47,17 +47,18 @@ class _Robot:
 def _feed(core: VRTeleopCore, robot: object, seconds: float, hz: float = 250.0):
     """Run the control-loop hook for ``seconds`` of simulated time.
 
-    The clock carries on from the previous call on the same core.
+    The clock carries on from the previous call on the same core. The patched
+    clock returns the current simulated time rather than consuming a sequence,
+    so stray calls from other threads can't exhaust it.
     """
     n = int(seconds * hz)
     t0 = getattr(core, "_test_clock", 100.0)
-    times = iter(t0 + np.arange(n) / hz)
-    core._test_clock = t0 + n / hz
-    with patch.object(
-        core_module.time, "perf_counter", side_effect=lambda: next(times)
-    ):
-        for _ in range(n):
+    now = [t0]
+    with patch.object(core_module.time, "perf_counter", side_effect=lambda: now[0]):
+        for i in range(n):
+            now[0] = t0 + i / hz
             core.maybe_broadcast_haptics(robot)
+    core._test_clock = t0 + n / hz
 
 
 class HapticLevelsTest(unittest.TestCase):
