@@ -123,6 +123,7 @@ The server pushes JSON messages to the headset over the same socket.
 | `{"type": "episode", "value": N}` | At each episode start | Shows **Episode N** on the HUD. |
 | `{"type": "tracking", "value": true \| false}` | When tracking engages or disengages | The headset lets you move and resize camera screens only while tracking is off. |
 | `{"type": "joints", "value": {...}}` | About 20 times a second | Arm joint state for the HUD. |
+| `{"type": "haptics", "value": {...}}` | About 30 times a second while a controller vibrates, then once with all zeros | Vibrates the controllers. See [Haptics](#haptics). |
 
 Send any of these with `VRServer.broadcast_text()`. `AxolVRTeleop.send_feedback_state(state)` sends the `state` message for any `VRState`.
 
@@ -149,6 +150,25 @@ The `joints` message has this shape:
   - `width` is the grip width in metres, between the contact faces.
   - `tilt` is the pair's inward tilt in degrees, and `grasp` is `"flush"` or `"straight"`.
 
+### Haptics
+
+`VRTeleopCore.maybe_broadcast_haptics()` sends each controller's vibration levels. Both teleop adapters call it from the control loop.
+
+```json
+{
+  "type": "haptics",
+  "value": {
+    "left": {"near": 0.0, "force": 0.0},
+    "right": {"near": 0.6, "force": 0.0}
+  }
+}
+```
+
+- Each level runs from `0` to `1`, and only an engaged arm has non-zero levels. In box mode the leading controller gets the stronger of the two arms, and the other controller gets zeros.
+- `near` is how close the arm is to the IK's arm/body collision boundary, from the solver's `collision_proximity()`. It is `0` unless `haptic_near` is on. It is `1` where the IK holds the arm off the body instead of following the target. A pose as clear as the rest pose reads `0`.
+- `force` is how far the arm's largest torque residual (measured minus modeled gravity, low-passed over about 80 ms) is past `haptic_torque`. It reaches `1` at 2.5 times `haptic_torque`. It is always `0` in sim.
+- `useAxolHaptics(wsRef)` in `@almond/axol-vr-client` plays them: `near` as ticks that speed up, and `force` as throbs that get stronger and faster with it, up to a steady rumble at `1`. The throbs take over from the ticks. It stops if the messages stop for 300 ms.
+
 The server also serves the robot model under `/urdf/` (`axol.urdf` and `meshes/*.stl`).
 
 ### Live session settings
@@ -173,6 +193,9 @@ Some settings can change during a session from any client: the headset HUD, the 
 | `box_squeeze_torque` | **Squeeze cap** | number, Nm | Hard shoulder torque cap in box mode. Hardware only. |
 | `reengage` | **Re-engage** | `"clutch"` / `"ramp"` | Calls `VRTeleopCore.set_reengage()`. Applies at the next grip press. |
 | `hold_to_engage` | **Hold to engage** | boolean | Grips act as per-arm dead-man switches instead of toggles. |
+| `haptics` | **Haptics** | boolean | Turns the [controller haptics](#haptics) on or off. |
+| `haptic_near` | **Body ticks** | boolean | Adds the ticks near the body (`near`). Off by default. |
+| `haptic_torque` | **Haptic push** | number, Nm | Torque residual at which the rumble starts. Hardware only, so it is hidden in sim. |
 | `gripper_torque` | **Grip force** | number, Nm | Torque limit of both grippers. Hardware only, so it is hidden in sim. |
 | `position_multiplier` | **Reach scale** | number, × | Scale from hand motion to arm motion. |
 | `teleop_max_vel` | **Arm speed** | number, rev/s | Joint velocity cap while tracking. |

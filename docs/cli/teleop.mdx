@@ -54,6 +54,10 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--teleop.reset_gravity_comp_kd FLOAT` | Damping (Nm·s/rad) while the arms hang limp after a contact stop (default: 0.25). Same as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
 | `--teleop.teleop_torque_threshold FLOAT` | Contact limit (Nm) while you drive the arms (default: `0`, off). The control panel suggests `16.0`. |
 | `--teleop.hold_to_engage BOOL` | `true` makes each grip a hold-to-move switch for its arm (default: `false`, toggle). See [Engaging](#engaging). |
+| `--teleop.haptics BOOL` | Vibrate each engaged arm's controller when the arm pushes on something (default: `true`). See [Controller haptics](/operations/teleop#controller-haptics). |
+| `--teleop.haptic_near BOOL` | Also tick the controller as its arm gets close to Axol's body (default: `false`). |
+| `--teleop.haptic_torque FLOAT` | Unexpected joint torque (Nm) at which a controller starts to rumble (default: `6.0`). `0` turns the push vibration off. |
+| `--teleop.haptic_held_load BOOL` | Keep the weight of a held object, and the squeeze in box mode, from making the controller rumble (default: `true`). |
 | `--teleop.park_to_zero BOOL` | On **Stop** or `Ctrl+C`, move the arms from rest on to the all-zero pose before releasing the motors (default: `true`). See [Stopping parks the arms](/operations/teleop). |
 | `--teleop.reengage {clutch,ramp}` | What an arm does when you [re-engage](/guides/vr-interface#re-engaging) it (default: `clutch`). See [Engaging](#engaging). |
 | `--teleop.box_mode BOOL` | Start in [box mode](/guides/vr-interface#box-mode) (default: `false`). Parcel gripper only. See [Box mode settings](#box-mode-settings). |
