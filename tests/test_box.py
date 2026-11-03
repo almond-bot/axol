@@ -1170,6 +1170,8 @@ class _FakeCore:
             "box_elbow_out": 30.0,
             "reengage": "clutch",
             "hold_to_engage": False,
+            "haptics": True,
+            "haptic_near": False,
             "position_multiplier": 1.0,
             "teleop_max_vel": 6.283185307179586,
         }

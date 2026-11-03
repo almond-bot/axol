@@ -28,6 +28,7 @@ import {
   formatSettingValue,
   nextSettingValue,
   useAxolControlChannel,
+  useAxolHaptics,
   useAxolJoints,
   useAxolPoseSocket,
   useAxolSettings,
@@ -836,6 +837,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 }
 
 const hudBg = { backgroundColor: "#000000", backgroundOpacity: 0.5, padding: 0.006 } as object
+
+/** Plays the server's haptics on the controllers (see useAxolHaptics). */
+function ControllerHaptics({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+  useAxolHaptics(wsRef)
+  return null
+}
 
 function XRHud({ children }: { children: ReactNode }) {
   const session = useXR((s) => s.session)
@@ -1955,6 +1962,7 @@ export default function App() {
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
+            <ControllerHaptics wsRef={wsRef} />
             <XRHud>
               <ExitButton />
               <HelpIcon

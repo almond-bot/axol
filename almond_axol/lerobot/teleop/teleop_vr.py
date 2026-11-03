@@ -1226,6 +1226,7 @@ class AxolVRTeleop(Teleoperator):
             q = self._q_out
         if out is not None:
             self._core.maybe_broadcast_joints(out, self.measured_robot)
+            self._core.maybe_broadcast_haptics(self.measured_robot)
         # The core's output layout is fixed at (16,): left arm at [0:8], right
         # at [8:16], grips in slots 7/15. On the gripperless SKU the shorter
         # key lists simply skip the grip slots.

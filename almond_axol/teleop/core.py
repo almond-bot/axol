@@ -46,6 +46,7 @@ import numpy as np
 
 from ..constants import ARM_JOINTS, AxolModel, Joint, urdf_path
 from ..robot.control import ContactWatchdog
+from ..robot.gravity import GravityCompensator
 from ..settings import resolve_gripper, resolve_robot_model
 from .absolute_pose import AbsoluteCalibration
 from .config import VRTeleopConfig
@@ -55,6 +56,7 @@ from .filter import (
     ResetInterpolator,
     TrapezoidalFilter,
 )
+from .held_load import HeldLoad, load_regressor
 from .recorder import make as _recorder_make
 from .tcp import AbsoluteTCPMapping
 
@@ -113,6 +115,26 @@ def measured_arms(robot: object) -> MeasuredArms | None:
 # headset HUD's box-mode readout (pair status). A ~200 B JSON message;
 # negligible next to the pose stream.
 JOINT_BROADCAST_HZ = 20.0
+
+# Haptics push (``{"type": "haptics"}``, see VRTeleopCore.maybe_broadcast_haptics):
+# its rate, the time constant (s) of the low-pass on the torque residuals
+# (a hard stop or a quick swing spikes them for a few ms; contact lasts), the
+# residual (as a multiple of ``config.haptic_torque``) at which the force cue
+# reaches full strength, and the collision-proximity level below which an
+# arm reads as clear (so drifting a few mm closer than rest stays quiet).
+HAPTICS_BROADCAST_HZ = 30.0
+_HAPTIC_TORQUE_TAU_S = 0.08
+_HAPTIC_TORQUE_FULL = 2.5
+_HAPTIC_NEAR_DEADBAND = 0.2
+# Held-load estimate (see HeldLoad): the commanded gripper opening (0 closed,
+# 1 open) below which a gripper counts as holding, the fraction of
+# ``config.haptic_torque`` a held-load fit may leave unexplained on a joint,
+# the time constant (s) of its slow estimate, and the joint speed (rad/s)
+# above which the arm's dynamics would bias that estimate.
+_HELD_GRIP_CLOSED = 0.5
+_HELD_FIT_TOL = 0.5
+_HELD_LEARN_TAU_S = 0.3
+_HELD_SLOW_RAD_S = 1.0
 
 
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
@@ -387,6 +409,21 @@ class VRTeleopCore:
         self.last_tcp_change_ts: float | None = None
         self._last_urdf_broadcast = 0.0
         self._last_joint_broadcast = 0.0
+        # Haptics (see maybe_broadcast_haptics): the worker's latest
+        # per-arm collision proximity, the low-passed torque residuals and
+        # their last sample time, the part of them left once what each
+        # gripper holds is explained away (the push cue), the held-load
+        # estimates with the kinematics they need and each arm's last
+        # measured joint positions, and whether the last push was non-zero.
+        self.collision_near: dict[str, float] | None = None
+        self._torque_lp: dict[str, np.ndarray] = {}
+        self._torque_lp_t: float | None = None
+        self._push: dict[str, np.ndarray] = {}
+        self.held_loads: dict[str, HeldLoad] = {}
+        self._held_kinematics: GravityCompensator | None = None
+        self._held_q: dict[str, np.ndarray] = {}
+        self._last_haptics_broadcast = 0.0
+        self._haptics_playing = False
         self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
         self.right_indices: list[int] = []
@@ -866,7 +903,15 @@ class VRTeleopCore:
     # read live by this class; ``worker`` fields are also forwarded to the IK
     # subprocess (whose config is a pickled copy) as ``("set", key, value)``.
     _LIVE_CORE_FIELDS = frozenset(
-        {"hold_to_engage", "teleop_max_vel", "box_squeeze_torque", "box_lead_hand"}
+        {
+            "hold_to_engage",
+            "teleop_max_vel",
+            "box_squeeze_torque",
+            "box_lead_hand",
+            "haptics",
+            "haptic_near",
+            "haptic_torque",
+        }
     )
     _LIVE_WORKER_FIELDS = frozenset(
         {
@@ -1591,9 +1636,12 @@ class VRTeleopCore:
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
 
-        The worker answers a frame with ``(q, status)`` where ``status`` is
-        ``None`` or a small dict it refreshes a few times a second (see
-        :meth:`IKWorker.pair_status`); a bare array is accepted too. The
+        The worker answers a frame with ``(q, status, near)`` where
+        ``status`` is ``None`` or a small dict it refreshes a few times a
+        second (see :meth:`IKWorker.pair_status`) and ``near`` the per-arm
+        collision proximity, published on :attr:`collision_near` for the
+        haptics (see :meth:`IKWorker.collision_proximity`); a bare array or
+        a ``(q, status)`` pair is accepted too. The
         status is published on :attr:`pair_status` for the adapter's
         headset feedback (the "arms aligned" cue). The ``grasp`` and
         ``elbow`` it reports (the box-mode grasp and elbows-out angle in
@@ -1602,7 +1650,10 @@ class VRTeleopCore:
         what the arms are doing.
         """
         if isinstance(result, tuple):
-            q, status = result
+            q, status = result[:2]
+            near = result[2] if len(result) > 2 else None
+            if near is not None:
+                self.collision_near = near
             if status is not None:
                 self.pair_status = status
                 if isinstance(status, dict):
@@ -2620,6 +2671,171 @@ class VRTeleopCore:
                     "pair": self.pair_status,
                 },
             }
+        )
+
+    def maybe_broadcast_haptics(self, robot: object) -> None:
+        """Push each controller's haptic levels to the headset, throttled.
+
+        Call from the control loop next to :meth:`maybe_broadcast_joints`.
+        Every call feeds the torque-residual low-pass (hardware only: a
+        ``robot`` with ``torque_residuals()``); pushes go out at
+        :data:`HAPTICS_BROADCAST_HZ` while any level is non-zero, plus one
+        all-zero push when they stop. See :meth:`haptic_levels` for the
+        message.
+        """
+        now = time.perf_counter()
+        self._update_torque_lp(robot, now)
+        if not self.teleop_enabled:
+            # The worker stops reporting proximity once both arms let go;
+            # don't replay the last reading at the next engage.
+            self.collision_near = None
+        if now - self._last_haptics_broadcast < 1.0 / HAPTICS_BROADCAST_HZ:
+            return
+        dt = now - self._last_haptics_broadcast
+        self._last_haptics_broadcast = now
+        self._update_push(robot, dt)
+        if self._broadcast_json is None:
+            return
+        levels = self.haptic_levels()
+        playing = any(v > 0.0 for side in levels.values() for v in side.values())
+        if not playing and not self._haptics_playing:
+            return
+        self._haptics_playing = playing
+        self._broadcast_json({"type": "haptics", "value": levels})
+
+    def haptic_levels(self) -> dict[str, dict[str, float]]:
+        """Haptic levels per controller, ``{"left": {"near", "force"}, "right": ...}``.
+
+        Each level is 0 to 1. ``near`` is how close that arm is to the IK
+        collision boundary (:attr:`collision_near`), ``force`` how far its
+        largest low-passed torque residual (measured minus model gravity,
+        less what its gripper holds: :attr:`held_loads`) is past
+        ``config.haptic_torque``, full at
+        ``_HAPTIC_TORQUE_FULL`` times it. Only an engaged arm plays, and
+        nothing plays with ``config.haptics`` off or during a return to
+        rest, and ``near`` stays 0 with ``config.haptic_near`` off. In
+        box mode both arms follow the leading controller, so it
+        plays the stronger of the two and the other controller is quiet.
+        """
+        levels = {side: {"near": 0.0, "force": 0.0} for side in ("left", "right")}
+        if not self.config.haptics or self.is_resetting:
+            return levels
+        near = self.collision_near or {}
+        start = float(self.config.haptic_torque)
+        for side, engaged in (
+            ("left", self.left_enabled),
+            ("right", self.right_enabled),
+        ):
+            if not engaged:
+                continue
+            raw = float(near.get(side, 0.0)) if self.config.haptic_near else 0.0
+            levels[side]["near"] = round(
+                max(0.0, (raw - _HAPTIC_NEAR_DEADBAND) / (1.0 - _HAPTIC_NEAR_DEADBAND)),
+                3,
+            )
+            push = self._push.get(side)
+            if start > 0.0 and push is not None and push.size:
+                peak = float(np.max(np.abs(push)))
+                force = (peak - start) / (start * (_HAPTIC_TORQUE_FULL - 1.0))
+                levels[side]["force"] = round(min(max(force, 0.0), 1.0), 3)
+        if self.box_mode and self._box_leader in ("left", "right"):
+            leader = self._box_leader
+            other = "right" if leader == "left" else "left"
+            levels[leader] = {
+                key: max(levels[leader][key], levels[other][key])
+                for key in ("near", "force")
+            }
+            levels[other] = {"near": 0.0, "force": 0.0}
+        return levels
+
+    def _update_torque_lp(self, robot: object, now: float) -> None:
+        """Feed one torque-residual sample into the haptics low-pass."""
+        read = getattr(robot, "torque_residuals", None)
+        if not callable(read):
+            return
+        try:
+            residuals = read()
+        except Exception:  # noqa: BLE001 - haptics must never break the loop
+            return
+        dt = 0.0 if self._torque_lp_t is None else now - self._torque_lp_t
+        self._torque_lp_t = now
+        alpha = 1.0 - float(np.exp(-max(dt, 0.0) / _HAPTIC_TORQUE_TAU_S))
+        for side, res in zip(("left", "right"), residuals):
+            if res is None:
+                self._torque_lp.pop(side, None)
+                continue
+            # a4 joints can report NaN torque; they add nothing.
+            sample = np.nan_to_num(
+                np.asarray(res, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            lp = self._torque_lp.get(side)
+            if lp is None or lp.shape != sample.shape:
+                self._torque_lp[side] = sample
+            else:
+                lp += alpha * (sample - lp)
+
+    def _update_push(self, robot: object, dt: float) -> None:
+        """Refresh the push cue: each arm's low-passed residual less its held load.
+
+        Runs at the haptics rate rather than every control tick: the
+        held-load fit costs a few hundred microseconds per arm.
+        """
+        self._push = {
+            side: lp - self._held_torque(robot, side, lp, dt)
+            for side, lp in self._torque_lp.items()
+        }
+
+    def _held_torque(
+        self, robot: object, side: str, residual: np.ndarray, dt: float
+    ) -> np.ndarray:
+        """The part of one arm's low-passed ``residual`` its gripper's load explains.
+
+        A gripper holds something while its command is closed, or while box
+        mode clamps the box between both grippers (which also squeezes it).
+        Opening the gripper, or leaving box mode, drops the estimate (see
+        :class:`~almond_axol.teleop.held_load.HeldLoad`). Zero while nothing
+        is held, with ``config.haptic_held_load`` off, or without measured
+        joint positions to evaluate the load at.
+        """
+        zero = np.zeros_like(residual)
+        grip = self.l_grip if side == "left" else self.r_grip
+        box = self.box_mode and self.teleop_enabled
+        start = float(self.config.haptic_torque)
+        holding = box or float(grip) < _HELD_GRIP_CLOSED
+        if (
+            not holding
+            or not self.config.haptic_held_load
+            or start <= 0.0
+            or residual.shape != (len(ARM_JOINTS),)
+        ):
+            self.held_loads.pop(side, None)
+            self._held_q.pop(side, None)
+            return zero
+        try:
+            q = np.asarray(getattr(robot, side).positions, dtype=np.float64)[:7]
+        except Exception:  # noqa: BLE001 - no arm or no reading yet
+            return zero
+        if q.shape != (len(ARM_JOINTS),) or not np.all(np.isfinite(q)):
+            return zero
+        held = self.held_loads.get(side)
+        if held is None or held.squeeze != box:
+            held = self.held_loads[side] = HeldLoad(squeeze=box)
+        if self._held_kinematics is None:
+            self._held_kinematics = GravityCompensator()
+        _, rot, jac = self._held_kinematics.mount_jacobian(q, is_left=side == "left")
+        last_q = self._held_q.get(side)
+        self._held_q[side] = q
+        slow = (
+            last_q is not None
+            and dt > 0.0
+            and float(np.max(np.abs(q - last_q))) <= _HELD_SLOW_RAD_S * dt
+        )
+        learn = 1.0 - float(np.exp(-dt / _HELD_LEARN_TAU_S)) if slow else 0.0
+        return held.explain(
+            load_regressor(jac, rot, squeeze=box),
+            residual,
+            tol=_HELD_FIT_TOL * start,
+            learn=learn,
         )
 
     def _maybe_broadcast_urdf_state(self) -> None:

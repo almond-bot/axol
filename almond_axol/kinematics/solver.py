@@ -804,6 +804,15 @@ _SOLVE_IK = ExportedJit(
     _solve_ik, "solve_ik", static_argnames=("max_iterations", "use_self_collision")
 )
 _SAFE_STEP = ExportedJit(_base_collision_safe_step, "safe_step")
+_COLLISION_DISTANCE = jax.jit(body_collision_distance)
+
+# How far outside a pair's soft-cost activation the proximity cue starts
+# (see KinematicsSolver.collision_proximity). Capped per pair at its home
+# clearance, so a pose as clear as home never reads as near.
+_PROXIMITY_LEAD = 0.02
+# Narrowest distance (m) over which a pair's proximity cue rises from 0 to 1
+# (see KinematicsSolver.set_proximity_reference).
+_PROXIMITY_SPAN_MIN = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -921,6 +930,36 @@ class KinematicsSolver:
                     clearance_floor[k] = upper_arm_guard_floor(home_distances[k])
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
+        # Proximity cue (see collision_proximity): each pair reads 0 at or
+        # beyond its onset and 1 once the soft cost reaches full slope. The
+        # onset sits _PROXIMITY_LEAD outside the activation start, but never
+        # outside the home clearance — many base pairs activate just 2 mm
+        # inside home, and the arms hanging at home must read as clear (the
+        # teleop rest pose is added by set_proximity_reference).
+        self._proximity_onset = np.zeros(0, dtype=np.float32)
+        self._proximity_full = np.zeros(0, dtype=np.float32)
+        self._proximity_side: dict[str, np.ndarray] = {}
+        if self.robot_coll is not None:
+            self._proximity_onset = np.minimum(
+                starts + _PROXIMITY_LEAD, home_distances
+            ).astype(np.float32)
+            self._proximity_full = (starts - widths).astype(np.float32)
+            pair_links = [
+                (self.robot_coll.link_names[int(i)], self.robot_coll.link_names[int(j)])
+                for i, j in zip(
+                    self.robot_coll.active_idx_i, self.robot_coll.active_idx_j
+                )
+            ]
+            self._proximity_side = {
+                side: np.array(
+                    [
+                        a.startswith(f"{side}_") or b.startswith(f"{side}_")
+                        for a, b in pair_links
+                    ],
+                    dtype=bool,
+                )
+                for side in ("left", "right")
+            }
         # The lift (see set_lift): IK freezes it fully raised; the collision
         # checks move what it leaves behind by its live height.
         self._lift_shift, self._lift_travel = lift_link_shift(
@@ -1449,6 +1488,59 @@ class KinematicsSolver:
         q_out = np.asarray(q_out, dtype=np.float32)
         return self.from_pyroki_order(q_out)
 
+    def set_proximity_reference(self, q: np.ndarray) -> None:
+        """Make ``q`` read as clear in :meth:`collision_proximity`.
+
+        Each pair's onset moves in to its clearance at ``q`` where that is
+        closer, and its full level to at least ``_PROXIMITY_SPAN_MIN`` past
+        the onset. For the teleop rest pose: on a mount whose column or cart
+        top sits near the arms, rest is already inside the lead (or the soft
+        cost), and an operator holding the arms near it must feel nothing.
+        Only ever tightens; a no-op with collision detection off.
+        """
+        if self.robot_coll is None:
+            return
+        d = np.asarray(
+            _COLLISION_DISTANCE(
+                self.robot,
+                self.robot_coll,
+                jnp.asarray(self.to_pyroki_order(q), dtype=jnp.float32),
+                self._link_shift,
+            )
+        )
+        self._proximity_onset = np.minimum(self._proximity_onset, d).astype(np.float32)
+        self._proximity_full = np.minimum(
+            self._proximity_full, self._proximity_onset - _PROXIMITY_SPAN_MIN
+        ).astype(np.float32)
+
+    def collision_proximity(self, q: np.ndarray) -> dict[str, float] | None:
+        """How close each arm is to the arm/base collision boundary at ``q``.
+
+        ``{"left": p, "right": p}`` with ``p`` in ``[0, 1]``: 0 while every
+        pair of that arm is clear of its soft-cost activation by
+        ``_PROXIMITY_LEAD`` (or is at least as clear as at home and at the
+        :meth:`set_proximity_reference` pose), rising to 1
+        where the cost reaches full slope — the region where IK holds the
+        arm off the body instead of following the target. The worst pair of
+        each arm wins. ``None`` when collision detection is off.
+        """
+        if self.robot_coll is None:
+            return None
+        d = np.asarray(
+            _COLLISION_DISTANCE(
+                self.robot,
+                self.robot_coll,
+                jnp.asarray(self.to_pyroki_order(q), dtype=jnp.float32),
+                self._link_shift,
+            )
+        )
+        span = self._proximity_onset - self._proximity_full
+        level = np.clip((self._proximity_onset - d) / span, 0.0, 1.0)
+        return {
+            side: float(level[mask].max()) if mask.any() else 0.0
+            for side, mask in self._proximity_side.items()
+        }
+
     def _elbow_fade(
         self, ee_target: np.ndarray | None, shoulder_pos: np.ndarray
     ) -> float:
@@ -1493,4 +1585,6 @@ class KinematicsSolver:
             # serve the first real pose. Propagate them instead of announcing a
             # false-ready solver and leaving teleop frozen on its seed pose.
             self.ik(**kwargs)
+        # The haptic proximity check runs beside every teleop solve.
+        self.collision_proximity(dummy_q)
         _logger.info("IK solver ready.")

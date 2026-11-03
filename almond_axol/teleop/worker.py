@@ -153,6 +153,11 @@ _CLAMP_LOG_PERIOD_S = 1.0
 _STATUS_EVERY_N = 12
 _ALIGNED_TOL_DEG = 25.0
 
+# Collision proximity for the headset's haptics (see
+# IKWorker.collision_proximity): reported every this many solved frames
+# (~30 Hz at the 120 Hz cadence) while either arm is engaged.
+_PROXIMITY_EVERY_N = 4
+
 # Re-engage ramp (config.reengage == "ramp", see IKWorker.step): the blend from
 # the arm's pose at the grip to the controller-implied target is paced by the
 # configured linear speed and, for the rotational part, by this angular rate.
@@ -514,6 +519,10 @@ class IKWorker:
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
+        # The haptics' collision proximity reads the rest pose as clear.
+        set_reference = getattr(self._solver, "set_proximity_reference", None)
+        if callable(set_reference):
+            set_reference(self.get_rest_q())
 
         # Teleop flight recorder (--teleop.record, arriving here via
         # the pickled config, see .recorder): taps the solve path at every
@@ -1302,6 +1311,20 @@ class IKWorker:
             "trim": round(self.squeeze_trim_deg, 1),
             "trims": [round(v, 1) for v in self.squeeze_trims_deg.values()],
         }
+
+    def collision_proximity(self, q: np.ndarray) -> dict[str, float] | None:
+        """Per-arm closeness to the IK collision boundary at ``q``, 0 to 1.
+
+        See :meth:`~almond_axol.kinematics.solver.KinematicsSolver.collision_proximity`.
+        ``None`` when the solver has no collision model (detection off).
+        """
+        proximity = getattr(self._solver, "collision_proximity", None)
+        if proximity is None:
+            return None
+        levels = proximity(q)
+        if not isinstance(levels, dict):
+            return None
+        return {side: round(float(v), 3) for side, v in levels.items()}
 
     def _box_grasp(self) -> str:
         """The current box-mode grasp, ``"straight"`` or ``"flush"`` (``config.box_grasp``)."""
@@ -2588,9 +2611,11 @@ def run_ik_worker(
 
     Message protocol (after the ``("ready", …)`` handshake):
 
-    - ``VRFrame``                      → ``(q, status)`` (one solve step;
-      ``status`` is :meth:`IKWorker.pair_status` every
-      ``_STATUS_EVERY_N`` frames, else ``None``)
+    - ``VRFrame``                      → ``(q, status, near)`` (one solve
+      step; ``status`` is :meth:`IKWorker.pair_status` every
+      ``_STATUS_EVERY_N`` frames, else ``None``; ``near`` is
+      :meth:`IKWorker.collision_proximity` every ``_PROXIMITY_EVERY_N``
+      frames while an arm is engaged, else ``None``)
     - ``("set", key, value)``          → *(no reply)* — live update of one
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
@@ -2786,12 +2811,19 @@ def run_ik_worker(
                 else:
                     # Relative-mode replies pair the joint solution with the
                     # gripper-pair status (box-mode "aligned" cue), refreshed
-                    # every _STATUS_EVERY_N frames and None in between.
+                    # every _STATUS_EVERY_N frames and None in between, and
+                    # the collision proximity the headset's haptics play.
                     frames += 1
                     status = (
                         worker.pair_status(q) if frames % _STATUS_EVERY_N == 0 else None
                     )
-                    conn.send((q.copy(), status))
+                    near = (
+                        worker.collision_proximity(q)
+                        if (msg.l_lock or msg.r_lock)
+                        and frames % _PROXIMITY_EVERY_N == 0
+                        else None
+                    )
+                    conn.send((q.copy(), status, near))
         except (EOFError, KeyboardInterrupt, OSError):
             # OSError covers ConnectionResetError/BrokenPipeError when the
             # parent end closes abruptly (parent crash, or a shutdown that

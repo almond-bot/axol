@@ -122,6 +122,29 @@ These bindings are for Axol. For the Mantis gestures used in data collection, se
 
 To move an arm only while you hold its grip, turn on **Hold grips to engage** (`--teleop.hold_to_engage`). Each grip then engages the arm on its side, from rest too, and releasing the grip freezes that arm. After a forced disengage, release any grip you were still holding before it engages again.
 
+### Controller haptics
+
+While an arm is engaged, its controller vibrates to tell you what the arm feels.
+
+| You feel | What it means |
+|---|---|
+| Short ticks that speed up | The arm is getting close to Axol's body or mount. At the fastest ticks, the arm stops following your hand toward the body. Off by default. |
+| Throbs that grow stronger and faster | The arm is pushing on something, such as the table or a wall. The harder it pushes, the stronger and closer together the throbs, up to a steady rumble. Real robot only. |
+
+A frozen arm's controller stays quiet.
+
+- Turn on the ticks with **Ticks near the body** in **Axol settings → Teleop & VR** (`--teleop.haptic_near true`), or with **Body ticks** in the headset's session settings.
+- Turn all vibration off with **Controller haptics** (`--teleop.haptics false`), or with **Haptics** in the headset.
+
+The throbs start when a joint meets 6 Nm of unexpected torque. They become a steady, full-strength rumble at 2.5 times that (15 Nm). If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to turn the throbs off.
+
+The weight of what a gripper holds doesn't make its controller rumble, with either gripper. In box mode, the squeeze on the box doesn't either.
+
+- Axol treats a gripper as holding something while you hold its trigger past halfway, or while box mode is on.
+- It learns the weight as you lift. Opening the gripper or leaving box mode clears it.
+- Pushing the held object down onto a surface, or pressing the box sideways into something, doesn't rumble, because Axol can't tell that push from extra weight or squeeze.
+- To feel the full load instead, turn off **Ignore held weight** (`--teleop.haptic_held_load false`).
+
 ## Safety behavior
 
 ### Starting
