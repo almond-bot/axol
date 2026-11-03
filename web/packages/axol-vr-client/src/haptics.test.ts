@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest"
 
 import {
-  RUMBLE_EVERY_MS,
+  THROB_FAST_MS,
+  THROB_SLOW_MS,
   TICK_FAST_MS,
   TICK_SLOW_MS,
   nextHapticPulse,
@@ -45,14 +46,26 @@ describe("nextHapticPulse", () => {
     expect(nextHapticPulse({ near: 1, force: 0 }, close, 1000 + TICK_FAST_MS)).not.toBeNull()
   })
 
-  it("rumbles for force, overlapping pulses, and wins over the ticks", () => {
+  it("throbs harder and faster as the push grows, and wins over the ticks", () => {
+    const light: HapticClock = { nextAt: 0 }
+    const hard: HapticClock = { nextAt: 0 }
+    const a = nextHapticPulse({ near: 1, force: 0.1 }, light, 1000)!
+    const b = nextHapticPulse({ near: 0, force: 0.7 }, hard, 1000)!
+    expect(b.intensity).toBeGreaterThan(a.intensity)
+    expect(hard.nextAt).toBeLessThan(light.nextAt)
+    expect(light.nextAt - 1000).toBeLessThanOrEqual(THROB_SLOW_MS)
+    // Light throbs leave gaps; the ticks' near level doesn't speed them up.
+    expect(light.nextAt - 1000).toBeGreaterThan(a.duration)
+    expect(a.duration).toBeGreaterThan(30)
+  })
+
+  it("merges into a solid rumble at full force", () => {
     const clock: HapticClock = { nextAt: 0 }
-    const first = nextHapticPulse({ near: 1, force: 0.5 }, clock, 1000)!
-    expect(first.duration).toBeGreaterThan(RUMBLE_EVERY_MS)
-    expect(nextHapticPulse({ near: 1, force: 0.5 }, clock, 1000 + RUMBLE_EVERY_MS)).not.toBeNull()
-    const full = nextHapticPulse({ near: 0, force: 1 }, { nextAt: 0 }, 0)!
+    const full = nextHapticPulse({ near: 0, force: 1 }, clock, 0)!
     expect(full.intensity).toBe(1)
-    expect(first.intensity).toBeLessThan(1)
+    expect(clock.nextAt).toBeCloseTo(THROB_FAST_MS)
+    expect(full.duration).toBeGreaterThan(THROB_FAST_MS)
+    expect(nextHapticPulse({ near: 0, force: 1 }, clock, THROB_FAST_MS)).not.toBeNull()
   })
 
   it("ticks at once on the next approach after going quiet", () => {

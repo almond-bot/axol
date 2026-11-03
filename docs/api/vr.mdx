@@ -167,7 +167,7 @@ The `joints` message has this shape:
 - Each level runs from `0` to `1`, and only an engaged arm has non-zero levels. In box mode the leading controller gets the stronger of the two arms, and the other controller gets zeros.
 - `near` is how close the arm is to the IK's arm/body collision boundary, from the solver's `collision_proximity()`. It is `1` where the IK holds the arm off the body instead of following the target. A pose as clear as the rest pose reads `0`.
 - `force` is how far the arm's largest torque residual (measured minus modeled gravity, low-passed over about 80 ms) is past `haptic_torque`. It reaches `1` at 2.5 times `haptic_torque`. It is always `0` in sim.
-- `useAxolHaptics(wsRef)` in `@almond/axol-vr-client` plays them: `near` as ticks that speed up, and `force` as a steady rumble that takes over from the ticks. It stops if the messages stop for 300 ms.
+- `useAxolHaptics(wsRef)` in `@almond/axol-vr-client` plays them: `near` as ticks that speed up, and `force` as throbs that get stronger and faster with it, up to a steady rumble at `1`. The throbs take over from the ticks. It stops if the messages stop for 300 ms.
 
 The server also serves the robot model under `/urdf/` (`axol.urdf` and `meshes/*.stl`).
 

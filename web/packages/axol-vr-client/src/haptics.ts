@@ -8,7 +8,9 @@
  * - `near`: how close that arm is to the IK's arm/body collision boundary.
  *   Played as short ticks that speed up as it rises, like a parking sensor.
  * - `force`: how hard that arm pushes on something (torque past nominal).
- *   Played as a continuous rumble that grows with it, and wins over the ticks.
+ *   Played as throbs that get stronger and closer together as it rises, until
+ *   they merge into a solid rumble at full force. Wins over the ticks; the
+ *   throbs are longer than the ticks, so the two feel different.
  *
  * Pure so the pattern is testable; `useAxolHaptics` drives the controllers.
  */
@@ -34,10 +36,14 @@ export const TICK_FAST_MS = 70
 const TICK_MS = 25
 const TICK_MIN = 0.2
 const TICK_MAX = 0.6
-// Push rumble: re-issued before the previous pulse ends so it stays solid.
-export const RUMBLE_EVERY_MS = 40
-const RUMBLE_MS = 60
-const RUMBLE_MIN = 0.3
+// Push throbs: interval and length from just past the push torque up to full
+// force, and strength over the same range. At full force each throb is
+// re-issued before the last one ends, so they merge into a solid rumble.
+export const THROB_SLOW_MS = 300
+export const THROB_FAST_MS = 40
+const THROB_LONG_MS = 100
+const THROB_SHORT_MS = 60
+const THROB_MIN = 0.3
 // Levels older than this are dropped (link lost mid-rumble).
 export const HAPTICS_STALE_MS = 300
 
@@ -70,8 +76,11 @@ export function nextHapticPulse(
 ): HapticPulse | null {
   if (hand.force > 0) {
     if (now < clock.nextAt) return null
-    clock.nextAt = now + RUMBLE_EVERY_MS
-    return { intensity: RUMBLE_MIN + (1 - RUMBLE_MIN) * hand.force, duration: RUMBLE_MS }
+    clock.nextAt = now + THROB_SLOW_MS + (THROB_FAST_MS - THROB_SLOW_MS) * hand.force
+    return {
+      intensity: THROB_MIN + (1 - THROB_MIN) * hand.force,
+      duration: THROB_LONG_MS + (THROB_SHORT_MS - THROB_LONG_MS) * hand.force,
+    }
   }
   if (hand.near > 0) {
     if (now < clock.nextAt) return null
