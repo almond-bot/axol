@@ -44,7 +44,7 @@ Run it on the computer that is wired to the hardware and has the ZED cameras att
         Pick **Collect data** and fill in:
 
         - **Repo ID**: type a new name such as `myorg/pick-place`, or pick an existing dataset from the list to add to it. The list shows each dataset's episode count.
-        - **Task**: a description of the task.
+        - **Task**: a description of the task for the first episode. You can pick a different task for each episode during the session. See [Choose the task for each episode](#choose-the-task-for-each-episode).
 
         Recording rate, teleoperation rate, stiffness and upload settings are in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
@@ -215,7 +215,7 @@ The camera feeds are shown in the headset, so you can line up takes from the rob
   </Step>
 </Steps>
 
-The HUD shows **Episode N** at the top right: the number of the episode you are about to record, counting from 1.
+The HUD shows **Episode N** at the top right: the number of the episode you are about to record, counting from 1. The task that episode records follows it.
 
 | Headset state | Meaning |
 |---|---|
@@ -234,6 +234,23 @@ You can also stop the arms when they push hard during a take. This check is off 
 When it trips, tracking disengages, the take is discarded and the arms go limp. Guide them clear, then press **X** and record again. [Teleoperation](/operations/teleop) uses the same settings.
 
 These stops apply to Axol's arms. Mantis has no arms to return home. Each Mantis take starts with the source's [start gesture](/mantis/tracking#start-gesture-and-recovery), and the grippers are off between takes.
+
+## Choose the task for each episode
+
+Every episode records one task. A session starts with **Task** (`--task`) selected. Change it between takes in either place:
+
+- **In the headset**: click the **Episode N** line at the top right with a controller ray. Click a task in the list. With more than eight tasks, click **More tasks** to see the rest.
+- **On the control panel**: pick a task in the **Task** card. To add one, type it under **New task** and press **Add task**. The new task is selected, and the headset can pick it too.
+
+The list holds **Task**, any tasks you pass with `--tasks`, and the tasks already in the dataset when you add to one. A task you add during the session stays in the list until the session ends. It is kept for later sessions once an episode records it.
+
+```bash
+axol collect-data --repo_id myorg/kitchen --task "Open the drawer" \
+    --tasks '["Close the drawer", "Put the cup in the drawer"]' \
+    --robot_config.cameras "{overhead: {serial: 41234567}}"
+```
+
+The task is fixed while an episode records and saves. Pick the next task once the take has ended. To fix the task of a saved episode, rename it on the [Datasets](/guides/control-panel#datasets) page.
 
 ## Driving from the panel
 

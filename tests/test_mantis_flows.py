@@ -264,6 +264,7 @@ class MantisFlowTest(unittest.TestCase):
             mantis=False,
             repo_id="test/repo",
             task="test",
+            tasks=[],
             fps=60,
             teleop_hz=120,
             vcodec="auto",

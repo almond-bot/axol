@@ -42,7 +42,8 @@ axol collect-data --repo_id myorg/pick --task "pick up the cup" \
 | Flag | Default | Description |
 |---|---|---|
 | `--repo_id` | required | Dataset ID, `<user>/<dataset>`. |
-| `--task` | required | Task description stored with every frame. |
+| `--task` | required | Task of the first episode. Pick a task for each later episode in the headset or on the control panel. |
+| `--tasks` | `[]` | Other tasks to offer for each episode, as a list: `'["Open the drawer", "Close the drawer"]'`. Tasks already in the dataset are offered too. |
 | `--fps` | `30` | Recording rate. Cameras capture at 60 and drop frames to match. `60` doubles the recording load on a Jetson. |
 | `--teleop_hz` | `120` | Motor command rate (Hz) while teleoperating, independent of `fps`. |
 | `--dataset_resolution` | `SVGA` | Resolution of the recorded video: `SVGA`, `HD1080` or `HD1200`. The headset stream keeps the capture resolution. |

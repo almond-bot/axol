@@ -3,7 +3,12 @@ import { createRoot, type Root } from "react-dom/client"
 import { afterEach, beforeEach, describe, expect, it } from "vitest"
 
 import type { AxolSettingDef } from "./types"
-import { formatSettingValue, nextSettingValue, useAxolSettings } from "./useAxolSettings"
+import {
+  formatSettingValue,
+  nextSettingValue,
+  taskPicker,
+  useAxolSettings,
+} from "./useAxolSettings"
 
 const num = (over: Partial<AxolSettingDef> = {}): AxolSettingDef => ({
   key: "position_multiplier",
@@ -25,6 +30,21 @@ const select: AxolSettingDef = {
   options: ["clutch", "ramp"],
   unit: "",
 }
+
+describe("taskPicker", () => {
+  it("is null without settings or without a task setting", () => {
+    expect(taskPicker(null)).toBeNull()
+    expect(taskPicker({ schema: [select], values: { reengage: "ramp" } })).toBeNull()
+  })
+
+  it("returns the task choices and the current task", () => {
+    const task: AxolSettingDef = { ...select, key: "task", options: ["Pick", "Place"] }
+    expect(taskPicker({ schema: [select, task], values: { task: "Place" } })).toEqual({
+      tasks: ["Pick", "Place"],
+      current: "Place",
+    })
+  })
+})
 
 describe("nextSettingValue", () => {
   it("toggles booleans and cycles selects", () => {

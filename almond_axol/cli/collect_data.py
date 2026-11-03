@@ -95,6 +95,8 @@ from ..recording import (
     default_vcodec,
     restore_dataset_ownership,
 )
+from ..recording.dataset_browser import read_task_names
+from ..recording.task_picker import TaskPicker
 from ..robot.base import HardwareCleanupError, mark_hardware_cleanup_uncertain
 from ..robot.control import ContactWatchdog
 from ..robot.start_pose import check_start_pose
@@ -750,7 +752,12 @@ class CollectDataConfig:
     """
 
     repo_id: str
+    # Task for the first episode. Pick a task for each later episode in the
+    # headset or on the control panel.
     task: str
+    # Other tasks to offer for each episode, as a list: ["Open the drawer",
+    # "Close the drawer"]. Tasks already in the dataset are offered too.
+    tasks: list[str] = field(default_factory=list)
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
     # Record with the Mantis handheld rig instead of the robot: its grippers
@@ -1583,7 +1590,6 @@ def _run_session(
         control = _NullCollectControl()
 
     repo_id = cfg.repo_id
-    task = cfg.task
     fps = cfg.fps
     teleop_hz = cfg.teleop_hz
     vcodec = cfg.vcodec
@@ -1671,6 +1677,16 @@ def _run_session(
             f"Incomplete dataset found at {dataset_root} (missing tasks.parquet or episodes/). "
             "Move or delete that exact dataset directory, then rerun to start fresh."
         )
+    # Each take records the task picked on the headset HUD or the control
+    # panel (the live setting ``task``), starting from --task.
+    resumed_tasks: list[str] = []
+    if is_complete:
+        try:
+            resumed_tasks = read_task_names(dataset_root)
+        except Exception as exc:  # noqa: BLE001 - the picker still has --task
+            _logger.warning("could not read the dataset's tasks: %s", exc)
+    task_picker = TaskPicker(cfg.task, [*cfg.tasks, *resumed_tasks])
+    teleop.live_settings.add_session_setting(task_picker)
     # A resumed dataset's image resolution is fixed by its existing metadata, so
     # the relay must record at it regardless of the configured dataset_resolution
     # — otherwise the downscaled frames mismatch the stored feature shape and
@@ -2544,7 +2560,13 @@ def _run_session(
             _publish_mantis_boundary(joint_obs)
 
         def _start_capture() -> None:
-            recorder.start_episode(task)
+            task = task_picker.begin_take()
+            try:
+                recorder.start_episode(task)
+            except BaseException:
+                task_picker.end_take()
+                raise
+            _logger.info("Episode task: %s", task)
             if relay is not None:
                 relay.set_raw_enabled(True)
 
@@ -2558,6 +2580,8 @@ def _run_session(
                 except RecorderCaptureError as exc:
                     return 0, str(exc)
             finally:
+                # The rows are frozen: the next take may record another task.
+                task_picker.end_take()
                 # A relay-close failure is a camera lifecycle failure, not an
                 # episode rejection. Let it override the recoverable capture
                 # result so the session cannot continue with an open branch.

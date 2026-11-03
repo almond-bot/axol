@@ -46,6 +46,7 @@ import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { EpisodeBriefCard } from "@/components/episode-brief"
 import { SessionSettings } from "@/components/session-settings"
+import { TaskPicker } from "@/components/task-picker"
 import { Card } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -972,6 +973,7 @@ function OperatorDeck({
   const [vrSocket, setVrSocket] = useState<WebSocket | null>(null)
   // Without the feed card (sim, arms-off) the settings card connects itself.
   const ownSocket = useVrSocket(host, vrPort, showSettings && !showFeeds)
+  const settingsSocket = showFeeds ? vrSocket : ownSocket
 
   function toggleFullscreen() {
     const next = !fullscreen
@@ -1005,6 +1007,12 @@ function OperatorDeck({
   const body = (
     <>
       {episodeControl && <EpisodeControls policy={policy} onEpisode={onEpisode} hud={hud} />}
+      {showSettings && (
+        <TaskPicker
+          socket={settingsSocket}
+          locked={policy?.phase === "recording" || policy?.phase === "saving"}
+        />
+      )}
       {showFeeds && (
         <CameraFeeds
           host={host}
@@ -1015,7 +1023,7 @@ function OperatorDeck({
           onSocket={setVrSocket}
         />
       )}
-      {showSettings && !fullscreen && <SessionSettings socket={showFeeds ? vrSocket : ownSocket} />}
+      {showSettings && !fullscreen && <SessionSettings socket={settingsSocket} />}
       {hud?.confirm && <ConfirmPopup action={hud.confirm} policy={policy} />}
     </>
   )

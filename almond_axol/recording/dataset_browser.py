@@ -217,8 +217,11 @@ def _episode_files(root: Path) -> list[Path]:
     return sorted((root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
 
 
-def _read_task_names(root: Path) -> list[str]:
-    """Task strings in ``task_index`` order (position == index)."""
+def read_task_names(root: Path) -> list[str]:
+    """A dataset's task strings in ``task_index`` order (position == index).
+
+    Empty when the dataset has no ``meta/tasks.parquet`` yet.
+    """
     import pyarrow.parquet as pq
 
     path = root / "meta" / "tasks.parquet"
@@ -315,7 +318,7 @@ def read_episodes(root: Path) -> DatasetEpisodes:
             episodes.append(_summary(row, fps, cameras, info))
     episodes.sort(key=lambda e: e.index)
     try:
-        tasks = _read_task_names(root)
+        tasks = read_task_names(root)
     except Exception:
         tasks = []
     return DatasetEpisodes(
@@ -636,6 +639,7 @@ __all__ = [
     "episode_video",
     "read_episodes",
     "reload_tasks_from_disk",
+    "read_task_names",
     "rename_episode_task",
     "resolve_dataset",
 ]

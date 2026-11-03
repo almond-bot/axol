@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from .core import VRTeleopCore
 
@@ -313,6 +313,29 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
 
 _DEFS = {d.key: d for d in LIVE_SETTINGS}
 
+
+class SessionSetting(Protocol):
+    """A live setting that one kind of session adds on top of :data:`LIVE_SETTINGS`.
+
+    ``collect-data``'s task picker is one: its choices come from the run's
+    config and dataset, so it can't be declared statically. Register it with
+    :meth:`LiveSettings.add_session_setting`; it is published and set like
+    any other live setting, but validates and stores its own value.
+    """
+
+    def definition(self) -> LiveSettingDef:
+        """The setting's current schema entry (its options may change)."""
+        ...
+
+    def value(self) -> Any:
+        """The current value, in wire units."""
+        ...
+
+    def apply(self, value: Any) -> None:
+        """Validate and store a ``set`` request; raise ``ValueError`` to refuse it."""
+        ...
+
+
 # Joint velocities are configured in rad/s but shown in rev/s (the unit the
 # rest of the docs use for teleop_max_vel).
 _RAD_PER_REV = 6.283185307179586
@@ -343,6 +366,7 @@ class LiveSettings:
         self._core = core
         self._robot = robot
         self._publish = publish
+        self._session: dict[str, SessionSetting] = {}
 
     def set_robot(self, robot: object) -> None:
         """Attach (or swap) the robot the robot-side settings act on.
@@ -392,16 +416,29 @@ class LiveSettings:
 
     # -- Public API ----------------------------------------------------------
 
+    def add_session_setting(self, setting: SessionSetting) -> None:
+        """Publish a session-specific setting after the built-in ones.
+
+        Announces the new snapshot. The key must not clash with a built-in
+        setting (or another session setting).
+        """
+        key = setting.definition().key
+        if key in _DEFS or key in self._session:
+            raise ValueError(f"live setting {key!r} is already defined")
+        self._session[key] = setting
+        self.announce()
+
+    @staticmethod
+    def _wire_def(d: LiveSettingDef) -> dict[str, Any]:
+        entry = asdict(d)
+        entry.pop("source")
+        entry["options"] = list(d.options)
+        return entry
+
     def schema(self) -> list[dict[str, Any]]:
         """The settings available in *this* session (robot-side ones only on hardware)."""
-        out = []
-        for d in LIVE_SETTINGS:
-            if self._hidden(d):
-                continue
-            entry = asdict(d)
-            entry.pop("source")
-            entry["options"] = list(d.options)
-            out.append(entry)
+        out = [self._wire_def(d) for d in LIVE_SETTINGS if not self._hidden(d)]
+        out.extend(self._wire_def(s.definition()) for s in self._session.values())
         return out
 
     def values(self) -> dict[str, Any]:
@@ -422,6 +459,8 @@ class LiveSettings:
             else:
                 v = self._core.live_value(d.key)
                 vals[d.key] = round(float(v), 3) if isinstance(v, float) else v
+        for key, setting in self._session.items():
+            vals[key] = setting.value()
         return vals
 
     def snapshot(self) -> dict[str, Any]:
@@ -444,6 +483,15 @@ class LiveSettings:
         Raises ``KeyError`` / ``ValueError`` for an unknown key or an
         out-of-range value (the server logs and drops the request).
         """
+        session = self._session.get(key)
+        if session is not None:
+            # Announced even when refused, so a client that showed its
+            # request optimistically falls back to the server's value.
+            try:
+                session.apply(value)
+            finally:
+                self.announce()
+            return
         d = _DEFS.get(key)
         if d is None:
             raise KeyError(f"unknown live setting {key!r}")

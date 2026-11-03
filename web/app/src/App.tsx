@@ -27,6 +27,8 @@ import {
   axolHttpsOrigin,
   formatSettingValue,
   nextSettingValue,
+  TASK_SETTING_KEY,
+  taskPicker,
   useAxolControlChannel,
   useAxolHaptics,
   useAxolJoints,
@@ -930,25 +932,161 @@ function StateDisplay({
   )
 }
 
+// Shorten text for a HUD line, ending it with an ellipsis.
+function hudTruncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}\u2026`
+}
+
 // Current episode number, shown top-right under the recording status and the
-// tools row during data collection. Null (plain teleop, or before the server
-// announces one) renders nothing.
-function EpisodeDisplay({ episode }: { episode: number | null }) {
+// tools row during data collection, followed by the task it records. Null
+// (plain teleop, or before the server announces one) renders nothing. With a
+// task picker, clicking it opens the task list (see TaskPanel); `onPick` is
+// undefined while an episode records, since the task can't change then.
+function EpisodeDisplay({
+  episode,
+  task,
+  onPick,
+}: {
+  episode: number | null
+  task: string | null
+  onPick?: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
   if (episode === null) return null
+  const label = task ? `Episode ${episode} \u00b7 ${hudTruncate(task, 28)}` : `Episode ${episode}`
 
   return (
     <HudText
       position={[0.2, 0.05, -0.5]}
       fontSize={0.016}
       fontWeight="bold"
-      color="white"
+      color={onPick && hovered ? "yellow" : "white"}
       anchorX="right"
       anchorY="top"
       renderOrder={999}
       material-depthTest={false}
       {...hudBg}
+      onPointerOver={() => setHovered(true)}
+      onPointerOut={() => setHovered(false)}
+      onClick={onPick}
     >
-      {`Episode ${episode}`}
+      {label}
+    </HudText>
+  )
+}
+
+// Rows per page of the task list; more tasks add a "More tasks" row.
+const TASK_PAGE_ROWS = 8
+
+// The session's task list (collect-data's task picker): click a task to record
+// it from the next episode on. The current task is green.
+function TaskPanel({
+  tasks,
+  current,
+  onSelect,
+  onDismiss,
+}: {
+  tasks: string[]
+  current: string
+  onSelect: (task: string) => void
+  onDismiss: () => void
+}) {
+  const pages = Math.max(1, Math.ceil(tasks.length / TASK_PAGE_ROWS))
+  const [page, setPage] = useState(() =>
+    Math.max(0, Math.floor(tasks.indexOf(current) / TASK_PAGE_ROWS))
+  )
+  const shownPage = Math.min(page, pages - 1)
+  const rows = tasks.slice(shownPage * TASK_PAGE_ROWS, (shownPage + 1) * TASK_PAGE_ROWS)
+  const rowH = 0.02
+  const W = 0.34
+  const H = 0.03 + (rows.length + (pages > 1 ? 1 : 0)) * rowH
+  const top = 0.06
+  return (
+    <group position={[0, top, -0.5]}>
+      {/* Dismiss plane behind everything */}
+      <mesh position={[0, 0, -0.002]} renderOrder={996} onClick={onDismiss}>
+        <planeGeometry args={[2, 2]} />
+        <meshBasicMaterial transparent opacity={0} depthTest={false} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh position={[0, -H / 2, -0.001]} renderOrder={998} onClick={(e) => e.stopPropagation()}>
+        <planeGeometry args={[W, H]} />
+        <meshBasicMaterial
+          color="black"
+          transparent
+          opacity={0.97}
+          depthTest={false}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <HudText
+        position={[0, -0.004, 0]}
+        fontSize={0.013}
+        color="white"
+        fontWeight="bold"
+        anchorX="center"
+        anchorY="top"
+        renderOrder={1000}
+        material-depthTest={false}
+      >
+        TASK FOR THE NEXT EPISODE
+      </HudText>
+      {rows.map((task, i) => (
+        <TaskRow
+          key={task}
+          y={-0.024 - i * rowH}
+          x={-W / 2 + 0.012}
+          label={hudTruncate(task, 44)}
+          active={task === current}
+          onClick={() => onSelect(task)}
+        />
+      ))}
+      {pages > 1 && (
+        <TaskRow
+          y={-0.024 - rows.length * rowH}
+          x={-W / 2 + 0.012}
+          label={`More tasks (${shownPage + 1}/${pages})`}
+          muted
+          onClick={() => setPage((shownPage + 1) % pages)}
+        />
+      )}
+    </group>
+  )
+}
+
+function TaskRow({
+  x,
+  y,
+  label,
+  active = false,
+  muted = false,
+  onClick,
+}: {
+  x: number
+  y: number
+  label: string
+  active?: boolean
+  muted?: boolean
+  onClick: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <HudText
+      position={[x, y, 0]}
+      fontSize={0.012}
+      fontWeight={active ? "bold" : "normal"}
+      color={hovered ? "yellow" : active ? "#4ade80" : muted ? "#9ca3af" : "white"}
+      anchorX="left"
+      anchorY="top"
+      renderOrder={1000}
+      material-depthTest={false}
+      onPointerOver={() => setHovered(true)}
+      onPointerOut={() => setHovered(false)}
+      onClick={(e) => {
+        e.stopPropagation()
+        onClick()
+      }}
+    >
+      {label}
     </HudText>
   )
 }
@@ -1107,7 +1245,8 @@ function SettingsPanel({
   onStep: (def: AxolSettingDef, direction: 1 | -1) => void
   onDismiss: () => void
 }) {
-  const rows = settings.schema
+  // The task picker has its own list (TaskPanel): task names don't fit a row.
+  const rows = settings.schema.filter((def) => def.key !== TASK_SETTING_KEY)
   const rowH = 0.02
   const W = 0.34
   const H = 0.03 + rows.length * rowH
@@ -1271,6 +1410,7 @@ function HelpPanel({
   boxAvailable,
   rampAvailable,
   settingsAvailable,
+  taskAvailable,
   poseSourceKind,
 }: {
   onDismiss: () => void
@@ -1280,6 +1420,8 @@ function HelpPanel({
   // The tools-row buttons exist only once the server announces its settings.
   rampAvailable: boolean
   settingsAvailable: boolean
+  // The episode line picks the task (collect-data only).
+  taskAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const W = 0.44
@@ -1322,6 +1464,7 @@ function HelpPanel({
                 ...(settingsAvailable ? ["[Settings]  Session settings"] : []),
               ]),
         ]),
+    ...(taskAvailable ? ["[Episode]  Choose task"] : []),
   ].join("\n")
 
   return (
@@ -1409,6 +1552,7 @@ function HelpIcon({
   boxAvailable,
   rampAvailable,
   settingsAvailable,
+  taskAvailable,
   poseSourceKind,
 }: {
   mode: AxolMode | null
@@ -1416,6 +1560,7 @@ function HelpIcon({
   boxAvailable: boolean
   rampAvailable: boolean
   settingsAvailable: boolean
+  taskAvailable: boolean
   poseSourceKind: AxolPoseSourceKind
 }) {
   const [open, setOpen] = useState(false)
@@ -1443,6 +1588,7 @@ function HelpIcon({
           boxAvailable={boxAvailable}
           rampAvailable={rampAvailable}
           settingsAvailable={settingsAvailable}
+          taskAvailable={taskAvailable}
           poseSourceKind={poseSourceKind}
         />
       )}
@@ -1623,8 +1769,9 @@ export default function App() {
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
-  // In-headset live-settings panel.
+  // In-headset live-settings panel and task list.
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [taskOpen, setTaskOpen] = useState(false)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
   const jointsRef = useAxolJoints(wsRef, status === AxolConnectionStatus.Open)
   // Live session settings (box mode, re-engage, grip force, …) mirrored from
@@ -1639,6 +1786,10 @@ export default function App() {
   // Offered by the server only with the parcel gripper.
   const boxAvailable = settings != null && "box_mode" in settings.values
   const reengage = settings ? String(settings.values.reengage ?? "") : null
+  // collect-data's task picker: the task the next episode records. It can't
+  // change while an episode records or saves.
+  const task = taskPicker(settings)
+  const taskLocked = vrState === AxolState.Recording || vrState === AxolState.Saving
   const [xrError, setXrError] = useState<string | null>(null)
 
   // Fire the autoconnect once the client is idle with a host set.
@@ -1971,6 +2122,7 @@ export default function App() {
                 boxAvailable={boxAvailable}
                 rampAvailable={!!reengage}
                 settingsAvailable={settings != null}
+                taskAvailable={task !== null}
                 poseSourceKind={poseSourceKind}
               />
               <StateDisplay
@@ -1978,7 +2130,29 @@ export default function App() {
                 isRecordingPending={recordingPendingAt !== null}
                 viewOnly={poseSourceKind === "tracker"}
               />
-              <EpisodeDisplay episode={episode} />
+              <EpisodeDisplay
+                episode={episode}
+                task={task?.current || null}
+                onPick={
+                  task && !taskLocked
+                    ? () => {
+                        setSettingsOpen(false)
+                        setTaskOpen(true)
+                      }
+                    : undefined
+                }
+              />
+              {task && taskOpen && !taskLocked && (
+                <TaskPanel
+                  tasks={task.tasks}
+                  current={task.current}
+                  onSelect={(next) => {
+                    setSetting(TASK_SETTING_KEY, next)
+                    setTaskOpen(false)
+                  }}
+                  onDismiss={() => setTaskOpen(false)}
+                />
+              )}
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
               <HudTools
@@ -1986,7 +2160,10 @@ export default function App() {
                 onSet={setSetting}
                 jointsRef={jointsRef}
                 settingsOpen={settingsOpen}
-                onOpenSettings={() => setSettingsOpen(true)}
+                onOpenSettings={() => {
+                  setTaskOpen(false)
+                  setSettingsOpen(true)
+                }}
                 onCloseSettings={() => setSettingsOpen(false)}
                 onStep={stepSetting}
               />

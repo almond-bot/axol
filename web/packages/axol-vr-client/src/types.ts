@@ -110,7 +110,7 @@ export type AxolSettingDef = {
  * server-side against the value the server holds. The value set includes at
  * least `reengage` (`AxolReengage`); `box_mode` (boolean) and the other
  * `box_*` keys only when the robot has the parcel gripper (box mode exists
- * only there).
+ * only there); `task` only in `collect-data` (see `TASK_SETTING_KEY`).
  */
 export type AxolSettings = {
   schema: AxolSettingDef[]

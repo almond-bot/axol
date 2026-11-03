@@ -14,7 +14,8 @@ This command is configured through draccus. The robot and teleop settings live i
 | Flag | Description |
 |---|---|
 | `--repo_id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
-| `--task TEXT` | Natural language task description (required) |
+| `--task TEXT` | Task of the first episode, in plain language (required). Pick a task for each later episode in the headset or on the control panel. See [Choose the task for each episode](/operations/data-collection#choose-the-task-for-each-episode). |
+| `--tasks LIST` | Other tasks to offer for each episode, such as `'["Open the drawer", "Close the drawer"]'` (default: none). Tasks already in the dataset are offered too. |
 | `--fps INT` | Dataset frame rate (default: 30). It can't be higher than the camera capture rate. The headset stream is separate. |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution of the dataset video (default: `SVGA`, 960×600). The headset still gets full resolution. A resumed dataset keeps its original resolution. |
 | `--vcodec STR` | Dataset video codec (default: `h264` on Jetson, `auto` elsewhere). Accepts any LeRobot codec, e.g. `auto`, `h264` or `libsvtav1`. |

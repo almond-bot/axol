@@ -8,7 +8,13 @@ export { useAxolHaptics } from "./useAxolHaptics"
 export type { AxolHaptics, AxolHandHaptics } from "./haptics"
 export { useAxolJoints } from "./useAxolJoints"
 export type { AxolJointSample } from "./useAxolJoints"
-export { useAxolSettings, nextSettingValue, formatSettingValue } from "./useAxolSettings"
+export {
+  useAxolSettings,
+  nextSettingValue,
+  formatSettingValue,
+  taskPicker,
+  TASK_SETTING_KEY,
+} from "./useAxolSettings"
 export type { AxolSettingValue } from "./useAxolSettings"
 export { useAxolUrdfState } from "./useAxolUrdfState"
 export type { AxolUrdfBase, AxolUrdfState } from "./useAxolUrdfState"

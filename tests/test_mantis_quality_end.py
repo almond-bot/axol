@@ -22,6 +22,7 @@ from lerobot.teleoperators.utils import TeleopEvents
 from almond_axol.cli import collect_data
 from almond_axol.lerobot.robot.robot_axol import _LEFT_EE_KEYS, _RIGHT_EE_KEYS
 from almond_axol.mantis.relative import quat_xyzw_to_rotvec
+from almond_axol.recording.task_picker import TaskPicker
 from almond_axol.teleop.core import TCPPoseSnapshot
 from almond_axol.vr.models import VRState
 
@@ -150,7 +151,7 @@ def _run_take(
         "max_pose_lag": {"v": 0.0},
         "max_slip": {"v": 0.0},
         "prev_t0": {"v": 0.0},
-        "task": "tracking quality fence",
+        "task_picker": TaskPicker("tracking quality fence"),
         "relay": None,
         "episode_idx": 0,
         "take_gc": SimpleNamespace(begin=Mock()),

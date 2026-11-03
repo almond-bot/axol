@@ -199,8 +199,11 @@ Some settings can change during a session from any client: the headset HUD, the 
 | `gripper_torque` | **Grip force** | number, Nm | Torque limit of both grippers. Hardware only, so it is hidden in sim. |
 | `position_multiplier` | **Reach scale** | number, × | Scale from hand motion to arm motion. |
 | `teleop_max_vel` | **Arm speed** | number, rev/s | Joint velocity cap while tracking. |
+| `task` | **Task** | `"select"` | `collect-data` only. The task the next episode records. `options` lists the session's tasks. Any other non-empty text is added to `options` and selected. A change while an episode records or saves is rejected, and the server re-sends `settings`. See [Choose the task for each episode](/operations/data-collection#choose-the-task-for-each-episode). |
 
 See [`VRTeleopConfig` fields](/api/teleop#box-mode) for what each box-mode setting does. The `box_*` keys exist only when the robot has the parcel gripper (`VRTeleopConfig.gripper == "parcel"`). Otherwise they are left out of `schema` and `values`, and a `set` of one is rejected. Clients show box mode only when `box_mode` is in `values`.
+
+`collect-data` adds `task` through `LiveSettings.add_session_setting()`. A session setting checks its own values, and its `options` can grow during the session. Both UIs show `task` in its own picker, not with the other settings.
 
 `VRTeleopCore.set_live()` queues each change and applies it on the IK thread before the next frame, or while the session is idle. Settings that the IK worker reads are passed on to it as `("set", key, value)` messages.
 

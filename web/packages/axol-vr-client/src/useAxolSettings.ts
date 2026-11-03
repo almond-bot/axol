@@ -130,3 +130,21 @@ export function formatSettingValue(
   const num = value.toFixed(decimals)
   return def.unit ? `${num} ${def.unit}` : num
 }
+
+/**
+ * Key of the task picker in the live settings. `collect-data` publishes it as
+ * a `select`: the options are the session's tasks and the value is the task
+ * the next episode records. Any non-empty text is accepted and added to the
+ * options; the server refuses a change while an episode records.
+ */
+export const TASK_SETTING_KEY = "task"
+
+/** The session's task choices and current task, or null when it has no picker. */
+export function taskPicker(
+  settings: AxolSettings | null
+): { tasks: string[]; current: string } | null {
+  const def = settings?.schema.find((d) => d.key === TASK_SETTING_KEY)
+  if (!settings || !def) return null
+  const current = settings.values[TASK_SETTING_KEY]
+  return { tasks: def.options, current: typeof current === "string" ? current : "" }
+}

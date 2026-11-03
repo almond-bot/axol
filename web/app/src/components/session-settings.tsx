@@ -3,6 +3,7 @@ import { Minus, Plus, SlidersHorizontal } from "lucide-react"
 import {
   formatSettingValue,
   nextSettingValue,
+  TASK_SETTING_KEY,
   useAxolSettings,
   type AxolSettingDef,
   type AxolSettingValue,
@@ -32,7 +33,9 @@ export function SessionSettings({ socket }: { socket: WebSocket | null }) {
   const socketRef = useMemo(() => ({ current: socket }), [socket])
   const { settings, setSetting } = useAxolSettings(socketRef, socket !== null)
 
-  if (!settings || settings.schema.length === 0) return null
+  // The task picker has its own card (TaskPicker).
+  const schema = settings?.schema.filter((def) => def.key !== TASK_SETTING_KEY) ?? []
+  if (!settings || schema.length === 0) return null
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3">
@@ -46,7 +49,7 @@ export function SessionSettings({ socket }: { socket: WebSocket | null }) {
         </span>
       </div>
       <div className="divide-y divide-white/5">
-        {settings.schema.map((def) => (
+        {schema.map((def) => (
           <SettingRow
             key={def.key}
             def={def}
