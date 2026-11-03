@@ -95,11 +95,14 @@ class VRTeleopConfig:
             disengage (reset, dropped link, contact stop) a grip that is
             still held must be released once before it engages again.
         haptics: Quest controller vibration while an arm is engaged
-            (relative mode). A controller ticks, faster as its arm nears
-            the IK's arm/base collision boundary, and rumbles while its arm
-            pushes on something (hardware only, see ``haptic_torque``).
-            ``True`` (default) plays both; the headset streams them as
-            ``{"type": "haptics"}`` (see ``VRTeleopCore.haptic_levels``).
+            (relative mode): the rumble while an arm pushes on something
+            (hardware only, see ``haptic_torque``) and, with
+            ``haptic_near``, the ticks near the body. ``True`` (default)
+            plays them; ``False`` silences both. The headset streams them
+            as ``{"type": "haptics"}`` (see ``VRTeleopCore.haptic_levels``).
+        haptic_near: Tick a controller, faster as its arm nears the IK's
+            arm/base collision boundary. ``False`` (default) leaves only
+            the push rumble.
         haptic_torque: Torque residual (measured minus modeled gravity, Nm
             on Damiao) at which a controller starts to rumble; the rumble
             reaches full strength at 2.5 times this. The residual is
@@ -582,6 +585,7 @@ class VRTeleopConfig:
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
     haptics: bool = True
+    haptic_near: bool = False
     haptic_torque: float = 6.0
     haptic_held_load: bool = True
     park_to_zero: bool = True

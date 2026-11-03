@@ -244,10 +244,15 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         label="Haptics",
         type="boolean",
         help=(
-            "Vibrates a controller while its arm is engaged: ticks that speed "
-            "up as the arm gets close to Axol's body, and a rumble while the "
-            "arm pushes on something."
+            "Vibrates a controller while its arm is engaged and pushes on "
+            "something. Off: no vibration at all."
         ),
+    ),
+    LiveSettingDef(
+        key="haptic_near",
+        label="Body ticks",
+        type="boolean",
+        help="Ticks a controller, faster as its arm gets close to Axol's body.",
     ),
     LiveSettingDef(
         key="haptic_torque",

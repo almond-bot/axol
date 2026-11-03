@@ -128,12 +128,15 @@ While an arm is engaged, its controller vibrates to tell you what the arm feels.
 
 | You feel | What it means |
 |---|---|
-| Short ticks that speed up | The arm is getting close to Axol's body or mount. At the fastest ticks, the arm stops following your hand toward the body. |
+| Short ticks that speed up | The arm is getting close to Axol's body or mount. At the fastest ticks, the arm stops following your hand toward the body. Off by default. |
 | Throbs that grow stronger and faster | The arm is pushing on something, such as the table or a wall. The harder it pushes, the stronger and closer together the throbs, up to a steady rumble. Real robot only. |
 
-A frozen arm's controller stays quiet. Turn haptics off with **Controller haptics** in **Axol settings → Teleop & VR** (`--teleop.haptics false`), or with **Haptics** in the headset's session settings.
+A frozen arm's controller stays quiet.
 
-The throbs start when a joint meets 6 Nm of unexpected torque. They become a steady, full-strength rumble at 2.5 times that (15 Nm). If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to keep only the ticks.
+- Turn on the ticks with **Ticks near the body** in **Axol settings → Teleop & VR** (`--teleop.haptic_near true`), or with **Body ticks** in the headset's session settings.
+- Turn all vibration off with **Controller haptics** (`--teleop.haptics false`), or with **Haptics** in the headset.
+
+The throbs start when a joint meets 6 Nm of unexpected torque. They become a steady, full-strength rumble at 2.5 times that (15 Nm). If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to turn the throbs off.
 
 The weight of what a gripper holds doesn't make its controller rumble, with either gripper. In box mode, the squeeze on the box doesn't either.
 

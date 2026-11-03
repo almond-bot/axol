@@ -909,6 +909,7 @@ class VRTeleopCore:
             "box_squeeze_torque",
             "box_lead_hand",
             "haptics",
+            "haptic_near",
             "haptic_torque",
         }
     )
@@ -2712,7 +2713,8 @@ class VRTeleopCore:
         ``config.haptic_torque``, full at
         ``_HAPTIC_TORQUE_FULL`` times it. Only an engaged arm plays, and
         nothing plays with ``config.haptics`` off or during a return to
-        rest. In box mode both arms follow the leading controller, so it
+        rest, and ``near`` stays 0 with ``config.haptic_near`` off. In
+        box mode both arms follow the leading controller, so it
         plays the stronger of the two and the other controller is quiet.
         """
         levels = {side: {"near": 0.0, "force": 0.0} for side in ("left", "right")}
@@ -2726,7 +2728,7 @@ class VRTeleopCore:
         ):
             if not engaged:
                 continue
-            raw = float(near.get(side, 0.0))
+            raw = float(near.get(side, 0.0)) if self.config.haptic_near else 0.0
             levels[side]["near"] = round(
                 max(0.0, (raw - _HAPTIC_NEAR_DEADBAND) / (1.0 - _HAPTIC_NEAR_DEADBAND)),
                 3,

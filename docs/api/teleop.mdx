@@ -90,7 +90,8 @@ Joint velocities and accelerations are set in rad/s and rad/s². The defaults be
 | Field | Default | Description |
 |---|---|---|
 | `hold_to_engage` | `False` | `True` makes each grip a dead-man switch: its arm tracks only while the grip is held. Live setting (**Hold to engage**). |
-| `haptics` | `True` | Vibrates the controller of each engaged arm: ticks near the IK's arm/body collision boundary, and a rumble while the arm pushes on something. See [Haptics](/api/vr#haptics). Live setting (**Haptics**). |
+| `haptics` | `True` | Vibrates the controller of each engaged arm while it pushes on something, plus the ticks below when `haptic_near` is on. `False` silences both. See [Haptics](/api/vr#haptics). Live setting (**Haptics**). |
+| `haptic_near` | `False` | Ticks a controller, faster as its arm nears the IK's arm/body collision boundary. Live setting (**Body ticks**). |
 | `haptic_torque` | `6.0` Nm | Low-passed torque residual (measured minus modeled gravity) at which the rumble starts. It is strongest at 2.5 times this. `0` turns the rumble off. Hardware only. Live setting (**Haptic push**). |
 | `haptic_held_load` | `True` | While a gripper is commanded closed, or box mode is on, fits its arm's torque residual as a held point mass (plus the box squeeze in box mode) and leaves it out of the rumble. The fit uses the gripper mount, so it works with either gripper. Opening the gripper clears it. See `almond_axol.teleop.held_load`. Hardware only. |
 | `reengage` | `"clutch"` | What a grip does when it re-engages an arm: `"clutch"` or `"ramp"`. See [Re-engaging](#re-engaging). Live setting (**Re-engage**). |
@@ -185,4 +186,4 @@ The arm never moves on the engage frame itself. A return to rest or a DAgger syn
 
 ## Live settings
 
-Some settings can change while a session runs, from the headset or the control panel: `box_mode`, the other box-mode settings marked live above, `reengage`, `hold_to_engage`, `haptics`, `haptic_torque`, `position_multiplier`, `teleop_max_vel`, and the gripper torque limit on hardware. `almond_axol.teleop.live.LiveSettings` validates each request and passes it to `VRTeleopCore.set_live(key, value)`. Changes apply on the IK thread before the next frame, or while the session is idle, so the control panel can change them with no headset connected. See [Live session settings](/api/vr#live-session-settings) for the full list and the wire protocol.
+Some settings can change while a session runs, from the headset or the control panel: `box_mode`, the other box-mode settings marked live above, `reengage`, `hold_to_engage`, `haptics`, `haptic_near`, `haptic_torque`, `position_multiplier`, `teleop_max_vel`, and the gripper torque limit on hardware. `almond_axol.teleop.live.LiveSettings` validates each request and passes it to `VRTeleopCore.set_live(key, value)`. Changes apply on the IK thread before the next frame, or while the session is idle, so the control panel can change them with no headset connected. See [Live session settings](/api/vr#live-session-settings) for the full list and the wire protocol.

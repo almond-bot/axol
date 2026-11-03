@@ -26,8 +26,9 @@ from almond_axol.teleop.live import LiveSettings
 
 
 def _core(sent: list | None = None, **config) -> VRTeleopCore:
+    """A core with both cues on (the body ticks are off by default)."""
     return VRTeleopCore(
-        VRTeleopConfig(**config),
+        VRTeleopConfig(**{"haptic_near": True, **config}),
         logging.getLogger("test"),
         broadcast_tracking=lambda _enabled: None,
         broadcast_json=(sent.append if sent is not None else None),
@@ -124,6 +125,16 @@ class HapticLevelsTest(unittest.TestCase):
         _feed(core, _Robot(left_elbow=20.0), 0.5)
         self.assertEqual(core.haptic_levels()["left"], {"near": 1.0, "force": 0.0})
 
+    def test_body_ticks_are_off_by_default(self) -> None:
+        self.assertFalse(VRTeleopConfig().haptic_near)
+        self.assertTrue(VRTeleopConfig().haptics)
+        core = _core(haptic_near=False)
+        core.left_enabled = True
+        core.collision_near = {"left": 1.0, "right": 0.0}
+        _feed(core, _Robot(left_elbow=20.0), 0.5)
+        self.assertEqual(core.haptic_levels()["left"]["near"], 0.0)
+        self.assertGreater(core.haptic_levels()["left"]["force"], 0.0)
+
     def test_box_mode_plays_on_the_leading_controller(self) -> None:
         core = _core()
         core.left_enabled = core.right_enabled = True
@@ -173,13 +184,16 @@ class LiveSettingTest(unittest.TestCase):
         self.assertIn("haptic_torque", {d["key"] for d in hardware.schema()})
         self.assertNotIn("haptic_torque", {d["key"] for d in sim.schema()})
         self.assertIn("haptics", {d["key"] for d in sim.schema()})
+        self.assertIn("haptic_near", {d["key"] for d in sim.schema()})
 
     def test_apply_routes_to_the_core(self) -> None:
         core = _core()
         live = LiveSettings(core, _Robot(), lambda s: None)
         live.apply("haptics", "toggle")
         live.apply("haptic_torque", 9.0)
+        live.apply("haptic_near", "toggle")
         core._apply_live_requests()
+        self.assertFalse(core.config.haptic_near)
         self.assertFalse(core.config.haptics)
         self.assertEqual(core.config.haptic_torque, 9.0)
 
