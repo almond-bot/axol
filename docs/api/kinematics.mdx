@@ -66,7 +66,14 @@ The bundled URDFs are in `almond_axol/kinematics/urdf/`, one per version. All bu
 **One model for everything.** Each generated file describes the full robot. IK, the sim viewer, the headset overlay, the control panel's viewer and physics simulators all load it. With every body joint at zero, the torso root (`root`) is the world origin, so poses match `axol.urdf`. IK loads the file through `almond_axol.kinematics.model.ik_urdf`, which:
 
 - **freezes every joint except the arm joints.** The base, lift, fingers and wheels stay at zero, so the lifts are fully raised.
-- **uses simpler collision shapes than each part's hull.** These are the custom `<ik_collision>` elements, which other importers ignore. They cover the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck and the Owl Mount foot plate as strips, and each gripper's jaws as one body over their whole motion.
+- **uses simpler collision shapes than each part's hull.** These are the custom `<ik_collision>` elements, which other importers ignore. They cover the shoulder bar, the head-camera mount, the lift column's top plate and each section, the Jelly deck, the Owl Mount foot plate and each gripper's jaws.
+
+The collision shapes depend on the version:
+
+- **Axol on Jelly:** each body part is a box or capsule fitted to it, and each arm part and finger is a capsule fitted to it. Every shape encloses its part. An `<ik_collision>` cylinder is read as a capsule: its radius, and the length of the straight section along the origin's z axis.
+- **Other versions:** IK fits one capsule to each link's meshes. The Owl Mount foot plate is six strips, and each gripper's jaws are one body over their whole motion.
+
+To see the shapes over the robot model, run `uv run python scripts/view_ik_collision.py` and open `http://localhost:8003`. Add `--gripper parcel` or `--model owl` for another model.
 
 **Picking the version.** With Jelly enabled, the model is Axol on Jelly. Otherwise it is the mount picked under **Mount** on the control panel's Robot tab, saved as `kinematics.mount`: `classic` (Legacy, the default), `standalone`, `ox_cart` or `owl`. `kinematics.robot_model` forces a version.
 
@@ -74,7 +81,8 @@ Each version tells IK which parts of the body to keep the arms away from:
 
 - **Ox Cart:** the lift column. IK keeps the cart's lift fully raised, so its caster frame is out of reach. If the lift is lowered, the frame comes up toward the hands, and IK doesn't account for it.
 - **Owl Mount:** the column and its foot plate, as six thin strips. The strips are left out of the hard upper-arm guard, since they sit under the arms' path.
-- **Jelly:** the deck, as three strips, also left out of the hard upper-arm guard. The lift carries the arms down while the deck stays on the ground. Teleop passes the height the lift reports to IK, which moves the deck and the lower column up toward the arms by that amount. Until the lift first reports a homed height, IK treats it as fully raised, and if the readings stop, IK keeps the last height.
+- **Jelly:** the deck, also left out of the hard upper-arm guard. The lift carries the arms down while the deck stays on the ground. Teleop passes the height the lift reports to IK, which moves the deck and the lower column up toward the arms by that amount. Until the lift first reports a homed height, IK treats it as fully raised, and if the readings stop, IK keeps the last height.
+- **Jelly, parallel gripper:** teleop also passes each gripper's commanded opening to IK, which slides the fingers to match. Until the first command, IK treats both grippers as fully open.
 
 **Parcel gripper.** With `axol.gripper` set to `parcel`, Axol on Jelly uses `axol_jelly_parcel.urdf` everywhere a URDF is chosen: the IK solver (`KinematicsConfig.gripper`, which teleop sets from `AxolConfig.gripper`), the sim viewer, the headset overlay and the control panel's pose viewer. Each gripper is a fixed jaw (`*_gripper`) and a plate hinged on it (`*_plate`). The hinge, `*_plate_joint`, turns through half a turn, with 0 alongside the jaw. The parcel gripper has no wrist cameras, so this model has only the head camera frames.
 
@@ -186,7 +194,7 @@ When the headset elbow hint is on (`elbow_weight` above `0`), it is projected on
 
 With `self_collision` on (the default):
 
-- the capsule model is built, and a soft self-collision cost is part of the IK solve
+- the collision model is built, and a soft self-collision cost is part of the IK solve
 - a hard guard between the upper arms and the base runs on every final step, so a pose target can't push an arm into the torso
 - the return-to-rest planner avoids collisions
 

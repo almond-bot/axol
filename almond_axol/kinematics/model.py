@@ -15,8 +15,9 @@ Building the robot once per process and handing the same instance to every
 instance after the first hit JAX's in-memory jit cache, so constructing
 additional objects is close to free.
 
-The collision model is built lazily and separately: forward-kinematics-only
-users (observation recording) never pay for capsule fitting.
+The collision model (:class:`~.collision.ArmBodyCollision`) is built lazily
+and separately: forward-kinematics-only users (observation recording) never
+pay for building it.
 
 Each :class:`~almond_axol.constants.AxolModel` (hardware version) has its own
 URDF and therefore its own robot and collision model; both are cached per
@@ -34,6 +35,7 @@ import threading
 from pathlib import Path
 from xml.etree import ElementTree
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pyroki as pk
@@ -46,6 +48,7 @@ from ..constants import (
     urdf_path,
 )
 from ..settings import resolve_gripper, resolve_robot_model
+from .collision import ArmBodyCollision
 
 _logger = logging.getLogger(__name__)
 
@@ -89,8 +92,9 @@ _lock = threading.RLock()
 _Key = tuple[AxolModel, str]
 _urdf: dict[_Key, yourdfpy.URDF] = {}
 _robot: dict[_Key, pk.Robot] = {}
-_robot_coll: dict[_Key, pk.collision.RobotCollision] = {}
+_robot_coll: dict[_Key, ArmBodyCollision] = {}
 _lift_shift: dict[_Key, tuple[np.ndarray, float]] = {}
+_finger_slide: dict[_Key, tuple[np.ndarray, np.ndarray, float]] = {}
 
 # The lift's driving joint in the generated URDFs (0 = fully raised,
 # lowering the arms); any further stages mimic it.
@@ -115,9 +119,9 @@ def ik_urdf_xml(path: Path) -> str:
     :func:`~almond_axol.constants.urdf_path`). For IK every joint but the
     arms' is frozen at zero — the body, lift, fingers and wheels — since
     pyroki treats every movable joint as a variable; and each link's
-    capsule-friendly ``<ik_collision>`` pieces replace its per-part
-    ``<collision>`` hulls. A URDF without ``<ik_collision>`` (the classic
-    one) keeps its collision geometry.
+    ``<ik_collision>`` shapes replace its per-part ``<collision>`` hulls (see
+    :mod:`.collision`). A URDF without ``<ik_collision>`` (the classic one)
+    keeps its collision geometry.
     """
     root = ElementTree.parse(path).getroot()
     solved = set(
@@ -179,13 +183,15 @@ def shared_robot(
 
 def shared_robot_collision(
     model: AxolModel | str | None = None, *, gripper: str | None = None
-) -> pk.collision.RobotCollision:
+) -> ArmBodyCollision:
     """``model``'s torso<->arm collision model, built once per process."""
     with _lock:
         key = _key(model, gripper)
         if key not in _robot_coll:
             _robot_coll[key] = _build_robot_collision(
-                _load_urdf(key), torso_links(key[0])
+                _load_urdf(key),
+                torso_links(key[0]),
+                tuple(shared_robot(key[0], gripper=key[1]).links.names),
             )
         return _robot_coll[key]
 
@@ -212,6 +218,57 @@ def lift_link_shift(
                 urdf_path(key[0], gripper=key[1]), names
             )
         return _lift_shift[key]
+
+
+def finger_slide(
+    model: AxolModel | str | None = None, *, gripper: str | None = None
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """How the gripper opening moves each finger link, and the fingers' travel.
+
+    IK freezes the fingers closed (:func:`ik_urdf_xml`). Each finger slides
+    along its joint axis, in its own frame, as the gripper opens. Returns
+    ``(axis, side, travel)``: ``axis`` is ``(num_links, 3)`` in the IK
+    robot's link order, each finger link's displacement in its own frame per
+    metre of opening (zero for every other link); ``side`` is ``(num_links,)``,
+    0 for a left finger, 1 for a right one and -1 otherwise; ``travel`` is the
+    fingers' full stroke (m). A gripper without sliding fingers (the parcel
+    gripper, the classic URDF) has zero axes and travel.
+    """
+    with _lock:
+        key = _key(model, gripper)
+        if key not in _finger_slide:
+            names = list(shared_robot(key[0], gripper=key[1]).links.names)
+            _finger_slide[key] = _measure_finger_slide(
+                urdf_path(key[0], gripper=key[1]), names
+            )
+        return _finger_slide[key]
+
+
+def _measure_finger_slide(
+    path: Path, names: list[str]
+) -> tuple[np.ndarray, np.ndarray, float]:
+    axis = np.zeros((len(names), 3), dtype=np.float32)
+    side = np.full(len(names), -1, dtype=np.int32)
+    travel = 0.0
+    full = yourdfpy.URDF.load(
+        str(path), build_collision_scene_graph=False, load_meshes=False
+    )
+    for joint in full.joint_map.values():
+        child = joint.child
+        if (
+            joint.type != "prismatic"
+            or "_finger_" not in child
+            or child not in names
+            or joint.axis is None
+        ):
+            continue
+        k = names.index(child)
+        multiplier = 1.0 if joint.mimic is None else float(joint.mimic.multiplier)
+        axis[k] = np.asarray(joint.axis, dtype=np.float32) * multiplier
+        side[k] = 0 if child.startswith("left_") else 1
+        driver = joint if joint.mimic is None else full.joint_map[joint.mimic.joint]
+        travel = max(travel, float(driver.limit.upper))
+    return axis, side, travel
 
 
 def _measure_lift_shift(path: Path, names: list[str]) -> tuple[np.ndarray, float]:
@@ -245,51 +302,70 @@ def _measure_lift_shift(path: Path, names: list[str]) -> tuple[np.ndarray, float
     return shift, travel
 
 
+def _uses_primitives(urdf: yourdfpy.URDF) -> bool:
+    """Whether the IK collision is fitted boxes and capsules (no meshes)."""
+    geoms = [c.geometry for link in urdf.robot.links for c in link.collisions]
+    return bool(geoms) and all(g.mesh is None for g in geoms)
+
+
 def _build_robot_collision(
-    urdf: yourdfpy.URDF, torso: tuple[str, ...] = torso_links()
-) -> pk.collision.RobotCollision:
-    """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
+    urdf: yourdfpy.URDF,
+    torso: tuple[str, ...] = torso_links(),
+    link_names: tuple[str, ...] | None = None,
+) -> ArmBodyCollision:
+    """Build the collision model, restricted to torso<->arm pairs.
 
     Each Axol arm is a serial chain attached to a static torso (``torso``:
-    ``base`` + ``s1`` on the classic Axol, plus the lift column's top plate
-    and the ``head`` camera mount on the mobile one — see
-    :func:`almond_axol.constants.torso_links`). pyroki's PCA capsule fit
-    produces conservative single-capsule-per-link shapes that always overlap at adjacent-link joint interfaces,
-    so blanket self-collision causes persistent jitter the IK cannot
-    resolve. We restrict the active pair set to the only collisions that
-    actually matter: any link pair where exactly one side is the torso
-    and the other is an arm link. Within-arm, cross-arm, and torso<->torso
-    pairs are filtered out (cross-arm contacts are unreachable, within-arm
-    is constrained by joint limits, and torso<->torso is rigidly fixed).
+    ``base`` + ``s1`` on the classic Axol, plus the lift column, the deck and
+    the ``head`` camera mount on the mobile one — see
+    :func:`almond_axol.constants.torso_links`). The only collisions that
+    matter are an arm link against the torso: within-arm, cross-arm, and
+    torso<->torso pairs are left out (cross-arm contacts are unreachable,
+    within-arm is constrained by joint limits, and torso<->torso is rigidly
+    fixed).
 
-    Only the shoulder-mount links (``s2``/``s3``) are excluded. The old model
-    also discarded every distal pair whose conservative capsule happened to
-    overlap at the safe straight-down home pose. That removed ``base/s1 <->
-    e1`` — the upper-arm pair that physically contacted the base during a
-    cross-body reach — as well as ``base <-> w2``. The custom residual uses a
-    per-pair activation relative to home clearance, so those negative home
-    distances are usable: the cost is off at home and activates only when the
-    arm moves closer to the base than that known-safe reference.
+    Only the shoulder-mount links (``s2``/``s3``) are excluded. They mount
+    directly onto the torso, so their shapes overlap it by construction.
+    Distal pairs whose shapes overlap at the safe straight-down home pose
+    are kept: the custom residual activates each pair relative to its home
+    clearance (:func:`collision_cost_params`), so the cost is off at home
+    and comes on only when the arm moves closer to the body than that.
+
+    A URDF of fitted boxes and capsules (:func:`_uses_primitives`) collides
+    those, against ``link_names`` (the pyroki robot's link order); any other
+    collides pyroki's one capsule per link, fitted to its meshes.
     """
-    link_names = [link.name for link in urdf.robot.links]
     # Frame-only links (camera optical frames, the fingers' own frames) would
     # otherwise enter as zero-radius capsules at their origins.
     has_geometry = {link.name for link in urdf.robot.links if link.collisions}
 
     def is_arm(n: str) -> bool:
-        return (n.startswith("left_") or n.startswith("right_")) and n in has_geometry
+        return (
+            n.startswith(("left_", "right_"))
+            and n in has_geometry
+            and not n.endswith(_SHOULDER_MOUNT_SUFFIXES)
+        )
 
     def is_torso(n: str) -> bool:
         return n in torso
 
+    if _uses_primitives(urdf):
+        if link_names is None:
+            link_names = tuple(pk.Robot.from_urdf(urdf).links.names)
+        rc = ArmBodyCollision.from_primitives(urdf, link_names, is_arm, is_torso)
+        _logger.info(
+            "Arm/body collision: %d capsules and %d boxes, %d torso<->arm pairs.",
+            len(rc.capsule_link),
+            len(rc.box_link),
+            len(rc.active_idx_i),
+        )
+        return rc
+
+    names = [link.name for link in urdf.robot.links]
     ignore: set[tuple[str, str]] = set()
-    for i, a in enumerate(link_names):
-        for b in link_names[i + 1 :]:
-            keep = (is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))
-            arm_link = b if is_torso(a) else a if is_torso(b) else ""
-            if arm_link.endswith(_SHOULDER_MOUNT_SUFFIXES):
-                keep = False
-            if not keep:
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            if not ((is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))):
                 ignore.add((a, b))
 
     rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
@@ -297,7 +373,7 @@ def _build_robot_collision(
         "RobotCollision: restricted to %d torso<->arm pairs.",
         len(rc.active_idx_i),
     )
-    return rc
+    return ArmBodyCollision.from_pyroki(rc)
 
 
 _UPPER_ARM_GUARD_SLACK = 0.020
@@ -320,7 +396,10 @@ def upper_arm_guard_floor(home_clearance: float) -> float:
 
 
 def collision_cost_params(
-    robot: pk.Robot, rc: pk.collision.RobotCollision, default_margin: float
+    robot: pk.Robot,
+    rc: ArmBodyCollision,
+    default_margin: float,
+    home_shifts: tuple[jax.Array, ...] = (),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-pair ``(activation_start, ramp_width)`` for the smoothed collision cost.
 
@@ -332,12 +411,21 @@ def collision_cost_params(
     start where that start is generous, floored at ``_RAMP_WIDTH_MIN`` so
     near-shell pairs keep a protective gradient onset.
 
-    Cheap (one collision-distance evaluation), so callers compute it per
+    ``home_shifts``: further link shifts (see
+    :func:`~.solver.body_collision_distance`) the home pose is measured with,
+    the closest of all counting (the gripper open as well as closed), so no
+    pair is active at home in any of them.
+
+    Cheap (a few collision-distance evaluations), so callers compute it per
     solver instance rather than caching it here: the result depends on the
     configured ``default_margin``.
     """
+    from .solver import body_collision_distance
+
     q0 = jnp.zeros(robot.joints.num_actuated_joints)
     d = np.asarray(rc.compute_self_collision_distance(robot, q0))
+    for shift in home_shifts:
+        d = np.minimum(d, np.asarray(body_collision_distance(robot, rc, q0, shift)))
     starts = np.minimum(d - _MARGIN_REST_BUFFER, default_margin).astype(np.float32)
     widths = np.maximum(starts, _RAMP_WIDTH_MIN).astype(np.float32)
     _logger.info(

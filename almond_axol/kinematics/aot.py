@@ -43,7 +43,7 @@ _logger = logging.getLogger(__name__)
 EXPORT_DIR = Path.home() / ".almond" / "jax-cache" / "exports"
 
 # The code an export embeds: these modules' source goes into every digest.
-_SOURCES = ("solver.py", "model.py", "aot.py")
+_SOURCES = ("solver.py", "model.py", "collision.py", "aot.py")
 _PACKAGES = ("jax", "jaxlib", "pyroki", "jaxls")
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]+")
 

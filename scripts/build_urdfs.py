@@ -24,12 +24,14 @@ the viewers and physics simulators (Isaac Sim, MuJoCo) all load:
   wheels. With every body joint at zero the torso root is the world
   origin, so the world frame is the classic one.
 - **Two collision sets** (see ``MODEL_NOTE``): one convex hull per part in
-  ``<collision>``, for physics, and capsule-friendly pieces in the custom
-  ``<ik_collision>`` (pyroki fits one capsule per link): the shoulder bar,
-  the head-camera mount, the lift column's top plate and each section, the
-  Jelly deck and the Owl foot plate as strips, and each gripper's jaws as
-  one body over their whole motion. IK (``almond_axol.kinematics.model``)
-  freezes every joint but the arms' and collides the second set.
+  ``<collision>``, for physics, and the custom ``<ik_collision>``, which IK
+  (``almond_axol.kinematics.model``) collides with every joint but the arms'
+  frozen. On Jelly (``Body.ik_primitives``) these are a box or capsule
+  fitted to each part (see IK primitives); elsewhere, capsule-friendly
+  pieces pyroki fits one capsule per link to: the shoulder bar, the
+  head-camera mount, the lift column's top plate and each section, the Owl
+  foot plate as strips, and each gripper's jaws as one body over their
+  whole motion.
 - **Masses and drives** from :class:`~almond_axol.robot.config.AxolConfig`
   for the arms (wrist_3's lump split across the gripper parts), estimates
   elsewhere (``Body.masses``); friction and impedance gains on the arm
@@ -55,11 +57,19 @@ reuse its meshes::
     uv run --with fast-simplification python scripts/build_urdfs.py \\
         jelly/almond_urdf parcel/almond_urdf axol/almond_urdf \\
         owl/almond_urdf ox_cart/almond_urdf
+
+Without the exports, ``--refit-ik`` refits a generated URDF's IK shapes from
+its own part hulls (see :func:`refit_ik`)::
+
+    uv run python scripts/build_urdfs.py --refit-ik \\
+        almond_axol/kinematics/urdf/axol_jelly.urdf \\
+        almond_axol/kinematics/urdf/axol_jelly_parcel.urdf
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import itertools
 import re
 import textwrap
@@ -200,6 +210,11 @@ class Body:
     # The Jelly base drives in the plane: base_x / base_y / base_yaw joints
     # a simulator can drive.
     planar: bool = False
+    # IK collides shapes fitted to each part (see IK primitives) rather than
+    # meshes pyroki turns into one capsule per link: ik_hulls name the body
+    # links' pieces, flat parts need no strips, and the parallel gripper's
+    # fingers collide on their own links (IK moves them by the live opening).
+    ik_primitives: bool = False
 
 
 _TORSO_MASSES = {"s1": 3.0, "head": 0.3}
@@ -216,7 +231,7 @@ JELLY = Body(
         "wheel_3": "wheel_3_link",
         "wheel_1": "wheel_4_link",
     },
-    extra_links={"lift_plate": "base"},
+    extra_links={"lift_plate": "base", "deck": "jelly"},
     moving={
         "wheel_1_link": Moving("wheel", "wheel_1", "jelly"),
         "wheel_2_link": Moving("wheel_2", "wheel_2", "jelly"),
@@ -245,17 +260,19 @@ JELLY = Body(
         ),
         "Jelly_Stage_2.stl": (*_ALL, "column_mid", ""),
     },
-    # Each lift-column section rides its own stage.
+    # Each lift-column section rides its own stage. The deck stays on the
+    # ground while the lift carries the arms down, so it is in reach with the
+    # lift lowered (IK places it from the live lift height, see
+    # almond_axol.kinematics.model.lift_link_shift); it is its own link, so
+    # the upper-arm hard stop can leave it out.
     ik_hulls={
         "lift_plate": ("lift_plate",),
         "base": ("column_top",),
         "lift_stage": ("column_mid",),
         "jelly": ("column_stub",),
+        "deck": ("deck",),
     },
-    # The deck stays on the ground while the lift carries the arms down, so
-    # it is in reach with the lift lowered (IK places it from the live lift
-    # height, see almond_axol.kinematics.model.lift_link_shift).
-    strips={"deck": ("jelly", "deck", DECK_STRIPS)},
+    strips={},
     sim_hulls={
         "lift_plate": (("lift_plate",),),
         "base": (("column_top",),),
@@ -280,12 +297,17 @@ JELLY = Body(
     note=(
         "IK keeps the arms clear of the shoulder bar (s1), the head-camera "
         "mount (head), the lift column's top plate (lift_plate) and its three "
-        "sections (base, lift_stage, jelly), and the deck as strips (deck_*). "
-        "IK freezes the base and lift at zero, the lift fully raised, and "
-        "moves the parts the lift leaves behind (the deck and the lower "
-        "column) up to the arms by the live lift height."
+        "sections (base, lift_stage, jelly), and the deck (deck): a box or "
+        "capsule fitted to each part, against a capsule fitted to each arm "
+        "part (ik_collision cylinders are capsules: the radius, and the "
+        "straight section's length along the origin's z). IK freezes the "
+        "base and lift at zero, the lift fully raised, and moves the parts "
+        "the lift leaves behind (the deck and the lower column) up to the "
+        "arms by the live lift height; it freezes the fingers closed and "
+        "moves them by the live gripper opening."
     ),
     planar=True,
+    ik_primitives=True,
 )
 
 # Axol on its own: the shoulder bar and head, nothing below them.
@@ -421,8 +443,8 @@ MODEL_NOTE = (
     "With every body joint at zero the torso root (link root) is the "
     "world origin, so poses match the classic axol.urdf. IK "
     "(almond_axol.kinematics.model) freezes every joint but the arms' and "
-    "collides capsule-friendly pieces, the custom ik_collision elements, "
-    "instead of each part's collision hull; importers ignore them. {ik} "
+    "collides the custom ik_collision elements instead of each part's "
+    "collision hull; importers ignore them. {ik} "
     "Physics: arm joints carry AxolConfig's measured friction as <dynamics "
     "friction> (Coulomb, N·m) and damping (viscous, N·m·s/rad), per arm, and "
     "the motors' impedance gains as <drive stiffness> (kp, N·m/rad) and "
@@ -515,11 +537,18 @@ class Variant:
 
     @property
     def all_extra_links(self) -> dict[str, str]:
+        # The parallel gripper's fingers collide on their own links where IK
+        # collides fitted shapes (Body.ik_primitives).
+        fingers = (
+            {}
+            if self.body.ik_primitives and self.gripper == "parallel"
+            else FINGER_LINKS
+        )
         return {
             **HEAD_LINKS,
             **self.body.extra_links,
             **self.extra_links,
-            **FINGER_LINKS,
+            **fingers,
         }
 
     @property
@@ -906,7 +935,7 @@ class Frames:
         }
 
     def __call__(self, link: str) -> np.ndarray:
-        if link in self.variant.body.frame_links or link.startswith("deck_"):
+        if link in self.variant.body.frame_links or link.startswith("deck"):
             frame = np.eye(4)
             frame[:3, 3] = self.jelly_center
             return frame
@@ -1212,7 +1241,7 @@ def camera_frames(
 # -- collision -----------------------------------------------------------------
 
 
-Spec = tuple  # ("mesh", path) | ("cylinder", radius, length, xyz, rpy)
+Spec = tuple  # ("mesh", path) | ("cylinder", radius, length, xyz, rpy) | ("box", size, xyz, rpy)
 
 
 def _fit_cylinder(pts: np.ndarray, axis: int) -> tuple[float, float, np.ndarray]:
@@ -1232,6 +1261,138 @@ def _fit_cylinder(pts: np.ndarray, axis: int) -> tuple[float, float, np.ndarray]
     )
     half = max(float(overhang.max()), 0.0)
     return round(radius, 5), round(2 * half, 5), centre
+
+
+# -- IK primitives ----------------------------------------------------------
+# Where Body.ik_primitives is set, IK collides explicit shapes fitted to each
+# part's convex hull instead of a mesh pyroki turns into one capsule per link
+# (its bounding cylinder with a hemisphere added on each end, which overshoots
+# every part by a radius at both ends and swallows flat ones):
+# - arm links: capsules (<cylinder>: radius, and the straight section's
+#   length along the origin's z), the axis searched for the smallest one;
+# - body links: boxes (<box>, the hull's smallest oriented box) or capsules,
+#   whichever is smaller.
+# Every shape encloses its hull. (Cutting a part in two for two shapes buys
+# under 15% on every Jelly part: the arm links are rounded boxes, which a
+# capsule covers at about twice their volume.) See
+# almond_axol.kinematics.collision.
+
+# Clearance added to every fitted shape: covers the hull's 2 mm grid snap and
+# the URDF's 6-digit rounding.
+_IK_PAD = 1e-3
+_Z = np.array([0.0, 0.0, 1.0])
+
+
+def _ceil(x: float) -> float:
+    """``x`` rounded up to 0.01 mm, as the URDF stores it."""
+    return float(np.ceil(x * 1e5) / 1e5)
+
+
+def _rotation_z_to(axis: np.ndarray) -> np.ndarray:
+    """A rotation taking +z onto ``axis``."""
+    a = axis / np.linalg.norm(axis)
+    return trimesh.geometry.align_vectors(_Z, a)[:3, :3]
+
+
+def _origin(rot: np.ndarray, centre: np.ndarray) -> tuple[np.ndarray, str]:
+    return np.asarray(centre, dtype=float), _fmt(_rpy(rot))
+
+
+def _capsule_along(pts: np.ndarray, axis: np.ndarray) -> tuple[float, Spec]:
+    """The smallest capsule along ``axis`` enclosing ``pts``, and its volume.
+
+    The axis line goes through the centre of the points' smallest enclosing
+    circle across it; a larger radius sometimes buys a shorter straight
+    section, so a few are tried.
+    """
+    rot = _rotation_z_to(axis)
+    local = pts @ rot  # columns: across, across, along
+    centre2, r_min = trimesh.nsphere.minimum_nsphere(local[:, :2])
+    rho = np.linalg.norm(local[:, :2] - centre2, axis=1)
+    t = local[:, 2]
+    best: tuple[float, Spec] | None = None
+    for scale in (1.0, 1.03, 1.07, 1.12, 1.2, 1.3, 1.45):
+        r = float(r_min) * scale
+        cap = np.sqrt(np.maximum(r**2 - rho**2, 0.0))
+        # A point is covered when it is within its cap reach of the segment.
+        lo, hi = float((t + cap).min()), float((t - cap).max())
+        if hi < lo:
+            lo = hi = (lo + hi) / 2
+        length = hi - lo
+        # The pad goes on after the fit, so the ends keep it too.
+        r_out = _ceil(r + _IK_PAD)
+        volume = np.pi * r_out**2 * length + 4 / 3 * np.pi * r_out**3
+        if best is None or volume < best[0]:
+            centre = rot @ np.array([centre2[0], centre2[1], (lo + hi) / 2])
+            xyz, rpy = _origin(rot, centre)
+            best = (volume, ("cylinder", r_out, _ceil(length), xyz, rpy))
+    assert best is not None
+    return best
+
+
+def fit_capsule(pts: np.ndarray) -> tuple[float, Spec]:
+    """The smallest capsule enclosing ``pts`` (volume, spec).
+
+    Directions are searched in the points' principal axes, over a set closed
+    under flipping any axis, then refined locally: the fit does not depend on
+    the link's frame, so a part and a copy of it (the fingers, rotated rather
+    than mirrored between the grippers) get the same capsule.
+    """
+    from scipy.optimize import minimize
+
+    centred = pts - pts.mean(axis=0)
+    _, basis = np.linalg.eigh(centred.T @ centred)
+    golden = np.pi * (3 - np.sqrt(5))
+    k = np.arange(40) + 0.5
+    z = 1 - k / 40  # 40 directions over the upper hemisphere's first quadrant
+    rho = np.sqrt(1 - z**2)
+    octant = np.abs(np.c_[rho * np.cos(golden * k), rho * np.sin(golden * k), z])
+    signs = np.array([[1, 1, 1], [-1, 1, 1], [1, -1, 1], [-1, -1, 1]])
+    candidates = np.vstack([np.eye(3), *(octant * sg for sg in signs)])
+
+    def along(a_local: np.ndarray) -> tuple[float, Spec]:
+        return _capsule_along(pts, basis @ a_local)
+
+    scored = sorted(candidates, key=lambda a: along(a)[0])
+
+    def angles(a: np.ndarray) -> np.ndarray:
+        a = a / np.linalg.norm(a)
+        return np.array([np.arccos(np.clip(a[2], -1, 1)), np.arctan2(a[1], a[0])])
+
+    def direction(x: np.ndarray) -> np.ndarray:
+        return np.array(
+            [np.sin(x[0]) * np.cos(x[1]), np.sin(x[0]) * np.sin(x[1]), np.cos(x[0])]
+        )
+
+    best = along(scored[0])
+    for start in scored[:3]:
+        res = minimize(
+            lambda x: along(direction(x))[0],
+            angles(start),
+            method="Nelder-Mead",
+            options={"xatol": 1e-4, "fatol": 1e-9, "maxiter": 200},
+        )
+        fit = along(direction(res.x))
+        if fit[0] < best[0]:
+            best = fit
+    return best
+
+
+def fit_box(pts: np.ndarray) -> tuple[float, Spec]:
+    """The hull's smallest oriented box (volume, spec)."""
+    to_box, extents = trimesh.bounds.oriented_bounds(pts)
+    pose = np.linalg.inv(to_box)
+    size = np.array([_ceil(e + 2 * _IK_PAD) for e in extents])
+    xyz, rpy = _origin(pose[:3, :3], pose[:3, 3])
+    return float(np.prod(size)), ("box", size, xyz, rpy)
+
+
+def fit_ik_shape(hulls: list[trimesh.Trimesh], kinds: tuple[str, ...]) -> Spec:
+    """The smallest shape of ``kinds`` (``"capsule"``, ``"box"``) enclosing a
+    link's part hulls."""
+    fitters = {"capsule": fit_capsule, "box": fit_box}
+    pts = np.asarray(trimesh.util.concatenate(hulls).convex_hull.vertices)
+    return min((fitters[k](pts) for k in kinds), key=lambda f: f[0])[1]
 
 
 class Collision:
@@ -1342,6 +1503,79 @@ class Collision:
         return out
 
 
+def _spec_pose(spec: Spec) -> np.ndarray:
+    pose = trimesh.transformations.euler_matrix(
+        *(float(v) for v in spec[-1].split()), axes="sxyz"
+    )
+    pose[:3, 3] = spec[-2]
+    return pose
+
+
+def _mirrored_capsule(
+    spec: Spec, left: np.ndarray, right: np.ndarray, hulls: list[trimesh.Trimesh]
+) -> Spec | None:
+    """The left arm's capsule ``spec`` mirrored through the torso's x-z
+    plane onto the right link (``left`` / ``right``: the links' poses in the
+    torso frame), or None if it does not enclose the right part's ``hulls``."""
+    _, radius, length, _, _ = spec
+    pose = left @ _spec_pose(spec)
+    mirror = np.diag([1.0, -1.0, 1.0])
+    centre = np.linalg.inv(right) @ np.append(mirror @ pose[:3, 3], 1.0)
+    axis = np.linalg.inv(right)[:3, :3] @ (mirror @ pose[:3, 2])
+    rot = _rotation_z_to(axis)
+    # Enclosure check: every hull vertex within the radius of the segment.
+    pts = np.vstack([h.vertices for h in hulls])
+    a, b = centre[:3] - axis * length / 2, centre[:3] + axis * length / 2
+    t = np.clip((pts - a) @ (b - a) / max(length**2, 1e-12), 0.0, 1.0)
+    dist = np.linalg.norm(pts - (a + t[:, None] * (b - a)), axis=1)
+    if dist.max() > radius - _IK_PAD / 2:
+        return None
+    xyz, rpy = _origin(rot, centre[:3])
+    return ("cylinder", radius, length, xyz, rpy)
+
+
+def ik_primitive_plan(
+    variant: Variant,
+    hulls_of: Callable[[str, tuple[str, ...]], list[trimesh.Trimesh]],
+    pose_of: Callable[[str], np.ndarray],
+) -> dict[str, list[Spec]]:
+    """The IK shapes (link -> specs) of a body with ``ik_primitives``: a box
+    or capsule per body part, a capsule per arm part and (parallel gripper)
+    per finger. ``hulls_of(link, pieces)`` gives the pieces' convex hulls in
+    ``link``'s frame, ``pose_of(link)`` the link's pose in the torso frame
+    with every joint at zero. The right arm's capsules are the left's
+    mirrored, so the two sides clear the body alike; a right part the mirror
+    does not enclose (a finger) gets its own fit. The parcel gripper's plate
+    sweep is the caller's."""
+    body = variant.body
+    plan: dict[str, list[Spec]] = {}
+    for link, pieces in {
+        "s1": ("s1",),
+        **{h: (h,) for h in HEAD_LINKS},
+        **body.ik_hulls,
+    }.items():
+        plan[link] = [fit_ik_shape(hulls_of(link, pieces), ("box", "capsule"))]
+    arm = [*_ARM_PARTS, *variant.hulls]
+    if variant.gripper == "parallel":
+        arm += [n.split("_", 1)[1] for n in variant.moving if n.startswith("left_")]
+    for part in arm:
+        link = f"left_{part}"
+        plan[link] = [fit_ik_shape(hulls_of(link, (link,)), ("capsule",))]
+    for part in arm:
+        left, right = f"left_{part}", f"right_{part}"
+        hulls = hulls_of(right, (right,))
+        mirrored = _mirrored_capsule(
+            plan[left][0], pose_of(left), pose_of(right), hulls
+        )
+        if mirrored is None:
+            # The fingers: each gripper's are the other's turned, not
+            # mirrored, so they get their own fit.
+            print(f"  {right}: not the mirror of {left}, fitted on its own")
+            mirrored = fit_ik_shape(hulls, ("capsule",))
+        plan[right] = [mirrored]
+    return plan
+
+
 def collision_plan(kind: str, col: Collision) -> dict[str, list[Spec]]:
     """The model's collision bodies (link -> specs): ``"ik"`` the
     capsule-friendly set IK collides (<ik_collision>), ``"sim"`` one hull per
@@ -1363,6 +1597,18 @@ def collision_plan(kind: str, col: Collision) -> dict[str, list[Spec]]:
         side: tuple(n for n in variant.moving if n.startswith(f"{side}_"))
         for side in ("left", "right")
     }
+    if kind == "ik" and body.ik_primitives:
+        plan = ik_primitive_plan(
+            variant,
+            lambda link, pieces: [
+                trimesh.PointCloud(col.points(link, pieces)).convex_hull
+            ],
+            col.frames,
+        )
+        if variant.gripper == "parcel":
+            for side, parts in jaws.items():
+                plan[f"{side}_fingers"] = [col.plate_sweep(f"{side}_gripper", *parts)]
+        return plan
     if kind == "ik":
         for link, pieces in body.ik_hulls.items():
             plan[link] = [col.hull(link, pieces)]
@@ -1395,6 +1641,9 @@ def report(model: str, plan: dict[str, list[Spec]]) -> None:
                 print(
                     f"  {link:22s} cylinder r={spec[1] * 1e3:5.1f} mm h={spec[2] * 1e3:5.1f} mm"
                 )
+            elif spec[0] == "box":
+                size = " x ".join(f"{v * 1e3:.0f}" for v in spec[1])
+                print(f"  {link:22s} box {size} mm")
             else:
                 hull = trimesh.load(URDF_DIR / spec[1])
                 cyl = trimesh.bounds.minimum_cylinder(hull)
@@ -1547,6 +1796,11 @@ def _collision(element: ET.Element, tag: str, spec: Spec) -> None:
         ET.SubElement(col, "origin", xyz="0 0 0", rpy="0 0 0")
         geom = ET.SubElement(col, "geometry")
         ET.SubElement(geom, "mesh", filename=spec[1], scale="1 1 1")
+    elif spec[0] == "box":
+        _, size, xyz, rpy = spec
+        ET.SubElement(col, "origin", xyz=_fmt(xyz), rpy=rpy)
+        geom = ET.SubElement(col, "geometry")
+        ET.SubElement(geom, "box", size=" ".join(f"{v:g}" for v in size))
     else:
         _, radius, length, xyz, rpy = spec
         ET.SubElement(col, "origin", xyz=_fmt(xyz), rpy=rpy)
@@ -1574,6 +1828,38 @@ def _inertial(element: ET.Element, mass: float, com: np.ndarray, tensor) -> None
 # The planar base's two intermediate links carry no part; physics engines
 # want some mass on every moving link.
 _VIRTUAL_MASS = 0.01
+
+
+def _header(variant: Variant) -> str:
+    """The generated file's header comment."""
+    body = variant.body
+    gripper = (
+        "With the parcel gripper (AxolConfig.gripper = parcel): a fixed jaw "
+        "and a plate hinged on it, no wrist cameras. "
+        if variant.gripper == "parcel"
+        else ""
+    )
+    model_note = MODEL_NOTE.format(
+        body_joints=BODY_JOINTS_NOTE.get(body.key, ""),
+        gripper_joints=variant.gripper_joints,
+        ik=body.note,
+        wrist_parts=variant.wrist_parts_note,
+        sim=SIM_BODY_NOTE.get(body.key, ""),
+    )
+    note = (
+        f"{body.title}. GENERATED by scripts/build_urdfs.py "
+        "from the Onshape export; do not edit by hand. "
+        + gripper
+        + "Arm links, joints and "
+        "joint frames are the classic axol.urdf's, so FK and gravity "
+        "compensation match it exactly; joint limits and meshes are the "
+        "export's. "
+        + model_note
+        + " "
+        + (WRIST_CAMERA_NOTE if variant.wrist_cameras else HEAD_CAMERA_NOTE)
+    )
+    header = "<!-- " + textwrap.fill(note, 76, subsequent_indent="     ") + "\n-->\n"
+    return header
 
 
 def write_urdf(
@@ -1775,32 +2061,7 @@ def write_urdf(
             )
     ET.indent(tree, space="    ")
     xml = ET.tostring(robot, encoding="unicode")
-    gripper = (
-        "With the parcel gripper (AxolConfig.gripper = parcel): a fixed jaw "
-        "and a plate hinged on it, no wrist cameras. "
-        if variant.gripper == "parcel"
-        else ""
-    )
-    model_note = MODEL_NOTE.format(
-        body_joints=BODY_JOINTS_NOTE.get(body.key, ""),
-        gripper_joints=variant.gripper_joints,
-        ik=body.note,
-        wrist_parts=variant.wrist_parts_note,
-        sim=SIM_BODY_NOTE.get(body.key, ""),
-    )
-    note = (
-        f"{body.title}. GENERATED by scripts/build_urdfs.py "
-        "from the Onshape export; do not edit by hand. "
-        + gripper
-        + "Arm links, joints and "
-        "joint frames are the classic axol.urdf's, so FK and gravity "
-        "compensation match it exactly; joint limits and meshes are the "
-        "export's. "
-        + model_note
-        + " "
-        + (WRIST_CAMERA_NOTE if variant.wrist_cameras else HEAD_CAMERA_NOTE)
-    )
-    header = "<!-- " + textwrap.fill(note, 76, subsequent_indent="     ") + "\n-->\n"
+    header = _header(variant)
     out_path.write_text(header + xml + "\n")
     print(f"wrote {out_path.relative_to(REPO)}")
 
@@ -1870,12 +2131,104 @@ def build(args: argparse.Namespace, export_dir: Path) -> None:
     )
 
 
+# -- refit ----------------------------------------------------------------------
+
+
+def refit_ik(path: Path) -> None:
+    """Rewrite a generated URDF's IK collision as its body's
+    :func:`ik_primitive_plan`, fitted to the file's own part hulls
+    (``<collision>``), without the Onshape export. Everything else in the
+    file is left as it is, except the links the plan adds or drops (the deck
+    strips become one ``deck`` link; the parallel gripper's ``*_fingers``
+    link goes) and the header."""
+    variant = next((v for v in VARIANTS if v.output == path.resolve()), None)
+    if variant is None or not variant.body.ik_primitives:
+        raise SystemExit(f"{path}: not a generated URDF whose body has ik_primitives")
+    text = path.read_text()
+    root = ET.fromstring(text[text.index("-->") + 4 :])
+    full = yourdfpy.URDF.load(
+        str(path), build_collision_scene_graph=False, load_meshes=False
+    )
+    full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
+
+    # Every part hull in the file, by the pieces it was built from (see
+    # Collision.hull: "<link>__<pieces>_collision.stl", or "<link>_collision.stl"
+    # for a link's own part).
+    hulls: dict[tuple[str, ...], tuple[str, trimesh.Trimesh]] = {}
+    for link in root.findall("link"):
+        name = link.get("name")
+        for col in link.findall("collision"):
+            mesh = col.find("geometry/mesh")
+            if mesh is None:
+                continue
+            stem = Path(mesh.get("filename")).name.removesuffix("_collision.stl")
+            pieces = (
+                tuple(stem.split("__", 1)[1].split("_")) if "__" in stem else (stem,)
+            )
+            hull = trimesh.load(path.parent / mesh.get("filename"), force="mesh")
+            origin = col.find("origin")
+            pose = np.eye(4)
+            if origin is not None:
+                pose = trimesh.transformations.euler_matrix(
+                    *(float(v) for v in origin.get("rpy", "0 0 0").split()), axes="sxyz"
+                )
+                pose[:3, 3] = [float(v) for v in origin.get("xyz", "0 0 0").split()]
+            hulls[pieces] = (name, hull.apply_transform(pose))
+    by_name = {"_".join(k): v for k, v in hulls.items()}
+
+    def hulls_of(link: str, pieces: tuple[str, ...]) -> list[trimesh.Trimesh]:
+        owner, hull = by_name["_".join(pieces)]
+        to_link = np.linalg.inv(full.get_transform(link)) @ full.get_transform(owner)
+        return [hull.copy().apply_transform(to_link)]
+
+    # The links the plan adds and drops.
+    dropped = {f"deck_{i}" for i in range(DECK_STRIPS)}
+    if variant.gripper == "parallel":
+        dropped |= set(FINGER_LINKS)
+    added = {n: p for n, p in variant.all_extra_links.items() if n not in full.link_map}
+    for el in list(root):
+        if el.tag == "link" and el.get("name") in dropped:
+            root.remove(el)
+        elif el.tag == "joint" and el.find("child").get("link") in dropped:
+            root.remove(el)
+    anchor = list(root).index(root.find("link[@name='world']"))
+    for name, parent in added.items():
+        root.insert(anchor, ET.Element("link", name=name))
+        joint = ET.Element("joint", name=f"{name}_0", type="fixed")
+        ET.SubElement(joint, "origin", xyz="0 0 0", rpy="0 0 0")
+        ET.SubElement(joint, "parent", link=parent)
+        ET.SubElement(joint, "child", link=name)
+        root.insert(anchor + 1, joint)
+        anchor += 2
+    full = yourdfpy.URDF.load(
+        io.StringIO(ET.tostring(root, encoding="unicode")),
+        build_collision_scene_graph=False,
+        load_meshes=False,
+        mesh_dir=str(path.parent),
+    )
+    full.update_cfg({n: 0.0 for n in full.actuated_joint_names})
+
+    plan = ik_primitive_plan(variant, hulls_of, full.get_transform)
+    links = {ln.get("name"): ln for ln in root.findall("link")}
+    for name, link in links.items():
+        if name.endswith("_fingers"):
+            continue  # the parcel plate's sweep needs the export: kept
+        for el in link.findall("ik_collision"):
+            link.remove(el)
+        for spec in plan.get(name, []):
+            _collision(link, "ik_collision", spec)
+    ET.indent(root, space="    ")
+    path.write_text(_header(variant) + ET.tostring(root, encoding="unicode") + "\n")
+    report(path.name, plan)
+    print(f"refit {path.resolve().relative_to(REPO)}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument(
         "export_dirs",
         type=Path,
-        nargs="+",
+        nargs="*",
         help="Onshape exports (each contains urdf/ and meshes/), one per "
         "gripper; the parallel gripper's first, since the others reuse its "
         "body meshes",
@@ -1895,9 +2248,22 @@ def main() -> None:
         default=1.0,
         help="largest deviation from the CAD of every other visual mesh",
     )
+    ap.add_argument(
+        "--refit-ik",
+        type=Path,
+        nargs="+",
+        default=[],
+        metavar="URDF",
+        help="refit these generated URDFs' IK collision from their own part "
+        "hulls instead of building from exports (see refit_ik)",
+    )
     args = ap.parse_args()
+    if not args.export_dirs and not args.refit_ik:
+        ap.error("give Onshape exports or --refit-ik URDFs")
     for export_dir in args.export_dirs:
         build(args, export_dir)
+    for path in args.refit_ik:
+        refit_ik(path)
 
 
 if __name__ == "__main__":

@@ -147,12 +147,11 @@ _URDF_FILES: dict[AxolModel, str] = {
 # of the parallel gripper and its wrist camera.
 _PARCEL_URDF = "axol_jelly_parcel.urdf"
 
-# Static body links the arms must not collide into, per version. pyroki fits
-# one capsule per link, so the body is split into capsule-friendly pieces
-# (the IK collision set, <ik_collision>): the shoulder bar, the head-camera
-# mount, the lift column's top plate and each of its sections. (IK keeps the
-# lifts fully raised, where the Jelly deck and the Ox cart's caster frame
-# are out of reach — see the URDFs' headers.)
+# Static body links the arms must not collide into, per version: the shoulder
+# bar, the head-camera mount, the lift column's top plate and each of its
+# sections, each with its own IK collision shapes (<ik_collision>; see
+# almond_axol.kinematics.collision). (IK keeps the lifts fully raised, where
+# the Ox cart's caster frame is out of reach — see the URDFs' headers.)
 _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.CLASSIC: ("base", "s1"),
     AxolModel.STANDALONE: ("s1", "head"),
@@ -161,8 +160,8 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.OX_CART: ("base", "s1", "lift_plate", "head"),
     # The mount's column (base) and its foot plate as six strips.
     AxolModel.OWL: ("base", "s1", "head", *(f"foot_{i}" for i in range(6))),
-    # The lift column's sections and top plate, and the deck as three strips
-    # (in reach with the lift lowered).
+    # The lift column's sections and top plate, and the deck (in reach with
+    # the lift lowered).
     AxolModel.MOBILE: (
         "base",
         "s1",
@@ -170,7 +169,7 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
         "head",
         "lift_stage",
         "jelly",
-        *(f"deck_{i}" for i in range(3)),
+        "deck",
     ),
 }
 
@@ -202,12 +201,10 @@ def urdf_path(
 # ordinary poses even though the parts clear by ~5 cm, so it is kept off
 # the hard upper-arm guard (built for the upper arm swinging into the torso
 # cross-body); the soft collision cost still keeps the arms off it. The
-# Jelly deck's strips likewise: the deck rises toward the arms as the lift
-# lowers, and a hard stop there would pin an arm the lift brought down next
-# to it rather than let the soft cost ease it away.
-_UPPER_ARM_GUARD_EXEMPT = frozenset(
-    (*(f"foot_{i}" for i in range(6)), *(f"deck_{i}" for i in range(3)))
-)
+# Jelly deck likewise: it rises toward the arms as the lift lowers, and a
+# hard stop there would pin an arm the lift brought down next to it rather
+# than let the soft cost ease it away.
+_UPPER_ARM_GUARD_EXEMPT = frozenset((*(f"foot_{i}" for i in range(6)), "deck"))
 
 
 def upper_arm_guard_links(

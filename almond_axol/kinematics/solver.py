@@ -40,10 +40,12 @@ from ..constants import (
 )
 from ..settings import resolve_gripper, resolve_robot_model
 from .aot import ExportedJit
+from .collision import ArmBodyCollision
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
     collision_cost_params,
+    finger_slide,
     ik_urdf_xml,
     lift_link_shift,
     shared_robot,
@@ -201,38 +203,41 @@ def _axes_meet(
 # ---------------------------------------------------------------------------
 
 
+def shift_links(link_poses: jax.Array, link_shift: jax.Array) -> jax.Array:
+    """``link_poses`` (``(*batch, num_links, 7)``, wxyz_xyz) with each link
+    moved by its row of ``link_shift``: columns 0-2 a displacement in the
+    torso frame (the live lift height, :func:`.model.lift_link_shift`),
+    columns 3-5 (when present) one in the link's own frame (the live gripper
+    opening, :func:`.model.finger_slide`)."""
+    move = link_shift[..., :3]
+    if link_shift.shape[-1] == 6:
+        move = move + jaxlie.SO3(link_poses[..., :4]).apply(link_shift[..., 3:])
+    return link_poses.at[..., 4:].add(move)
+
+
 def body_collision_distance(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: ArmBodyCollision,
     cfg: jax.Array,
     link_shift: jax.Array | None = None,
 ) -> jax.Array:
     """Signed distance of each active arm/body pair at ``cfg``.
 
     ``robot_coll.compute_self_collision_distance``, with each link first
-    moved by its row of ``link_shift`` (``(num_links, 3)``, torso frame):
-    where the live lift height puts the parts the lift leaves behind (see
-    :func:`.model.lift_link_shift`). ``None``: the model as frozen.
+    moved by its row of ``link_shift`` (see :func:`shift_links`): where the
+    live lift height puts the parts the lift leaves behind, and the live
+    gripper opening the fingers. ``None``: the model as frozen.
     """
-    if link_shift is None:
-        return robot_coll.compute_self_collision_distance(robot, cfg)
     Ts = robot.forward_kinematics(cfg)
-    Ts = Ts.at[..., 4:].add(link_shift)
-    coll = robot_coll.coll.transform(
-        jaxlie.SE3(Ts[..., robot_coll._geom_to_link_idx, :])
-    )
-    idx_i = jnp.asarray(robot_coll.active_idx_i, dtype=jnp.int32)
-    idx_j = jnp.asarray(robot_coll.active_idx_j, dtype=jnp.int32)
-    return pk.collision.collide(
-        jax.tree.map(lambda x: x[..., idx_i, :], coll),
-        jax.tree.map(lambda x: x[..., idx_j, :], coll),
-    )
+    if link_shift is not None:
+        Ts = shift_links(Ts, link_shift)
+    return robot_coll.distances(Ts)
 
 
 def _self_collision_residual(
     vals: jaxls.VarValues,
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: ArmBodyCollision,
     joint_var: jaxls.Var[jax.Array],
     activation_start: jax.Array,
     ramp_width: jax.Array,
@@ -278,7 +283,7 @@ _self_collision_cost = jaxls.Cost.factory(_self_collision_residual)
 @jax.jit
 def _base_collision_safe_step(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    robot_coll: ArmBodyCollision,
     q_from: jax.Array,
     q_to: jax.Array,
     clearance_floor: jax.Array,
@@ -484,7 +489,7 @@ def _clamp_to_limits_np(
 @functools.partial(jax.jit, static_argnames=("max_iterations", "use_self_collision"))
 def _solve_ik(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision | None,
+    robot_coll: ArmBodyCollision | None,
     target_L: jaxlie.SE3 | None,
     target_R: jaxlie.SE3 | None,
     L_ee_idx: jax.Array,
@@ -882,15 +887,26 @@ class KinematicsSolver:
         # off, no collision model is built at all — the soft cost is left out
         # of the solve graph and the hard base guard below is skipped, so the
         # only geometric constraint on the arms is their joint limits.
-        self.robot_coll: pk.collision.RobotCollision | None = (
+        self.robot_coll: ArmBodyCollision | None = (
             shared_robot_collision(self.robot_model, gripper=self.gripper)
             if config.self_collision
             else None
         )
+        # The lift (see set_lift): IK freezes it fully raised; the collision
+        # checks move what it leaves behind by its live height. The fingers
+        # (see set_gripper): IK freezes them closed; the checks move them by
+        # the live opening, open until the first call.
+        self._lift_shift, self._lift_travel = lift_link_shift(
+            self.robot_model, gripper=self.gripper
+        )
+        self._lift_lowered = 0.0
+        self._finger_axis, self._finger_side, self._finger_travel = finger_slide(
+            self.robot_model, gripper=self.gripper
+        )
+        self._grip = (1.0, 1.0)
+        self._link_shift = self._make_link_shift()
         if self.robot_coll is not None:
-            starts, widths = collision_cost_params(
-                self.robot, self.robot_coll, config.self_collision_margin
-            )
+            starts, widths = self.collision_params(config.self_collision_margin)
         else:
             _logger.info("Self-collision (arm/base) detection is off.")
             starts = np.zeros(0, dtype=np.float32)
@@ -921,13 +937,6 @@ class KinematicsSolver:
                     clearance_floor[k] = upper_arm_guard_floor(home_distances[k])
         self._base_clearance_floor = jnp.asarray(clearance_floor)
         self._base_collision_guard_active = False
-        # The lift (see set_lift): IK freezes it fully raised; the collision
-        # checks move what it leaves behind by its live height.
-        self._lift_shift, self._lift_travel = lift_link_shift(
-            self.robot_model, gripper=self.gripper
-        )
-        self._lift_lowered = 0.0
-        self._link_shift = jnp.zeros(self._lift_shift.shape, dtype=jnp.float32)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -1048,7 +1057,59 @@ class KinematicsSolver:
         if abs(lowered - self._lift_lowered) < 1e-4:
             return
         self._lift_lowered = lowered
-        self._link_shift = jnp.asarray(self._lift_shift * lowered, dtype=jnp.float32)
+        self._link_shift = self._make_link_shift()
+
+    def set_gripper(self, left: float, right: float) -> None:
+        """Place the fingers for the live gripper opening.
+
+        IK freezes the fingers closed; each slides along its joint axis as
+        the gripper opens. ``left`` / ``right`` are the openings as fractions
+        (0 = closed, 1 = fully open, as teleop commands them). Until the
+        first call the grippers are taken as fully open. No effect on a
+        gripper without sliding fingers (the parcel gripper).
+        """
+        if self._finger_travel <= 0.0:
+            return
+        grip = tuple(min(max(float(g), 0.0), 1.0) for g in (left, right))
+        if max(abs(a - b) for a, b in zip(grip, self._grip)) < 1e-3:
+            return
+        self._grip = grip
+        self._link_shift = self._make_link_shift()
+
+    def collision_params(self, margin: float) -> tuple[np.ndarray, np.ndarray]:
+        """Per-pair ``(activation_start, ramp_width)`` of the collision cost
+        for a default ``margin`` (:func:`.model.collision_cost_params`), with
+        the home clearance taken over the fingers closed and open: whichever
+        the gripper holds at rest, no pair is active there."""
+        assert self.robot_coll is not None
+        return collision_cost_params(
+            self.robot,
+            self.robot_coll,
+            margin,
+            home_shifts=(
+                self._make_link_shift(0.0, (0.0, 0.0)),
+                self._make_link_shift(0.0, (1.0, 1.0)),
+            ),
+        )
+
+    def _make_link_shift(
+        self, lowered: float | None = None, grip: tuple[float, float] | None = None
+    ) -> jax.Array:
+        """The ``(num_links, 6)`` link shift (see :func:`shift_links`) for a
+        lift lowered by ``lowered`` (m) and gripper openings ``grip``
+        (fractions); the live values by default."""
+        lowered = self._lift_lowered if lowered is None else lowered
+        grip = self._grip if grip is None else grip
+        opening = np.where(
+            self._finger_side >= 0,
+            np.asarray(grip, dtype=np.float32)[np.maximum(self._finger_side, 0)],
+            0.0,
+        )
+        local = self._finger_axis * (opening * self._finger_travel)[:, None]
+        return jnp.asarray(
+            np.concatenate([self._lift_shift * lowered, local], axis=1),
+            dtype=jnp.float32,
+        )
 
     @property
     def lift_lowered(self) -> float:
@@ -1056,9 +1117,16 @@ class KinematicsSolver:
         return self._lift_lowered
 
     @property
+    def grip(self) -> tuple[float, float]:
+        """The gripper openings (fractions) the collision checks place the
+        fingers at (see :meth:`set_gripper`)."""
+        return self._grip
+
+    @property
     def link_shift(self) -> jax.Array:
-        """Per-link displacement (``(num_links, 3)``, torso frame) the live lift
-        height puts on the collision model (see :meth:`set_lift`)."""
+        """Per-link displacement (``(num_links, 6)``, see :func:`shift_links`)
+        the live lift height and gripper opening put on the collision model
+        (see :meth:`set_lift` and :meth:`set_gripper`)."""
         return self._link_shift
 
     @property

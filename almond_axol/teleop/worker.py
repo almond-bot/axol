@@ -1277,11 +1277,21 @@ class IKWorker:
             self._box = None
         setattr(self._config, key, coerced)
 
+    def set_gripper(self, left: float, right: float) -> None:
+        """The commanded gripper openings (``("grip", left, right)``
+        message, 0 = closed, 1 = open): where the collision checks put the
+        fingers (see :meth:`KinematicsSolver.set_gripper`). The Mink model
+        has no sliding fingers: ignored there."""
+        if not self._mink_backend:
+            self._solver.set_gripper(left, right)
+
     def set_lift(self, raised: float) -> None:
         """The live lift height (``("lift", raised)`` message): where the
         collision checks put the deck and lower column (see
-        :meth:`KinematicsSolver.set_lift`)."""
-        self._solver.set_lift(raised)
+        :meth:`KinematicsSolver.set_lift`). The Mink model has no lift:
+        ignored there."""
+        if not self._mink_backend:
+            self._solver.set_lift(raised)
 
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
@@ -2810,6 +2820,8 @@ def run_ik_worker(
                 worker.set_config(str(msg[1]), msg[2])
             elif isinstance(msg, tuple) and msg[0] == "lift":
                 worker.set_lift(float(msg[1]))
+            elif isinstance(msg, tuple) and msg[0] == "grip":
+                worker.set_gripper(float(msg[1]), float(msg[2]))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":

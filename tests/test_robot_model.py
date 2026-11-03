@@ -7,8 +7,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import numpy as np
-
 from almond_axol.constants import (
     MOUNTS,
     URDF_PATH,
@@ -157,11 +155,7 @@ class UrdfSelectionTest(unittest.TestCase):
                 }
                 # Frame-only links (camera frames, finger frames) have no
                 # geometry and take part in no pair.
-                solid = {
-                    n
-                    for n, r in zip(rc.link_names, np.asarray(rc.coll.radius))
-                    if r > 0
-                }
+                solid = rc.solid_links
                 arms = {
                     n
                     for n in solid
@@ -241,6 +235,10 @@ class CapsuleDistanceTest(unittest.TestCase):
                         a.replace("left_", "right_"),
                         b.replace("left_", "right_"),
                     )
+                    # Each gripper's fingers are the other's turned, not
+                    # mirrored: their capsules are not mirror images.
+                    if "_finger_" in a + b:
+                        continue
                     if "left_" in a + b:
                         # Within hull tolerance: each hull is snapped to a 2 mm grid
                         # (<= 1.7 mm per side); the bugs this guards read 22 and
