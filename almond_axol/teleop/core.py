@@ -62,6 +62,9 @@ from .tcp import AbsoluteTCPMapping
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 _RAW_TCP_MAX_AGE_S = 0.15  # same capture-age contract as managed tracker input
+# Gripper opening step (fraction of travel) worth telling the IK worker:
+# 1% is 0.6 mm of finger travel.
+_GRIP_SEND_STEP = 0.01
 
 # The arm joints box mode's squeeze cap (``VRTeleopConfig.box_squeeze_torque``)
 # applies to. In the side-clamp poses — arms hanging or reaching forward,
@@ -2226,12 +2229,18 @@ class VRTeleopCore:
                 lift lowers (``KinematicsSolver.set_lift``); until the first
                 reading the solver takes the lift as fully raised, and an
                 unknown height keeps the last one sent.
+
+        The commanded gripper openings (``l_grip`` / ``r_grip``) go to the
+        worker as ``("grip", left, right)`` whenever they move, so the
+        collision checks place the fingers where the gripper puts them
+        (``KinematicsSolver.set_gripper``).
         """
         ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0
         sent_lift: float | None = None
+        sent_grip: tuple[float, float] | None = None
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -2257,6 +2266,17 @@ class VRTeleopCore:
                         sent_lift = raised
                     except OSError:
                         pass  # the dead-process path below reports it
+
+            grip = (float(self.l_grip), float(self.r_grip))
+            if (
+                sent_grip is None
+                or max(abs(a - b) for a, b in zip(grip, sent_grip)) >= _GRIP_SEND_STEP
+            ):
+                try:
+                    conn.send(("grip", *grip))
+                    sent_grip = grip
+                except OSError:
+                    pass  # the dead-process path below reports it
 
             if self._record_raw_tcp:
                 with self._raw_tcp_lock:

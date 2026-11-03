@@ -22,14 +22,14 @@ import jaxls
 import numpy as np
 import pyroki as pk
 
-from ..kinematics.model import collision_cost_params
+from ..kinematics.collision import ArmBodyCollision
 from ..kinematics.solver import KinematicsSolver, _self_collision_cost
 
 
 @functools.partial(jax.jit, static_argnames=("max_iterations", "use_self_collision"))
 def solve_path_step(
     robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision | None,
+    robot_coll: ArmBodyCollision | None,
     q_interp: jax.Array,
     q_current: jax.Array,
     rest_weight: float,
@@ -145,9 +145,7 @@ def plan_collision_aware_trajectory(
 
     use_collision = solver.robot_coll is not None
     if use_collision:
-        starts, widths = collision_cost_params(
-            solver.robot, solver.robot_coll, collision_margin
-        )
+        starts, widths = solver.collision_params(collision_margin)
     else:
         starts = widths = np.zeros(0, dtype=np.float32)
     starts_jax, widths_jax = jnp.asarray(starts), jnp.asarray(widths)

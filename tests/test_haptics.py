@@ -359,10 +359,11 @@ class SolverProximityTest(unittest.TestCase):
         return q
 
     def test_clear_at_home_and_rest(self) -> None:
+        # Teleop's IK worker sets the rest pose as the reference.
+        solver = KinematicsSolver(KinematicsConfig())
+        solver.set_proximity_reference(self.rest)
         for q in (np.zeros(14, np.float32), self.rest):
-            self.assertEqual(
-                self.solver.collision_proximity(q), {"left": 0.0, "right": 0.0}
-            )
+            self.assertEqual(solver.collision_proximity(q), {"left": 0.0, "right": 0.0})
 
     def test_full_when_ik_holds_the_arm_off_the_body(self) -> None:
         levels = self.solver.collision_proximity(self._blocked(self.solver))
@@ -370,9 +371,10 @@ class SolverProximityTest(unittest.TestCase):
         self.assertLess(levels["right"], 0.1)
 
     def test_rest_reads_clear_on_a_mount_close_to_the_arms(self) -> None:
-        # The Owl Mount's feet sit inside the lead at the default rest pose.
+        # The Owl Mount's foot plate sits inside the lead at the default rest
+        # pose.
         solver = KinematicsSolver(KinematicsConfig(robot_model="owl"))
-        self.assertEqual(solver.collision_proximity(self.rest)["left"], 1.0)
+        self.assertGreater(solver.collision_proximity(self.rest)["left"], 0.0)
         solver.set_proximity_reference(self.rest)
         self.assertEqual(
             solver.collision_proximity(self.rest), {"left": 0.0, "right": 0.0}

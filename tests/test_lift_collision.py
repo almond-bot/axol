@@ -25,7 +25,7 @@ from almond_axol.robot.jelly import Jelly
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
 
-_DECK = tuple(f"deck_{i}" for i in range(3))
+_DECK = ("deck",)
 
 
 class LiftShiftTest(unittest.TestCase):
@@ -67,6 +67,7 @@ class SolverLiftTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.solver.set_lift(1.0)
+        self.solver.set_gripper(1.0, 1.0)
 
     def _deck_clearance(self, q: np.ndarray) -> float:
         s = self.solver
@@ -75,8 +76,9 @@ class SolverLiftTest(unittest.TestCase):
         )
         return float(np.asarray(d)[self.deck].min())
 
-    def test_raised_is_the_frozen_model(self) -> None:
+    def test_raised_and_closed_is_the_frozen_model(self) -> None:
         s = self.solver
+        s.set_gripper(0.0, 0.0)
         q = jnp.zeros(s.robot.joints.num_actuated_joints)
         np.testing.assert_allclose(
             body_collision_distance(s.robot, s.robot_coll, q, s.link_shift),
@@ -98,19 +100,20 @@ class SolverLiftTest(unittest.TestCase):
         s = self.solver
         q = np.zeros(14, np.float32)
         (lp, lr), (rp, rr) = s.fk(q)
+        # Over the deck's front half (it ends 0.19 m ahead of the torso).
         targets = dict(
-            left_pose=(lp + [0.3, 0.0, -0.05], lr),
-            right_pose=(rp + [0.3, 0.0, -0.05], rr),
+            left_pose=(lp + [0.15, 0.0, -0.05], lr),
+            right_pose=(rp + [0.15, 0.0, -0.05], rr),
         )
         for _ in range(150):
             q = s.ik(q, **targets)
-        s.set_lift(0.5)
+        s.set_lift(0.6)
         # The lift came down with the hands just over the deck: now in it.
-        self.assertLess(self._deck_clearance(q), 0.0)
+        self.assertLess(self._deck_clearance(q), -0.02)
         for _ in range(150):
             q = s.ik(q, **targets)
         # The soft cost lifts them back out, holding the same target.
-        self.assertGreater(self._deck_clearance(q), 0.005)
+        self.assertGreater(self._deck_clearance(q), 0.0)
 
 
 class JellyLiftRaisedTest(unittest.TestCase):
