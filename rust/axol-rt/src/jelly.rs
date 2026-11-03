@@ -595,6 +595,36 @@ struct Wheels {
     answered: [bool; 4],
 }
 
+/// Continuous wheel angles for the status packet (rad, zero at the first
+/// feedback of the session). Damiao feedback folds each position into ±PMAX;
+/// samples taken a status interval apart are far closer than one fold, so the
+/// shortest step between two of them is the wheel's true motion.
+#[derive(Default)]
+struct Odometer {
+    last: Option<[f64; 4]>,
+    total: [f64; 4],
+}
+
+impl Odometer {
+    fn update(&mut self, pos: &[f64; 4], ranges: &[MitRanges; 4]) -> [f64; 4] {
+        match self.last {
+            None => self.total = [0.0; 4],
+            Some(last) => {
+                for i in 0..4 {
+                    let span = 2.0 * ranges[i].p_max;
+                    let mut step = pos[i] - last[i];
+                    if span > 0.0 {
+                        step -= span * (step / span).round();
+                    }
+                    self.total[i] += step;
+                }
+            }
+        }
+        self.last = Some(*pos);
+        self.total
+    }
+}
+
 impl Wheels {
     fn any_tripped(&self) -> bool {
         self.status.iter().any(|s| recoverable(*s))
@@ -918,6 +948,7 @@ fn control_loop(
     let mut yaw_bias = 0.0;
     let mut next = Instant::now() + period;
     let mut next_status = Instant::now();
+    let mut odometer = Odometer::default();
     let mut enobufs = None;
     // The enable sequence above was echoed with feedback frames; drop them so
     // the reply count below is for these zero-velocity frames.
@@ -1236,7 +1267,10 @@ fn control_loop(
                 }
             }
             if now >= next_status {
-                next_status = now + Duration::from_millis(50);
+                // Every tick at the default 50 Hz, so a dataset recording the
+                // wheel positions at 30 fps sees a fresh sample each frame.
+                next_status = now + Duration::from_millis(20);
+                let wheel_pos = odometer.update(&wheels.pos, &wheels.ranges);
                 let mut p = vec![b'U'];
                 for v in cmd
                     .into_iter()
@@ -1252,6 +1286,9 @@ fn control_loop(
                         | ((linked as u8) << 3)
                         | ((!wheels_ok as u8) << 4),
                 );
+                for v in wheel_pos {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
                 write_message(output, &p)?;
             }
         }
@@ -1285,6 +1322,26 @@ mod tests {
 
     fn test_config() -> Config {
         parse_config(&wire(PY_CONFIG)).unwrap()
+    }
+
+    #[test]
+    fn odometer_unwraps_folded_feedback() {
+        let ranges = [MitRanges {
+            p_max: PMAX,
+            v_max: 45.0,
+            kp_max: 500.0,
+            kd_max: 5.0,
+            t_max: 18.0,
+        }; 4];
+        let mut odo = Odometer::default();
+        assert_eq!(odo.update(&[1.0, -2.0, 399.5, -399.5], &ranges), [0.0; 4]);
+        // Wheels 3 and 4 cross the fold: the feedback jumps by 2·PMAX but the
+        // wheel only moved one radian.
+        let total = odo.update(&[1.5, -2.5, -399.5, 399.5], &ranges);
+        let expected = [0.5, -0.5, 1.0, -1.0];
+        for (got, want) in total.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-9, "{got} != {want}");
+        }
     }
 
     #[test]

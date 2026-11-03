@@ -107,6 +107,11 @@ _YAW_TRACE_HZ = 10.0
 # rail, so the battery estimate holds its resting value while driving.
 _WHEEL_LOAD_RAD_S = 0.5
 
+# Rust core status packet: b"U", 10 doubles and a flag byte, then optionally
+# the four measured wheel positions (an older core omits them).
+_STATUS_SIZE = 1 + 10 * 8 + 1
+_STATUS_SIZE_WITH_POSITIONS = _STATUS_SIZE + 4 * 8
+
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before Jelly says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
@@ -524,6 +529,10 @@ class Jelly:
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        # Measured wheel angles in rad (ids 1-4), continuous across the
+        # feedback's ±PMAX fold and zero at the session's first reading.
+        # None until the Rust core reports them.
+        self.wheel_positions: list[float] | None = None
         self.yaw_correction: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
@@ -939,10 +948,17 @@ class Jelly:
                     )
                     self._ready.set()
                     continue
-                if payload[:1] != b"U" or len(payload) != 82:
+                if payload[:1] != b"U" or len(payload) not in (
+                    _STATUS_SIZE,
+                    _STATUS_SIZE_WITH_POSITIONS,
+                ):
                     _logger.warning("Jelly Rust core sent an invalid status packet")
                     continue
-                *values, flags = struct.unpack("<10dB", payload[1:])
+                *values, flags = struct.unpack("<10dB", payload[1:_STATUS_SIZE])
+                if len(payload) == _STATUS_SIZE_WITH_POSITIONS:
+                    self.wheel_positions = list(
+                        struct.unpack("<4d", payload[_STATUS_SIZE:])
+                    )
                 self.body_cmd = tuple(values[:3])
                 self.wheel_speeds = list(values[3:7])
                 self.yaw_correction = values[7]

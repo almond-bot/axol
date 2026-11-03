@@ -178,7 +178,7 @@ The control panel can take the same actions. See [Driving from the panel](#drivi
 | 6 | A | **Record**: start a take after a 3-second countdown. During a take, asks **Save episode?** |
 | 7 | Y | **Exit** the VR session. |
 | | Right **B** | **Reset the camera screens** to where you are looking. See [Camera views](/guides/vr-interface#camera-views). |
-| | Thumbsticks | **Drive [Jelly](/guides/vr-interface#jelly)** between takes, on Axol on Jelly. Jelly motion is never recorded. |
+| | Thumbsticks | **Drive [Jelly](/guides/vr-interface#jelly)** between takes, on Axol on Jelly. To record the lift and wheels, see [Record Jelly](#record-jelly). |
 
 The camera feeds are shown in the headset, so you can line up takes from the robot's view.
 
@@ -259,6 +259,21 @@ When a take ends without being saved, the **Episode control** box shows the reas
 - **Takes with dropped video frames are discarded.** If the camera encoder drops frames under heavy load, the video doesn't match the recorded rows. Axol discards that take and logs why. The session keeps running, so record the take again.
 
 See the [VR Interface](/guides/vr-interface) guide for every controller binding and headset state.
+
+## Record Jelly
+
+On Axol on Jelly, turn on **Record Jelly** in the **Recording** settings to also record the lift and the wheels (`--record_jelly true` on the command line). It is off by default.
+
+Each frame then has an `observation.jelly` column next to `observation.state`:
+
+| Name | Value |
+|---|---|
+| `jelly_lift.pos` | Lift height as a fraction of its travel. `0` is fully lowered and `1` is fully raised. |
+| `jelly_wheel_1.pos` to `jelly_wheel_4.pos` | Angle of each wheel in radians, counted from where it was when the session started. Wheel 1 is front-left, 2 front-right, 3 back-left and 4 back-right. |
+
+`observation.state` doesn't change, so a policy trained on the arms alone still runs with [Run Policy](/operations/run-policy).
+
+The session won't start unless Jelly's wheels and lift are both on and reporting. If the lift has never been homed, run **Home the lift** first. Keep the setting the same for every session that adds to one dataset.
 
 ## Upload to the HuggingFace Hub
 

@@ -817,6 +817,10 @@ class CollectDataConfig:
     # episodes read poses from joint encoders and always pass. A tracking
     # fault under the strict Lighthouse policy is refused regardless.
     qa_gate: bool = True
+    # Also record Jelly's lift height and wheel positions, as the
+    # ``observation.jelly`` column (see almond_axol.recording.jelly_state).
+    # Needs Axol on Jelly with its wheels and lift on. Ignored with Mantis.
+    record_jelly: bool = False
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
@@ -1652,6 +1656,28 @@ def _run_session(
     else:
         trace_prefix = None
 
+    # Jelly's lift and wheels are recorded only on the robot: a Mantis rig
+    # has no Jelly. Check the hardware before anything opens.
+    # getattr: a downstream package may hand in a config without the field.
+    want_jelly = bool(getattr(cfg, "record_jelly", False))
+    record_jelly = want_jelly and not mantis_mode
+    if want_jelly and mantis_mode:
+        _logger.warning("Record Jelly is on but ignored: Mantis has no Jelly.")
+    jelly_extra_features: dict[str, dict[str, Any]] = {}
+    jelly_state: Any = None
+    if record_jelly:
+        from ..recording.jelly_state import jelly_config_problem, jelly_features
+        from ..robot.jelly import detect_jelly
+
+        jelly_cfg = (
+            detect_jelly(cfg.teleop_config.jelly)
+            if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+            else None
+        )
+        if (problem := jelly_config_problem(jelly_cfg)) is not None:
+            raise ValueError(problem)
+        jelly_extra_features = jelly_features()
+
     robot = (
         MantisRobot(cfg.robot_config, defer_gripper_enable=True)
         if mantis_mode
@@ -1714,7 +1740,7 @@ def _run_session(
         resume_extras = (
             {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
             if mantis_mode
-            else None
+            else dict(jelly_extra_features) or None
         )
         expected_resume_features = dataset_features_for_robot(
             robot,
@@ -1890,10 +1916,14 @@ def _run_session(
         extra_features = (
             {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
             if mantis_mode
-            else None
+            else dict(jelly_extra_features) or None
         )
         features = dataset_features_for_robot(robot, extra_features=extra_features)
         obs_keys = list(robot.get_joint_observation().keys())
+        if record_jelly:
+            from ..recording.jelly_state import JELLY_KEYS
+
+            obs_keys += list(JELLY_KEYS)
         action_keys = list(robot.action_features.keys())
         if is_complete:
             # External relay readers expose the actual downscaled dataset
@@ -1922,6 +1952,15 @@ def _run_session(
         # hand the teleoperator the arms now that the robot is up.
         teleop.live_settings.set_robot(robot.axol)
         teleop.measured_robot = robot.axol
+        if record_jelly:
+            # Jelly is up with the teleop. Every recorded row needs a lift and
+            # wheel reading, so wait for the first of each now.
+            from ..recording.jelly_state import JellyStateReader
+
+            if teleop.jelly is None:
+                raise RuntimeError("Record Jelly is on, but Jelly did not start.")
+            jelly_state = JellyStateReader(teleop.jelly)
+            jelly_state.wait_ready()
         try:
             activity.start()
         except OSError as exc:
@@ -2420,7 +2459,7 @@ def _run_session(
             last_robot_act = robot_act
             last_dataset_act = dataset_act
             if not mantis_mode:
-                recorder.publish(joint_obs, dataset_act, row_ts)
+                recorder.publish(_with_jelly(joint_obs), dataset_act, row_ts)
             elif (
                 last_tcp is not None
                 and pose_ts is not None
@@ -2501,7 +2540,14 @@ def _run_session(
             if mantis_mode:
                 _publish_mantis_boundary(joint_obs)
             else:
-                recorder.publish(joint_obs, last_dataset_act, t0)
+                recorder.publish(_with_jelly(joint_obs), last_dataset_act, t0)
+
+        def _with_jelly(observation: dict[str, Any]) -> dict[str, Any]:
+            # Record Jelly: the lift and wheel readings ride along with the
+            # arm state into the observation.jelly column.
+            if jelly_state is None:
+                return observation
+            return {**observation, **jelly_state.read()}
 
         def _publish_mantis_boundary(gripper_obs: dict[str, Any]) -> None:
             # Closing capture may still consume final camera exposures. Their
