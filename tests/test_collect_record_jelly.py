@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import unittest
 from unittest import mock
 
@@ -37,6 +39,29 @@ class RecordJellyPreflightTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no Jelly is attached"):
                 collect_data._run_session(cfg)
         robot_cls.assert_not_called()
+
+
+class RecordJellyEpisodeZeroTest(unittest.TestCase):
+    def test_wheels_are_zeroed_before_capture_opens(self) -> None:
+        session = ast.parse(inspect.getsource(collect_data._run_session))
+        start = next(
+            node
+            for node in ast.walk(session)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "_start_recording"
+        )
+        zero_line = next(
+            node.lineno
+            for node in ast.walk(start)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "jelly_state.zero_wheels"
+        )
+        capture_line = next(
+            node.lineno
+            for node in ast.walk(start)
+            if isinstance(node, ast.Name) and node.id == "_start_capture"
+        )
+        self.assertLess(zero_line, capture_line)
 
 
 if __name__ == "__main__":

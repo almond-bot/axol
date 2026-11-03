@@ -135,6 +135,7 @@ def _run_take(
         "_RIGHT_EE_KEYS": _RIGHT_EE_KEYS,
         "cfg": SimpleNamespace(mantis_source="lighthouse", _lighthouse_quality=policy),
         "mantis_mode": True,
+        "jelly_state": None,
         "teleop": teleop,
         "robot": robot,
         "recorder": recorder,

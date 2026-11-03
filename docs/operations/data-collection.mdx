@@ -269,7 +269,7 @@ Each frame then has an `observation.jelly` column next to `observation.state`:
 | Name | Value |
 |---|---|
 | `jelly_lift.pos` | Lift height as a fraction of its travel. `0` is fully lowered and `1` is fully raised. |
-| `jelly_wheel_1.pos` to `jelly_wheel_4.pos` | Angle of each wheel in radians, counted from where it was when the session started. Wheel 1 is front-left, 2 front-right, 3 back-left and 4 back-right. |
+| `jelly_wheel_1.pos` to `jelly_wheel_4.pos` | Angle of each wheel in radians since the episode started. Each episode starts at `0`. Wheel 1 is front-left, 2 front-right, 3 back-left and 4 back-right. |
 
 `observation.state` doesn't change, so a policy trained on the arms alone still runs with [Run Policy](/operations/run-policy).
 

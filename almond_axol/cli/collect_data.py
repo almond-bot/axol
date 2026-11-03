@@ -2724,6 +2724,11 @@ def _run_session(
             # tick watchdog so a stall is attributed, not just detected.
             take_gc.begin(collect=False)
             tick_watchdog.resume()
+            if jelly_state is not None:
+                # Record Jelly: each episode's wheel angles start at zero.
+                # Zero before capture opens, so no recorded row can pair
+                # with a reading from before the reset.
+                jelly_state.zero_wheels()
             # Arm recorder cutoffs before opening the shared-timestamp
             # dataset valves. Both calls can wait for transport boundaries,
             # so run them off-loop while normal teleop ticks continue

@@ -9,7 +9,7 @@ name                      value
 ``jelly_lift.pos``        lift height as a fraction of its travel (0 = down)
 ``jelly_wheel_<n>.pos``   wheel ``n``'s measured angle in rad (ids 1-4, see
                           :mod:`almond_axol.robot.jelly`), continuous across
-                          turns and zero where the session started
+                          turns and zero at the start of each episode
 ========================  ==================================================
 
 It is a separate column rather than more entries in ``observation.state`` so
@@ -72,12 +72,18 @@ class JellyStateReader:
     The lift reports a few times a second and is briefly unknown when a status
     frame is late, so each part holds its last reading. :meth:`wait_ready`
     makes sure there is a first reading before any row is recorded.
+
+    The wheel angles are relative to the last :meth:`zero_wheels`. Call it
+    before each episode's capture opens, so every episode starts at zero
+    however far the base was driven between takes. The lift stays absolute:
+    its height is a physical state of the scene.
     """
 
     def __init__(self, jelly: Any) -> None:
         self._jelly = jelly
         self._lift: float | None = None
         self._wheels: tuple[float, ...] | None = None
+        self._wheel_origin: tuple[float, ...] = (0.0,) * len(WHEEL_KEYS)
 
     def _refresh(self) -> None:
         lift = self._jelly.lift_raised
@@ -121,9 +127,20 @@ class JellyStateReader:
             + ". Fix this and start again, or turn off Record Jelly."
         )
 
+    def zero_wheels(self) -> None:
+        """Make the wheels' current angles read as zero from now on."""
+        self._refresh()
+        if self._wheels is None:
+            raise RuntimeError("Jelly wheels zeroed before their first reading")
+        self._wheel_origin = self._wheels
+
     def read(self) -> dict[str, float]:
         """The latest values by dataset name. Call :meth:`wait_ready` first."""
         self._refresh()
         if self._lift is None or self._wheels is None:
             raise RuntimeError("Jelly state read before its first reading")
-        return {LIFT_KEY: self._lift, **dict(zip(WHEEL_KEYS, self._wheels))}
+        wheels = (
+            angle - origin
+            for angle, origin in zip(self._wheels, self._wheel_origin, strict=True)
+        )
+        return {LIFT_KEY: self._lift, **dict(zip(WHEEL_KEYS, wheels))}

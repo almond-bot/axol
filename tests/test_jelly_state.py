@@ -66,6 +66,28 @@ class JellyStateReaderTest(unittest.TestCase):
         self.assertEqual(values["jelly_lift.pos"], 0.25)
         self.assertEqual(values["jelly_wheel_4.pos"], -0.4)
 
+    def test_each_episode_starts_the_wheels_at_zero(self) -> None:
+        jelly = _FakeJelly()
+        jelly.lift_raised = 0.75
+        jelly.wheel_positions = [10.0, -20.0, 30.0, -40.0]
+        reader = JellyStateReader(jelly)
+        reader.wait_ready(timeout_s=0.0)
+        reader.zero_wheels()
+        values = reader.read()
+        self.assertEqual([values[k] for k in JELLY_KEYS[1:]], [0.0] * 4)
+        # The lift stays absolute.
+        self.assertEqual(values["jelly_lift.pos"], 0.75)
+
+        jelly.wheel_positions = [11.0, -21.5, 30.0, -38.0]
+        values = reader.read()
+        self.assertEqual([values[k] for k in JELLY_KEYS[1:]], [1.0, -1.5, 0.0, 2.0])
+
+        # Driving between takes doesn't carry into the next episode.
+        jelly.wheel_positions = [50.0, -60.0, 70.0, -80.0]
+        reader.zero_wheels()
+        values = reader.read()
+        self.assertEqual([values[k] for k in JELLY_KEYS[1:]], [0.0] * 4)
+
     def test_dataset_frame_fills_the_column(self) -> None:
         from lerobot.utils.feature_utils import build_dataset_frame
 
