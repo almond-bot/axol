@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import struct
 from collections.abc import Mapping
@@ -20,12 +21,22 @@ from .driver import MotorDriver
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
 
+logger = logging.getLogger(__name__)
+
 
 class _DamiaoStatus(Enum):
-    """Raw Damiao status/error codes (feedback frame byte 0, high nibble)."""
+    """Raw Damiao status/error codes (feedback frame byte 0, high nibble).
+
+    From the DM-J4310-2EC V1.2 manual's LED status table. Its feedback-frame
+    section omits 0x3-0x5, but the motors do report them (a Mantis gripper
+    sent 0x3 with its LED flashing red).
+    """
 
     DISABLED = 0x0
     ENABLED = 0x1
+    OUTPUT_SHAFT_CALIBRATION_ERROR = 0x3
+    SENSOR_ERROR = 0x4
+    MOTOR_ENCODER_CALIBRATION_ERROR = 0x5
     OVER_VOLTAGE = 0x8
     UNDER_VOLTAGE = 0x9
     OVER_CURRENT = 0xA
@@ -39,7 +50,9 @@ class _DamiaoStatus(Enum):
 class _MotorFeedback:
     """Decoded fields from a single Damiao feedback frame."""
 
-    status: _DamiaoStatus
+    # The raw nibble when it is not a documented code, so an unrecognized
+    # fault reads as UNKNOWN (not healthy) and its value can be logged.
+    status: _DamiaoStatus | int
     position: float  # rad (motor internal)
     velocity: float  # rad/s
     torque: float  # Nm
@@ -63,9 +76,25 @@ _DM_REG_SPEED_KI = 26  # KI_ASR — speed loop integral gain
 _DM_REG_POS_KP = 27  # KP_APR — position loop proportional gain
 _DM_REG_POS_KI = 28  # KI_APR — position loop integral gain
 
-_DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
+
+def _decode_status(code: int) -> _DamiaoStatus | int:
+    """Feedback status nibble as a :class:`_DamiaoStatus`, or the raw int if undocumented."""
+    try:
+        return _DamiaoStatus(code)
+    except ValueError:
+        return code
+
+
+_DM_STATUS_MAP: dict[_DamiaoStatus | int, MotorStatus] = {
     _DamiaoStatus.DISABLED: MotorStatus.DISABLED,
     _DamiaoStatus.ENABLED: MotorStatus.OK,
+    _DamiaoStatus.OUTPUT_SHAFT_CALIBRATION_ERROR: (
+        MotorStatus.OUTPUT_SHAFT_CALIBRATION_ERROR
+    ),
+    _DamiaoStatus.SENSOR_ERROR: MotorStatus.SENSOR_ERROR,
+    _DamiaoStatus.MOTOR_ENCODER_CALIBRATION_ERROR: (
+        MotorStatus.MOTOR_ENCODER_CALIBRATION_ERROR
+    ),
     _DamiaoStatus.OVER_VOLTAGE: MotorStatus.OVER_VOLTAGE,
     _DamiaoStatus.UNDER_VOLTAGE: MotorStatus.UNDER_VOLTAGE,
     _DamiaoStatus.OVER_CURRENT: MotorStatus.OVER_CURRENT,
@@ -113,6 +142,9 @@ class DamiaoMotor(MotorDriver):
         self._feedback_id = feedback_id
 
         self._feedback: _MotorFeedback | None = None
+        # Last undocumented status code logged, so a motor stuck on one
+        # code logs it once rather than on every feedback frame.
+        self._logged_unknown_status: int | None = None
         self._registers: dict[int, float | int] = {}
         self._feedback_waiters: list[asyncio.Future[_MotorFeedback]] = []
         self._register_waiters: dict[int, asyncio.Future[float | int]] = {}
@@ -193,10 +225,17 @@ class DamiaoMotor(MotorDriver):
         vel_int = (data[3] << 4) | (data[4] >> 4)
         torq_int = ((data[4] & 0xF) << 8) | data[5]
 
-        try:
-            status = _DamiaoStatus(status_code)
-        except ValueError:
-            status = _DamiaoStatus.DISABLED
+        status = _decode_status(status_code)
+        if isinstance(status, _DamiaoStatus):
+            self._logged_unknown_status = None
+        elif status != self._logged_unknown_status:
+            self._logged_unknown_status = status
+            logger.warning(
+                "Damiao motor %#04x reports undocumented status code %#x; "
+                "treating it as a fault",
+                self._motor_id,
+                status,
+            )
 
         self._feedback = _MotorFeedback(
             status=status,
