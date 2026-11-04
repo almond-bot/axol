@@ -185,7 +185,7 @@ Teleop finds Jelly from the attached CAN devices:
 - It runs the lift when its bus exists (`can_alm_axol_c`, or the shared wheel bus). If the lift bus is down at start, the lift is disabled with a warning and the wheels still drive.
 - [`can.setup`](/cli/can-setup) and the control panel's CAN discovery set these names. Teleop brings Jelly's CAN up on start, so you don't need [`can.enable`](/cli/can-enable).
 
-To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift false` (the control panel's **Jelly wheels** and **Jelly lift** switches). Jelly motion is never recorded into a dataset, and a policy never drives it.
+To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift false` (the control panel's **Jelly wheels** and **Jelly lift** switches). A policy never drives Jelly. Data collection records Jelly only with [Record Jelly](/operations/data-collection#record-jelly) on.
 
 `--arms false` drives only Jelly. Teleop doesn't start the arms or open the Axol hub's CAN bus, so the arms don't need to be connected. Teleop does the same, with a warning, when the arms' CAN interfaces are missing and Jelly's are present.
 

@@ -138,7 +138,7 @@ class RecorderGcHoldTest(unittest.TestCase):
             ),
             mock.patch.object(record_proc, "_log_capture_quality"),
             mock.patch.object(record_proc, "_cleanup_recorder_session"),
-            mock.patch.object(record_proc, "_maybe_smooth_episode"),
+            mock.patch.object(record_proc, "_adjust_episode_rows"),
             mock.patch.object(record_proc, "_prepare_streaming_episode"),
             mock.patch.object(record_proc, "make_episode_durable", return_value={}),
             mock.patch(

@@ -566,9 +566,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="boolean",
                 help=(
                     "Drive Jelly's wheels when they are attached. The left stick moves "
-                    "the base and the right stick turns it. Jelly's "
-                    "motion is never recorded or driven by a policy. Set speeds and "
-                    "heading hold in Jelly's Parameters tab."
+                    "the base and the right stick turns it. A policy never drives "
+                    "Jelly. To record the lift and wheels, turn on Record Jelly. Set "
+                    "speeds and heading hold in Jelly's Parameters tab."
                 ),
             ),
             SettingDef(
@@ -1082,6 +1082,17 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "of the 7 joint angles. Must match between data collection "
                     "and running the policy."
                 ),
+            ),
+            SettingDef(
+                key="recording.record_jelly",
+                label="Record Jelly",
+                type="boolean",
+                help=(
+                    "Also record Jelly's lift height and wheel positions in each "
+                    "frame, for Axol on Jelly. Collect data won't start while "
+                    "Jelly's lift or wheels are off."
+                ),
+                targets={"collect-data": ("record_jelly",)},
             ),
             SettingDef(
                 key="recording.vcodec",

@@ -107,9 +107,31 @@ _YAW_TRACE_HZ = 10.0
 # rail, so the battery estimate holds its resting value while driving.
 _WHEEL_LOAD_RAD_S = 0.5
 
+# Rust core status packet: b"U", 10 doubles and a flag byte, then optionally
+# a wheel sample: 4 positions, 4 measured speeds and its time (an older core
+# omits it).
+_STATUS_SIZE = 1 + 10 * 8 + 1
+_STATUS_SIZE_WITH_WHEELS = _STATUS_SIZE + 9 * 8
+
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before Jelly says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
+
+
+@dataclass(frozen=True)
+class WheelSample:
+    """One reading of Jelly's four wheels (ids 1-4), from the Rust core.
+
+    ``positions`` are measured angles in rad, continuous across the
+    feedback's ±PMAX fold and zero at the session's first reading.
+    ``velocities`` are the measured speeds in rad/s. ``at`` is when the
+    wheels answered, on the :func:`time.monotonic` clock, or 0 when they
+    haven't answered a full round yet.
+    """
+
+    positions: tuple[float, float, float, float]
+    velocities: tuple[float, float, float, float]
+    at: float
 
 
 @dataclass(frozen=True)
@@ -524,6 +546,9 @@ class Jelly:
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        # The latest wheel reading, replaced whole so a reader on another
+        # thread never sees a mix of two. None until the Rust core reports one.
+        self.wheel_sample: WheelSample | None = None
         self.yaw_correction: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
@@ -939,10 +964,18 @@ class Jelly:
                     )
                     self._ready.set()
                     continue
-                if payload[:1] != b"U" or len(payload) != 82:
+                if payload[:1] != b"U" or len(payload) not in (
+                    _STATUS_SIZE,
+                    _STATUS_SIZE_WITH_WHEELS,
+                ):
                     _logger.warning("Jelly Rust core sent an invalid status packet")
                     continue
-                *values, flags = struct.unpack("<10dB", payload[1:])
+                *values, flags = struct.unpack("<10dB", payload[1:_STATUS_SIZE])
+                if len(payload) == _STATUS_SIZE_WITH_WHEELS:
+                    wheels = struct.unpack("<9d", payload[_STATUS_SIZE:])
+                    self.wheel_sample = WheelSample(
+                        positions=wheels[0:4], velocities=wheels[4:8], at=wheels[8]
+                    )
                 self.body_cmd = tuple(values[:3])
                 self.wheel_speeds = list(values[3:7])
                 self.yaw_correction = values[7]
