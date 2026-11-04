@@ -36,6 +36,9 @@ class MotorStatus(Enum):
     CALIBRATION_ERROR = "calibration_error"  # MyActuator only
     POWER_OVERRUN = "power_overrun"  # MyActuator only
     SPEEDING = "speeding"  # MyActuator only
+    OUTPUT_SHAFT_CALIBRATION_ERROR = "output_shaft_calibration_error"  # Damiao only
+    SENSOR_ERROR = "sensor_error"  # Damiao only
+    MOTOR_ENCODER_CALIBRATION_ERROR = "motor_encoder_calibration_error"  # Damiao only
     UNKNOWN = "unknown"
 
 

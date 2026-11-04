@@ -130,6 +130,8 @@ def motor_faults(
             problem = "unreachable"
         elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
             problem = str(m["status"]).replace("_", " ").lower()
+            if problem == "unknown":
+                problem = "unknown fault"
         else:
             continue
         faults.append(
