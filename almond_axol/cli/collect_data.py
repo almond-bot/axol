@@ -2026,7 +2026,7 @@ def _run_session(
         "push_to_hub": push_to_hub,
         "log_level": cfg.log_level,
         # Tracked (VR) poses carry measurement noise the robot's encoder FK
-        # doesn't — smooth only Mantis episodes (see record_proc._maybe_smooth_episode).
+        # doesn't — smooth only Mantis episodes (see record_proc._adjust_episode_rows).
         "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
         # Which tracker→gripper transforms the recorded poses were mapped
         # through (meta/axol.json). A later constant change is migrated from
@@ -2725,9 +2725,10 @@ def _run_session(
             take_gc.begin(collect=False)
             tick_watchdog.resume()
             if jelly_state is not None:
-                # Record Jelly: each episode's wheel angles start at zero.
-                # Zero before capture opens, so no recorded row can pair
-                # with a reading from before the reset.
+                # Record Jelly: restart the wheel angles near zero for this
+                # episode. Zero before capture opens, so no recorded row can
+                # pair with a reading from before the reset; the recorder then
+                # shifts the saved rows so the first one is exactly zero.
                 jelly_state.zero_wheels()
             # Arm recorder cutoffs before opening the shared-timestamp
             # dataset valves. Both calls can wait for transport boundaries,

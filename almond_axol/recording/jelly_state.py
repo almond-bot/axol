@@ -22,6 +22,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+import numpy as np
+
 JELLY_FEATURE = "observation.jelly"
 LIFT_KEY = "jelly_lift.pos"
 WHEEL_KEYS = tuple(f"jelly_wheel_{i}.pos" for i in range(1, 5))
@@ -71,6 +73,28 @@ def jelly_config_problem(jelly_cfg: Any) -> str | None:
     return None
 
 
+def zero_episode_wheels(episode_buffer: Any) -> None:
+    """Shift a buffered episode's wheel angles so its first row reads zero.
+
+    ``episode_buffer`` is LeRobot's per-episode dict (feature key -> list of
+    per-row arrays); rows are edited in place before save. The recorder opens
+    an episode a moment after collect-data zeroes the wheels (it waits for
+    the cameras), so a base that is already rolling would otherwise start the
+    episode a little off zero. No-op for a session without the Jelly column.
+    """
+    if not isinstance(episode_buffer, dict):
+        return
+    rows = episode_buffer.get(JELLY_FEATURE)
+    if not rows:
+        return
+    wheels = slice(1, len(JELLY_KEYS))
+    origin = np.array(rows[0][wheels], dtype=np.float64)
+    for row in rows:
+        row[wheels] = (np.asarray(row[wheels], dtype=np.float64) - origin).astype(
+            row.dtype
+        )
+
+
 class JellyStateReader:
     """Reads :data:`JELLY_KEYS` from a running :class:`~almond_axol.robot.jelly.Jelly`.
 
@@ -85,9 +109,10 @@ class JellyStateReader:
     angle when the row was taken.
 
     The wheel angles are relative to the last :meth:`zero_wheels`. Call it
-    before each episode's capture opens, so every episode starts at zero
-    however far the base was driven between takes. The lift stays absolute:
-    its height is a physical state of the scene.
+    before each episode's capture opens, so the values stay small however far
+    the base was driven between takes; :func:`zero_episode_wheels` then makes
+    the first recorded row exactly zero. The lift stays absolute: its height
+    is a physical state of the scene.
     """
 
     def __init__(self, jelly: Any) -> None:

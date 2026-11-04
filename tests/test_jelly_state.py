@@ -14,6 +14,7 @@ from almond_axol.recording.jelly_state import (
     JellyStateReader,
     jelly_config_problem,
     jelly_features,
+    zero_episode_wheels,
 )
 from almond_axol.robot.jelly import JellyConfig, WheelSample
 
@@ -142,6 +143,24 @@ class JellyStateReaderTest(unittest.TestCase):
             out.append(reader.read(now=now)[JELLY_KEYS[1]])
         steps = np.diff(out)
         np.testing.assert_allclose(steps, speed / 30.0, atol=1e-9)
+
+    def test_saved_episode_starts_the_wheels_at_zero(self) -> None:
+        rows = [
+            np.array([0.5, 1.2, -1.25, 1.23, -1.25], dtype=np.float32),
+            np.array([0.5, 1.4, -1.45, 1.43, -1.45], dtype=np.float32),
+            np.array([0.6, 2.2, -2.25, 2.23, -2.25], dtype=np.float32),
+        ]
+        buffer = {"size": 3, JELLY_FEATURE: rows, "observation.state": [None] * 3}
+        zero_episode_wheels(buffer)
+        np.testing.assert_allclose(rows[0], [0.5, 0.0, 0.0, 0.0, 0.0])
+        np.testing.assert_allclose(rows[1], [0.5, 0.2, -0.2, 0.2, -0.2], atol=1e-6)
+        # The lift stays absolute.
+        np.testing.assert_allclose(rows[2], [0.6, 1.0, -1.0, 1.0, -1.0], atol=1e-6)
+        self.assertEqual(rows[2].dtype, np.float32)
+        # A session without the column, or an empty episode, is left alone.
+        zero_episode_wheels({"size": 0})
+        zero_episode_wheels({"size": 0, JELLY_FEATURE: []})
+        zero_episode_wheels(None)
 
     def test_dataset_frame_fills_the_column(self) -> None:
         from lerobot.utils.feature_utils import build_dataset_frame
