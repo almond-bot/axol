@@ -27,6 +27,11 @@ LIFT_KEY = "jelly_lift.pos"
 WHEEL_KEYS = tuple(f"jelly_wheel_{i}.pos" for i in range(1, 5))
 JELLY_KEYS = (LIFT_KEY, *WHEEL_KEYS)
 
+# Longest gap (s) a wheel sample is carried forward with its measured speed.
+# Jelly's wheels report every 20 ms; a sample older than this means they
+# stopped answering, and guessing further would invent motion.
+MAX_EXTRAPOLATION_S = 0.1
+
 
 def jelly_features() -> dict[str, dict[str, Any]]:
     """The dataset feature the Jelly readout fills."""
@@ -73,6 +78,12 @@ class JellyStateReader:
     frame is late, so each part holds its last reading. :meth:`wait_ready`
     makes sure there is a first reading before any row is recorded.
 
+    The wheels report at 50 Hz, which beats against a 30 fps recording: a
+    frame would see one, two or no new samples. So :meth:`read` carries the
+    latest sample forward to the read time with the measured wheel speeds
+    (for at most :data:`MAX_EXTRAPOLATION_S`), and each row is the wheels'
+    angle when the row was taken.
+
     The wheel angles are relative to the last :meth:`zero_wheels`. Call it
     before each episode's capture opens, so every episode starts at zero
     however far the base was driven between takes. The lift stays absolute:
@@ -82,16 +93,26 @@ class JellyStateReader:
     def __init__(self, jelly: Any) -> None:
         self._jelly = jelly
         self._lift: float | None = None
-        self._wheels: tuple[float, ...] | None = None
+        self._wheels: Any = None  # the latest WheelSample
         self._wheel_origin: tuple[float, ...] = (0.0,) * len(WHEEL_KEYS)
 
     def _refresh(self) -> None:
         lift = self._jelly.lift_raised
         if lift is not None:
             self._lift = float(lift)
-        wheels = self._jelly.wheel_positions
-        if wheels is not None and len(wheels) == len(WHEEL_KEYS):
-            self._wheels = tuple(float(v) for v in wheels)
+        wheels = self._jelly.wheel_sample
+        if wheels is not None:
+            self._wheels = wheels
+
+    def _wheel_angles(self, now: float) -> tuple[float, ...]:
+        sample = self._wheels
+        age = now - sample.at
+        if sample.at <= 0 or not 0 <= age <= MAX_EXTRAPOLATION_S:
+            age = 0.0
+        return tuple(
+            p + v * age
+            for p, v in zip(sample.positions, sample.velocities, strict=True)
+        )
 
     def missing(self) -> list[str]:
         """The parts with no reading yet (``"lift"``, ``"wheels"``)."""
@@ -127,20 +148,24 @@ class JellyStateReader:
             + ". Fix this and start again, or turn off Record Jelly."
         )
 
-    def zero_wheels(self) -> None:
+    def zero_wheels(self, now: float | None = None) -> None:
         """Make the wheels' current angles read as zero from now on."""
         self._refresh()
         if self._wheels is None:
             raise RuntimeError("Jelly wheels zeroed before their first reading")
-        self._wheel_origin = self._wheels
+        self._wheel_origin = self._wheel_angles(
+            time.monotonic() if now is None else now
+        )
 
-    def read(self) -> dict[str, float]:
-        """The latest values by dataset name. Call :meth:`wait_ready` first."""
+    def read(self, now: float | None = None) -> dict[str, float]:
+        """The values at ``now`` (default: this moment, :func:`time.monotonic`)
+        by dataset name. Call :meth:`wait_ready` first."""
         self._refresh()
         if self._lift is None or self._wheels is None:
             raise RuntimeError("Jelly state read before its first reading")
+        angles = self._wheel_angles(time.monotonic() if now is None else now)
         wheels = (
             angle - origin
-            for angle, origin in zip(self._wheels, self._wheel_origin, strict=True)
+            for angle, origin in zip(angles, self._wheel_origin, strict=True)
         )
         return {LIFT_KEY: self._lift, **dict(zip(WHEEL_KEYS, wheels))}

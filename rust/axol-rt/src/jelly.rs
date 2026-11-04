@@ -605,6 +605,18 @@ struct Odometer {
     total: [f64; 4],
 }
 
+/// `CLOCK_MONOTONIC` in seconds: the clock Python's `time.monotonic()` reads,
+/// so the status packet can say when its wheel sample was taken.
+fn monotonic_s() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
 impl Odometer {
     fn update(&mut self, pos: &[f64; 4], ranges: &[MitRanges; 4]) -> [f64; 4] {
         match self.last {
@@ -949,6 +961,11 @@ fn control_loop(
     let mut next = Instant::now() + period;
     let mut next_status = Instant::now();
     let mut odometer = Odometer::default();
+    // When all four wheels last answered in the same tick (`monotonic_s`), or
+    // 0 before the first time. A reader extrapolates the angles from here with
+    // the measured speeds, so a sample is placed in time to well under the
+    // 20 ms the loop runs at.
+    let mut wheels_fed_at = 0.0;
     let mut enobufs = None;
     // The enable sequence above was echoed with feedback frames; drop them so
     // the reply count below is for these zero-velocity frames.
@@ -1232,7 +1249,7 @@ fn control_loop(
             if sent {
                 // Every command frame is echoed with a feedback frame; that
                 // echo is also where a mid-stream LOST_COMM shows up.
-                let _ = collect_feedback(
+                let answered = collect_feedback(
                     &sock,
                     &wheels.ranges,
                     &mut wheels.pos,
@@ -1240,6 +1257,9 @@ fn control_loop(
                     &mut wheels.status,
                     now + period.mul_f64(0.8),
                 )?;
+                if answered == IDS.len() {
+                    wheels_fed_at = monotonic_s();
+                }
                 if let Some(h) = hold {
                     if let Some((i, how)) = hold_runaway(&h, &wheels.pos, &wheels.vel) {
                         // The hold keeps the CAN timeout fed, so a parked
@@ -1267,8 +1287,10 @@ fn control_loop(
                 }
             }
             if now >= next_status {
-                // Every tick at the default 50 Hz, so a dataset recording the
-                // wheel positions at 30 fps sees a fresh sample each frame.
+                // Every tick at the default 50 Hz. A dataset recording at
+                // 30 fps still sees one, two or no new samples per frame, so
+                // the packet also carries the measured speeds and the sample
+                // time for the reader to extrapolate to its frame time.
                 next_status = now + Duration::from_millis(20);
                 let wheel_pos = odometer.update(&wheels.pos, &wheels.ranges);
                 let mut p = vec![b'U'];
@@ -1286,7 +1308,11 @@ fn control_loop(
                         | ((linked as u8) << 3)
                         | ((!wheels_ok as u8) << 4),
                 );
-                for v in wheel_pos {
+                for v in wheel_pos
+                    .into_iter()
+                    .chain(wheels.vel)
+                    .chain([wheels_fed_at])
+                {
                     p.extend_from_slice(&v.to_le_bytes());
                 }
                 write_message(output, &p)?;
@@ -1322,6 +1348,19 @@ mod tests {
 
     fn test_config() -> Config {
         parse_config(&wire(PY_CONFIG)).unwrap()
+    }
+
+    #[test]
+    fn monotonic_matches_python_clock() {
+        // Python's time.monotonic() is CLOCK_MONOTONIC: same epoch as
+        // Instant on Linux, so two reads a few ms apart stay close.
+        let a = monotonic_s();
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let b = monotonic_s();
+        let elapsed = start.elapsed().as_secs_f64();
+        assert!(a > 0.0);
+        assert!((b - a - elapsed).abs() < 2e-3, "{} vs {elapsed}", b - a);
     }
 
     #[test]
