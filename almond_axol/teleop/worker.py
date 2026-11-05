@@ -37,6 +37,7 @@ from .box import (
     elbow_swivel_hint,
     pair_aligned,
     parcel_tool,
+    right_stick_axis,
     rodrigues,
     rotation_angle,
     smoothstep,
@@ -2125,7 +2126,10 @@ class IKWorker:
             return
         # The raw stick axis reads negative pushed forward (WebXR gamepad
         # convention, as Jelly's drive reads it too): forward = wider.
-        width_rate = -_dz(frame.r_stick_y) * cfg.box_width_speed
+        # Only while forward/back outweighs left/right: a sideways push
+        # turns Jelly, and must not change the width (right_stick_axis).
+        _, stick_y = right_stick_axis(frame.r_stick_x, frame.r_stick_y)
+        width_rate = -_dz(stick_y) * cfg.box_width_speed
         if width_rate:
             box.width = float(
                 np.clip(

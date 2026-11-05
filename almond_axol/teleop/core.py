@@ -49,6 +49,7 @@ from ..robot.control import ContactWatchdog
 from ..robot.gravity import GravityCompensator
 from ..settings import resolve_gripper, resolve_robot_model
 from .absolute_pose import AbsoluteCalibration
+from .box import right_stick_axis
 from .config import VRTeleopConfig
 from .filter import (
     AlphaSmoothFilter,
@@ -1122,7 +1123,9 @@ class VRTeleopCore:
         never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
         lift as outside box mode, from then until the release. Until a press
         has lasted that long its click is cleared from the frame Jelly gets
-        (a copy; the sticks' axes are untouched). Both sticks pressed
+        (a copy). The right stick is also locked to the axis pushed
+        further (:func:`~almond_axol.teleop.box.right_stick_axis`), so
+        squeezing doesn't turn the base. Both sticks pressed
         together — the box-mode toggle gesture — are never a tap.
 
         Call once per received frame (VR thread), before Jelly; the same
@@ -1166,6 +1169,12 @@ class VRTeleopCore:
                 for side in ("l", "r")
                 if getattr(frame, f"{side}_stick_click", False) and not held[side]
             }
+            # The right stick is locked to its dominant axis: while
+            # forward/back (the grip width) outweighs left/right, Jelly
+            # doesn't turn (right_stick_axis).
+            stick_x, _ = right_stick_axis(frame.r_stick_x, frame.r_stick_y)
+            if stick_x != frame.r_stick_x:
+                masked["r_stick_x"] = stick_x
             if masked:
                 out = frame.model_copy(update=masked)
         self._sticks_in, self._sticks_out = frame, out

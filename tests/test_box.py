@@ -26,6 +26,7 @@ from almond_axol.teleop.box import (
     pair_aligned,
     parallel_grip_rel,
     parcel_tool,
+    right_stick_axis,
     rodrigues,
     rotation_angle,
     side_clamp_rotation,
@@ -792,6 +793,25 @@ class StickTapTest(unittest.TestCase):
         core._apply_live_requests()
         self.assertEqual(core.config.box_grasp, "straight")
 
+    def test_squeezing_does_not_turn_jelly(self) -> None:
+        core = self._led()
+        out = core.box_stick_frame(_stick_frame(r_stick_x=0.4, r_stick_y=-0.9), 0.0)
+        self.assertEqual(out.r_stick_x, 0.0)
+        self.assertEqual(out.r_stick_y, -0.9)
+        # A mostly sideways push still turns.
+        out = core.box_stick_frame(_stick_frame(r_stick_x=0.9, r_stick_y=0.4), 0.1)
+        self.assertEqual(out.r_stick_x, 0.9)
+        # Outside box mode both axes pass through.
+        core = self._core()
+        frame = _stick_frame(r_stick_x=0.4, r_stick_y=-0.9)
+        self.assertIs(core.box_stick_frame(frame, now=0.0), frame)
+
+    def test_right_stick_axis_keeps_the_larger_axis(self) -> None:
+        self.assertEqual(right_stick_axis(0.3, -0.6), (0.0, -0.6))
+        self.assertEqual(right_stick_axis(-0.7, 0.2), (-0.7, 0.0))
+        self.assertEqual(right_stick_axis(0.5, 0.5), (0.0, 0.5))
+        self.assertEqual(right_stick_axis(0.0, 0.0), (0.0, 0.0))
+
     def test_the_same_frame_again_gives_the_same_result(self) -> None:
         core = self._led()
         frame = _stick_frame(r_stick_click=True)
@@ -1066,6 +1086,15 @@ class StickControlTest(unittest.TestCase):
         self._sticks(worker, box, _stick_frame(r_stick_y=1.0))
         self.assertAlmostEqual(box.width, 0.3, places=6)
         self.assertEqual(box.tilt, 0.0)
+
+    def test_a_mostly_sideways_push_leaves_the_width_alone(self) -> None:
+        worker = _stick_worker()
+        box = _box_state()
+        self._sticks(worker, box, _stick_frame(r_stick_x=0.8, r_stick_y=-0.4))
+        self.assertAlmostEqual(box.width, 0.3, places=6)
+        # A forward push that drifts sideways still changes the width.
+        self._sticks(worker, box, _stick_frame(r_stick_x=0.4, r_stick_y=-0.8))
+        self.assertAlmostEqual(box.width, 0.304, places=6)
 
     def test_jellys_axes_and_clicks_leave_the_pair_alone(self) -> None:
         worker = _stick_worker()

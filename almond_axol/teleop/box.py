@@ -214,6 +214,21 @@ def parcel_tool(flush_deg: float, grasp: str = "flush") -> ToolGeometry:
     )
 
 
+def right_stick_axis(x: float, y: float) -> tuple[float, float]:
+    """Box mode's right stick, locked to the axis pushed further.
+
+    In box mode the right stick does two things: forward/back (``y``) sets
+    the grip width, left/right (``x``) turns Jelly. A thumb pushing straight
+    forward still drifts sideways, and that drift turned the base while the
+    operator only meant to squeeze (and the reverse). Whichever axis is
+    deflected further keeps its value; the other reads ``0``. A tie goes to
+    the width, the box-mode action.
+    """
+    if abs(x) > abs(y):
+        return float(x), 0.0
+    return 0.0, float(y)
+
+
 def rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
     """Rotation matrix for ``angle`` radians about the unit vector ``axis``."""
     x, y, z = (float(v) for v in axis)
