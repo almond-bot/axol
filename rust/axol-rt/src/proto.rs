@@ -24,7 +24,6 @@ pub const MA_MULTI_TURN_ANGLE: u8 = 0x92;
 /// matched the 0x92 angle at rest (2026-10-01).
 pub const MA_MULTI_TURN_ENCODER: u8 = 0x60;
 pub const MA_MOTOR_STATUS_2: u8 = 0x9C;
-pub const MA_RELEASE_BRAKE: u8 = 0x77;
 pub const MA_SHUTDOWN: u8 = 0x80;
 /// System reset — no response; the motor reboots (~1.1 s, allow 2+).
 pub const MA_RESET: u8 = 0x76;
@@ -205,8 +204,7 @@ pub fn ma_decode_status1(data: &[u8; 8]) -> (f64, u16) {
 }
 
 /// "Enabled and holding" from a 0x9A reply — the Python driver's
-/// `is_holding`. Byte 3 is labelled the brake-release state by the protocol,
-/// but fleet firmware reads it 1 only while the motor is actively executing
+/// `is_holding`. Byte 3 is the running state: fleet firmware reads it 1 only while the motor is actively executing
 /// commands (0 when disabled, freshly enabled but never commanded, or just
 /// reset); combined with a clean error mask it is exactly the signal the
 /// idempotent enable needs to leave a live joint alone.
@@ -479,7 +477,7 @@ mod tests {
     /// prep never sends it the 0x76 reset.
     #[test]
     fn ma_is_holding_matches_python() {
-        // 0x9A reply: [cmd, temp, brake/running..., volts lo, hi, err lo, hi]
+        // 0x9A reply: [cmd, temp, _, running, volts lo, hi, err lo, hi]
         let holding = [0x9A, 30, 0, 0x01, 0xF0, 0x00, 0x00, 0x00];
         assert!(ma_is_holding(&holding));
         let disabled = [0x9A, 30, 0, 0x00, 0xF0, 0x00, 0x00, 0x00];
