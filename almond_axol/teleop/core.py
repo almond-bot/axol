@@ -149,6 +149,9 @@ _HELD_SLOW_RAD_S = 1.0
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
 # worker's re-blend to the straight grasp starts a frame after the request.
 _BOX_EXIT_MARGIN_S = 0.25
+# How far (rad, any joint) a published target may sit from the pose the last
+# return to rest ended at and still count as at rest (see set_target).
+_AT_REST_TOL_RAD = 0.02
 # Box mode's stick clicks (see VRTeleopCore.box_stick_frame): a click
 # released sooner than this is a grasp tap; one held longer runs the lift.
 _BOX_TAP_S = 0.3
@@ -494,6 +497,10 @@ class VRTeleopCore:
         self._tracking_reengage_blocked: bool = False
         self._tracking_release_seen: bool = False
         self._at_rest: bool = True
+        # The pose the last return to rest ended at. A target that leaves it
+        # (the arms stepping out of the way of Jelly's deck, say) clears
+        # ``_at_rest`` — see set_target.
+        self._rest_target: np.ndarray | None = None
         self._engage_time: float | None = None
 
         # Box mode (bimanual carry, see :mod:`.box`): one controller leads
@@ -1811,6 +1818,15 @@ class VRTeleopCore:
         dur = min(max(gap, 2.0 / self.config.frequency), 0.04)
         self.q = q_new
         self._segment = (start, q_new, now, dur)
+        if (
+            self._at_rest
+            and self._rest_target is not None
+            and q_new.shape == self._rest_target.shape
+            and float(np.max(np.abs(q_new - self._rest_target))) > _AT_REST_TOL_RAD
+        ):
+            # Moved off the rest pose without engaging (Jelly's deck clearance
+            # does this as the lift lowers): a stop must park again.
+            self._at_rest = False
 
     def _eval_target(self, now: float) -> np.ndarray | None:
         """Render the interpolated raw target at time ``now`` (any thread)."""
@@ -1920,6 +1936,7 @@ class VRTeleopCore:
                 self.l_grip = l_grip
                 self.r_grip = r_grip
                 self._at_rest = True
+                self._rest_target = q.copy()
                 seed_l = np.append(q[self.left_indices], l_grip)
                 seed_r = np.append(q[self.right_indices], r_grip)
                 self.ema_left.reset(seed=seed_l)
@@ -2399,6 +2416,9 @@ class VRTeleopCore:
                                 self.reset_interp.freeze_grippers(*self._park_grippers)
                             self._disengage_all()
                             self._at_rest = True
+                            self._rest_target = np.asarray(
+                                trajectory[-1], dtype=np.float32
+                            ).copy()
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
                     elif q_goal is not None:
                         raise ValueError(f"unexpected park planner reply: {result!r}")

@@ -173,6 +173,18 @@ class SettingsUpdateRequest(BaseModel):
     advanced: dict[str, Any] | None = None
 
 
+class OpStopRequest(BaseModel):
+    """What a Stop does with the arms (teleop only).
+
+    ``ask``: when the arms are away from rest, stop nothing and answer
+    ``{"needsChoice": true}`` so the panel can ask the operator; otherwise
+    stop with the default park. ``rest`` parks the arms, ``hold`` leaves the
+    motors holding the arms where they are. Omitted: the default park.
+    """
+
+    arms: Literal["ask", "rest", "hold"] | None = None
+
+
 class EpisodeRequest(BaseModel):
     """A control command for the running op, as named in its own snapshot.
 
@@ -3225,8 +3237,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse(session.to_dict())
 
     @app.post("/api/op/stop")
-    async def op_stop() -> JSONResponse:
-        session = await asyncio.to_thread(runner.stop)
+    async def op_stop(req: OpStopRequest | None = None) -> JSONResponse:
+        arms = req.arms if req is not None else None
+        if arms == "ask":
+            if runner.arms_need_stop_choice():
+                return JSONResponse({"needsChoice": True})
+            arms = None
+        session = await asyncio.to_thread(runner.stop, arms)
         if session is None:
             return JSONResponse({"error": "no operation running"}, status_code=404)
         return JSONResponse(session.to_dict())

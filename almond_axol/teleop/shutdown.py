@@ -42,6 +42,63 @@ OUTCOME_MESSAGES: dict[str, str] = {
 }
 
 
+# What the operator chose for the arms when a teleop session stops (see
+# :func:`request_stop_choice`): ``"rest"`` parks them (the default, and the
+# only choice a Ctrl+C or a CLI stop gets), ``"hold"`` leaves every motor
+# holding its last command. The control panel turns its **Gravity comp**
+# choice into ``"hold"`` followed by a gravity-comp operation, so the arms
+# never go unpowered in between.
+STOP_CHOICES = ("rest", "hold")
+
+_stop_lock = threading.Lock()
+_stop_choice: str | None = None
+_arms_probe: Callable[[], bool] | None = None
+
+
+def register_arms_probe(probe: Callable[[], bool] | None) -> None:
+    """Install (or, with ``None``, remove) the live session's away-from-rest probe.
+
+    ``probe()`` answers "would stopping now move or drop the arms?": true
+    while the session drives hardware arms that are not settled at rest.
+    One teleop session runs per process (``axol serve`` runs its operations
+    in-process, one at a time), so a single slot is enough.
+    """
+    global _arms_probe
+    with _stop_lock:
+        _arms_probe = probe
+
+
+def arms_away_from_rest() -> bool:
+    """Whether the live session's arms are away from rest (``False`` if none)."""
+    with _stop_lock:
+        probe = _arms_probe
+    if probe is None:
+        return False
+    try:
+        return bool(probe())
+    except Exception:  # noqa: BLE001 - a broken probe must not block a stop
+        return False
+
+
+def request_stop_choice(choice: str | None) -> None:
+    """Record what the next stop does with the arms (``None`` = the default park)."""
+    global _stop_choice
+    if choice is not None and choice not in STOP_CHOICES:
+        raise ValueError(
+            f"unknown stop choice {choice!r}; expected one of {STOP_CHOICES}"
+        )
+    with _stop_lock:
+        _stop_choice = choice
+
+
+def take_stop_choice() -> str:
+    """Return the stop choice for this teardown and clear it (default ``"rest"``)."""
+    global _stop_choice
+    with _stop_lock:
+        choice, _stop_choice = _stop_choice, None
+    return choice or "rest"
+
+
 @contextlib.contextmanager
 def abort_on_sigint(abort: threading.Event) -> Iterator[None]:
     """Turn a Ctrl+C during the park into an abort request, not an exception.

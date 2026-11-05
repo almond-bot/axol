@@ -699,6 +699,10 @@ class OperationRunner:
             if self.is_running():
                 raise RuntimeError("an operation is already running")
             session = Session(op_id, args)
+            # A Stop choice left over from an earlier run never applies here.
+            from ..teleop.shutdown import request_stop_choice
+
+            request_stop_choice(None)
             # The op runs on a worker thread; route subscriber wakeups back to
             # the server loop so the log WebSocket stays responsive.
             session.loop = loop
@@ -1018,8 +1022,26 @@ class OperationRunner:
                 self._mark_terminal(session, "error", error=STALL_STOP_ERROR)
                 return
 
-    def stop(self) -> Session | None:
+    def arms_need_stop_choice(self) -> bool:
+        """Whether a Stop now should first ask what to do with the arms.
+
+        True while a teleop session runs on hardware arms that are away from
+        rest (see ``almond_axol.teleop.shutdown.arms_away_from_rest``).
+        """
+        from ..teleop.shutdown import arms_away_from_rest
+
+        session = self._session
+        if session is None or session.command_id != "teleop":
+            return False
+        if session.status not in ("starting", "running") or self._stopping:
+            return False
+        return arms_away_from_rest()
+
+    def stop(self, arms: str | None = None) -> Session | None:
         """Begin stopping the current op and return immediately.
+
+        ``arms`` (teleop only): ``"rest"`` parks the arms (the default),
+        ``"hold"`` leaves the motors holding them where they are.
 
         Signals the op to unwind and hands off to a background watchdog that
         force-kills the op's child subprocesses if it doesn't exit within the
@@ -1034,8 +1056,14 @@ class OperationRunner:
             # Already finished (or finishing): nothing to stop, and we must not
             # flip a terminal session back to "stopping".
             return session
+        if arms is not None and session.command_id == "teleop":
+            from ..teleop.shutdown import request_stop_choice
+
+            request_stop_choice(arms)
         if not self._begin_stop(session):
             return session
+        if arms == "hold" and session.command_id == "teleop":
+            session.emit("[serve] the arms stay where they are; the motors stay on")
         thread = self._thread
         watchdog = threading.Thread(
             target=self._await_stop,

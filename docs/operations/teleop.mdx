@@ -194,6 +194,16 @@ When you press **Stop** in the control panel or `Ctrl+C` on the CLI, the arms re
 
 Turn off **Park to zero on stop** to stop at the rest pose.
 
+If the arms are not at rest when you press **Stop** in the control panel, it asks what they should do:
+
+| Choice | What happens |
+|---|---|
+| **Go to rest** | The arms park as described above, then the motors turn off. |
+| **Hold position** | The arms stay where they are and the motors stay on. |
+| **Gravity comp** | The arms stay where they are, then [Gravity compensation](/operations/gravity-comp) starts so you can move them by hand. |
+
+Press **Keep running** to go back to teleop. `Ctrl+C` on the CLI always parks the arms.
+
 ### Driving Jelly
 
 On Axol on Jelly, the thumbsticks drive Jelly's base and lift. See [Jelly](/guides/vr-interface#jelly). Axol detects Jelly from the CAN devices that are attached.

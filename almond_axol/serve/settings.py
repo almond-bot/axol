@@ -815,11 +815,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box-mode elbows out (°)",
                 type="number",
                 help=(
-                    "How far out box mode holds the elbows, from 0 (hanging straight "
-                    "down) to 90 (out level). This is the starting value. In the "
-                    "headset, push either thumbstick forward to move the elbows apart "
-                    "or back to bring them in, and the value you end with is saved "
-                    "here."
+                    "How far out box mode holds the elbows: 0 keeps them tucked beside "
+                    "the body, so they go back instead of out when you pull a box in, "
+                    "and 90 holds them out level. "
+                    "This is the starting value. Change it during a session with "
+                    "Elbows out in the headset's session settings."
                 ),
                 targets={
                     "teleop": ("teleop.box_elbow_out",),
