@@ -734,9 +734,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Ignore held weight",
                 type="boolean",
                 help=(
-                    "Keeps the weight of what a gripper holds, and the squeeze on a "
-                    "box in box mode, from making its controller rumble. Pushing on "
-                    "something still rumbles."
+                    "Keeps the weight of what a gripper holds from making its "
+                    "controller rumble. Pushing on something still rumbles, and so "
+                    "does squeezing a box hard in box mode."
                 ),
             ),
             SettingDef(

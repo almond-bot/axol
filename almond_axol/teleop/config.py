@@ -111,10 +111,14 @@ class VRTeleopConfig:
             Defaults to ``6.0`` (the return-to-rest contact stop).
         haptic_held_load: Keep what a gripper holds out of the rumble.
             ``True`` (default): while a gripper is closed, or box mode
-            clamps a box, its arm's torque residual is fit as a held weight
-            (and box mode's squeeze), so carrying a heavy object or box
-            stays quiet while pushing on something still rumbles. Works
-            with any gripper; opening it forgets the load. See
+            clamps a box, its arm's torque residual is fit as a held weight,
+            so carrying a heavy object or box stays quiet while pushing on
+            something still rumbles. In box mode the fit also models the
+            squeeze but leaves it in the rumble, so closing the grip width
+            onto a box rumbles once the clamp passes ``haptic_torque`` on a
+            joint. Box mode's capped joints (``box_wrist_torque``,
+            ``box_squeeze_torque``) start at 80% of their cap and are full
+            at it. Works with any gripper; opening it forgets the load. See
             :mod:`almond_axol.teleop.held_load`.
         park_to_zero: Shutdown park. ``True`` (default): when a hardware
             session stops (**Stop** in the control panel, ``Ctrl+C``), the

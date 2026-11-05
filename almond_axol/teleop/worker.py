@@ -163,6 +163,18 @@ _PROXIMITY_EVERY_N = 4
 # configured linear speed and, for the rotational part, by this angular rate.
 _RAMP_ANG_SPEED = 0.6  # rad/s
 
+# Lift clearance on the mobile Axol (see IKWorker.clear_lift): the fastest
+# (m/s) an arm that isn't tracking is moved out of the way of Jelly's deck as
+# the lift lowers. The deck rises at twice the lift's speed.
+_LIFT_CLEAR_SPEED = 0.2
+# An engaged arm held up by Jelly's deck keeps its height (see
+# IKWorker._hold_lift_plane): the smallest height (m) its target is raised
+# by (below it the gap is the solve's own lag), and how far up (the
+# vertical component of the contact normal) the deck must push the arm
+# for it to count. The lower column's sides push sideways and don't.
+_LIFT_PLANE_MIN_M = 0.002
+_LIFT_PLANE_MIN_UP = 0.2
+
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
 # ---------------------------------------------------------------------------
@@ -443,6 +455,10 @@ class IKWorker:
         # Wall time of the previous solve, for scaling the solver's per-call
         # step clamp by the actual solve cadence (see delta_scale in step()).
         self._last_solve_t: float | None = None
+        # Lift clearance (see clear_lift): time of the previous step, and the
+        # lift-safe rest goal with the lift height it was computed for.
+        self._lift_clear_t: float | None = None
+        self._rest_goal: tuple[float, np.ndarray] | None = None
         # Box mode (bimanual carry, see .box): the pair's state from the engage
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
@@ -702,7 +718,7 @@ class IKWorker:
             self._box = None
             self._box_leader = None
             self._box_snap = None
-            return q_current
+            return self.clear_lift(q_current)
 
         if frame.box_leader is not None:
             return self._step_box(
@@ -999,6 +1015,20 @@ class IKWorker:
                 posture[indices] = q_current[indices]
             if not getattr(self, "_mink_backend", False):
                 self._solver.set_posture_pose(posture)
+        if self._has_lift_contact():
+            # An arm re-anchored above already has a fresh mapping.
+            fresh = {side for side, *_rest in reanchor}
+            q_new = self._lift_contact_per_arm(
+                q_new,
+                {
+                    side: pose
+                    for side, pose in (
+                        ("left", (tl_pos, tl_rot)),
+                        ("right", (tr_pos, tr_rot)),
+                    )
+                    if side not in fresh
+                },
+            )
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -1195,7 +1225,7 @@ class IKWorker:
     def path_goal(self, name: str) -> np.ndarray:
         """Full (N,) joint vector for a named path goal (see :data:`PATH_GOALS`)."""
         if name == "rest":
-            return self.get_rest_q()
+            return self.rest_goal()
         if name == "zero":
             return np.zeros(self._solver.num_joints, dtype=np.float32)
         raise ValueError(f"unknown path goal {name!r} (expected one of {PATH_GOALS})")
@@ -1264,6 +1294,124 @@ class IKWorker:
         ignored there."""
         if not self._mink_backend:
             self._solver.set_lift(raised)
+
+    def _has_lift_contact(self) -> bool:
+        """Whether the solver models a lift (the mobile Axol on the JAX
+        backend, collision detection on): see :meth:`clear_lift`."""
+        return (
+            not getattr(self, "_mink_backend", False)
+            and getattr(self._solver, "has_lift_contact", False) is True
+        )
+
+    def rest_goal(self) -> np.ndarray:
+        """The return-to-rest goal: the rest pose, moved clear of Jelly's
+        deck at the live lift height.
+
+        With the lift lowered far enough that the hanging arms would sit in
+        the deck, the arms come up and forward over it instead
+        (:meth:`KinematicsSolver.lift_clear_pose`). The rest pose itself
+        everywhere else. Cached per lift height.
+        """
+        rest = self.get_rest_q()
+        if not self._has_lift_contact():
+            return rest
+        lowered = float(self._solver.lift_lowered)
+        cached = self._rest_goal
+        if cached is not None and abs(cached[0] - lowered) < 1e-4:
+            return cached[1].copy()
+        goal = np.asarray(self._solver.lift_clear_pose(rest), dtype=np.float32)
+        self._rest_goal = (lowered, goal)
+        if not np.array_equal(goal, rest):
+            _logger.info(
+                "Rest pose raised over Jelly's deck (lift lowered %.0f mm)",
+                1e3 * lowered,
+            )
+        return goal.copy()
+
+    def clear_lift(
+        self, q: np.ndarray, sides: tuple[str, ...] = ("left", "right")
+    ) -> np.ndarray:
+        """``q`` with each of ``sides`` moved a step out of Jelly's deck.
+
+        On the mobile Axol the deck and lower lift stage rise toward the arms
+        as the lift lowers. An arm that isn't tracking (disengaged, or frozen
+        while the other tracks) is moved out of their way, at up to
+        ``_LIFT_CLEAR_SPEED`` (see :meth:`KinematicsSolver.lift_clear_step`).
+        ``q`` unchanged when no arm is in their way, and everywhere but the
+        mobile Axol.
+        """
+        if not self._has_lift_contact():
+            return q
+        now = time.perf_counter()
+        nominal = 1.0 / float(self._config.ik_frequency)
+        dt = nominal if self._lift_clear_t is None else now - self._lift_clear_t
+        self._lift_clear_t = now
+        dt = min(max(dt, nominal), 4.0 * nominal)
+        q_new = self._solver.lift_clear_step(
+            q, max_step=_LIFT_CLEAR_SPEED * dt, sides=sides
+        )
+        return q if q_new is None else np.asarray(q_new, dtype=np.float32)
+
+    def _lift_contact_per_arm(
+        self, q_new: np.ndarray, targets: dict[str, Pose]
+    ) -> np.ndarray:
+        """Per-arm teleop's handling of Jelly's deck after a solve.
+
+        An engaged arm held up by the deck has its clutch anchor raised to
+        the height it is held at (:meth:`_hold_lift_plane`). A frozen arm the
+        deck rises into is moved out of its way (:meth:`clear_lift`), and its
+        hold pose follows it.
+        """
+        contact = self._solver.lift_contact(q_new)
+        if not contact:
+            return q_new
+        engaged = {side: targets[side] for side in targets if self._active[side]}
+        for side, shift in self._hold_lift_plane(q_new, engaged, contact).items():
+            pos, rot = self._snap_fk[side]
+            self._snap_fk[side] = (pos + shift, rot)
+        frozen = tuple(
+            side
+            for side in ("left", "right")
+            if not self._active[side] and side in contact
+        )
+        if frozen:
+            q_new = self.clear_lift(q_new, frozen)
+            left, right = self._solver.fk(q_new)
+            for side in frozen:
+                self._hold_fk[side] = left if side == "left" else right
+        return q_new
+
+    def _hold_lift_plane(
+        self,
+        q_new: np.ndarray,
+        targets: dict[str, Pose],
+        contact: dict[str, tuple[float, np.ndarray]],
+    ) -> dict[str, np.ndarray]:
+        """How far to raise each engaged arm's target held up by Jelly's deck.
+
+        While the collision cost holds an arm up off the deck, its target
+        sits under the arm, inside the deck. Left there, it drops the arm to
+        it the moment the arm clears the deck's edge. This returns, per side
+        in ``contact`` whose contact pushes the arm up, the shift (world
+        frame, straight up) that raises the target to the height of the
+        solved gripper (FK of ``q_new``), so the arm leaves the edge at the
+        height it was held at. Pressing further down is given up the same
+        way; raising the hand raises the arm at once. Horizontal motion is
+        left alone, so pushing into the deck's edge still slides the arm up
+        over it. Shifts under ``_LIFT_PLANE_MIN_M`` are left out.
+        """
+        if not contact:
+            return {}
+        left, right = self._solver.fk(q_new)
+        solved = {"left": left, "right": right}
+        shifts: dict[str, np.ndarray] = {}
+        for side, (_depth, normal) in contact.items():
+            if side not in targets or float(normal[2]) < _LIFT_PLANE_MIN_UP:
+                continue
+            below = float(solved[side][0][2]) - float(targets[side][0][2])
+            if below > _LIFT_PLANE_MIN_M:
+                shifts[side] = np.array((0.0, 0.0, below), dtype=np.float32)
+        return shifts
 
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
@@ -1875,6 +2023,16 @@ class IKWorker:
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
+        if self._has_lift_contact():
+            # Held up by Jelly's deck, the pair keeps the height it is held
+            # at (see _hold_lift_plane): the box centre rises with the arm
+            # held furthest above its target, so the pair stays a pair.
+            shifts = self._hold_lift_plane(
+                q_new, targets, self._solver.lift_contact(q_new)
+            )
+            if shifts:
+                shift = max(shifts.values(), key=lambda v: float(np.linalg.norm(v)))
+                box.center = (box.center + shift).astype(np.float32)
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -2630,7 +2788,13 @@ def run_ik_worker(
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
     - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
-    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("clear",)``                   → ``("cleared", q, moved)`` — one
+      :meth:`IKWorker.clear_lift` step on the worker's joint vector while
+      the arms aren't tracking and no frames arrive (the lift lowered from
+      the control panel); ``moved`` is whether it changed.
+    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``;
+      ``q_rest`` is :meth:`IKWorker.rest_goal` (the rest pose, clear of
+      Jelly's deck at the live lift height)
     - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
       an explicit joint target for the second (zero) leg of a guarded park.
     - ``("reset_path", q_current, goals)`` → ``("reset_traj", last, traj)`` —
@@ -2727,6 +2891,11 @@ def run_ik_worker(
                 worker.set_lift(float(msg[1]))
             elif isinstance(msg, tuple) and msg[0] == "grip":
                 worker.set_gripper(float(msg[1]), float(msg[2]))
+            elif isinstance(msg, tuple) and msg[0] == "clear":
+                q_clear = worker.clear_lift(q)
+                moved = not np.array_equal(q_clear, q)
+                q = np.asarray(q_clear, dtype=np.float32).copy()
+                conn.send(("cleared", q.copy(), moved))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":
@@ -2739,7 +2908,7 @@ def run_ik_worker(
                     q_target = (
                         np.asarray(msg[2], dtype=np.float32)
                         if len(msg) == 3
-                        else q_rest
+                        else worker.rest_goal()
                     )
                     if (
                         q_current.shape != q_rest.shape

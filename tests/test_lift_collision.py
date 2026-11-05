@@ -24,6 +24,7 @@ from almond_axol.kinematics.solver import KinematicsSolver, body_collision_dista
 from almond_axol.robot.jelly import Jelly
 from almond_axol.teleop.config import VRTeleopConfig
 from almond_axol.teleop.core import VRTeleopCore
+from almond_axol.teleop.worker import IKWorker
 
 _DECK = ("deck",)
 
@@ -114,6 +115,171 @@ class SolverLiftTest(unittest.TestCase):
             q = s.ik(q, **targets)
         # The soft cost lifts them back out, holding the same target.
         self.assertGreater(self._deck_clearance(q), 0.0)
+
+
+class LiftClearanceTest(unittest.TestCase):
+    """Arms that aren't tracking are moved out of the way of the rising deck,
+    the return-to-rest goal clears it, and an engaged arm's target keeps the
+    plane the deck holds it at."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.solver = KinematicsSolver(
+            KinematicsConfig(robot_model="mobile", gripper="parallel")
+        )
+        config = VRTeleopConfig()
+        cls.rest = np.concatenate(
+            [config.rest_pose_left, config.rest_pose_right]
+        ).astype(np.float32)
+        rc = cls.solver.robot_coll
+        cls.deck = [
+            k
+            for k, (i, j) in enumerate(zip(rc.active_idx_i, rc.active_idx_j))
+            if {rc.link_names[int(i)], rc.link_names[int(j)]} & set(_DECK)
+        ]
+
+    def setUp(self) -> None:
+        self.solver.set_posture_pose(self.rest)
+
+    def tearDown(self) -> None:
+        self.solver.set_lift(1.0)
+
+    def _deck_clearance(self, q: np.ndarray) -> float:
+        s = self.solver
+        d = body_collision_distance(
+            s.robot, s.robot_coll, jnp.asarray(s.to_pyroki_order(q)), s.link_shift
+        )
+        return float(np.asarray(d)[self.deck].min())
+
+    def _worker(self) -> IKWorker:
+        worker = object.__new__(IKWorker)
+        worker._solver = self.solver
+        worker._mink_backend = False
+        worker._config = VRTeleopConfig()
+        worker._lift_clear_t = None
+        worker._rest_goal = None
+        worker._rest_pose_left = self.rest[:7].copy()
+        worker._rest_pose_right = self.rest[7:].copy()
+        return worker
+
+    def test_contact_reports_the_deck_rising_under_the_hands(self) -> None:
+        s = self.solver
+        self.assertTrue(s.has_lift_contact)
+        self.assertEqual(s.lift_contact(self.rest), {})
+        s.set_lift(0.6)
+        contact = s.lift_contact(self.rest)
+        self.assertEqual(set(contact), {"left", "right"})
+        for depth, normal in contact.values():
+            self.assertGreater(depth, 0.03)
+            self.assertGreater(normal[2], 0.9)  # out of the deck is up
+
+    def test_versions_without_a_lift_report_none(self) -> None:
+        owl = KinematicsSolver(KinematicsConfig(robot_model="owl"))
+        self.assertFalse(owl.has_lift_contact)
+        self.assertEqual(owl.lift_contact(self.rest), {})
+        self.assertIsNone(owl.lift_clear_step(self.rest))
+
+    def test_the_rest_goal_clears_the_lowered_deck(self) -> None:
+        worker = self._worker()
+        np.testing.assert_array_equal(worker.rest_goal(), self.rest)
+        s = self.solver
+        s.set_lift(0.3)
+        posture = s.posture_pose
+        self.assertLess(self._deck_clearance(self.rest), -0.1)
+        goal = worker.rest_goal()
+        self.assertGreater(self._deck_clearance(goal), 0.0)
+        # The solver is left as it was.
+        self.assertAlmostEqual(s.lift_lowered, 0.7 * 0.34, places=6)
+        np.testing.assert_allclose(s.posture_pose, posture)
+        # The planned return ends there.
+        np.testing.assert_array_equal(worker.path_goal("rest"), goal)
+
+    def test_a_disengaged_arm_is_moved_out_of_the_deck(self) -> None:
+        worker = self._worker()
+        s = self.solver
+        s.set_lift(0.6)
+        q = self.rest.copy()
+        self.assertLess(self._deck_clearance(q), 0.0)
+        for _ in range(300):
+            q = worker.clear_lift(q)
+            if self._deck_clearance(q) > 0.0:
+                break
+        self.assertGreater(self._deck_clearance(q), 0.0)
+
+    def test_a_clear_step_is_paced_and_moves_only_the_sides_asked(self) -> None:
+        s = self.solver
+        s.set_lift(0.6)
+        q = s.lift_clear_step(self.rest, max_step=0.002, sides=("left",))
+        self.assertIsNotNone(q)
+        np.testing.assert_array_equal(q[7:], self.rest[7:])
+        (before, _), _ = s.fk(self.rest)
+        (after, _), _ = s.fk(q)
+        self.assertGreater(after[2], before[2])
+        self.assertLess(float(np.linalg.norm(after - before)), 0.003)
+
+    def test_an_engaged_target_keeps_the_plane_it_is_held_at(self) -> None:
+        worker = self._worker()
+        s = self.solver
+        s.set_lift(0.6)
+        contact = s.lift_contact(self.rest)
+        (lp, lr), (rp, rr) = s.fk(self.rest)
+        # The hand pressed 4 cm further into the deck and moved forward: only
+        # the press is given up.
+        deeper = lp + np.array([0.03, 0.0, -0.04], np.float32)
+        shifts = worker._hold_lift_plane(
+            self.rest, {"left": (deeper, lr), "right": (rp + [0, 0, 0.02], rr)}, contact
+        )
+        self.assertEqual(set(shifts), {"left"})
+        shifted = deeper + shifts["left"]
+        self.assertAlmostEqual(
+            float(np.dot(contact["left"][1], shifted - lp)), 0.0, places=4
+        )
+        self.assertAlmostEqual(float(shifted[0] - lp[0]), 0.03, places=2)
+
+
+class IdleLiftClearTest(unittest.TestCase):
+    def test_steps_the_arms_clear_with_no_frames_arriving(self) -> None:
+        core = VRTeleopCore(
+            VRTeleopConfig(ik_frequency=1000.0),
+            logging.getLogger("test"),
+            broadcast_tracking=lambda _enabled: None,
+        )
+        core.set_target(np.zeros(16, np.float32))
+        cleared = np.full(14, 0.1, np.float32)
+        stop = threading.Event()
+
+        class Conn(_Conn):
+            replies = [("cleared", cleared, True), ("cleared", cleared, False)]
+
+            def recv(self):
+                if self.sent and self.sent[-1] == ("clear",):
+                    if not self.replies:
+                        stop.set()
+                        return ("cleared", cleared, False)
+                    return self.replies.pop(0)
+                return super().recv()
+
+        conn = Conn()
+        heights = iter([0.5] * 20)
+
+        def get_lift():
+            try:
+                return next(heights)
+            except StopIteration:
+                stop.set()
+                return 0.5
+
+        core.run_ik_loop(
+            conn,
+            MagicMock(return_value=None),
+            stop,
+            lambda: True,
+            lambda _t: None,
+            get_lift=get_lift,
+        )
+        # One lift reading, then clear steps until the arms stop moving.
+        self.assertEqual(conn.sent.count(("clear",)), 2)
+        np.testing.assert_array_equal(core.q, cleared)
 
 
 class JellyLiftRaisedTest(unittest.TestCase):

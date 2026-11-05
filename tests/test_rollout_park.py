@@ -234,6 +234,7 @@ def test_worker_honors_explicit_zero_target_without_changing_rest_protocol():
     zero = np.zeros(14, dtype=np.float32)
     worker = mock.Mock(left_indices=list(range(7)), right_indices=list(range(7, 14)))
     worker.get_rest_q.return_value = rest
+    worker.rest_goal.return_value = rest
     worker.compute_reset_trajectory.side_effect = lambda start, goal: [
         start.copy(),
         goal.copy(),

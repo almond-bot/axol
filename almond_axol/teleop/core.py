@@ -129,6 +129,11 @@ HAPTICS_BROADCAST_HZ = 30.0
 _HAPTIC_TORQUE_TAU_S = 0.08
 _HAPTIC_TORQUE_FULL = 2.5
 _HAPTIC_NEAR_DEADBAND = 0.2
+# A joint under a spring-torque cap (box mode's wrists, see spring_caps) can
+# never push past the cap, so its cue starts at this fraction of the cap
+# (when that is below ``config.haptic_torque``) and is full at the cap: a
+# joint held at its cap, the one that heats up, rumbles at full strength.
+_HAPTIC_CAP_START = 0.8
 # Held-load estimate (see HeldLoad): the commanded gripper opening (0 closed,
 # 1 open) below which a gripper counts as holding, the fraction of
 # ``config.haptic_torque`` a held-load fit may leave unexplained on a joint,
@@ -2241,6 +2246,9 @@ class VRTeleopCore:
         last_dead_warn = 0.0
         sent_lift: float | None = None
         sent_grip: tuple[float, float] | None = None
+        # Set when the lift moves; cleared once an idle "clear" step (see
+        # _clear_lift_idle) leaves the arms where they are.
+        lift_clear_pending = False
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -2264,6 +2272,7 @@ class VRTeleopCore:
                     try:
                         conn.send(("lift", float(raised)))
                         sent_lift = raised
+                        lift_clear_pending = True
                     except OSError:
                         pass  # the dead-process path below reports it
 
@@ -2412,6 +2421,13 @@ class VRTeleopCore:
                 # No new frame (idle headset, or none connected): live
                 # settings still apply — the panel may be changing them.
                 self._apply_live_requests()
+                if (
+                    lift_clear_pending
+                    and not self.teleop_enabled
+                    and not self.config.absolute_mode
+                    and process_alive()
+                ):
+                    lift_clear_pending = self._clear_lift_idle(conn, stop_event)
                 if frame is not None:
                     # PoseInterpolator deliberately preserves object identity
                     # when the rendered pose is numerically unchanged, but
@@ -2547,6 +2563,37 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _clear_lift_idle(
+        self, conn: multiprocessing.connection.Connection, stop_event: threading.Event
+    ) -> bool:
+        """Move the arms out of the way of Jelly's deck with no frames arriving.
+
+        On the mobile Axol the deck rises toward the arms as the lift lowers.
+        While frames arrive, the IK worker moves arms that aren't tracking
+        out of its way on every solve. This covers the lift lowered from the
+        control panel with no headset streaming: one ``("clear",)`` step
+        (``IKWorker.clear_lift``). Returns whether the arms moved, so the
+        caller keeps stepping until they are clear.
+        """
+        try:
+            conn.send(("clear",))
+            reply = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
+        except Exception as e:  # noqa: BLE001 - keep the loop alive
+            self._logger.error("IK lift clearance dispatch error: %s", e)
+            return False
+        if not (
+            isinstance(reply, tuple)
+            and len(reply) == 3
+            and isinstance(reply[0], str)
+            and reply[0] == "cleared"
+        ):
+            self._logger.warning("Unexpected IK lift clearance reply: %r", reply)
+            return False
+        _, q, moved = reply
+        if moved:
+            self.set_target(q)
+        return bool(moved)
 
     def _handle_engage_rejection(self, base_msg: object) -> bool:
         """Disengage on an IK-worker ``{"rejected": reason}`` base message.
@@ -2729,9 +2776,11 @@ class VRTeleopCore:
         Each level is 0 to 1. ``near`` is how close that arm is to the IK
         collision boundary (:attr:`collision_near`), ``force`` how far its
         largest low-passed torque residual (measured minus model gravity,
-        less what its gripper holds: :attr:`held_loads`) is past
+        less the weight its gripper holds: :attr:`held_loads`) is past
         ``config.haptic_torque``, full at
-        ``_HAPTIC_TORQUE_FULL`` times it. Only an engaged arm plays, and
+        ``_HAPTIC_TORQUE_FULL`` times it. A joint under a spring cap
+        (:meth:`spring_caps`) starts at ``_HAPTIC_CAP_START`` of its cap if
+        that is lower and is full at the cap. Only an engaged arm plays, and
         nothing plays with ``config.haptics`` off or during a return to
         rest, and ``near`` stays 0 with ``config.haptic_near`` off. In
         box mode both arms follow the leading controller, so it
@@ -2741,7 +2790,7 @@ class VRTeleopCore:
         if not self.config.haptics or self.is_resetting:
             return levels
         near = self.collision_near or {}
-        start = float(self.config.haptic_torque)
+        start, full = self._haptic_torque_band()
         for side, engaged in (
             ("left", self.left_enabled),
             ("right", self.right_enabled),
@@ -2754,10 +2803,12 @@ class VRTeleopCore:
                 3,
             )
             push = self._push.get(side)
-            if start > 0.0 and push is not None and push.size:
-                peak = float(np.max(np.abs(push)))
-                force = (peak - start) / (start * (_HAPTIC_TORQUE_FULL - 1.0))
-                levels[side]["force"] = round(min(max(force, 0.0), 1.0), 3)
+            if start is not None and push is not None and push.size:
+                n = min(push.size, start.size)
+                force = (np.abs(push[:n]) - start[:n]) / (full[:n] - start[:n])
+                levels[side]["force"] = round(
+                    min(max(float(np.max(force)), 0.0), 1.0), 3
+                )
         if self.box_mode and self._box_leader in ("left", "right"):
             leader = self._box_leader
             other = "right" if leader == "left" else "left"
@@ -2767,6 +2818,21 @@ class VRTeleopCore:
             }
             levels[other] = {"near": 0.0, "force": 0.0}
         return levels
+
+    def _haptic_torque_band(self) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """Per arm joint, the push torque (Nm) where the force cue starts and
+        where it is full; ``(None, None)`` with the cue off
+        (``config.haptic_torque`` 0). See :meth:`haptic_levels`."""
+        torque = float(self.config.haptic_torque)
+        if torque <= 0.0:
+            return None, None
+        start = np.full(len(ARM_JOINTS), torque)
+        full = np.full(len(ARM_JOINTS), torque * _HAPTIC_TORQUE_FULL)
+        for joint, cap in (self.spring_caps() or {}).items():
+            i = ARM_JOINTS.index(joint)
+            start[i] = min(start[i], _HAPTIC_CAP_START * cap)
+            full[i] = max(min(full[i], cap), start[i] + 1e-3)
+        return start, full
 
     def _update_torque_lp(self, robot: object, now: float) -> None:
         """Feed one torque-residual sample into the haptics low-pass."""
@@ -2811,8 +2877,10 @@ class VRTeleopCore:
         """The part of one arm's low-passed ``residual`` its gripper's load explains.
 
         A gripper holds something while its command is closed, or while box
-        mode clamps the box between both grippers (which also squeezes it).
-        Opening the gripper, or leaving box mode, drops the estimate (see
+        mode clamps the box between both grippers. In box mode the fit also
+        models the squeeze, so it stays out of the weight estimate, but only
+        the weight is explained: the squeeze stays in the push cue. Opening
+        the gripper, or leaving box mode, drops the estimate (see
         :class:`~almond_axol.teleop.held_load.HeldLoad`). Zero while nothing
         is held, with ``config.haptic_held_load`` off, or without measured
         joint positions to evaluate the load at.
