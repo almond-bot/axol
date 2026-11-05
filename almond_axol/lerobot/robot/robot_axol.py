@@ -247,12 +247,18 @@ class AxolRobot(Robot):
         *,
         ik_config: "KinematicsConfig | MinkIKConfig | None" = None,
         mink_solve_hz: float | None = None,
+        cartesian_action_hz: float | None = None,
     ) -> None:
         """Create the robot with a fixed Cartesian solver cadence.
 
         ``mink_solve_hz`` overrides only the cadence in a copied Mink config;
         omitted, it preserves an explicit config's cadence or the 30 Hz default.
         Configure this before connecting; a different cadence needs a new robot.
+
+        ``cartesian_action_hz`` declares JAX policy cadence (at least 4 Hz,
+        within the 250 ms shaper reset interval). Filtering advances at most
+        one period with 240 Hz substeps. Omitted, generic Cartesian callers
+        retain the single 60 Hz-step cap. Native admission remains independent.
         """
         if config.cartesian_controller == "mink":
             from ...policy.mink_ik import MinkIKConfig
@@ -273,6 +279,20 @@ class AxolRobot(Robot):
             ik_config = replace(ik_config, mink_solve_hz=float(rate))
         elif mink_solve_hz is not None:
             raise ValueError("mink_solve_hz requires cartesian_controller='mink'")
+        if cartesian_action_hz is not None:
+            if (
+                isinstance(cartesian_action_hz, bool)
+                or not isinstance(cartesian_action_hz, Real)
+                or not np.isfinite(cartesian_action_hz)
+                or cartesian_action_hz < 4
+                or config.cartesian_controller != "jax"
+            ):
+                raise ValueError(
+                    "cartesian_action_hz requires JAX and a finite rate >= 4 Hz"
+                )
+        self._cartesian_action_period = (
+            None if cartesian_action_hz is None else 1.0 / cartesian_action_hz
+        )
         super().__init__(config)
         self.config = config
         # Feature keys for the joints this robot actually has: the gripperless
@@ -1528,7 +1548,7 @@ class AxolRobot(Robot):
         for i, gi in enumerate(solver.right_indices):
             right[i] = q_out[gi]
 
-        # Cartesian senders have no fixed rate contract, so the shapers run on
+        # Generic Cartesian senders have no fixed rate contract, so they run on
         # measured inter-send spacing — but the dt fed to the filter is capped
         # at one nominal 60 Hz tick, so a single command can never advance the
         # target by more than ``max_vel / 60`` no matter how long the sender
@@ -1557,11 +1577,23 @@ class AxolRobot(Robot):
         if gap > 0.25:
             shaper_l.reset(seed=np.asarray(left_cur, dtype=np.float32)[:7])
             shaper_r.reset(seed=np.asarray(right_cur, dtype=np.float32)[:7])
-        dt = min(max(gap, 1.0 / 240.0), 1.0 / 60.0)
-        shaper_l.dt = dt
-        shaper_r.dt = dt
-        left[:7] = shaper_l.update(left[:7])
-        right[:7] = shaper_r.update(right[:7])
+        period = self._cartesian_action_period
+        if period is None:
+            duration, steps = min(max(gap, 1.0 / 240.0), 1.0 / 60.0), 1
+        else:
+            # Explicit policy cadence spends at most one period, never a
+            # starvation gap. Faster calls spend only elapsed time. Integrate
+            # with native-rate substeps so filter gains do not run at 12 Hz.
+            duration = min(max(gap, 0.0), period)
+            steps = max(1, int(np.ceil(duration * 240)))
+        shaper_l.dt = shaper_r.dt = duration / steps
+        target_l, target_r = left[:7].copy(), right[:7].copy()
+        if duration == 0:
+            left[:7], right[:7] = shaper_l.position, shaper_r.position
+        else:
+            for _ in range(steps):
+                left[:7] = shaper_l.update(target_l)
+                right[:7] = shaper_r.update(target_r)
 
         # The gripperless SKU has no gripper keys; Axol ignores the padded slot.
         left[-1] = action[_LEFT_GRIPPER_KEY] if self._has_gripper else 0.0

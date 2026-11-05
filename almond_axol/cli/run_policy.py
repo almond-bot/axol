@@ -2903,6 +2903,8 @@ def _run(
     robot_options = (
         {"mink_solve_hz": fps}
         if getattr(robot_config, "cartesian_controller", "jax") == "mink"
+        else {"cartesian_action_hz": fps}
+        if robot_config.action_space == "cartesian"
         else {}
     )
     robot = AxolRobot(robot_config, **robot_options)
