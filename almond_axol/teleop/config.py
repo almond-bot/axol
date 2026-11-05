@@ -260,7 +260,9 @@ class VRTeleopConfig:
         box_elbow_out: How far out the elbows are held in box mode, in
             degrees from straight down toward each arm's outboard side
             (``0`` hangs the elbows under the shoulder-wrist line, ``90``
-            holds them out level). The parallel, fingers-forward gripper
+            holds them out level). ``0`` (the default) keeps them tucked
+            beside the body: with the box pulled in to the chest the elbows
+            go down and back instead of flaring out sideways. The parallel, fingers-forward gripper
             poses of box mode leave each arm's elbow swivel free; an IK
             elbow hint steers it to this angle (at ``box_elbow_weight``).
             Live-adjustable from the settings panel and the headset menu
@@ -608,7 +610,7 @@ class VRTeleopConfig:
     box_width_min: float = 0.0
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
-    box_elbow_out: float = 30.0
+    box_elbow_out: float = 0.0
     box_elbow_weight: float = 10.0
     box_wrist_torque: float = 5.0
     box_squeeze_torque: float = 0.0

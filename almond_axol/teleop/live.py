@@ -164,9 +164,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=5.0,
         unit="°",
         help=(
-            "Box mode: how far out the elbows are held, in degrees from "
-            "hanging straight down under the shoulder-wrist line (0) to out "
-            "level (90)."
+            "Box mode: how far out the elbows are held. 0 keeps them tucked "
+            "beside the body and 90 holds them out level."
         ),
     ),
     LiveSettingDef(

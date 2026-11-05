@@ -1570,7 +1570,7 @@ class GraspSwitchTest(unittest.TestCase):
             broadcast_mode=lambda key, value: notified.append((key, value)),
         )
         q = np.zeros(14, np.float32)
-        self.assertEqual(core.config.box_elbow_out, 30.0)  # the default
+        self.assertEqual(core.config.box_elbow_out, 0.0)  # the default
         self.assertEqual(core.config.box_elbow_weight, 10.0)  # hint on by default
         status = {"aligned": False, "width": 0.3, "grasp": "straight", "elbow": 42.5}
         core._unpack_solution((q, status))
