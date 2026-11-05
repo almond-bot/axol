@@ -183,6 +183,13 @@ class VRFrame(BaseModel):
             *together* toggle **box mode** (handled on the headset, which
             sends the ``set`` message; see
             :meth:`almond_axol.vr.server.VRServer.set_on_setting`).
+        stow: True while the right controller's **A** is held in plain
+            teleop (data collection keeps A for recording). In box mode a
+            press while a grip leads the pair stows the box: see
+            :meth:`almond_axol.teleop.worker.IKWorker._step_stow`.
+        box_stow: Server-internal: a one-frame request, set by the teleop
+            core on the frame it forwards to the IK worker, to start the
+            box-mode stow. Headsets leave it unset.
         box_leader: Server-internal: which controller leads the arm pair in
             box mode (``"left"`` / ``"right"``). Set by the teleop core on
             the frame it forwards to the IK worker; headsets leave it unset.
@@ -228,5 +235,7 @@ class VRFrame(BaseModel):
     r_stick_y: FiniteFloat = 0.0
     l_stick_click: bool = False
     r_stick_click: bool = False
+    stow: bool = False
+    box_stow: bool = False
     box_leader: Literal["left", "right"] | None = None
     reengage: Literal["clutch", "ramp"] | None = None

@@ -76,6 +76,8 @@ export type AxolPoseData = {
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
+  /** Right controller A held, in plain teleop only: box-mode stow. */
+  stow?: boolean
 }
 
 /** Re-engage behaviour (the `reengage` live setting): "clutch" — a re-engaging

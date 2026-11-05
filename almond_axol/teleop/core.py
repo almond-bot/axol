@@ -478,6 +478,14 @@ class VRTeleopCore:
         self._prev_both: bool = False
         self._prev_l_lock: bool = False
         self._prev_r_lock: bool = False
+        # Box-mode stow (A while a grip leads, see _update_stow): the A held
+        # last frame, whether a stow is running (the worker moves the pair;
+        # it is frozen once the worker reports it done) and the one-frame
+        # request still to be sent to the worker.
+        self._prev_stow: bool = False
+        self._stowing: bool = False
+        self._stow_pulse: bool = False
+        self._stow_leader: str | None = None
         # Both-grips gate for the next engage. Set at startup, at rest, and by
         # every forced disengage (reset, stale stream, contact) so resuming is
         # always deliberate; cleared once engaged, so an operator who froze
@@ -1495,6 +1503,7 @@ class VRTeleopCore:
         self._maybe_auto_engage(frame)
         if self.box_mode:
             self._update_engage_box(frame)
+            self._update_stow(frame)
             # A grip that just froze the pair ends a deferred exit now.
             self._finish_box_exit()
             return
@@ -1657,6 +1666,49 @@ class VRTeleopCore:
             self.l_grip = float(frame.l_grip)
             self.r_grip = float(frame.r_grip)
 
+    def _update_stow(self, frame: object) -> None:
+        """Start the box-mode stow on an **A** press while a grip leads.
+
+        The stow (``IKWorker._start_stow``) squares the box in front of the
+        chest and pulls it in as far as the arms follow, ignoring the
+        leading hand; once the worker reports it done
+        (:meth:`_finish_stow`) the pair freezes, as a click of the leading
+        grip would, so the grippers stay closed while Jelly drives. A grip
+        press during the stow (a freeze or a handover) cancels it.
+        """
+        pressed = bool(getattr(frame, "stow", False))
+        edge = pressed and not self._prev_stow
+        self._prev_stow = pressed
+        if not (self.teleop_enabled and self._box_leader is not None):
+            self._stowing = False
+            self._stow_pulse = False
+            return
+        if self._stowing and self._box_leader != self._stow_leader:
+            # The lead changed hands: the worker re-snapped and dropped it.
+            self._stowing = False
+        if edge and not self._stowing:
+            self._logger.info("Box stow: pulling the box in to the chest")
+            self._stowing = True
+            self._stow_pulse = True
+            self._stow_leader = self._box_leader
+
+    def _finish_stow(self, status: dict) -> None:
+        """Freeze the pair once the worker reports the stow done."""
+        if not self._stowing:
+            return
+        phase = status.get("stow")
+        if phase == "done":
+            self._stowing = False
+            self._box_leader = None
+            self.left_enabled = False
+            self.right_enabled = False
+            self._require_both_engage = False
+            self._logger.info("Box stowed: pair frozen. Press a grip to lead again.")
+            self._broadcast(False)
+        elif phase is None and not self._stow_pulse:
+            # The worker dropped it (a re-snap, or the pair let go).
+            self._stowing = False
+
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
 
@@ -1687,6 +1739,7 @@ class VRTeleopCore:
                     elbow = status.get("elbow")
                     if isinstance(elbow, (int, float)):
                         self._mirror_worker_field("box_elbow_out", float(elbow))
+                    self._finish_stow(status)
             return q
         return result
 
@@ -2446,7 +2499,9 @@ class VRTeleopCore:
                 self._logger.exception("VR frame sampling failed; keeping last target")
                 self._pace(t0, ik_interval)
                 continue
-            if frame is None or frame is last_frame:
+            if frame is None or (frame is last_frame and not self._stowing):
+                # (While a stow runs the last frame is sent again: the worker
+                # moves the pair on every solve, even with the hand still.)
                 # No new frame (idle headset, or none connected): live
                 # settings still apply — the panel may be changing them.
                 self._apply_live_requests()
@@ -2531,8 +2586,10 @@ class VRTeleopCore:
                         ),
                         # The worker only ever sees the *effective* mode.
                         "reengage": self.reengage,
+                        "box_stow": self._stow_pulse,
                     }
                 )
+                self._stow_pulse = False
                 # Live config changes the worker's pickled config must
                 # mirror (fire-and-forget; see run_ik_worker).
                 if self._worker_updates:

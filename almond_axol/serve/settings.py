@@ -827,6 +827,21 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.box_stow_height",
+                ui=_parcel_only(),
+                label="Box-mode stow height (m)",
+                type="number",
+                help=(
+                    "How far below the shoulders the box is held when you press A "
+                    "to stow it. The arms square the box up, pull it in to the "
+                    "chest at this height, then hold it so you can drive."
+                ),
+                targets={
+                    "teleop": ("teleop.box_stow_height",),
+                    "collect-data": (f"{_VRT}.box_stow_height",),
+                },
+            ),
+            SettingDef(
                 key="teleop.box_elbow_weight",
                 ui=_parcel_only(),
                 label="Box-mode elbow hint weight",

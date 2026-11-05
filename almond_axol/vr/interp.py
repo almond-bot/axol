@@ -1084,6 +1084,7 @@ def _build_frame(
         r_stick_y=latest.r_stick_y,
         l_stick_click=latest.l_stick_click,
         r_stick_click=latest.r_stick_click,
+        stow=latest.stow,
     )
     motion = np.concatenate(
         [
@@ -1156,4 +1157,5 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.r_stick_y == b.r_stick_y
         and a.l_stick_click == b.l_stick_click
         and a.r_stick_click == b.r_stick_click
+        and a.stow == b.stow
     )

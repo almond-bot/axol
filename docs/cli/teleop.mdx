@@ -152,6 +152,9 @@ To switch box mode on or off during a session, press the headset's **Box** butto
 | `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0` / `0.70` m). The gripper bodies raise the minimum where needed. The parcel gripper's faces can close all the way together. |
 | `--teleop.box_align_duration` | Time to blend into the pair when box mode engages (default: `1.5` s). |
 | `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `0`, tucked beside the body). Live control: **Elbows out**. |
+| `--teleop.box_stow_height` | How far below the shoulders **A** stows the box, in meters (default: `0.25`). |
+| `--teleop.box_stow_reach` | Closest the stow pulls the box to the shoulders, in meters forward of them (default: `0.15`). |
+| `--teleop.box_stow_speed` | How fast the stow moves the box, in m/s (default: `0.12`). |
 | `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and **Elbows out** does nothing. |
 | `--teleop.box_squeeze_lean` | Lean each gripper into the box as you squeeze, so the face presses evenly from root to tip (default: `1`; `0` is off). Live control: **Squeeze lean**. |
 | `--teleop.box_squeeze_trim` | Largest extra inward turn, in degrees, added while squeezing to square each face to the box (default: `5`; `0` is off). Live control: **Squeeze trim**. |
