@@ -134,7 +134,7 @@ class Motor:
         self._driver.set_feedback_callback(_cache_feedback)
 
     async def enable(self) -> None:
-        """Enable the motor and release the brake."""
+        """Enable the motor."""
         await self._driver.enable()
 
     async def attach(self, mode: ControlMode) -> None:
@@ -145,7 +145,7 @@ class Motor:
         it died mid-session). Re-reads the state needed for correct command
         scaling and verifies the motor is enabled, fault-free, and — where the
         hardware exposes a mode register (Damiao) — already in ``mode``. No
-        reset, brake, enable, or motion command is sent, so a motor holding
+        reset, enable, or motion command is sent, so a motor holding
         position keeps holding it throughout. In contrast,
         :meth:`set_control_mode` reboots MyActuator motors, dropping torque
         for ~2 s.
@@ -168,7 +168,7 @@ class Motor:
         self.mode = mode
 
     async def disable(self) -> None:
-        """Disable the motor and engage the brake."""
+        """Disable the motor (it goes limp)."""
         await self._driver.disable()
 
     async def is_holding(self) -> bool:

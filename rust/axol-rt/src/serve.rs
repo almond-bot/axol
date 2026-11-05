@@ -73,8 +73,8 @@
 //!                     drop the arm — and named in an `L` line; the gripper
 //!                     is never touched
 //! - `A`               arm: bring-up, enable the cold joints, hold current
-//!                     pose (holding joints are attached to without a brake
-//!                     release / enable frame; the gripper must already be
+//!                     pose (holding joints are attached to without an
+//!                     enable frame; the gripper must already be
 //!                     enabled + calibrated in POSITION_FORCE mode by the
 //!                     Python side)
 //! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots

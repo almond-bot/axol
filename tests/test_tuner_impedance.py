@@ -2,7 +2,7 @@
 
 A customer's left shoulder_1 swung violently in ``tune.factory`` (2026-10-07):
 the tools homed one joint at a time on the motors' own 0xA4 position loops,
-with every other joint reset, brake released and unheld until its turn. Now
+with every other joint reset and unheld until its turn. Now
 every joint is held on impedance (calibration gains, gravity fed forward)
 before anything moves, and every move is an impedance ramp.
 """

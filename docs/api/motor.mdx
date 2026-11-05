@@ -35,7 +35,7 @@ asyncio.run(main())
 
 | Method | Description |
 |---|---|
-| `enable()` / `disable()` | Enable the motor, or disable it and engage the brake. On a Damiao motor, `disable()` also clears a `LOST_COMM` fault (see below). |
+| `enable()` / `disable()` | Enable the motor, or disable it. A disabled motor has no torque. On a Damiao motor, `disable()` also clears a `LOST_COMM` fault (see below). |
 | `attach(mode)` | Reconnect to a motor that is already enabled, without changing its torque. Checks with reads only that it is enabled, fault-free and in `mode`. |
 | `is_holding()` | `True` if the motor is enabled and holding torque. Read-only (see below for how each motor family reports it). |
 | `clear_errors()` | Clear latched error flags |

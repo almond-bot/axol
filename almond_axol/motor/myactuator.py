@@ -38,7 +38,6 @@ _MA_MC_REQ = 0x400  # motion control request    → 0x400 + motor_id
 _MA_MC_RESP = 0x500  # motion control response   ← 0x500 + motor_id
 
 _MA_SHUTDOWN = 0x80
-_MA_RELEASE_BRAKE = 0x77
 _MA_RESET = 0x76  # system reset; no response — motor restarts immediately
 _MA_READ_STATUS1 = 0x9A  # temperature, voltage, error flags
 _MA_READ_VERSION = 0xB2  # system software VersionDate (uint32, e.g. 2026042402)
@@ -328,9 +327,8 @@ class MyActuatorMotor(MotorDriver):
     async def _running_state(self) -> tuple[bool, int]:
         """Return ``(running, error_bits)`` from a status-1 read.
 
-        ``running`` is status-1 byte 3. The protocol labels it the brake
-        release state; observed on fleet firmware (2025070202) it reads 1
-        only while the motor is actively executing commands — 0 when
+        ``running`` is status-1 byte 3. Observed on fleet firmware
+        (2025070202) it reads 1 only while the motor is actively executing commands — 0 when
         disabled, freshly enabled but never commanded, or just reset — which
         makes it exactly the "enabled and holding" signal attach/is_holding
         need.
@@ -459,15 +457,17 @@ class MyActuatorMotor(MotorDriver):
         except MotorError:
             pass
         await self._apply_low_voltage_threshold()
-        await self._request(self._cmd(_MA_RELEASE_BRAKE))
+        # The joints have no brake, so there is nothing to release: the motor
+        # takes torque on its first motion command. Read status 1 so a motor
+        # that doesn't answer still fails enable().
+        await self._get_status1()
 
     async def attach(self) -> None:
         # Reads only. The capability detection must succeed here (unlike
         # enable(), which tolerates a silent motor still booting): a motor
         # that doesn't answer can't be verified as holding. Crucially there
         # is no 0x76 reset (that reboots the motor, killing torque for ~2 s)
-        # and no 0x77 brake release (that would drop an arm parked on its
-        # brake) — the whole point of attach is to leave torque untouched.
+        # — the whole point of attach is to leave torque untouched.
         await self._detect_capabilities()
         running, error_bits = await self._running_state()
         if error_bits:

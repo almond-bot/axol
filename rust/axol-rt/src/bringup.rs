@@ -153,7 +153,7 @@ pub struct ReadyMotor {
     pub hold_pos: f64,
     /// Already enabled and holding torque when found (a previous session
     /// died or disconnected while live). Such a motor is *attached to*, not
-    /// brought up: no reset, no brake release, no enable — it keeps holding
+    /// brought up: no reset, no enable — it keeps holding
     /// its pose until the core's hold stream takes over at that same pose.
     pub holding: bool,
     pub kp: f64,
@@ -495,7 +495,7 @@ pub fn write_dm_register(sock: &CanSock, motor_id: u16, rid: u8, value: [u8; 4])
 }
 
 /// Enable every cold motor. Motors found holding by [`prepare`] are left
-/// exactly as they are (no brake release / enable frame), and are excluded
+/// exactly as they are (no enable frame), and are excluded
 /// from the rollback: a failed cold bring-up must never drop a pre-existing
 /// hold, only the motors this call itself touched.
 pub fn enable(sock: &CanSock, iface: &str, motors: &[ReadyMotor]) -> io::Result<()> {
@@ -513,11 +513,13 @@ pub fn enable(sock: &CanSock, iface: &str, motors: &[ReadyMotor]) -> io::Result<
         }
         attempted.push(m.clone());
         let result = match m.vendor {
+            // No brake to release: a MyActuator joint takes torque on its
+            // first MIT frame. The status read checks it answered its reset.
             Vendor::MyActuator => {
-                match txn::ma_request(sock, m.id, proto::ma_cmd(proto::MA_RELEASE_BRAKE), TIMEOUT) {
+                match txn::ma_request(sock, m.id, proto::ma_cmd(proto::MA_READ_STATUS1), TIMEOUT) {
                     Ok(Some(_)) => Ok(()),
                     Ok(None) => Err(io::Error::other(format!(
-                        "{}: brake release not acknowledged",
+                        "{}: no status reply at enable",
                         m.joint
                     ))),
                     Err(err) => Err(err),
