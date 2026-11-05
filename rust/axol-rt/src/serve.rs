@@ -213,6 +213,7 @@ use crate::hold::sleep_until;
 use crate::proto;
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, NO_ACK_REPORT, STALL_DETECT};
 use crate::stall;
+use crate::thermal::{ThermalEvent, ThermalGuard, ThermalLimit};
 
 /// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
 /// `almond_axol.robot.control`.  The slow pole keeps target-rate steps out of
@@ -290,7 +291,10 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   tick spacing, see `filter::TrackingProfile`). A proto-18 core rejects
 ///   the line as an unknown directive; the bump makes that the proto
 ///   mismatch's "rebuild with `axol rt.install`" instead.
-const CONFIG_PROTO: u32 = 19;
+/// - 20: an optional `thermal` line (the Damiao wrists' temperature limit,
+///   `thermal::ThermalLimit`). A proto-19 core rejects it as an unknown
+///   directive, and would run the wrists with no thermal limit.
+const CONFIG_PROTO: u32 = 20;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping
 /// stays off until a full clean window has passed, and the transition is
@@ -614,6 +618,47 @@ type BusStartGate = (Mutex<Option<Instant>>, Condvar);
 /// the client why, once. Edge-triggered: a repeating condition (a motor that
 /// stays silent) reports on its first tick only. Returns whether this call
 /// made the transition.
+/// Tell the operator about a wrist's thermal limit (see `thermal`): a `W`
+/// line when its torque comes down or it keeps heating, an `L` line when
+/// the torque comes back.
+fn report_thermal(
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    iface: &str,
+    joint: &str,
+    lim: &ThermalLimit,
+    event: ThermalEvent,
+) {
+    match event {
+        ThermalEvent::Cooling { coil_c, driver_c } => send_text(
+            out_tx,
+            b'W',
+            &format!(
+                "{iface}: {joint} is hot (coil {coil_c:.0} °C, driver {driver_c:.0} °C). \
+                 Reducing its torque to {:.1} Nm until the coil cools to {:.0} °C and the \
+                 driver to {:.0} °C.",
+                lim.cool_cap_nm, lim.coil_resume_c, lim.driver_resume_c,
+            ),
+        ),
+        ThermalEvent::StillHeating { coil_c, driver_c } => send_text(
+            out_tx,
+            b'W',
+            &format!(
+                "{iface}: {joint} is still heating with its torque reduced (coil \
+                 {coil_c:.0} °C, driver {driver_c:.0} °C). Let the arm rest, or the motor \
+                 turns itself off."
+            ),
+        ),
+        ThermalEvent::Restored { coil_c, driver_c } => send_text(
+            out_tx,
+            b'L',
+            &format!(
+                "{iface}: {joint} cooled (coil {coil_c:.0} °C, driver {driver_c:.0} °C). \
+                 Restoring its full torque."
+            ),
+        ),
+    }
+}
+
 fn go_limp(limp: &AtomicBool, out_tx: &mpsc::Sender<Vec<u8>>, reason: &str) -> bool {
     if limp
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1367,6 +1412,9 @@ struct Config {
     watchdog_ms: f64,
     max_step_rad: f64,
     tracking_profile: TrackingProfile,
+    /// The Damiao wrists' temperature limit (`thermal` line; defaults when
+    /// absent).
+    thermal: ThermalLimit,
     /// (side, iface, specs) — side 0 = left, 1 = right.
     buses: Vec<(u8, String, Vec<MotorSpec>)>,
 }
@@ -1377,6 +1425,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut watchdog_ms = 150.0;
     let mut max_step_rad = 0.35;
     let mut tracking_profile = TrackingProfile::Default;
+    let mut thermal = ThermalLimit::default();
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
     let mut proto: Option<u32> = None;
 
@@ -1442,6 +1491,11 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     ["tracking_profile", "mink"] => TrackingProfile::Mink,
                     _ => return Err(bad(line)),
                 };
+            }
+            "thermal" => {
+                // thermal off | thermal <coil_limit> <coil_resume>
+                //   <driver_limit> <driver_resume> <cool_cap_nm> <ramp_s>
+                thermal = ThermalLimit::parse(&f[1..]).ok_or_else(|| bad(line))?;
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
@@ -1615,6 +1669,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
         watchdog_ms,
         max_step_rad,
         tracking_profile,
+        thermal,
         buses,
     })
 }
@@ -1757,6 +1812,29 @@ mod tests {
         // The gripper is never capped.
         let cfg = parse_config(&format!("proto {CONFIG_PROTO}\ngripper 0 canL 8\n")).unwrap();
         assert_eq!(cfg.buses[0].2[0].tau_cap, f64::INFINITY);
+    }
+
+    /// The wrists' thermal limit is an optional, strict line; without it
+    /// the defaults run.
+    #[test]
+    fn parse_config_thermal() {
+        let joint =
+            "joint 0 canL wrist_2 6 130 3.5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20";
+        let thermal_of = |line: &str| {
+            parse_config(&format!(
+                "proto {CONFIG_PROTO}\nloop_hz 240\n{line}{joint}\n"
+            ))
+            .map(|cfg| cfg.thermal)
+        };
+        assert_eq!(thermal_of("").unwrap(), ThermalLimit::default());
+        let lim = thermal_of("thermal 80 70 100 90 2 1\n").unwrap();
+        assert_eq!(
+            (lim.coil_limit_c, lim.cool_cap_nm, lim.ramp_s),
+            (80.0, 2.0, 1.0)
+        );
+        assert!(!thermal_of("thermal off\n").unwrap().enabled);
+        assert!(thermal_of("thermal 70 80 100 90 2 1\n").is_err());
+        assert!(thermal_of("thermal 80 70\n").is_err());
     }
 
     #[test]
@@ -2219,10 +2297,10 @@ mod tests {
     fn impedance_joints_run_at_240_hz_only() {
         let spec = |wire: &str, gripper: bool| {
             let text = if gripper {
-                "proto 19\ngripper 0 canL 8\n".to_string()
+                "proto 20\ngripper 0 canL 8\n".to_string()
             } else {
                 format!(
-                    "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
+                    "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 {wire} 0 0.3 0.1 0.1 0 20\n"
                 )
             };
             text
@@ -2459,7 +2537,7 @@ mod tests {
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
-            "proto 19\n\
+            "proto 20\n\
              loop_hz 240\n\
              joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
@@ -2511,39 +2589,39 @@ mod tests {
         );
         // An unknown wire token is a bad line, not a silent MIT.
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a9 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
-        assert!(parse_config("proto 19\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
+        assert!(parse_config("proto 20\njoint 0 canL shoulder_1 1 250 3.5\n").is_err());
         // ... and so must the proto-2 … 8 layouts (13 … 24 fields).
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
+            "proto 20\njoint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0\n"
         )
         .is_err());
     }
@@ -2554,7 +2632,7 @@ mod tests {
     #[test]
     fn parse_config_subset_keeps_joint_slots() {
         let cfg = parse_config(
-            "proto 19\n\
+            "proto 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_3 7 40 1.0 9.4 33.0 0.0 0.0 0.0 0.0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              gripper 0 can0 8\n",
@@ -2568,15 +2646,15 @@ mod tests {
         // Arm joint ids outside 1..=7 have no slot; a repeated id would
         // double-book one.
         assert!(parse_config(
-            "proto 19\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 20\njoint 0 can0 wrist_3 8 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
+            "proto 20\njoint 0 can0 bogus 0 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
         .is_err());
         assert!(parse_config(
-            "proto 19\n\
+            "proto 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n\
              joint 0 can0 wrist_2 6 40 1.0 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         )
@@ -2607,7 +2685,7 @@ mod tests {
         assert!(parse_config(&format!("proto\n{joint}")).is_err());
         assert!(parse_config(&format!("proto two\n{joint}")).is_err());
         // Order does not matter; the line just has to be there.
-        assert!(parse_config(&format!("{joint}proto 19\n")).is_ok());
+        assert!(parse_config(&format!("{joint}proto 20\n")).is_ok());
     }
 
     const S1_A4: &str = "joint 1 canR shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 a4 0 0.3 0.1 0.1 0 20";
@@ -2616,7 +2694,7 @@ mod tests {
     #[test]
     fn parse_config_takes_tf_scale() {
         let cfg = parse_config(&format!(
-            "proto 19\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
+            "proto 20\nloop_hz 480\n{S1_A4} 0 0 0.24\n\
              joint 1 canR elbow 4 130 5 9.4 33.0 0 0 0 0 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n"
         ))
         .unwrap();
@@ -2631,27 +2709,27 @@ mod tests {
     #[test]
     fn fast_impedance_needs_a_480_hz_loop() {
         let mit = "joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02 0 0 0 0 60 mit 0 0.3 0.1 0.1 0 20\n";
-        let cfg = parse_config(&format!("proto 19\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
+        let cfg = parse_config(&format!("proto 20\nloop_hz 480\nimpedance_hz 480\n{mit}")).unwrap();
         assert_eq!(cfg.impedance_hz, FAST_IMPEDANCE_HZ);
         assert_eq!(
-            parse_config(&format!("proto 19\n{mit}"))
+            parse_config(&format!("proto 20\n{mit}"))
                 .unwrap()
                 .impedance_hz,
             IMPEDANCE_HZ
         );
-        let err = parse_config(&format!("proto 19\nloop_hz 240\nimpedance_hz 480\n{mit}"))
+        let err = parse_config(&format!("proto 20\nloop_hz 240\nimpedance_hz 480\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("480 Hz only"), "{err}");
-        let err = parse_config(&format!("proto 19\nloop_hz 480\nimpedance_hz 400\n{mit}"))
+        let err = parse_config(&format!("proto 20\nloop_hz 480\nimpedance_hz 400\n{mit}"))
             .err()
             .expect("refused")
             .to_string();
         assert!(err.contains("impedance_hz 400"), "{err}");
         // A bus with no impedance joint is not held to the rule.
         assert!(parse_config(&format!(
-            "proto 19\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
+            "proto 20\nloop_hz 400\nimpedance_hz 480\n{S1_A4}\n"
         ))
         .is_ok());
     }
@@ -2667,7 +2745,7 @@ mod tests {
             )
         };
         let text = format!(
-            "proto 19\nloop_hz 480\n{}{}{}{}",
+            "proto 20\nloop_hz 480\n{}{}{}{}",
             line("shoulder_1", 1, 480.0),
             line("shoulder_2", 2, 0.0),
             line("elbow", 4, 480.0),
@@ -3326,6 +3404,10 @@ fn bus_loop(
     // an `F` packet — the core is the only CAN consumer; Python fills its
     // Motor caches from these instead of passively reading the bus.
     let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
+    // The Damiao wrists' temperature limit, per slot (see `thermal`): fed
+    // the temperatures every feedback frame carries, it lowers that joint's
+    // spring-torque cap while it cools.
+    let mut thermal = [ThermalGuard::default(); N_SLOTS];
     // Whether the immediately preceding tick produced a fresh sample for
     // each slot. Host damping is suppressed for one tick after a miss; the
     // firmware's local kd remains active without relying on stale host state.
@@ -3751,6 +3833,9 @@ fn bus_loop(
             // the tracker step (filter::MINK_MAX_OVERRUN_PERIODS).
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
             prev_tick = Some(began);
+            for guard in thermal.iter_mut() {
+                guard.step(&cfg.thermal, tick_dt);
+            }
             let cmd_dt = cfg
                 .tracking_profile
                 .command_dt(tick_dt, period.as_secs_f64(), overrun);
@@ -3914,7 +3999,10 @@ fn bus_loop(
                             p_track,
                             latest[m.slot].map(|(pos, _, _, _)| pos),
                             c.kp,
-                            effective_tau_cap(m.tau_cap, c.tau_cap),
+                            // The wrists' thermal limit tightens it further
+                            // while one cools (`thermal`).
+                            effective_tau_cap(m.tau_cap, c.tau_cap)
+                                .min(thermal[m.slot].cap(&cfg.thermal)),
                         )
                     } else {
                         p_track
@@ -4360,6 +4448,12 @@ fn bus_loop(
                             m.ranges.v_max,
                             m.ranges.t_max,
                         );
+                        if !m.gripper && m.vendor == Vendor::Damiao {
+                            let event = thermal[m.slot].observe(&cfg.thermal, fb.t_rotor, fb.t_mos);
+                            if let Some(event) = event {
+                                report_thermal(out_tx, iface, &m.joint, &cfg.thermal, event);
+                            }
+                        }
                         (idx, fb.position, fb.velocity, fb.torque)
                     }
                     _ => continue,

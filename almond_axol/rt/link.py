@@ -51,7 +51,9 @@ _ARM_TIMEOUT_S = 15.0
 #: it requires a core that stops on the arm hub's no-ACK report, because this
 #: package flashes hubs to the firmware that no longer backs up on an e-stop.
 #: 19 adds the optional ``tracking_profile mink`` line (Mink IK sessions).
-CONFIG_PROTO = 19
+#: 20 adds the ``thermal`` line (the Damiao wrists' temperature limit,
+#: :class:`~almond_axol.robot.config.WristThermalConfig`).
+CONFIG_PROTO = 20
 
 
 def config_header() -> list[str]:

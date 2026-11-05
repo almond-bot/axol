@@ -173,6 +173,10 @@ You can also stop the arms when they push hard while you drive them. This check 
 
 When a joint pushes past the threshold for a moment, tracking disengages and the arms go limp in the same hold. Guide them clear, then press **X** to return to rest. This works on the real robot only.
 
+### Hot wrists
+
+When a wrist motor gets hot, Axol lowers that wrist's torque until it cools, then restores it. While it cools, the wrist gives way to what it pushes on. The session log shows `wrist_2 is hot` or `wrist_3 is hot`. Back off and let the arm rest. To change the temperatures, see **Wrist temperature limit** in the [config parameters](/operations/teleop-config).
+
 ### Losing the link
 
 If pose updates stop while the arms are engaged, the arms freeze in place after about half a second. This happens when you take off the headset, open the system menu, quit the VR app or lose the network. The arms hold that pose until you come back.
