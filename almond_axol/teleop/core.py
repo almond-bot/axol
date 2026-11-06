@@ -1115,7 +1115,9 @@ class VRTeleopCore:
         the other stick up throughout — switches the grasp
         (``box_grasp``: straight / flush) while a grip leads the pair, and
         never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
-        lift as outside box mode, from then until the release. Until a press
+        lift (right raises, left lowers), from then until the release. Box
+        mode's lift is on the clicks because the right stick's forward/back,
+        the lift outside box mode, is the grip width here. Until a press
         has lasted that long its click is cleared from the frame Jelly gets
         (a copy; the sticks' axes are untouched). Both sticks pressed
         together — the box-mode toggle gesture — are never a tap.

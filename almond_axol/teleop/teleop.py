@@ -1182,11 +1182,13 @@ class VRTeleop:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
             # creep while the arms replay their return-to-rest trajectory (or
-            # park). Box mode leaves Jelly its sticks: its grip width is on the
-            # right stick's forward/back, which Jelly doesn't read, and a held
-            # click still runs the lift.
+            # park). Outside box mode the right stick's forward/back runs the
+            # lift; box mode takes it for the grip width, so there a held
+            # click runs the lift instead.
             self._jelly.apply_vr_frame(
-                sticks, resetting=self._core.is_resetting or self._core.is_parking
+                sticks,
+                resetting=self._core.is_resetting or self._core.is_parking,
+                box_mode=self._core.box_mode,
             )
 
     # ------------------------------------------------------------------

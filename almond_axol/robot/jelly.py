@@ -204,6 +204,41 @@ def stick_command(
     return vx, vy, stick_curve(wz, expo)
 
 
+# Outside box mode the right stick's forward/back runs the lift, once pushed
+# at least this far (fraction of full deflection). The lift has one jog speed,
+# so a half push is a deliberate request rather than a drift off centre.
+LIFT_STICK_THRESHOLD = 0.5
+
+
+class RightStickLock:
+    """Lock the headset's right stick to one job per push: turn or lift.
+
+    The right stick turns Jelly (left/right) and runs the lift (forward/back).
+    A push rarely stays on one axis, so the axis that leads when the stick
+    first leaves its deadzone owns that push until the stick returns to
+    centre: a push for the lift never turns the base, and a turn never
+    bumps the lift. :meth:`block` makes the stick do nothing until it next
+    centres, for a push that started while the stick meant something else
+    (box mode's grip width, a reset).
+    """
+
+    def __init__(self) -> None:
+        self.axis: str | None = None  # None (centred), "turn", "lift", "blocked"
+
+    def update(self, rx: float, ry: float, deadzone_: float) -> str | None:
+        """The job this frame's push does: ``"turn"``, ``"lift"`` or ``None``."""
+        if abs(rx) < deadzone_ and abs(ry) < deadzone_:
+            self.axis = None
+        elif self.axis is None:
+            self.axis = "lift" if abs(ry) > abs(rx) else "turn"
+        return None if self.axis == "blocked" else self.axis
+
+    def block(self, rx: float, ry: float, deadzone_: float) -> None:
+        """Ignore the current push, if any, until the stick centres."""
+        centred = abs(rx) < deadzone_ and abs(ry) < deadzone_
+        self.axis = None if centred else "blocked"
+
+
 def mix(
     vx: float, vy: float, wz: float, max_speed: float, turn_scale: float
 ) -> list[float]:
@@ -535,6 +570,8 @@ class Jelly:
         # handed over twice (a poller re-reading the server's latest frame,
         # say) must not count as a fresh command.
         self._last_vr_frame: object | None = None
+        # Turn-or-lift lock on the headset's right stick (VR thread only).
+        self._right_stick = RightStickLock()
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
         # written from any thread; None until a sensor feeds one. The counter
@@ -872,20 +909,35 @@ class Jelly:
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
 
-    def apply_vr_frame(self, frame, resetting: bool = False) -> None:  # noqa: ANN001
+    def apply_vr_frame(  # noqa: ANN001
+        self, frame, resetting: bool = False, box_mode: bool = False
+    ) -> None:
         """Map a headset :class:`~almond_axol.vr.models.VRFrame` to a command.
 
         The single source of truth for the VR control mapping, shared by
         plain teleop (``VRTeleop``) and data collection (``AxolVRTeleop``) so
         the two flows cannot drift apart. Stick deflection is the deadman:
-        Jelly moves only while a stick is pushed past its deadzone (or a
-        stick click holds the lift), independent of the arm engage toggle.
+        Jelly moves only while a stick is pushed past its deadzone,
+        independent of the arm engage toggle.
+
+        - Left stick: translate.
+        - Right stick, outside box mode: left/right turns, forward/back runs
+          the lift (forward raises, past :data:`LIFT_STICK_THRESHOLD`).
+          Each push does one or the other (:class:`RightStickLock`), so a
+          push for the lift never turns the base. The stick clicks don't
+          touch the lift.
+        - Right stick, in box mode: left/right turns; forward/back is the
+          grip width (the IK worker reads it), so the lift runs on held
+          stick clicks instead (right raises, left lowers), already split
+          from grasp taps by
+          :meth:`~almond_axol.teleop.core.VRTeleopCore.box_stick_frame`.
 
         Args:
             frame:     The incoming VR frame (only its stick fields are read).
             resetting: True while the arms replay a reset trajectory (or the
                        frame itself carries a reset) — forces a stop so the
                        base doesn't creep during the return to rest.
+            box_mode:  True while the teleop session is in box mode.
 
         Thread-safe (only latches the target); staleness is handled by the
         command task, so a dead frame stream times out to a full stop. Only a
@@ -898,22 +950,41 @@ class Jelly:
         if frame is self._last_vr_frame:
             return
         self._last_vr_frame = frame
+        dz = self._config.deadzone
+        rx = float(getattr(frame, "r_stick_x", 0.0))
+        ry = float(getattr(frame, "r_stick_y", 0.0))
         if resetting or frame.reset:
+            self._right_stick.block(rx, ry, dz)
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
+        if box_mode:
+            # A push begun on the width stick must not carry over into the
+            # lift when box mode ends: wait for the stick to centre first.
+            self._right_stick.block(rx, ry, dz)
+            if frame.r_stick_click and not frame.l_stick_click:
+                lift = UP
+            elif frame.l_stick_click and not frame.r_stick_click:
+                lift = DOWN
+            else:
+                lift = STOP
+        else:
+            axis = self._right_stick.update(rx, ry, dz)
+            lift = STOP
+            if axis == "lift":
+                # Pushed forward reads negative (gamepad convention).
+                if ry <= -LIFT_STICK_THRESHOLD:
+                    lift = UP
+                elif ry >= LIFT_STICK_THRESHOLD:
+                    lift = DOWN
+            if axis != "turn":
+                rx = 0.0
         vx, vy, wz = stick_command(
             frame.l_stick_x,
             frame.l_stick_y,
-            frame.r_stick_x,
-            self._config.deadzone,
+            rx,
+            dz,
             self._config.stick_expo,
         )
-        if frame.r_stick_click and not frame.l_stick_click:
-            lift = UP
-        elif frame.l_stick_click and not frame.r_stick_click:
-            lift = DOWN
-        else:
-            lift = STOP
         self.set_command(vx, vy, wz, lift)
 
     def feed_yaw_rate(self, rate: float) -> None:

@@ -170,11 +170,16 @@ class VRFrame(BaseModel):
             xr-standard convention, same as a gamepad).
         r_stick_x: Right thumbstick x, [-1, 1], right = +1. Drives Jelly's
             rotation.
-        r_stick_y: Right thumbstick y, [-1, 1], pushed forward = -1. Unused
-            by Jelly; in box mode, while a grip leads the pair, it sets the
-            grip width (forward = wider).
-        l_stick_click: Left thumbstick pressed in — lift down while held.
-        r_stick_click: Right thumbstick pressed in — lift up while held. In
+        r_stick_y: Right thumbstick y, [-1, 1], pushed forward = -1.
+            Outside box mode it runs Jelly's lift (forward = up), locked
+            against the turn per push (see
+            :meth:`almond_axol.robot.jelly.Jelly.apply_vr_frame`). In box
+            mode, while a grip leads the pair, it sets the grip width
+            (forward = wider) instead.
+        l_stick_click: Left thumbstick pressed in. In box mode, lift down
+            while held.
+        r_stick_click: Right thumbstick pressed in. In box mode, lift up
+            while held. In
             box mode a click is split by how long it's held: a tap (either
             stick, released within ~0.3 s) switches the grasp while a grip
             leads, and only a hold past that runs the lift (see

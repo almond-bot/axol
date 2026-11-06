@@ -59,8 +59,7 @@ The screens stay fixed in the room, where you were looking when the session star
 | | B (right) | Reset the camera screens. |
 | | Left thumbstick | Drive [Jelly](#jelly) forward, back and sideways. |
 | | Right thumbstick, left or right | Turn Jelly. |
-| | Left thumbstick click, held | Lower Jelly's lift. |
-| | Right thumbstick click, held | Raise Jelly's lift. |
+| | Right thumbstick, forward or back | Raise or lower Jelly's lift. |
 | | Both thumbstick clicks together | Turn [box mode](#box-mode) on or off. Parcel gripper only. |
 
 ### Engage and freeze the arms
@@ -136,7 +135,8 @@ On engage, the arms first move into a parallel pair over about 1.5 s. They keep 
 | Right trigger | Close the right gripper, whichever hand leads. |
 | Right thumbstick, forward or back | Change the grip width. Forward is wider, back is narrower. |
 | Thumbstick click, quick tap | Switch between the straight and flush grasp. See [Grasps](#box-grasp). |
-| Thumbstick click, held | Move Jelly's lift, as outside box mode. |
+| Right thumbstick click, held | Raise Jelly's lift. |
+| Left thumbstick click, held | Lower Jelly's lift. |
 | Other thumbstick directions | Drive [Jelly](#jelly), as outside box mode. |
 | Both thumbstick clicks | Leave box mode. |
 | X | Return to rest and leave box mode. |
@@ -168,7 +168,7 @@ Each gripper turns whichever flat side is closer toward the box, so the wrist ne
 
 ### Driving with the box
 
-The thumbsticks drive [Jelly](#jelly) with the normal controls the whole time box mode is on, whether the pair is led or frozen. Only the right thumbstick's forward and back sets the width instead. You can carry a box across the room while you lead the pair.
+The thumbsticks drive [Jelly](#jelly) with the normal controls the whole time box mode is on, whether the pair is led or frozen. Two controls change: the right thumbstick's forward and back sets the width, and the thumbstick clicks run the lift. You can carry a box across the room while you lead the pair.
 
 For a long drive, freeze the pair:
 
@@ -258,12 +258,13 @@ On Axol on Jelly, the thumbsticks drive the base, so you can move Axol without l
 |---|---|
 | Left thumbstick | Drive forward, back and sideways. |
 | Right thumbstick, left or right | Turn. |
-| Left thumbstick click, held | Lower the lift. |
-| Right thumbstick click, held | Raise the lift. |
+| Right thumbstick, forward or back | Raise or lower the lift. Forward raises it. |
 
 - Jelly moves only while you push a stick, and stops smoothly when you let go. This works whether or not arm tracking is engaged.
+- Each push of the right thumbstick does one thing. If you push it forward or back first, it runs the lift and Jelly doesn't turn. If you push it left or right first, Jelly turns and the lift stays still. Let the stick return to center to switch.
+- The lift starts once the right thumbstick is about halfway forward or back.
 - Speed follows how far you push the stick. The first part of the travel is slow, for creeping up on a spot, and a full push is full speed. Set the curve with `--jelly.stick_expo` (default `0.6`, `0` is linear).
-- In box mode, the sticks still drive Jelly. The right thumbstick's forward and back sets the grip width instead, and a held click must last about 0.3 s before the lift moves. See [Driving with the box](#driving-with-the-box).
+- In box mode, the right thumbstick's forward and back sets the grip width. Hold a thumbstick click to run the lift instead: right raises it and left lowers it. See [Driving with the box](#driving-with-the-box).
 - If the headset link drops while you drive, Jelly stops. A parked Jelly keeps holding its position.
 - After several minutes of driving mostly one way, a parked Jelly brakes its wheels instead of holding them, and it can creep slowly on a slope. Power Jelly off and on to restore the full hold.
 - If a parked wheel turns fast or moves too far, Jelly turns its wheels off and stops parking until you restart the session.
