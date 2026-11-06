@@ -620,6 +620,59 @@ class JogSessionArmTest(unittest.TestCase):
             self.session.state()["arms"]["left"], plan["joints"], atol=1e-6
         )
 
+    def _move_left_away(self) -> None:
+        left = self.planner.tips(self.session.current_q())[0]
+        quat = list(Rotation.from_matrix(left[1]).as_quat())
+        goal = [float(v) for v in left[0] + np.array([0.08, 0.0, 0.1])]
+        plan = self.session.plan("left", goal, quat)
+        self.session.execute(plan["id"])
+        self.assertTrue(
+            _wait(
+                lambda: (self.session.state()["lastExecution"] or {}).get("id")
+                == plan["id"],
+                5.0,
+            )
+        )
+
+    def test_go_to_rest_returns_both_arms_clear_of_the_body(self) -> None:
+        self.assertEqual(self.session.go_to_rest(), {"id": None, "duration": 0.0})
+        self._move_left_away()
+        away = self.session.current_q()
+        self.assertGreater(float(np.max(np.abs(away - rest_q()))), 0.05)
+        move = self.session.go_to_rest()
+        self.assertIsNotNone(move["id"])
+        self.assertEqual(self.session.state()["execution"]["arm"], "both")
+        with self.assertRaises(JogError):
+            self.session.go_to_rest()
+        kin = self.planner.kinematics
+        lowest = float("inf")
+        while self.session.state()["execution"] is not None:
+            lowest = min(lowest, float(kin.clearances(self.session.current_q()).min()))
+            time.sleep(TICK)
+        last = self.session.state()["lastExecution"]
+        self.assertEqual(
+            (last["id"], last["arm"], last["status"]), (move["id"], "both", "done")
+        )
+        np.testing.assert_allclose(self.session.current_q(), rest_q(), atol=1e-5)
+        self.assertGreater(lowest, -1e-3)
+
+    def test_stop_move_halts_go_to_rest(self) -> None:
+        self._move_left_away()
+        self.session.go_to_rest()
+        time.sleep(0.2)
+        self.assertTrue(self.session.cancel())
+        self.assertTrue(
+            _wait(
+                lambda: (self.session.state()["lastExecution"] or {}).get("status")
+                == "stopped",
+                1.0,
+            )
+        )
+        halted = self.session.current_q()
+        time.sleep(0.2)
+        np.testing.assert_array_equal(self.session.current_q(), halted)
+        self.assertGreater(float(np.max(np.abs(halted - rest_q()))), 0.01)
+
     def test_bad_arm_jog_commands_are_refused_and_release(self) -> None:
         self.session.hold(0, 0, 0, 0, arms={"left": [0, 0, 1, 0, 0, 0]})
         self.assertTrue(self.session.state()["hold"]["arms"]["left"][2] == 1)
@@ -1052,6 +1105,9 @@ class _StubSession:
     def cancel(self) -> bool:
         return True
 
+    def go_to_rest(self) -> dict[str, Any]:
+        return {"id": 9, "duration": 2.0}
+
     def hold(
         self, vx: float, vy: float, wz: float, lift: int, source: str = "", **kw: Any
     ) -> None:
@@ -1094,6 +1150,7 @@ def test_jog_api_without_a_session(tmp_path: Path) -> None:
         assert client.post("/api/jog/plan", json=body).status_code == 409
         assert client.post("/api/jog/execute", json={"id": 1}).status_code == 409
         assert client.post("/api/jog/cancel").status_code == 409
+        assert client.post("/api/jog/rest").status_code == 409
 
 
 def test_jog_api_routes_to_the_session(tmp_path: Path) -> None:
@@ -1120,6 +1177,7 @@ def test_jog_api_routes_to_the_session(tmp_path: Path) -> None:
         assert client.post("/api/jog/execute", json={"id": 7}).json()["duration"] == 1.0
         assert client.post("/api/jog/execute", json={"id": 3}).status_code == 409
         assert client.post("/api/jog/cancel").json() == {"stopped": True}
+        assert client.post("/api/jog/rest").json() == {"id": 9, "duration": 2.0}
         with client.websocket_connect("/api/jog/ws") as ws:
             assert ws.receive_json()["type"] == "state"
             ws.send_json({"type": "hold", "drive": [0.5, 0, 0], "lift": 1})

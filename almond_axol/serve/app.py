@@ -3029,6 +3029,18 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         except JogError as exc:
             return JSONResponse({"error": str(exc)}, status_code=409)
 
+    @app.post("/api/jog/rest", response_model=None)
+    async def jog_rest() -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(session.go_to_rest)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
     @app.post("/api/jog/cancel", response_model=None)
     async def jog_cancel() -> dict[str, Any] | JSONResponse:
         session = _jog_session()

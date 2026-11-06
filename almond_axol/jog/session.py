@@ -38,7 +38,7 @@ from typing import Any, Protocol
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .planner import Arm, JogPlan, JogPlanner, Pose
+from .planner import Arm, JogPlan, JogPlanner, Pose, next_move_id
 from .servo import FRAMES, ArmJog, Frame, JogLimits
 
 _logger = logging.getLogger(__name__)
@@ -145,7 +145,11 @@ class _Source:
 
 @dataclass
 class _Execution:
-    plan: JogPlan
+    """A move streaming to the arms: a plan of one arm, or both arms to rest."""
+
+    id: int
+    arm: str  # "left", "right" or "both"
+    trajectory: list[np.ndarray]
     step: int = 0
     cancelled: bool = False
 
@@ -493,9 +497,53 @@ class JogSession:
                     "The arm moved after this plan was made. Plan the move again."
                 )
             del self._plans[plan_id]
-            self._execution = _Execution(plan)
+            self._execution = _Execution(plan.id, plan.arm, plan.trajectory)
             self._last_result = None
         return {"id": plan.id, "duration": plan.duration}
+
+    def go_to_rest(self) -> dict[str, Any]:
+        """Move both arms to the rest pose, along the collision-aware path the
+        session parks on when it stops. Runs like an executed plan (Stop move
+        halts it). Blocking: run off the event loop. ``id`` is None when the
+        arms are already at rest.
+        """
+        from ..teleop.config import VRTeleopConfig
+        from .backends import rest_q
+
+        if not self._backend.has_arms:
+            raise JogError("The arms are not connected.")
+        planner = self._require_planner()
+        with self._lock:
+            if self._execution is not None:
+                raise JogError("A move is already running. Stop it first.")
+        q_now = self.current_q()
+        rest = rest_q()
+        if float(np.max(np.abs(q_now - rest))) <= PARK_TOLERANCE_RAD:
+            return {"id": None, "duration": 0.0}
+        planner.kinematics.set_lift(self._lift_raised())
+        planner.kinematics.set_gripper(*self._grip)
+        config = VRTeleopConfig()
+        trajectory = planner.joint_trajectory(
+            q_now,
+            rest,
+            speed=config.reset_speed,
+            rate=self._rate,
+            min_duration=config.reset_min_duration,
+        )
+        with self._lock:
+            if self._execution is not None:
+                raise JogError("A move is already running. Stop it first.")
+            if (
+                self._command is None
+                or float(np.max(np.abs(self._command - q_now)))
+                > PLAN_START_TOLERANCE_RAD
+            ):
+                raise JogError("The arms moved while the path was planned. Try again.")
+            move = _Execution(next_move_id(), "both", trajectory)
+            self._execution = move
+            self._plans = {}
+            self._last_result = None
+        return {"id": move.id, "duration": len(trajectory) / self._rate}
 
     def cancel(self) -> bool:
         """Stop a running move where it is. False when nothing was running."""
@@ -548,9 +596,9 @@ class JogSession:
             "execution": None
             if execution is None
             else {
-                "id": execution.plan.id,
-                "arm": execution.plan.arm,
-                "progress": execution.step / max(1, len(execution.plan.trajectory)),
+                "id": execution.id,
+                "arm": execution.arm,
+                "progress": execution.step / max(1, len(execution.trajectory)),
             },
             "lastExecution": last,
         }
@@ -649,17 +697,17 @@ class JogSession:
         with self._lock:
             execution = self._execution
             if execution is not None:
-                plan = execution.plan
-                if execution.cancelled or execution.step >= len(plan.trajectory):
+                trajectory = execution.trajectory
+                if execution.cancelled or execution.step >= len(trajectory):
                     finished = not execution.cancelled
                     self._last_result = {
-                        "id": plan.id,
-                        "arm": plan.arm,
+                        "id": execution.id,
+                        "arm": execution.arm,
                         "status": "done" if finished else "stopped",
                     }
                     self._execution = None
                 else:
-                    self._command = plan.trajectory[execution.step].copy()
+                    self._command = trajectory[execution.step].copy()
                     execution.step += 1
             executing = self._execution is not None
             command = None if self._command is None else self._command.copy()

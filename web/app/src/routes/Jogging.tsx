@@ -4,6 +4,7 @@ import {
   ArrowDown,
   ArrowUp,
   Hand,
+  House,
   Loader2,
   Move3d,
   Play,
@@ -29,6 +30,7 @@ import {
   describePlanError,
   DRIVE_KEYS,
   executeJogPlan,
+  goToRest,
   gamepadControls,
   IDLE_HOLD,
   keyDrive,
@@ -639,6 +641,10 @@ export default function Jogging() {
       if (plan) await executeJogPlan(plan.id)
     })
   const cancel = () => run("cancel", () => cancelJogMove())
+  const rest = () =>
+    run("rest", async () => {
+      await goToRest()
+    })
 
   const nudge = (kind: "move" | "turn", axis: 0 | 1 | 2, sign: 1 | -1) => {
     if (!target) return
@@ -1016,9 +1022,25 @@ export default function Jogging() {
                 />
               </div>
             )}
-            <Button variant="outline" onClick={resetTarget} disabled={!canMoveArm}>
-              <RotateCcw /> Reset target
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={resetTarget}
+                disabled={!canMoveArm}
+              >
+                <RotateCcw /> Reset target
+              </Button>
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={rest}
+                disabled={!canMoveArm || Boolean(busy)}
+                title="Move both arms to the rest pose. Stop move halts it."
+              >
+                {busy === "rest" ? <Loader2 className="animate-spin" /> : <House />} Go to rest
+              </Button>
+            </div>
             <div className="flex flex-col gap-2 border-t border-white/10 pt-4">
               <div className="flex items-center justify-between text-xs text-white/55">
                 <span>Move target</span>
@@ -1287,7 +1309,7 @@ export default function Jogging() {
                     ? `Controller connected. Turning the ${arm} gripper.`
                     : "Controller connected."
                 : gamepad === ""
-                  ? "This controller isn't supported. On a Logitech controller, set the switch on the back to X."
+                  ? "The browser can't read this controller's buttons. On a Logitech controller, move the switch on the back to the other letter (D on a Mac), then press a button."
                   : "To use a game controller, plug it in and press any button on it."}
             </CardDescription>
           </CardHeader>

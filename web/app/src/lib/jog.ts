@@ -59,8 +59,9 @@ export interface JogState {
   hold?: { active: boolean; drive: Vec3; lift: number; arms?: Record<JogArm, number[]> }
   /** Per arm: jogging, and held back by a joint limit or the body. */
   armJog?: Record<JogArm, { moving: boolean; limited: boolean }> | null
-  execution?: { id: number; arm: JogArm; progress: number } | null
-  lastExecution?: { id: number; arm: JogArm; status: "done" | "stopped" } | null
+  /** The move running: a plan of one arm, or both arms going to rest. */
+  execution?: { id: number; arm: JogArm | "both"; progress: number } | null
+  lastExecution?: { id: number; arm: JogArm | "both"; status: "done" | "stopped" } | null
 }
 
 export interface JogPlan {
@@ -129,6 +130,10 @@ export const executeJogPlan = (id: number) =>
   post<{ id: number; duration: number }>("/api/jog/execute", { id })
 
 export const cancelJogMove = () => post<{ stopped: boolean }>("/api/jog/cancel")
+
+/** Move both arms to the rest pose; `id` is null when they are already there.
+ * It runs like an executed plan: cancelJogMove stops it. */
+export const goToRest = () => post<{ id: number | null; duration: number }>("/api/jog/rest")
 
 /**
  * Drive pad geometry: a pointer at (dx, dy) pixels from the pad centre, on a
@@ -217,8 +222,9 @@ export interface GamepadControls {
   pick: JogArm | null
 }
 
-/** Read a game controller in the standard layout (a Logitech pad in XInput
- * mode). Unscaled: the page's speed limits apply when it is combined.
+/** Read a game controller the browser maps to the standard layout (a Logitech
+ * pad in D mode on a Mac, where X mode has no driver). Unscaled: the page's
+ * speed limits apply when it is combined.
  *
  * - No shoulder button: the left stick drives Jelly (forward, left), the
  *   right stick's left and right turns it in place.

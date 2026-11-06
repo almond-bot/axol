@@ -33,6 +33,11 @@ _PATH_POINTS = 48
 _plan_ids = itertools.count(1)
 
 
+def next_move_id() -> int:
+    """A fresh id for a move, from the same sequence as the plans' ids."""
+    return next(_plan_ids)
+
+
 @dataclass
 class IkSolution:
     """The closest reachable configuration to a target tip pose."""
