@@ -13,13 +13,16 @@ This module solves the same kinematics directly:
   arrays (:func:`.model.shared_robot`), so they match
   :meth:`.solver.KinematicsSolver.fk` to float precision. Only the seven
   joints of the arm being moved are evaluated.
-- Self-collision uses the same capsules (:func:`.model.shared_robot_collision`)
-  and arm/body pairs, plus arm/arm pairs. Every pair has a hard floor (see
+- Self-collision uses the same shapes (:func:`.model.shared_robot_collision`:
+  capsules on the arms, capsules and boxes on the body) and arm/body pairs,
+  plus arm/arm pairs. The lift and the gripper openings move them as they
+  move the teleop solver's (:meth:`ArmKinematics.set_lift`,
+  :meth:`ArmKinematics.set_gripper`). Every pair has a hard floor (see
   ``ArmKinematics.floors``): no step may take a pair below it, or closer
   than it already is when it starts inside.
 - Each step is a small QP (seven variables, solved by DAQP in microseconds)
   with the joint limits, a per-step joint bound and linearised clearance
-  rows, and every step is checked against the exact capsule distances.
+  rows, and every step is checked against the exact shape distances.
 
 Joint vectors use the robot's layout, the left arm's seven joints in
 :data:`~almond_axol.constants.ARM_JOINTS` order then the right arm's. Poses
@@ -196,6 +199,112 @@ def _segment_points(
     return a1 + d1 * s[:, None], a2 + d2 * t[:, None]
 
 
+def _box_sdf(p: np.ndarray, half: np.ndarray) -> np.ndarray:
+    """Signed distance from points ``p`` (box frame) to boxes of
+    half-extents ``half`` centred at the origin."""
+    q = np.abs(p) - half
+    outside = np.sqrt((np.maximum(q, 0.0) ** 2).sum(-1))
+    return outside + np.minimum(q.max(-1), 0.0)
+
+
+# Each pair of box axes, with each sign of each: where two face distances
+# can tie along a capsule's axis (see _capsule_box).
+_TIES = tuple(
+    np.array(v)
+    for v in zip(
+        *(
+            (i, j, si, sj)
+            for i, j in ((0, 1), (0, 2), (1, 2))
+            for si in (1.0, -1.0)
+            for sj in (1.0, -1.0)
+        )
+    )
+)
+
+
+def _capsule_box(
+    a: np.ndarray,
+    b: np.ndarray,
+    centre: np.ndarray,
+    rotation: np.ndarray,
+    half: np.ndarray,
+    *,
+    distance_only: bool = False,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Closest approach of capsule axes ``[a, b]`` to boxes (``(k, 3)`` each,
+    the boxes' ``rotation`` ``(k, 3, 3)``, all in the torso frame).
+
+    Returns the box's signed distance at the closest axis point (subtract
+    the capsule's radius for the gap), that point, and the box's outward
+    unit normal there (None for both with ``distance_only``). It matches :func:`.collision.capsule_box_distance`,
+    which searches for the same minimum, to well under 0.1 mm.
+
+    The box's signed distance along the axis is convex, and its minimum is
+    at one of a few candidate points, all evaluated at once:
+
+    - outside the box it is the root of a piecewise quadratic, with a piece
+      between each pair of points where a coordinate crosses a face plane:
+      each piece's stationary point;
+    - inside it is the largest of the three face distances, piecewise linear:
+      where two of them tie, or a coordinate crosses zero;
+    - the axis ends and the face-plane crossings.
+    """
+    k = len(a)
+    p0 = np.einsum("kji,kj->ki", rotation, a - centre)
+    d = np.einsum("kji,kj->ki", rotation, b - a)
+    tiny = 1e-12
+    safe = np.where(np.abs(d) > tiny, d, tiny)
+    # Face-plane crossings (p = +-half) and zero crossings, per coordinate.
+    planes = np.concatenate([(half - p0) / safe, (-half - p0) / safe], axis=1)
+    zeros = -p0 / safe
+    # Inside: two face distances tie, |p_i| - h_i = |p_j| - h_j.
+    i, j, si, sj = _TIES
+    den = si * d[:, i] - sj * d[:, j]
+    num = half[:, i] - half[:, j] - si * p0[:, i] + sj * p0[:, j]
+    ties = num / np.where(np.abs(den) > tiny, den, tiny)
+    # Outside: on each piece between sorted plane crossings, the stationary
+    # point of the sum of squares over the coordinates outside their face.
+    edges = np.sort(
+        np.concatenate([np.zeros((k, 1)), np.ones((k, 1)), np.clip(planes, 0, 1)], 1),
+        axis=1,
+    )
+    lo, hi = edges[:, :-1], edges[:, 1:]
+    mid = p0[:, None, :] + d[:, None, :] * ((lo + hi) / 2.0)[..., None]
+    sign = np.where(mid < 0.0, -1.0, 1.0)
+    active = np.abs(mid) > half[:, None, :]
+    dd = d[:, None, :]
+    num = (active * dd * (sign * half[:, None, :] - p0[:, None, :])).sum(-1)
+    den = (active * dd * dd).sum(-1)
+    stationary = np.where(den > tiny, num / np.where(den > tiny, den, 1.0), lo)
+    stationary = np.clip(stationary, lo, hi)
+    ts = np.clip(
+        np.concatenate([edges, planes, zeros, ties, stationary], axis=1),
+        0.0,
+        1.0,
+    )
+    values = _box_sdf(p0[:, None, :] + d[:, None, :] * ts[..., None], half[:, None])
+    if distance_only:
+        return values.min(1), None, None
+    best = values.argmin(1)
+    rows = np.arange(k)
+    t = ts[rows, best]
+    sdf = values[rows, best]
+    local = p0 + d * t[:, None]
+    # The box SDF's gradient: outside, toward the point from the nearest
+    # surface point; inside, out through the nearest face.
+    q = np.abs(local) - half
+    out = np.maximum(q, 0.0)
+    norm = np.sqrt((out * out).sum(-1))
+    face = np.zeros_like(q)
+    face[rows, q.argmax(-1)] = 1.0
+    grad = np.where(
+        (norm > 1e-12)[:, None], out / np.maximum(norm, 1e-12)[:, None], face
+    )
+    grad = grad * np.where(local < 0.0, -1.0, 1.0)
+    normal = np.einsum("kij,kj->ki", rotation, grad)
+    return sdf, a + (b - a) * t[:, None], normal
+
+
 def _qp(
     hessian: np.ndarray,
     gradient: np.ndarray,
@@ -245,6 +354,8 @@ class _Arm:
     cap_joint: np.ndarray  # (c,): the joint (0-6) each capsule rides on
     cap_a: np.ndarray  # (c, 3): capsule axis ends, in that joint's frame
     cap_b: np.ndarray
+    cap_slide: np.ndarray  # (c, 3): a finger's slide per metre of its joint
+    cap_finger: np.ndarray  # (c,): which capsules are this gripper's fingers
 
 
 @dataclass
@@ -294,9 +405,10 @@ class _Moving:
 class ArmKinematics:
     """Thread-safe single-arm FK, IK and servoing for one Axol model.
 
-    Everything is read-only after construction except the lift height
-    (:meth:`set_lift`), which swaps one array, so the control loop, previews
-    and plans can share an instance without a lock.
+    Everything is read-only after construction except the lift height and
+    the gripper openings (:meth:`set_lift`, :meth:`set_gripper`), which swap
+    whole arrays, so the control loop, previews and plans can share an
+    instance without a lock.
     """
 
     def __init__(
@@ -321,6 +433,7 @@ class ArmKinematics:
         """
         from ..settings import resolve_gripper, resolve_robot_model
         from .model import (
+            finger_slide,
             lift_link_shift,
             shared_robot,
             shared_robot_collision,
@@ -381,33 +494,62 @@ class ArmKinematics:
                         return side, k
             return None
 
-        # Capsules: one per link (Pyroki's fit), axis ends in the link frame.
+        # The shapes (.collision.ArmBodyCollision): capsules on the arms,
+        # capsules and boxes on the body, any number per link. Capsule axis
+        # ends and box poses are in their link's frame.
         coll = shared_robot_collision(model, gripper=gripper) if collision else None
-        capsules: dict[int, tuple[np.ndarray, np.ndarray, float]] = {}
         if coll is not None:
             if list(coll.link_names) != link_names:
                 raise RuntimeError("The collision model's links don't match the robot.")
-            poses = np.asarray(coll.coll.pose.wxyz_xyz, dtype=np.float64)
-            sizes = np.asarray(coll.coll.size, dtype=np.float64)
-            for link in range(len(link_names)):
-                t = _transform(poses[link])
-                half = t[:3, 2] * sizes[link, 1] * 0.5
-                capsules[link] = (t[:3, 3] - half, t[:3, 3] + half, sizes[link, 0])
-            active = sorted(
-                {int(i) for i in coll.active_idx_i}
-                | {int(j) for j in coll.active_idx_j}
+            cap_pose = np.asarray(coll.capsules.pose.wxyz_xyz, np.float64)
+            cap_radius = np.asarray(coll.capsules.radius, np.float64).reshape(-1)
+            cap_height = np.asarray(coll.capsules.height, np.float64).reshape(-1)
+            cap_link = [int(k) for k in coll.capsule_link]
+            box_link = [int(k) for k in coll.box_link]
+            box_pose = (
+                np.asarray(coll.boxes.pose.wxyz_xyz, np.float64)
+                if coll.boxes is not None
+                else np.zeros((0, 7))
             )
+            box_half = (
+                np.asarray(coll.boxes.half_extent, np.float64)
+                if coll.boxes is not None
+                else np.zeros((0, 3))
+            )
+            capsule_pairs = [(int(i), int(j)) for i, j in coll.capsule_pairs]
+            box_pairs = [(int(i), int(j)) for i, j in coll.box_pairs]
         else:
-            active = []
+            cap_pose = np.zeros((0, 7))
+            cap_radius = cap_height = np.zeros(0)
+            cap_link, box_link = [], []
+            box_pose, box_half = np.zeros((0, 7)), np.zeros((0, 3))
+            capsule_pairs, box_pairs = [], []
 
-        # The global capsule table: left arm, right arm, then the body.
-        arm_links: dict[Side, list[int]] = {
-            side: [link for link in active if (riding(link) or ("",))[0] == side]
+        def cap_ends(c: int, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            """Capsule ``c``'s axis ends, with its link at ``frame``."""
+            t = frame @ _transform(cap_pose[c])
+            half = t[:3, 2] * cap_height[c] * 0.5
+            return t[:3, 3] - half, t[:3, 3] + half
+
+        # Every pair's first shape is an arm capsule; the second a body
+        # capsule or box. The arm capsules in any pair take part.
+        arm_caps = sorted({i for i, _ in capsule_pairs} | {i for i, _ in box_pairs})
+        for c in arm_caps:
+            if riding(cap_link[c]) is None:
+                raise RuntimeError(f"{link_names[cap_link[c]]} is not on an arm.")
+        arm_caps_of: dict[Side, list[int]] = {
+            side: [c for c in arm_caps if riding(cap_link[c])[0] == side]  # type: ignore[index]
             for side in SIDES
         }
-        body_links = [link for link in active if riding(link) is None]
-        table = arm_links["left"] + arm_links["right"] + body_links
-        slot = {link: k for k, link in enumerate(table)}
+        body_caps = sorted({j for _, j in capsule_pairs})
+        body_boxes = sorted({j for _, j in box_pairs})
+        # The capsule table: left arm, right arm, then the body.
+        table = arm_caps_of["left"] + arm_caps_of["right"] + body_caps
+        slot = {c: k for k, c in enumerate(table)}
+        box_slot = {b: k for k, b in enumerate(body_boxes)}
+        finger_axis, finger_side, finger_closed, finger_stroke = finger_slide(
+            model, gripper=gripper
+        )
 
         self._arms: dict[Side, _Arm] = {}
         for side in SIDES:
@@ -427,15 +569,18 @@ class ArmKinematics:
             if riding(ee) != (side, ARM_DOF - 1):
                 raise RuntimeError(f"The {side} gripper does not ride on wrist_3.")
             mount = np.linalg.inv(joint_zero(idx[-1])) @ link_zero(ee)
-            cap_joint, cap_a, cap_b = [], [], []
-            for link in arm_links[side]:
+            cap_joint, cap_a, cap_b, cap_slide = [], [], [], []
+            for c in arm_caps_of[side]:
+                link = cap_link[c]
                 ride = riding(link)
                 assert ride is not None
                 local = np.linalg.inv(joint_zero(idx[ride[1]])) @ link_zero(link)
-                a, b, _ = capsules[link]
+                a, b = cap_ends(c, local)
                 cap_joint.append(ride[1])
-                cap_a.append(local[:3, :3] @ a + local[:3, 3])
-                cap_b.append(local[:3, :3] @ b + local[:3, 3])
+                cap_a.append(a)
+                cap_b.append(b)
+                # A finger slides along its joint axis with the opening.
+                cap_slide.append(local[:3, :3] @ finger_axis[link])
             fixed_arr = np.stack(fixed)
             self._arms[side] = _Arm(
                 fixed_r=fixed_arr[:, :3, :3].copy(),
@@ -450,92 +595,110 @@ class ArmKinematics:
                 cap_joint=np.asarray(cap_joint, dtype=np.intp),
                 cap_a=np.asarray(cap_a, dtype=np.float64).reshape(-1, 3),
                 cap_b=np.asarray(cap_b, dtype=np.float64).reshape(-1, 3),
+                cap_slide=np.asarray(cap_slide, dtype=np.float64).reshape(-1, 3),
+                cap_finger=np.asarray(
+                    [
+                        finger_side[cap_link[c]] == (0 if side == "left" else 1)
+                        for c in arm_caps_of[side]
+                    ],
+                    dtype=bool,
+                ),
             )
 
-        # Pairs: Pyroki's arm/body pairs, then every left/right arm pair (the
-        # teleop model leaves those out, but a jogged gripper can be driven
-        # into the other arm). The first capsule is always an arm's.
-        first: list[int] = []
-        second: list[int] = []
-        if coll is not None:
-            for i, j in zip(coll.active_idx_i, coll.active_idx_j):
-                i, j = int(i), int(j)
-                if (riding(i) is None) == (riding(j) is None):
-                    continue  # Pyroki pairs only the body with an arm.
-                arm_link, body_link = (i, j) if riding(i) is not None else (j, i)
-                first.append(slot[arm_link])
-                second.append(slot[body_link])
-            for left in arm_links["left"]:
-                for right in arm_links["right"]:
-                    first.append(slot[left])
-                    second.append(slot[right])
+        # Pairs: Pyroki's arm/body pairs in its order (capsule pairs, then
+        # box pairs, so the first distances match .collision's), then every
+        # left/right arm pair (the teleop model leaves those out, but a
+        # jogged gripper can be driven into the other arm). The first shape
+        # is always an arm capsule.
+        first = [slot[i] for i, _ in capsule_pairs] + [slot[i] for i, _ in box_pairs]
+        second = [slot[j] for _, j in capsule_pairs] + [
+            box_slot[j] for _, j in box_pairs
+        ]
+        is_box = [False] * len(capsule_pairs) + [True] * len(box_pairs)
+        n_body = len(first)
+        for left in arm_caps_of["left"]:
+            for right in arm_caps_of["right"]:
+                first.append(slot[left])
+                second.append(slot[right])
+                is_box.append(False)
         self._pair_i = np.asarray(first, dtype=np.intp)
         self._pair_j = np.asarray(second, dtype=np.intp)
-        n_left, n_right = len(arm_links["left"]), len(arm_links["right"])
+        self._pair_box = np.asarray(is_box, dtype=bool)
+        self._body_mask = np.arange(len(first)) < n_body
+        n_left, n_right = len(arm_caps_of["left"]), len(arm_caps_of["right"])
         self._n_arm = n_left + n_right
-        self._radius = np.asarray([capsules[link][2] for link in table], np.float64)
-        body_a = np.asarray(
-            [
-                link_zero(k)[:3, :3] @ capsules[k][0] + link_zero(k)[:3, 3]
-                for k in body_links
-            ],
-            np.float64,
-        ).reshape(-1, 3)
-        body_b = np.asarray(
-            [
-                link_zero(k)[:3, :3] @ capsules[k][1] + link_zero(k)[:3, 3]
-                for k in body_links
-            ],
-            np.float64,
-        ).reshape(-1, 3)
-        self._body_a0, self._body_b0 = body_a, body_b
-        self._body = (body_a, body_b)
+        self._radius = cap_radius[table] if table else np.zeros(0)
+
+        # Body shapes in the torso frame, as frozen (the lift fully raised).
+        ends = [cap_ends(c, link_zero(cap_link[c])) for c in body_caps]
+        self._body_a0 = np.asarray([e[0] for e in ends], np.float64).reshape(-1, 3)
+        self._body_b0 = np.asarray([e[1] for e in ends], np.float64).reshape(-1, 3)
+        boxes = [link_zero(box_link[b]) @ _transform(box_pose[b]) for b in body_boxes]
+        self._box_r = np.asarray([t[:3, :3] for t in boxes], np.float64).reshape(
+            -1, 3, 3
+        )
+        self._box_c0 = np.asarray([t[:3, 3] for t in boxes], np.float64).reshape(-1, 3)
+        self._box_half = box_half[body_boxes] if body_boxes else np.zeros((0, 3))
+        self._box_reach = np.linalg.norm(self._box_half, axis=1)
+        self._body = (self._body_a0, self._body_b0, self._box_c0)
         shift, travel = lift_link_shift(model, gripper=gripper)
         self._body_shift = np.asarray(
-            [shift[link] for link in body_links], np.float64
+            [shift[cap_link[c]] for c in body_caps], np.float64
+        ).reshape(-1, 3)
+        self._box_shift = np.asarray(
+            [shift[box_link[b]] for b in body_boxes], np.float64
         ).reshape(-1, 3)
         self._lift_travel = float(travel)
         self._lift_raised = 1.0
+        self._finger_closed = float(finger_closed)
+        self._finger_stroke = float(finger_stroke)
+        self._grip: tuple[float, float] | None = None
+        self._slide: dict[Side, np.ndarray] = {}
+        self._other_cache: dict[Side, ArmFrames] = {}
 
         def moving(side: Side) -> _Moving:
             lo = 0 if side == "left" else n_left
             hi = lo + (n_left if side == "left" else n_right)
             on_i = (self._pair_i >= lo) & (self._pair_i < hi)
-            on_j = (self._pair_j >= lo) & (self._pair_j < hi)
+            on_j = ~self._pair_box & (self._pair_j >= lo) & (self._pair_j < hi)
             pairs = np.flatnonzero(on_i | on_j)
             is_second = on_j[pairs]
             cap = np.where(is_second, self._pair_j[pairs], self._pair_i[pairs]) - lo
             return _Moving(pairs, is_second, self._arms[side].cap_joint[cap])
 
         self._moving = {side: moving(side) for side in SIDES}
-        self._other_cache: dict[Side, ArmFrames] = {}
         self.lower = np.concatenate([self._arms[s].lower for s in SIDES])
         self.upper = np.concatenate([self._arms[s].upper for s in SIDES])
         self.left_indices = list(range(ARM_DOF))
         self.right_indices = list(range(ARM_DOF, 2 * ARM_DOF))
 
         # Floors, from each pair's clearance at the straight-down home pose
-        # (the capsules are conservative, and some overlap there):
+        # (the shapes are conservative, and some overlap there), the closest
+        # of the fingers as frozen, closed and open:
         # - an upper arm against the body keeps the Pyroki solver's hard
         #   guard (.model.upper_arm_guard_floor);
         # - every other pair stays _MIN_CLEARANCE_M apart, or as close as
         #   the Pyroki solver's collision cost starts pushing back
         #   (.model.collision_cost_params) where that is closer.
-        home = self._distances(np.zeros(2 * ARM_DOF))
+        zero = np.zeros(2 * ARM_DOF)
+        home = self._distances(zero)
+        for grip in ((0.0, 0.0), (1.0, 1.0)):
+            self.set_gripper(*grip)
+            home = np.minimum(home, self._distances(zero))
+        # Until told otherwise the grippers are taken as fully open, like the
+        # teleop solver.
         start = np.minimum(home - _MARGIN_REST_BUFFER, collision_margin)
         self.floors = np.minimum(start, _MIN_CLEARANCE_M)
-        guard = {
-            slot[link]
-            for link in body_links
-            if link_names[link] in set(upper_arm_guard_links(model))
-        }
-        for k, (i, j) in enumerate(zip(self._pair_i, self._pair_j)):
-            if int(j) in guard and link_names[table[int(i)]].endswith("_e1"):
+        guard_links = set(upper_arm_guard_links(model))
+        for k, (arm_cap, shape) in enumerate(capsule_pairs + box_pairs):
+            body_link = box_link[shape] if self._pair_box[k] else cap_link[shape]
+            arm_link = link_names[cap_link[arm_cap]]
+            if link_names[body_link] in guard_links and arm_link.endswith("_e1"):
                 self.floors[k] = upper_arm_guard_floor(float(home[k]))
         _logger.info(
             "Arm IK ready: %d clearance pairs (%d against the body).",
             self.num_pairs,
-            int((self._pair_j >= self._n_arm).sum()),
+            n_body,
         )
 
     # -- configuration -----------------------------------------------------
@@ -547,8 +710,9 @@ class ArmKinematics:
     @property
     def body_pairs(self) -> np.ndarray:
         """Which clearance pairs are an arm against the body (the rest are
-        arm against arm)."""
-        return self._pair_j >= self._n_arm
+        arm against arm). They come first, in the order of
+        :meth:`.collision.ArmBodyCollision.distances`."""
+        return self._body_mask
 
     @property
     def joint_names(self) -> list[str]:
@@ -571,9 +735,42 @@ class ArmKinematics:
         raised = min(max(float(raised), 0.0), 1.0)
         if abs(raised - self._lift_raised) < 1e-4:
             return
-        offset = self._body_shift * (1.0 - raised) * self._lift_travel
-        self._body = (self._body_a0 + offset, self._body_b0 + offset)
+        lowered = (1.0 - raised) * self._lift_travel
+        offset = self._body_shift * lowered
+        self._body = (
+            self._body_a0 + offset,
+            self._body_b0 + offset,
+            self._box_c0 + self._box_shift * lowered,
+        )
         self._lift_raised = raised
+
+    def set_gripper(self, left: float, right: float) -> None:
+        """Place the fingers for the live gripper openings.
+
+        ``left`` / ``right`` are fractions (0 = closed, 1 = fully open), as
+        the arms report them. IK freezes the finger joints at zero, and each
+        finger slides along its joint axis to where the opening puts it
+        (:func:`.model.finger_slide`). Until the first call the grippers are
+        taken as fully open. No effect on a gripper without sliding fingers.
+        """
+        if self._finger_stroke == 0.0:
+            return
+        grip = (min(max(float(left), 0.0), 1.0), min(max(float(right), 0.0), 1.0))
+        if (
+            self._grip is not None
+            and max(abs(a - b) for a, b in zip(grip, self._grip)) < 1e-3
+        ):
+            return
+        slide = {}
+        for side, g in zip(SIDES, grip):
+            arm = self._arms[side]
+            joint = self._finger_closed + g * self._finger_stroke
+            slide[side] = arm.cap_slide * (joint * arm.cap_finger)[:, None]
+        # Swapped whole, with the held-arm cache, so readers see one or the
+        # other.
+        self._slide = slide
+        self._other_cache = {}
+        self._grip = grip
 
     # -- kinematics --------------------------------------------------------
 
@@ -600,17 +797,21 @@ class ArmKinematics:
         tip = (mount_p + mount_r @ self._offset, mount_r)
         jr = rotations[arm.cap_joint]
         jo = origins[arm.cap_joint]
-        cap_a = (jr @ arm.cap_a[:, :, None])[:, :, 0] + jo
-        cap_b = (jr @ arm.cap_b[:, :, None])[:, :, 0] + jo
+        slide = self._slide.get(side)
+        a_local = arm.cap_a if slide is None else arm.cap_a + slide
+        b_local = arm.cap_b if slide is None else arm.cap_b + slide
+        cap_a = (jr @ a_local[:, :, None])[:, :, 0] + jo
+        cap_b = (jr @ b_local[:, :, None])[:, :, 0] + jo
         return ArmFrames(q_arm, origins, axes, tip, cap_a, cap_b)
 
     def _held(self, q_arm: np.ndarray, side: Side) -> ArmFrames:
         """:meth:`frames` for an arm that isn't moving, cached across calls."""
         q_arm = np.asarray(q_arm, dtype=np.float64)
-        cached = self._other_cache.get(side)
+        cache = self._other_cache
+        cached = cache.get(side)
         if cached is None or not np.array_equal(cached.q, q_arm):
             cached = self.frames(q_arm, side)
-            self._other_cache[side] = cached
+            cache[side] = cached
         return cached
 
     def tip(self, q: np.ndarray, side: Side) -> Pose:
@@ -624,19 +825,54 @@ class ArmKinematics:
     # -- clearance ---------------------------------------------------------
 
     def _geometry(
-        self, left: ArmFrames, right: ArmFrames, pairs: np.ndarray | None = None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Distances and closest axis points (first, second capsule) of ``pairs``."""
-        body_a, body_b = self._body
+        self,
+        left: ArmFrames,
+        right: ArmFrames,
+        pairs: np.ndarray | None = None,
+        *,
+        distance_only: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Signed distances of ``pairs``, the closest points on the first and
+        second shape's axis (a box's: its surface), and the unit normals
+        along which moving the first point apart opens the gap. With
+        ``distance_only`` only the distances are filled in."""
+        body_a, body_b, box_c = self._body
         a = np.concatenate([left.cap_a, right.cap_a, body_a])
         b = np.concatenate([left.cap_b, right.cap_b, body_b])
-        i = self._pair_i if pairs is None else self._pair_i[pairs]
-        j = self._pair_j if pairs is None else self._pair_j[pairs]
-        p1, p2 = _segment_points(a[i], b[i], a[j], b[j])
-        # Pyroki's sphere distance adds 1e-6 to each component before the norm.
-        gap = p2 - p1 + 1e-6
-        d = np.sqrt((gap * gap).sum(1)) - self._radius[i] - self._radius[j]
-        return d, p1, p2
+        if pairs is None:
+            pairs = np.arange(self.num_pairs)
+        i, j = self._pair_i[pairs], self._pair_j[pairs]
+        box = self._pair_box[pairs]
+        n = len(pairs)
+        d = np.empty(n)
+        p1, p2, normal = np.empty((n, 3)), np.empty((n, 3)), np.empty((n, 3))
+        cap = ~box
+        if cap.any():
+            ci, cj = i[cap], j[cap]
+            q1, q2 = _segment_points(a[ci], b[ci], a[cj], b[cj])
+            # Pyroki's sphere distance adds 1e-6 to each component before the
+            # norm.
+            gap = q2 - q1 + 1e-6
+            length = np.sqrt((gap * gap).sum(1))
+            d[cap] = length - self._radius[ci] - self._radius[cj]
+            p1[cap], p2[cap] = q1, q2
+            normal[cap] = (q1 - q2) / np.maximum(length, 1e-9)[:, None]
+        if box.any():
+            bi, bj = i[box], j[box]
+            sdf, point, grad = _capsule_box(
+                a[bi],
+                b[bi],
+                box_c[bj],
+                self._box_r[bj],
+                self._box_half[bj],
+                distance_only=distance_only,
+            )
+            d[box] = sdf - self._radius[bi]
+            if point is not None and grad is not None:
+                p1[box] = point
+                p2[box] = point - grad * sdf[:, None]
+                normal[box] = grad
+        return d, p1, p2, normal
 
     def _distances(self, q: np.ndarray) -> np.ndarray:
         if not self.num_pairs:
@@ -644,7 +880,39 @@ class ArmKinematics:
         q = np.asarray(q, dtype=np.float64)
         left = self.frames(q[:ARM_DOF], "left")
         right = self.frames(q[ARM_DOF:], "right")
-        return self._geometry(left, right)[0]
+        return self._geometry(left, right, distance_only=True)[0]
+
+    def _clear(self, q: np.ndarray, floors: np.ndarray) -> bool:
+        """Whether every pair at ``q`` stays above ``floors`` (less the
+        slack). A box pair whose bounding sphere is already clear skips the
+        exact search."""
+        if not self.num_pairs:
+            return True
+        q = np.asarray(q, dtype=np.float64)
+        left = self.frames(q[:ARM_DOF], "left")
+        right = self.frames(q[ARM_DOF:], "right")
+        limit = floors - _FLOOR_SLACK_M
+        box = np.flatnonzero(self._pair_box)
+        check = np.ones(self.num_pairs, dtype=bool)
+        if len(box):
+            a = np.concatenate([left.cap_a, right.cap_a])
+            b = np.concatenate([left.cap_b, right.cap_b])
+            i, j = self._pair_i[box], self._pair_j[box]
+            centre = self._body[2][j]
+            axis = b[i] - a[i]
+            t = ((centre - a[i]) * axis).sum(1) / np.maximum(
+                (axis * axis).sum(1), 1e-12
+            )
+            near = a[i] + axis * np.clip(t, 0.0, 1.0)[:, None]
+            bound = (
+                np.linalg.norm(near - centre, axis=1)
+                - self._box_reach[j]
+                - self._radius[i]
+            )
+            check[box[bound >= limit[box]]] = False
+        pairs = np.flatnonzero(check)
+        d = self._geometry(left, right, pairs, distance_only=True)[0]
+        return bool(np.all(d >= limit[pairs]))
 
     def clearances(self, q: np.ndarray) -> np.ndarray:
         """Each pair's distance less its floor (negative: inside the floor)."""
@@ -654,22 +922,21 @@ class ArmKinematics:
         self,
         side: Side,
         own: ArmFrames,
-        geometry: tuple[np.ndarray, np.ndarray, np.ndarray],
+        geometry: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
         floors: np.ndarray,
         rate: float,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Linearised ``rows @ dq <= bounds`` keeping ``side``'s pairs above
         ``floors``: each may close at most ``rate`` of its distance to the
         floor, and one already inside may not close at all."""
-        d, p1, p2 = geometry
+        d, p1, p2, normals = geometry
         near = d < floors + _INFLUENCE_M
         if not near.any():
             return _NO_ROWS
         moving = self._moving[side]
         second = moving.second[near]
         point = np.where(second[:, None], p2[near], p1[near])
-        normal = p1[near] - p2[near]
-        normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-9)
+        normal = normals[near].copy()
         normal[second] *= -1.0  # the moving capsule's outward direction
         # d(distance)/dq_k = normal . (axis_k x (point - origin_k)) for the
         # joints upstream of the moving capsule.
@@ -727,9 +994,18 @@ class ArmKinematics:
         floors = np.minimum(self.floors[pairs], geometry[0])
         return q_arm, own, other, pairs, geometry, floors
 
-    def _pair_geometry(self, side: Side, own: ArmFrames, other: ArmFrames):
+    def _pair_geometry(
+        self,
+        side: Side,
+        own: ArmFrames,
+        other: ArmFrames,
+        *,
+        distance_only: bool = False,
+    ):
         left, right = (own, other) if side == "left" else (other, own)
-        return self._geometry(left, right, self._moving[side].pairs)
+        return self._geometry(
+            left, right, self._moving[side].pairs, distance_only=distance_only
+        )
 
     # -- IK -----------------------------------------------------------------
 
@@ -853,7 +1129,12 @@ class ArmKinematics:
         blocked = size > 1e-7 and float(np.linalg.norm(free - step)) > 1e-3 * size
         if geometry:
             for _ in range(5):
-                d = self._pair_geometry(side, self.frames(q_arm + step, side), other)[0]
+                d = self._pair_geometry(
+                    side,
+                    self.frames(q_arm + step, side),
+                    other,
+                    distance_only=True,
+                )[0]
                 if np.all(d >= floors - _FLOOR_SLACK_M):
                     break
                 step = step * 0.5
@@ -903,8 +1184,8 @@ class ArmKinematics:
                 extra += 1
             else:
                 break
-            if float(np.max(np.abs(goal - q))) <= bound + 1e-9 and np.all(
-                self._distances(goal) >= floors - _FLOOR_SLACK_M
+            if float(np.max(np.abs(goal - q))) <= bound + 1e-9 and self._clear(
+                goal, floors
             ):
                 q = goal
             else:
@@ -938,9 +1219,8 @@ class ArmKinematics:
             if step is None:
                 continue
             for _ in range(5):
-                d = self._pair_geometry(side, self.frames(q[idx] + step, side), other)[
-                    0
-                ]
+                trial = self.frames(q[idx] + step, side)
+                d = self._pair_geometry(side, trial, other, distance_only=True)[0]
                 if np.all(d >= side_floors - _FLOOR_SLACK_M):
                     q[idx] += step
                     break

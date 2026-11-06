@@ -270,7 +270,12 @@ def test_numpy_fk_and_capsules_match_pyroki(model: str) -> None:
     import jax.numpy as jnp
 
     from almond_axol.constants import GRIPPER_TIP_OFFSET, Joint, urdf_body_name
-    from almond_axol.kinematics.model import shared_robot, shared_robot_collision
+    from almond_axol.kinematics.model import (
+        finger_slide,
+        shared_robot,
+        shared_robot_collision,
+    )
+    from almond_axol.kinematics.solver import body_collision_distance
 
     kin = _kinematics(model)
     robot = shared_robot(model, gripper="parallel")
@@ -281,8 +286,9 @@ def test_numpy_fk_and_capsules_match_pyroki(model: str) -> None:
     links = list(robot.links.names)
     offset = np.asarray(GRIPPER_TIP_OFFSET)
     body = kin.body_pairs
+    axis, finger, closed, stroke = finger_slide(model, gripper="parallel")
     rng = np.random.default_rng(0)
-    for _ in range(20):
+    for n in range(20):
         q = rng.uniform(kin.lower, kin.upper)
         poses = np.asarray(robot.forward_kinematics(jnp.asarray(q[order])))
         for side in ("left", "right"):
@@ -294,14 +300,57 @@ def test_numpy_fk_and_capsules_match_pyroki(model: str) -> None:
             tip = kin.tip(q, side)
             np.testing.assert_allclose(tip[0], pose[4:] + rotation @ offset, atol=1e-5)
             np.testing.assert_allclose(tip[1], rotation, atol=1e-5)
+        # The fingers at a random opening per gripper, as the teleop solver
+        # places them (.solver.shift_links).
+        grip = rng.uniform(0.0, 1.0, 2) if n % 2 else np.zeros(2)
+        kin.set_gripper(*grip)
+        joint = np.where(finger >= 0, closed + grip[np.maximum(finger, 0)] * stroke, 0)
+        shift = np.concatenate([np.zeros_like(axis), axis * joint[:, None]], axis=1)
         expected = np.asarray(
-            coll.compute_self_collision_distance(robot, jnp.asarray(q[order]))
+            body_collision_distance(
+                robot, coll, jnp.asarray(q[order]), jnp.asarray(shift)
+            )
         )
+        # The arm/body pairs come first, in the Pyroki model's order.
+        assert np.flatnonzero(body).tolist() == list(range(len(expected)))
         np.testing.assert_allclose(
-            np.sort(kin.clearances(q)[body] + kin.floors[body]),
-            np.sort(expected),
-            atol=1e-4,
+            kin.clearances(q)[body] + kin.floors[body], expected, atol=1e-4
         )
+    kin.set_gripper(1.0, 1.0)
+
+
+def test_capsule_box_normal_is_the_distance_gradient() -> None:
+    from almond_axol.kinematics.arm_ik import _capsule_box
+
+    rng = np.random.default_rng(1)
+    k = 200
+    a = rng.uniform(-0.3, 0.3, (k, 3))
+    b = a + rng.uniform(-0.2, 0.2, (k, 3))
+    centre = rng.uniform(-0.05, 0.05, (k, 3))
+    rotation = Rotation.random(k, random_state=2).as_matrix()
+    half = rng.uniform(0.02, 0.1, (k, 3))
+    d, point, normal = _capsule_box(a, b, centre, rotation, half)
+    np.testing.assert_allclose(np.linalg.norm(normal, axis=1), 1.0, atol=1e-9)
+    # The minimum is exact: never above a dense scan of the axis, and at
+    # most a scan step's worth below it.
+    ts = np.linspace(0.0, 1.0, 2001)
+    points = a[:, None] + (b - a)[:, None] * ts[None, :, None] - centre[:, None]
+    local = np.einsum("kji,ktj->kti", rotation, points)
+    q = np.abs(local) - half[:, None]
+    scan = np.sqrt((np.maximum(q, 0.0) ** 2).sum(-1)) + np.minimum(q.max(-1), 0.0)
+    assert float((d - scan.min(1)).max()) < 1e-12
+    assert float((scan.min(1) - d).max()) < 1e-4
+    # Clear of the box, moving the capsule along the normal opens the gap by
+    # as much. (An axis through the box has its deepest point on a kink
+    # between faces, with no gradient: the normal is then a face's.)
+    clear = d > 1e-4
+    assert clear.sum() > k // 2
+    eps = 1e-5
+    moved = _capsule_box(a + normal * eps, b + normal * eps, centre, rotation, half)[0]
+    np.testing.assert_allclose((moved - d)[clear] / eps, 1.0, atol=1e-3)
+    # The point is on the axis.
+    t = ((point - a) * (b - a)).sum(1) / ((b - a) ** 2).sum(1)
+    np.testing.assert_allclose(point, a + (b - a) * t[:, None], atol=1e-9)
 
 
 def test_floors_keep_the_teleop_solver_upper_arm_guard(kinematics: Any) -> None:

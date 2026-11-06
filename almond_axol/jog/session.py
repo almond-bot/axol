@@ -399,6 +399,7 @@ class JogSession:
             min_duration=self._min_duration,
             lift_raised=self._lift_raised(),
             seed=self._seed(arm, q_now),
+            grip=self._grip,
         )
         with self._lock:
             # Only the latest plan can be executed.
@@ -424,7 +425,12 @@ class JogSession:
         planner = self._require_planner(timeout=0.0)
         q_now = self.current_q()
         solution = planner.solve(
-            q_now, arm, target, self._lift_raised(), seed=self._seed(arm, q_now)
+            q_now,
+            arm,
+            target,
+            self._lift_raised(),
+            seed=self._seed(arm, q_now),
+            grip=self._grip,
         )
         with self._lock:
             self._preview_seed[arm] = (q_now.copy(), solution.q.copy())
@@ -692,6 +698,7 @@ class JogSession:
                 continue
             if not jogged and twist is not None:
                 planner.kinematics.set_lift(self._lift_raised())
+                planner.kinematics.set_gripper(*self._grip)
             q = jog.step(
                 command,
                 None if twist is None else np.asarray(twist),

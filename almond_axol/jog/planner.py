@@ -120,6 +120,7 @@ class JogPlanner:
         lift_raised: float | None = None,
         *,
         seed: np.ndarray | None = None,
+        grip: tuple[float, float] | None = None,
     ) -> IkSolution:
         """Closest reachable configuration putting ``arm``'s tip at ``target``.
 
@@ -127,9 +128,13 @@ class JogPlanner:
         showed is what gets planned) when given, else from ``q_now``. A seed
         that ends short of the target is checked against a fresh solve from
         ``q_now``, and the closer one wins. The other arm stays at ``q_now``.
+        ``lift_raised`` and ``grip`` place the lift and the fingers for the
+        clearance checks (see :class:`~almond_axol.kinematics.arm_ik.ArmKinematics`).
         """
         kin = self._kin
         kin.set_lift(lift_raised)
+        if grip is not None:
+            kin.set_gripper(*grip)
         q_now = np.asarray(q_now, dtype=np.float64)
         position = np.asarray(target[0], dtype=np.float64)
         rotation = np.asarray(target[1], dtype=np.float64)
@@ -187,6 +192,7 @@ class JogPlanner:
         min_duration: float,
         lift_raised: float | None = None,
         seed: np.ndarray | None = None,
+        grip: tuple[float, float] | None = None,
     ) -> JogPlan:
         """IK to the closest pose, then a collision-aware trajectory to it."""
         q_now = np.asarray(q_now, dtype=np.float32)
@@ -194,7 +200,7 @@ class JogPlanner:
             np.asarray(target[0], dtype=np.float32),
             np.asarray(target[1], dtype=np.float32),
         )
-        solution = self.solve(q_now, arm, target, lift_raised, seed=seed)
+        solution = self.solve(q_now, arm, target, lift_raised, seed=seed, grip=grip)
         trajectory = self.joint_trajectory(
             q_now, solution.q, speed=speed, rate=rate, min_duration=min_duration
         )
