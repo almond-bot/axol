@@ -5,13 +5,14 @@ import {
   combineHold,
   describePlanError,
   DRIVE_KEYS,
-  gamepadDrive,
+  gamepadControls,
   executeJogPlan,
   holdMessage,
   IDLE_HOLD,
   jointValuesFor,
   keyDrive,
   liftJointValue,
+  NO_TWIST,
   padCommand,
   planJogMove,
   PreviewQueue,
@@ -44,8 +45,8 @@ describe("padCommand", () => {
 
 describe("keyDrive", () => {
   it("drives with W A S D and turns with the left and right arrows", () => {
-    expect(keyDrive(new Set())).toEqual({ pad: [0, 0, 0], turn: 0 })
-    expect(keyDrive(new Set(["KeyW"]), 0.5)).toEqual({ pad: [0.5, 0, 0], turn: 0 })
+    expect(keyDrive(new Set())).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
+    expect(keyDrive(new Set(["KeyW"]), 0.5)).toEqual({ pad: [0.5, 0, 0], turn: 0, lift: 0 })
     expect(keyDrive(new Set(["KeyS", "KeyD"]), 1).pad.map((v) => +v.toFixed(4))).toEqual([
       -0.7071, -0.7071, 0,
     ])
@@ -54,40 +55,86 @@ describe("keyDrive", () => {
     expect(keyDrive(new Set(["ArrowRight"])).turn).toBe(-1)
   })
 
+  it("raises and lowers the lift with the up and down arrows", () => {
+    expect(keyDrive(new Set(["ArrowUp"])).lift).toBe(1)
+    expect(keyDrive(new Set(["ArrowDown"])).lift).toBe(-1)
+    expect(keyDrive(new Set(["ArrowUp", "ArrowDown"])).lift).toBe(0)
+  })
+
   it("cancels opposite keys", () => {
     expect(keyDrive(new Set(["KeyW", "KeyS", "ArrowLeft", "ArrowRight"]))).toEqual({
       pad: [0, 0, 0],
       turn: 0,
+      lift: 0,
     })
   })
 
   it("covers exactly the drive keys", () => {
     expect([...DRIVE_KEYS].sort()).toEqual(
-      ["ArrowLeft", "ArrowRight", "KeyA", "KeyD", "KeyS", "KeyW"].sort()
+      ["ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "KeyA", "KeyD", "KeyS", "KeyW"].sort()
     )
   })
 })
 
-describe("gamepadDrive", () => {
-  it("drives with the left stick and turns with the right stick", () => {
-    const forward = gamepadDrive([0, -1, 0, 0])
-    expect(forward.pad).toEqual([1, 0, 0])
-    expect(forward.turn).toBe(0)
-    const strafe = gamepadDrive([-1, 0, 0, 0]).pad
-    expect(strafe).toEqual([0, 1, 0])
-    expect(gamepadDrive([0, 0, 1, 0]).turn).toBe(-1)
-    expect(gamepadDrive([0, 0, -1, 0]).turn).toBe(1)
+describe("gamepadControls", () => {
+  const pressed = (...on: number[]) =>
+    Array.from({ length: 17 }, (_, i) => ({ pressed: on.includes(i) }))
+
+  it("drives Jelly with the left stick and turns with the right stick", () => {
+    const forward = gamepadControls([0, -1, 0, 0])
+    expect(forward.mode).toBe("drive")
+    expect(forward.drive).toEqual({ pad: [1, 0, 0], turn: 0, lift: 0 })
+    expect(forward.twist).toEqual([...NO_TWIST])
+    expect(gamepadControls([-1, 0, 0, 0]).drive.pad).toEqual([0, 1, 0])
+    expect(gamepadControls([0, 0, 1, 0]).drive.turn).toBe(-1)
+    expect(gamepadControls([0, 0, -1, 0]).drive.turn).toBe(1)
+  })
+
+  it("moves the gripper while LB is held, and the base stays still", () => {
+    const up = gamepadControls([0, -1, 0, -1], pressed(4))
+    expect(up.mode).toBe("move")
+    expect(up.twist).toEqual([1, 0, 1, 0, 0, 0])
+    expect(up.drive.pad).toEqual([0, 0, 0])
+    expect(up.drive.turn).toBe(0)
+    expect(gamepadControls([-1, 0, 0, 0], pressed(4)).twist).toEqual([0, 1, 0, 0, 0, 0])
+  })
+
+  it("turns the gripper while RB is held", () => {
+    const turned = gamepadControls([1, 0, 0, 0], pressed(5))
+    expect(turned.mode).toBe("turn")
+    expect(turned.twist).toEqual([0, 0, 0, 1, 0, 0])
+    expect(gamepadControls([0, -1, 0, 0], pressed(5)).twist).toEqual([0, 0, 0, 0, 1, 0])
+    expect(gamepadControls([0, 0, 1, 0], pressed(5)).twist).toEqual([0, 0, 0, 0, 0, -1])
+    // LB wins when both are held.
+    expect(gamepadControls([0, 0, 0, 0], pressed(4, 5)).mode).toBe("move")
+  })
+
+  it("runs the lift and picks the arm with the D-pad", () => {
+    expect(gamepadControls([0, 0, 0, 0], pressed(12)).drive.lift).toBe(1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(13)).drive.lift).toBe(-1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(12, 13)).drive.lift).toBe(0)
+    expect(gamepadControls([0, 0, 0, 0], pressed(4, 12)).drive.lift).toBe(1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(14)).pick).toBe("left")
+    expect(gamepadControls([0, 0, 0, 0], pressed(15)).pick).toBe("right")
+    expect(gamepadControls([0, 0, 0, 0]).pick).toBeNull()
   })
 
   it("ignores a resting stick and ramps from the edge of the deadzone", () => {
-    expect(gamepadDrive([0.1, -0.1, 0.12, 0])).toEqual({ pad: [0, 0, 0], turn: 0 })
-    const half = gamepadDrive([0, -(STICK_DEADZONE + (1 - STICK_DEADZONE) / 2), 0, 0])
-    expect(half.pad[0]).toBeCloseTo(0.5)
+    const resting = gamepadControls([0.1, -0.1, 0.12, -0.1], pressed(4))
+    expect(resting.twist).toEqual([...NO_TWIST])
+    expect(gamepadControls([0.1, -0.1, 0.12, 0]).drive).toEqual({
+      pad: [0, 0, 0],
+      turn: 0,
+      lift: 0,
+    })
+    const half = gamepadControls([0, -(STICK_DEADZONE + (1 - STICK_DEADZONE) / 2), 0, 0])
+    expect(half.drive.pad[0]).toBeCloseTo(0.5)
   })
 
   it("treats a missing or broken axis as centred", () => {
-    expect(gamepadDrive([])).toEqual({ pad: [0, 0, 0], turn: 0 })
-    expect(gamepadDrive([Number.NaN, 0, Number.NaN])).toEqual({ pad: [0, 0, 0], turn: 0 })
+    expect(gamepadControls([]).drive).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
+    const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], pressed(4))
+    expect(broken.twist).toEqual([...NO_TWIST])
   })
 })
 

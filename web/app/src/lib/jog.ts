@@ -150,9 +150,20 @@ export function padCommand(dx: number, dy: number, radius: number, speed = 1, de
   return [forward * scale, left * scale, 0]
 }
 
-/** Keys that drive the base, by `KeyboardEvent.code` (the key's position, so
- * W A S D sit in the same place on every layout): W A S D move, the left and
- * right arrows turn in place. */
+/** What the keyboard or a game controller asks the base and lift for: a pad
+ * command (forward, left), a turn (-1 right to 1 left) and a lift direction. */
+export interface OtherDrive {
+  pad: Vec3
+  turn: number
+  lift: -1 | 0 | 1
+}
+
+export const NO_DRIVE: OtherDrive = { pad: [0, 0, 0], turn: 0, lift: 0 }
+
+/** Keys that drive the base and the lift, by `KeyboardEvent.code` (the key's
+ * position, so W A S D sit in the same place on every layout): W A S D move,
+ * the left and right arrows turn in place, the up and down arrows raise and
+ * lower the lift. */
 export const DRIVE_KEYS: ReadonlySet<string> = new Set([
   "KeyW",
   "KeyA",
@@ -160,16 +171,19 @@ export const DRIVE_KEYS: ReadonlySet<string> = new Set([
   "KeyD",
   "ArrowLeft",
   "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
 ])
 
-/** The base command for the drive keys held down: a pad command (forward,
- * left; diagonals no faster than straight) and a turn direction. */
-export function keyDrive(held: ReadonlySet<string>, speed = 1): { pad: Vec3; turn: -1 | 0 | 1 } {
+/** The command for the drive keys held down. Diagonals are no faster than
+ * straight, and opposite keys cancel. */
+export function keyDrive(held: ReadonlySet<string>, speed = 1): OtherDrive {
   const forward = Number(held.has("KeyW")) - Number(held.has("KeyS"))
   const left = Number(held.has("KeyA")) - Number(held.has("KeyD"))
   const scale = Math.max(0, Math.min(1, speed)) / (Math.hypot(forward, left) || 1)
-  const turn = (Number(held.has("ArrowLeft")) - Number(held.has("ArrowRight"))) as -1 | 0 | 1
-  return { pad: [forward * scale + 0, left * scale + 0, 0], turn }
+  const turn = Number(held.has("ArrowLeft")) - Number(held.has("ArrowRight"))
+  const lift = (Number(held.has("ArrowUp")) - Number(held.has("ArrowDown"))) as -1 | 0 | 1
+  return { pad: [forward * scale + 0, left * scale + 0, 0], turn, lift }
 }
 
 /** How far a game controller stick must move before it drives (a resting
@@ -182,20 +196,62 @@ function deadzone(value: number): number {
   return (Math.sign(value) * Math.min(1, magnitude - STICK_DEADZONE)) / (1 - STICK_DEADZONE)
 }
 
-/** The base command for a game controller in the standard layout: the left
- * stick drives (forward, left), the right stick's left and right turns.
- * Unscaled: the speed limit applies when it is combined. */
-export function gamepadDrive(axes: readonly number[]): { pad: Vec3; turn: number } {
+/** What a game controller's sticks control: the base (no shoulder button
+ * held), the selected gripper's position (LB held) or its rotation (RB held). */
+export type GamepadMode = "drive" | "move" | "turn"
+
+export interface GamepadControls {
+  mode: GamepadMode
+  /** The base and lift command (the base is still while a shoulder is held). */
+  drive: OtherDrive
+  /** The selected gripper's jog twist, -1 to 1 per axis (see JogTwist). */
+  twist: JogTwist
+  /** The arm the D-pad's left or right selects, while pressed. */
+  pick: JogArm | null
+}
+
+/** Read a game controller in the standard layout (a Logitech pad in XInput
+ * mode). Unscaled: the page's speed limits apply when it is combined.
+ *
+ * - No shoulder button: the left stick drives Jelly (forward, left), the
+ *   right stick's left and right turns it in place.
+ * - LB held: the left stick moves the gripper forward, back, left and right,
+ *   the right stick's up and down moves it up and down.
+ * - RB held: the left stick rolls and pitches the gripper, the right stick's
+ *   left and right turns it (yaw).
+ * - The D-pad's up and down (buttons 12 and 13) raise and lower the lift, its
+ *   left and right (14 and 15) select the left or right arm.
+ */
+export function gamepadControls(
+  axes: readonly number[],
+  buttons: readonly { pressed: boolean }[] = []
+): GamepadControls {
   const axis = (i: number) => (Number.isFinite(axes[i]) ? axes[i] : 0)
+  const pressed = (i: number) => Boolean(buttons[i]?.pressed)
   const x = axis(0)
   const y = axis(1)
   const length = Math.hypot(x, y)
-  const radial = deadzone(length)
-  const scale = length > 0 ? radial / length : 0
-  return {
-    pad: [-y * scale + 0, -x * scale + 0, 0],
-    turn: -deadzone(axis(2)) + 0,
-  }
+  const scale = length > 0 ? deadzone(length) / length : 0
+  // Stick right and up are +1 here; the standard layout reports down as +.
+  const leftRight = x * scale + 0
+  const leftUp = -y * scale + 0
+  const rightRight = deadzone(axis(2)) + 0
+  const rightUp = -deadzone(axis(3)) + 0
+  const lift = (Number(pressed(12)) - Number(pressed(13))) as -1 | 0 | 1
+  const mode: GamepadMode = pressed(4) ? "move" : pressed(5) ? "turn" : "drive"
+  const still: Vec3 = [0, 0, 0]
+  const drive: OtherDrive =
+    mode === "drive"
+      ? { pad: [leftUp, -leftRight + 0, 0], turn: -rightRight + 0, lift }
+      : { pad: still, turn: 0, lift }
+  const twist: JogTwist =
+    mode === "move"
+      ? [leftUp, -leftRight + 0, rightUp, 0, 0, 0]
+      : mode === "turn"
+        ? [0, 0, 0, leftRight, leftUp, -rightRight + 0]
+        : [...NO_TWIST]
+  const pick: JogArm | null = pressed(14) ? "left" : pressed(15) ? "right" : null
+  return { mode, drive, twist, pick }
 }
 
 /** Combine the drive pad and the turn controls into one held command. ``turn``
