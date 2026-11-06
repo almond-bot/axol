@@ -205,7 +205,7 @@ class VRTeleopConfig:
             (:class:`~almond_axol.teleop.box.ToolGeometry`): the straight
             grasp holds the box on the fixed blades' front faces, the box in
             front of the gripper bodies (so it holds nothing narrower than
-            the open plates allow, ~13 cm), the angled grasp turns each
+            the open plates allow, ~12 cm), the angled grasp turns each
             gripper ``box_flush_deg`` inward about the plate's front edge
             onto its chamfer facet, which then touches together with the
             fixed blade's tip. The width is measured between the contact

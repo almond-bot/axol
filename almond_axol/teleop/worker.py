@@ -304,8 +304,11 @@ def _dz(v: float) -> float:
 
 
 # Clearance (m) kept between the two grippers' bodies when the width is
-# closed with nothing between them (see ToolGeometry.min_width).
+# closed with nothing between them (see ToolGeometry.min_width). The stock
+# gripper's bodies are its wrists. The parcel gripper's are its open plates
+# (straight grasp), which may close onto each other.
 _BODY_CLEARANCE_M = 0.01
+_PARCEL_BODY_CLEARANCE_M = 0.0
 # Longest step (m) along its swivel an elbow hint asks for (swivel_step): the
 # swivel is a curve, and a longer step's chord leaves it.
 _ELBOW_HINT_STEP_M = 0.03
@@ -1702,19 +1705,19 @@ class IKWorker:
 
         ``config.box_width_min`` — the operator's floor between the contact
         faces — or, if larger, the width at which the fitted tool's bodies
-        would come within ``_BODY_CLEARANCE_M`` of each other in the
-        current grasp (:meth:`ToolGeometry.min_width`). The parcel
-        gripper's contact faces are proud of everything else on it in both
-        grasps, so they may close to the operator's floor (``0`` by
-        default: the faces together); the stock
-        gripper's face is modelled on the mount axis and its wrists meet
-        first, at ~77 mm.
+        would come within a clearance of each other in the current grasp
+        (:meth:`ToolGeometry.min_width`). The parcel gripper's straight
+        grasp closes until its open plates meet (``_PARCEL_BODY_CLEARANCE_M``,
+        ~124 mm between the blade fronts); its flush grasp's contacts are
+        proud of everything else, so they may close to the operator's floor
+        (``0`` by default: the faces together). The stock gripper's face is
+        modelled on the mount axis and its wrists meet first, kept
+        ``_BODY_CLEARANCE_M`` apart (~77 mm).
         """
         cfg = self._config
-        return max(
-            float(cfg.box_width_min),
-            self._box_tool().min_width(_BODY_CLEARANCE_M),
-        )
+        parcel = getattr(cfg, "gripper", "parallel") == "parcel"
+        clearance = _PARCEL_BODY_CLEARANCE_M if parcel else _BODY_CLEARANCE_M
+        return max(float(cfg.box_width_min), self._box_tool().min_width(clearance))
 
     def note_measured(
         self,
