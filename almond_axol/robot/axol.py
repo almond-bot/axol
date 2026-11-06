@@ -2045,6 +2045,14 @@ class AxolArm:
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
         # Deltas are frame-invariant (constant offset), so compute in joint frame.
+        # The reference is the caller's last accepted command as given, before
+        # the joint-limit clip and the spring-cap back-off below: those pull
+        # the sent command toward the measured pose while a capped joint is
+        # pressed (a box held in box mode), by up to the whole run-ahead.
+        # Measured against the backed-off command, the caller's next command
+        # (still at its target) read as a jump of that run-ahead, was dropped,
+        # and every one after it too, since a dropped command leaves the
+        # reference where it was: the arm froze until teleop restarted.
         max_step = self._config.max_step_rad
         if self._last_q_commanded is not None and max_step < float("inf"):
             gripper_i = self._gripper_i
@@ -2069,6 +2077,7 @@ class AxolArm:
                 )
                 return
 
+        requested = q.copy()
         gripper_i = self._gripper_i
         if self._has_gripper:
             q[gripper_i] = self._gripper_to_raw(float(q[gripper_i]))
@@ -2229,7 +2238,7 @@ class AxolArm:
             else:
                 sink_cmds.append((0.0,) * RT_TARGET_FIELDS)
             self._command_sink(sink_cmds)
-            self._last_q_commanded = clipped
+            self._last_q_commanded = requested
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
@@ -2318,7 +2327,7 @@ class AxolArm:
                 )
             )
         await _await_all_hardware_actions(*tasks)
-        self._last_q_commanded = clipped
+        self._last_q_commanded = requested
 
     async def gravity_compensate(
         self,
