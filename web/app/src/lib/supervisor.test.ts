@@ -36,10 +36,12 @@ import {
   type CommandSpec,
   type DatasetEpisode,
   type OperationId,
+  type RobotStatus,
   type SchemaField,
   type SchemaNode,
   type SettingsCategory,
   motorFaultBlockers,
+  robotReadiness,
 } from "./supervisor"
 
 const required: SchemaField = {
@@ -438,6 +440,71 @@ describe("showWhen gates", () => {
       "teleop.frequency",
       "teleop.box_flush_deg",
     ])
+  })
+})
+
+describe("robotReadiness", () => {
+  const motors = ["left", "right"].map((arm) => ({
+    arm,
+    joint: "elbow",
+    reachable: false,
+    status: null,
+    temperature: null,
+    voltage: null,
+  }))
+  const unreachable = motors.map((m) => ({
+    arm: m.arm,
+    joint: m.joint,
+    problem: "unreachable",
+    temperature: null,
+  }))
+  const robot = (patch: Partial<RobotStatus> = {}): RobotStatus => ({
+    state: "connected",
+    connected: true,
+    error: null,
+    lastPing: null,
+    motors,
+    motorCount: motors.length,
+    reachableCount: motors.length,
+    faults: [],
+    profile: "axol",
+    ...patch,
+  })
+  const check = (patch: Partial<Parameters<typeof robotReadiness>[0]>) =>
+    robotReadiness({
+      requiresRobot: true,
+      robotFree: false,
+      mantis: false,
+      robot: robot(),
+      ...patch,
+    })
+
+  it("is clear when Axol is linked and every motor answers", () => {
+    expect(check({})).toEqual({ blockers: [], short: null })
+  })
+
+  it("asks to turn Axol on when the link is up but no motor answers", () => {
+    expect(check({ robot: robot({ faults: unreachable, reachableCount: 0 }) })).toEqual({
+      blockers: ["Axol isn't answering. Turn on its power."],
+      short: "Turn on Axol",
+    })
+  })
+
+  it("asks to connect Axol without a link, or with Mantis linked instead", () => {
+    expect(check({ robot: null }).short).toBe("Connect Axol")
+    expect(check({ robot: robot({ profile: "mantis" }) }).blockers).toEqual([
+      "Connect Axol instead of Mantis",
+    ])
+  })
+
+  it("leaves sim and arms-off runs alone, but not a Mantis run", () => {
+    expect(check({ robot: null, robotFree: true })).toEqual({ blockers: [], short: null })
+    expect(check({ robot: null, robotFree: true, mantis: true }).short).toBe("Connect Mantis")
+  })
+
+  it("calls a single fault a motor problem", () => {
+    const faults = [{ arm: "left", joint: "elbow", problem: "overheat", temperature: 80 }]
+    expect(check({ robot: robot({ faults }) }).short).toBe("Check the motors")
   })
 })
 

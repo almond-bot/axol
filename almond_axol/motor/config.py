@@ -151,10 +151,7 @@ class MyActuatorParam(IntEnum):
     OVER_VOLTAGE = 0x13
     LOW_VOLTAGE = 0x14
     STALL_TIME_LIMIT = 0x15
-    EBRAKE_START_DUTY = 0x16
     CURRENT_SAMPLE_RES = 0x17
-    EBRAKE_HOLD_DUTY = 0x18
-    BRAKE_MODE = 0x19
     # Plan Parameters panel.
     MAX_POSITIVE_POSITION = 0x1A
     MIN_NEGATIVE_POSITION = 0x1B
@@ -202,11 +199,7 @@ MYACTUATOR_PARAMS: dict[MyActuatorParam, ParamSpec] = {
     MyActuatorParam.OVER_VOLTAGE: ParamSpec("V"),
     MyActuatorParam.LOW_VOLTAGE: ParamSpec("V"),
     MyActuatorParam.STALL_TIME_LIMIT: ParamSpec("s"),
-    MyActuatorParam.EBRAKE_START_DUTY: ParamSpec("%"),
     MyActuatorParam.CURRENT_SAMPLE_RES: ParamSpec("mOhm", _PROT),
-    MyActuatorParam.EBRAKE_HOLD_DUTY: ParamSpec("%"),
-    # 0 = holding brake ("E-Brake"), 1 = braking resistor.
-    MyActuatorParam.BRAKE_MODE: ParamSpec(""),
     MyActuatorParam.ERROR_DETECTION_LPF_CF: ParamSpec("", min_firmware=_V44),
     MyActuatorParam.AUTOMATIC_ERROR_RECOVERY: ParamSpec(""),
     # Second-encoder (OUTENCODER2) deviation thresholds. No unit suffix in the

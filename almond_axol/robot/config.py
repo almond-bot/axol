@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal, get_args
 
-from ..constants import ARM_JOINTS, Joint
+from ..constants import ARM_JOINTS, GRIPPER_MAX_TORQUE, Joint
 from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
     CALIBRATION_PATH,
@@ -487,12 +487,20 @@ class PositionForceConfig:
     """Position-force control parameters.
 
     Attributes:
-        torque_limit: Peak output torque (Nm).
+        torque_limit: Peak output torque (Nm), at most ``GRIPPER_MAX_TORQUE``.
         max_speed:    Maximum joint speed (rad/s).
     """
 
     torque_limit: float
     max_speed: float
+
+    def __post_init__(self) -> None:
+        if not self.torque_limit <= GRIPPER_MAX_TORQUE:
+            raise ValueError(
+                f"Gripper torque limit {self.torque_limit} Nm is above the "
+                f"{GRIPPER_MAX_TORQUE:g} Nm maximum. Set it to "
+                f"{GRIPPER_MAX_TORQUE:g} or lower."
+            )
 
 
 GripperType = Literal["parallel", "parcel"]

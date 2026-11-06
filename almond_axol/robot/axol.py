@@ -1696,7 +1696,7 @@ class AxolArm:
         self._set_gripper_range(open_pos, close_pos)
 
     async def disable(self) -> None:
-        """Disable all motors and engage brakes."""
+        """Disable all motors (the arms go limp)."""
         results = await asyncio.gather(
             *(m.disable() for m in self.motors.values()), return_exceptions=True
         )

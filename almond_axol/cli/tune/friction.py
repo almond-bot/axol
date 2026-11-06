@@ -236,7 +236,7 @@ async def _enter_impedance_hold(motors: dict[Joint, JointFrameMotor]) -> None:
     Damiao position-velocity): every hold and move is an impedance command
     at :data:`CAL_GAINS` with gravity fed forward. And no joint is left
     free: they once homed one joint at a time on 0xA4 with every other
-    joint reset, brake released and unheld until its turn — a free
+    joint reset and unheld until its turn — a free
     shoulder swung while the joints below it moved (2026-10-07). The mode
     switch's reset drops torque for ~2 s with nothing moving; then every
     joint is held at once.

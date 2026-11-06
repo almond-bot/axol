@@ -16,7 +16,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}wrist_thermal.driver_resume_c</F> | `95.0` | Driver temperature (°C) the wrist must cool to before its full torque comes back. |
 | <F>--{prefix}wrist_thermal.cool_torque_nm</F> | `1.5` | Torque (Nm) the wrist is held to while it cools. The motor is rated for 3.5 Nm continuous. |
 | <F>--{prefix}wrist_thermal.ramp_s</F> | `2.0` | Seconds over which the torque comes down, and later comes back. |
-| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm). |
+| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm), at most `5`. |
 | <F>--{prefix}left.gripper.max_speed</F> | `10.0` | Maximum gripper speed (rad/s). |
 | <F>--{prefix}left.elbow.kp</F> | per joint | Position stiffness of one joint at stiffness `1`, in `[0, 500]`. |
 | <F>--{prefix}left.elbow.kd</F> | per joint | Velocity damping in the motor firmware, in `[0, 5]`. |
