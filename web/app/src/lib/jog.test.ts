@@ -17,6 +17,7 @@ import {
   planJogMove,
   PreviewQueue,
   robotConnected,
+  wheelLagging,
   STICK_DEADZONE,
   withArmJog,
   type JogPose,
@@ -147,6 +148,20 @@ describe("gamepadControls", () => {
     expect(gamepadControls([]).drive).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
     const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], triggers(1, 0))
     expect(broken.twist).toEqual([...NO_TWIST])
+  })
+})
+
+describe("wheelLagging", () => {
+  const wheel = (command: number, measured: number | null) => ({ name: "w", command, measured })
+  it("flags a wheel told to turn that turns well under it or backwards", () => {
+    expect(wheelLagging(wheel(4, 3.9))).toBe(false)
+    expect(wheelLagging(wheel(-4, -3.5))).toBe(false)
+    expect(wheelLagging(wheel(4, 0.2))).toBe(true)
+    expect(wheelLagging(wheel(-4, 1))).toBe(true)
+  })
+  it("ignores a still or unreported wheel", () => {
+    expect(wheelLagging(wheel(0.2, 0))).toBe(false)
+    expect(wheelLagging(wheel(4, null))).toBe(false)
   })
 })
 

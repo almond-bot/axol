@@ -991,6 +991,35 @@ class _FakeJelly:
         self.body_cmd = (vx, vy, wz)
 
 
+def test_hardware_base_state_reports_each_wheel() -> None:
+    from almond_axol.jog.backends import HardwareBackend
+    from almond_axol.robot.jelly import WheelSample
+
+    jelly = _FakeJelly()
+    backend = HardwareBackend(None, jelly)
+    asyncio.run(backend.start())
+    assert backend.base_state()["wheels"] is None  # no wheel speeds yet
+    jelly.wheel_speeds = [1.0, 2.0, 3.0, 4.0]
+    wheels = backend.base_state()["wheels"]
+    assert [w["name"] for w in wheels] == [
+        "front_left",
+        "front_right",
+        "back_left",
+        "back_right",
+    ]
+    assert [w["command"] for w in wheels] == [1.0, 2.0, 3.0, 4.0]
+    assert all(w["measured"] is None for w in wheels)
+    jelly.wheel_sample = WheelSample(
+        positions=(0.0,) * 4, velocities=(0.9, 0.0, 3.1, 4.0), at=1.0
+    )
+    assert [w["measured"] for w in backend.base_state()["wheels"]] == [
+        0.9,
+        0.0,
+        3.1,
+        4.0,
+    ]
+
+
 class HardwareBackendTest(unittest.TestCase):
     def test_session_holds_the_measured_pose_and_feeds_jelly(self) -> None:
         axol, jelly = _FakeAxol(), _FakeJelly()
