@@ -7,8 +7,10 @@ begin by playing a planned move from wherever the arms are to the configured
 rest pose. When an arm has been left far from zero — folded over by hand
 while limp, collapsed onto the table, or reading a bad joint offset — that
 first move is large and unsupervised, so these flows check the measured pose
-first and refuse to start if any arm joint is more than
-:data:`START_POSE_TOLERANCE_DEG` from zero.
+first and refuse to start if any of :data:`START_POSE_CHECKED_JOINTS`
+(shoulder_1, shoulder_3 and the elbow) is more than
+:data:`START_POSE_TOLERANCE_DEG` from zero. shoulder_2 and the wrist joints
+are not capped and may start anywhere.
 
 The reference is zero rather than the configured rest pose on purpose: the
 rest pose is an operator setting that may sit well away from where the arms
@@ -29,15 +31,21 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ..constants import ARM_JOINTS
+from ..constants import ARM_JOINTS, Joint
 
 START_POSE_TOLERANCE_DEG = 25.0
+
+# The joints held to the start tolerance. Every other arm joint may start
+# anywhere.
+START_POSE_CHECKED_JOINTS: frozenset[Joint] = frozenset(
+    {Joint.SHOULDER_1, Joint.SHOULDER_3, Joint.ELBOW}
+)
 
 ArmPair = tuple[Sequence[float] | None, Sequence[float] | None]
 
 
 class StartPoseError(RuntimeError):
-    """An arm joint is too far from zero to start a session."""
+    """A checked arm joint is too far from zero to start a session."""
 
 
 @dataclass(frozen=True)
@@ -53,7 +61,9 @@ def start_pose_deviations(
     positions: ArmPair,
     tolerance_deg: float = START_POSE_TOLERANCE_DEG,
 ) -> list[JointDeviation]:
-    """Arm joints more than ``tolerance_deg`` from zero, left arm first.
+    """Checked arm joints more than ``tolerance_deg`` from zero, left arm first.
+
+    Only :data:`START_POSE_CHECKED_JOINTS` are checked.
 
     ``positions`` is the measured ``(left, right)`` pair in Joint enum order
     (the gripper, if present, is ignored; ``None`` is an absent arm). A
@@ -65,6 +75,8 @@ def start_pose_deviations(
         if q is None:
             continue
         for i, joint in enumerate(ARM_JOINTS):
+            if joint not in START_POSE_CHECKED_JOINTS:
+                continue
             pos = math.degrees(float(q[i]))
             if not abs(pos) <= tolerance_deg:
                 out.append(JointDeviation(side, joint.value, pos))

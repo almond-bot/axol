@@ -130,7 +130,7 @@ Set DAgger's own `server_host` and `hold_to_intervene`. The control panel shows 
 
 When you hand back, the robot holds your last command until the desktop returns a fresh plan from the corrected pose. It then blends into that plan. Each switch between policy and operator stays in the same dataset episode, and the rows are labelled correctly at the switch.
 
-The startup move must finish before the first VR Record prompt opens. Whenever the session homes on start (the default, or with `--home_on_start true`), it first checks that every arm joint is within 25° of zero, and the first home goes through zero. See [Starting needs the arms near zero](/operations/teleop). A session with `--start_from_current_pose` and without `--home_on_start` can start anywhere.
+The startup move must finish before the first VR Record prompt opens. Whenever the session homes on start (the default, or with `--home_on_start true`), it first checks that `shoulder_1`, `shoulder_3` and `elbow` are within 25° of zero, and the first home goes through zero. See [Starting needs the arms near zero](/operations/teleop). A session with `--start_from_current_pose` and without `--home_on_start` can start anywhere.
 
 ## Stopping a session
 
