@@ -2444,6 +2444,12 @@ export default function ControlPanel() {
         actions={runningChip}
         notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
         badges={badges}
+        navTargets={
+          // While an operation runs, Operations opens it instead of the list.
+          isLive && runningOp
+            ? { "/control/operations": `/control/operations/${encodeURIComponent(runningOp)}` }
+            : undefined
+        }
         host={host}
       >
         {view === "overview" && (
