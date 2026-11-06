@@ -76,7 +76,7 @@ export type AxolPoseData = {
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
-  /** Right controller A held, in plain teleop only: box-mode stow. */
+  /** Right controller A held, in plain teleop only: the stow (box mode's, or tucking the arms with the parcel gripper). */
   stow?: boolean
 }
 

@@ -62,7 +62,7 @@ A small 3D model of Axol stands below the overhead camera screen. It shows where
 | 3 | Left trigger | Close the left gripper. With tracking disengaged, move or resize a camera screen. |
 | 4 | Right trigger | Close the right gripper. With tracking disengaged, move or resize a camera screen. |
 | 5 | X | Return the arms to the rest pose. Cancels a recording countdown. While recording, asks to discard the episode. |
-| 6 | A | Data collection only. Starts recording, or while recording, asks to save the episode. |
+| 6 | A | In teleop with the parcel gripper, tucks both arms in and freezes them. See [Tucking the arms](#arm-stow). In data collection, starts recording, or while recording, asks to save the episode. |
 | 7 | Y | Exit VR. The arms stop and hold their position. |
 | | B (right) | Reset the camera screens. |
 | | Left thumbstick | Drive [Jelly](#jelly) forward, back and sideways. |
@@ -78,6 +78,19 @@ A small 3D model of Axol stands below the overhead camera screen. It shows where
 
 With **Hold grips to engage** turned on in the control panel (`--teleop.hold_to_engage true`), each grip is a dead-man switch. Hold a grip to move its arm, and release it to freeze the arm. Either grip engages its own arm, including from rest. After a forced disengage, release a grip you are still holding before it engages again.
 
+<a id="arm-stow"></a>
+
+### Tucking the arms
+
+With the parcel gripper fitted, press **A** in teleop to tuck both arms in before you drive. It works while the arms move, while they are frozen and from rest.
+
+1. The two grippers move in together to the middle of the chest, below the shoulders, with the elbows tucked in against the robot.
+2. They keep their positions relative to each other the whole way, so a box squeezed between them stays squeezed with the same force.
+3. Each gripper stays as open or closed as it was when you pressed **A**.
+4. Once the arms settle, both arms freeze. Click a grip to move that arm again.
+
+Click a grip during the move to stop it, and both arms freeze where they are. In box mode, **A** stows the box instead. See [Stowing the box](#box-stow).
+
 ### If the link drops
 
 The arms disengage after about half a second and hold their position if the headset stops sending poses. This happens when you take the headset off, open the system menu, exit the app or lose Wi-Fi. Engaging again never jerks the arms toward the controllers (see [Re-engaging](#re-engaging)). Press **X** to return them to rest.
@@ -86,7 +99,7 @@ The arms disengage after about half a second and hold their position if the head
 
 The command that starts the session sets the mode. You can't switch it in the headset.
 
-- [`axol teleop`](/cli/teleop): the HUD shows `Teleop` and **A** does nothing.
+- [`axol teleop`](/cli/teleop): the HUD shows `Teleop`. With the parcel gripper, **A** tucks the arms in (see [Tucking the arms](#arm-stow)). Otherwise it does nothing.
 - [`axol collect-data`](/cli/collect-data): the HUD shows `Data collection` and **A** records. See [Record episodes](#record-episodes).
 
 <a id="re-engaging"></a>

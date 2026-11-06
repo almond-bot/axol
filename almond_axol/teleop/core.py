@@ -485,6 +485,11 @@ class VRTeleopCore:
         # request still to be sent to the worker.
         self._prev_stow: bool = False
         self._stowing: bool = False
+        # Plain teleop's stow (A outside box mode with the parcel gripper,
+        # see _update_arm_stow): asked of the worker on every frame while
+        # it runs (``arm_stow``). ``_stowing`` and ``_stow_pulse`` track it
+        # as they do the box-mode stow.
+        self._arm_stowing: bool = False
         self._stow_pulse: bool = False
         self._stow_leader: str | None = None
         self._last_box_leader: str | None = None
@@ -1243,6 +1248,11 @@ class VRTeleopCore:
         self._r_inhibit = True
         self._engage_time = None
         self._box_leader = None
+        if self._arm_stowing:
+            self._logger.info("Arm stow: cancelled")
+            self._arm_stowing = False
+            self._stowing = False
+            self._stow_pulse = False
         if self.config.absolute_mode:
             # A forced stop invalidates the absolute world→base anchor. This
             # covers explicit bad-tracking frames as well as a total WebXR
@@ -1506,10 +1516,14 @@ class VRTeleopCore:
 
         self._maybe_auto_engage(frame)
         if self.box_mode:
+            if self._arm_stowing:
+                self._cancel_arm_stow("Arm stow: cancelled (box mode on)")
             self._update_engage_box(frame)
             self._update_stow(frame)
             # A grip that just froze the pair ends a deferred exit now.
             self._finish_box_exit()
+            return
+        if self._update_arm_stow(frame):
             return
 
         was_left = self.left_enabled
@@ -1710,6 +1724,75 @@ class VRTeleopCore:
             self._stowing = False
             self._stow_pulse = False
 
+    def _update_arm_stow(self, frame: object) -> bool:
+        """Plain teleop's stow: **A** with the parcel gripper, outside box mode.
+
+        A press tucks both arms in as a pair, whatever each was doing
+        (tracking, frozen, at rest): the worker carries the two grippers in
+        together, each keeping its pose relative to the other, so a box
+        squeezed between them stays squeezed with the same force
+        (``IKWorker._step_arm_stow``). Both grippers keep their opening and
+        the hands are ignored until the worker reports it done
+        (:meth:`_finish_stow`), when both arms freeze. A grip press during it
+        cancels it, and both arms hold where they are. Returns whether the
+        stow took this frame (the caller then skips the per-arm engage
+        update).
+        """
+        pressed = bool(getattr(frame, "stow", False))
+        edge = pressed and not self._prev_stow
+        self._prev_stow = pressed
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        if self._arm_stowing:
+            if self.config.hold_to_engage:
+                grip = l_lock or r_lock
+            else:
+                grip = (l_lock and not self._prev_l_lock) or (
+                    r_lock and not self._prev_r_lock
+                )
+            self._prev_both = l_lock and r_lock
+            self._prev_l_lock = l_lock
+            self._prev_r_lock = r_lock
+            if grip:
+                self._cancel_arm_stow("Arm stow: cancelled; both arms frozen")
+                if self.config.hold_to_engage:
+                    # The grip that cancelled must be let go before it
+                    # engages its arm.
+                    self._l_inhibit = l_lock
+                    self._r_inhibit = r_lock
+            return True
+        if not (
+            edge
+            and getattr(self.config, "gripper", "parallel") == "parcel"
+            and self.q is not None
+        ):
+            return False
+        self._logger.info("Arm stow: tucking both arms in")
+        self._arm_stowing = True
+        self._stowing = True
+        self._stow_pulse = True
+        self._prev_both = l_lock and r_lock
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+        return True
+
+    def _cancel_arm_stow(self, message: str) -> None:
+        """Stop plain teleop's stow; both arms freeze where they are."""
+        self._logger.info(message)
+        self._arm_stowing = False
+        self._stowing = False
+        self._stow_pulse = False
+        self._freeze_both_arms()
+
+    def _freeze_both_arms(self) -> None:
+        """Freeze both arms (a single grip click resumes that arm)."""
+        was_enabled = self.teleop_enabled
+        self.left_enabled = False
+        self.right_enabled = False
+        self._require_both_engage = False
+        if was_enabled:
+            self._broadcast(False)
+
     def _finish_stow(self, status: dict) -> None:
         """Track the worker's stow: stop requesting it, freeze when done."""
         if not self._stowing:
@@ -1719,7 +1802,14 @@ class VRTeleopCore:
             # The worker has it (the request repeats until it does: a frame
             # that re-snaps the pair can't start one).
             self._stow_pulse = False
-        if phase == "done":
+        if phase == "done" and self._arm_stowing:
+            self._arm_stowing = False
+            self._stowing = False
+            self._freeze_both_arms()
+            self._logger.info(
+                "Arm stow: done, both arms frozen. Press a grip to move that arm."
+            )
+        elif phase == "done":
             self._stowing = False
             self._box_leader = None
             self.left_enabled = False
@@ -1728,8 +1818,14 @@ class VRTeleopCore:
             self._logger.info("Box stowed: pair frozen. Press a grip to lead again.")
             self._broadcast(False)
         elif phase is None and not self._stow_pulse:
-            self._logger.warning("Box stow: the IK worker dropped the stow")
+            self._logger.warning(
+                "%s stow: the IK worker dropped the stow",
+                "Arm" if self._arm_stowing else "Box",
+            )
             self._stowing = False
+            if self._arm_stowing:
+                self._arm_stowing = False
+                self._freeze_both_arms()
 
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
@@ -2608,7 +2704,8 @@ class VRTeleopCore:
                         ),
                         # The worker only ever sees the *effective* mode.
                         "reengage": self.reengage,
-                        "box_stow": self._stow_pulse,
+                        "box_stow": self._stow_pulse and self.box_mode,
+                        "arm_stow": self._arm_stowing,
                     }
                 )
                 # Live config changes the worker's pickled config must

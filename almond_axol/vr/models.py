@@ -191,11 +191,19 @@ class VRFrame(BaseModel):
         stow: True while the right controller's **A** is held in plain
             teleop (data collection keeps A for recording). In box mode a
             press (the pair led or frozen) stows the box: see
-            :meth:`almond_axol.teleop.worker.IKWorker._start_stow`.
+            :meth:`almond_axol.teleop.worker.IKWorker._start_stow`. Outside
+            it, with the parcel gripper, a press tucks both arms in as a
+            pair (``arm_stow``).
         box_stow: Server-internal: a request, set by the teleop core on the
             frames it forwards to the IK worker until the worker reports the
             stow under way, to start the box-mode stow. Headsets leave it
             unset.
+        arm_stow: Server-internal: set by the teleop core on every frame it
+            forwards to the IK worker while plain teleop's stow runs (**A**
+            outside box mode with the parcel gripper), so the worker moves
+            both arms in as a pair and ends the stow when it clears. See
+            :meth:`almond_axol.teleop.worker.IKWorker._step_arm_stow`.
+            Headsets leave it unset.
         box_leader: Server-internal: which controller leads the arm pair in
             box mode (``"left"`` / ``"right"``). Set by the teleop core on
             the frame it forwards to the IK worker; headsets leave it unset.
@@ -243,5 +251,6 @@ class VRFrame(BaseModel):
     r_stick_click: bool = False
     stow: bool = False
     box_stow: bool = False
+    arm_stow: bool = False
     box_leader: Literal["left", "right"] | None = None
     reengage: Literal["clutch", "ramp"] | None = None
