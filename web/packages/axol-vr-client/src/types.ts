@@ -119,9 +119,12 @@ export type AxolSettings = {
 
 /**
  * Live joint state the teleop server pushes ~20x/s as
- * `{"type":"joints","value":AxolJointState}` — drives the HUD's box-mode
- * readout. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
- * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
+ * `{"type":"joints","value":AxolJointState}` — drives the headset's live
+ * robot model and the HUD's box-mode readout. `q` maps URDF joint names (e.g.
+ * `left_s1_0`) to radians; grips are normalised 0 (closed) – 1 (open). `urdf`
+ * names this Axol's model under the server's `/urdf` mount and `lift` is
+ * Jelly's lift height as a fraction of its travel (1 = fully raised; null
+ * without a lift); both are null from an older server. `pair` is the gripper-pair geometry from
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
  * — a good moment to switch to box mode), `width` in metres, `grasp` the
@@ -137,6 +140,8 @@ export type AxolJointState = {
   l_grip: number
   r_grip: number
   engaged: boolean
+  urdf: string | null
+  lift: number | null
   pair: {
     aligned: boolean
     width: number

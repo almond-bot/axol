@@ -1129,7 +1129,11 @@ class VRTeleop:
         out = self._core.compute_output()
         if out is None:
             return None, None
-        self._core.maybe_broadcast_joints(out, self._robot)
+        self._core.maybe_broadcast_joints(
+            out,
+            self._robot,
+            lift=self._jelly.lift_raised if self._jelly is not None else None,
+        )
         self._core.maybe_broadcast_haptics(self._robot)
         return out[:8], out[8:]
 
