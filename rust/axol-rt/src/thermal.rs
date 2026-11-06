@@ -47,12 +47,12 @@ impl Default for ThermalLimit {
         // Mirrors `WristThermalConfig` in almond_axol/robot/config.py.
         Self {
             enabled: true,
-            coil_limit_c: 85.0,
-            coil_resume_c: 75.0,
+            coil_limit_c: 75.0,
+            coil_resume_c: 65.0,
             driver_limit_c: 105.0,
             driver_resume_c: 95.0,
             cool_cap_nm: 1.5,
-            ramp_s: 2.0,
+            ramp_s: 0.25,
         }
     }
 }
@@ -207,6 +207,12 @@ impl ThermalGuard {
 mod tests {
     use super::*;
 
+    /// Thresholds the tests below are written against (the defaults until a
+    /// stalled wrist heated 85 to 95 °C inside the old 2 s ramp).
+    fn slow() -> ThermalLimit {
+        ThermalLimit::parse(&["85", "75", "105", "95", "1.5", "2"]).unwrap()
+    }
+
     fn run(g: &mut ThermalGuard, lim: &ThermalLimit, seconds: f64) {
         let dt = 1.0 / 240.0;
         for _ in 0..(seconds / dt).round() as usize {
@@ -216,7 +222,7 @@ mod tests {
 
     #[test]
     fn cool_until_resume_then_restore() {
-        let lim = ThermalLimit::default();
+        let lim = slow();
         let mut g = ThermalGuard::default();
         assert_eq!(g.observe(&lim, 60.0, 50.0), None);
         run(&mut g, &lim, 1.0);
@@ -258,7 +264,7 @@ mod tests {
 
     #[test]
     fn the_driver_temperature_counts_too() {
-        let lim = ThermalLimit::default();
+        let lim = slow();
         let mut g = ThermalGuard::default();
         assert!(matches!(
             g.observe(&lim, 40.0, 105.0),
@@ -275,7 +281,7 @@ mod tests {
 
     #[test]
     fn warns_once_if_it_keeps_heating() {
-        let lim = ThermalLimit::default();
+        let lim = slow();
         let mut g = ThermalGuard::default();
         g.observe(&lim, 85.0, 50.0);
         assert_eq!(g.observe(&lim, 90.0, 50.0), None);
@@ -297,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_restore_mid_ramp_turns_back_from_where_it_is() {
-        let lim = ThermalLimit::default();
+        let lim = slow();
         let mut g = ThermalGuard::default();
         g.observe(&lim, 85.0, 50.0);
         run(&mut g, &lim, 0.5);
@@ -309,7 +315,7 @@ mod tests {
 
     #[test]
     fn parse_is_strict() {
-        let lim = ThermalLimit::parse(&["85", "75", "105", "95", "1.5", "2"]).unwrap();
+        let lim = ThermalLimit::parse(&["75", "65", "105", "95", "1.5", "0.25"]).unwrap();
         assert_eq!(lim, ThermalLimit::default());
         assert!(ThermalLimit::parse(&["85", "75", "105", "95", "1.5"]).is_none());
         assert!(ThermalLimit::parse(&["75", "85", "105", "95", "1.5", "2"]).is_none());
@@ -320,7 +326,7 @@ mod tests {
 
     #[test]
     fn garbage_readings_change_nothing() {
-        let lim = ThermalLimit::default();
+        let lim = slow();
         let mut g = ThermalGuard::default();
         assert_eq!(g.observe(&lim, f64::NAN, 50.0), None);
         assert!(!g.cooling());

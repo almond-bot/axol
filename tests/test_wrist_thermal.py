@@ -22,7 +22,7 @@ class WristThermalConfigTest(unittest.TestCase):
         self.assertLess(cfg.driver_limit_c, 120.0)
         # Cooling runs under the DM-J4310's rated 3.5 Nm.
         self.assertLess(cfg.cool_torque_nm, 3.5)
-        self.assertEqual(cfg.config_line(), "thermal 85.0 75.0 105.0 95.0 1.5 2.0")
+        self.assertEqual(cfg.config_line(), "thermal 75.0 65.0 105.0 95.0 1.5 0.25")
 
     def test_off(self) -> None:
         self.assertEqual(WristThermalConfig(enabled=False).config_line(), "thermal off")
@@ -48,13 +48,13 @@ class CoreConfigLineTest(unittest.TestCase):
 
     def test_the_core_config_carries_the_line(self) -> None:
         lines = self._lines(_partial_axol(set(WRIST_KIT)))
-        self.assertIn("thermal 85.0 75.0 105.0 95.0 1.5 2.0", lines)
+        self.assertIn("thermal 75.0 65.0 105.0 95.0 1.5 0.25", lines)
         # Ahead of the joint lines, like the other directives.
         first_joint = next(
             i for i, line in enumerate(lines) if line.startswith("joint ")
         )
         self.assertLess(
-            lines.index("thermal 85.0 75.0 105.0 95.0 1.5 2.0"), first_joint
+            lines.index("thermal 75.0 65.0 105.0 95.0 1.5 0.25"), first_joint
         )
 
     def test_follows_the_robot_config(self) -> None:

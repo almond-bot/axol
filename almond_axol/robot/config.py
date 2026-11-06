@@ -1354,12 +1354,15 @@ class WristThermalConfig:
     """
 
     enabled: bool = True
-    coil_limit_c: float = 85.0
-    coil_resume_c: float = 75.0
+    # A wrist stalled near its peak torque heats its coil ~5 °C/s: 85 °C and
+    # a 2 s ramp let it reach 95 °C before the cap was down, and the motor's
+    # own 100 °C cutoff soon after. 75 °C and 0.25 s leave ~25 °C of margin.
+    coil_limit_c: float = 75.0
+    coil_resume_c: float = 65.0
     driver_limit_c: float = 105.0
     driver_resume_c: float = 95.0
     cool_torque_nm: float = 1.5
-    ramp_s: float = 2.0
+    ramp_s: float = 0.25
 
     def __post_init__(self) -> None:
         values = (
