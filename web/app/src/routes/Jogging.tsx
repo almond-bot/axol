@@ -3,6 +3,9 @@ import { Link } from "react-router-dom"
 import {
   ArrowDown,
   ArrowUp,
+  ChevronDown,
+  CircleQuestionMark,
+  Gamepad2,
   Hand,
   House,
   Loader2,
@@ -16,7 +19,7 @@ import {
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { AppShell } from "@/components/app-shell"
@@ -286,15 +289,6 @@ function JogButtons({
   ))
 }
 
-function Readout({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2">
-      <p className="text-[11px] text-white/45">{label}</p>
-      <p className="mt-0.5 font-mono text-sm tabular-nums">{value}</p>
-    </div>
-  )
-}
-
 const deg = (rad: number, digits = 1) => `${((rad * 180) / Math.PI).toFixed(digits)}°`
 
 /** One condensed table of everything moving: both arms, the lift and the base. */
@@ -318,7 +312,7 @@ function RobotStatus({
   return (
     <Card data-testid="jog-status">
       <CardHeader>
-        <CardTitle>Robot state</CardTitle>
+        <CardTitle>Telemetry</CardTitle>
       </CardHeader>
       <div
         className={cn(
@@ -681,6 +675,30 @@ export default function Jogging() {
   const [gamepad, setGamepad] = useState<string | null>(null)
   const [gamepadMode, setGamepadMode] = useState<GamepadMode>("drive")
 
+  // The controls, one tab at a time. The keyboard and a controller work on
+  // every tab. The lift and the base only exist on Axol on Jelly.
+  const controlTabs: { key: ControlTab; label: string }[] = [
+    { key: "arm", label: "Arm move" },
+    { key: "jog", label: "Jog gripper" },
+    ...(robotModel === "mobile"
+      ? [
+          { key: "lift" as const, label: "Lift" },
+          { key: "drive" as const, label: "Drive" },
+        ]
+      : []),
+  ]
+  const [tab, setTab] = useState<ControlTab>(loadControlTab)
+  const shownTab = controlTabs.some((t) => t.key === tab) ? tab : "arm"
+  const selectTab = (next: ControlTab) => {
+    setTab(next)
+    try {
+      localStorage.setItem(CONTROL_TAB_KEY, next)
+    } catch {
+      // A remembered tab is a convenience.
+    }
+  }
+  const [helpOpen, setHelpOpen] = useState(false)
+
   // Drive the base and the lift from the keyboard: W A S D move, the left
   // and right arrows turn, the up and down arrows raise and lower the lift.
   // Typing in a field, a focused slider or menu, and shortcuts with a
@@ -882,10 +900,6 @@ export default function Jogging() {
         </div>
       )}
 
-      {running && sessionMode === "hardware" && video && (
-        <CameraFeeds host={video.host} vrPort={video.vrPort} />
-      )}
-
       {(error || linkError || hostError || otherOperation || state?.solverError) && (
         <div
           role="alert"
@@ -914,462 +928,476 @@ export default function Jogging() {
         </p>
       )}
 
-      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_340px] lg:items-start">
-        <Card className="gap-0 overflow-hidden p-0">
-          <div className="relative h-[clamp(420px,64vh,680px)]">
-            <Suspense
-              fallback={
-                <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
-                  <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
+      <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px] lg:items-start">
+        <div className="flex min-w-0 flex-col gap-6">
+          <Card className="gap-0 overflow-hidden p-0">
+            <div className="relative h-[clamp(420px,64vh,680px)]">
+              <Suspense
+                fallback={
+                  <div className="flex h-full items-center justify-center gap-2 text-sm text-white/45">
+                    <Loader2 className="size-4 animate-spin" /> Loading the 3D view…
+                  </div>
+                }
+              >
+                <JogViewer
+                  key={`${robotModel}:${gripper}`}
+                  robotModel={robotModel}
+                  gripper={gripper}
+                  state={running ? (state ?? null) : null}
+                  plan={plan}
+                  preview={shownPreview}
+                  activeArm={arm}
+                  target={canMoveArm || plan ? target : null}
+                  onTargetChange={changeTarget}
+                  onSelectArm={selectArm}
+                />
+              </Suspense>
+              {running && !ready && (
+                <div className="pointer-events-none absolute inset-x-0 top-3 flex justify-center">
+                  <span className="flex items-center gap-2 rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
+                    <Loader2 className="size-3.5 animate-spin" /> Starting the IK solver…
+                  </span>
                 </div>
-              }
-            >
-              <JogViewer
-                key={`${robotModel}:${gripper}`}
-                robotModel={robotModel}
-                gripper={gripper}
-                state={running ? (state ?? null) : null}
-                plan={plan}
-                preview={shownPreview}
-                activeArm={arm}
-                target={canMoveArm || plan ? target : null}
-                onTargetChange={changeTarget}
-                onSelectArm={selectArm}
-              />
-            </Suspense>
-            {running && !ready && (
-              <div className="pointer-events-none absolute inset-x-0 top-3 flex justify-center">
-                <span className="flex items-center gap-2 rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
-                  <Loader2 className="size-3.5 animate-spin" /> Starting the IK solver…
-                </span>
-              </div>
-            )}
-            {!running && (
-              <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
-                <span className="rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
-                  Start jogging to move the robot.
-                </span>
-              </div>
-            )}
-          </div>
-          <div className="flex flex-wrap items-center gap-2 border-t border-white/10 px-4 py-3 text-xs text-white/50">
-            <Move3d className="size-4" />
-            Drag the gizmo arrows to move the target and its rings to turn it. Drag empty space to
-            orbit, scroll to zoom.
-            {target && (
-              <>
-                <span data-testid="jog-target" className="font-mono text-white/70 tabular-nums">
-                  Target {target.position.map((v) => (v * 1000).toFixed(0)).join(", ")} mm
-                </span>
+              )}
+              {!running && (
+                <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
+                  <span className="rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
+                    Start jogging to move the robot.
+                  </span>
+                </div>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 border-t border-white/10 px-4 py-3 text-xs text-white/50">
+              <Move3d className="size-4" />
+              Drag the gizmo arrows to move the target and its rings to turn it. Drag empty space to
+              orbit, scroll to zoom.
+              {target && (
+                <>
+                  <span data-testid="jog-target" className="font-mono text-white/70 tabular-nums">
+                    Target {target.position.map((v) => (v * 1000).toFixed(0)).join(", ")} mm
+                  </span>
+                  <span
+                    data-testid="jog-target-rpy"
+                    className="font-mono text-white/70 tabular-nums"
+                    title="Roll, pitch and yaw in the robot's axes"
+                  >
+                    {rpyDegrees(target.quaternion)
+                      .map((v) => v.toFixed(0))
+                      .join(", ")}
+                    °
+                  </span>
+                </>
+              )}
+              {plan && planError && (
                 <span
-                  data-testid="jog-target-rpy"
-                  className="font-mono text-white/70 tabular-nums"
-                  title="Roll, pitch and yaw in the robot's axes"
+                  className={cn("ml-auto", plan.reachable ? "text-emerald-300" : "text-amber-300")}
                 >
-                  {rpyDegrees(target.quaternion)
-                    .map((v) => v.toFixed(0))
-                    .join(", ")}
-                  °
+                  {plan.reachable
+                    ? `Reaches the target in ${plan.duration.toFixed(1)} s`
+                    : `Closest reachable pose: ${planError.mm.toFixed(0)} mm and ${planError.degrees.toFixed(0)}° from the target`}
                 </span>
-              </>
-            )}
-            {plan && planError && (
-              <span
-                className={cn("ml-auto", plan.reachable ? "text-emerald-300" : "text-amber-300")}
-              >
-                {plan.reachable
-                  ? `Reaches the target in ${plan.duration.toFixed(1)} s`
-                  : `Closest reachable pose: ${planError.mm.toFixed(0)} mm and ${planError.degrees.toFixed(0)}° from the target`}
-              </span>
-            )}
-            {!plan && shownPreview && previewError && (
-              <span
-                data-testid="jog-preview"
-                className={cn(
-                  "ml-auto",
-                  shownPreview.reachable ? "text-emerald-300" : "text-amber-300"
-                )}
-              >
-                {shownPreview.reachable
-                  ? "Preview: the gripper reaches the target"
-                  : `Preview: closest pose is ${previewError.mm.toFixed(0)} mm and ${previewError.degrees.toFixed(0)}° away`}
-              </span>
-            )}
-          </div>
-        </Card>
+              )}
+              {!plan && shownPreview && previewError && (
+                <span
+                  data-testid="jog-preview"
+                  className={cn(
+                    "ml-auto",
+                    shownPreview.reachable ? "text-emerald-300" : "text-amber-300"
+                  )}
+                >
+                  {shownPreview.reachable
+                    ? "Preview: the gripper reaches the target"
+                    : `Preview: closest pose is ${previewError.mm.toFixed(0)} mm and ${previewError.degrees.toFixed(0)}° away`}
+                </span>
+              )}
+            </div>
+          </Card>
+
+          {running && sessionMode === "hardware" && video && (
+            <CameraFeeds host={video.host} vrPort={video.vrPort} />
+          )}
+        </div>
 
         <div className="flex flex-col gap-6">
-          <Card>
-            <CardHeader>
-              <CardTitle>Arm move</CardTitle>
-              <CardDescription>
-                Plan a move of one gripper to the target, then execute it.
-              </CardDescription>
-            </CardHeader>
-            <label className="flex flex-col gap-1 text-xs text-white/55">
-              Arm
-              <Select
-                aria-label="Arm"
-                value={arm}
-                onChange={(event) => selectArm(event.target.value as JogArm)}
-              >
-                <SelectOption value="left" label="Left" />
-                <SelectOption value="right" label="Right" />
-              </Select>
-            </label>
-            <div className="flex gap-2">
-              <Button
-                className="flex-1"
-                onClick={planMove}
-                disabled={!canMoveArm || !target || Boolean(busy)}
-              >
-                {busy === "plan" ? <Loader2 className="animate-spin" /> : <Target />} Plan move
-              </Button>
-              {executing ? (
-                <Button variant="destructive" className="flex-1" onClick={cancel}>
-                  <Square /> Stop move
-                </Button>
-              ) : (
-                <Button
-                  className="flex-1"
-                  onClick={execute}
-                  disabled={!plan || !canMoveArm || Boolean(busy)}
-                >
-                  {busy === "execute" ? <Loader2 className="animate-spin" /> : <Play />} Execute
-                </Button>
-              )}
-            </div>
-            {executing && (
-              <div
-                className="h-1.5 overflow-hidden rounded-full bg-white/10"
-                aria-label="Move progress"
-              >
-                <div
-                  className="h-full bg-[#eff483]"
-                  style={{ width: `${Math.round(executing.progress * 100)}%` }}
-                />
-              </div>
-            )}
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                className="flex-1"
-                onClick={resetTarget}
-                disabled={!canMoveArm}
-              >
-                <RotateCcw /> Reset target
-              </Button>
-              <Button
-                variant="outline"
-                className="flex-1"
-                onClick={rest}
-                disabled={!canMoveArm || Boolean(busy)}
-                title="Move both arms to the rest pose. Stop move halts it."
-              >
-                {busy === "rest" ? <Loader2 className="animate-spin" /> : <House />} Go to rest
-              </Button>
-            </div>
-            <div className="flex flex-col gap-2 border-t border-white/10 pt-4">
-              <div className="flex items-center justify-between text-xs text-white/55">
-                <span>Move target</span>
-                <Select
-                  aria-label="Move step"
-                  className="h-8 w-24"
-                  value={stepMm}
-                  onChange={(event) => setStepMm(Number(event.target.value))}
-                >
-                  {STEPS_MM.map((mm) => (
-                    <SelectOption key={mm} value={String(mm)} label={`${mm} mm`} />
-                  ))}
-                </Select>
-              </div>
-              <div className="grid grid-cols-3 gap-1.5">
-                {(["X", "Y", "Z"] as const).map((name, axis) =>
-                  ([1, -1] as const).map((sign) => (
-                    <Button
-                      key={`${name}${sign}`}
-                      variant="outline"
-                      size="sm"
-                      disabled={!canMoveArm || !target}
-                      onClick={() => nudge("move", axis as 0 | 1 | 2, sign)}
-                    >
-                      {name} {sign > 0 ? "+" : "−"}
-                    </Button>
-                  ))
-                )}
-              </div>
-              <div className="mt-1 flex items-center justify-between text-xs text-white/55">
-                <span>Turn target</span>
-                <Select
-                  aria-label="Turn step"
-                  className="h-8 w-24"
-                  value={stepDeg}
-                  onChange={(event) => setStepDeg(Number(event.target.value))}
-                >
-                  {STEPS_DEG.map((deg) => (
-                    <SelectOption key={deg} value={String(deg)} label={`${deg}°`} />
-                  ))}
-                </Select>
-              </div>
-              <div className="grid grid-cols-3 gap-1.5">
-                {(["Roll", "Pitch", "Yaw"] as const).map((name, axis) =>
-                  ([1, -1] as const).map((sign) => (
-                    <Button
-                      key={`${name}${sign}`}
-                      variant="outline"
-                      size="sm"
-                      disabled={!canMoveArm || !target}
-                      onClick={() => nudge("turn", axis as 0 | 1 | 2, sign)}
-                    >
-                      {name} {sign > 0 ? "+" : "−"}
-                    </Button>
-                  ))
-                )}
-              </div>
-              <p className="text-[11px] text-white/40">
-                X is forward, Y is left and Z is up. Turns are about the gripper.
-              </p>
-            </div>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Jog gripper</CardTitle>
-              <CardDescription>
-                Hold a button to move the {arm} gripper. It stops when you let go.
-              </CardDescription>
-            </CardHeader>
-            <div className="grid grid-cols-2 gap-2">
-              <label className="flex flex-col gap-1 text-xs text-white/55">
-                Axes
-                <Select
-                  aria-label="Jog axes"
-                  value={jogFrame}
-                  onChange={(event) => setJogFrame(event.target.value as JogFrame)}
-                >
-                  <SelectOption value="torso" label="Robot" />
-                  <SelectOption value="gripper" label="Gripper" />
-                </Select>
-              </label>
-              <label className="flex flex-col gap-1 text-xs text-white/55">
-                Speed
-                <Slider
-                  aria-label="Jog speed"
-                  className="h-9"
-                  value={jogSpeed}
-                  min={0.1}
-                  max={1}
-                  step={0.05}
-                  onChange={setJogSpeed}
-                  format={(v) => `${Math.round(v * 100)} %`}
-                />
-              </label>
-            </div>
-            <JogButtons disabled={!canMoveArm} onJog={jogArm} />
-            {armLimited && (
-              <p className="text-xs text-amber-300" role="status">
-                <Hand className="mr-1 inline size-3.5" />
-                The {arm} gripper can't move further this way.
-              </p>
-            )}
-            <p className="text-[11px] text-white/40">
-              {jogFrame === "torso"
-                ? "X is forward, Y is left and Z is up. Turns are about the gripper tip."
-                : "The axes turn with the gripper. The fingers point along Z −."}
-            </p>
-          </Card>
-
           <RobotStatus state={running ? (state ?? null) : null} activeArm={arm} plan={plan} />
+
+          <Card>
+            <div className="flex items-center gap-2">
+              <div
+                role="tablist"
+                aria-label="Controls"
+                className="flex min-w-0 flex-1 flex-wrap rounded-lg border border-white/10 bg-white/[0.02] p-0.5"
+              >
+                {controlTabs.map((t) => (
+                  <button
+                    key={t.key}
+                    type="button"
+                    role="tab"
+                    aria-selected={shownTab === t.key}
+                    onClick={() => selectTab(t.key)}
+                    className={cn(
+                      "flex-1 rounded-md px-2.5 py-1.5 text-xs whitespace-nowrap transition-colors",
+                      shownTab === t.key
+                        ? "bg-[#eff483]/10 text-[#eff483]"
+                        : "text-white/55 hover:bg-white/[0.05] hover:text-white/85"
+                    )}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-expanded={helpOpen}
+                aria-label="Controls help"
+                title="Keyboard and controller"
+                onClick={() => setHelpOpen((open) => !open)}
+                className={cn("shrink-0 px-2", helpOpen && "text-[#eff483]")}
+              >
+                <CircleQuestionMark />
+                <ChevronDown className={cn("transition-transform", helpOpen && "rotate-180")} />
+              </Button>
+            </div>
+            {gamepad !== null && (
+              <p role="status" className="flex items-center gap-1.5 text-[11px] text-white/45">
+                <Gamepad2 className="size-3.5" />
+                {gamepad === ""
+                  ? "Controller not supported. Open the help for what to do."
+                  : gamepadMode === "move"
+                    ? `Controller: moving the ${arm} gripper`
+                    : gamepadMode === "turn"
+                      ? `Controller: turning the ${arm} gripper`
+                      : "Controller connected"}
+              </p>
+            )}
+            {helpOpen && <ControlsHelp gamepad={gamepad} />}
+
+            {shownTab === "arm" && (
+              <div role="tabpanel" aria-label="Arm move" className="flex flex-col gap-4">
+                <p className="text-xs text-white/50">
+                  Plan a move of one gripper to the target, then execute it.
+                </p>
+                <label className="flex flex-col gap-1 text-xs text-white/55">
+                  Arm
+                  <Select
+                    aria-label="Arm"
+                    value={arm}
+                    onChange={(event) => selectArm(event.target.value as JogArm)}
+                  >
+                    <SelectOption value="left" label="Left" />
+                    <SelectOption value="right" label="Right" />
+                  </Select>
+                </label>
+                <div className="flex gap-2">
+                  <Button
+                    className="flex-1"
+                    onClick={planMove}
+                    disabled={!canMoveArm || !target || Boolean(busy)}
+                  >
+                    {busy === "plan" ? <Loader2 className="animate-spin" /> : <Target />} Plan move
+                  </Button>
+                  {executing ? (
+                    <Button variant="destructive" className="flex-1" onClick={cancel}>
+                      <Square /> Stop move
+                    </Button>
+                  ) : (
+                    <Button
+                      className="flex-1"
+                      onClick={execute}
+                      disabled={!plan || !canMoveArm || Boolean(busy)}
+                    >
+                      {busy === "execute" ? <Loader2 className="animate-spin" /> : <Play />} Execute
+                    </Button>
+                  )}
+                </div>
+                {executing && (
+                  <div
+                    className="h-1.5 overflow-hidden rounded-full bg-white/10"
+                    aria-label="Move progress"
+                  >
+                    <div
+                      className="h-full bg-[#eff483]"
+                      style={{ width: `${Math.round(executing.progress * 100)}%` }}
+                    />
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    onClick={resetTarget}
+                    disabled={!canMoveArm}
+                  >
+                    <RotateCcw /> Reset target
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="flex-1"
+                    onClick={rest}
+                    disabled={!canMoveArm || Boolean(busy)}
+                    title="Move both arms to the rest pose. Stop move halts it."
+                  >
+                    {busy === "rest" ? <Loader2 className="animate-spin" /> : <House />} Go to rest
+                  </Button>
+                </div>
+                <div className="flex flex-col gap-2 border-t border-white/10 pt-4">
+                  <div className="flex items-center justify-between text-xs text-white/55">
+                    <span>Move target</span>
+                    <Select
+                      aria-label="Move step"
+                      className="h-8 w-24"
+                      value={stepMm}
+                      onChange={(event) => setStepMm(Number(event.target.value))}
+                    >
+                      {STEPS_MM.map((mm) => (
+                        <SelectOption key={mm} value={String(mm)} label={`${mm} mm`} />
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(["X", "Y", "Z"] as const).map((name, axis) =>
+                      ([1, -1] as const).map((sign) => (
+                        <Button
+                          key={`${name}${sign}`}
+                          variant="outline"
+                          size="sm"
+                          disabled={!canMoveArm || !target}
+                          onClick={() => nudge("move", axis as 0 | 1 | 2, sign)}
+                        >
+                          {name} {sign > 0 ? "+" : "−"}
+                        </Button>
+                      ))
+                    )}
+                  </div>
+                  <div className="mt-1 flex items-center justify-between text-xs text-white/55">
+                    <span>Turn target</span>
+                    <Select
+                      aria-label="Turn step"
+                      className="h-8 w-24"
+                      value={stepDeg}
+                      onChange={(event) => setStepDeg(Number(event.target.value))}
+                    >
+                      {STEPS_DEG.map((deg) => (
+                        <SelectOption key={deg} value={String(deg)} label={`${deg}°`} />
+                      ))}
+                    </Select>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {(["Roll", "Pitch", "Yaw"] as const).map((name, axis) =>
+                      ([1, -1] as const).map((sign) => (
+                        <Button
+                          key={`${name}${sign}`}
+                          variant="outline"
+                          size="sm"
+                          disabled={!canMoveArm || !target}
+                          onClick={() => nudge("turn", axis as 0 | 1 | 2, sign)}
+                        >
+                          {name} {sign > 0 ? "+" : "−"}
+                        </Button>
+                      ))
+                    )}
+                  </div>
+                  <p className="text-[11px] text-white/40">
+                    X is forward, Y is left and Z is up. Turns are about the gripper.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {shownTab === "jog" && (
+              <div role="tabpanel" aria-label="Jog gripper" className="flex flex-col gap-4">
+                <p className="text-xs text-white/50">
+                  Hold a button to move the {arm} gripper. It stops when you let go.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="flex flex-col gap-1 text-xs text-white/55">
+                    Axes
+                    <Select
+                      aria-label="Jog axes"
+                      value={jogFrame}
+                      onChange={(event) => setJogFrame(event.target.value as JogFrame)}
+                    >
+                      <SelectOption value="torso" label="Robot" />
+                      <SelectOption value="gripper" label="Gripper" />
+                    </Select>
+                  </label>
+                  <label className="flex flex-col gap-1 text-xs text-white/55">
+                    Speed
+                    <Slider
+                      aria-label="Jog speed"
+                      className="h-9"
+                      value={jogSpeed}
+                      min={0.1}
+                      max={1}
+                      step={0.05}
+                      onChange={setJogSpeed}
+                      format={(v) => `${Math.round(v * 100)} %`}
+                    />
+                  </label>
+                </div>
+                <JogButtons disabled={!canMoveArm} onJog={jogArm} />
+                {armLimited && (
+                  <p className="text-xs text-amber-300" role="status">
+                    <Hand className="mr-1 inline size-3.5" />
+                    The {arm} gripper can't move further this way.
+                  </p>
+                )}
+                <p className="text-[11px] text-white/40">
+                  {jogFrame === "torso"
+                    ? "X is forward, Y is left and Z is up. Turns are about the gripper tip."
+                    : "The axes turn with the gripper. The fingers point along Z −."}
+                </p>
+              </div>
+            )}
+
+            {shownTab === "lift" && (
+              <div role="tabpanel" aria-label="Lift" className="flex flex-col gap-4">
+                <p className="text-xs text-white/50">
+                  Hold a button to raise or lower the lift. It stops when you let go.
+                </p>
+                <div className="flex gap-2">
+                  <HoldButton
+                    label="Raise"
+                    icon={<ArrowUp />}
+                    disabled={!canLift}
+                    active={canLift && otherDrive.lift > 0}
+                    onHold={(held) => {
+                      lift.current = held ? 1 : 0
+                      pushHold()
+                    }}
+                  />
+                  <HoldButton
+                    label="Lower"
+                    icon={<ArrowDown />}
+                    disabled={!canLift}
+                    active={canLift && otherDrive.lift < 0}
+                    onHold={(held) => {
+                      lift.current = held ? -1 : 0
+                      pushHold()
+                    }}
+                  />
+                </div>
+                {liftState?.raised != null && (
+                  <div
+                    className="h-2 overflow-hidden rounded-full bg-white/10"
+                    aria-label="Lift height"
+                  >
+                    <div
+                      className="h-full bg-[#eff483]/80"
+                      style={{ width: `${liftState.raised * 100}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {shownTab === "drive" && (
+              <div role="tabpanel" aria-label="Drive" className="flex flex-col gap-4">
+                <p className="text-xs text-white/50">
+                  Hold the pad to drive Jelly. It ramps up and down like it does in teleop.
+                </p>
+                <div className="flex flex-col items-center gap-4">
+                  <DrivePad
+                    disabled={!canDrive}
+                    speed={driveSpeed}
+                    shown={otherDrive.pad}
+                    onDrive={(command) => {
+                      pad.current = command
+                      pushHold()
+                    }}
+                  />
+                  <div className="flex w-full flex-col gap-3">
+                    <label className="flex flex-col gap-1 text-xs text-white/55">
+                      Speed limit
+                      <Slider
+                        aria-label="Speed limit"
+                        value={driveSpeed}
+                        min={0.1}
+                        max={1}
+                        step={0.05}
+                        onChange={setDriveSpeed}
+                        format={(v) => `${Math.round(v * 100)} %`}
+                      />
+                    </label>
+                    <div className="flex gap-2">
+                      <HoldButton
+                        label="Turn left"
+                        icon={<RotateCcw />}
+                        disabled={!canDrive}
+                        active={canDrive && otherDrive.turn > 0}
+                        onHold={(held) => {
+                          turn.current = held ? 1 : 0
+                          pushHold()
+                        }}
+                      />
+                      <HoldButton
+                        label="Turn right"
+                        icon={<RotateCw />}
+                        disabled={!canDrive}
+                        active={canDrive && otherDrive.turn < 0}
+                        onHold={(held) => {
+                          turn.current = held ? -1 : 0
+                          pushHold()
+                        }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </Card>
         </div>
       </div>
-
-      <div className="grid gap-6 md:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Lift</CardTitle>
-            <CardDescription>
-              {robotModel === "mobile"
-                ? "Hold a button to raise or lower the lift. It stops when you let go."
-                : "Only Axol on Jelly has a powered lift."}
-            </CardDescription>
-          </CardHeader>
-          <div className="flex gap-2">
-            <HoldButton
-              label="Raise"
-              icon={<ArrowUp />}
-              disabled={!canLift}
-              active={canLift && otherDrive.lift > 0}
-              onHold={(held) => {
-                lift.current = held ? 1 : 0
-                pushHold()
-              }}
-            />
-            <HoldButton
-              label="Lower"
-              icon={<ArrowDown />}
-              disabled={!canLift}
-              active={canLift && otherDrive.lift < 0}
-              onHold={(held) => {
-                lift.current = held ? -1 : 0
-                pushHold()
-              }}
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <Readout
-              label="Height"
-              value={
-                liftState?.raised != null
-                  ? `${(liftState.raised * 100).toFixed(1)} %`
-                  : running && liftState
-                    ? "Not homed"
-                    : "–"
-              }
-            />
-            <Readout
-              label="Speed"
-              value={liftState ? `${(liftState.velocity * 100).toFixed(2)} %/s` : "–"}
-            />
-          </div>
-          {liftState?.raised != null && (
-            <div className="h-2 overflow-hidden rounded-full bg-white/10" aria-label="Lift height">
-              <div
-                className="h-full bg-[#eff483]/80"
-                style={{ width: `${liftState.raised * 100}%` }}
-              />
-            </div>
-          )}
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Drive base</CardTitle>
-            <CardDescription>
-              {robotModel === "mobile"
-                ? "Hold the pad to drive. Jelly ramps up and down like it does in teleop."
-                : "Only Axol on Jelly has a powered base."}
-            </CardDescription>
-          </CardHeader>
-          <div className="flex flex-wrap items-start justify-center gap-4">
-            <DrivePad
-              disabled={!canDrive}
-              speed={driveSpeed}
-              shown={otherDrive.pad}
-              onDrive={(command) => {
-                pad.current = command
-                pushHold()
-              }}
-            />
-            <div className="flex min-w-64 flex-1 flex-col gap-3">
-              <label className="flex flex-col gap-1 text-xs text-white/55">
-                Speed limit
-                <Slider
-                  aria-label="Speed limit"
-                  value={driveSpeed}
-                  min={0.1}
-                  max={1}
-                  step={0.05}
-                  onChange={setDriveSpeed}
-                  format={(v) => `${Math.round(v * 100)} %`}
-                />
-              </label>
-              <div className="flex gap-2">
-                <HoldButton
-                  label="Turn left"
-                  icon={<RotateCcw />}
-                  disabled={!canDrive}
-                  active={canDrive && otherDrive.turn > 0}
-                  onHold={(held) => {
-                    turn.current = held ? 1 : 0
-                    pushHold()
-                  }}
-                />
-                <HoldButton
-                  label="Turn right"
-                  icon={<RotateCw />}
-                  disabled={!canDrive}
-                  active={canDrive && otherDrive.turn < 0}
-                  onHold={(held) => {
-                    turn.current = held ? -1 : 0
-                    pushHold()
-                  }}
-                />
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <Readout label="X" value={baseState ? `${baseState.x.toFixed(2)} m` : "–"} />
-                <Readout label="Y" value={baseState ? `${baseState.y.toFixed(2)} m` : "–"} />
-                <Readout
-                  label="Heading"
-                  value={baseState ? `${((baseState.yaw * 180) / Math.PI).toFixed(0)}°` : "–"}
-                />
-              </div>
-              <Readout
-                label="Speed"
-                value={
-                  baseState
-                    ? `${Math.hypot(baseState.velocity[0], baseState.velocity[1]).toFixed(2)} m/s, ${((baseState.velocity[2] * 180) / Math.PI).toFixed(0)}°/s`
-                    : "–"
-                }
-              />
-              {baseState?.estimated && (
-                <p className="text-[11px] text-white/40">
-                  Position is estimated from the wheel commands.
-                </p>
-              )}
-              {baseState?.fault && (
-                <p className="text-xs text-amber-300">
-                  <Zap className="mr-1 inline size-3.5" />A wheel is faulted. Check Jelly on the
-                  Devices page.
-                </p>
-              )}
-            </div>
-          </div>
-        </Card>
-
-        <Card className="md:col-span-2">
-          <CardHeader>
-            <CardTitle>Keyboard and controller</CardTitle>
-            <CardDescription role="status">
-              {gamepad
-                ? gamepadMode === "move"
-                  ? `Controller connected. Moving the ${arm} gripper.`
-                  : gamepadMode === "turn"
-                    ? `Controller connected. Turning the ${arm} gripper.`
-                    : "Controller connected."
-                : gamepad === ""
-                  ? "The browser can't read this controller's buttons. On a Logitech controller, move the switch on the back to the other letter (D on a Mac), then press a button."
-                  : "To use a game controller, plug it in and press any button on it."}
-            </CardDescription>
-          </CardHeader>
-          <div className="grid gap-4 text-xs text-white/60 sm:grid-cols-2">
-            <ControlList
-              title="Keyboard"
-              rows={[
-                [<KeyCombo key="k" keys={["W", "A", "S", "D"]} />, "Drive Jelly"],
-                [<KeyCombo key="k" keys={["Left", "Right"]} />, "Turn Jelly in place"],
-                [<KeyCombo key="k" keys={["Up", "Down"]} />, "Raise or lower the lift"],
-              ]}
-            />
-            <ControlList
-              title="Controller"
-              rows={[
-                ["Left stick", "Drive Jelly"],
-                ["Right stick", "Turn Jelly in place"],
-                ["D-pad up and down", "Raise or lower the lift"],
-                ["D-pad left and right", "Choose the left or right arm"],
-                ["Hold LT", "Move the gripper: left stick across, right stick up and down"],
-                ["Hold RT", "Turn the gripper: left stick tilts, right stick turns"],
-              ]}
-            />
-          </div>
-          <p className="text-[11px] text-white/40">
-            The gripper moves in the frame and at the speed set under{" "}
-            <strong className="text-white/70">Jog gripper</strong>. Everything stops when you let go
-            or leave this page.
-          </p>
-        </Card>
-      </div>
     </AppShell>
+  )
+}
+
+type ControlTab = "arm" | "jog" | "lift" | "drive"
+const CONTROL_TAB_KEY = "axolJogTab"
+
+function loadControlTab(): ControlTab {
+  try {
+    const saved = localStorage.getItem(CONTROL_TAB_KEY)
+    if (saved === "arm" || saved === "jog" || saved === "lift" || saved === "drive") return saved
+  } catch {
+    // Storage can be blocked; start on the first tab.
+  }
+  return "arm"
+}
+
+/** The keyboard and controller guide, opened from the controls' help button. */
+function ControlsHelp({ gamepad }: { gamepad: string | null }) {
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs text-white/60">
+      <ControlList
+        title="Keyboard"
+        rows={[
+          [<KeyCombo key="k" keys={["W", "A", "S", "D"]} />, "Drive Jelly"],
+          [<KeyCombo key="k" keys={["Left", "Right"]} />, "Turn Jelly in place"],
+          [<KeyCombo key="k" keys={["Up", "Down"]} />, "Raise or lower the lift"],
+        ]}
+      />
+      <ControlList
+        title="Controller"
+        rows={[
+          ["Left stick", "Drive Jelly"],
+          ["Right stick", "Turn Jelly in place"],
+          ["D-pad up and down", "Raise or lower the lift"],
+          ["D-pad left and right", "Choose the left or right arm"],
+          ["Hold LT", "Move the gripper: left stick across, right stick up and down"],
+          ["Hold RT", "Turn the gripper: left stick tilts, right stick turns"],
+        ]}
+      />
+      <p className="text-[11px] text-white/45">
+        {gamepad === ""
+          ? "The browser can't read this controller's buttons. On a Logitech controller, move the switch on the back to the other letter (D on a Mac), then press a button."
+          : gamepad === null
+            ? "To use a game controller, plug it in, click this page and press any button on it."
+            : "The gripper moves along the axes and at the speed set on the Jog gripper tab."}{" "}
+        Everything stops when you let go or leave this page.
+      </p>
+    </div>
   )
 }
 
