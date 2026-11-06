@@ -10,7 +10,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
+from almond_axol.constants import Joint
 from almond_axol.robot.start_pose import (
+    START_POSE_CHECKED_JOINTS,
     START_POSE_TOLERANCE_DEG,
     StartPoseError,
     check_start_pose,
@@ -44,19 +46,34 @@ class StartPoseCheckTest(unittest.TestCase):
             check_start_pose((_arm(0, 0, 0, 30), _arm()))
 
     def test_a_joint_just_inside_the_tolerance_passes(self) -> None:
-        check_start_pose((_arm(), _arm(0, -(START_POSE_TOLERANCE_DEG - 0.5))))
+        check_start_pose((_arm(), _arm(0, 0, -(START_POSE_TOLERANCE_DEG - 0.5))))
 
     def test_a_joint_past_the_tolerance_is_refused_by_name(self) -> None:
-        with self.assertRaisesRegex(StartPoseError, "right shoulder_2") as raised:
-            check_start_pose((_arm(), _arm(0, -(START_POSE_TOLERANCE_DEG + 1.0))))
+        with self.assertRaisesRegex(StartPoseError, "right shoulder_3") as raised:
+            check_start_pose((_arm(), _arm(0, 0, -(START_POSE_TOLERANCE_DEG + 1.0))))
         self.assertIn("-26.0°", str(raised.exception))
 
     def test_every_offending_joint_is_listed(self) -> None:
-        found = start_pose_deviations((_arm(60), _arm(0, 0, 0, 0, 0, 0, -60)))
+        found = start_pose_deviations((_arm(60, 0, 60), _arm(0, 0, 0, -60)))
         self.assertEqual(
             [(d.side, d.joint) for d in found],
-            [("left", "shoulder_1"), ("right", "wrist_3")],
+            [("left", "shoulder_1"), ("left", "shoulder_3"), ("right", "elbow")],
         )
+
+    def test_only_shoulder_1_shoulder_3_and_the_elbow_are_capped(self) -> None:
+        self.assertEqual(
+            START_POSE_CHECKED_JOINTS,
+            {Joint.SHOULDER_1, Joint.SHOULDER_3, Joint.ELBOW},
+        )
+        # shoulder_2 and every wrist joint far from zero still start.
+        far = _arm(0, 90, 0, 0, -120, 90, 170)
+        self.assertEqual(start_pose_deviations((far, far)), [])
+        check_start_pose((far, far))
+
+    def test_a_non_finite_unchecked_joint_is_ignored(self) -> None:
+        left = _arm()
+        left[4] = np.nan
+        check_start_pose((left, _arm()))
 
     def test_the_gripper_is_not_checked(self) -> None:
         check_start_pose((_arm(gripper=1.0), _arm(gripper=0.0)), tolerance_deg=0.1)

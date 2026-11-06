@@ -109,7 +109,7 @@ With `--repo_id`, each saved episode is added to a LeRobot-format dataset. Resum
 
 ## Starting and stopping
 
-**Starting needs the arms near zero.** Run-policy refuses to start while any arm joint is more than 25° from zero, the arms' natural resting pose. It names each joint that is out. Move them back by hand, for example under [`axol gravity-comp`](/cli/gravity-comp), and start again. The first move then goes through zero on its way to the rest pose. See [Starting needs the arms near zero](/operations/teleop).
+**Starting needs the arms near zero.** Run-policy refuses to start while `shoulder_1`, `shoulder_3` or `elbow` is more than 25° from zero, the arms' natural resting pose. It names each joint that is out. Move them back by hand, for example under [`axol gravity-comp`](/cli/gravity-comp), and start again. The first move then goes through zero on its way to the rest pose. See [Starting needs the arms near zero](/operations/teleop).
 
 **Stopping parks the arms.** When you end a run with `Ctrl+C`, `q` or **Stop** in the control panel:
 

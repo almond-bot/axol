@@ -151,7 +151,7 @@ In box mode, the squeeze does rumble. As you close the grip width onto a box, th
 
 ### Starting
 
-Teleoperation, data collection, DAgger, run policy and replay refuse to start while any arm joint is more than 25° from zero. Zero is the pose the arms settle into when the motors are off. The error names each joint that is out of range. Move the arms back by hand, for example under `axol gravity-comp`, then start again.
+Teleoperation, data collection, DAgger, run policy and replay refuse to start while `shoulder_1`, `shoulder_3` or `elbow` on either arm is more than 25° from zero (the pose the arms settle into when the motors are off). `shoulder_2` and the wrist joints can start anywhere. The error names each joint that is out of range. Move the arms back by hand, for example under `axol gravity-comp`, then start again.
 
 Once the check passes, the arms move to zero and then out to the rest pose. `collect-dagger --start_from_current_pose` skips this check unless `--home_on_start` is also set.
 
