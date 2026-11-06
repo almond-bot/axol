@@ -2189,7 +2189,8 @@ export default function ControlPanel() {
         <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
           <p>
             The robot is locked because the last operation could not confirm that the motors are
-            off. Cut motor power with the E-Stop, then press Re-check motors.
+            off. Press the E-Stop, then release it. The robot unlocks on its own once the motors
+            read off.
           </p>
           <Button
             variant="outline"

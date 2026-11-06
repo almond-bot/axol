@@ -74,6 +74,9 @@ _logger = logging.getLogger(__name__)
 # Grace between acknowledging a host shutdown/restart and running it, so the
 # response reaches the panel before the server goes down with the host.
 _HOST_POWER_DELAY_S = 0.5
+# Least time (s) between automatic re-checks of a hardware-cleanup lockout,
+# run while the control panel polls /api/op/status.
+_LOCKOUT_RECHECK_S = 3.0
 
 
 class RunRequest(BaseModel):
@@ -3228,8 +3231,56 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- in-process operations (teleop / gravity / collect / policy) --------
 
+    # The hardware-cleanup lockout clears itself once the motors can be
+    # proven torque-free (the same probe as Re-check motors), checked at most
+    # every _LOCKOUT_RECHECK_S while the control panel polls the status: the
+    # operator only has to restore power after the E-Stop.
+    lockout_recheck = {"t": 0.0, "task": None}
+
+    async def _clear_lockout() -> str | None:
+        """Lift the lockout if the motors read torque-free: the refusal, else None.
+
+        The caller holds ``session_launch_reservation``.
+        """
+        if not runner.hardware_cleanup_lockout():
+            return "no hardware cleanup lockout is active"
+        if runner.is_running(ignore_cleanup_lockout=True):
+            return "An operation is still running. Stop it first."
+        refusal = await asyncio.to_thread(
+            prove_motors_torque_free, robot, runner.lockout_power_lost()
+        )
+        if refusal is not None:
+            return f"{refusal}; the lockout stands"
+        runner.clear_hardware_cleanup_lockout()
+        # The failed run borrowed the Jelly buses too and the lockout kept
+        # them ``busy``; with it lifted, hand them back to the idle links.
+        # A device that fails to reopen shows as ``error`` on its tile,
+        # where Connect can retry — the lockout itself is already proven.
+        try:
+            await asyncio.to_thread(jelly.reacquire)
+        except Exception as exc:  # noqa: BLE001 - devices left in error state
+            _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
+        return None
+
+    async def _auto_recheck_lockout() -> None:
+        if session_launch_reservation.locked():
+            return
+        async with session_launch_reservation:
+            if runner.hardware_cleanup_lockout() and await _clear_lockout() is None:
+                _logger.info("Motors read torque-free; the safety lockout is lifted")
+
     @app.get("/api/op/status")
     async def op_status() -> dict[str, Any]:
+        task = lockout_recheck["task"]
+        if (
+            runner.hardware_cleanup_lockout()
+            and (task is None or task.done())
+            and time.monotonic() - lockout_recheck["t"] >= _LOCKOUT_RECHECK_S
+        ):
+            lockout_recheck["t"] = time.monotonic()
+            lockout_recheck["task"] = asyncio.create_task(
+                _auto_recheck_lockout(), name="lockout-recheck"
+            )
         session = runner.current()
         return {
             "running": runner.is_running(),
@@ -3255,30 +3306,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         back (``busy``) exactly as it was before the probe.
         """
         async with session_launch_reservation:
-            if not runner.hardware_cleanup_lockout():
-                return JSONResponse(
-                    {"error": "no hardware cleanup lockout is active"},
-                    status_code=409,
-                )
-            if runner.is_running(ignore_cleanup_lockout=True):
-                return JSONResponse(
-                    {"error": "An operation is still running. Stop it first."},
-                    status_code=409,
-                )
-            refusal = await asyncio.to_thread(prove_motors_torque_free, robot)
+            refusal = await _clear_lockout()
             if refusal is not None:
-                return JSONResponse(
-                    {"error": f"{refusal}; the lockout stands"}, status_code=409
-                )
-            runner.clear_hardware_cleanup_lockout()
-            # The failed run borrowed the Jelly buses too and the lockout kept
-            # them ``busy``; with it lifted, hand them back to the idle links.
-            # A device that fails to reopen shows as ``error`` on its tile,
-            # where Connect can retry — the lockout itself is already proven.
-            try:
-                await asyncio.to_thread(jelly.reacquire)
-            except Exception as exc:  # noqa: BLE001 - devices left in error state
-                _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
+                return JSONResponse({"error": refusal}, status_code=409)
             return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")

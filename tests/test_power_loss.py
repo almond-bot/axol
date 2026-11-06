@@ -36,7 +36,11 @@ from almond_axol.serve.robot_link import (
     RobotLink,
     motor_faults,
 )
-from almond_axol.serve.runner import STALL_STOP_ERROR, OperationRunner
+from almond_axol.serve.runner import (
+    STALL_STOP_ERROR,
+    OperationRunner,
+    prove_motors_torque_free,
+)
 
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
@@ -679,6 +683,81 @@ class LockoutExemptionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.hardware_cleanup_lockout())
         self.assertEqual(robot.releases, 1)
         self.assertEqual(robot.state, STATE_BUSY)
+
+
+def _typed(
+    joint: str,
+    kind: str,
+    *,
+    arm: str = "left",
+    reachable: bool | None,
+    status: str | None,
+) -> dict[str, Any]:
+    return {
+        **_motor(joint, reachable=reachable, status=status),
+        "type": kind,
+        "arm": arm,
+    }
+
+
+class PowerCycledArmTest(unittest.TestCase):
+    """After an E-Stop, an arm powered again proves itself torque-free.
+
+    MyActuator motors never read DISABLED, so before this a re-check passed
+    only with the E-Stop held in. An arm whose bus lost power during the run
+    and whose Damiao motors now read DISABLED was power-cycled: its
+    MyActuator motors reading OK are torque-free too.
+    """
+
+    def _arm(self, damiao_status: str) -> list[dict[str, Any]]:
+        return [
+            _typed("SHOULDER_1", "myactuator", reachable=True, status="OK"),
+            _typed("ELBOW", "myactuator", reachable=True, status="OK"),
+            _typed("WRIST_2", "damiao", reachable=True, status=damiao_status),
+            _typed("GRIPPER", "damiao", reachable=True, status=damiao_status),
+        ]
+
+    def test_a_power_cycled_arm_passes(self) -> None:
+        robot = _LockedOutLink(self._arm("DISABLED"))
+        self.assertIsNone(prove_motors_torque_free(robot, {"can-left"}))
+
+    def test_without_a_power_loss_it_still_refuses(self) -> None:
+        robot = _LockedOutLink(self._arm("DISABLED"))
+        refusal = prove_motors_torque_free(robot, set())
+        self.assertIn("left shoulder_1", refusal or "")
+        # A channel that isn't an arm's (Jelly's) is no power loss either.
+        refusal = prove_motors_torque_free(
+            _LockedOutLink(self._arm("DISABLED")), {"can-base"}
+        )
+        self.assertIn("left shoulder_1", refusal or "")
+
+    def test_one_dead_arm_bus_counts_for_both_arms(self) -> None:
+        # The first dead bus stops the run before the other is seen dead;
+        # the arms share the supply the E-Stop cuts.
+        robot = _LockedOutLink(self._arm("DISABLED"))
+        self.assertIsNone(prove_motors_torque_free(robot, {"can-right"}))
+
+    def test_a_dead_bus_with_the_power_on_refuses(self) -> None:
+        # A pulled cable also stalls the bus, but the Damiao motors stay
+        # enabled (OK): nothing shows the power went away.
+        robot = _LockedOutLink(self._arm("OK"))
+        refusal = prove_motors_torque_free(robot, {"can-left"})
+        self.assertIn("left shoulder_1", refusal or "")
+        self.assertIn("left wrist_2", refusal or "")
+
+    def test_silent_damiao_motors_prove_nothing(self) -> None:
+        motors = self._arm("DISABLED")
+        for m in motors[2:]:
+            m["reachable"], m["status"] = False, None
+        refusal = prove_motors_torque_free(_LockedOutLink(motors), {"can-left"})
+        self.assertIn("left shoulder_1", refusal or "")
+
+    def test_a_myactuator_fault_still_refuses(self) -> None:
+        motors = self._arm("DISABLED")
+        motors[0]["status"] = "OVER_TEMPERATURE"
+        refusal = prove_motors_torque_free(_LockedOutLink(motors), {"can-left"})
+        self.assertIn("left shoulder_1", refusal or "")
+        self.assertNotIn("elbow", refusal or "")
 
 
 class BusStallWatchdogTest(unittest.TestCase):

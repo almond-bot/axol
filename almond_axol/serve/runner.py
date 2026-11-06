@@ -40,6 +40,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Collection
 from typing import Any
 
 from .. import progress
@@ -221,7 +222,9 @@ def _forward_line(sink: Any, line: str) -> None:
         pass
 
 
-def prove_motors_torque_free(robot: Any) -> str | None:
+def prove_motors_torque_free(
+    robot: Any, power_lost: Collection[str] = ()
+) -> str | None:
     """Prove every motor is torque-free, or say why that could not be shown.
 
     Used when an operation could not confirm it disabled the motors. Rather
@@ -231,6 +234,21 @@ def prove_motors_torque_free(robot: Any) -> str | None:
     is unpowered). A motor that answers and is not disabled is holding torque
     nobody supervises; a motor with no reading (``reachable is None``) proves
     nothing. Both refuse.
+
+    A MyActuator motor never reads ``DISABLED`` (its status is only OK or an
+    error), so once powered again it could only pass by being unpowered at
+    the moment of the check: the operator had to hold the E-Stop in while
+    pressing Re-check. ``power_lost`` names the arm CAN channels that went
+    dead during the operation (no motor answering: the E-Stop cut motor
+    power). The two arms share the power supply the E-Stop cuts, and the
+    first dead bus stops the run before the other is seen dead, so one is
+    enough for both. An arm whose Damiao motors now read ``DISABLED`` (or
+    don't answer, at least one ``DISABLED``) was then power-cycled: the
+    operation had them enabled, its disable never got through, and the
+    lockout keeps anything else from enabling or disabling them. A motor
+    powers up torque-free, so that arm's MyActuator motors reading OK are
+    accepted too. A dead bus with the power still on (a cable pulled)
+    leaves its Damiao motors enabled, so that arm doesn't pass.
 
     Returns ``None`` on proof, otherwise the refusal reason. The probe only
     borrows the buses: the failed operation may still hold them, so on
@@ -257,6 +275,17 @@ def prove_motors_torque_free(robot: Any) -> str | None:
         for m in status["motors"]
         if m["reachable"] is not False and m["status"] != "DISABLED"
     ]
+    cycled = _power_cycled_arms(robot, status["motors"], power_lost)
+    live = [
+        m
+        for m in live
+        if not (
+            m["arm"] in cycled
+            and m.get("type") == "myactuator"
+            and m["reachable"] is True
+            and m["status"] == "OK"
+        )
+    ]
     if live:
         return refuse(
             "these motors still answer and are not disabled: "
@@ -267,6 +296,38 @@ def prove_motors_torque_free(robot: Any) -> str | None:
             )
         )
     return None
+
+
+def _power_cycled_arms(
+    robot: Any, motors: list[dict[str, Any]], power_lost: Collection[str]
+) -> set[str]:
+    """Arms shown power-cycled since the operation (see prove_motors_torque_free).
+
+    Only after a power loss on either arm's CAN channel (``power_lost``): an
+    arm counts when every Damiao motor on it reads ``DISABLED`` or doesn't
+    answer, at least one of them ``DISABLED`` (all silent proves nothing
+    about the rest of the arm).
+    """
+    try:
+        left, right = robot.channels()
+    except Exception:  # noqa: BLE001 - no channel map, no power-cycle proof
+        return set()
+    if not set(power_lost) & {left, right} - {None}:
+        return set()
+    cycled: set[str] = set()
+    for side, channel in (("left", left), ("right", right)):
+        if channel is None:
+            continue
+        damiao = [m for m in motors if m["arm"] == side and m.get("type") == "damiao"]
+        if (
+            damiao
+            and any(m["status"] == "DISABLED" for m in damiao)
+            and all(
+                m["status"] == "DISABLED" or m["reachable"] is False for m in damiao
+            )
+        ):
+            cycled.add(side)
+    return cycled
 
 
 class _StreamTee:
@@ -627,6 +688,11 @@ class OperationRunner:
         # the operator cuts motor power, typically), or the serve process
         # restarts.
         self._hardware_cleanup_uncertain = False
+        # CAN channels that went dead (motor power lost) during the current
+        # or last operation, and those that the lockout was set with: the
+        # probe accepts a power-cycled arm on them (prove_motors_torque_free).
+        self._run_power_lost: frozenset[str] = frozenset()
+        self._lockout_power_lost: frozenset[str] = frozenset()
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -681,6 +747,11 @@ class OperationRunner:
         """
         with self._lock:
             self._hardware_cleanup_uncertain = False
+            self._lockout_power_lost = frozenset()
+
+    def lockout_power_lost(self) -> frozenset[str]:
+        """The CAN channels that lost motor power in the run that locked out."""
+        return self._lockout_power_lost
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -994,6 +1065,7 @@ class OperationRunner:
         # (an abandoned worker that never closed its bus), and stopping this
         # operation would not fix it.
         inherited = stalled_channels()
+        self._run_power_lost = frozenset()
         stalled_since: float | None = None
         while not stop_event.wait(_STALL_POLL_S):
             if self._session is not session or session.status not in (
@@ -1019,6 +1091,7 @@ class OperationRunner:
                 _logger.warning(
                     "motor power lost during %s; stopping", session.command_id
                 )
+                self._run_power_lost = frozenset(current - inherited)
                 self.stop()
                 self._mark_terminal(session, "error", error=STALL_STOP_ERROR)
                 return
@@ -1884,7 +1957,9 @@ class OperationRunner:
                 session.emit(
                     "[serve] hardware cleanup could not be verified; probing the motors"
                 )
-                refusal = prove_motors_torque_free(self._robot_link)
+                refusal = prove_motors_torque_free(
+                    self._robot_link, self._run_power_lost
+                )
             if refusal is None:
                 cleanup_uncertain = False
                 session.emit(
@@ -1893,6 +1968,7 @@ class OperationRunner:
             else:
                 with self._lock:
                     self._hardware_cleanup_uncertain = True
+                    self._lockout_power_lost = self._run_power_lost
                 message = (
                     f"{refusal}; robot ownership remains reserved. Cut motor "
                     "power, then use Re-check motors in the control panel "
