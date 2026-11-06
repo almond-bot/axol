@@ -150,6 +150,13 @@ export function padCommand(dx: number, dy: number, radius: number, speed = 1, de
   return [forward * scale, left * scale, 0]
 }
 
+/** Whether the Host Computer reports a robot to jog: its arms connected, or
+ * any motor answering. The Jog page then starts on the robot rather than in
+ * sim. */
+export function robotConnected(status: { connected: boolean; reachableCount?: number }): boolean {
+  return status.connected || (status.reachableCount ?? 0) > 0
+}
+
 /** What the keyboard or a game controller asks the base and lift for: a pad
  * command (forward, left), a turn (-1 right to 1 left) and a lift direction. */
 export interface OtherDrive {

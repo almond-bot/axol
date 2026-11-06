@@ -36,6 +36,7 @@ import {
   NO_TWIST,
   padCommand,
   planJogMove,
+  robotConnected,
   useJogLink,
   withArmJog,
   type JogArm,
@@ -52,6 +53,7 @@ import {
 import { nudgePose, rpyDegrees } from "@/lib/jog-pose"
 import {
   fetchOpStatus,
+  fetchRobotStatus,
   fetchSettings,
   parseAxolModel,
   parseGripper,
@@ -380,6 +382,9 @@ function RobotStatus({
 export default function Jogging() {
   const [simPick] = useState(storedSimRobot)
   const [mode, setMode] = useState<Mode>("sim")
+  // Whether the operator picked Sim or Robot: the robot's status then no
+  // longer moves the default.
+  const modeChosen = useRef(false)
   const [simModel, setSimModel] = useState<AxolModel>(simPick?.model ?? "mobile")
   const [simGripper] = useState<GripperType>(simPick?.gripper ?? "parallel")
   const [host, setHost] = useState<{ model: AxolModel; gripper: GripperType } | null>(null)
@@ -482,6 +487,16 @@ export default function Jogging() {
       .catch(() =>
         setHostError("Can't reach the Host Computer. Connect to it on the Devices page.")
       )
+    // Start on the robot when one is connected, like the other operations.
+    let active = true
+    fetchRobotStatus()
+      .then((status) => {
+        if (active && !modeChosen.current && robotConnected(status)) setMode("hardware")
+      })
+      .catch(() => undefined)
+    return () => {
+      active = false
+    }
   }, [])
 
   useEffect(() => rememberOperation("jog"), [])
@@ -783,7 +798,10 @@ export default function Jogging() {
                 role="radio"
                 aria-checked={viewMode === value}
                 disabled={running}
-                onClick={() => setMode(value)}
+                onClick={() => {
+                  modeChosen.current = true
+                  setMode(value)
+                }}
                 className={cn(
                   "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed",
                   viewMode === value
