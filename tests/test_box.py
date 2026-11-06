@@ -725,13 +725,17 @@ class SticksDriveJellyTest(unittest.TestCase):
         self.assertTrue(core.teleop_enabled)  # the right hand leads
         frame = _stick_frame(l_stick_y=-1.0, r_stick_x=0.5)
         teleop._on_vr_frame(frame)
-        teleop._jelly.apply_vr_frame.assert_called_with(frame, resetting=False)
+        teleop._jelly.apply_vr_frame.assert_called_with(
+            frame, resetting=False, box_mode=True
+        )
         # Frozen: the same.
         core.update_engage(_stick_frame(l_lock=False, r_lock=False))
         core.update_engage(_stick_frame(l_lock=False, r_lock=True))
         self.assertFalse(core.teleop_enabled)
         teleop._on_vr_frame(frame)
-        teleop._jelly.apply_vr_frame.assert_called_with(frame, resetting=False)
+        teleop._jelly.apply_vr_frame.assert_called_with(
+            frame, resetting=False, box_mode=True
+        )
 
 
 class StickTapTest(unittest.TestCase):

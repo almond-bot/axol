@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import multiprocessing.connection
 import threading
 import time
@@ -116,8 +117,8 @@ def measured_arms(robot: object) -> MeasuredArms | None:
 
 
 # Rate of the joint-state push (``{"type": "joints"}``) that drives the
-# headset HUD's box-mode readout (pair status). A ~200 B JSON message;
-# negligible next to the pose stream.
+# headset's live robot model and the HUD's box-mode readout (pair status). A
+# ~400 B JSON message; negligible next to the pose stream.
 JOINT_BROADCAST_HZ = 20.0
 
 # Haptics push (``{"type": "haptics"}``, see VRTeleopCore.maybe_broadcast_haptics):
@@ -1137,7 +1138,9 @@ class VRTeleopCore:
         the other stick up throughout — switches the grasp
         (``box_grasp``: straight / flush) while a grip leads the pair, and
         never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
-        lift as outside box mode, from then until the release. Until a press
+        lift (right raises, left lowers), from then until the release. Box
+        mode's lift is on the clicks because the right stick's forward/back,
+        the lift outside box mode, is the grip width here. Until a press
         has lasted that long its click is cleared from the frame Jelly gets
         (a copy). The right stick is also locked to the axis pushed
         further (:func:`~almond_axol.teleop.box.right_stick_axis`), so
@@ -2787,15 +2790,21 @@ class VRTeleopCore:
             out_of_reach=previous.out_of_reach if previous is not None else (),
         )
 
-    def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
+    def maybe_broadcast_joints(
+        self, out: np.ndarray, robot: object, lift: float | None = None
+    ) -> None:
         """Push the joint state and pair status to the headset, throttled.
 
         Throttled to :data:`JOINT_BROADCAST_HZ`; call from the control loop
         with the 16-DOF command ``out`` (see :meth:`compute_output`). Measured
         positions are preferred when ``robot`` exposes them (``AxolArm``
-        ``positions``), falling back to the command in sim. Both teleop
-        adapters (``axol teleop`` and collect-data) send it, so the HUD's box
-        readout works in each.
+        ``positions``), falling back to the command in sim. ``lift`` is
+        Jelly's lift height as a fraction of its travel (1 = fully raised,
+        :attr:`~almond_axol.robot.jelly.Jelly.lift_raised`), ``None`` without
+        one. The message also names this Axol's URDF (under the VR server's
+        ``/urdf`` mount), so the headset can draw the robot as it stands.
+        Both teleop adapters (``axol teleop`` and collect-data) send it, so
+        the headset's robot model and box readout work in each.
         """
         if self._broadcast_json is None:
             return
@@ -2836,6 +2845,12 @@ class VRTeleopCore:
                     "l_grip": round(float(left[7]), 3),
                     "r_grip": round(float(right[7]), 3),
                     "engaged": self.teleop_enabled,
+                    "urdf": self._urdf_file,
+                    "lift": (
+                        round(float(lift), 4)
+                        if lift is not None and math.isfinite(lift)
+                        else None
+                    ),
                     # Gripper-pair geometry from the IK worker: the headset
                     # shows "aligned" when the pair already sits in the
                     # box-mode grasp, i.e. a good moment to switch modes.
