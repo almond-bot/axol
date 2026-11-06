@@ -190,6 +190,21 @@ _STOW_HOLD_MAX_S = 3.0
 
 
 @dataclass
+class _DeckPlane:
+    """An arm's hold on the height of Jelly's deck's top (see
+    :meth:`IKWorker._hold_lift_plane`)."""
+
+    # The solved gripper height (m, world) while it was on the top.
+    z: float
+    # The target's height then, after any raise.
+    hand_z: float
+    # How far the target has been raised since (m).
+    raised: float = 0.0
+    # When the arm last touched the deck.
+    t: float = 0.0
+
+
+@dataclass
 class _Stow:
     """One box-mode stow in progress (see :meth:`IKWorker._start_stow`)."""
 
@@ -264,6 +279,19 @@ _LIFT_CLEAR_SPEED = 0.2
 # for it to count. The lower column's sides push sideways and don't.
 _LIFT_PLANE_MIN_M = 0.002
 _LIFT_PLANE_MIN_UP = 0.2
+# An arm held on the deck's top (a contact pushing at least _LIFT_PLANE_TOP_UP
+# up) remembers that height. Off the top (round the edge and past it) the
+# deck no longer holds it up, and the solve's pull toward its posture would
+# let it sag below its target (a dip of up to ~1.5 cm in sim). Its target
+# is raised by _LIFT_PLANE_GAIN of the sag each solve until it is back at
+# the remembered height (and, once clear, lowered again by as much of that
+# raise as left it above it). The hold lets go once the hand moves up or down
+# _LIFT_PLANE_RELEASE_M from where it was when the arm left the top, or
+# _LIFT_PLANE_HOLD_S after the arm last touched the deck.
+_LIFT_PLANE_TOP_UP = 0.98
+_LIFT_PLANE_GAIN = 0.2
+_LIFT_PLANE_RELEASE_M = 0.01
+_LIFT_PLANE_HOLD_S = 1.0
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -548,6 +576,9 @@ class IKWorker:
         # Lift clearance (see clear_lift): time of the previous step, and the
         # lift-safe rest goal with the lift height it was computed for.
         self._lift_clear_t: float | None = None
+        # Per engaged arm held on Jelly's deck's top: the height it is held
+        # at (see _hold_lift_plane).
+        self._deck_plane: dict[str, _DeckPlane] = {}
         self._rest_goal: tuple[float, np.ndarray] | None = None
         # Box mode (bimanual carry, see .box): the pair's state from the engage
         # snap and which controller leads it. None while not in box tracking.
@@ -1462,12 +1493,12 @@ class IKWorker:
         hold pose follows it.
         """
         contact = self._solver.lift_contact(q_new)
-        if not contact:
-            return q_new
         engaged = {side: targets[side] for side in targets if self._active[side]}
         for side, shift in self._hold_lift_plane(q_new, engaged, contact).items():
             pos, rot = self._snap_fk[side]
             self._snap_fk[side] = (pos + shift, rot)
+        if not contact:
+            return q_new
         frozen = tuple(
             side
             for side in ("left", "right")
@@ -1485,32 +1516,90 @@ class IKWorker:
         q_new: np.ndarray,
         targets: dict[str, Pose],
         contact: dict[str, tuple[float, np.ndarray]],
+        shared: bool = False,
     ) -> dict[str, np.ndarray]:
         """How far to raise each engaged arm's target held up by Jelly's deck.
 
         While the collision cost holds an arm up off the deck, its target
         sits under the arm, inside the deck. Left there, it drops the arm to
-        it the moment the arm clears the deck's edge. This returns, per side
-        in ``contact`` whose contact pushes the arm up, the shift (world
-        frame, straight up) that raises the target to the height of the
-        solved gripper (FK of ``q_new``), so the arm leaves the edge at the
-        height it was held at. Pressing further down is given up the same
-        way; raising the hand raises the arm at once. Horizontal motion is
-        left alone, so pushing into the deck's edge still slides the arm up
-        over it. Shifts under ``_LIFT_PLANE_MIN_M`` are left out.
+        it the moment the arm clears the deck's edge. So per side in
+        ``targets`` whose contact pushes the arm up, the target is raised to
+        the height of the solved gripper (FK of ``q_new``). Pressing further
+        down is given up the same way; raising the hand raises the arm at
+        once. Horizontal motion is left alone, so pushing into the deck's
+        edge still slides the arm up over it.
+
+        That alone still lets the arm sag as it leaves the top: the deck held
+        it up against the solve's pull toward its posture, and the target
+        sits only where the arm was. So an arm on the top remembers its
+        height (``_deck_plane``), and round the edge and past it its target
+        is raised by ``_LIFT_PLANE_GAIN`` of any sag below that height each
+        solve (clear of the deck, lowered the same way while above it, by no
+        more than it was raised), until the hand moves up or down ``_LIFT_PLANE_RELEASE_M`` or
+        ``_LIFT_PLANE_HOLD_S`` after the arm last touched the deck.
+
+        Returns the shifts (world frame, vertical); those under
+        ``_LIFT_PLANE_MIN_M`` (raise to the solved height) are left out.
+        ``shared``: both targets move by the largest shift (box mode, which
+        raises the box centre), so each hold counts that one.
         """
-        if not contact:
+        planes = self._deck_plane
+        for side in [side for side in planes if side not in targets]:
+            del planes[side]
+        if not contact and not planes:
             return {}
+        now = time.perf_counter()
         left, right = self._solver.fk(q_new)
         solved = {"left": left, "right": right}
-        shifts: dict[str, np.ndarray] = {}
-        for side, (_depth, normal) in contact.items():
-            if side not in targets or float(normal[2]) < _LIFT_PLANE_MIN_UP:
-                continue
-            below = float(solved[side][0][2]) - float(targets[side][0][2])
-            if below > _LIFT_PLANE_MIN_M:
-                shifts[side] = np.array((0.0, 0.0, below), dtype=np.float32)
-        return shifts
+        raises: dict[str, float] = {}
+        on_top: dict[str, float] = {}
+        for side, target in targets.items():
+            z = float(solved[side][0][2])
+            z_target = float(target[0][2])
+            up = float(contact[side][1][2]) if side in contact else None
+            raise_by = 0.0
+            if up is not None and up >= _LIFT_PLANE_MIN_UP:
+                below = z - z_target
+                if below > _LIFT_PLANE_MIN_M:
+                    raise_by = below
+            plane = planes.get(side)
+            if up is not None and up >= _LIFT_PLANE_TOP_UP:
+                planes[side] = _DeckPlane(z=z, hand_z=z_target, t=now)
+                on_top[side] = z_target
+            elif plane is not None:
+                if up is not None:
+                    plane.t = now
+                hand = z_target - plane.raised - plane.hand_z
+                if (
+                    abs(hand) > _LIFT_PLANE_RELEASE_M
+                    or now - plane.t > _LIFT_PLANE_HOLD_S
+                ):
+                    del planes[side]
+                else:
+                    sag = plane.z - z
+                    if sag > _LIFT_PLANE_MIN_M:
+                        raise_by = max(raise_by, _LIFT_PLANE_GAIN * sag)
+                    elif up is None and sag < -_LIFT_PLANE_MIN_M:
+                        # Clear of the deck and above its height: give back
+                        # what the edge made the hold overshoot, no more.
+                        raise_by = max(_LIFT_PLANE_GAIN * sag, -plane.raised)
+            if raise_by != 0.0:
+                raises[side] = raise_by
+        if shared and raises:
+            top = max(raises.values())
+            raises = dict.fromkeys(raises, top)
+            applied = dict.fromkeys(targets, top)
+        else:
+            applied = raises
+        for side, plane in planes.items():
+            if side in on_top:
+                plane.hand_z = on_top[side] + applied.get(side, 0.0)
+            else:
+                plane.raised += applied.get(side, 0.0)
+        return {
+            side: np.array((0.0, 0.0, v), dtype=np.float32)
+            for side, v in raises.items()
+        }
 
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
@@ -1952,6 +2041,7 @@ class IKWorker:
         self._clear_freeze()
         self._box = None
         self._held_tool = None
+        self._deck_plane = {}
         self._box_leader = None
         self._box_snap = None
         self._box_rot = None
@@ -2056,6 +2146,7 @@ class IKWorker:
                 held_tool=self._held_tool,
             )
             self._held_tool = None
+            self._deck_plane = {}
             self._box_leader = leader
             self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
             self._stow = None
@@ -2150,7 +2241,7 @@ class IKWorker:
             # at (see _hold_lift_plane): the box centre rises with the arm
             # held furthest above its target, so the pair stays a pair.
             shifts = self._hold_lift_plane(
-                q_new, targets, self._solver.lift_contact(q_new)
+                q_new, targets, self._solver.lift_contact(q_new), shared=True
             )
             if shifts:
                 shift = max(shifts.values(), key=lambda v: float(np.linalg.norm(v)))
@@ -3179,6 +3270,7 @@ class IKWorker:
         """
         self._snap_ctrl[side] = (ctrl_pos, ctrl_rot)
         self._snap_fk[side] = ee_pose
+        getattr(self, "_deck_plane", {}).pop(side, None)
         self._snap_elbow_ctrl[side] = ctrl_e
         if elbow_pos is not None:
             self._snap_elbow_fk[side] = elbow_pos
