@@ -38,7 +38,9 @@ import {
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
+  isRobotFreeRun,
   isSimRun,
+  robotReadiness,
   jellyConnect,
   jellyDisconnect,
   loadLocalHardwareProfile,
@@ -2202,6 +2204,23 @@ export default function ControlPanel() {
     mantis: hardwareProfile === "mantis",
   }).map((entry) => {
     const hostMeta = operations.find((o) => o.id === entry.id) ?? null
+    // The same robot check as the operation's checklist, for its next run:
+    // a sim or arms-off run doesn't need Axol.
+    const opMantis = Boolean(hostMeta?.supportsMantis) && hardwareProfile === "mantis"
+    const robotProblem = hostMeta
+      ? robotReadiness({
+          requiresRobot: hostMeta.requiresRobot,
+          robotFree:
+            opMantis ||
+            isRobotFreeRun(
+              hostMeta,
+              settingsByOp[entry.id] ?? loadOpSettings(entry.id),
+              settingsSnap?.values ?? null
+            ),
+          mantis: opMantis,
+          robot,
+        }).short
+      : null
     return {
       entry,
       status: operationStatus({
@@ -2213,6 +2232,7 @@ export default function ControlPanel() {
         otherRunning: isLive && runningOp !== entry.id,
         needsMount,
         hasCameras: selectedHasCamera,
+        robotProblem,
       }),
     }
   })

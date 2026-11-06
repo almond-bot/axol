@@ -194,6 +194,7 @@ export function operationStatus({
   otherRunning,
   needsMount,
   hasCameras,
+  robotProblem = null,
 }: {
   entry: CatalogEntry
   /** The host's description of this operation, or null if it has none. */
@@ -205,6 +206,9 @@ export function operationStatus({
   otherRunning: boolean
   needsMount: boolean
   hasCameras: boolean
+  /** What keeps its next run from using the robot, in a few words
+   *  (robotReadiness's `short`), or null. */
+  robotProblem?: string | null
 }): OperationStatus {
   if (running) return { tone: "running", label: "Running" }
   if (!connected) return { tone: "off", label: "Connect to start" }
@@ -212,6 +216,7 @@ export function operationStatus({
   if (!available) return { tone: "off", label: "Not available" }
   if (otherRunning) return { tone: "off", label: "Another operation is running" }
   if (needsMount && hostMeta.requiresRobot) return { tone: "attention", label: "Choose a mount" }
+  if (robotProblem) return { tone: "attention", label: robotProblem }
   if (hostMeta.requiresCameras && !hasCameras) {
     return { tone: "attention", label: "Assign cameras" }
   }
