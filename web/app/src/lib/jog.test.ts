@@ -16,7 +16,6 @@ import {
   padCommand,
   planJogMove,
   PreviewQueue,
-  robotConnected,
   STICK_DEADZONE,
   withArmJog,
   type JogPose,
@@ -147,15 +146,6 @@ describe("gamepadControls", () => {
     expect(gamepadControls([]).drive).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
     const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], triggers(1, 0))
     expect(broken.twist).toEqual([...NO_TWIST])
-  })
-})
-
-describe("robotConnected", () => {
-  it("is true when the arms are connected or any motor answers", () => {
-    expect(robotConnected({ connected: true, reachableCount: 0 })).toBe(true)
-    expect(robotConnected({ connected: false, reachableCount: 3 })).toBe(true)
-    expect(robotConnected({ connected: false, reachableCount: 0 })).toBe(false)
-    expect(robotConnected({ connected: false })).toBe(false)
   })
 })
 

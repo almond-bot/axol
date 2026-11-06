@@ -1,5 +1,10 @@
+/**
+ * Jog's workspace: the 3D view, the telemetry and the controls. The control
+ * panel's operation screen wraps it in the same header, checklist and run
+ * details as every other operation, and starts and stops the run.
+ */
+
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from "react"
-import { Link } from "react-router-dom"
 import {
   ArrowDown,
   ArrowUp,
@@ -17,20 +22,13 @@ import {
   Target,
   Zap,
 } from "lucide-react"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardHeader, CardTitle } from "@/components/ui/card"
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
-import { AppShell } from "@/components/app-shell"
 import { CameraFeeds } from "@/components/camera-feeds"
-import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
-import { StatusBadge } from "@/components/operation-panel"
-import { FieldRow } from "@/components/config-form"
-import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
-import { useHostSummary } from "@/lib/host-summary"
-import { useStartupView } from "@/lib/operation-progress"
-import { catalogEntry, rememberOperation } from "@/lib/operation-catalog"
+import type { SimRobot } from "@/components/sim-robot-picker"
+import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
 import {
   cancelJogMove,
@@ -46,7 +44,6 @@ import {
   NO_TWIST,
   padCommand,
   planJogMove,
-  robotConnected,
   useJogLink,
   withArmJog,
   type JogArm,
@@ -62,24 +59,14 @@ import {
 } from "@/lib/jog"
 import { nudgePose, rpyDegrees } from "@/lib/jog-pose"
 import {
-  fetchInfo,
-  fetchOpStatus,
-  fetchRobotStatus,
-  fetchSettings,
   parseAxolModel,
   parseGripper,
-  setServerBase,
-  startOperation,
-  stopOperation,
   type AxolModel,
-  type SchemaField,
   type GripperType,
-  type OpStatus,
+  type SessionInfo,
 } from "@/lib/supervisor"
 
 const JogViewer = lazy(() => import("@/components/jog/jog-viewer"))
-
-const OPERATION = catalogEntry("jog")
 
 const JOINT_LABELS = [
   "Shoulder 1",
@@ -99,30 +86,7 @@ const JOG_AXES = [
 
 type Mode = "sim" | "hardware"
 
-const SIM_ROBOT_KEY = "axolSimRobot"
-
-// The same Sim switch as Teleoperation's run details.
-const SIM_FIELD: SchemaField = {
-  kind: "field",
-  key: "sim",
-  label: "Sim",
-  type: "boolean",
-  default: false,
-  required: false,
-  help: "Jog a simulated Axol in the browser instead of the robot.",
-}
 type Edits = { epoch: string; poses: Partial<Record<JogArm, JogPose>> }
-
-/** The sim robot this browser last picked (shared with Teleoperation). */
-function storedSimRobot(): SimRobot | null {
-  try {
-    const raw = JSON.parse(localStorage.getItem(SIM_ROBOT_KEY) ?? "null")
-    const model = parseAxolModel(raw?.model)
-    return model ? { model, gripper: parseGripper(raw?.gripper) } : null
-  } catch {
-    return null
-  }
-}
 
 function Kbd({ children }: { children: ReactNode }) {
   return (
@@ -389,22 +353,26 @@ function RobotStatus({
   )
 }
 
-export default function Jogging() {
-  const [mode, setMode] = useState<Mode>("sim")
-  // Whether the operator picked Sim or Robot: the robot's status then no
-  // longer moves the default.
-  const modeChosen = useRef(false)
-  // The robot a sim run simulates: this browser's last pick (shared with
-  // Teleoperation), else the robot this host is.
-  const [simChoice, setSimChoice] = useState<SimRobot | null>(storedSimRobot)
-  const [host, setHost] = useState<{ model: AxolModel; gripper: GripperType } | null>(null)
-  const [hostError, setHostError] = useState<string | null>(null)
-  const [opStatus, setOpStatus] = useState<OpStatus | null>(null)
-  // Whether the Host Computer answered the last status poll; null until it does.
-  const [reachable, setReachable] = useState<boolean | null>(null)
-  const hostSummary = useHostSummary(reachable)
+export default function JogWorkspace({
+  session: jogSession,
+  sim,
+  simRobot,
+  hostRobot,
+  video,
+}: {
+  /** The live Jog run, or null while none is. */
+  session: SessionInfo | null
+  /** Whether the live run, or the next one, is in sim. */
+  sim: boolean
+  /** The robot a sim run simulates. */
+  simRobot: SimRobot
+  /** The robot this host is, once its settings have loaded. */
+  hostRobot: { model: AxolModel; gripper: GripperType } | null
+  /** Where the camera video comes from: the Host Computer's VR server. */
+  video: { host: string; vrPort: number }
+}) {
+  const toast = useToast()
   const [busy, setBusy] = useState<string | null>(null)
-  const [error, setError] = useState<string | null>(null)
 
   const [arm, setArm] = useState<JogArm>("left")
   const [edits, setEdits] = useState<Edits>({ epoch: "", poses: {} })
@@ -461,7 +429,7 @@ export default function Jogging() {
   }, [driveSpeed, arm, jogFrame, jogSpeed])
   useEffect(() => pushHold(), [pushHold])
 
-  const { state, connected, error: linkError, preview, requestPreview } = useJogLink(true, holdRef)
+  const { state, error: linkError, preview, requestPreview } = useJogLink(true, holdRef)
 
   // Let go of everything when the window loses focus: a missed pointer-up
   // must never leave the base, lift or an arm running.
@@ -485,74 +453,10 @@ export default function Jogging() {
     }
   }, [])
 
-  // Where the camera video comes from: the VR server of the Host Computer.
-  const [video, setVideo] = useState<{ host: string; vrPort: number } | null>(null)
-
-  useEffect(() => {
-    setServerBase(localStorage.getItem("axolServerHost") ?? "")
-    const serverHost = localStorage.getItem("axolServerHost") ?? ""
-    fetchInfo()
-      .then((info) =>
-        setVideo({ host: serverHost || info.lanIp || "", vrPort: info.vrPort ?? 8000 })
-      )
-      .catch(() => setVideo({ host: serverHost, vrPort: 8000 }))
-    fetchSettings()
-      .then((settings) =>
-        setHost({
-          model: settings.robotModel ?? "classic",
-          gripper: parseGripper(settings.values["axol.gripper"]),
-        })
-      )
-      .catch(() =>
-        setHostError("Can't reach the Host Computer. Connect to it on the Devices page.")
-      )
-    // Start on the robot when one is connected, like the other operations.
-    let active = true
-    fetchRobotStatus()
-      .then((status) => {
-        if (active && !modeChosen.current && robotConnected(status)) setMode("hardware")
-      })
-      .catch(() => undefined)
-    return () => {
-      active = false
-    }
-  }, [])
-
-  useEffect(() => rememberOperation("jog"), [])
-
-  useEffect(() => {
-    let cancelled = false
-    const poll = () =>
-      fetchOpStatus()
-        .then((status) => {
-          if (cancelled) return
-          setOpStatus(status)
-          setReachable(true)
-        })
-        .catch(() => !cancelled && setReachable(false))
-    poll()
-    const timer = setInterval(poll, 1000)
-    return () => {
-      cancelled = true
-      clearInterval(timer)
-    }
-  }, [])
-
-  const session = opStatus?.running ? opStatus.session : null
-  const jogSession = session?.command === "jog" ? session : null
-  const otherOperation = session && session.command !== "jog" ? session.command : null
   const running = Boolean(state?.running && jogSession)
-  const jogSim = jogSession?.args?.sim === true || jogSession?.args?.sim === "true"
-  // The run's startup (connecting the arms and Jelly, warming up IK), shown
-  // as a progress bar until it is ready.
-  const startup = useStartupView(jogSession?.progress ?? null, { device: "Axol", sim: jogSim })
   const sessionMode: Mode | null = running ? (state?.mode ?? null) : null
   // The robot drawn is what the session runs, or what Start would run.
-  const viewMode: Mode = sessionMode ?? mode
-  const simRobot: SimRobot = simChoice ?? {
-    model: host?.model ?? "classic",
-    gripper: host?.gripper ?? "parallel",
-  }
+  const viewMode: Mode = sessionMode ?? (sim ? "sim" : "hardware")
   const sessionModel = parseAxolModel(String(jogSession?.args?.["kinematics.robot_model"] ?? ""))
   const sessionGripper = jogSession?.args?.["axol.gripper"]
   const robotModel: AxolModel =
@@ -560,21 +464,13 @@ export default function Jogging() {
       ? sessionMode
         ? (sessionModel ?? simRobot.model)
         : simRobot.model
-      : (host?.model ?? "classic")
+      : (hostRobot?.model ?? "classic")
   const gripper: GripperType =
     viewMode === "sim"
       ? sessionMode && sessionGripper != null
         ? parseGripper(sessionGripper)
         : simRobot.gripper
-      : (host?.gripper ?? "parallel")
-  const chooseSimRobot = (next: SimRobot) => {
-    setSimChoice(next)
-    try {
-      localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
-    } catch {
-      // Private mode or storage off: the choice lasts this page view.
-    }
-  }
+      : (hostRobot?.gripper ?? "parallel")
   const ready = running && Boolean(state?.ready)
   const executing = state?.execution ?? null
   // Edits and plans belong to one session and one arm pose: starting a new
@@ -645,33 +541,15 @@ export default function Jogging() {
 
   const run = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label)
-    setError(null)
     try {
       await action()
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
+      toast.error(reason instanceof Error ? reason.message : String(reason))
     } finally {
       setBusy(null)
     }
   }
 
-  const start = () =>
-    run("start", async () => {
-      const args: Record<string, string | boolean> = { sim: mode === "sim" }
-      if (mode === "sim") {
-        // As in Teleoperation: the run simulates the picked robot, which may
-        // differ from the robot's saved model.
-        args["kinematics.robot_model"] = simRobot.model
-        if (simRobot.model === "mobile") args["axol.gripper"] = simRobot.gripper
-      }
-      await startOperation("jog", args)
-      setOpStatus(await fetchOpStatus())
-    })
-  const stop = () =>
-    run("stop", async () => {
-      await stopOperation()
-      setOpStatus(await fetchOpStatus())
-    })
   const planMove = () =>
     run("plan", async () => {
       if (!target) return
@@ -817,123 +695,26 @@ export default function Jogging() {
       pushHold()
     }
   }, [canDrive, canLift, canMoveArm, pushHold])
-  return (
-    <AppShell
-      title="Operations"
-      back="/control/operations"
-      wide
-      badges={{ "/control/operations": session ? "running" : undefined }}
-      host={hostSummary}
-    >
-      <section
-        className={cn(
-          "flex flex-col gap-5 rounded-2xl border p-5 sm:flex-row sm:items-center",
-          jogSession
-            ? "border-emerald-400/25 bg-gradient-to-br from-emerald-400/[0.06] to-transparent"
-            : "border-white/10 bg-gradient-to-br from-white/[0.04] to-transparent"
-        )}
-      >
-        <div className="flex min-w-0 flex-1 items-start gap-4">
-          <OperationIcon entry={OPERATION} size="lg" running={Boolean(jogSession)} />
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="font-heading text-xl font-semibold">{OPERATION.label}</h2>
-              <Badge variant="neutral" title="Runs on the Axol arms.">
-                Axol
-              </Badge>
-              {(jogSession ? jogSim : mode === "sim") && <Badge variant="neutral">Sim</Badge>}
-            </div>
-            <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-white/55">
-              Drag the target, plan the move, check the orange preview, then execute it.
-            </p>
-            {jogSession && startup && (
-              <div className="mt-3 max-w-md">
-                <StartupBar view={startup} />
-              </div>
-            )}
-            {jogSession && !startup && (
-              <p className="mt-2 flex items-center gap-2 text-sm">
-                <StatusBadge session={jogSession} />
-                {jogSession.status === "running" && (
-                  <span className="text-white/70">
-                    <ElapsedTime startedAt={jogSession.startedAt} />
-                  </span>
-                )}
-              </p>
-            )}
-          </div>
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
-          {busy === "stop" ? (
-            <Button variant="destructive" size="lg" disabled>
-              <Loader2 className="animate-spin" />
-              Stopping…
-            </Button>
-          ) : jogSession ? (
-            <Button variant="destructive" size="lg" onClick={stop}>
-              <Square />
-              Stop
-            </Button>
-          ) : (
-            <Button
-              size="lg"
-              className="min-w-32"
-              onClick={start}
-              disabled={Boolean(busy) || Boolean(otherOperation) || !connected}
-            >
-              {busy === "start" ? <Loader2 className="animate-spin" /> : <Play />}
-              Start
-            </Button>
-          )}
-        </div>
-      </section>
+  // Problems with a live run: the page lost its link to Jog, or the IK
+  // solver failed. Start and stop errors show like any operation's.
+  const runProblem = jogSession ? (state?.solverError ?? linkError) : null
 
-      {(error || linkError || hostError || otherOperation || state?.solverError) && (
+  return (
+    <div className="flex min-w-0 flex-col gap-6">
+      {runProblem && (
         <div
           role="alert"
           className="rounded-lg border border-amber-400/25 bg-amber-400/[0.06] px-4 py-3 text-sm text-amber-200"
         >
-          {otherOperation ? (
-            <>
-              {catalogEntry(otherOperation).label} is running. Stop it to jog.{" "}
-              <Link
-                to={`/control/operations/${encodeURIComponent(otherOperation)}`}
-                className="font-medium underline underline-offset-2"
-              >
-                Open {catalogEntry(otherOperation).label}
-              </Link>
-            </>
-          ) : (
-            (error ?? state?.solverError ?? linkError ?? hostError)
-          )}
+          {runProblem}
         </div>
       )}
-      {!running && mode === "hardware" && !otherOperation && (
+      {!jogSession && !sim && (
         <p className="text-sm text-white/50">
           On the robot, the arms hold their pose when jogging starts and move only when you press{" "}
           <strong className="text-white/80">Execute</strong>. The lift and base move only while you
           hold their controls.
         </p>
-      )}
-
-      {!jogSession && (
-        <Card className="gap-5">
-          <h3 className="font-heading text-sm font-semibold">Run details</h3>
-          <FieldRow
-            field={SIM_FIELD}
-            overrides={mode === "sim" ? { sim: true } : {}}
-            disabled={Boolean(busy)}
-            onChange={(_, value) => {
-              modeChosen.current = true
-              setMode(value ? "sim" : "hardware")
-            }}
-            onReset={() => {
-              modeChosen.current = true
-              setMode("hardware")
-            }}
-          />
-          {mode === "sim" && <SimRobotPicker value={simRobot} onChange={chooseSimRobot} />}
-        </Card>
       )}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px] lg:items-start">
@@ -970,7 +751,7 @@ export default function Jogging() {
               {!running && (
                 <div className="pointer-events-none absolute inset-x-0 bottom-3 flex justify-center">
                   <span className="rounded-full border border-white/10 bg-black/60 px-3 py-1.5 text-xs text-white/70">
-                    Start jogging to move the robot.
+                    Press Start to jog.
                   </span>
                 </div>
               )}
@@ -1357,7 +1138,7 @@ export default function Jogging() {
           </Card>
         </div>
       </div>
-    </AppShell>
+    </div>
   )
 }
 

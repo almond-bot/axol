@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
+import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
   ChevronRight,
@@ -108,6 +108,7 @@ export function OperationPanel({
   onStart,
   onStop,
   onEpisode,
+  workspace,
 }: {
   /** How the app presents the operation: its icon and name. */
   entry: CatalogEntry
@@ -158,6 +159,9 @@ export function OperationPanel({
   onStart: () => void
   onStop: () => void
   onEpisode: (command: string) => void
+  /** The operation's own screen (Jog's 3D view and controls), shown
+   *  between the checklist and the run details. */
+  workspace?: ReactNode
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
@@ -625,10 +629,14 @@ export function OperationPanel({
             mantisSource={mantisSource}
             dataCollection={meta.id === "collect-data"}
             session={live ? session : null}
-            isSim={isSim}
+            // An operation with its own screen draws the sim robot there;
+            // only the others open the browser 3D viewer.
+            isSim={isSim && !workspace}
             host={host}
             viewerPort={viewerPort}
           />
+
+          {workspace}
 
           <Card className="gap-5">
             {(runFields.length > 0 || (isSim && simRobot && onSimRobotChange)) && (
@@ -1484,8 +1492,7 @@ function RunningHints({
   )
 }
 
-/** The run's state, as the operation pages show it. */
-export function StatusBadge({ session }: { session: SessionInfo | null }) {
+function StatusBadge({ session }: { session: SessionInfo | null }) {
   if (!session) return null
   switch (session.status) {
     case "starting":

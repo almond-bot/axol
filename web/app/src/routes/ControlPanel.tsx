@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
 import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -182,6 +191,9 @@ function parseControlPath(pathname: string): { view: ControlView | null; rest: s
 }
 
 const SIM_ROBOT_KEY = "axolSimRobot"
+
+// Jog's 3D view and controls, loaded only when Jog is open.
+const JogWorkspace = lazy(() => import("@/components/jog/jog-workspace"))
 
 /** How long to wait before asking a host that failed to send its settings again. */
 const SETTINGS_RETRY_MS = 3000
@@ -2407,6 +2419,7 @@ export default function ControlPanel() {
       <AppShell
         title={page[view].title}
         back={routeOp ? "/control/operations" : undefined}
+        wide={routeOp === "jog"}
         description={page[view].description}
         actions={runningChip}
         notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
@@ -2553,6 +2566,36 @@ export default function ControlPanel() {
               onStart={handleStart}
               onStop={handleStop}
               onEpisode={handleEpisode}
+              workspace={
+                opId === "jog" ? (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center gap-2 py-16 text-sm text-white/45">
+                        <Loader2 className="size-4 animate-spin" /> Loading Jog…
+                      </div>
+                    }
+                  >
+                    <JogWorkspace
+                      session={selectedLive ? effectiveStatus : null}
+                      sim={
+                        selectedLive
+                          ? String(effectiveStatus?.args?.sim) === "true"
+                          : isSimRun(meta, settings)
+                      }
+                      simRobot={simRobot}
+                      hostRobot={
+                        settingsSnap
+                          ? {
+                              model: settingsSnap.robotModel ?? "classic",
+                              gripper: parseGripper(settingsSnap.values["axol.gripper"]),
+                            }
+                          : null
+                      }
+                      video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
+                    />
+                  </Suspense>
+                ) : undefined
+              }
             />
 
             {lines.length > 0 && (
