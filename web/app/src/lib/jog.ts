@@ -209,8 +209,11 @@ function deadzone(value: number): number {
 }
 
 /** What a game controller's sticks control: the base (no shoulder button
- * held), the selected gripper's position (LB held) or its rotation (RB held). */
+ * held), the selected gripper's position (LT held) or its rotation (RT held). */
 export type GamepadMode = "drive" | "move" | "turn"
+
+/** How far a trigger must be pulled (0 to 1) to count as held. */
+export const TRIGGER_HELD = 0.5
 
 export interface GamepadControls {
   mode: GamepadMode
@@ -228,19 +231,25 @@ export interface GamepadControls {
  *
  * - No shoulder button: the left stick drives Jelly (forward, left), the
  *   right stick's left and right turns it in place.
- * - LB held: the left stick moves the gripper forward, back, left and right,
+ * - LT held: the left stick moves the gripper forward, back, left and right,
  *   the right stick's up and down moves it up and down.
- * - RB held: the left stick rolls and pitches the gripper, the right stick's
+ * - RT held: the left stick rolls and pitches the gripper, the right stick's
  *   left and right turns it (yaw).
  * - The D-pad's up and down (buttons 12 and 13) raise and lower the lift, its
  *   left and right (14 and 15) select the left or right arm.
  */
 export function gamepadControls(
   axes: readonly number[],
-  buttons: readonly { pressed: boolean }[] = []
+  buttons: readonly { pressed: boolean; value?: number }[] = []
 ): GamepadControls {
   const axis = (i: number) => (Number.isFinite(axes[i]) ? axes[i] : 0)
   const pressed = (i: number) => Boolean(buttons[i]?.pressed)
+  // A trigger (LT 6, RT 7) counts as held past half travel, so a light touch
+  // or a resting trigger never takes over the sticks.
+  const held = (i: number) => {
+    const value = buttons[i]?.value
+    return Number.isFinite(value) ? (value as number) > TRIGGER_HELD : pressed(i)
+  }
   const x = axis(0)
   const y = axis(1)
   const length = Math.hypot(x, y)
@@ -251,7 +260,7 @@ export function gamepadControls(
   const rightRight = deadzone(axis(2)) + 0
   const rightUp = -deadzone(axis(3)) + 0
   const lift = (Number(pressed(12)) - Number(pressed(13))) as -1 | 0 | 1
-  const mode: GamepadMode = pressed(4) ? "move" : pressed(5) ? "turn" : "drive"
+  const mode: GamepadMode = held(6) ? "move" : held(7) ? "turn" : "drive"
   const still: Vec3 = [0, 0, 0]
   const drive: OtherDrive =
     mode === "drive"

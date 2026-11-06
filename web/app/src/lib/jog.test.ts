@@ -80,6 +80,11 @@ describe("keyDrive", () => {
 describe("gamepadControls", () => {
   const pressed = (...on: number[]) =>
     Array.from({ length: 17 }, (_, i) => ({ pressed: on.includes(i) }))
+  const triggers = (lt: number, rt: number) =>
+    Array.from({ length: 17 }, (_, i) => {
+      const value = i === 6 ? lt : i === 7 ? rt : 0
+      return { pressed: value > 0.1, value }
+    })
 
   it("drives Jelly with the left stick and turns with the right stick", () => {
     const forward = gamepadControls([0, -1, 0, 0])
@@ -91,23 +96,29 @@ describe("gamepadControls", () => {
     expect(gamepadControls([0, 0, -1, 0]).drive.turn).toBe(1)
   })
 
-  it("moves the gripper while LB is held, and the base stays still", () => {
-    const up = gamepadControls([0, -1, 0, -1], pressed(4))
+  it("moves the gripper while LT is held, and the base stays still", () => {
+    const up = gamepadControls([0, -1, 0, -1], triggers(1, 0))
     expect(up.mode).toBe("move")
     expect(up.twist).toEqual([1, 0, 1, 0, 0, 0])
     expect(up.drive.pad).toEqual([0, 0, 0])
     expect(up.drive.turn).toBe(0)
-    expect(gamepadControls([-1, 0, 0, 0], pressed(4)).twist).toEqual([0, 1, 0, 0, 0, 0])
+    expect(gamepadControls([-1, 0, 0, 0], triggers(1, 0)).twist).toEqual([0, 1, 0, 0, 0, 0])
   })
 
-  it("turns the gripper while RB is held", () => {
-    const turned = gamepadControls([1, 0, 0, 0], pressed(5))
+  it("turns the gripper while RT is held", () => {
+    const turned = gamepadControls([1, 0, 0, 0], triggers(0, 1))
     expect(turned.mode).toBe("turn")
     expect(turned.twist).toEqual([0, 0, 0, 1, 0, 0])
-    expect(gamepadControls([0, -1, 0, 0], pressed(5)).twist).toEqual([0, 0, 0, 0, 1, 0])
-    expect(gamepadControls([0, 0, 1, 0], pressed(5)).twist).toEqual([0, 0, 0, 0, 0, -1])
-    // LB wins when both are held.
-    expect(gamepadControls([0, 0, 0, 0], pressed(4, 5)).mode).toBe("move")
+    expect(gamepadControls([0, -1, 0, 0], triggers(0, 1)).twist).toEqual([0, 0, 0, 0, 1, 0])
+    expect(gamepadControls([0, 0, 1, 0], triggers(0, 1)).twist).toEqual([0, 0, 0, 0, 0, -1])
+    // LT wins when both are held.
+    expect(gamepadControls([0, 0, 0, 0], triggers(1, 1)).mode).toBe("move")
+  })
+
+  it("needs a trigger past half travel, and ignores the shoulder buttons", () => {
+    expect(gamepadControls([0, -1, 0, 0], triggers(0.3, 0.4)).mode).toBe("drive")
+    expect(gamepadControls([0, -1, 0, 0], triggers(0.6, 0)).mode).toBe("move")
+    expect(gamepadControls([0, -1, 0, 0], pressed(4, 5)).mode).toBe("drive")
   })
 
   it("runs the lift and picks the arm with the D-pad", () => {
@@ -121,7 +132,7 @@ describe("gamepadControls", () => {
   })
 
   it("ignores a resting stick and ramps from the edge of the deadzone", () => {
-    const resting = gamepadControls([0.1, -0.1, 0.12, -0.1], pressed(4))
+    const resting = gamepadControls([0.1, -0.1, 0.12, -0.1], triggers(1, 0))
     expect(resting.twist).toEqual([...NO_TWIST])
     expect(gamepadControls([0.1, -0.1, 0.12, 0]).drive).toEqual({
       pad: [0, 0, 0],
@@ -134,7 +145,7 @@ describe("gamepadControls", () => {
 
   it("treats a missing or broken axis as centred", () => {
     expect(gamepadControls([]).drive).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
-    const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], pressed(4))
+    const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], triggers(1, 0))
     expect(broken.twist).toEqual([...NO_TWIST])
   })
 })

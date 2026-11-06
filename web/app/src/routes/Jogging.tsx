@@ -1357,8 +1357,8 @@ export default function Jogging() {
                 ["Right stick", "Turn Jelly in place"],
                 ["D-pad up and down", "Raise or lower the lift"],
                 ["D-pad left and right", "Choose the left or right arm"],
-                ["Hold LB", "Move the gripper: left stick across, right stick up and down"],
-                ["Hold RB", "Turn the gripper: left stick tilts, right stick turns"],
+                ["Hold LT", "Move the gripper: left stick across, right stick up and down"],
+                ["Hold RT", "Turn the gripper: left stick tilts, right stick turns"],
               ]}
             />
           </div>
