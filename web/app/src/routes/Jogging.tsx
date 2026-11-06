@@ -273,9 +273,9 @@ function JogButtons({
   onJog: (axis: number, sign: 1 | -1, held: boolean) => void
 }) {
   return JOG_AXES.map((names, group) => (
-    <div key={group} className="grid grid-cols-3 gap-1.5">
+    <div key={group} className="grid grid-cols-2 gap-1.5">
       {names.map((name, i) =>
-        ([1, -1] as const).map((sign) => (
+        ([-1, 1] as const).map((sign) => (
           <HoldButton
             key={`${name}${sign}`}
             label={`${name} ${sign > 0 ? "+" : "−"}`}
@@ -1193,9 +1193,9 @@ export default function Jogging() {
                       ))}
                     </Select>
                   </div>
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-1.5">
                     {(["X", "Y", "Z"] as const).map((name, axis) =>
-                      ([1, -1] as const).map((sign) => (
+                      ([-1, 1] as const).map((sign) => (
                         <Button
                           key={`${name}${sign}`}
                           variant="outline"
@@ -1221,9 +1221,9 @@ export default function Jogging() {
                       ))}
                     </Select>
                   </div>
-                  <div className="grid grid-cols-3 gap-1.5">
+                  <div className="grid grid-cols-2 gap-1.5">
                     {(["Roll", "Pitch", "Yaw"] as const).map((name, axis) =>
-                      ([1, -1] as const).map((sign) => (
+                      ([-1, 1] as const).map((sign) => (
                         <Button
                           key={`${name}${sign}`}
                           variant="outline"
