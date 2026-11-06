@@ -1433,6 +1433,7 @@ class KinematicsSolver:
         delta_scale: float = 1.0,
         elbow_weight: float | None = None,
         pose_weight_scale: tuple[float, float] = (1.0, 1.0),
+        posture_weight: float | None = None,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -1472,6 +1473,10 @@ class KinematicsSolver:
                 The other costs (manipulability, an elbow hint) settle where
                 they balance a small pose error; a caller that needs the
                 pose held to a fraction of a degree raises these.
+            posture_weight: Per-call weight on the posture attractor
+                (:meth:`set_posture_pose`), replacing
+                ``config.posture_weight`` for this solve. Box mode's stow
+                raises it to pull the arms into a planned pose.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -1556,7 +1561,7 @@ class KinematicsSolver:
             cfg.pos_weight * float(pose_weight_scale[0]),
             cfg.ori_weight * float(pose_weight_scale[1]),
             cfg.rest_weight,
-            cfg.posture_weight,
+            cfg.posture_weight if posture_weight is None else float(posture_weight),
             cfg.manipulability_weight,
             cfg.limit_weight,
             self._collision_starts,

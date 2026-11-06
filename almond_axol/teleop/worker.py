@@ -36,6 +36,7 @@ from .box import (
     choose_faces,
     contact_width,
     elbow_swivel_hint,
+    ideal_gripper_poses,
     pair_aligned,
     parcel_tool,
     right_stick_axis,
@@ -125,46 +126,77 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
-# Box-mode stow (see IKWorker._step_stow). The pull toward the chest stops
-# once the solved grippers trail their targets by _STOW_IK_LAG_M (the arms
-# can't follow any closer), or the measured grippers trail them by
-# _STOW_STALL_M (the arms are pressed against something, the box on the
-# chest); the box then settles _STOW_BACKOFF_M forward of the last point
-# both were well inside those limits. The squaring move turns the box at no
-# more than _STOW_TURN_RAD_S and lasts at least _STOW_MIN_S.
-_STOW_IK_LAG_M = 0.015
+# Box mode keeps each elbow bent at least this far forward of straight
+# (rad, see IKWorker._keep_elbows_bent); ARM_JOINTS index of the elbow.
+_ELBOW_BENT_RAD = 0.05
+_ELBOW_INDEX = 3
+
+# Box-mode stow (see IKWorker._start_stow). The stowed pose is planned
+# once, offline, for the left arm and mirrored onto the right (the arms are
+# exact mirror images: q_right = -q_left), so the stow ends symmetric from
+# any start. The plan swings each elbow _STOW_ELBOW_DEG about its
+# shoulder-wrist line (negative: inboard of straight down, toward the base;
+# the arm/base collision model holds it off the body) over
+# up to _STOW_PLAN_ITERS solves per candidate (stopping once no joint moves
+# more than _STOW_PLAN_SETTLED_RAD in a solve: the angled grasp's elbow
+# takes ~80 to swing in, the straight grasp's far fewer), trying box distances from
+# box_stow_reach outward in _STOW_PLAN_STEP_M steps (up to _STOW_PLAN_SPAN_M
+# further) and taking the first whose grippers land within
+# _STOW_PLAN_POS_TOL_M of their slots with the elbows no more than
+# _STOW_ELBOW_OUT_MAX_M outboard of the shoulders (a small box held right
+# against the chest pushes the elbows back into the base, which spreads
+# them, so it stows a little further out); failing that, the best of the
+# rest (in reach first, then the tighter elbows).
+_STOW_ELBOW_DEG = -30.0
+_STOW_PLAN_ITERS = 200
+_STOW_PLAN_MIN_ITERS = 10
+_STOW_PLAN_SETTLED_RAD = 1e-3
+_STOW_PLAN_STEP_M = 0.025
+_STOW_PLAN_SPAN_M = 0.20
+_STOW_PLAN_POS_TOL_M = 0.008
+_STOW_ELBOW_OUT_MAX_M = 0.02
+# The move carries the box on a straight line while the arms' posture and
+# elbows blend into the planned pose; it lasts long enough for the box to
+# move at box_stow_speed, turn at _STOW_TURN_RAD_S and every joint to move
+# at _STOW_JOINT_RAD_S, and at least _STOW_MIN_S.
+_STOW_TURN_RAD_S = math.radians(60.0)
+_STOW_JOINT_RAD_S = 0.8
+_STOW_MIN_S = 1.0
+# Once the measured grippers trail their targets by _STOW_STALL_M more than
+# they did when the move began (pressed against something: the box on the
+# chest, on hardware), the box stops _STOW_BACKOFF_M short of there.
 _STOW_STALL_M = 0.03
 _STOW_BACKOFF_M = 0.01
-_STOW_TURN_RAD_S = math.radians(60.0)
-_STOW_MIN_S = 0.5
-# The pull's stop checks start this long after it begins, so the lag left
-# over from the squaring move doesn't end it on the spot.
-_STOW_SETTLE_S = 0.3
-# After the pull the pose is held while the elbows finish swinging in (the
-# elbow hint steps them a few centimetres per solve): the stow is done once
-# no joint moves more than _STOW_STILL_RAD per solve, after at least
+# After the move the arms step onto the planned pose in joint space (at up to
+# _STOW_SETTLE_RAD_S, see _settle_stow) and it is held until they are on it —
+# no joint moves more than _STOW_STILL_RAD per solve and every joint is within
+# _STOW_ARRIVED_RAD of the plan — after at least
 # _STOW_HOLD_MIN_S and at most _STOW_HOLD_MAX_S. The frozen pair is never
 # solved again, so a stow reported done mid-swing would keep the flare.
 _STOW_STILL_RAD = 2e-3
+_STOW_ARRIVED_RAD = 0.01
+_STOW_SETTLE_RAD_S = 0.3
 _STOW_HOLD_MIN_S = 0.5
 _STOW_HOLD_MAX_S = 3.0
 
 
 @dataclass
 class _Stow:
-    """One box-mode stow in progress (see :meth:`IKWorker._step_stow`)."""
+    """One box-mode stow in progress (see :meth:`IKWorker._start_stow`)."""
 
     start: tuple[np.ndarray, np.ndarray]
     goal: tuple[np.ndarray, np.ndarray]
-    x_min: float
+    q_start: np.ndarray
+    # The planned stowed joints (None once a stall cut the move short).
+    q_goal: np.ndarray | None
+    elbows_start: dict[str, np.ndarray]
+    elbows_goal: dict[str, np.ndarray]
     t0: float
     duration: float
-    phase: str = "square"  # "square" -> "pull" -> "hold" -> "done"
-    x: float = 0.0
-    x_ok: float = 0.0
-    t_prev: float = 0.0
-    pull_t0: float = 0.0
+    phase: str = "move"  # "move" -> "hold" -> "done"
+    alpha: float = 0.0
     hold_t0: float = 0.0
+    stall_base: float | None = None
 
 
 # Squeeze lean (see IKWorker._squeeze_lean): low-pass time constant on the
@@ -521,7 +553,7 @@ class IKWorker:
         # (snap_box's ``rot``) instead of levelling it; dropped once the
         # session leaves box tracking or the arms are moved by something else.
         self._box_rot: np.ndarray | None = None
-        # The box-mode stow in progress, if any (see _step_stow).
+        # The box-mode stow in progress, if any (see _start_stow).
         self._stow: _Stow | None = None
         # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
         # and joint stiffness as last reported by the core (``("meas", ...)``,
@@ -2039,7 +2071,7 @@ class IKWorker:
         self._box_rot = rot
         self._integrate_sticks(frame, box, now)
         if getattr(frame, "box_stow", False) and getattr(self, "_stow", None) is None:
-            self._stow = self._start_stow(center, rot, q_current, now)
+            self._stow = self._start_stow(box, center, rot, q_current, now)
         stow = getattr(self, "_stow", None)
         if stow is not None:
             # The stow drives the pair; the leading hand is ignored.
@@ -2047,7 +2079,11 @@ class IKWorker:
             self._box_rot = rot
         targets = box_targets(box, center, rot, now)
         targets = self._squeeze_lean(box, targets, q_current, now, rot)
-        elbows = self._box_elbow_hints(q_current, targets)
+        elbows = (
+            self._stow_elbows(stow)
+            if stow is not None
+            else self._box_elbow_hints(q_current, targets)
+        )
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
         # cost well short of the target — posture_weight 5 against pos_weight
@@ -2058,7 +2094,9 @@ class IKWorker:
         # doesn't need one: rest damping holds it where it is, the arm/torso
         # collision model keeps it off the base, and the optional elbow hint
         # (box_elbow_weight > 0) steers it explicitly.
-        self._solver.set_posture_pose(q_current)
+        # A stow instead pulls the posture into its planned pose, so the
+        # arms arrive there, symmetric, whatever they started from.
+        self._solver.set_posture_pose(self._stow_posture(stow, q_current))
 
         delta_scale = 1.0
         if self._last_solve_t is not None:
@@ -2079,16 +2117,10 @@ class IKWorker:
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
-        if stow is not None and stow.phase == "pull":
-            self._check_stow(stow, q_new, q_current, targets)
-        elif stow is not None and stow.phase == "hold":
-            held = now - stow.hold_t0
-            still = (
-                float(np.max(np.abs(q_new - np.asarray(q_current)))) < _STOW_STILL_RAD
-            )
-            if held >= _STOW_HOLD_MAX_S or (held >= _STOW_HOLD_MIN_S and still):
-                stow.phase = "done"
-                _logger.info("Box stow: done")
+        self._keep_elbows_bent(q_new, q_current)
+        if stow is not None:
+            self._settle_stow(stow, q_new, q_current, delta_scale)
+            self._advance_stow(stow, q_new, q_current, targets, now)
         if self._has_lift_contact():
             # Held up by Jelly's deck, the pair keeps the height it is held
             # at (see _hold_lift_plane): the box centre rises with the arm
@@ -2125,102 +2157,296 @@ class IKWorker:
             )
         return q_new
 
+    def _keep_elbows_bent(self, q_new: np.ndarray, q_current: np.ndarray) -> None:
+        """Keep box mode's elbows from bending backwards (in place).
+
+        Each elbow can hyperextend a little past straight (the URDF allows
+        about 24°). Led out of reach, the box-mode solve stretches an arm
+        through straight into that backwards branch, and once there no box
+        motion toward the body brings it back: with the gripper held, the
+        arm would have to pass through straight again, at full reach. The
+        stow then can't fold that arm into its plan. So in box mode an
+        elbow may not move further past ``_ELBOW_BENT_RAD`` from straight
+        toward the backwards side; one already past it may only come back.
+        """
+        left = getattr(self._solver, "left_indices", None)
+        right = getattr(self._solver, "right_indices", None)
+        if getattr(self, "_mink_backend", False) or left is None or right is None:
+            return
+        for indices, sign in ((left, 1.0), (right, -1.0)):
+            i = indices[_ELBOW_INDEX]
+            # Bent forward is +sign; "sign * q" < _ELBOW_BENT_RAD is backwards.
+            floor = min(float(sign * q_current[i]), _ELBOW_BENT_RAD)
+            if sign * q_new[i] < floor:
+                q_new[i] = sign * floor
+
     def _start_stow(
-        self, center: np.ndarray, rot: np.ndarray, q: np.ndarray, now: float
+        self,
+        box: BoxState,
+        center: np.ndarray,
+        rot: np.ndarray,
+        q: np.ndarray,
+        now: float,
     ) -> _Stow:
         """Begin the box-mode stow from the pair's pose this frame.
 
-        The stow (**A** while a grip leads) first *squares* the box: level,
-        facing straight forward, centred between the shoulders and
-        ``config.box_stow_height`` below them, at its current distance in
-        front (or ``box_stow_reach``, if it is already closer). Then it
-        *pulls* the box straight back toward the chest at
-        ``box_stow_speed`` until the arms can't follow or stall against
-        something (:meth:`_check_stow`), backs off a centimetre and holds
-        it there. The core then freezes the pair for driving. The elbows
-        follow the box-mode elbow hint the whole way, so with the box
-        centred in front of the chest they stay tucked.
+        The stow (**A**) brings the box in to the chest: level, facing
+        straight forward, centred between the shoulders,
+        ``config.box_stow_height`` below them and as close in front as the
+        arms reach (:meth:`_plan_stow`), with the elbows tucked in toward
+        the base and the two arms mirror images of each other. The box moves
+        there on a straight line while the arms' posture and elbows blend
+        into the planned pose (:meth:`_stow_posture`,
+        :meth:`_stow_elbows`), then the pose is held until the arms settle
+        (:meth:`_advance_stow`). The core then freezes the pair for driving.
         """
         cfg = self._config
-        swivel = self._solver.elbow_swivel(q)
-        shoulders = (
-            np.asarray(swivel["left"].shoulder, np.float64)
-            + np.asarray(swivel["right"].shoulder, np.float64)
-        ) * 0.5
-        x_min = float(shoulders[0]) + float(cfg.box_stow_reach)
-        x1 = max(float(center[0]), x_min)
-        goal_center = np.array(
-            (x1, shoulders[1], shoulders[2] - float(cfg.box_stow_height)),
-            dtype=np.float32,
-        )
+        t_plan = time.perf_counter()
+        goal_center, q_goal = self._plan_stow(box, q)
         goal_rot = np.eye(3, dtype=np.float32)
+        q = np.asarray(q, dtype=np.float32)
         speed = max(float(cfg.box_stow_speed), 1e-3)
         distance = float(np.linalg.norm(goal_center - np.asarray(center, np.float32)))
         turn = rotation_angle(np.asarray(rot, np.float32), goal_rot)
-        duration = max(distance / speed, turn / _STOW_TURN_RAD_S, _STOW_MIN_S)
-        _logger.info(
-            "Box stow: squaring the box in front of the chest (%.1f s)", duration
+        joints = 0.0 if q_goal is None else float(np.max(np.abs(q_goal - q)))
+        duration = max(
+            distance / speed,
+            turn / _STOW_TURN_RAD_S,
+            joints / _STOW_JOINT_RAD_S,
+            _STOW_MIN_S,
         )
-        start = (
-            np.asarray(center, np.float32).copy(),
-            np.asarray(rot, np.float32).copy(),
+        el0 = self._solver.elbow_positions(q)
+        el1 = el0 if q_goal is None else self._solver.elbow_positions(q_goal)
+        _logger.info(
+            "Box stow: planned in %.1f s; moving the box in to the chest (%.1f s)",
+            time.perf_counter() - t_plan,
+            duration,
         )
         return _Stow(
-            start=start,
+            start=(
+                np.asarray(center, np.float32).copy(),
+                np.asarray(rot, np.float32).copy(),
+            ),
             goal=(goal_center, goal_rot),
-            x_min=x_min,
-            t0=now,
+            q_start=q.copy(),
+            q_goal=q_goal,
+            elbows_start={"left": np.asarray(el0[0]), "right": np.asarray(el0[1])},
+            elbows_goal={"left": np.asarray(el1[0]), "right": np.asarray(el1[1])},
+            # The plan blocked this solve for a while: the move starts now.
+            t0=now + (time.perf_counter() - t_plan),
             duration=duration,
-            x=x1,
-            x_ok=x1,
         )
+
+    def _plan_stow(
+        self, box: BoxState, q: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """The stowed box centre and joints: ``(center, q)``.
+
+        Tries box centres ``box_stow_reach`` in front of the shoulders and
+        then further out (see ``_STOW_PLAN_*``), and returns the first the
+        arms reach with the grippers in their slots; failing every one, the
+        closest miss. Each candidate is solved for the left arm from the
+        rest pose (warm-started from the previous candidate), with its elbow
+        swung ``_STOW_ELBOW_DEG`` toward the base, and mirrored onto the
+        right arm. The solver's posture, step history and collision-guard
+        state are restored afterwards.
+        """
+        cfg = self._config
+        solver = self._solver
+        shoulders = solver.shoulder_positions
+        mid = (
+            np.asarray(shoulders["left"], np.float64)
+            + np.asarray(shoulders["right"], np.float64)
+        ) * 0.5
+        rot = np.eye(3, dtype=np.float32)
+        if getattr(self, "_mink_backend", False):
+            # Mink has no elbow model to plan with: the box goes straight
+            # in, the arms following it as they would a led box.
+            center = np.array(
+                (
+                    float(mid[0]) + float(cfg.box_stow_reach),
+                    mid[1],
+                    mid[2] - float(cfg.box_stow_height),
+                ),
+                dtype=np.float32,
+            )
+            return center, None
+        grip_rel, feet = box.grip_rel(), box.feet()
+        saved = (
+            getattr(solver, "_posture_pose", None),
+            getattr(solver, "_q_prev", None),
+            getattr(solver, "_base_collision_guard_active", None),
+        )
+        best: tuple[tuple[bool, bool, float], float, np.ndarray, np.ndarray] | None = (
+            None
+        )
+        seed = self.get_rest_q()
+        x0 = float(mid[0]) + float(cfg.box_stow_reach)
+        n = int(round(_STOW_PLAN_SPAN_M / _STOW_PLAN_STEP_M)) + 1
+        try:
+            for k in range(n):
+                center = np.array(
+                    (
+                        x0 + k * _STOW_PLAN_STEP_M,
+                        mid[1],
+                        mid[2] - float(cfg.box_stow_height),
+                    ),
+                    dtype=np.float32,
+                )
+                targets = ideal_gripper_poses(center, rot, box.width, grip_rel, feet)
+                seed, miss = self._solve_stow_arms(seed, targets)
+                out = self._stow_elbow_out(seed)
+                reached = miss <= _STOW_PLAN_POS_TOL_M
+                tucked = out <= _STOW_ELBOW_OUT_MAX_M
+                key = (not reached, not tucked, miss + max(out, 0.0))
+                if best is None or key < best[0]:
+                    best = (key, miss, center, seed.copy())
+                if reached and tucked:
+                    break
+        finally:
+            for name, value in zip(
+                ("_posture_pose", "_q_prev", "_base_collision_guard_active"), saved
+            ):
+                if value is not None:
+                    setattr(solver, name, value)
+        assert best is not None
+        _key, miss, center, q_goal = best
+        if miss > _STOW_PLAN_POS_TOL_M:
+            _logger.warning(
+                "Box stow: the arms can't reach the stowed box exactly "
+                "(grippers %.0f mm off); stowing as close as they get",
+                miss * 1000.0,
+            )
+        return center, q_goal
+
+    def _stow_elbow_out(self, q: np.ndarray) -> float:
+        """How far (m) the left elbow sits outboard of its shoulder at ``q``.
+
+        The stow plans mirrored arms, so the left one speaks for both.
+        """
+        arm = self._solver.elbow_swivel(q)["left"]
+        return float(arm.elbow[1] - arm.shoulder[1])
+
+    def _solve_stow_arms(
+        self, seed: np.ndarray, targets: dict[str, Pose]
+    ) -> tuple[np.ndarray, float]:
+        """Solve the stowed pose for ``targets``: ``(q, worst gripper miss)``.
+
+        The left arm is solved with its elbow swung toward the base and the
+        right arm is its mirror image (``q_right = -q_left``). A tool whose
+        mirrored right gripper doesn't land in its own slot (the miss says
+        so) falls back to the closest of the two.
+        """
+        solver = self._solver
+        li, ri = solver.left_indices, solver.right_indices
+        q = np.asarray(seed, dtype=np.float32).copy()
+        angle = math.radians(_STOW_ELBOW_DEG)
+        pos, rot = targets["left"]
+        for k in range(_STOW_PLAN_ITERS):
+            q_prev = q
+            arm = solver.elbow_swivel(q)["left"]
+            wrist = np.asarray(pos, np.float64) + np.asarray(
+                rot, np.float64
+            ) @ np.asarray(arm.wrist_in_mount, np.float64)
+            hint = elbow_swivel_hint(arm.shoulder, arm.elbow, wrist, 1.0, angle)
+            solver.set_posture_pose(q)
+            # Both arms, the right against the mirrored hint: the solver's
+            # two-arm graph is the one already compiled (its warm-up), so the
+            # first stow doesn't stall on a compile.
+            q = np.asarray(
+                solver.ik(
+                    q,
+                    left_pose=targets["left"],
+                    right_pose=targets["right"],
+                    left_elbow_pos=hint,
+                    right_elbow_pos=(hint * np.array((1.0, -1.0, 1.0))).astype(
+                        np.float32
+                    ),
+                    delta_scale=4.0,
+                    elbow_weight=float(self._config.box_elbow_weight) or 10.0,
+                    pose_weight_scale=_BOX_POSE_WEIGHT_SCALE,
+                ),
+                dtype=np.float32,
+            ).copy()
+            q[ri] = -q[li]
+            settled = float(np.max(np.abs(q[li] - q_prev[li]))) < _STOW_PLAN_SETTLED_RAD
+            if settled and k + 1 >= _STOW_PLAN_MIN_ITERS:
+                break
+        fk = dict(zip(("left", "right"), solver.fk(q)))
+        miss = max(
+            float(np.linalg.norm(np.asarray(fk[s][0]) - np.asarray(targets[s][0])))
+            for s in ("left", "right")
+        )
+        return q, miss
 
     def _stow_pose(self, stow: _Stow, now: float) -> tuple[np.ndarray, np.ndarray]:
         """The box pose the stow commands this frame (see :meth:`_start_stow`)."""
-        goal_center, goal_rot = stow.goal
-        if stow.phase == "square":
+        if stow.phase == "move":
             u = (now - stow.t0) / stow.duration
-            if u < 1.0:
-                return blend_pose(stow.start, stow.goal, smoothstep(u))
-            stow.phase = "pull"
-            stow.t_prev = now
-            stow.pull_t0 = now
-        if stow.phase == "pull":
-            dt = min(max(now - stow.t_prev, 0.0), _STICK_MAX_DT_S)
-            stow.t_prev = now
-            stow.x = max(stow.x - dt * float(self._config.box_stow_speed), stow.x_min)
-        center = goal_center.copy()
-        center[0] = stow.x
-        return center, goal_rot
+            stow.alpha = smoothstep(min(max(u, 0.0), 1.0))
+            if u >= 1.0:
+                stow.phase = "hold"
+                stow.hold_t0 = now
+            return blend_pose(stow.start, stow.goal, stow.alpha)
+        return stow.goal
 
-    def _check_stow(
+    def _stow_posture(self, stow: _Stow | None, q_current: np.ndarray) -> np.ndarray:
+        """The posture the solve is pulled toward (``q_current`` outside a stow)."""
+        if stow is None or stow.q_goal is None:
+            return q_current
+        a = stow.alpha if stow.phase == "move" else 1.0
+        return ((1.0 - a) * stow.q_start + a * stow.q_goal).astype(np.float32)
+
+    def _stow_elbows(self, stow: _Stow) -> dict[str, np.ndarray] | None:
+        """Elbow hints during a stow: blending into the planned pose's elbows."""
+        if self._config.box_elbow_weight <= 0.0 or stow.q_goal is None:
+            return None
+        a = stow.alpha if stow.phase == "move" else 1.0
+        return {
+            side: (
+                (1.0 - a) * stow.elbows_start[side] + a * stow.elbows_goal[side]
+            ).astype(np.float32)
+            for side in ("left", "right")
+        }
+
+    def _settle_stow(
+        self,
+        stow: _Stow,
+        q_new: np.ndarray,
+        q_current: np.ndarray,
+        delta_scale: float,
+    ) -> None:
+        """Once the box is in place, step the arms onto the planned pose.
+
+        The live solve settles near the plan but not on it: the arm/base
+        clearance cost nudges the elbows a centimetre or two outboard of
+        where the plan put them. The plan already holds the grippers in
+        their slots, so for the hold the arms move to it in joint space, at
+        up to ``_STOW_SETTLE_RAD_S``, in place of the solve. Not after a
+        stall (no plan to settle onto).
+        """
+        if stow.phase != "hold" or stow.q_goal is None:
+            return
+        step = _STOW_SETTLE_RAD_S * delta_scale / float(self._config.ik_frequency)
+        cur = np.asarray(q_current, dtype=np.float32)
+        for idx in (self._solver.left_indices, self._solver.right_indices):
+            q_new[idx] = cur[idx] + np.clip(stow.q_goal[idx] - cur[idx], -step, step)
+
+    def _advance_stow(
         self,
         stow: _Stow,
         q_new: np.ndarray,
         q_current: np.ndarray,
         targets: dict[str, Pose],
+        now: float,
     ) -> None:
-        """End the stow's pull once the arms stop following it.
-
-        Stops when the solved grippers trail their targets by more than
-        ``_STOW_IK_LAG_M`` (the arms can't reach any closer to the chest),
-        when the measured grippers trail them by more than ``_STOW_STALL_M``
-        (pressed against something, on hardware), or at
-        ``box_stow_reach``. The box then holds ``_STOW_BACKOFF_M`` in front
-        of the last point where both were comfortably inside those limits.
-        """
-        if time.perf_counter() - stow.pull_t0 < _STOW_SETTLE_S:
-            return
-        solved = dict(zip(("left", "right"), self._solver.fk(q_new)))
-        ik_lag = max(
-            float(np.linalg.norm(np.asarray(solved[s][0]) - np.asarray(targets[s][0])))
-            for s in ("left", "right")
-        )
-        stall = 0.0
-        q_meas = self._measured_q(q_current)
-        if q_meas is not None:
+        """Watch for a stall during the move; finish once the arms settle."""
+        if stow.phase == "move":
+            q_meas = self._measured_q(q_current)
+            if q_meas is None:
+                return
             measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
-            stall = max(
+            lag = max(
                 float(
                     np.linalg.norm(
                         np.asarray(measured[s][0]) - np.asarray(targets[s][0])
@@ -2228,27 +2454,42 @@ class IKWorker:
                 )
                 for s in ("left", "right")
             )
-        blocked = ik_lag > _STOW_IK_LAG_M or stall > _STOW_STALL_M
-        if (
-            not blocked
-            and ik_lag < 0.5 * _STOW_IK_LAG_M
-            and stall < 0.5 * _STOW_STALL_M
-        ):
-            stow.x_ok = stow.x
-        if blocked or stow.x <= stow.x_min:
-            if blocked:
-                stow.x = min(stow.x_ok + _STOW_BACKOFF_M, stow.goal[0][0])
-            stow.phase = "hold"
-            stow.hold_t0 = time.perf_counter()
-            _logger.info(
-                "Box stow: pulled in, %.0f mm in front of the shoulders (%s)",
-                (stow.x - (stow.x_min - float(self._config.box_stow_reach))) * 1000.0,
-                "arms stopped following"
-                if ik_lag > _STOW_IK_LAG_M
-                else "pressed against something"
-                if stall > _STOW_STALL_M
-                else "closest reach",
+            if stow.stall_base is None:
+                stow.stall_base = lag
+                return
+            if lag - stow.stall_base > _STOW_STALL_M:
+                # Pressed against something: stop short of it and hold.
+                center, rot = blend_pose(stow.start, stow.goal, stow.alpha)
+                back = np.asarray(stow.goal[0]) - np.asarray(stow.start[0])
+                norm = float(np.linalg.norm(back))
+                if norm > 1e-6:
+                    center = (center - _STOW_BACKOFF_M * back / norm).astype(np.float32)
+                stow.goal = (center, rot)
+                stow.q_goal = None
+                stow.phase = "hold"
+                stow.hold_t0 = now
+                _logger.info("Box stow: pressed against something; holding here")
+            return
+        if stow.phase == "hold":
+            held = now - stow.hold_t0
+            still = (
+                float(np.max(np.abs(q_new - np.asarray(q_current)))) < _STOW_STILL_RAD
             )
+            arrived = stow.q_goal is None or (
+                float(np.max(np.abs(q_new - stow.q_goal))) < _STOW_ARRIVED_RAD
+            )
+            if held >= _STOW_HOLD_MAX_S or (
+                held >= _STOW_HOLD_MIN_S and still and arrived
+            ):
+                stow.phase = "done"
+                if arrived:
+                    _logger.info("Box stow: done")
+                else:
+                    _logger.warning(
+                        "Box stow: done, but the arms stopped short of the "
+                        "planned pose (%.2f rad off)",
+                        float(np.max(np.abs(q_new - stow.q_goal))),
+                    )
 
     def _measured_q(self, q_current: np.ndarray) -> np.ndarray | None:
         """The arms' measured joints as a full ``q`` (``None`` if not reported)."""

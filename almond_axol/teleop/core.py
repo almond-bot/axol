@@ -486,6 +486,7 @@ class VRTeleopCore:
         self._stowing: bool = False
         self._stow_pulse: bool = False
         self._stow_leader: str | None = None
+        self._last_box_leader: str | None = None
         # Both-grips gate for the next engage. Set at startup, at rest, and by
         # every forced disengage (reset, stale stream, contact) so resuming is
         # always deliberate; cleared once engaged, so an operator who froze
@@ -1621,7 +1622,7 @@ class VRTeleopCore:
                     leader = "left"
                 elif leader is None:
                     leader = "right" if r_lock else "left"
-            else:
+            elif not self._stowing:
                 leader = None
         else:
             l_edge = l_lock and not self._prev_l_lock
@@ -1662,41 +1663,59 @@ class VRTeleopCore:
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
 
-        if enabled:
+        if enabled and not self._stowing:
+            # (A stow holds the grasp it started with.)
             self.l_grip = float(frame.l_grip)
             self.r_grip = float(frame.r_grip)
 
     def _update_stow(self, frame: object) -> None:
-        """Start the box-mode stow on an **A** press while a grip leads.
+        """Start the box-mode stow on an **A** press, led or frozen.
 
-        The stow (``IKWorker._start_stow``) squares the box in front of the
-        chest and pulls it in as far as the arms follow, ignoring the
-        leading hand; once the worker reports it done
-        (:meth:`_finish_stow`) the pair freezes, as a click of the leading
-        grip would, so the grippers stay closed while Jelly drives. A grip
-        press during the stow (a freeze or a handover) cancels it.
+        The stow (``IKWorker._start_stow``) brings the box in to the chest,
+        symmetric and level, ignoring the hands; once the worker reports it
+        done (:meth:`_finish_stow`) the pair freezes, as a click of the
+        leading grip would, so the grippers stay closed while Jelly drives.
+        Pressed with the pair frozen, it leads the pair again (with the hand
+        that led last) for the stow. The grippers hold the grasp they had at
+        the press throughout, whatever the triggers do. A grip press during
+        the stow (a freeze or a handover) cancels it.
         """
         pressed = bool(getattr(frame, "stow", False))
         edge = pressed and not self._prev_stow
         self._prev_stow = pressed
-        if not (self.teleop_enabled and self._box_leader is not None):
-            self._stowing = False
-            self._stow_pulse = False
-            return
-        if self._stowing and self._box_leader != self._stow_leader:
-            # The lead changed hands: the worker re-snapped and dropped it.
-            self._stowing = False
-        if edge and not self._stowing:
-            self._logger.info("Box stow: pulling the box in to the chest")
+        if self._box_leader is not None:
+            self._last_box_leader = self._box_leader
+        if edge and not self._stowing and self.box_mode:
+            if not self.teleop_enabled:
+                leader = self._last_box_leader or self.config.box_lead_hand
+                self._box_leader = leader
+                self.left_enabled = True
+                self.right_enabled = True
+                self._require_both_engage = False
+                self._logger.info("Teleop enabled (box stow, %s hand leads)", leader)
+                self._broadcast(True)
+            self._logger.info("Box stow: bringing the box in to the chest")
             self._stowing = True
             self._stow_pulse = True
             self._stow_leader = self._box_leader
+            return
+        if not self._stowing:
+            return
+        if not (self.teleop_enabled and self._box_leader == self._stow_leader):
+            # A grip froze the pair or handed the lead over: the stow is off.
+            self._logger.info("Box stow: cancelled")
+            self._stowing = False
+            self._stow_pulse = False
 
     def _finish_stow(self, status: dict) -> None:
-        """Freeze the pair once the worker reports the stow done."""
+        """Track the worker's stow: stop requesting it, freeze when done."""
         if not self._stowing:
             return
         phase = status.get("stow")
+        if phase is not None:
+            # The worker has it (the request repeats until it does: a frame
+            # that re-snaps the pair can't start one).
+            self._stow_pulse = False
         if phase == "done":
             self._stowing = False
             self._box_leader = None
@@ -1706,7 +1725,7 @@ class VRTeleopCore:
             self._logger.info("Box stowed: pair frozen. Press a grip to lead again.")
             self._broadcast(False)
         elif phase is None and not self._stow_pulse:
-            # The worker dropped it (a re-snap, or the pair let go).
+            self._logger.warning("Box stow: the IK worker dropped the stow")
             self._stowing = False
 
     def _unpack_solution(self, result: object) -> object:
@@ -2589,7 +2608,6 @@ class VRTeleopCore:
                         "box_stow": self._stow_pulse,
                     }
                 )
-                self._stow_pulse = False
                 # Live config changes the worker's pickled config must
                 # mirror (fire-and-forget; see run_ik_worker).
                 if self._worker_updates:

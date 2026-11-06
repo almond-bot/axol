@@ -267,17 +267,17 @@ class VRTeleopConfig:
             elbow hint steers it to this angle (at ``box_elbow_weight``).
             Live-adjustable from the settings panel and the headset menu
             (**Elbows out**).
-        box_stow_height: Box mode's stow (**A** while a grip leads the
-            pair): how far below the shoulders (m) the stowed box's centre
-            is held. The stow squares the box level and facing forward,
-            centres it between the shoulders at this height, pulls it back
-            toward the chest as far as the arms follow (or until they stall
-            against something, the box on the chest), then freezes the pair
-            for driving. The height is measured from the shoulders, so it
-            moves with Jelly's lift.
-        box_stow_reach: Closest the stow pulls the grip centre to the
-            shoulders' plane (m, forward of it). The stall check usually
-            stops it sooner.
+        box_stow_height: Box mode's stow (**A**, led or frozen): how far
+            below the shoulders (m) the stowed box's centre is held. The
+            stow squares the box level and facing forward, centres it
+            between the shoulders at this height and as close in front as
+            the arms reach, with the two arms mirror images of each other
+            and the elbows tucked toward the base, then freezes the pair for
+            driving (``IKWorker._start_stow``). The height is measured from
+            the shoulders, so it moves with Jelly's lift.
+        box_stow_reach: Closest the stow brings the box centre to the
+            shoulders' plane (m, forward of it); the plan moves it out until
+            the arms reach.
         box_stow_speed: How fast (m/s) the stow moves the box.
         box_elbow_weight: IK weight on that elbow hint (compare the
             grippers' pose weights, which box mode raises to twice
@@ -624,7 +624,7 @@ class VRTeleopConfig:
     box_align_duration: float = 1.5
     box_elbow_out: float = 0.0
     box_elbow_weight: float = 10.0
-    box_stow_height: float = 0.25
+    box_stow_height: float = 0.15
     box_stow_reach: float = 0.15
     box_stow_speed: float = 0.12
     box_wrist_torque: float = 5.0

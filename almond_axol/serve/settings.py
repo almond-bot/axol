@@ -833,7 +833,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "How far below the shoulders the box is held when you press A "
-                    "to stow it. The arms square the box up, pull it in to the "
+                    "to stow it. The arms square the box up, bring it in to the "
                     "chest at this height, then hold it so you can drive."
                 ),
                 targets={
