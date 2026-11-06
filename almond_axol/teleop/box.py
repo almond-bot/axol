@@ -147,13 +147,11 @@ URDF_TOOL = ToolGeometry()
 # Parcel gripper, measured off its CAD (Parcel_Gripper.step), in metres as
 # ``(forward, in, up)`` from the URDF gripper mount (on the flange axis, 3 mm
 # behind the flange face). The hinged plate stays at its open stop in every
-# mode, folded back along the wrist on the box side, 41.5 mm out: its outer
-# face is what the straight grasp presses flat on the box, from beside the
-# wrist to just past the hinge, full height behind the hinge and cut down
-# to 12.5 mm above the axis ahead of it.
+# mode, folded back along the wrist on the box side, 41.5 mm out, from beside
+# the wrist to just past the hinge, full height behind the hinge and cut
+# down to 12.5 mm above the axis ahead of it. Nothing else on the gripper
+# reaches that far toward the box.
 PARCEL_PLATE_IN_M = 0.0415
-PARCEL_PLATE_REAR_M = -0.0524
-PARCEL_PLATE_FRONT_M = 0.0534
 PARCEL_PLATE_HALF_HEIGHT_M = 0.0305
 PARCEL_PLATE_FRONT_TOP_M = 0.0125
 # The plate's front corner is chamfered at 39.2° to its face: turned in by
@@ -172,41 +170,63 @@ PARCEL_EDGE_FWD_M = 0.0542
 PARCEL_TIP_FWD_M = 0.1350
 PARCEL_TIP_IN_M = -0.0240
 PARCEL_TIP_HALF_HEIGHT_M = 0.0145
+# The fixed blade's flat face on the box side, ahead of the jaw body and the
+# open plate (both proud of it, toward the box, up to 66 mm ahead of the
+# mount): 20.5 mm across the mount axis from the box side, flat from 75 mm
+# to 125 mm ahead of the mount, ±30 mm high at its rear and ±18 mm near the
+# rounded tip. The straight grasp holds the box on these faces alone, the
+# box in front of the gripper bodies.
+PARCEL_BLADE_IN_M = -0.0205
+PARCEL_BLADE_REAR_M = 0.075
+PARCEL_BLADE_FRONT_M = 0.125
+PARCEL_BLADE_REAR_HALF_HEIGHT_M = 0.030
+PARCEL_BLADE_FRONT_HALF_HEIGHT_M = 0.018
 
 
 def parcel_tool(flush_deg: float, grasp: str = "flush") -> ToolGeometry:
     """Contact geometry of the parcel gripper, its plate at the open stop.
 
-    ``grasp`` ``"straight"``: the fingers straight along the box, the
-    folded plate's outer face flat on it (its four corners). ``"flush"``:
-    each gripper turned ``flush_deg`` inward (``VRTeleopConfig.box_flush_deg``,
-    39° — the chamfer's 39.2° puts the facet flat on the box), pressing with
-    the chamfer facet and the fixed blade's tip, half the clamp each (the
-    facet's top and bottom and the tip edge's). Both grasps share the foot,
-    the face-to-facet edge, so the turn between them keeps it on the box
-    side, and nothing else on the gripper reaches past either contact plane
-    — the faces may close all but together.
+    ``grasp`` ``"straight"``: the fingers straight along the box, the fixed
+    blade's flat face on it ahead of the gripper body (its four corners),
+    so the box sits in front of the bodies, held by the blades' front ends.
+    The open plate and the jaw body behind the blade face reach
+    ``PARCEL_PLATE_IN_M - PARCEL_BLADE_IN_M`` further toward the other
+    gripper (:attr:`ToolGeometry.body_in`), which sets the smallest box this
+    grasp holds. ``"flush"``: each gripper turned ``flush_deg`` inward
+    (``VRTeleopConfig.box_flush_deg``, 39° — the chamfer's 39.2° puts the
+    facet flat on the box), pressing with the plate's chamfer facet and the
+    fixed blade's tip, half the clamp each (the facet's top and bottom and
+    the tip edge's), turned about the plate's face-to-facet edge (its foot);
+    nothing else on the gripper reaches past that contact plane, so the
+    faces may close all but together. A switch between the two keeps the
+    box where it is and moves each gripper onto the other grasp's contacts
+    (see :func:`snap_box`'s ``held_tool``).
     """
-    up = PARCEL_PLATE_HALF_HEIGHT_M
     if grasp == "straight":
+        rear, front = PARCEL_BLADE_REAR_HALF_HEIGHT_M, PARCEL_BLADE_FRONT_HALF_HEIGHT_M
         patch = (
-            (PARCEL_PLATE_REAR_M, PARCEL_PLATE_IN_M, up),
-            (PARCEL_PLATE_REAR_M, PARCEL_PLATE_IN_M, -up),
-            (PARCEL_PLATE_FRONT_M, PARCEL_PLATE_IN_M, PARCEL_PLATE_FRONT_TOP_M),
-            (PARCEL_PLATE_FRONT_M, PARCEL_PLATE_IN_M, -up),
+            (PARCEL_BLADE_REAR_M, PARCEL_BLADE_IN_M, rear),
+            (PARCEL_BLADE_REAR_M, PARCEL_BLADE_IN_M, -rear),
+            (PARCEL_BLADE_FRONT_M, PARCEL_BLADE_IN_M, front),
+            (PARCEL_BLADE_FRONT_M, PARCEL_BLADE_IN_M, -front),
         )
-        tilt = 0.0
-    else:
-        tip = PARCEL_TIP_HALF_HEIGHT_M
-        patch = (
-            (PARCEL_FACET_FWD_M, PARCEL_FACET_IN_M, PARCEL_PLATE_FRONT_TOP_M),
-            (PARCEL_FACET_FWD_M, PARCEL_FACET_IN_M, -up),
-            (PARCEL_TIP_FWD_M, PARCEL_TIP_IN_M, tip),
-            (PARCEL_TIP_FWD_M, PARCEL_TIP_IN_M, -tip),
+        return ToolGeometry(
+            flush_tilt=0.0,
+            foot_fwd=PARCEL_BLADE_REAR_M,
+            foot_in=PARCEL_BLADE_IN_M,
+            patch=patch,
+            body_in=PARCEL_PLATE_IN_M - PARCEL_BLADE_IN_M,
         )
-        tilt = math.radians(flush_deg)
+    up = PARCEL_PLATE_HALF_HEIGHT_M
+    tip = PARCEL_TIP_HALF_HEIGHT_M
+    patch = (
+        (PARCEL_FACET_FWD_M, PARCEL_FACET_IN_M, PARCEL_PLATE_FRONT_TOP_M),
+        (PARCEL_FACET_FWD_M, PARCEL_FACET_IN_M, -up),
+        (PARCEL_TIP_FWD_M, PARCEL_TIP_IN_M, tip),
+        (PARCEL_TIP_FWD_M, PARCEL_TIP_IN_M, -tip),
+    )
     return ToolGeometry(
-        flush_tilt=tilt,
+        flush_tilt=math.radians(flush_deg),
         foot_fwd=PARCEL_EDGE_FWD_M,
         foot_in=PARCEL_PLATE_IN_M,
         patch=patch,
@@ -559,6 +579,7 @@ def snap_box(
     tool: ToolGeometry = URDF_TOOL,
     faces: Faces | None = None,
     rot: np.ndarray | None = None,
+    held_tool: ToolGeometry | None = None,
 ) -> BoxState:
     """Build the box state for an engage snap from the current gripper poses.
 
@@ -577,13 +598,20 @@ def snap_box(
     ``rot`` keeps a given box rotation instead of the level one
     :func:`box_frame` builds — a re-snap of a pair the leader has tipped
     (:func:`tipped_frame_holds`), so it isn't levelled under the box.
+
+    ``held_tool`` is the grasp the pair holds the box in when that differs
+    from ``tool`` (a grasp switch whose two grasps touch the box at
+    different points): the box — its centre and width — is read off
+    ``held_tool``'s feet, and each gripper then blends onto ``tool``'s
+    contacts on the same box sides.
     """
     if rot is None:
         _mounts, rot, _width = box_frame(left[0], right[0])
     rot = np.asarray(rot, dtype=np.float32)
     yaw = tilt + tool.flush_tilt
     face = choose_faces({"left": left[1], "right": right[1]}, rot, yaw, faces)
-    feet = {side: tool.foot(face[side]) for side in _SIDE_SIGN}
+    held = tool if held_tool is None else held_tool
+    feet = {side: held.foot(face[side]) for side in _SIDE_SIGN}
     foot = contact_feet(left, right, feet)
     center = (0.5 * (foot["left"] + foot["right"])).astype(np.float32)
     width = float((foot["left"] - foot["right"]) @ np.asarray(rot, np.float64)[:, 1])

@@ -174,7 +174,7 @@ _STOW_BACKOFF_M = 0.01
 # _STOW_HOLD_MIN_S and at most _STOW_HOLD_MAX_S. The frozen pair is never
 # solved again, so a stow reported done mid-swing would keep the flare.
 _STOW_STILL_RAD = 2e-3
-_STOW_ARRIVED_RAD = 0.01
+_STOW_ARRIVED_RAD = 1e-3
 _STOW_SETTLE_RAD_S = 0.3
 _STOW_HOLD_MIN_S = 0.5
 _STOW_HOLD_MAX_S = 3.0
@@ -538,6 +538,9 @@ class IKWorker:
         # Box mode (bimanual carry, see .box): the pair's state from the engage
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
+        # The grasp the pair still holds the box in after a grasp switch,
+        # until the re-snap reads the box off it (see set_config).
+        self._held_tool: ToolGeometry | None = None
         self._box_leader: str | None = None
         # The leader's anchor for the pair — its controller pose and its
         # gripper's FK at the box engage — kept apart from the per-arm snaps
@@ -1353,8 +1356,11 @@ class IKWorker:
             _logger.warning("Ignoring live update %s=%r (bad value)", key, value)
             return
         if key == "box_grasp" and coerced != current and self._box is not None:
-            # Switch grasps under a live pair:
-            # re-snap, so the arms blend into the new configuration.
+            # Switch grasps under a live pair: re-snap, so the arms blend
+            # into the new configuration. The two grasps touch the box at
+            # different points, so the box is read off the grasp it is held
+            # in (see snap_box's held_tool).
+            self._held_tool = self._box.tool
             self._box = None
         setattr(self._config, key, coerced)
 
@@ -1573,10 +1579,11 @@ class IKWorker:
         """The box-mode contact geometry for the current grasp and tool.
 
         The fitted gripper's (``config.gripper``) in the current grasp: for
-        the parcel gripper, its plate's face in ``"straight"`` and its
-        facet and tip, turned ``box_flush_deg`` inward, in ``"flush"``
-        (:func:`parcel_tool`) — the same foot in both, so a grasp switch
-        turns each gripper about it. Box mode only runs with the parcel
+        the parcel gripper, its fixed blade's front face in ``"straight"``
+        and its plate's facet and the blade's tip, turned ``box_flush_deg``
+        inward, in ``"flush"`` (:func:`parcel_tool`). A grasp switch keeps
+        the box and moves each gripper onto the new grasp's contacts (see
+        :meth:`set_config`). Box mode only runs with the parcel
         gripper; anything else gets the trivial :data:`URDF_TOOL` (the
         mounts themselves, the same in both grasps).
         """
@@ -1650,9 +1657,9 @@ class IKWorker:
         run-ahead into the clamp. A plain lateral run-ahead, though, is a
         force at the gripper *mount* plus the moment it takes to hold the
         mount's orientation against the arm's stiffness coupling — and the
-        parcel gripper touches the box with its plate's face along the
-        wrist, or its chamfer facet and the fixed blade's tip 7 cm further
-        on, so that moment can only be carried by the contacts loading
+        parcel gripper touches the box with its fixed blade's front face,
+        7.5 to 12.5 cm ahead of the mount, or its chamfer facet and the
+        blade's tip 7 cm apart, so that moment can only be carried by the contacts loading
         unevenly: the facet digs in as the tip lifts, the pinch. :func:`squeeze_lean` gives, from the
         arm's Jacobian at the commanded pose and its joint stiffness, the
         target offset (a yaw of about a degree per centimetre of depth, a
@@ -1930,6 +1937,7 @@ class IKWorker:
         self._ramp = {}
         self._clear_freeze()
         self._box = None
+        self._held_tool = None
         self._box_leader = None
         self._box_snap = None
         self._box_rot = None
@@ -2031,7 +2039,9 @@ class IKWorker:
                 tool=self._box_tool(),
                 faces=self._box_faces(),
                 rot=keep,
+                held_tool=self._held_tool,
             )
+            self._held_tool = None
             self._box_leader = leader
             self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
             self._stow = None
@@ -2218,8 +2228,13 @@ class IKWorker:
         el0 = self._solver.elbow_positions(q)
         el1 = el0 if q_goal is None else self._solver.elbow_positions(q_goal)
         _logger.info(
-            "Box stow: planned in %.1f s; moving the box in to the chest (%.1f s)",
+            "Box stow: planned in %.1f s (box %.0f mm wide, %.0f mm ahead of "
+            "the shoulders, elbows %+.0f mm outboard); moving it in (%.1f s)",
             time.perf_counter() - t_plan,
+            box.width * 1000.0,
+            (float(goal_center[0]) - float(self._shoulder_mid()[0])) * 1000.0,
+            (self._stow_elbow_out(q_goal) if q_goal is not None else float("nan"))
+            * 1000.0,
             duration,
         )
         return _Stow(
@@ -2253,11 +2268,7 @@ class IKWorker:
         """
         cfg = self._config
         solver = self._solver
-        shoulders = solver.shoulder_positions
-        mid = (
-            np.asarray(shoulders["left"], np.float64)
-            + np.asarray(shoulders["right"], np.float64)
-        ) * 0.5
+        mid = self._shoulder_mid()
         rot = np.eye(3, dtype=np.float32)
         if getattr(self, "_mink_backend", False):
             # Mink has no elbow model to plan with: the box goes straight
@@ -2318,6 +2329,14 @@ class IKWorker:
                 miss * 1000.0,
             )
         return center, q_goal
+
+    def _shoulder_mid(self) -> np.ndarray:
+        """The midpoint between the two shoulders (the stow's reference)."""
+        shoulders = self._solver.shoulder_positions
+        return (
+            np.asarray(shoulders["left"], np.float64)
+            + np.asarray(shoulders["right"], np.float64)
+        ) * 0.5
 
     def _stow_elbow_out(self, q: np.ndarray) -> float:
         """How far (m) the left elbow sits outboard of its shoulder at ``q``.
@@ -2423,9 +2442,11 @@ class IKWorker:
         where the plan put them. The plan already holds the grippers in
         their slots, so for the hold the arms move to it in joint space, at
         up to ``_STOW_SETTLE_RAD_S``, in place of the solve. Not after a
-        stall (no plan to settle onto).
+        stall (no plan to settle onto). It keeps holding the plan once the
+        stow is done, until the core (which reads the phase off the status a
+        few times a second) freezes the pair.
         """
-        if stow.phase != "hold" or stow.q_goal is None:
+        if stow.phase not in ("hold", "done") or stow.q_goal is None:
             return
         step = _STOW_SETTLE_RAD_S * delta_scale / float(self._config.ik_frequency)
         cur = np.asarray(q_current, dtype=np.float32)

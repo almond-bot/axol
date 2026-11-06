@@ -203,11 +203,13 @@ class VRTeleopConfig:
             back along the wrist on the box side at its open stop; box mode
             places its contact geometry
             (:class:`~almond_axol.teleop.box.ToolGeometry`): the straight
-            grasp presses the plate's face flat on the box, the angled grasp
-            rolls each gripper ``box_flush_deg`` inward about the plate's
-            front edge onto its chamfer facet, which then touches together
-            with the fixed blade's tip. The width is measured between the
-            contact faces in both.
+            grasp holds the box on the fixed blades' front faces, the box in
+            front of the gripper bodies (so it holds nothing narrower than
+            the open plates allow, ~13 cm), the angled grasp turns each
+            gripper ``box_flush_deg`` inward about the plate's front edge
+            onto its chamfer facet, which then touches together with the
+            fixed blade's tip. The width is measured between the contact
+            faces in both.
         box_flush_deg: Parcel gripper only: how far (degrees) box mode's
             angled (``"flush"``) grasp turns each gripper inward from the
             parallel grasp, about the folded plate's front edge. The
@@ -216,17 +218,19 @@ class VRTeleopConfig:
             stop in this grasp as everywhere else. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
-            the tool's flat face on the box — the parcel gripper's folded
-            plate, the stock gripper's closed fingers (width between the
-            mounts). ``"flush"``: for the parcel gripper, each gripper
+            the tool's flat face on the box — the parcel gripper's fixed
+            blade fronts, the box ahead of the gripper bodies; the stock
+            gripper's closed fingers (width between the mounts).
+            ``"flush"``: for the parcel gripper, each gripper
             turned ``box_flush_deg`` (39°) inward about the plate's front
             edge, the plate still at its stop and the width still measured
             between the contact faces. Toggled live while a grip is
             leading by a quick tap of either thumbstick (released within
             ~0.3 s; a longer hold runs the lift, and the both-sticks
             box-mode gesture never counts) or from the settings; the pair blends into the new grasp over
-            ``box_align_duration``, each gripper turning about that edge so
-            a box already held stays held. The tilt trim applies on top of
+            ``box_align_duration``, the box kept where it is and each
+            gripper moved onto the new grasp's contacts, so a box already
+            held stays held. The tilt trim applies on top of
             either.
         box_face_left / box_face_right: Which flat side of each gripper
             (the mount's ``"+x"`` or ``"-x"``) is turned toward the box.

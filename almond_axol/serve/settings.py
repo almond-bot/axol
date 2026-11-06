@@ -798,10 +798,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="select",
                 options=("straight", "flush"),
                 help=(
-                    "The grasp box mode starts in. straight (the default) points the "
-                    "fingers forward and measures the width between the mounts. flush "
-                    "turns each gripper 39° inward about its contact face and measures "
-                    "the width between the faces. In the headset, click either "
+                    "The grasp box mode starts in. straight (the default) holds the "
+                    "box on the front of the fixed blades, in front of the grippers. "
+                    "flush turns each gripper 39° inward. In the headset, tap either "
                     "thumbstick while leading to switch."
                 ),
                 targets={
