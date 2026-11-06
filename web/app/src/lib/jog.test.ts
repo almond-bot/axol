@@ -4,14 +4,18 @@ import {
   cancelJogMove,
   combineHold,
   describePlanError,
+  DRIVE_KEYS,
+  gamepadDrive,
   executeJogPlan,
   holdMessage,
   IDLE_HOLD,
   jointValuesFor,
+  keyDrive,
   liftJointValue,
   padCommand,
   planJogMove,
   PreviewQueue,
+  STICK_DEADZONE,
   withArmJog,
   type JogPose,
   type JogState,
@@ -35,6 +39,55 @@ describe("padCommand", () => {
   it("is zero near the centre and for a degenerate pad", () => {
     expect(padCommand(3, 3, 100)).toEqual([0, 0, 0])
     expect(padCommand(50, 50, 0)).toEqual([0, 0, 0])
+  })
+})
+
+describe("keyDrive", () => {
+  it("drives with W A S D and turns with the left and right arrows", () => {
+    expect(keyDrive(new Set())).toEqual({ pad: [0, 0, 0], turn: 0 })
+    expect(keyDrive(new Set(["KeyW"]), 0.5)).toEqual({ pad: [0.5, 0, 0], turn: 0 })
+    expect(keyDrive(new Set(["KeyS", "KeyD"]), 1).pad.map((v) => +v.toFixed(4))).toEqual([
+      -0.7071, -0.7071, 0,
+    ])
+    expect(keyDrive(new Set(["KeyA"])).pad).toEqual([0, 1, 0])
+    expect(keyDrive(new Set(["ArrowLeft"])).turn).toBe(1)
+    expect(keyDrive(new Set(["ArrowRight"])).turn).toBe(-1)
+  })
+
+  it("cancels opposite keys", () => {
+    expect(keyDrive(new Set(["KeyW", "KeyS", "ArrowLeft", "ArrowRight"]))).toEqual({
+      pad: [0, 0, 0],
+      turn: 0,
+    })
+  })
+
+  it("covers exactly the drive keys", () => {
+    expect([...DRIVE_KEYS].sort()).toEqual(
+      ["ArrowLeft", "ArrowRight", "KeyA", "KeyD", "KeyS", "KeyW"].sort()
+    )
+  })
+})
+
+describe("gamepadDrive", () => {
+  it("drives with the left stick and turns with the right stick", () => {
+    const forward = gamepadDrive([0, -1, 0, 0])
+    expect(forward.pad).toEqual([1, 0, 0])
+    expect(forward.turn).toBe(0)
+    const strafe = gamepadDrive([-1, 0, 0, 0]).pad
+    expect(strafe).toEqual([0, 1, 0])
+    expect(gamepadDrive([0, 0, 1, 0]).turn).toBe(-1)
+    expect(gamepadDrive([0, 0, -1, 0]).turn).toBe(1)
+  })
+
+  it("ignores a resting stick and ramps from the edge of the deadzone", () => {
+    expect(gamepadDrive([0.1, -0.1, 0.12, 0])).toEqual({ pad: [0, 0, 0], turn: 0 })
+    const half = gamepadDrive([0, -(STICK_DEADZONE + (1 - STICK_DEADZONE) / 2), 0, 0])
+    expect(half.pad[0]).toBeCloseTo(0.5)
+  })
+
+  it("treats a missing or broken axis as centred", () => {
+    expect(gamepadDrive([])).toEqual({ pad: [0, 0, 0], turn: 0 })
+    expect(gamepadDrive([Number.NaN, 0, Number.NaN])).toEqual({ pad: [0, 0, 0], turn: 0 })
   })
 })
 

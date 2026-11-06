@@ -27,8 +27,11 @@ import {
   cancelJogMove,
   combineHold,
   describePlanError,
+  DRIVE_KEYS,
   executeJogPlan,
+  gamepadDrive,
   IDLE_HOLD,
+  keyDrive,
   NO_TWIST,
   padCommand,
   planJogMove,
@@ -97,11 +100,20 @@ function storedSimRobot(): { model: AxolModel; gripper: GripperType } | null {
   }
 }
 
+function Kbd({ children }: { children: ReactNode }) {
+  return (
+    <kbd className="rounded border border-white/20 bg-white/[0.06] px-1 font-mono text-[10px] text-white/70">
+      {children}
+    </kbd>
+  )
+}
+
 /** A button that acts only while it is pressed, and always lets go. */
 function HoldButton({
   label,
   icon,
   disabled,
+  active,
   onHold,
   className,
   "aria-label": ariaLabel,
@@ -109,6 +121,8 @@ function HoldButton({
   label: string
   icon?: ReactNode
   disabled?: boolean
+  /** Shown pressed by another control (a key or a game controller). */
+  active?: boolean
   onHold: (held: boolean) => void
   className?: string
   "aria-label"?: string
@@ -127,7 +141,7 @@ function HoldButton({
       aria-label={ariaLabel}
       className={cn(
         "h-11 flex-1 touch-none select-none",
-        held && "border-[#eff483]/60 bg-[#eff483]/15",
+        (held || active) && "border-[#eff483]/60 bg-[#eff483]/15",
         className
       )}
       onPointerDown={(event) => {
@@ -154,10 +168,14 @@ function HoldButton({
 function DrivePad({
   disabled,
   speed,
+  shown,
   onDrive,
 }: {
   disabled: boolean
   speed: number
+  /** Drive from another control (forward, left; -1 to 1), shown on the knob
+   * while the pad itself is not held. */
+  shown: Vec3
   onDrive: (command: Vec3) => void
 }) {
   const pad = useRef<HTMLDivElement>(null)
@@ -216,10 +234,16 @@ function DrivePad({
       <span
         className={cn(
           "absolute top-1/2 left-1/2 size-12 rounded-full border transition-colors",
-          knob ? "border-[#eff483]/70 bg-[#eff483]/25" : "border-white/20 bg-white/[0.06]"
+          knob || shown[0] || shown[1]
+            ? "border-[#eff483]/70 bg-[#eff483]/25"
+            : "border-white/20 bg-white/[0.06]"
         )}
         style={{
-          transform: `translate(calc(-50% + ${knob?.[0] ?? 0}px), calc(-50% + ${knob?.[1] ?? 0}px))`,
+          // The pad is 13rem across: an outside control's full deflection
+          // puts the knob 5rem from the centre.
+          transform: knob
+            ? `translate(calc(-50% + ${knob[0]}px), calc(-50% + ${knob[1]}px))`
+            : `translate(calc(-50% + ${-shown[1] * 5}rem), calc(-50% + ${-shown[0] * 5}rem))`,
         }}
       />
     </div>
@@ -380,9 +404,34 @@ export default function Jogging() {
   const turn = useRef<-1 | 0 | 1>(0)
   const lift = useRef<-1 | 0 | 1>(0)
   const armJog = useRef<JogTwist>([...NO_TWIST])
+  // The base drive keys held down, and a game controller's sticks (unscaled).
+  const keys = useRef(new Set<string>())
+  const stick = useRef<{ pad: Vec3; turn: number }>({ pad: [0, 0, 0], turn: 0 })
+  // What the keys and the controller ask for, unscaled, for the pad's knob
+  // and the turn buttons.
+  const [otherDrive, setOtherDrive] = useState<{ pad: Vec3; turn: number }>({
+    pad: [0, 0, 0],
+    turn: 0,
+  })
   const pushHold = useCallback(() => {
-    const base = combineHold(pad.current, turn.current, lift.current, driveSpeed)
+    // The pad and turn buttons win over the controller, and the controller
+    // over the keys.
+    const keyed = keyDrive(keys.current, 1)
+    const stickDrives = stick.current.pad[0] !== 0 || stick.current.pad[1] !== 0
+    const other = {
+      pad: stickDrives ? stick.current.pad : keyed.pad,
+      turn: stick.current.turn || keyed.turn,
+    }
+    const scale = Math.max(0, Math.min(1, driveSpeed))
+    const padHeld = pad.current[0] !== 0 || pad.current[1] !== 0
+    const drive: Vec3 = padHeld ? pad.current : [other.pad[0] * scale, other.pad[1] * scale, 0]
+    const base = combineHold(drive, turn.current || other.turn, lift.current, driveSpeed)
     holdRef.current = withArmJog(base, arm, armJog.current, jogFrame, jogSpeed)
+    setOtherDrive((shown) =>
+      shown.pad[0] === other.pad[0] && shown.pad[1] === other.pad[1] && shown.turn === other.turn
+        ? shown
+        : other
+    )
   }, [driveSpeed, arm, jogFrame, jogSpeed])
   useEffect(() => pushHold(), [pushHold])
 
@@ -396,7 +445,10 @@ export default function Jogging() {
       turn.current = 0
       lift.current = 0
       armJog.current = [...NO_TWIST]
+      keys.current.clear()
+      stick.current = { pad: [0, 0, 0], turn: 0 }
       holdRef.current = { ...IDLE_HOLD }
+      setOtherDrive({ pad: [0, 0, 0], turn: 0 })
     }
     window.addEventListener("blur", releaseAll)
     document.addEventListener("visibilitychange", releaseAll)
@@ -571,6 +623,82 @@ export default function Jogging() {
   const previewError = shownPreview ? describePlanError(shownPreview) : null
   const liftState = state?.lift ?? null
   const baseState = state?.base ?? null
+  const canDrive = running && Boolean(baseState)
+  const [gamepad, setGamepad] = useState<string | null>(null)
+
+  // Drive the base from the keyboard: W A S D move, the left and right
+  // arrows turn. Typing in a field, a focused slider or menu, and shortcuts
+  // with a modifier key are left alone.
+  useEffect(() => {
+    if (!canDrive) {
+      if (keys.current.size) {
+        keys.current.clear()
+        pushHold()
+      }
+      return
+    }
+    const ownsKeys = (target: EventTarget | null) =>
+      target instanceof HTMLElement &&
+      (target.isContentEditable ||
+        target.closest(
+          "input, textarea, select, [role=slider], [role=listbox], [role=menu], [role=combobox]"
+        ) !== null)
+    const down = (event: KeyboardEvent) => {
+      if (!DRIVE_KEYS.has(event.code)) return
+      if (event.ctrlKey || event.metaKey || event.altKey || ownsKeys(event.target)) return
+      event.preventDefault()
+      if (keys.current.has(event.code)) return
+      keys.current.add(event.code)
+      pushHold()
+    }
+    const up = (event: KeyboardEvent) => {
+      if (keys.current.delete(event.code)) pushHold()
+    }
+    window.addEventListener("keydown", down)
+    window.addEventListener("keyup", up)
+    return () => {
+      window.removeEventListener("keydown", down)
+      window.removeEventListener("keyup", up)
+    }
+  }, [canDrive, pushHold])
+
+  // Drive the base from a game controller in the standard layout (a
+  // Logitech pad in XInput mode): the left stick drives, the right stick
+  // turns. It drives only while this page has focus, and lets go when the
+  // controller is unplugged.
+  useEffect(() => {
+    if (typeof navigator === "undefined" || !navigator.getGamepads) return
+    let frame = 0
+    const poll = () => {
+      frame = requestAnimationFrame(poll)
+      const pads = Array.from(navigator.getGamepads()).filter(
+        (gp): gp is Gamepad => gp !== null && gp.connected
+      )
+      const gp = pads.find((p) => p.mapping === "standard") ?? null
+      setGamepad(gp ? gp.id : pads.length ? "" : null)
+      const focused = document.hasFocus() && document.visibilityState === "visible"
+      const next =
+        gp && canDrive && focused ? gamepadDrive(gp.axes) : { pad: [0, 0, 0] as Vec3, turn: 0 }
+      const last = stick.current
+      if (
+        Math.abs(next.pad[0] - last.pad[0]) > 0.01 ||
+        Math.abs(next.pad[1] - last.pad[1]) > 0.01 ||
+        Math.abs(next.turn - last.turn) > 0.01 ||
+        (next.pad[0] === 0) !== (last.pad[0] === 0) ||
+        (next.pad[1] === 0) !== (last.pad[1] === 0) ||
+        (next.turn === 0) !== (last.turn === 0)
+      ) {
+        stick.current = next
+        pushHold()
+      }
+    }
+    frame = requestAnimationFrame(poll)
+    return () => {
+      cancelAnimationFrame(frame)
+      stick.current = { pad: [0, 0, 0], turn: 0 }
+      pushHold()
+    }
+  }, [canDrive, pushHold])
   const canMoveArm = ready && Boolean(state?.hasArms) && !executing
   const armLimited = Boolean(state?.armJog?.[arm]?.limited)
   const status = !connected
@@ -1024,8 +1152,9 @@ export default function Jogging() {
           </CardHeader>
           <div className="flex flex-wrap items-start justify-center gap-4">
             <DrivePad
-              disabled={!running || !baseState}
+              disabled={!canDrive}
               speed={driveSpeed}
+              shown={otherDrive.pad}
               onDrive={(command) => {
                 pad.current = command
                 pushHold()
@@ -1048,7 +1177,8 @@ export default function Jogging() {
                 <HoldButton
                   label="Turn left"
                   icon={<RotateCcw />}
-                  disabled={!running || !baseState}
+                  disabled={!canDrive}
+                  active={canDrive && otherDrive.turn > 0}
                   onHold={(held) => {
                     turn.current = held ? 1 : 0
                     pushHold()
@@ -1057,13 +1187,29 @@ export default function Jogging() {
                 <HoldButton
                   label="Turn right"
                   icon={<RotateCw />}
-                  disabled={!running || !baseState}
+                  disabled={!canDrive}
+                  active={canDrive && otherDrive.turn < 0}
                   onHold={(held) => {
                     turn.current = held ? -1 : 0
                     pushHold()
                   }}
                 />
               </div>
+              {robotModel === "mobile" && (
+                <div className="flex flex-col gap-1 text-[11px] text-white/45">
+                  <p>
+                    Keyboard: <Kbd>W</Kbd> <Kbd>A</Kbd> <Kbd>S</Kbd> <Kbd>D</Kbd> to drive, the left
+                    and right arrow keys to turn.
+                  </p>
+                  <p role="status">
+                    {gamepad
+                      ? "Controller connected: the left stick drives and the right stick turns."
+                      : gamepad === ""
+                        ? "This controller isn't supported. On a Logitech controller, set the switch on the back to X."
+                        : "To drive with a game controller, plug it in and press any button on it."}
+                  </p>
+                </div>
+              )}
               <div className="grid grid-cols-3 gap-2">
                 <Readout label="X" value={baseState ? `${baseState.x.toFixed(2)} m` : "–"} />
                 <Readout label="Y" value={baseState ? `${baseState.y.toFixed(2)} m` : "–"} />

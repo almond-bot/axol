@@ -150,10 +150,60 @@ export function padCommand(dx: number, dy: number, radius: number, speed = 1, de
   return [forward * scale, left * scale, 0]
 }
 
-/** Combine the drive pad and the turn buttons into one held command. */
-export function combineHold(pad: Vec3, turn: -1 | 0 | 1, lift: -1 | 0 | 1, speed = 1): JogHold {
+/** Keys that drive the base, by `KeyboardEvent.code` (the key's position, so
+ * W A S D sit in the same place on every layout): W A S D move, the left and
+ * right arrows turn in place. */
+export const DRIVE_KEYS: ReadonlySet<string> = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "ArrowLeft",
+  "ArrowRight",
+])
+
+/** The base command for the drive keys held down: a pad command (forward,
+ * left; diagonals no faster than straight) and a turn direction. */
+export function keyDrive(held: ReadonlySet<string>, speed = 1): { pad: Vec3; turn: -1 | 0 | 1 } {
+  const forward = Number(held.has("KeyW")) - Number(held.has("KeyS"))
+  const left = Number(held.has("KeyA")) - Number(held.has("KeyD"))
+  const scale = Math.max(0, Math.min(1, speed)) / (Math.hypot(forward, left) || 1)
+  const turn = (Number(held.has("ArrowLeft")) - Number(held.has("ArrowRight"))) as -1 | 0 | 1
+  return { pad: [forward * scale + 0, left * scale + 0, 0], turn }
+}
+
+/** How far a game controller stick must move before it drives (a resting
+ * stick drifts a few percent). */
+export const STICK_DEADZONE = 0.15
+
+function deadzone(value: number): number {
+  const magnitude = Math.abs(value)
+  if (!Number.isFinite(value) || magnitude <= STICK_DEADZONE) return 0
+  return (Math.sign(value) * Math.min(1, magnitude - STICK_DEADZONE)) / (1 - STICK_DEADZONE)
+}
+
+/** The base command for a game controller in the standard layout: the left
+ * stick drives (forward, left), the right stick's left and right turns.
+ * Unscaled: the speed limit applies when it is combined. */
+export function gamepadDrive(axes: readonly number[]): { pad: Vec3; turn: number } {
+  const axis = (i: number) => (Number.isFinite(axes[i]) ? axes[i] : 0)
+  const x = axis(0)
+  const y = axis(1)
+  const length = Math.hypot(x, y)
+  const radial = deadzone(length)
+  const scale = length > 0 ? radial / length : 0
+  return {
+    pad: [-y * scale + 0, -x * scale + 0, 0],
+    turn: -deadzone(axis(2)) + 0,
+  }
+}
+
+/** Combine the drive pad and the turn controls into one held command. ``turn``
+ * is -1 (right) to 1 (left). */
+export function combineHold(pad: Vec3, turn: number, lift: -1 | 0 | 1, speed = 1): JogHold {
   const scale = Math.max(0, Math.min(1, speed))
-  return { drive: [pad[0], pad[1], turn * scale], lift }
+  const clipped = Math.max(-1, Math.min(1, Number.isFinite(turn) ? turn : 0))
+  return { drive: [pad[0], pad[1], clipped * scale], lift }
 }
 
 /** Add one arm's gripper jog to a held command. */
