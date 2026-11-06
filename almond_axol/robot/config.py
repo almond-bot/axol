@@ -504,6 +504,10 @@ class PositionForceConfig:
 
 
 GripperType = Literal["parallel", "parcel"]
+
+#: wrist_3's default mass (kg, gripper included) with the parcel gripper
+#: fitted, in place of the stock gripper's ``ArmConfig().wrist_3.mass``.
+PARCEL_WRIST_3_MASS = 0.6
 GRIPPER_TYPES: tuple[str, ...] = get_args(GripperType)
 
 
@@ -1513,6 +1517,23 @@ class AxolConfig:
             raise ValueError(
                 f"gripper must be one of {list(GRIPPER_TYPES)}, got {self.gripper!r}"
             )
+        if self.gripper == "parcel" and self.has_gripper:
+            # wrist_3's mass lumps in the gripper. The coded default is the
+            # stock (parallel) gripper's; a wrist_3 still on it runs the
+            # parcel gripper's instead. Any other mass was set on purpose
+            # (panel, calibration.json, a flag) and is kept.
+            stock = ArmConfig().wrist_3.mass
+            for side in ("left", "right"):
+                arm = getattr(self, side)
+                if math.isclose(arm.wrist_3.mass, stock, abs_tol=1e-9):
+                    setattr(
+                        self,
+                        side,
+                        replace(
+                            arm,
+                            wrist_3=replace(arm.wrist_3, mass=PARCEL_WRIST_3_MASS),
+                        ),
+                    )
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.
