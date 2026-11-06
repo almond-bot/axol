@@ -468,6 +468,10 @@ COMMANDS: dict[str, CommandDef] = {
         sim_capable=True,
         entrypoint=_jog_run,
         sim_flag="sim",
+        # The Jog page shows the cameras' live video, streamed like teleop's
+        # (from the camera settings' stream branch).
+        camera_mode="teleop",
+        streams_video=True,
         # Arm gains and channels are the robot's shared settings, the same
         # ones gravity compensation and waypoints use.
         settings_like="gravity-comp",

@@ -1081,6 +1081,129 @@ def test_jog_is_a_sim_capable_operation_using_gravity_comp_settings() -> None:
     assert cfg.rate_hz == 100
 
 
+def test_jog_streams_cameras_like_teleop() -> None:
+    from almond_axol.serve.commands import COMMANDS
+
+    cmd = COMMANDS["jog"]
+    assert cmd.camera_mode == "teleop" and cmd.streams_video
+    assert not cmd.uses_headset
+
+
+def test_jog_reports_its_startup_and_becomes_ready() -> None:
+    from almond_axol import progress
+
+    tracker = progress.begin()
+    try:
+        session = JogSession(SimBackend("mobile"), _FakePlanner, rate=200.0)
+        thread, stop = _start(session)
+        try:
+            assert _wait(tracker.to_dict, 1.0)
+            assert _wait(lambda: tracker.is_ready, 5.0)
+            report = tracker.to_dict()
+            assert report["steps"] == ["arms", "ik"]
+            assert report["current"] == 1
+        finally:
+            stop.set()
+            thread.join(5)
+    finally:
+        progress.end(tracker)
+
+
+class _FakeVRServer:
+    instances: list[_FakeVRServer] = []
+
+    def __init__(self, config: Any) -> None:
+        self.expected = False
+        self.manager: Any = "unset"
+        self.open = False
+        _FakeVRServer.instances.append(self)
+
+    def set_video_expected(self, expected: bool) -> None:
+        self.expected = expected
+
+    def set_video_manager(self, manager: Any) -> None:
+        self.manager = manager
+
+    async def __aenter__(self) -> _FakeVRServer:
+        self.open = True
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.open = False
+
+
+class _FakeRelay:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def shutdown(self) -> None:
+        self.closed = True
+
+
+class _OneTickSession:
+    def __init__(self, servers: list[_FakeVRServer]) -> None:
+        self.servers = servers
+        self.ran_open = False
+
+    async def run(self, stop_event: Any) -> None:
+        await asyncio.sleep(0.05)
+        self.ran_open = all(s.open for s in self.servers)
+
+
+def _camera_cfg(**kw: Any) -> Any:
+    from almond_axol.cli.jog import JogCmdConfig
+
+    return JogCmdConfig(cameras={"overhead": 123}, **kw)
+
+
+def test_jog_streams_the_cameras_and_closes_them_after_the_session() -> None:
+    from almond_axol.cli import jog
+
+    _FakeVRServer.instances = []
+    relay = _FakeRelay()
+    session = _OneTickSession(_FakeVRServer.instances)
+    with (
+        patch("almond_axol.vr.VRServer", _FakeVRServer),
+        patch("almond_axol.cli.teleop._stereo_serials_for", return_value=set()),
+        patch("almond_axol.cli.teleop._start_video_relay", return_value=relay),
+    ):
+        asyncio.run(jog._run_with_cameras(_camera_cfg(), session, None))
+    (server,) = _FakeVRServer.instances
+    assert server.expected and server.manager is relay
+    assert session.ran_open and not server.open
+    assert relay.closed
+
+
+def test_a_camera_failure_never_stops_jogging() -> None:
+    from almond_axol.cli import jog
+
+    _FakeVRServer.instances = []
+    session = _OneTickSession(_FakeVRServer.instances)
+    with (
+        patch("almond_axol.vr.VRServer", _FakeVRServer),
+        patch("almond_axol.cli.teleop._stereo_serials_for", return_value=set()),
+        patch(
+            "almond_axol.cli.teleop._start_video_relay",
+            side_effect=RuntimeError("no ZED"),
+        ),
+    ):
+        asyncio.run(jog._run_with_cameras(_camera_cfg(), session, None))
+    (server,) = _FakeVRServer.instances
+    # Parked viewers hear there is no video, and the session still ran.
+    assert server.manager is None and session.ran_open
+
+
+def test_sim_jogging_streams_no_cameras() -> None:
+    from almond_axol.cli import jog
+
+    _FakeVRServer.instances = []
+    session = _OneTickSession([])
+    with patch("almond_axol.vr.VRServer", _FakeVRServer):
+        asyncio.run(jog._run_with_cameras(_camera_cfg(sim=True), session, None))
+        asyncio.run(jog._run_with_cameras(jog.JogCmdConfig(), session, None))
+    assert _FakeVRServer.instances == []
+
+
 class _StubSession:
     def __init__(self) -> None:
         self.holds: list[tuple[Any, ...]] = []

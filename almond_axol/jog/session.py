@@ -609,13 +609,24 @@ class JogSession:
         self._stop.set()
 
     async def run(self, stop_event: threading.Event | None = None) -> None:
-        """Run until :meth:`stop`, ``stop_event`` or cancellation."""
+        """Run until :meth:`stop`, ``stop_event`` or cancellation.
+
+        Reports its startup to the control panel (:mod:`almond_axol.progress`):
+        connecting the arms and Jelly, then the IK solver, ready once both are
+        up.
+        """
+        from .. import progress
+
         backend = self._backend
+        progress.plan(["arms", "ik"])
+        progress.step("arms")
         threading.Thread(
             target=self._build_planner, name="axol-jog-ik", daemon=True
         ).start()
         await backend.start()
         _set_active(self)
+        progress.step("ik")
+        announced = False
         try:
             if backend.has_arms:
                 left, right = await backend.arm_positions()
@@ -631,6 +642,9 @@ class JogSession:
                 started = time.monotonic()
                 elapsed = min(0.1, started - last)
                 last = started
+                if not announced and self._planner_ready.is_set():
+                    progress.ready()
+                    announced = True
                 with self._lock:
                     hold = self._effective_hold(started)
                 # A late tick moves the arms at most two ticks' worth.

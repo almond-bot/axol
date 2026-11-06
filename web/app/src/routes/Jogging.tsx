@@ -20,8 +20,10 @@ import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/ca
 import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { AppShell } from "@/components/app-shell"
-import { OperationIcon } from "@/components/operation-launcher"
+import { CameraFeeds } from "@/components/camera-feeds"
+import { OperationIcon, StartupBar } from "@/components/operation-launcher"
 import { useHostSummary } from "@/lib/host-summary"
+import { useStartupView } from "@/lib/operation-progress"
 import { catalogEntry, rememberOperation } from "@/lib/operation-catalog"
 import { cn } from "@/lib/utils"
 import {
@@ -54,6 +56,7 @@ import {
 } from "@/lib/jog"
 import { nudgePose, rpyDegrees } from "@/lib/jog-pose"
 import {
+  fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
   fetchSettings,
@@ -477,8 +480,17 @@ export default function Jogging() {
     }
   }, [])
 
+  // Where the camera video comes from: the VR server of the Host Computer.
+  const [video, setVideo] = useState<{ host: string; vrPort: number } | null>(null)
+
   useEffect(() => {
     setServerBase(localStorage.getItem("axolServerHost") ?? "")
+    const serverHost = localStorage.getItem("axolServerHost") ?? ""
+    fetchInfo()
+      .then((info) =>
+        setVideo({ host: serverHost || info.lanIp || "", vrPort: info.vrPort ?? 8000 })
+      )
+      .catch(() => setVideo({ host: serverHost, vrPort: 8000 }))
     fetchSettings()
       .then((settings) =>
         setHost({
@@ -525,6 +537,10 @@ export default function Jogging() {
   const jogSession = session?.command === "jog" ? session : null
   const otherOperation = session && session.command !== "jog" ? session.command : null
   const running = Boolean(state?.running && jogSession)
+  const jogSim = jogSession?.args?.sim === true || jogSession?.args?.sim === "true"
+  // The run's startup (connecting the arms and Jelly, warming up IK), shown
+  // as a progress bar until it is ready.
+  const startup = useStartupView(jogSession?.progress ?? null, { device: "Axol", sim: jogSim })
   const sessionMode: Mode | null = running ? (state?.mode ?? null) : null
   // The robot drawn is what the session runs, or what Start would run.
   const viewMode: Mode = sessionMode ?? mode
@@ -761,7 +777,9 @@ export default function Jogging() {
             text: sessionMode === "hardware" ? "Robot" : "Sim",
           }
         : { variant: "neutral" as const, text: "Starting" }
-      : { variant: "neutral" as const, text: "Stopped" }
+      : jogSession
+        ? { variant: "neutral" as const, text: "Starting" }
+        : { variant: "neutral" as const, text: "Stopped" }
 
   return (
     <AppShell
@@ -839,7 +857,7 @@ export default function Jogging() {
               ))}
             </Select>
           )}
-          {running ? (
+          {jogSession ? (
             <Button variant="destructive" size="lg" onClick={stop} disabled={busy === "stop"}>
               {busy === "stop" ? <Loader2 className="animate-spin" /> : <Square />}
               Stop jogging
@@ -857,6 +875,16 @@ export default function Jogging() {
           )}
         </div>
       </section>
+
+      {jogSession && startup && (
+        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
+          <StartupBar view={startup} />
+        </div>
+      )}
+
+      {running && sessionMode === "hardware" && video && (
+        <CameraFeeds host={video.host} vrPort={video.vrPort} />
+      )}
 
       {(error || linkError || hostError || otherOperation || state?.solverError) && (
         <div

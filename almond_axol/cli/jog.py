@@ -55,6 +55,13 @@ class JogCmdConfig:
     """Fastest any arm joint turns while jogging a gripper (rad/s)."""
     rate_hz: float = 125.0
     """Control-loop rate: arm commands and planned moves are streamed at it."""
+    cameras: dict[str, int] = field(default_factory=dict)
+    """Cameras streamed to the Jog page, by slot (filled from the camera
+    settings by the control panel, as for teleop)."""
+    camera_eyes: dict[str, str] = field(default_factory=dict)
+    """Which eyes a stereo camera streams, by slot."""
+    resolution: str | None = None
+    """Camera stream resolution (the camera settings' stream resolution)."""
     kd: float = 0.25
     """Gravity compensation's hand-guiding damping. Shared with gravity
     compensation's settings; jogging never hand-guides."""
@@ -138,7 +145,57 @@ def _run(cfg: JogCmdConfig, stop_event: threading.Event | None = None) -> None:
             "rate_hz and every speed must be positive and min_duration non-negative."
         )
     session = build_session(cfg)
-    asyncio.run(session.run(stop_event))
+    asyncio.run(_run_with_cameras(cfg, session, stop_event))
+
+
+async def _run_with_cameras(
+    cfg: JogCmdConfig, session: Any, stop_event: threading.Event | None
+) -> None:
+    """Run ``session``, streaming the configured cameras to the Jog page.
+
+    The page plays them over WebRTC, negotiated on the same VR server and
+    relay teleop uses (:func:`.teleop._start_video_relay`). The relay starts
+    alongside the session, since opening the cameras can take tens of
+    seconds, and a camera that fails never stops jogging. A sim run, or one
+    with no cameras, streams nothing. The VR server takes no poses: nothing
+    a headset sends moves the robot.
+    """
+    import asyncio
+
+    if cfg.sim or not cfg.cameras:
+        await session.run(stop_event)
+        return
+
+    from ..vr import VRServer
+    from ..vr.config import VRServerConfig
+    from .teleop import _start_video_relay, _stereo_serials_for
+
+    server = VRServer(VRServerConfig())
+    server.set_video_expected(True)
+    relay: Any = None
+
+    async def start_relay() -> None:
+        nonlocal relay
+        try:
+            stereo = await asyncio.to_thread(_stereo_serials_for, cfg)
+            relay = await asyncio.to_thread(_start_video_relay, cfg, stereo)
+        except Exception:  # noqa: BLE001 - jogging goes on without video
+            _logger.exception("jog: camera streaming unavailable")
+            relay = None
+        server.set_video_manager(relay)
+        if relay is not None:
+            _logger.info("jog: streaming %s", ", ".join(sorted(cfg.cameras)))
+
+    async with server:
+        cameras = asyncio.create_task(start_relay())
+        try:
+            await session.run(stop_event)
+        finally:
+            # Opening the cameras can't be interrupted: let it finish, then
+            # close them.
+            await asyncio.shield(cameras)
+            if relay is not None:
+                await asyncio.to_thread(relay.shutdown)
 
 
 def main(argv: list[str]) -> None:
