@@ -46,27 +46,28 @@ class StartPoseCheckTest(unittest.TestCase):
             check_start_pose((_arm(0, 0, 0, 30), _arm()))
 
     def test_a_joint_just_inside_the_tolerance_passes(self) -> None:
-        check_start_pose((_arm(), _arm(0, 0, -(START_POSE_TOLERANCE_DEG - 0.5))))
+        check_start_pose((_arm(), _arm(0, -(START_POSE_TOLERANCE_DEG - 0.5))))
 
     def test_a_joint_past_the_tolerance_is_refused_by_name(self) -> None:
-        with self.assertRaisesRegex(StartPoseError, "right shoulder_3") as raised:
-            check_start_pose((_arm(), _arm(0, 0, -(START_POSE_TOLERANCE_DEG + 1.0))))
+        with self.assertRaisesRegex(StartPoseError, "right shoulder_2") as raised:
+            check_start_pose((_arm(), _arm(0, -(START_POSE_TOLERANCE_DEG + 1.0))))
         self.assertIn("-26.0°", str(raised.exception))
 
     def test_every_offending_joint_is_listed(self) -> None:
-        found = start_pose_deviations((_arm(60, 0, 60), _arm(0, 0, 0, -60)))
+        found = start_pose_deviations((_arm(60, 60), _arm(0, 0, 0, -60)))
         self.assertEqual(
             [(d.side, d.joint) for d in found],
-            [("left", "shoulder_1"), ("left", "shoulder_3"), ("right", "elbow")],
+            [("left", "shoulder_1"), ("left", "shoulder_2"), ("right", "elbow")],
         )
 
-    def test_only_shoulder_1_shoulder_3_and_the_elbow_are_capped(self) -> None:
+    def test_only_shoulder_1_shoulder_2_and_the_elbow_are_capped(self) -> None:
         self.assertEqual(
             START_POSE_CHECKED_JOINTS,
-            {Joint.SHOULDER_1, Joint.SHOULDER_3, Joint.ELBOW},
+            {Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.ELBOW},
         )
-        # shoulder_2 and every wrist joint far from zero still start.
-        far = _arm(0, 90, 0, 0, -120, 90, 170)
+        # shoulder_3 (here the -26.4 deg that refused a start) and every
+        # wrist joint far from zero still start.
+        far = _arm(0, 0, -26.4, 0, -120, 90, 170)
         self.assertEqual(start_pose_deviations((far, far)), [])
         check_start_pose((far, far))
 
@@ -83,8 +84,8 @@ class StartPoseCheckTest(unittest.TestCase):
 
     def test_a_non_finite_reading_is_refused(self) -> None:
         left = _arm()
-        left[2] = np.nan
-        with self.assertRaisesRegex(StartPoseError, "left shoulder_3"):
+        left[1] = np.nan
+        with self.assertRaisesRegex(StartPoseError, "left shoulder_2"):
             check_start_pose((left, _arm()))
 
 
