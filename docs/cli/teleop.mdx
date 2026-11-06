@@ -43,7 +43,7 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed` or the stick response curve `--jelly.stick_expo`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
 | `--axol.left_stiffness S` | Left arm stiffness, from `0` (fully hand-guidable) to `1` (default, the tuned production gains). A scalar (`0.8`) or one value per joint (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`). See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
-| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5). Use `right` for the right gripper. |
+| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5, at most 5). Use `right` for the right gripper. |
 | `--axol.gripper TYPE` | Fitted gripper: `parallel` (default, the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Control panel: **Gripper** on the Robot tab. |
 | `--axol.<side>.<joint>.<gain> VALUE` | Override a per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left` or `right`, `<joint>` is `shoulder_1` to `wrist_3`, and `<gain>` is `kp`, `kd` and so on. |
 | `--teleop.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand, which helps cover the arm's full reach. |
