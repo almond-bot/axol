@@ -14,7 +14,7 @@ import multiprocessing.connection
 import os
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Sequence
 from typing import Any
 
@@ -162,10 +162,19 @@ _STOW_ELBOW_OUT_MAX_M = 0.02
 _STOW_TURN_RAD_S = math.radians(60.0)
 _STOW_JOINT_RAD_S = 0.8
 _STOW_MIN_S = 1.0
-# Once the measured grippers trail their targets by _STOW_STALL_M more than
-# they did when the move began (pressed against something: the box on the
-# chest, on hardware), the box stops _STOW_BACKOFF_M short of there.
+# The move stops short when the box is pressed against something (the
+# chest, on hardware): the measured box (the midpoint of the measured
+# grippers, so a squeeze on a clamped box cancels out) trails the commanded
+# one (the midpoint of the solved grippers, so a target the IK can't reach
+# isn't a stall) along the move by _STOW_STALL_M more than when the move
+# began, and it has moved less than _STOW_STALL_STILL_M along the move in the
+# last _STOW_STALL_WINDOW_S (an arm that lags at speed is still moving). The
+# box then stops _STOW_BACKOFF_M short of the measured one. A move shorter
+# than _STOW_STALL_MIN_MOVE_M is not watched.
 _STOW_STALL_M = 0.03
+_STOW_STALL_STILL_M = 0.005
+_STOW_STALL_WINDOW_S = 0.5
+_STOW_STALL_MIN_MOVE_M = 0.05
 _STOW_BACKOFF_M = 0.01
 # After the move the arms step onto the planned pose in joint space (at up to
 # _STOW_SETTLE_RAD_S, see _settle_stow) and it is held until they are on it —
@@ -197,6 +206,11 @@ class _Stow:
     alpha: float = 0.0
     hold_t0: float = 0.0
     stall_base: float | None = None
+    # The measured box's progress along the move when it began.
+    stall_p0: float = 0.0
+    # (time, measured box progress along the move) over the last
+    # _STOW_STALL_WINDOW_S of the move.
+    stall_trace: list[tuple[float, float]] = field(default_factory=list)
 
 
 # Squeeze lean (see IKWorker._squeeze_lean): low-pass time constant on the
@@ -2466,30 +2480,45 @@ class IKWorker:
             q_meas = self._measured_q(q_current)
             if q_meas is None:
                 return
-            measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
-            lag = max(
-                float(
-                    np.linalg.norm(
-                        np.asarray(measured[s][0]) - np.asarray(targets[s][0])
-                    )
-                )
-                for s in ("left", "right")
-            )
-            if stow.stall_base is None:
-                stow.stall_base = lag
+            start = np.asarray(stow.start[0], np.float64)
+            path = np.asarray(stow.goal[0], np.float64) - start
+            length = float(np.linalg.norm(path))
+            if length < _STOW_STALL_MIN_MOVE_M:
                 return
-            if lag - stow.stall_base > _STOW_STALL_M:
+            along = path / length
+            (ml, _), (mr, _) = self._solver.fk(q_meas)
+            (cl, _), (cr, _) = self._solver.fk(q_new)
+            meas = 0.5 * (np.asarray(ml, np.float64) + np.asarray(mr, np.float64))
+            cmd = 0.5 * (np.asarray(cl, np.float64) + np.asarray(cr, np.float64))
+            progress = float(np.dot(meas - start, along))
+            trail = float(np.dot(cmd - start, along)) - progress
+            if stow.stall_base is None:
+                stow.stall_base = trail
+                stow.stall_p0 = progress
+            trace = stow.stall_trace
+            trace.append((now, progress))
+            while len(trace) > 2 and now - trace[1][0] >= _STOW_STALL_WINDOW_S:
+                trace.pop(0)
+            still = (
+                now - trace[0][0] >= _STOW_STALL_WINDOW_S
+                and progress - trace[0][1] < _STOW_STALL_STILL_M
+            )
+            if trail - stow.stall_base > _STOW_STALL_M and still:
                 # Pressed against something: stop short of it and hold.
-                center, rot = blend_pose(stow.start, stow.goal, stow.alpha)
-                back = np.asarray(stow.goal[0]) - np.asarray(stow.start[0])
-                norm = float(np.linalg.norm(back))
-                if norm > 1e-6:
-                    center = (center - _STOW_BACKOFF_M * back / norm).astype(np.float32)
+                _, rot = blend_pose(stow.start, stow.goal, stow.alpha)
+                moved = progress - stow.stall_p0
+                stop = max(moved - _STOW_BACKOFF_M, 0.0)
+                center = (start + stop * along).astype(np.float32)
                 stow.goal = (center, rot)
                 stow.q_goal = None
                 stow.phase = "hold"
                 stow.hold_t0 = now
-                _logger.info("Box stow: pressed against something; holding here")
+                _logger.info(
+                    "Box stow: pressed against something %.0f mm into the "
+                    "%.0f mm move; holding there",
+                    moved * 1000.0,
+                    length * 1000.0,
+                )
             return
         if stow.phase == "hold":
             held = now - stow.hold_t0
@@ -3293,6 +3322,16 @@ def run_ik_worker(
     # emits a several-page traceback while racing the parent's ownership
     # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # A spawned child starts with no logging set up, so only warnings would
+    # reach stderr (the parent's log), bare. Route this module's info lines
+    # (box stow plans and stops) there too, in the parent's format.
+    if not logging.getLogger().handlers and not _logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        _logger.addHandler(handler)
+        _logger.setLevel(logging.INFO)
+        _logger.propagate = False
 
     configure_ik_process(getattr(kinematics_config, "backend", "jax"))
 
