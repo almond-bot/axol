@@ -20,6 +20,8 @@ import can
 
 from .bus import CanBus
 from .config import (
+    MYACTUATOR_FW_ENCODER_524288,
+    MYACTUATOR_FW_REVERSED,
     MYACTUATOR_FW_V44,
     MYACTUATOR_PARAMS,
     PARAM_SWEEP_RANGE,
@@ -169,8 +171,24 @@ _MA_SERIES_MAX_TORQUE: dict[int, float] = {
     8: 129.0,
 }
 
+# Variants rated below their series, keyed by (series, model suffix): the
+# third 0xB5 block carries the suffix ("RMD-X6-P20-50" -> (6, 50)).
+_MA_VARIANT_MAX_TORQUE: dict[tuple[int, int], float] = {
+    (6, 50): 50.0,
+}
+
 # Fallback when the model can't be read or its series isn't in the table above.
 _MA_DEFAULT_MAX_TORQUE = 24.0
+
+# Protocol V4.4 defines the t_ff / feedback-torque range as the motor's own
+# MAX_TORQUE parameter (0xC0 index 0x46, "Max Torque" in the vendor software),
+# not as a property of the model. The host encodes against the model's rating
+# (60 Nm on an X6-P20-60, 50 Nm on an X6-P20-50, 129 Nm on an X8-P20), so the
+# setting must match it. Firmware 2026052501 ships X6-P20s with MAX_TORQUE at
+# 1.5 (the KT_OUT value), which makes every torque command 40x weak. enable()
+# writes the rating to ROM when the setting is off by more than this fraction
+# of it.
+_MA_MAX_TORQUE_TOLERANCE = 0.05
 
 # Acceleration range in dps/s²; [100, 60000] — 0 disables ramping.
 _MA_ACC_MIN_DPS_S2 = 100
@@ -237,13 +255,48 @@ def _model_max_torque(model: str | None) -> float:
     ``8``); ``n`` selects the rated max torque from ``_MA_SERIES_MAX_TORQUE``.
     Falls back to ``_MA_DEFAULT_MAX_TORQUE`` for unknown or unreadable models.
     """
+    rated = _model_rated_torque(model)
+    return _MA_DEFAULT_MAX_TORQUE if rated is None else rated
+
+
+def _model_rated_torque(model: str | None) -> float | None:
+    """The rated max torque (Nm) of a model in ``_MA_SERIES_MAX_TORQUE``, else None."""
     if model:
-        match = re.search(r"X(\d+)", model.strip().upper())
+        match = re.search(r"X(\d+)(?:-[^-]*-(\d+))?", model.strip().upper())
         if match is not None:
-            return _MA_SERIES_MAX_TORQUE.get(
-                int(match.group(1)), _MA_DEFAULT_MAX_TORQUE
-            )
-    return _MA_DEFAULT_MAX_TORQUE
+            series = int(match.group(1))
+            if match.group(2) is not None:
+                variant = _MA_VARIANT_MAX_TORQUE.get((series, int(match.group(2))))
+                if variant is not None:
+                    return variant
+            return _MA_SERIES_MAX_TORQUE.get(series)
+    return None
+
+
+def max_torque_matches(configured: float, rated: float) -> bool:
+    """Whether a MAX_TORQUE setting is within tolerance of the model's rating."""
+    return math.isfinite(configured) and abs(configured - rated) <= (
+        _MA_MAX_TORQUE_TOLERANCE * rated
+    )
+
+
+def max_torque_mismatch(
+    channel: str, motor_id: int, model: str, configured: float, rated: float
+) -> str | None:
+    """Operator message when a V4.4 motor's MAX_TORQUE is off its model's rating.
+
+    ``None`` when the setting is within ``_MA_MAX_TORQUE_TOLERANCE`` of the
+    rating (see that constant).
+    """
+    if max_torque_matches(configured, rated):
+        return None
+    return (
+        f"Motor {motor_id:#04x} on {channel} has its max torque set to "
+        f"{configured:g} Nm, but an {model} is rated {rated:g} Nm, so its torque "
+        f"commands would be scaled wrong. Run `axol motor.set-config --channel "
+        f"{channel} --id {motor_id:#04x} --param MAX_TORQUE --value {rated:g} "
+        f"--force-protected`, then try again."
+    )
 
 
 class MyActuatorMotor(MotorDriver):
@@ -347,17 +400,20 @@ class MyActuatorMotor(MotorDriver):
         return int(struct.unpack_from("<I", resp, 4)[0])
 
     async def _read_model(self) -> str:
-        """Read the first 10 characters of the motor model string via 0xB5.
+        """Read the full motor model string via 0xB5 (e.g. ``"RMD-X6-P20-60"``).
 
-        The full model is up to 15 characters (read 5 at a time by index).
-        Two blocks are read so that the ``X<series>`` digit (e.g. ``"X6"`` in
-        ``"RMD-X6-P20"``) is always captured regardless of its position.
+        The model is up to 15 characters, read 5 at a time by index 1-3. The
+        last block carries the variant suffix (``-60`` / ``-50`` on an
+        X6-P20), which the first 10 characters leave out.
         """
-        block1 = await self._request(bytes([_MA_READ_MODEL, 0x01, 0x01, 0, 0, 0, 0, 0]))
-        block2 = await self._request(bytes([_MA_READ_MODEL, 0x01, 0x02, 0, 0, 0, 0, 0]))
-        raw = bytes(block1[3:8]) + bytes(block2[3:8])
+        raw = b""
+        for index in (0x01, 0x02, 0x03):
+            block = await self._request(
+                bytes([_MA_READ_MODEL, 0x01, index, 0, 0, 0, 0, 0])
+            )
+            raw += bytes(block[3:8])
         chars = raw.split(b"\x00", 1)[0]
-        return chars.decode("ascii", errors="ignore")
+        return chars.decode("ascii", errors="ignore").strip()
 
     async def _read_param(self, index: int) -> float:
         """Read configuration parameter ``index`` via 0xC0.
@@ -435,6 +491,91 @@ class MyActuatorMotor(MotorDriver):
         self._max_torque = _model_max_torque(model)
         self._p_max, self._t_max = mit_ranges(version, model)
 
+    async def _check_direction(self, *, fix: bool) -> None:
+        """Turn CHANGE_DIRECTION on for :data:`MYACTUATOR_FW_REVERSED` firmware.
+
+        That firmware turns the reverse of the fleet with the flag off. With
+        ``fix`` (enable(), on a cold motor) the flag is written to ROM and the
+        motor reset so it takes effect, then read back. Without it (attach(),
+        on a motor already holding) an unset flag refuses: flipping the
+        direction under a live hold would drive the joint the wrong way. A
+        motor that doesn't answer the read refuses too, since its direction
+        is unknown.
+        """
+        version = self._fw_version
+        if version is None or version < MYACTUATOR_FW_REVERSED:
+            return
+        flag = await self._read_param(MyActuatorParam.CHANGE_DIRECTION)
+        if flag == 1.0:
+            return
+        if fix:
+            await self._write_param(MyActuatorParam.CHANGE_DIRECTION, 1.0)
+            await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+            await asyncio.sleep(_MA_RESET_SETTLE_S)
+            flag = await self._read_param(MyActuatorParam.CHANGE_DIRECTION)
+            if flag == 1.0:
+                _logger.warning(
+                    "Motor %#04x on %s: turned Change Motor Direction on (firmware %d)",
+                    self._motor_id,
+                    self._bus.channel,
+                    version,
+                )
+                return
+        raise MotorError(
+            f"Motor {self._motor_id:#04x} on {self._bus.channel} runs firmware "
+            f"{version}, which turns the wrong way until Change Motor Direction "
+            f"is on. Run `axol motor.set-config --channel {self._bus.channel} "
+            f"--id {self._motor_id:#04x} --param CHANGE_DIRECTION --value 1 "
+            f"--force-protected`, power-cycle Axol, then try again."
+        )
+
+    async def _check_torque_scale(self, *, fix: bool) -> None:
+        """Bring a V4.4 motor's MAX_TORQUE to its model's rating, or refuse it.
+
+        Runs before the motor is driven, never on config access, so a
+        mismatched motor can still be dumped. With ``fix`` (enable(), on a
+        cold motor) a mismatch is written to ROM and read back, and only a
+        write that doesn't stick refuses. Without it (attach(), on a motor
+        already holding) a mismatch refuses: changing the torque scale under
+        a live hold would step its torque. Skipped on legacy firmware (fixed
+        ±24 Nm range), on models outside the rating table, and when the read
+        goes unanswered: those keep the ranges ``_detect_capabilities`` chose.
+        """
+        version, model = self._fw_version, self._model
+        if version is None or version < _MA_FW_V44_VERSION or not model:
+            return
+        rated = _model_rated_torque(model)
+        if rated is None:
+            return
+        try:
+            configured = await self._read_param(MyActuatorParam.MAX_TORQUE)
+        except MotorError:
+            return
+        if max_torque_matches(configured, rated):
+            return
+        if fix:
+            # The write takes effect in RAM at once; the commit keeps it
+            # across power cycles.
+            await self._write_param(MyActuatorParam.MAX_TORQUE, rated)
+            stored = await self._read_param(MyActuatorParam.MAX_TORQUE)
+            if max_torque_matches(stored, rated):
+                _logger.warning(
+                    "Motor %#04x on %s: set max torque from %g Nm to %g Nm, "
+                    "the rating of an %s",
+                    self._motor_id,
+                    self._bus.channel,
+                    configured,
+                    rated,
+                    model,
+                )
+                return
+            configured = stored
+        problem = max_torque_mismatch(
+            self._bus.channel, self._motor_id, model, configured, rated
+        )
+        if problem is not None:
+            raise MotorError(problem)
+
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
     # ------------------------------------------------------------------ #
@@ -456,6 +597,8 @@ class MyActuatorMotor(MotorDriver):
             await self._detect_capabilities()
         except MotorError:
             pass
+        await self._check_direction(fix=True)
+        await self._check_torque_scale(fix=True)
         await self._apply_low_voltage_threshold()
         # The joints have no brake, so there is nothing to release: the motor
         # takes torque on its first motion command. Read status 1 so a motor
@@ -469,6 +612,8 @@ class MyActuatorMotor(MotorDriver):
         # is no 0x76 reset (that reboots the motor, killing torque for ~2 s)
         # — the whole point of attach is to leave torque untouched.
         await self._detect_capabilities()
+        await self._check_direction(fix=False)
+        await self._check_torque_scale(fix=False)
         running, error_bits = await self._running_state()
         if error_bits:
             raise MotorError(
@@ -666,6 +811,19 @@ class MyActuatorMotor(MotorDriver):
         if param is MyActuatorParam.ENABLE_2ND_ENCODER and float(value).is_integer():
             resolution = _MA_2ND_ENCODER_RESOLUTION.get(int(value))
             if resolution is not None:
+                # The mode-to-resolution pairing is only known up to the
+                # firmware before MYACTUATOR_FW_ENCODER_524288; a newer motor
+                # keeps the resolution it reports instead of being rewritten.
+                await self._detect_capabilities()
+                assert self._fw_version is not None
+                if self._fw_version >= MYACTUATOR_FW_ENCODER_524288:
+                    _logger.info(
+                        "MyActuator motor %#04x: firmware %d left "
+                        "SECOND_ENCODER_RESOLUTION as the motor reports it",
+                        self._motor_id,
+                        self._fw_version,
+                    )
+                    return
                 await super().write_config(
                     MyActuatorParam.SECOND_ENCODER_RESOLUTION, resolution
                 )

@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import struct
 import unittest
+from unittest import mock
 
 import can
 
-from almond_axol.motor.config import MYACTUATOR_FW_V44, MyActuatorParam
+from almond_axol.motor import myactuator
+from almond_axol.motor.config import (
+    MYACTUATOR_FW_ENCODER_524288,
+    MYACTUATOR_FW_REVERSED,
+    MYACTUATOR_FW_V44,
+    MyActuatorParam,
+)
 from almond_axol.motor.errors import MotorError
 from almond_axol.motor.myactuator import MyActuatorMotor
 
@@ -17,6 +24,9 @@ _OLD_FW = 2025070202
 class _FakeBus:
     """Answers the handful of 0x140-series commands config access needs."""
 
+    channel = "can_alm_axol_l"
+    model = "RMD-X6-P20-60"
+
     def __init__(self, motor_id: int, firmware: int, params: dict[int, float]):
         self._id = motor_id
         self.firmware = firmware
@@ -24,18 +34,39 @@ class _FakeBus:
         self.echo_override: dict[int, int] = {}
         self.writes: list[tuple[int, float]] = []
         self.commits = 0
+        self.position_centideg = 0  # what 0x92 reports
+        self.status2 = (0, 0)  # (iq in 0.01 A, speed in dps) for 0x9C
+        self.sent: list[tuple[int, bytes]] = []
+        self.resets = 0
         self._listener = None
 
     def _add_listener(self, callback) -> None:  # type: ignore[no-untyped-def]
         self._listener = callback
 
     async def _send(self, arbitration_id: int, data: bytes) -> None:
+        self.sent.append((arbitration_id, bytes(data)))
+        if arbitration_id == 0x400 + self._id:  # MIT command: no reply here
+            return
         assert arbitration_id == 0x140 + self._id
         cmd = data[0]
-        if cmd == 0xB2:
+        if cmd == 0x76:  # system reset: no reply
+            self.resets += 1
+            return
+        if cmd == 0x92:
+            reply = bytes([0x92, 0, 0, 0]) + struct.pack("<i", self.position_centideg)
+        elif cmd == 0x9C:
+            iq, speed = self.status2
+            reply = bytes([0x9C, 25]) + struct.pack("<hhh", iq, speed, 0)
+        elif cmd == 0xA4:
+            reply = bytes([0xA4, 25, 0, 0, 0, 0, 0, 0])
+        elif cmd == 0xB2:
             reply = bytes([0xB2, 0, 0, 0]) + struct.pack("<I", self.firmware)
         elif cmd == 0xB5:
-            reply = bytes([0xB5, 0x01, data[2]]) + b"X6S2V"[:5]
+            model = self.model.encode().ljust(15, b"\x00")
+            start = (data[2] - 1) * 5
+            reply = bytes([0xB5, 0x01, data[2]]) + model[start : start + 5]
+        elif cmd == 0x9A:  # status 1: 24 V, running, no faults
+            reply = bytes([0x9A, 25, 0, 1, 0xF0, 0x00, 0, 0])
         elif cmd == 0xC1:
             self.commits += 1
             reply = bytes(data)
@@ -106,6 +137,134 @@ class MyActuatorConfigTest(unittest.IsolatedAsyncioTestCase):
         # Disabled / mode 1 leave the resolution alone, as the setup software does.
         await motor.write_config(MyActuatorParam.ENABLE_2ND_ENCODER, 0)
         self.assertEqual(bus.writes, [(0x29, 0.0)])
+
+    async def test_2nd_encoder_resolution_is_left_alone_on_newer_firmware(self) -> None:
+        motor, bus = _motor(
+            MYACTUATOR_FW_ENCODER_524288, SECOND_ENCODER_RESOLUTION=524288.0
+        )
+        await motor.write_config(MyActuatorParam.ENABLE_2ND_ENCODER, 3)
+        self.assertEqual(bus.writes, [(0x29, 3.0)])
+        self.assertEqual(
+            await motor.read_config(MyActuatorParam.SECOND_ENCODER_RESOLUTION),
+            524288.0,
+        )
+
+
+class MyActuatorModelTest(unittest.IsolatedAsyncioTestCase):
+    async def test_model_includes_the_variant_suffix(self) -> None:
+        # Same series, another variant: only the third block tells them apart.
+        motor, bus = _motor(MYACTUATOR_FW_ENCODER_524288)
+        bus.model = "RMD-X6-P20-50"
+        self.assertEqual(await motor.get_model(), "RMD-X6-P20-50")
+        bus.model = "RMD-X8-P20-120"
+        self.assertEqual(await motor.get_model(), "RMD-X8-P20-120")
+
+
+class MyActuatorTorqueScaleTest(unittest.IsolatedAsyncioTestCase):
+    """V4.4 scales MIT torque against MAX_TORQUE; bring-up checks it."""
+
+    async def test_fleet_v44_motor_at_its_rating_enables(self) -> None:
+        motor, _ = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=60.0)
+        await motor.enable()
+        await motor.attach()
+
+    async def test_enable_sets_a_low_max_torque_to_the_rating(self) -> None:
+        # Firmware 2026052501 ships X6-P20s with MAX_TORQUE at 1.5.
+        motor, bus = _motor(
+            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5, CHANGE_DIRECTION=1.0
+        )
+        await motor.enable()
+        self.assertIn((MyActuatorParam.MAX_TORQUE, 60.0), bus.writes)
+        self.assertEqual(await motor.read_config(MyActuatorParam.MAX_TORQUE), 60.0)
+
+    async def test_the_50_nm_variant_is_set_to_50(self) -> None:
+        motor, bus = _motor(
+            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=60.0, CHANGE_DIRECTION=1.0
+        )
+        bus.model = "RMD-X6-P20-50"
+        await motor.enable()
+        self.assertEqual(await motor.read_config(MyActuatorParam.MAX_TORQUE), 50.0)
+        self.assertEqual(motor._t_max, 50.0)
+
+    async def test_attach_refuses_a_low_max_torque(self) -> None:
+        # A holding motor is not rescaled under its hold.
+        motor, bus = _motor(
+            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5, CHANGE_DIRECTION=1.0
+        )
+        with self.assertRaises(MotorError) as ctx:
+            await motor.attach()
+        message = str(ctx.exception)
+        self.assertIn("1.5 Nm", message)
+        self.assertIn("rated 60 Nm", message)
+        self.assertIn(
+            "axol motor.set-config --channel can_alm_axol_l --id 0x01 "
+            "--param MAX_TORQUE --value 60 --force-protected",
+            message,
+        )
+        self.assertEqual(bus.writes, [])
+
+    async def test_legacy_firmware_skips_the_check(self) -> None:
+        motor, _ = _motor(_OLD_FW, MAX_TORQUE=1.5)
+        await motor.enable()
+        self.assertEqual(motor._t_max, 24.0)
+
+
+def _direction_writes(bus: _FakeBus) -> list[float]:
+    return [v for i, v in bus.writes if i == MyActuatorParam.CHANGE_DIRECTION]
+
+
+class MyActuatorDirectionTest(unittest.IsolatedAsyncioTestCase):
+    """Firmware 2026052501 turns the reverse way until Change Motor Direction is on."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.object(myactuator, "_MA_RESET_SETTLE_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def test_enable_turns_the_flag_on_and_resets(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
+        await motor.enable()
+        self.assertEqual(_direction_writes(bus), [1.0])
+        self.assertEqual(bus.resets, 1)
+        # Every value then goes over the wire as is.
+        bus.position_centideg = 14612
+        self.assertAlmostEqual(await motor.get_position(), 2.5502751, places=6)
+
+    async def test_flag_already_on_is_left_alone(self) -> None:
+        motor, bus = _motor(
+            MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0, CHANGE_DIRECTION=1.0
+        )
+        await motor.enable()
+        await motor.attach()
+        self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
+
+    async def test_earlier_firmware_is_not_touched(self) -> None:
+        for firmware in (_OLD_FW, MYACTUATOR_FW_V44):
+            motor, bus = _motor(firmware, MAX_TORQUE=60.0)
+            await motor.enable()
+            self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
+
+    async def test_attach_refuses_the_flag_off(self) -> None:
+        # A holding motor is not flipped under its hold.
+        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
+        with self.assertRaises(MotorError) as ctx:
+            await motor.attach()
+        self.assertIn("--param CHANGE_DIRECTION --value 1", str(ctx.exception))
+        self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
+
+    async def test_a_flag_that_does_not_stick_refuses(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
+        bus.echo_override[MyActuatorParam.CHANGE_DIRECTION] = 0x0F
+        real_send = bus._send
+
+        async def ignore_direction_writes(arbitration_id: int, data: bytes) -> None:
+            if data[0] == 0xC0 and data[2] == 0x0F and data[3] == 0x00:
+                data = bytes(data[:4]) + struct.pack("<f", 0.0)
+            await real_send(arbitration_id, data)
+
+        bus._send = ignore_direction_writes  # type: ignore[method-assign]
+        with self.assertRaises(MotorError):
+            await motor.enable()
 
 
 if __name__ == "__main__":

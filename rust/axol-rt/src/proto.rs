@@ -39,20 +39,88 @@ pub const MA_P_MAX_LEGACY: f64 = 12.5;
 pub const MA_T_MAX_LEGACY: f64 = 24.0;
 pub const MA_P_MAX_V44: f64 = 12.566;
 
+/// First MyActuator firmware (VersionDate) that turns the reverse of the
+/// fleet with Change Motor Direction off: on Axol, shoulder_3 and elbow
+/// motors running 2026052501 count down where the earlier firmware counts
+/// up. Bring-up turns the flag on for them ([`MA_PARAM_CHANGE_DIRECTION`]).
+/// Mirrors `MYACTUATOR_FW_REVERSED` in the Python driver.
+pub const MA_FW_REVERSED: u32 = 2026052501;
+
 /// `(p_max, t_max)` this firmware scales MIT command/feedback against —
 /// mirrors `mit_ranges` in the Python driver. V4.4 widens `p_max` and uses
 /// the motor's rated max torque (from the 0xB5 model's X-series token).
 pub fn ma_mit_ranges(version: Option<u32>, model: Option<&str>) -> (f64, f64) {
     if version.is_some_and(|v| v >= MA_FW_V44) {
-        let t_max = match model.and_then(model_series) {
-            Some(6) => 60.0,
-            Some(8) => 129.0,
-            _ => MA_T_MAX_LEGACY,
-        };
+        let t_max = model.and_then(ma_rated_torque).unwrap_or(MA_T_MAX_LEGACY);
         (MA_P_MAX_V44, t_max)
     } else {
         (MA_P_MAX_LEGACY, MA_T_MAX_LEGACY)
     }
+}
+
+/// Rated max torque (Nm) of a known RMD model — mirrors
+/// `_model_rated_torque`. The series sets it, except for variants rated
+/// below their series (the model suffix: `RMD-X6-P20-50` is 50 Nm).
+pub fn ma_rated_torque(model: &str) -> Option<f64> {
+    let series = model_series(model)?;
+    if series == 6 && model_variant(model) == Some(50) {
+        return Some(50.0);
+    }
+    match series {
+        6 => Some(60.0),
+        8 => Some(129.0),
+        _ => None,
+    }
+}
+
+/// The numeric suffix after the series and gearing tokens (`RMD-X6-P20-50`
+/// gives 50), or `None` when the model has none.
+fn model_variant(model: &str) -> Option<u32> {
+    let upper = model.trim().to_uppercase();
+    let start = upper.find('X')?;
+    let mut parts = upper[start..].split('-');
+    parts.next()?;
+    parts.next()?;
+    parts.next()?.parse().ok()
+}
+
+/// 0xC0 configuration access, and the index of MAX_TORQUE ("Max Torque" in
+/// the vendor software; V4.4 firmware only).
+pub const MA_PARAM_ACCESS: u8 = 0xC0;
+pub const MA_PARAM_MAX_TORQUE: u8 = 0x46;
+/// Change Motor Direction (Master Encoder dialog), 0.0 or 1.0.
+pub const MA_PARAM_CHANGE_DIRECTION: u8 = 0x0F;
+/// Commits every 0xC0 write since the last commit to ROM (empty payload).
+pub const MA_PARAM_SAVE: u8 = 0xC1;
+
+/// A 0xC0 read request for parameter `index`.
+pub fn ma_param_read(index: u8) -> [u8; 8] {
+    [MA_PARAM_ACCESS, 0x00, index, 0x01, 0, 0, 0, 0]
+}
+
+/// A 0xC0 write of `value` to parameter `index` (RAM only until 0xC1).
+pub fn ma_param_write(index: u8, value: f64) -> [u8; 8] {
+    let v = (value as f32).to_le_bytes();
+    [MA_PARAM_ACCESS, 0x00, index, 0x00, v[0], v[1], v[2], v[3]]
+}
+
+/// Decode a 0xC0 reply to a read of `index`: the float32 in bytes 4-7, or
+/// `None` when the echoed index is another parameter's (a late reply).
+pub fn ma_decode_param(data: &[u8; 8], index: u8) -> Option<f64> {
+    (data[0] == MA_PARAM_ACCESS && data[2] == index)
+        .then(|| f32::from_le_bytes([data[4], data[5], data[6], data[7]]) as f64)
+}
+
+/// Allowed gap between a V4.4 motor's MAX_TORQUE and its model's rating,
+/// as a fraction of the rating — mirrors `_MA_MAX_TORQUE_TOLERANCE`.
+pub const MA_MAX_TORQUE_TOLERANCE: f64 = 0.05;
+
+/// Whether a V4.4 motor's MAX_TORQUE setting matches its model's rating.
+/// V4.4 scales t_ff and feedback torque against the setting while the host
+/// encodes against the rating, so a mismatch means wrongly scaled torque
+/// (firmware 2026052501 ships X6s at 1.5 Nm; bring-up writes the rating).
+pub fn ma_max_torque_matches(configured: f64, rated: f64) -> bool {
+    configured.is_finite() && (configured - rated).abs() <= MA_MAX_TORQUE_TOLERANCE * rated
 }
 
 /// Extract the X-series number from a model string like `"RMD-X8-P20"`.
@@ -377,6 +445,51 @@ pub fn mit_encode(p_des: f64, v_des: f64, kp: f64, kd: f64, t_ff: f64, r: &MitRa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAX_TORQUE (0x46) replies read off the fleet: 60 on an X6-P20 and 129
+    /// on an X8-P20 running 2026042402, 1.5 on an X6-P20 running 2026052501.
+    #[test]
+    fn max_torque_reply_is_checked_against_the_model_rating() {
+        let reply = |v: f32| {
+            let b = v.to_le_bytes();
+            [0xC0, 0x00, 0x46, 0x01, b[0], b[1], b[2], b[3]]
+        };
+        assert_eq!(
+            ma_param_read(MA_PARAM_MAX_TORQUE),
+            [0xC0, 0, 0x46, 0x01, 0, 0, 0, 0]
+        );
+        let x6 = ma_rated_torque("RMD-X6-P20").unwrap();
+        let x8 = ma_rated_torque("RMD-X8-P20").unwrap();
+        assert_eq!((x6, x8), (60.0, 129.0));
+        assert_eq!(ma_rated_torque("RMD-L-7015"), None);
+        assert_eq!(ma_rated_torque("RMD-X6-P20-60"), Some(60.0));
+        assert_eq!(ma_rated_torque("RMD-X6-P20-50"), Some(50.0));
+        assert_eq!(ma_rated_torque("RMD-X8-P20-120"), Some(129.0));
+        let w = ma_param_write(MA_PARAM_MAX_TORQUE, 60.0);
+        assert_eq!(&w[..4], &[MA_PARAM_ACCESS, 0, MA_PARAM_MAX_TORQUE, 0]);
+        assert_eq!(f32::from_le_bytes([w[4], w[5], w[6], w[7]]), 60.0);
+
+        let fleet_x6 = ma_decode_param(&reply(60.0), MA_PARAM_MAX_TORQUE).unwrap();
+        let fleet_x8 = ma_decode_param(&reply(129.0), MA_PARAM_MAX_TORQUE).unwrap();
+        let new_x6 = ma_decode_param(&reply(1.5), MA_PARAM_MAX_TORQUE).unwrap();
+        assert!(ma_max_torque_matches(fleet_x6, x6));
+        assert!(ma_max_torque_matches(fleet_x8, x8));
+        assert!(!ma_max_torque_matches(new_x6, x6));
+        assert!(!ma_max_torque_matches(f64::NAN, x6));
+        // A late reply to another parameter is not taken as MAX_TORQUE.
+        let mut late = reply(60.0);
+        late[2] = 0x3E;
+        assert_eq!(ma_decode_param(&late, MA_PARAM_MAX_TORQUE), None);
+        // The ranges still come from the model table.
+        assert_eq!(
+            ma_mit_ranges(Some(2026052501), Some("RMD-X6-P20")),
+            (12.566, 60.0)
+        );
+        assert_eq!(
+            ma_mit_ranges(Some(2025070202), Some("RMD-X6-P20")),
+            (12.5, 24.0)
+        );
+    }
 
     /// jelly's right shoulder_1 at rest (2026-10-01): 0x60 answered
     /// `60 00 00 00 bb 83 ff ff` (-31813 counts) while 0x92 read -87.37°.

@@ -396,7 +396,7 @@ class MotorDriver(ABC):
     async def get_model(self) -> str | None:
         """Return the motor model string, or None if unsupported.
 
-        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``), whose
+        MyActuator: the model string read via 0xB5 (e.g. ``"RMD-X6-P20-60"``), whose
         series determines the motor's rated max torque.
         Damiao: None — not exposed by the protocol.
         """

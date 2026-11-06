@@ -75,6 +75,22 @@ class ParamSpec:
 # MIT-range change in myactuator.py and the 0x46-0x4A parameters below.
 MYACTUATOR_FW_V44 = 2026042402
 
+# First firmware seen counting the output encoder at 524288 per revolution in
+# ENABLE_2ND_ENCODER mode 3 (the shoulder_3 / elbow X6-P20s, factory-dated
+# 2026-07 on). Earlier firmware counts 131072 in that mode, which is what the
+# vendor software writes alongside it, so from here on the driver leaves the
+# resolution as the motor reports it.
+MYACTUATOR_FW_ENCODER_524288 = 2026052501
+
+# First firmware whose positive direction is the reverse of the fleet's with
+# CHANGE_DIRECTION off: on Axol, the shoulder_3 and elbow X6-P20s running
+# 2026052501 count down where 2026042402 counts up (end-stop zeroing and
+# resting angles, checked against an Axol on 2026042402). These motors also
+# report EXCHANGE_PHASE 0 and a 131072-count rotor encoder, where every earlier
+# motor reports 1 and 16384. Bring-up turns CHANGE_DIRECTION on for them, so
+# the firmware itself turns the fleet's way. Mirrors MA_FW_REVERSED in axol-rt.
+MYACTUATOR_FW_REVERSED = 2026052501
+
 # Index range worth sweeping in a raw dump. The vendor software never addresses
 # anything above 0x55, so this covers its whole parameter space.
 PARAM_SWEEP_RANGE = range(0x00, 0x60)
@@ -113,14 +129,14 @@ class MyActuatorParam(IntEnum):
     firmware line whose ``dump_config`` no longer matches, re-verify before
     trusting a write.
 
-    A handful of factory/identity fields the GUI's "Settings" tab exposes (pole
-    pairs, single-turn resolution, calibration current, phase order, encoder
-    calibration value, powerdown-save-multiturn, change-direction) are
-    intentionally absent: their indices are not in the captured screenshots and
-    could not be pinned by value. Reading an unknown index is harmless, so
-    recover them with ``dump_config(raw_range=...)`` against a motor rather than
-    guessing. The motor's zero is set by the documented 0x64 command;
-    ``MOTOR_POSITION_ZERO`` here is the raw calibration field and is protected.
+    The "Master Encoder" dialog (0x0B-0x11) was mapped in Setup Software
+    V4.0 build 260616: its Save handler reads each widget into a field and
+    writes the fields in index order, and its setup code creates each widget
+    straight after its label ("改变电机方向", Change Motor Direction, labels the
+    checkbox written to 0x0F). Checkboxes are written as float 0.0 / 1.0. The
+    same dialog's encoder-write section (0x33-0x39) is left out. The motor's
+    zero is set by the documented 0x64 command; ``MOTOR_POSITION_ZERO`` here is
+    the raw calibration field and is protected.
 
     The Motor-panel selectors were disambiguated from the read handler's widget
     calls (a read feeding a checkbox is float-tested against zero and stored as
@@ -147,6 +163,14 @@ class MyActuatorParam(IntEnum):
     MOTOR_NUMBER = 0x01
     FACTORY_TIME = 0x02
     REDUCTION_RATIO = 0x03
+    # Master Encoder dialog.
+    POWERDOWN_SAVE_MULTITURN = 0x0B
+    POLE_PAIRS = 0x0C
+    SINGLE_TURN_RESOLUTION = 0x0D
+    CALIBRATION_CURRENT = 0x0E
+    CHANGE_DIRECTION = 0x0F
+    EXCHANGE_PHASE = 0x10
+    ENCODER_CALIBRATION_VALUE = 0x11
     # Protect Parameters panel.
     OVER_VOLTAGE = 0x13
     LOW_VOLTAGE = 0x14
@@ -195,6 +219,17 @@ MYACTUATOR_PARAMS: dict[MyActuatorParam, ParamSpec] = {
     MyActuatorParam.MOTOR_NUMBER: ParamSpec("", _PROT),
     MyActuatorParam.FACTORY_TIME: ParamSpec("", _PROT),
     MyActuatorParam.REDUCTION_RATIO: ParamSpec("", _PROT),
+    # Master Encoder. Encoder calibration and commutation settings: a wrong
+    # value can stop the motor from turning, so all are protected.
+    # CHANGE_DIRECTION is 0 or 1; bring-up sets it on MYACTUATOR_FW_REVERSED
+    # firmware.
+    MyActuatorParam.POWERDOWN_SAVE_MULTITURN: ParamSpec("", _PROT),
+    MyActuatorParam.POLE_PAIRS: ParamSpec("", _PROT),
+    MyActuatorParam.SINGLE_TURN_RESOLUTION: ParamSpec("pulses", _PROT),
+    MyActuatorParam.CALIBRATION_CURRENT: ParamSpec("A", _PROT),
+    MyActuatorParam.CHANGE_DIRECTION: ParamSpec("", _PROT),
+    MyActuatorParam.EXCHANGE_PHASE: ParamSpec("", _PROT),
+    MyActuatorParam.ENCODER_CALIBRATION_VALUE: ParamSpec("", _PROT),
     # Protect Parameters.
     MyActuatorParam.OVER_VOLTAGE: ParamSpec("V"),
     MyActuatorParam.LOW_VOLTAGE: ParamSpec("V"),

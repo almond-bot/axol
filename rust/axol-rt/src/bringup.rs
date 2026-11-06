@@ -267,6 +267,7 @@ pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<Vec<String>> {
             continue;
         }
         if spec.motor_id <= 5 {
+            set_direction_flag(sock, spec)?;
             sock.send(
                 proto::MA_REQ + spec.motor_id as u16,
                 &proto::ma_cmd(proto::MA_RESET),
@@ -293,8 +294,19 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         let id = spec.motor_id;
         let version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
             .map(|(d, _)| proto::ma_decode_version(&d));
+        // The firmware decides the MIT ranges and whether the motor needs
+        // Change Motor Direction, so a motor that won't say which it runs is
+        // not driven.
+        if version.is_none() {
+            return Err(err(format!(
+                "{} (0x{id:02X}): no firmware version reply",
+                spec.joint
+            )));
+        }
         let model = read_ma_model(sock, id)?;
         let (p_max, t_max) = proto::ma_mit_ranges(version, model.as_deref());
+        check_direction(sock, iface, spec, version)?;
+        check_max_torque(sock, iface, spec, version, model.as_deref())?;
 
         let Some((s1, _)) =
             txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_STATUS1), TIMEOUT)?
@@ -457,9 +469,124 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
     Ok(motors)
 }
 
+/// Read Change Motor Direction, or `None` when the motor doesn't answer.
+fn read_direction_flag(sock: &CanSock, id: u8) -> io::Result<Option<f64>> {
+    let req = proto::ma_param_read(proto::MA_PARAM_CHANGE_DIRECTION);
+    Ok(txn::ma_request(sock, id, req, TIMEOUT)?
+        .and_then(|(d, _)| proto::ma_decode_param(&d, proto::MA_PARAM_CHANGE_DIRECTION)))
+}
+
+/// Before [`prep`]'s reset of a cold motor: turn Change Motor Direction on
+/// and commit it to ROM if the firmware is [`proto::MA_FW_REVERSED`] or
+/// later, so the reset brings the motor up turning the fleet's way.
+/// [`check_direction`] refuses the motor later if this didn't take.
+fn set_direction_flag(sock: &CanSock, spec: &MotorSpec) -> io::Result<()> {
+    let id = spec.motor_id;
+    let version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
+        .map(|(d, _)| proto::ma_decode_version(&d));
+    if !version.is_some_and(|v| v >= proto::MA_FW_REVERSED) {
+        return Ok(());
+    }
+    if read_direction_flag(sock, id)? == Some(1.0) {
+        return Ok(());
+    }
+    let write = proto::ma_param_write(proto::MA_PARAM_CHANGE_DIRECTION, 1.0);
+    txn::ma_request(sock, id, write, TIMEOUT)?;
+    txn::ma_request(sock, id, proto::ma_cmd(proto::MA_PARAM_SAVE), TIMEOUT)?;
+    eprintln!(
+        "{} (0x{id:02X}): turned Change Motor Direction on (firmware {})",
+        spec.joint,
+        version.unwrap_or(0)
+    );
+    Ok(())
+}
+
+/// Refuse a motor on [`proto::MA_FW_REVERSED`] firmware or later whose
+/// Change Motor Direction is off (or unreadable): it would turn the reverse
+/// of every other joint. [`prep`] sets the flag on cold motors.
+fn check_direction(
+    sock: &CanSock,
+    iface: &str,
+    spec: &MotorSpec,
+    version: Option<u32>,
+) -> io::Result<()> {
+    let Some(v) = version.filter(|&v| v >= proto::MA_FW_REVERSED) else {
+        return Ok(());
+    };
+    let id = spec.motor_id;
+    if read_direction_flag(sock, id)? == Some(1.0) {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{iface}: {} (0x{id:02X}) runs firmware {v}, which turns the wrong way \
+         until Change Motor Direction is on. Run `axol motor.set-config --channel \
+         {iface} --id 0x{id:02X} --param CHANGE_DIRECTION --value 1 --force-protected`, \
+         power-cycle Axol, then try again.",
+        spec.joint
+    )))
+}
+
+/// Bring a V4.4 motor's MAX_TORQUE to its model's rating (see
+/// `proto::ma_max_torque_matches`) before it is driven: a mismatch is
+/// written, committed to ROM and read back. A motor found holding is refused
+/// instead, since changing the torque scale under a live hold steps its
+/// torque, and so is one whose write doesn't stick. Legacy firmware, models
+/// outside the rating table and an unanswered read pass, as in the Python
+/// driver.
+fn check_max_torque(
+    sock: &CanSock,
+    iface: &str,
+    spec: &MotorSpec,
+    version: Option<u32>,
+    model: Option<&str>,
+) -> io::Result<()> {
+    if !version.is_some_and(|v| v >= proto::MA_FW_V44) {
+        return Ok(());
+    }
+    let Some((model, rated)) = model.and_then(|m| proto::ma_rated_torque(m).map(|r| (m, r))) else {
+        return Ok(());
+    };
+    let id = spec.motor_id;
+    let read = |sock: &CanSock| -> io::Result<Option<f64>> {
+        let req = proto::ma_param_read(proto::MA_PARAM_MAX_TORQUE);
+        Ok(txn::ma_request(sock, id, req, TIMEOUT)?
+            .and_then(|(d, _)| proto::ma_decode_param(&d, proto::MA_PARAM_MAX_TORQUE)))
+    };
+    let Some(mut configured) = read(sock)? else {
+        return Ok(());
+    };
+    if proto::ma_max_torque_matches(configured, rated) {
+        return Ok(());
+    }
+    if !is_holding(sock, spec)? {
+        let write = proto::ma_param_write(proto::MA_PARAM_MAX_TORQUE, rated);
+        txn::ma_request(sock, id, write, TIMEOUT)?;
+        txn::ma_request(sock, id, proto::ma_cmd(proto::MA_PARAM_SAVE), TIMEOUT)?;
+        let stored = read(sock)?.unwrap_or(f64::NAN);
+        if proto::ma_max_torque_matches(stored, rated) {
+            eprintln!(
+                "{iface}: {} (0x{id:02X}): set max torque from {} Nm to {rated} Nm, \
+                 the rating of an {model}",
+                spec.joint, configured as f32
+            );
+            return Ok(());
+        }
+        configured = stored;
+    }
+    Err(io::Error::other(format!(
+        "{iface}: {} (0x{id:02X}) has its max torque set to {} Nm, but an \
+         {model} is rated {rated} Nm, so its torque commands would be scaled wrong. \
+         Run `axol motor.set-config --channel {iface} --id 0x{id:02X} --param MAX_TORQUE \
+         --value {rated} --force-protected`, then try again.",
+        spec.joint, configured as f32
+    )))
+}
+
+/// The full 0xB5 model string, up to 15 characters in three 5-character
+/// blocks (e.g. `RMD-X6-P20-60`; the last block holds the variant suffix).
 pub fn read_ma_model(sock: &CanSock, motor_id: u8) -> io::Result<Option<String>> {
     let mut raw = Vec::new();
-    for block in [0x01u8, 0x02] {
+    for block in [0x01u8, 0x02, 0x03] {
         let req = [proto::MA_READ_MODEL, 0x01, block, 0, 0, 0, 0, 0];
         match txn::ma_request(sock, motor_id, req, TIMEOUT)? {
             Some((d, _)) => raw.extend_from_slice(&proto::ma_decode_model_block(&d)),
