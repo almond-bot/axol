@@ -9,7 +9,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}max_step_rad</F> | `0.5` | Largest joint move (rad) allowed between two consecutive commands. Bigger moves are dropped with a warning. `inf` disables. |
 | <F>--{prefix}controller</F> | `impedance` | Control law for the arms. `impedance` is compliant and runs at 240 Hz, and `position` hands each joint to its motor's own position loop at 400 Hz (see the notes below). |
 | <F>--{prefix}impedance_hz</F> | `240.0` | Command rate (Hz) of the MyActuator impedance joints: `240.0` or the experimental `480.0`. The gains were tuned at 240 Hz. |
-| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm). |
+| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm), at most `5`. |
 | <F>--{prefix}left.gripper.max_speed</F> | `10.0` | Maximum gripper speed (rad/s). |
 | <F>--{prefix}left.elbow.kp</F> | per joint | Position stiffness of one joint at stiffness `1`, in `[0, 500]`. |
 | <F>--{prefix}left.elbow.kd</F> | per joint | Velocity damping in the motor firmware, in `[0, 5]`. |
