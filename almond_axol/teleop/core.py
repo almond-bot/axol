@@ -136,6 +136,11 @@ _HAPTIC_NEAR_DEADBAND = 0.2
 # (when that is below ``config.haptic_torque``) and is full at the cap: a
 # joint held at its cap, the one that heats up, rumbles at full strength.
 _HAPTIC_CAP_START = 0.8
+# Grip catch (see VRTeleopCore._follow_trigger): when an arm engages with its
+# trigger more open than its gripper's grasp by more than this (opening,
+# 0 closed to 1 open), the gripper keeps its grasp until the trigger is
+# squeezed back to within this of it.
+_GRIP_CATCH_TOL = 0.03
 # Held-load estimate (see HeldLoad): the commanded gripper opening (0 closed,
 # 1 open) below which a gripper counts as holding, the fraction of
 # ``config.haptic_torque`` a held-load fit may leave unexplained on a joint,
@@ -442,6 +447,12 @@ class VRTeleopCore:
         self.right_indices: list[int] = []
         self.l_grip: float = 0.0
         self.r_grip: float = 0.0
+        # Per gripper: waiting for its trigger to catch the grasp it held
+        # while its arm was frozen (see _follow_trigger).
+        self._grip_catch: dict[str, bool] = {"left": False, "right": False}
+        # Per gripper: whether its trigger has set its grasp yet this session
+        # (before that the grasp is only a seed, nothing to keep).
+        self._grip_driven: dict[str, bool] = {"left": False, "right": False}
 
         # Target playback segment: IK solutions arrive at the (irregular)
         # solve cadence, and tracking the newest one latest-wins makes the
@@ -1586,10 +1597,40 @@ class VRTeleopCore:
 
         # Only track a gripper while its arm is engaged, so a frozen arm's
         # grasp (and a disengaged session) can't be actuated by the trigger.
-        if self.left_enabled:
-            self.l_grip = frame.l_grip
-        if self.right_enabled:
-            self.r_grip = frame.r_grip
+        self._follow_trigger("left", self.left_enabled, was_left, frame.l_grip)
+        self._follow_trigger("right", self.right_enabled, was_right, frame.r_grip)
+
+    def _follow_trigger(
+        self, side: str, engaged: bool, was_engaged: bool, value: float
+    ) -> None:
+        """Set ``side``'s gripper from its trigger while its arm is engaged.
+
+        An arm engaging with its trigger more open than its gripper's grasp
+        (the grip button clicked to re-engage a frozen arm holding something,
+        the trigger let go) would open the gripper at once and drop what it
+        holds. Instead the gripper keeps its grasp until the trigger is
+        squeezed back to it (within ``_GRIP_CATCH_TOL``) and follows it from
+        there: letting the trigger out then opens it. A trigger already at
+        or past the grasp takes over at once, as does the first engage of
+        the session (the grasp is only a seed until a trigger has set it).
+        """
+        value = float(value)
+        held = self.l_grip if side == "left" else self.r_grip
+        if engaged and not was_engaged:
+            self._grip_catch[side] = (
+                self._grip_driven[side] and value > held + _GRIP_CATCH_TOL
+            )
+        if not engaged:
+            return
+        if self._grip_catch[side]:
+            if value > held + _GRIP_CATCH_TOL:
+                return
+            self._grip_catch[side] = False
+        self._grip_driven[side] = True
+        if side == "left":
+            self.l_grip = value
+        else:
+            self.r_grip = value
 
     def _ack_lock_release(self, frame: object, l_lock: bool, r_lock: bool) -> None:
         """Acknowledge a managed tracker bridge's lock-release request.
@@ -1680,10 +1721,11 @@ class VRTeleopCore:
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
 
-        if enabled and not self._stowing:
-            # (A stow holds the grasp it started with.)
-            self.l_grip = float(frame.l_grip)
-            self.r_grip = float(frame.r_grip)
+        if not self._stowing:
+            # (A stow holds the grasp it started with.) Engaging the pair
+            # keeps each grasp until its trigger catches it.
+            self._follow_trigger("left", enabled, was_enabled, frame.l_grip)
+            self._follow_trigger("right", enabled, was_enabled, frame.r_grip)
 
     def _update_stow(self, frame: object) -> None:
         """Start the box-mode stow on an **A** press, led or frozen.

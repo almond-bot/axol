@@ -74,6 +74,7 @@ A small 3D model of Axol stands below the overhead camera screen. It shows where
 
 - Press both grips together to start tracking.
 - Click one grip to freeze that arm. It holds its pose and its grip, so it can steady an object while the other arm works. Click the grip again to resume.
+- A resumed arm's gripper keeps its grip until you squeeze the trigger to the same point. From there it follows the trigger again, so letting the trigger out opens it.
 - A reset, a [contact stop](/operations/teleop) or a dropped link disengages both arms. Press both grips to engage again.
 
 With **Hold grips to engage** turned on in the control panel (`--teleop.hold_to_engage true`), each grip is a dead-man switch. Hold a grip to move its arm, and release it to freeze the arm. Either grip engages its own arm, including from rest. After a forced disengage, release a grip you are still holding before it engages again.
