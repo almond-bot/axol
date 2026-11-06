@@ -57,6 +57,11 @@ const TOOLS_NAV: NavItem[] = [
 /** Live state shown next to a nav item (e.g. a running operation). */
 export type NavBadges = Partial<Record<string, "running" | "attention">>
 
+/** Where a nav item leads for now, keyed by its own path (e.g. Operations
+ *  opens the running operation). The item still shows as current anywhere
+ *  in its section. */
+export type NavTargets = Partial<Record<string, string>>
+
 export type HostSummary = {
   dot: StatusDot
   label: string
@@ -73,48 +78,50 @@ export type SubNavItem = { to: string; label: string }
 function SidebarLink({
   item,
   badge,
+  target,
   onNavigate,
 }: {
   item: NavItem
   badge?: "running" | "attention"
+  /** Where the link goes, when not to the item's own page. */
+  target?: string
   onNavigate?: () => void
 }) {
   const Icon = item.icon
+  const { pathname } = useLocation()
+  // Current anywhere in the item's section, wherever the link points.
+  const inSection = item.end
+    ? pathname === item.to
+    : pathname === item.to || pathname.startsWith(`${item.to}/`)
   return (
-    <NavLink
-      to={item.to}
-      end={item.end}
+    <Link
+      to={target ?? item.to}
       onClick={onNavigate}
-      className={({ isActive }) =>
-        cn(
-          "group flex h-9 items-center gap-3 rounded-lg px-3 text-sm transition-colors",
-          isActive
-            ? "bg-white/[0.07] text-white"
-            : "text-white/55 hover:bg-white/[0.04] hover:text-white/90"
-        )
-      }
-    >
-      {({ isActive }) => (
-        <>
-          <Icon
-            className={cn(
-              "size-4 shrink-0",
-              isActive ? "text-[#eff483]" : "text-white/40 group-hover:text-white/70"
-            )}
-          />
-          <span className="min-w-0 flex-1 truncate">{item.label}</span>
-          {badge === "running" && (
-            <span
-              className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-400"
-              title="Running"
-            />
-          )}
-          {badge === "attention" && (
-            <span className="size-2 shrink-0 rounded-full bg-amber-400" title="Needs attention" />
-          )}
-        </>
+      aria-current={inSection ? "page" : undefined}
+      className={cn(
+        "group flex h-9 items-center gap-3 rounded-lg px-3 text-sm transition-colors",
+        inSection
+          ? "bg-white/[0.07] text-white"
+          : "text-white/55 hover:bg-white/[0.04] hover:text-white/90"
       )}
-    </NavLink>
+    >
+      <Icon
+        className={cn(
+          "size-4 shrink-0",
+          inSection ? "text-[#eff483]" : "text-white/40 group-hover:text-white/70"
+        )}
+      />
+      <span className="min-w-0 flex-1 truncate">{item.label}</span>
+      {badge === "running" && (
+        <span
+          className="size-2 shrink-0 animate-pulse rounded-full bg-emerald-400"
+          title="Running"
+        />
+      )}
+      {badge === "attention" && (
+        <span className="size-2 shrink-0 rounded-full bg-amber-400" title="Needs attention" />
+      )}
+    </Link>
   )
 }
 
@@ -143,11 +150,13 @@ function SubNav({ items, onNavigate }: { items: SubNavItem[]; onNavigate?: () =>
 
 function SidebarContents({
   badges,
+  navTargets,
   subNav,
   onNavigate,
   onQuickstart,
 }: {
   badges?: NavBadges
+  navTargets?: NavTargets
   subNav?: { under: string; items: SubNavItem[] }
   onNavigate?: () => void
   onQuickstart: () => void
@@ -156,7 +165,12 @@ function SidebarContents({
     "flex h-8 items-center gap-3 rounded-lg px-3 text-[0.8rem] text-white/45 transition-colors hover:bg-white/[0.04] hover:text-white/85"
   const renderItem = (item: NavItem) => (
     <div key={item.to}>
-      <SidebarLink item={item} badge={badges?.[item.to]} onNavigate={onNavigate} />
+      <SidebarLink
+        item={item}
+        badge={badges?.[item.to]}
+        target={navTargets?.[item.to]}
+        onNavigate={onNavigate}
+      />
       {subNav?.under === item.to && <SubNav items={subNav.items} onNavigate={onNavigate} />}
     </div>
   )
@@ -241,6 +255,7 @@ export function AppShell({
   actions,
   notices,
   badges,
+  navTargets,
   host,
   subNav,
   wide = false,
@@ -255,6 +270,8 @@ export function AppShell({
   /** Alerts shown above every page of a section (updates, lockouts). */
   notices?: ReactNode
   badges?: NavBadges
+  /** Where a nav item leads for now, when not to its own page. */
+  navTargets?: NavTargets
   host?: HostSummary
   /** Sub-pages of one section, listed under its sidebar item. */
   subNav?: { under: string; items: SubNavItem[] }
@@ -284,6 +301,7 @@ export function AppShell({
 
   const sidebarProps = {
     badges,
+    navTargets,
     subNav,
     onQuickstart: () => setQuickstartOpen(true),
   }

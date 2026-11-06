@@ -72,6 +72,7 @@ describe("operationStatus", () => {
     [{ otherRunning: true }, "Another operation is running"],
     [{ needsMount: true, hasCameras: false }, "Choose a mount"],
     [{ hasCameras: false }, "Assign cameras"],
+    [{ robotProblem: "Turn on Axol", hasCameras: false }, "Turn on Axol"],
   ])("says what blocks it: %j", (patch, label) => {
     expect(operationStatus({ ...base, ...patch }).label).toBe(label)
   })

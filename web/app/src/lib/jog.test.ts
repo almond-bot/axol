@@ -1,0 +1,366 @@
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { Euler, Quaternion, Vector3 } from "three"
+import {
+  cancelJogMove,
+  combineHold,
+  describePlanError,
+  DRIVE_KEYS,
+  gamepadControls,
+  executeJogPlan,
+  holdMessage,
+  IDLE_HOLD,
+  jointValuesFor,
+  keyDrive,
+  liftJointValue,
+  NO_TWIST,
+  padCommand,
+  planJogMove,
+  PreviewQueue,
+  STICK_DEADZONE,
+  withArmJog,
+  type JogPose,
+  type JogState,
+} from "./jog"
+import { nudgePose, rpyDegrees } from "./jog-pose"
+
+describe("padCommand", () => {
+  it("maps screen up to forward and screen left to +y", () => {
+    expect(padCommand(0, -100, 100)).toEqual([1, -0, 0])
+    const [vx, vy] = padCommand(-100, 0, 100)
+    expect(vx).toBeCloseTo(0)
+    expect(vy).toBeCloseTo(1)
+  })
+
+  it("clips to the unit circle and applies the speed limit", () => {
+    const [vx, vy] = padCommand(-300, -300, 100, 0.5)
+    expect(Math.hypot(vx, vy)).toBeCloseTo(0.5)
+    expect(vx).toBeCloseTo(vy)
+  })
+
+  it("is zero near the centre and for a degenerate pad", () => {
+    expect(padCommand(3, 3, 100)).toEqual([0, 0, 0])
+    expect(padCommand(50, 50, 0)).toEqual([0, 0, 0])
+  })
+})
+
+describe("keyDrive", () => {
+  it("drives with W A S D and turns with the left and right arrows", () => {
+    expect(keyDrive(new Set())).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
+    expect(keyDrive(new Set(["KeyW"]), 0.5)).toEqual({ pad: [0.5, 0, 0], turn: 0, lift: 0 })
+    expect(keyDrive(new Set(["KeyS", "KeyD"]), 1).pad.map((v) => +v.toFixed(4))).toEqual([
+      -0.7071, -0.7071, 0,
+    ])
+    expect(keyDrive(new Set(["KeyA"])).pad).toEqual([0, 1, 0])
+    expect(keyDrive(new Set(["ArrowLeft"])).turn).toBe(1)
+    expect(keyDrive(new Set(["ArrowRight"])).turn).toBe(-1)
+  })
+
+  it("raises and lowers the lift with the up and down arrows", () => {
+    expect(keyDrive(new Set(["ArrowUp"])).lift).toBe(1)
+    expect(keyDrive(new Set(["ArrowDown"])).lift).toBe(-1)
+    expect(keyDrive(new Set(["ArrowUp", "ArrowDown"])).lift).toBe(0)
+  })
+
+  it("cancels opposite keys", () => {
+    expect(keyDrive(new Set(["KeyW", "KeyS", "ArrowLeft", "ArrowRight"]))).toEqual({
+      pad: [0, 0, 0],
+      turn: 0,
+      lift: 0,
+    })
+  })
+
+  it("covers exactly the drive keys", () => {
+    expect([...DRIVE_KEYS].sort()).toEqual(
+      ["ArrowDown", "ArrowLeft", "ArrowRight", "ArrowUp", "KeyA", "KeyD", "KeyS", "KeyW"].sort()
+    )
+  })
+})
+
+describe("gamepadControls", () => {
+  const pressed = (...on: number[]) =>
+    Array.from({ length: 17 }, (_, i) => ({ pressed: on.includes(i) }))
+  const triggers = (lt: number, rt: number) =>
+    Array.from({ length: 17 }, (_, i) => {
+      const value = i === 6 ? lt : i === 7 ? rt : 0
+      return { pressed: value > 0.1, value }
+    })
+
+  it("drives Jelly with the left stick and turns with the right stick", () => {
+    const forward = gamepadControls([0, -1, 0, 0])
+    expect(forward.mode).toBe("drive")
+    expect(forward.drive).toEqual({ pad: [1, 0, 0], turn: 0, lift: 0 })
+    expect(forward.twist).toEqual([...NO_TWIST])
+    expect(gamepadControls([-1, 0, 0, 0]).drive.pad).toEqual([0, 1, 0])
+    expect(gamepadControls([0, 0, 1, 0]).drive.turn).toBe(-1)
+    expect(gamepadControls([0, 0, -1, 0]).drive.turn).toBe(1)
+  })
+
+  it("moves the gripper while LT is held, and the base stays still", () => {
+    const up = gamepadControls([0, -1, 0, -1], triggers(1, 0))
+    expect(up.mode).toBe("move")
+    expect(up.twist).toEqual([1, 0, 1, 0, 0, 0])
+    expect(up.drive.pad).toEqual([0, 0, 0])
+    expect(up.drive.turn).toBe(0)
+    expect(gamepadControls([-1, 0, 0, 0], triggers(1, 0)).twist).toEqual([0, 1, 0, 0, 0, 0])
+  })
+
+  it("turns the gripper while RT is held", () => {
+    const turned = gamepadControls([1, 0, 0, 0], triggers(0, 1))
+    expect(turned.mode).toBe("turn")
+    expect(turned.twist).toEqual([0, 0, 0, 1, 0, 0])
+    expect(gamepadControls([0, -1, 0, 0], triggers(0, 1)).twist).toEqual([0, 0, 0, 0, 1, 0])
+    expect(gamepadControls([0, 0, 1, 0], triggers(0, 1)).twist).toEqual([0, 0, 0, 0, 0, -1])
+    // LT wins when both are held.
+    expect(gamepadControls([0, 0, 0, 0], triggers(1, 1)).mode).toBe("move")
+  })
+
+  it("needs a trigger past half travel, and ignores the shoulder buttons", () => {
+    expect(gamepadControls([0, -1, 0, 0], triggers(0.3, 0.4)).mode).toBe("drive")
+    expect(gamepadControls([0, -1, 0, 0], triggers(0.6, 0)).mode).toBe("move")
+    expect(gamepadControls([0, -1, 0, 0], pressed(4, 5)).mode).toBe("drive")
+  })
+
+  it("runs the lift and picks the arm with the D-pad", () => {
+    expect(gamepadControls([0, 0, 0, 0], pressed(12)).drive.lift).toBe(1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(13)).drive.lift).toBe(-1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(12, 13)).drive.lift).toBe(0)
+    expect(gamepadControls([0, 0, 0, 0], pressed(4, 12)).drive.lift).toBe(1)
+    expect(gamepadControls([0, 0, 0, 0], pressed(14)).pick).toBe("left")
+    expect(gamepadControls([0, 0, 0, 0], pressed(15)).pick).toBe("right")
+    expect(gamepadControls([0, 0, 0, 0]).pick).toBeNull()
+  })
+
+  it("ignores a resting stick and ramps from the edge of the deadzone", () => {
+    const resting = gamepadControls([0.1, -0.1, 0.12, -0.1], triggers(1, 0))
+    expect(resting.twist).toEqual([...NO_TWIST])
+    expect(gamepadControls([0.1, -0.1, 0.12, 0]).drive).toEqual({
+      pad: [0, 0, 0],
+      turn: 0,
+      lift: 0,
+    })
+    const half = gamepadControls([0, -(STICK_DEADZONE + (1 - STICK_DEADZONE) / 2), 0, 0])
+    expect(half.drive.pad[0]).toBeCloseTo(0.5)
+  })
+
+  it("treats a missing or broken axis as centred", () => {
+    expect(gamepadControls([]).drive).toEqual({ pad: [0, 0, 0], turn: 0, lift: 0 })
+    const broken = gamepadControls([Number.NaN, 0, Number.NaN, Number.NaN], triggers(1, 0))
+    expect(broken.twist).toEqual([...NO_TWIST])
+  })
+})
+
+describe("combineHold", () => {
+  it("carries the pad, a scaled turn and the lift direction", () => {
+    expect(combineHold([0.4, -0.2, 0], 1, -1, 0.5)).toEqual({ drive: [0.4, -0.2, 0.5], lift: -1 })
+    expect(combineHold([0, 0, 0], 0, 0)).toEqual({ drive: [0, 0, 0], lift: 0 })
+  })
+})
+
+describe("withArmJog", () => {
+  it("adds one arm's twist, frame and speed to the held command", () => {
+    const hold = withArmJog(
+      combineHold([0.2, 0, 0], 0, 1),
+      "right",
+      [0, 0, 1, 0, 0, -1],
+      "gripper",
+      0.5
+    )
+    expect(hold).toEqual({
+      drive: [0.2, 0, 0],
+      lift: 1,
+      arms: { right: [0, 0, 1, 0, 0, -1] },
+      armFrame: "gripper",
+      armSpeed: 0.5,
+    })
+  })
+
+  it("clips the twist and speed and fills missing axes", () => {
+    const hold = withArmJog(IDLE_HOLD, "left", [3, -3, Number.NaN], "torso", 7)
+    expect(hold.arms?.left).toEqual([1, -1, 0, 0, 0, 0])
+    expect(hold.armSpeed).toBe(1)
+    expect(withArmJog(IDLE_HOLD, "left", [], "torso", -1).armSpeed).toBe(0)
+  })
+
+  it("goes out on the hold message, and a plain hold stays as it was", () => {
+    const hold = withArmJog(IDLE_HOLD, "left", [0, 1, 0, 0, 0, 0], "torso", 0.3)
+    expect(holdMessage(hold)).toEqual({
+      type: "hold",
+      drive: [0, 0, 0],
+      lift: 0,
+      arms: { left: [0, 1, 0, 0, 0, 0] },
+      armFrame: "torso",
+      armSpeed: 0.3,
+    })
+    expect(holdMessage(IDLE_HOLD)).toEqual({ type: "hold", drive: [0, 0, 0], lift: 0 })
+  })
+})
+
+describe("PreviewQueue", () => {
+  const pose = (x: number): JogPose => ({ position: [x, 0, 0], quaternion: [0, 0, 0, 1] })
+
+  it("keeps one request on the wire and sends only the latest target next", () => {
+    const queue = new PreviewQueue(1000)
+    expect(queue.next(0)).toBeNull()
+    queue.request("left", pose(1))
+    expect(queue.next(0)).toMatchObject({ type: "preview", seq: 1, position: [1, 0, 0] })
+    queue.request("left", pose(2))
+    queue.request("left", pose(3))
+    expect(queue.next(10)).toBeNull() // still waiting for seq 1
+    expect(queue.answer(1)).toBe(true)
+    expect(queue.next(20)).toMatchObject({ seq: 3, position: [3, 0, 0] })
+    expect(queue.next(30)).toBeNull()
+  })
+
+  it("never shows an older answer over a newer one, nor a failed one", () => {
+    const queue = new PreviewQueue(1000)
+    queue.request("left", pose(1))
+    queue.next(0)
+    queue.request("left", pose(2))
+    expect(queue.answer(1, true)).toBe(false)
+    queue.next(1)
+    expect(queue.answer(2)).toBe(true)
+    expect(queue.answer(1)).toBe(false)
+  })
+
+  it("gives up on a lost answer after the timeout, and on a dropped link", () => {
+    const queue = new PreviewQueue(100)
+    queue.request("right", pose(1))
+    queue.next(0)
+    queue.request("right", pose(2))
+    expect(queue.next(50)).toBeNull()
+    expect(queue.next(150)).toMatchObject({ seq: 2, arm: "right" })
+    queue.request("right", pose(3))
+    queue.reconnected()
+    expect(queue.next(160)).toMatchObject({ seq: 3 })
+  })
+})
+
+describe("liftJointValue", () => {
+  it("maps the raised fraction onto the URDF lift joint (0 = fully raised)", () => {
+    expect(liftJointValue(1, 0.34)).toBe(0)
+    expect(liftJointValue(0, 0.34)).toBeCloseTo(0.34)
+    expect(liftJointValue(0.25, 0.34)).toBeCloseTo(0.255)
+    expect(liftJointValue(null, 0.34)).toBe(0)
+    expect(liftJointValue(2, 0.34)).toBe(0)
+  })
+})
+
+describe("jointValuesFor", () => {
+  const state: JogState = {
+    running: true,
+    arms: { left: [1, 2, 3, 4, 5, 6, 7], right: [0, 0, 0, 0, 0, 0, 0.5] },
+    lift: { raised: 0.5, velocity: 0, moving: false },
+    base: {
+      x: 1,
+      y: 2,
+      yaw: 0.3,
+      command: [0, 0, 0],
+      velocity: [0, 0, 0],
+      moving: false,
+      estimated: false,
+    },
+  }
+
+  it("names every URDF joint the view needs", () => {
+    const values = jointValuesFor(state, 0.34)
+    expect(values.left_s1_0).toBe(1)
+    expect(values.left_w2_0).toBe(7)
+    expect(values.right_w2_0).toBe(0.5)
+    expect(values.lift).toBeCloseTo(0.17)
+    expect(values.lift_2).toBe(values.lift)
+    expect([values.base_x, values.base_y, values.base_yaw]).toEqual([1, 2, 0.3])
+  })
+
+  it("overlays a plan on its arm only", () => {
+    const values = jointValuesFor(state, 0.34, { arm: "right", joints: [9, 9, 9, 9, 9, 9, 9] })
+    expect(values.right_s1_0).toBe(9)
+    expect(values.left_s1_0).toBe(1)
+  })
+
+  it("is empty but safe before the session reports anything", () => {
+    expect(jointValuesFor(null, 0.34)).toEqual({ lift: 0, lift_2: 0 })
+  })
+})
+
+describe("describePlanError", () => {
+  it("reports millimetres and degrees", () => {
+    const { mm, degrees } = describePlanError({
+      positionError: 0.0123,
+      orientationError: Math.PI / 18,
+    })
+    expect(mm).toBeCloseTo(12.3)
+    expect(degrees).toBeCloseTo(10)
+  })
+})
+
+describe("rpyDegrees", () => {
+  it("reads roll, pitch and yaw back from a quaternion", () => {
+    const q = new Quaternion().setFromEuler(new Euler(0.2, -0.4, 1.1, "ZYX"))
+    const [roll, pitch, yaw] = rpyDegrees([q.x, q.y, q.z, q.w])
+    expect(roll).toBeCloseTo((0.2 * 180) / Math.PI)
+    expect(pitch).toBeCloseTo((-0.4 * 180) / Math.PI)
+    expect(yaw).toBeCloseTo((1.1 * 180) / Math.PI)
+  })
+})
+
+describe("nudgePose", () => {
+  const pose = {
+    position: [0.1, 0.2, 0.3] as [number, number, number],
+    quaternion: [0, 0, 0, 1] as [number, number, number, number],
+  }
+
+  it("moves along a torso axis without turning", () => {
+    const next = nudgePose(pose, "move", 2, 0.01)
+    expect(next.position[2]).toBeCloseTo(0.31)
+    expect(next.quaternion).toEqual([0, 0, 0, 1])
+    expect(pose.position[2]).toBe(0.3)
+  })
+
+  it("turns about the gripper's own axis", () => {
+    const yawed = new Quaternion().setFromAxisAngle(new Vector3(0, 0, 1), Math.PI / 2)
+    const start = {
+      ...pose,
+      quaternion: [yawed.x, yawed.y, yawed.z, yawed.w] as [number, number, number, number],
+    }
+    const next = nudgePose(start, "turn", 0, Math.PI / 2)
+    const q = new Quaternion(...next.quaternion)
+    // The gripper's x axis now points along torso +y; rolling about it
+    // must leave that axis where it is.
+    const x = new Vector3(1, 0, 0).applyQuaternion(q)
+    expect(x.y).toBeCloseTo(1)
+    const z = new Vector3(0, 0, 1).applyQuaternion(q)
+    expect(z.x).toBeCloseTo(1)
+    expect(next.position).toEqual(pose.position)
+  })
+})
+
+describe("jog API client", () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it("posts plans, executes and cancels, and surfaces server errors", async () => {
+    const calls: [string, RequestInit | undefined][] = []
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push([url, init])
+        if (url.endsWith("/api/jog/execute"))
+          return new Response(
+            JSON.stringify({ error: "That plan is out of date. Plan the move again." }),
+            {
+              status: 409,
+            }
+          )
+        return new Response(JSON.stringify({ id: 4, stopped: true }), { status: 200 })
+      })
+    )
+    const plan = await planJogMove("left", { position: [0.1, 0.2, 0.3], quaternion: [0, 0, 0, 1] })
+    expect(plan.id).toBe(4)
+    expect(JSON.parse(String(calls[0][1]?.body))).toEqual({
+      arm: "left",
+      position: [0.1, 0.2, 0.3],
+      quaternion: [0, 0, 0, 1],
+    })
+    await expect(executeJogPlan(4)).rejects.toThrow("That plan is out of date")
+    expect((await cancelJogMove()).stopped).toBe(true)
+  })
+})

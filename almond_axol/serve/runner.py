@@ -74,7 +74,8 @@ _STOP_GRACE_S = 6.0
 # The teleop and collect-data ops park the arms on Stop — rest, then zero
 # (``almond_axol.teleop.shutdown``) — before the torque comes off, and the
 # second leg needs the IK worker alive for its plan. Give those ops the two
-# park caps plus the hardware disconnect before any child is killed.
+# park caps plus the hardware disconnect before any child is killed. Jog
+# returns the arms to rest on Stop too.
 _PARK_STOP_GRACE_S = PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 4.0
 _FORCE_GRACE_S = 5.0
 
@@ -895,10 +896,10 @@ class OperationRunner:
         # Mantis teleop starts no VR server, so it has no headset to feed.
         if cmd.camera_mode == "teleop" and not grippers_only:
             try:
-                self._attach_cameras_to_teleop(cfg, cameras, session)
+                self._attach_cameras_to_teleop(cfg, cameras, session, op_id)
             except Exception as exc:  # noqa: BLE001
                 session.emit(
-                    f"[serve] teleop: camera streaming unavailable ({exc}); "
+                    f"[serve] {op_id}: camera streaming unavailable ({exc}); "
                     "continuing without cameras"
                 )
 
@@ -1087,7 +1088,7 @@ class OperationRunner:
             return
         grace = (
             _PARK_STOP_GRACE_S
-            if session.command_id in ("teleop", "collect-data")
+            if session.command_id in ("teleop", "collect-data", "jog")
             else _STOP_GRACE_S
         )
         thread.join(timeout=grace)
@@ -1423,7 +1424,11 @@ class OperationRunner:
         return merged
 
     def _attach_cameras_to_teleop(
-        self, cfg: Any, cameras: dict[str, Any] | None, session: Session
+        self,
+        cfg: Any,
+        cameras: dict[str, Any] | None,
+        session: Session,
+        op_id: str = "teleop",
     ) -> None:
         """Point teleop's headset video at the configured local ZED cameras.
 
@@ -1450,7 +1455,7 @@ class OperationRunner:
             if serial in detected and s_eyes is not None:
                 camera_eyes[slot] = s_eyes
         if not cam_map:
-            session.emit("[serve] teleop: streaming disabled (no cameras)")
+            session.emit(f"[serve] {op_id}: streaming disabled (no cameras)")
             return
         cfg.cameras = cam_map
         if camera_eyes:
@@ -1460,8 +1465,9 @@ class OperationRunner:
         stereo_slots = sorted(s for s in cam_map if cam_map[s] in detected)
         stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
         resolution_note = f" @ {stream_res}" if stream_res else ""
+        viewer = "the Jog page" if op_id == "jog" else "the headset"
         session.emit(
-            "[serve] teleop: streaming cameras to the headset "
+            f"[serve] {op_id}: streaming cameras to {viewer} "
             f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}"
         )
 
