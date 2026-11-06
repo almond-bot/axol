@@ -2,7 +2,8 @@
 
 Pressing a stick in to run the lift also tipped it sideways and turned the
 base. Outside box mode the lift is on the right stick's forward/back, and each
-push is locked to whichever job (turn or lift) leads when it leaves centre.
+push is locked to one job (turn or lift), chosen once it is well under way;
+only a push close to straight forward/back runs the lift.
 Box mode keeps the lift on held stick clicks, its forward/back being the grip
 width.
 """
@@ -65,6 +66,22 @@ class RightStickTest(unittest.TestCase):
         self.assertEqual(lift, STOP)
         wz, lift = self._feed(r_stick_x=0.5, r_stick_y=-0.9)
         self.assertLess(wz, 0.0)
+        self.assertEqual(lift, STOP)
+
+    def test_a_turn_that_leaves_centre_leaning_forward_still_turns(self) -> None:
+        # Just outside the deadzone the thumb reads more forward than
+        # sideways; by the time the push is decided it is a turn.
+        self.assertEqual(self._feed(r_stick_x=0.1, r_stick_y=-0.16), (0.0, STOP))
+        wz, lift = self._feed(r_stick_x=0.5, r_stick_y=-0.3)
+        self.assertLess(wz, 0.0)
+        self.assertEqual(lift, STOP)
+        wz, lift = self._feed(r_stick_x=0.6, r_stick_y=-0.7)
+        self.assertLess(wz, 0.0)
+        self.assertEqual(lift, STOP)
+
+    def test_a_diagonal_push_turns(self) -> None:
+        wz, lift = self._feed(r_stick_x=-0.6, r_stick_y=-0.7)
+        self.assertGreater(wz, 0.0)
         self.assertEqual(lift, STOP)
 
     def test_centring_the_stick_frees_it_for_the_other_job(self) -> None:

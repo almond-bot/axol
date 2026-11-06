@@ -209,17 +209,28 @@ def stick_command(
 # so a half push is a deliberate request rather than a drift off centre.
 LIFT_STICK_THRESHOLD = 0.5
 
+# RightStickLock: a push's job is chosen once the stick is this far out
+# (fraction of full deflection), not at the deadzone's edge, where a thumb
+# heading sideways often still reads more forward/back than sideways. The lift
+# takes only a push within this angle (deg) of straight forward/back; every
+# other push turns.
+STICK_DECIDE_RADIUS = 0.35
+LIFT_STICK_MAX_ANGLE_DEG = 30.0
+_LIFT_STICK_SLOPE = math.tan(math.radians(90.0 - LIFT_STICK_MAX_ANGLE_DEG))
+
 
 class RightStickLock:
     """Lock the headset's right stick to one job per push: turn or lift.
 
     The right stick turns Jelly (left/right) and runs the lift (forward/back).
-    A push rarely stays on one axis, so the axis that leads when the stick
-    first leaves its deadzone owns that push until the stick returns to
-    centre: a push for the lift never turns the base, and a turn never
-    bumps the lift. :meth:`block` makes the stick do nothing until it next
-    centres, for a push that started while the stick meant something else
-    (box mode's grip width, a reset).
+    A push rarely stays on one axis, so its job is chosen once, when the
+    stick first reaches :data:`STICK_DECIDE_RADIUS`, and kept until the stick
+    returns to centre: a push for the lift never turns the base, and a turn
+    never bumps the lift. Only a push within :data:`LIFT_STICK_MAX_ANGLE_DEG`
+    of straight forward/back is a lift; a diagonal turns. Until the push has
+    a job it does nothing. :meth:`block` makes the stick do nothing until it
+    next centres, for a push that started while the stick meant something
+    else (box mode's grip width, a reset).
     """
 
     def __init__(self) -> None:
@@ -229,8 +240,10 @@ class RightStickLock:
         """The job this frame's push does: ``"turn"``, ``"lift"`` or ``None``."""
         if abs(rx) < deadzone_ and abs(ry) < deadzone_:
             self.axis = None
-        elif self.axis is None:
-            self.axis = "lift" if abs(ry) > abs(rx) else "turn"
+        elif self.axis is None and math.hypot(rx, ry) >= max(
+            STICK_DECIDE_RADIUS, deadzone_
+        ):
+            self.axis = "lift" if abs(ry) >= _LIFT_STICK_SLOPE * abs(rx) else "turn"
         return None if self.axis == "blocked" else self.axis
 
     def block(self, rx: float, ry: float, deadzone_: float) -> None:
