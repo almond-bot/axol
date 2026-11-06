@@ -1484,7 +1484,8 @@ function RunningHints({
   )
 }
 
-function StatusBadge({ session }: { session: SessionInfo | null }) {
+/** The run's state, as the operation pages show it. */
+export function StatusBadge({ session }: { session: SessionInfo | null }) {
   if (!session) return null
   switch (session.status) {
     case "starting":

@@ -1474,3 +1474,16 @@ def test_jog_operation_end_to_end_in_sim(tmp_path: Path) -> None:
         assert _wait(
             lambda: client.get("/api/jog/state").json() == {"running": False}, 20
         )
+
+
+def test_a_sim_run_simulates_the_picked_gripper() -> None:
+    # The control panel sends a sim run's gripper as axol.gripper, the same
+    # way it does for teleop; it picks the mobile Axol's URDF.
+    from almond_axol.cli import jog
+
+    cfg = jog.JogCmdConfig(sim=True)
+    cfg.kinematics.robot_model = "mobile"
+    cfg.axol.gripper = "parcel"
+    with patch("almond_axol.jog.session.JogSession"):
+        jog.build_session(cfg)
+    assert cfg.kinematics.gripper == "parcel"

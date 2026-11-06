@@ -79,6 +79,10 @@ def build_session(cfg: JogCmdConfig) -> Any:
     jelly_cfg = shared_config(JellyConfig, "teleop", "jelly")
     kinematics = cfg.kinematics
     apply_mantis_kinematics_profile(kinematics)
+    # The fitted gripper picks the mobile Axol's URDF. As for teleop, the
+    # robot's axol.gripper decides it; a sim run sends the one it simulates.
+    if kinematics.gripper is None:
+        kinematics.gripper = cfg.axol.gripper
 
     def planner() -> JogPlanner:
         # Jogging solves one arm at a time in NumPy (kinematics.arm_ik): the

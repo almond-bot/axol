@@ -24,7 +24,10 @@ import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { AppShell } from "@/components/app-shell"
 import { CameraFeeds } from "@/components/camera-feeds"
-import { OperationIcon, StartupBar } from "@/components/operation-launcher"
+import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-launcher"
+import { StatusBadge } from "@/components/operation-panel"
+import { FieldRow } from "@/components/config-form"
+import { SimRobotPicker, type SimRobot } from "@/components/sim-robot-picker"
 import { useHostSummary } from "@/lib/host-summary"
 import { useStartupView } from "@/lib/operation-progress"
 import { catalogEntry, rememberOperation } from "@/lib/operation-catalog"
@@ -70,6 +73,7 @@ import {
   startOperation,
   stopOperation,
   type AxolModel,
+  type SchemaField,
   type GripperType,
   type OpStatus,
 } from "@/lib/supervisor"
@@ -87,13 +91,6 @@ const JOINT_LABELS = [
   "Wrist 2",
   "Wrist 3",
 ]
-const MODEL_LABELS: Record<AxolModel, string> = {
-  classic: "Axol Legacy",
-  standalone: "Axol Standalone",
-  ox_cart: "Axol on Ox Cart",
-  owl: "Axol on Owl Mount",
-  mobile: "Axol on Jelly",
-}
 const STEPS_MM = [1, 5, 10, 25, 50]
 const STEPS_DEG = [1, 5, 15, 45]
 const JOG_AXES = [
@@ -102,11 +99,25 @@ const JOG_AXES = [
 ] as const
 
 type Mode = "sim" | "hardware"
+
+const SIM_ROBOT_KEY = "axolSimRobot"
+
+// The same Sim switch as Teleoperation's run details.
+const SIM_FIELD: SchemaField = {
+  kind: "field",
+  key: "sim",
+  label: "Sim",
+  type: "boolean",
+  default: false,
+  required: false,
+  help: "Jog a simulated Axol in the browser instead of the robot.",
+}
 type Edits = { epoch: string; poses: Partial<Record<JogArm, JogPose>> }
 
-function storedSimRobot(): { model: AxolModel; gripper: GripperType } | null {
+/** The sim robot this browser last picked (shared with Teleoperation). */
+function storedSimRobot(): SimRobot | null {
   try {
-    const raw = JSON.parse(localStorage.getItem("axolSimRobot") ?? "null")
+    const raw = JSON.parse(localStorage.getItem(SIM_ROBOT_KEY) ?? "null")
     const model = parseAxolModel(raw?.model)
     return model ? { model, gripper: parseGripper(raw?.gripper) } : null
   } catch {
@@ -417,13 +428,13 @@ function RobotStatus({
 }
 
 export default function Jogging() {
-  const [simPick] = useState(storedSimRobot)
   const [mode, setMode] = useState<Mode>("sim")
   // Whether the operator picked Sim or Robot: the robot's status then no
   // longer moves the default.
   const modeChosen = useRef(false)
-  const [simModel, setSimModel] = useState<AxolModel>(simPick?.model ?? "mobile")
-  const [simGripper] = useState<GripperType>(simPick?.gripper ?? "parallel")
+  // The robot a sim run simulates: this browser's last pick (shared with
+  // Teleoperation), else the robot this host is.
+  const [simChoice, setSimChoice] = useState<SimRobot | null>(storedSimRobot)
   const [host, setHost] = useState<{ model: AxolModel; gripper: GripperType } | null>(null)
   const [hostError, setHostError] = useState<string | null>(null)
   const [opStatus, setOpStatus] = useState<OpStatus | null>(null)
@@ -576,14 +587,32 @@ export default function Jogging() {
   const sessionMode: Mode | null = running ? (state?.mode ?? null) : null
   // The robot drawn is what the session runs, or what Start would run.
   const viewMode: Mode = sessionMode ?? mode
+  const simRobot: SimRobot = simChoice ?? {
+    model: host?.model ?? "classic",
+    gripper: host?.gripper ?? "parallel",
+  }
   const sessionModel = parseAxolModel(String(jogSession?.args?.["kinematics.robot_model"] ?? ""))
+  const sessionGripper = jogSession?.args?.["axol.gripper"]
   const robotModel: AxolModel =
     viewMode === "sim"
       ? sessionMode
-        ? (sessionModel ?? simModel)
-        : simModel
+        ? (sessionModel ?? simRobot.model)
+        : simRobot.model
       : (host?.model ?? "classic")
-  const gripper: GripperType = viewMode === "sim" ? simGripper : (host?.gripper ?? "parallel")
+  const gripper: GripperType =
+    viewMode === "sim"
+      ? sessionMode && sessionGripper != null
+        ? parseGripper(sessionGripper)
+        : simRobot.gripper
+      : (host?.gripper ?? "parallel")
+  const chooseSimRobot = (next: SimRobot) => {
+    setSimChoice(next)
+    try {
+      localStorage.setItem(SIM_ROBOT_KEY, JSON.stringify(next))
+    } catch {
+      // Private mode or storage off: the choice lasts this page view.
+    }
+  }
   const ready = running && Boolean(state?.ready)
   const executing = state?.execution ?? null
   // Edits and plans belong to one session and one arm pose: starting a new
@@ -668,8 +697,10 @@ export default function Jogging() {
     run("start", async () => {
       const args: Record<string, string | boolean> = { sim: mode === "sim" }
       if (mode === "sim") {
-        args["kinematics.robot_model"] = simModel
-        args["kinematics.gripper"] = simGripper
+        // As in Teleoperation: the run simulates the picked robot, which may
+        // differ from the robot's saved model.
+        args["kinematics.robot_model"] = simRobot.model
+        if (simRobot.model === "mobile") args["axol.gripper"] = simRobot.gripper
       }
       await startOperation("jog", args)
       setOpStatus(await fetchOpStatus())
@@ -824,19 +855,6 @@ export default function Jogging() {
       pushHold()
     }
   }, [canDrive, canLift, canMoveArm, pushHold])
-  const status = !connected
-    ? { variant: "neutral" as const, text: "Offline" }
-    : running
-      ? ready
-        ? {
-            variant: sessionMode === "hardware" ? ("warning" as const) : ("success" as const),
-            text: sessionMode === "hardware" ? "Robot" : "Sim",
-          }
-        : { variant: "neutral" as const, text: "Starting" }
-      : jogSession
-        ? { variant: "neutral" as const, text: "Starting" }
-        : { variant: "neutral" as const, text: "Stopped" }
-
   return (
     <AppShell
       title="Operations"
@@ -847,76 +865,52 @@ export default function Jogging() {
     >
       <section
         className={cn(
-          "flex flex-col gap-5 rounded-2xl border p-5 lg:flex-row lg:items-center",
-          running
+          "flex flex-col gap-5 rounded-2xl border p-5 sm:flex-row sm:items-center",
+          jogSession
             ? "border-emerald-400/25 bg-gradient-to-br from-emerald-400/[0.06] to-transparent"
             : "border-white/10 bg-gradient-to-br from-white/[0.04] to-transparent"
         )}
       >
         <div className="flex min-w-0 flex-1 items-start gap-4">
-          <OperationIcon entry={OPERATION} size="lg" running={running} />
+          <OperationIcon entry={OPERATION} size="lg" running={Boolean(jogSession)} />
           <div className="min-w-0 flex-1">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="font-heading text-xl font-semibold">{OPERATION.label}</h2>
-              <Badge variant={status.variant}>{status.text}</Badge>
+              <Badge variant="neutral" title="Runs on the Axol arms.">
+                Axol
+              </Badge>
+              {(jogSession ? jogSim : mode === "sim") && <Badge variant="neutral">Sim</Badge>}
             </div>
             <p className="mt-1.5 max-w-prose text-sm leading-relaxed text-white/55">
               Drag the target, plan the move, check the orange preview, then execute it.
             </p>
+            {jogSession && startup && (
+              <div className="mt-3 max-w-md">
+                <StartupBar view={startup} />
+              </div>
+            )}
+            {jogSession && !startup && (
+              <p className="mt-2 flex items-center gap-2 text-sm">
+                <StatusBadge session={jogSession} />
+                {jogSession.status === "running" && (
+                  <span className="text-white/70">
+                    <ElapsedTime startedAt={jogSession.startedAt} />
+                  </span>
+                )}
+              </p>
+            )}
           </div>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end">
-          <div
-            className="flex rounded-lg border border-white/10 bg-white/[0.03] p-1"
-            role="radiogroup"
-            aria-label="Mode"
-          >
-            {(["sim", "hardware"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                role="radio"
-                aria-checked={viewMode === value}
-                disabled={running}
-                onClick={() => {
-                  modeChosen.current = true
-                  setMode(value)
-                }}
-                className={cn(
-                  "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed",
-                  viewMode === value
-                    ? "bg-white/10 text-white"
-                    : "text-white/50 hover:text-white/80"
-                )}
-              >
-                {value === "sim" ? "Sim" : "Robot"}
-              </button>
-            ))}
-          </div>
-          {viewMode === "sim" && (
-            <Select
-              aria-label="Robot model"
-              className="w-48"
-              value={robotModel}
-              disabled={running}
-              onChange={(event) => {
-                const next = event.target.value as AxolModel
-                setSimModel(next)
-                localStorage.setItem(
-                  "axolSimRobot",
-                  JSON.stringify({ model: next, gripper: simGripper })
-                )
-              }}
-            >
-              {Object.entries(MODEL_LABELS).map(([value, label]) => (
-                <SelectOption key={value} value={value} label={label} />
-              ))}
-            </Select>
-          )}
-          {jogSession ? (
-            <Button variant="destructive" size="lg" onClick={stop} disabled={busy === "stop"}>
-              {busy === "stop" ? <Loader2 className="animate-spin" /> : <Square />}
-              Stop jogging
+          {busy === "stop" ? (
+            <Button variant="destructive" size="lg" disabled>
+              <Loader2 className="animate-spin" />
+              Stopping…
+            </Button>
+          ) : jogSession ? (
+            <Button variant="destructive" size="lg" onClick={stop}>
+              <Square />
+              Stop
             </Button>
           ) : (
             <Button
@@ -926,17 +920,11 @@ export default function Jogging() {
               disabled={Boolean(busy) || Boolean(otherOperation) || !connected}
             >
               {busy === "start" ? <Loader2 className="animate-spin" /> : <Play />}
-              {mode === "sim" ? "Start sim" : "Start on robot"}
+              Start
             </Button>
           )}
         </div>
       </section>
-
-      {jogSession && startup && (
-        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
-          <StartupBar view={startup} />
-        </div>
-      )}
 
       {(error || linkError || hostError || otherOperation || state?.solverError) && (
         <div
@@ -964,6 +952,26 @@ export default function Jogging() {
           <strong className="text-white/80">Execute</strong>. The lift and base move only while you
           hold their controls.
         </p>
+      )}
+
+      {!jogSession && (
+        <Card className="gap-5">
+          <h3 className="font-heading text-sm font-semibold">Run details</h3>
+          <FieldRow
+            field={SIM_FIELD}
+            overrides={mode === "sim" ? { sim: true } : {}}
+            disabled={Boolean(busy)}
+            onChange={(_, value) => {
+              modeChosen.current = true
+              setMode(value ? "sim" : "hardware")
+            }}
+            onReset={() => {
+              modeChosen.current = true
+              setMode("hardware")
+            }}
+          />
+          {mode === "sim" && <SimRobotPicker value={simRobot} onChange={chooseSimRobot} />}
+        </Card>
       )}
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px] lg:items-start">
