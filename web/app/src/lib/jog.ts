@@ -44,22 +44,6 @@ export interface JogBaseState {
   /** True on hardware, where the pose is integrated from the wheel command. */
   estimated: boolean
   fault?: boolean
-  /** Each wheel's commanded and measured speed (rad/s), on the robot. */
-  wheels?: JogWheel[] | null
-}
-
-export interface JogWheel {
-  name: string
-  command: number
-  /** null until the wheels report. */
-  measured: number | null
-}
-
-/** Whether a wheel told to turn is turning well under that, or the wrong way:
- * the sign of a stuck, slipping or faulted wheel. */
-export function wheelLagging(wheel: JogWheel): boolean {
-  if (wheel.measured == null || Math.abs(wheel.command) < 0.5) return false
-  return wheel.measured * Math.sign(wheel.command) < 0.3 * Math.abs(wheel.command)
 }
 
 export interface JogState {

@@ -32,27 +32,6 @@ def rest_q() -> np.ndarray:
     return np.concatenate([left[:7], right[:7]]).astype(np.float32)
 
 
-def _wheel_dicts(jelly: Any) -> list[dict[str, Any]] | None:
-    """Each wheel's commanded and measured speed (rad/s), front left, front
-    right, back left, back right; ``measured`` is None until the wheels
-    report."""
-    from ..robot.jelly import WHEELS
-
-    speeds = list(getattr(jelly, "wheel_speeds", None) or [])
-    sample = getattr(jelly, "wheel_sample", None)
-    measured = list(sample.velocities) if sample is not None else []
-    if len(speeds) != len(WHEELS):
-        return None
-    return [
-        {
-            "name": wheel.name,
-            "command": float(speeds[i]),
-            "measured": float(measured[i]) if i < len(measured) else None,
-        }
-        for i, wheel in enumerate(WHEELS)
-    ]
-
-
 def _lift_dict(raised: float | None, velocity: float, moving: bool) -> dict[str, Any]:
     return {"raised": raised, "velocity": velocity, "moving": moving}
 
@@ -249,5 +228,4 @@ class HardwareBackend:
             "moving": any(abs(v) >= 1e-3 for v in command),
             "estimated": True,
             "fault": bool(jelly.wheel_fault),
-            "wheels": _wheel_dicts(jelly),
         }

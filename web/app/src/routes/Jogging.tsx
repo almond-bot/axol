@@ -57,7 +57,6 @@ import {
   type JogState,
   type GamepadMode,
   type JogTwist,
-  wheelLagging,
   type OtherDrive,
   type Vec3,
 } from "@/lib/jog"
@@ -303,13 +302,6 @@ function JogButtons({
 
 const deg = (rad: number, digits = 1) => `${((rad * 180) / Math.PI).toFixed(digits)}°`
 
-const WHEEL_LABELS: Record<string, string> = {
-  front_left: "Front left",
-  front_right: "Front right",
-  back_left: "Back left",
-  back_right: "Back right",
-}
-
 /** One condensed table of everything moving: both arms, the lift and the base. */
 function RobotStatus({
   state,
@@ -393,36 +385,6 @@ function RobotStatus({
           </span>
         )}
       </div>
-      {base?.wheels && (
-        <div
-          data-testid="status-wheels"
-          className="grid grid-cols-[1fr_auto_auto] gap-x-3 gap-y-1 border-t border-white/10 pt-3 text-xs"
-        >
-          <span className={name}>Wheel (rad/s)</span>
-          <span className="text-right text-white/50">Command</span>
-          <span className="text-right text-white/50">Actual</span>
-          {base.wheels.map((wheel) => {
-            const lagging = wheelLagging(wheel)
-            return (
-              <div key={wheel.name} className={row}>
-                <span className={lagging ? "text-amber-300" : name}>
-                  {WHEEL_LABELS[wheel.name] ?? wheel.name}
-                </span>
-                <span className={value}>{wheel.command.toFixed(1)}</span>
-                <span className={lagging ? cn(value, "text-amber-300") : value}>
-                  {wheel.measured == null ? "–" : wheel.measured.toFixed(1)}
-                </span>
-              </div>
-            )
-          })}
-          {base.wheels.some(wheelLagging) && (
-            <span className="col-span-3 text-amber-300">
-              <Zap className="mr-1 inline size-3.5" />A wheel is turning much slower than it is told
-              to. Check it for a jam or a loose connector.
-            </span>
-          )}
-        </div>
-      )}
     </Card>
   )
 }
