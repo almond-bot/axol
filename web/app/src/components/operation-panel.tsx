@@ -160,7 +160,7 @@ export function OperationPanel({
   onStop: () => void
   onEpisode: (command: string) => void
   /** The operation's own screen (Jog's 3D view and controls), shown
-   *  between the checklist and the run details. */
+   *  below the run details. */
   workspace?: ReactNode
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
@@ -636,8 +636,6 @@ export function OperationPanel({
             viewerPort={viewerPort}
           />
 
-          {workspace}
-
           <Card className="gap-5">
             {(runFields.length > 0 || (isSim && simRobot && onSimRobotChange)) && (
               <div className="flex items-center justify-between gap-2">
@@ -709,6 +707,8 @@ export function OperationPanel({
               <ChevronRight className="size-4 shrink-0 text-white/25 group-hover:text-white/60" />
             </button>
           </Card>
+
+          {workspace}
         </>
       )}
     </div>
