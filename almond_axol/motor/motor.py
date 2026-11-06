@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
-from ..constants import Joint
+from ..constants import GRIPPER_MAX_TORQUE, Joint
 from .bus import CanBus
 from .config import MotorParam, ParamSpec
 from .damiao import DamiaoMotor
@@ -514,13 +514,15 @@ class Motor:
         Args:
             position:   Target shaft position (rad)
             max_speed:  Maximum speed during the move (rad/s)
-            max_torque: Maximum output torque (Nm)
+            max_torque: Maximum output torque (Nm), clamped to
+                        ``GRIPPER_MAX_TORQUE``
         """
         if self.mode != ControlMode.POSITION_FORCE:
             raise RuntimeError(
                 f"{self.joint} is in mode {self.mode}, expected POSITION_FORCE. "
                 f"Call set_control_mode(ControlMode.POSITION_FORCE) first."
             )
+        max_torque = min(max_torque, GRIPPER_MAX_TORQUE)
         await self._driver.set_position_force(position, max_speed, max_torque)
 
     async def set_acceleration(

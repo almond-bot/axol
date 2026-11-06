@@ -227,6 +227,16 @@ const VEL_CUTOFF: f64 = 80.0;
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
+/// Hard ceiling (Nm) on gripper output torque, matching Python's
+/// `almond_axol.constants.GRIPPER_MAX_TORQUE`. Every gripper command is
+/// clamped to it whatever torque the host sends.
+const GRIPPER_MAX_TORQUE: f64 = 5.0;
+
+/// The gripper's POSITION_FORCE current limit as a fraction of rated
+/// current, from the commanded max torque (capped at `GRIPPER_MAX_TORQUE`).
+fn gripper_current_limit(max_torque: f64, t_max: f64) -> f64 {
+    max_torque.min(GRIPPER_MAX_TORQUE) / t_max
+}
 
 /// How long a late target is carried forward along the stream's velocity
 /// (`filter::Holdover`) before the carried target has glided to rest. Covers
@@ -1732,6 +1742,16 @@ mod tests {
         assert!((p - 0.016).abs() < 1e-12, "{p}");
         let p = filter::cap_spring(1.0, Some(0.0), 250.0, effective_tau_cap(f64::INFINITY, 0.0));
         assert_eq!(p, 1.0);
+    }
+
+    /// The gripper current limit passes torques up to the 5 Nm ceiling
+    /// through and clamps anything above it.
+    #[test]
+    fn gripper_current_limit_caps_at_max_torque() {
+        assert!((gripper_current_limit(1.0, 10.0) - 0.1).abs() < 1e-12);
+        assert!((gripper_current_limit(5.0, 10.0) - 0.5).abs() < 1e-12);
+        assert!((gripper_current_limit(9.0, 10.0) - 0.5).abs() < 1e-12);
+        assert!((gripper_current_limit(f64::INFINITY, 10.0) - 0.5).abs() < 1e-12);
     }
 
     /// `tau_cap` is an optional trailing field after `impedance_hz`: absent
@@ -3858,7 +3878,11 @@ fn bus_loop(
                     }
                     (
                         proto::DM_POS_FORCE_ARB_BASE + m.id as u16,
-                        proto::dm_pos_force_encode(c.p_des, c.mode, c.kp / m.ranges.t_max),
+                        proto::dm_pos_force_encode(
+                            c.p_des,
+                            c.mode,
+                            gripper_current_limit(c.kp, m.ranges.t_max),
+                        ),
                     )
                 } else {
                     // Tracked mode: the trapezoid renders this tick's

@@ -60,7 +60,7 @@ This command is configured through draccus. The robot settings (cameras, per-joi
 | `--robot_config.cameras DICT` | Camera slots (`overhead`, `left_arm`, `right_arm`) and each ZED camera's serial number, as one inline value: `--robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"`. Assign the cameras the policy was trained on. At least one is required. |
 | ↳ `stereo` (auto-detected) | Stereo ZED X cameras are detected from their serial number, as in [`collect-data`](/cli/collect-data#stereo-cameras). Match the camera setup of the training dataset. |
 | `--robot_config.video_backend {auto,gst,sdk}` | Camera capture backend (default: `auto`). Use the backend the training data was recorded with. |
-| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5). `<side>` is `left` or `right`. |
+| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5, at most 5). `<side>` is `left` or `right`. |
 | `--robot_config.axol_config.left_stiffness S` | Left arm stiffness in `[0, 1]` (default: 1, the tuned production gains). Match the value used to collect the data. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--rerun_ip IP` | IP of a Rerun viewer on your computer, for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876). Used only with `--rerun_ip`. |

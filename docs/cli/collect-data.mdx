@@ -33,7 +33,7 @@ This command is configured through draccus. The robot and teleop settings live i
 | ↳ `stereo` (auto-detected) | Stereo ZED X cameras are detected from their serial number. See [Stereo cameras](#stereo-cameras). |
 | ↳ `eyes` / `stream_eyes` (per stereo camera) | `eyes` picks which eyes are recorded (`both`, `left` or `right`). `stream_eyes` picks which are streamed to the headset (default `null`, same as `eyes`). |
 | `--robot_config.video_backend {auto,gst,sdk}` | Camera capture backend (default: `auto`). `auto` uses the GStreamer pipeline (`gst`) when it's installed, and the ZED SDK (`sdk`) otherwise. |
-| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5). `<side>` is `left` or `right`. |
+| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5, at most 5). `<side>` is `left` or `right`. |
 | `--robot_config.axol_config.left_stiffness S` | Left arm stiffness, from `0` (hand-guidable) to `1` (default, the tuned production gains). A scalar or one value per joint. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--teleop_config.vr_teleop_config.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand. |
 | `--teleop_config.vr_teleop_config.rotation_multiplier FLOAT` | Scale hand rotation by this factor (default: `1.0`). At `2.0` the gripper turns twice as far as your wrist. |

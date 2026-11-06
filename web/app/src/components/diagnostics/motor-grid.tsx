@@ -3,6 +3,7 @@ import { AlertTriangle, CircleCheck, CircleOff, CircleX, Loader2, X } from "luci
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { MotorParamsPanel } from "@/components/diagnostics/motor-params"
+import { statusText } from "@/lib/motor-status"
 import { cn } from "@/lib/utils"
 import {
   JOINTS,
@@ -95,6 +96,9 @@ export function MotorGrid({
         const Meta = STATUS_META[kind]
         const temp = reading?.temperature ?? null
         const pos = latestFrame?.m[key]?.[0] ?? null
+        const text = statusText(
+          kind === "ok" ? "OK" : reading && !reading.reachable ? "UNREACHABLE" : reading?.status
+        )
         return (
           <button
             key={joint}
@@ -115,15 +119,12 @@ export function MotorGrid({
               <span className="truncate text-sm font-semibold text-white/90 capitalize">
                 {jointLabel(joint)}
               </span>
-              <span className={cn("ml-auto flex items-center gap-1 text-xs", Meta.className)}>
+              <span
+                className={cn("ml-auto flex min-w-0 items-center gap-1 text-xs", Meta.className)}
+                title={text.full}
+              >
                 <Meta.icon className="size-4 shrink-0" />
-                <span className="font-mono text-[0.7rem] tracking-wide">
-                  {kind === "ok"
-                    ? "OK"
-                    : reading && !reading.reachable
-                      ? "UNREACHABLE"
-                      : (reading?.status ?? "–")}
-                </span>
+                <span className="truncate text-[0.7rem] font-medium">{text.short}</span>
               </span>
             </div>
             <div className="grid grid-cols-3 gap-2">
@@ -152,7 +153,7 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-baseline justify-between gap-4 py-1">
       <span className="text-xs text-white/45">{label}</span>
-      <span className="font-mono text-xs text-white/85 tabular-nums">{value}</span>
+      <span className="text-right font-mono text-xs text-white/85 tabular-nums">{value}</span>
     </div>
   )
 }
@@ -252,7 +253,7 @@ function MotorDetailsDialog({
           </div>
         ) : (
           <div className="flex flex-col divide-y divide-white/[0.06]">
-            <DetailRow label="Status" value={details.status ?? "–"} />
+            <DetailRow label="Status" value={statusText(details.status).full} />
             <DetailRow label="Control mode" value={details.mode ?? "–"} />
             <DetailRow label="Model" value={details.model ?? "–"} />
             <DetailRow label="Firmware" value={details.firmware?.toString() ?? "–"} />
