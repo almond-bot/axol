@@ -129,6 +129,7 @@
                   "cli/teleop",
                   "cli/gravity-comp",
                   "cli/waypoints",
+                  "cli/jog",
                   "cli/collect-data",
                   "cli/collect-dagger",
                   "cli/replay-dataset",

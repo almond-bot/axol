@@ -14,8 +14,8 @@ import multiprocessing.connection
 import os
 import signal
 import time
-from dataclasses import dataclass, field
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
