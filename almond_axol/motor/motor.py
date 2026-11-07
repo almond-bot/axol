@@ -204,6 +204,18 @@ class Motor:
         # returning, so no pre-reset frame can land later.
         self._position = None
 
+    async def set_direction_flag(self) -> bool:
+        """Set the motor's firmware direction flag if it needs it.
+
+        Call before zeroing the joint: the flag moves its zero. Returns True
+        when the flag was changed (the motor was reset to apply it).
+        """
+        changed = await self._driver.set_direction_flag()
+        if changed:
+            # The reset and the flipped reading both invalidate the cache.
+            self._position = None
+        return changed
+
     async def set_control_mode(self, mode: ControlMode) -> None:
         """Set the active control mode.
 
@@ -250,7 +262,7 @@ class Motor:
     async def get_model(self) -> str | None:
         """Return the motor model string, or None if unsupported.
 
-        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``).
+        MyActuator: the model string read via 0xB5 (e.g. ``"RMD-X6-P20-60"``).
         Damiao: None — not exposed by the protocol.
         """
         return await self._driver.get_model()

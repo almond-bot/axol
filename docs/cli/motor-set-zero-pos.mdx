@@ -28,7 +28,11 @@ axol motor.set-zero-pos --l --guided --joints wrist_2,wrist_3  # just the wrist 
 
 1. Hold every selected joint inside its range, away from the end stops, and press Enter once.
 2. For each joint in turn, move it to the end stop the prompt names and press Enter.
-3. If you moved the joint the wrong way, the prompt asks you to move it to the other end stop instead. Press Enter there.
+3. If the joint moved the wrong way, the prompt asks you to move it to the same end stop again. Axol zeroes a joint only after it moves the expected way.
+
+If the joint is already at the end stop the prompt names and it still reads as the wrong way, its motor turns the wrong way. Skip the joint with Ctrl-C and contact Almond support.
+
+Some MyActuator motors need **Change Motor Direction** turned on to turn the same way as the rest of Axol. Guided zeroing turns it on before you move any joint, then zeroes each joint as usual. Zeroing one motor with `--id` turns it on too. Until a joint that needs it is zeroed this way, Axol won't enable the arm.
 
 Press Ctrl-C to skip a joint.
 

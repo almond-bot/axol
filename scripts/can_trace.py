@@ -19,9 +19,12 @@ Decoded (MyActuator, ids 1-5): MIT commands (0x400+id: p_des, v_des, kp, kd,
 t_ff) and feedback (0x500+id: position, velocity, torque); 0xA4 position
 commands (0x140+id: target, speed cap) and their replies (0x240+id:
 temperature, current, speed, single-turn angle). Damiao wrists (ids 6-7):
-MIT feedback (0x10+id). MIT ranges depend on firmware: ``--v44`` lists the
-motor ids on V4.4 firmware (the X8-P20 shoulders' 2026042402; default
-"1,2"), every other MyActuator id uses the legacy ranges.
+MIT feedback (0x10+id). MIT ranges depend on firmware: each motor's
+VersionDate is read from the 0xB2 replies in the recording (bring-up asks for
+it), and VersionDate 2026042402 or later decodes with the V4.4 ranges.
+Start the recording before the arms connect so those replies are in it. A
+recording without them falls back to V4.4 on ids 1 and 2 (the X8-P20
+shoulders); ``--v44`` lists the V4.4 ids explicitly instead.
 """
 
 from __future__ import annotations
@@ -51,6 +54,8 @@ _V_MAX, _KP_MAX, _KD_MAX = 45.0, 500.0, 5.0
 _P_LEGACY, _T_LEGACY = 12.5, 24.0
 _P_V44 = 12.566
 _T_V44 = {1: 129.0, 2: 129.0, 3: 60.0, 4: 60.0, 5: 60.0}  # X8 shoulders, X6 others
+_FW_V44 = 2026042402  # almond_axol.motor.config.MYACTUATOR_FW_V44
+_V44_FALLBACK = {1, 2}
 
 
 def _u2f(x: int, lo: float, hi: float, bits: int) -> float:
@@ -131,9 +136,41 @@ def _dm_mit(d: bytes) -> dict:
     )
 
 
-def parse_log(path: Path, v44: set[int]) -> dict[tuple[str, int], list[dict]]:
-    """Every decodable frame of a recording, per ``(side, motor id)``."""
+def firmware_in_log(path: Path) -> dict[tuple[str, int], int]:
+    """Each MyActuator's VersionDate from the 0xB2 replies, per ``(side, id)``."""
     side_of = {v: k for k, v in _ARMS.items()}
+    versions: dict[tuple[str, int], int] = {}
+    with open(path) as f:
+        for line in f:
+            if line.startswith("#") or not line.strip():
+                continue
+            _, iface, arb, data = line.strip().split(",")
+            arb_id, d = int(arb, 16), bytes.fromhex(data)
+            if 0x241 <= arb_id <= 0x245 and len(d) == 8 and d[0] == 0xB2:
+                side = side_of.get(iface, iface)
+                versions[(side, arb_id - 0x240)] = int.from_bytes(d[4:8], "little")
+    return versions
+
+
+def parse_log(
+    path: Path, v44: set[int] | None = None
+) -> dict[tuple[str, int], list[dict]]:
+    """Every decodable frame of a recording, per ``(side, motor id)``.
+
+    ``v44`` lists the motor ids on V4.4 firmware on both arms. ``None`` reads
+    each motor's firmware from the recording (see the module docstring).
+    """
+    side_of = {v: k for k, v in _ARMS.items()}
+    if v44 is None:
+        versions = firmware_in_log(path)
+        if versions:
+            v44_motors = {k for k, v in versions.items() if v >= _FW_V44}
+        else:
+            v44_motors = {
+                (s, m) for s in (*_ARMS, *_ARMS.values()) for m in _V44_FALLBACK
+            }
+    else:
+        v44_motors = {(s, m) for s in (*_ARMS, *_ARMS.values()) for m in v44}
     rows: dict[tuple[str, int], list[dict]] = defaultdict(list)
     t0 = None
     with open(path) as f:
@@ -147,8 +184,9 @@ def parse_log(path: Path, v44: set[int]) -> dict[tuple[str, int], list[dict]]:
             rec = None
             mid = arb_id & 0xFF
             if 0x401 <= arb_id <= 0x405 and len(d) == 8:  # MIT command
-                p_max = _P_V44 if mid in v44 else _P_LEGACY
-                t_max = _T_V44[mid] if mid in v44 else _T_LEGACY
+                on_v44 = (side, mid) in v44_motors
+                p_max = _P_V44 if on_v44 else _P_LEGACY
+                t_max = _T_V44[mid] if on_v44 else _T_LEGACY
                 p = _u2f((d[0] << 8) | d[1], -p_max, p_max, 16)
                 v = _u2f((d[2] << 4) | (d[3] >> 4), -_V_MAX, _V_MAX, 12)
                 kp = _u2f(((d[3] & 0xF) << 8) | d[4], 0, _KP_MAX, 12)
@@ -156,8 +194,9 @@ def parse_log(path: Path, v44: set[int]) -> dict[tuple[str, int], list[dict]]:
                 tff = _u2f(((d[6] & 0xF) << 8) | d[7], -t_max, t_max, 12)
                 rec = dict(kind="mit_cmd", p=p, v=v, kp=kp, kd=kd, t=tff)
             elif 0x501 <= arb_id <= 0x505 and len(d) >= 6:  # MIT feedback
-                p_max = _P_V44 if mid in v44 else _P_LEGACY
-                t_max = _T_V44[mid] if mid in v44 else _T_LEGACY
+                on_v44 = (side, mid) in v44_motors
+                p_max = _P_V44 if on_v44 else _P_LEGACY
+                t_max = _T_V44[mid] if on_v44 else _T_LEGACY
                 p = _u2f((d[1] << 8) | d[2], -p_max, p_max, 16)
                 v = _u2f((d[3] << 4) | (d[4] >> 4), -_V_MAX, _V_MAX, 12)
                 tq = _u2f(((d[4] & 0xF) << 8) | d[5], -t_max, t_max, 12)
@@ -198,9 +237,12 @@ def parse_log(path: Path, v44: set[int]) -> dict[tuple[str, int], list[dict]]:
     return rows
 
 
+def _v44_arg(raw: str | None) -> set[int] | None:
+    return None if raw is None else {int(x) for x in raw.split(",") if x}
+
+
 def decode(args: argparse.Namespace) -> None:
-    v44 = {int(x) for x in args.v44.split(",") if x}
-    rows = parse_log(args.log, v44)
+    rows = parse_log(args.log, _v44_arg(args.v44))
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     print(f"{sum(len(v) for v in rows.values())} decoded frames, {len(rows)} motors")
@@ -405,8 +447,7 @@ def joint_summary(recs: list[dict]) -> dict | None:
 def summary(args: argparse.Namespace) -> None:
     import json
 
-    v44 = {int(x) for x in args.v44.split(",") if x}
-    rows = parse_log(args.log, v44)
+    rows = parse_log(args.log, _v44_arg(args.v44))
     joints = {}
     for (side, mid), recs in sorted(rows.items()):
         if not 1 <= mid <= 7:
@@ -447,7 +488,10 @@ def main() -> None:
     d.add_argument("log", type=Path)
     d.add_argument("--out", type=Path, default=None)
     d.add_argument(
-        "--v44", default="1,2", help="MyActuator ids on V4.4 firmware (default 1,2)"
+        "--v44",
+        default=None,
+        help="MyActuator ids on V4.4 firmware, e.g. 1,2,3,4 "
+        "(default: read from the recording)",
     )
     sm = sub.add_parser(
         "summary",
@@ -455,7 +499,10 @@ def main() -> None:
     )
     sm.add_argument("log", type=Path)
     sm.add_argument(
-        "--v44", default="1,2", help="MyActuator ids on V4.4 firmware (default 1,2)"
+        "--v44",
+        default=None,
+        help="MyActuator ids on V4.4 firmware, e.g. 1,2,3,4 "
+        "(default: read from the recording)",
     )
     args = p.parse_args()
     if args.cmd == "record":

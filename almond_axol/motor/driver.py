@@ -120,6 +120,15 @@ class MotorDriver(ABC):
         """Save the current shaft position as the encoder zero reference."""
         ...
 
+    async def set_direction_flag(self) -> bool:
+        """Set the motor's firmware direction flag if it needs it.
+
+        Only MyActuator motors have one (Change Motor Direction). Flipping it
+        moves the joint's zero, so call it before zeroing the joint. Returns
+        True when the flag was changed.
+        """
+        return False
+
     @abstractmethod
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
@@ -396,7 +405,7 @@ class MotorDriver(ABC):
     async def get_model(self) -> str | None:
         """Return the motor model string, or None if unsupported.
 
-        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``), whose
+        MyActuator: the model string read via 0xB5 (e.g. ``"RMD-X6-P20-60"``), whose
         series determines the motor's rated max torque.
         Damiao: None — not exposed by the protocol.
         """

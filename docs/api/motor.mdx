@@ -42,7 +42,7 @@ asyncio.run(main())
 | `set_zero_position()` | Save the current position as the encoder zero, in flash. Set it at a mechanical end stop, not the rest pose. |
 | `set_control_mode(mode)` | Set the `ControlMode`, which mode-specific commands require. **MyActuator motors reboot to switch, with torque off for about 2 s**, so never call it on a motor holding a load. |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
-| `get_model()` | Motor model string, e.g. `"X8S2V"` (`None` for Damiao) |
+| `get_model()` | Motor model string, e.g. `"RMD-X6-P20-60"` (`None` for Damiao) |
 | `get_firmware_version()` | Firmware VersionDate `int`, e.g. `2026042402` (`None` for Damiao) |
 | `get_position()` | Shaft position (rad); raises if telemetry is active |
 | `get_velocity()` | Shaft velocity (rad/s) |

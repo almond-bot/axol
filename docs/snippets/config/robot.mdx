@@ -95,7 +95,7 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
 
   - `planner_accel` at `60000` works best with `cap_track`. Values in between would re-plan every target so the joint barely moves, and are refused.
   - `cap_track` is sent to the realtime core, not written to the motor.
-  - `tf_rated_current_a` needs firmware with command 0x73 (VersionDate 2026042402 or later) and direct tracking (`planner_accel` `0`). The X8-P20 shoulders have it, and the X6-P20 elbow doesn't. Elsewhere the joint stays on plain 0xA4 and the core logs why.
+  - `tf_rated_current_a` needs firmware with command 0x73 (VersionDate 2026042402 or later) and direct tracking (`planner_accel` `0`). Elsewhere the joint stays on plain 0xA4 and the core logs why.
 </Accordion>
 
 <Accordion title="Stiction, dither and Stribeck terms">

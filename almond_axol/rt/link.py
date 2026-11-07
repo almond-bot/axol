@@ -53,7 +53,11 @@ _ARM_TIMEOUT_S = 15.0
 #: 19 adds the optional ``tracking_profile mink`` line (Mink IK sessions).
 #: 20 adds the ``thermal`` line (the Damiao wrists' temperature limit,
 #: :class:`~almond_axol.robot.config.WristThermalConfig`).
-CONFIG_PROTO = 20
+#: 21 changes no layout: it requires a core that refuses a MyActuator with
+#: Exchange Phase 0 and Change Motor Direction off, or with a current sample
+#: resistor that doesn't match its model, and sets MAX_TORQUE to the model's
+#: rating at bring-up.
+CONFIG_PROTO = 21
 
 
 def config_header() -> list[str]:
