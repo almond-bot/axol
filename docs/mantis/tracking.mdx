@@ -1,20 +1,19 @@
 ---
 title: "Mantis Tracking"
-description: "Set up Meta Quest, VIVE Tracker 3.0 or VIVE Ultimate tracking so Mantis can record demonstrations."
+description: "Set up Meta Quest or VIVE Tracker 3.0 tracking so Mantis can record demonstrations."
 ---
 
 Mantis **data collection** needs a **pose source**: a tracking system that reports where each rig is. Mantis teleoperation doesn't use tracking. It only drives the grippers from the triggers.
 
-Mantis supports three pose sources. Choose one under **Mantis settings → Tracking** in the control panel. The default is Lighthouse. The choice and its setup are saved on the computer, so every collection run uses them.
+Mantis supports two pose sources. Choose one under **Mantis settings → Tracking** in the control panel. The default is Lighthouse. The choice and its setup are saved on the computer, so every collection run uses them.
 
 | Source | Hardware | How it tracks | What you set up |
 |---|---|---|---|
 | **Quest** | Meta Quest headset and controllers | The headset tracks the controllers. | Save the controllers' calibration key once. |
 | **Lighthouse** | VIVE Tracker 3.0 and 1 to 4 SteamVR base stations | The base stations sweep the room and the trackers sense them. | Install support, pair the trackers, check the base stations, identify the sides and validate tracking. |
-| **Ultimate** | VIVE Ultimate Tracker and its wireless dongle | Each tracker follows a room map, with no base stations. | Pair and map once on Windows, then install support, connect the dongle, save the Wi-Fi settings and identify the sides. |
 
 <Note>
-  **VIVE Tracker 3.0** is the Lighthouse tracker. **VIVE Ultimate Tracker** is a different HTC tracker that needs no base stations. **Meta Quest** is the headset and its controllers.
+  **VIVE Tracker 3.0** is the Lighthouse tracker. **Meta Quest** is the headset and its controllers.
 </Note>
 
 Before you start, finish the [Mantis hardware setup](/mantis/hardware). The hub must be connected, **Mantis** selected on its card, the left and right sides checked, and the trigger check passed. Then open **Mantis settings → Tracking** and choose the source. The choice saves right away.
@@ -87,50 +86,6 @@ Data collection won't start until every step is done, even when you start it fro
 
     When the sides are identified, [validate tracking](#validate-lighthouse-tracking). Validation is required under the **Strict** policy and optional under **Standard**.
   </Tab>
-
-  <Tab title="Ultimate">
-    **VIVE Ultimate Trackers** follow a room map that they share over their own Wi-Fi network. They need no base stations or headset. HTC doesn't support Linux, so Axol talks to the trackers' **wireless dongle** through the community [pyvut](https://github.com/nijkah/pyvut) driver. You pair and map the trackers once on a Windows PC. After that, you do everything in the control panel.
-    <Steps>
-      <Step title="One time on Windows: pair">
-        1. On a Windows PC, install SteamVR and turn on its [driver for running without a headset](https://github.com/username223/SteamVRNoHeadset).
-        2. Install VIVE Streaming Hub, and install the **VIVE Ultimate Tracker service** inside it. See the [pyvut setup notes](https://github.com/nijkah/pyvut/blob/fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a/README.md#constructing-map-steamvr--vive---only-available-on-windows) and [HTC's pairing guide](https://business.vive.com/us/support/ultimate-tracker/category_howto/pairing-ultimate-tracker-with-the-dongle.html).
-        3. Connect the wireless dongle and open **Settings → VIVE Ultimate Tracker → Trackers → Pair new**.
-        4. Turn on a tracker and wait until its light is solid blue. Hold Power for about two seconds, until the light flashes blue again, and pair it.
-        5. Repeat for the second tracker, on the same dongle.
-      </Step>
-      <Step title="One time on Windows: map">
-        1. Choose **Start setup → Create map** and set the center.
-        2. Scan the whole Mantis work area, facing all four directions, from both kneeling and standing height.
-        3. Let the map save. Use Refine or Save if they appear.
-        4. Turn both trackers off and on again, and check that both find their position and rotation.
-
-        The pairing and the map are stored on the trackers, so they move with the trackers to the Host Computer.
-      </Step>
-      <Step title="Source">
-        In the control panel, choose **Ultimate**.
-      </Step>
-      <Step title="Software">
-        Press **Install Ultimate support**, or **Repair Ultimate support** if it is partly installed. From a terminal, run [`axol tracker.ultimate.install`](/cli/tracker#axol-trackerultimateinstall). It is safe to run again. Don't install pyvut yourself with `pip`.
-      </Step>
-      <Step title="Dongle">
-        Plug the same dongle into the computer. The step is done when Axol detects the dongle and can access it. If your user needs to join the `dialout` group, the step shows the command to run. Log out and back in afterward.
-      </Step>
-      <Step title="Wi-Fi">
-        Enter the settings of the Wi-Fi network the trackers share their map over: the network name, password, two-letter country code and center frequency in MHz. This is **not** your office network or the robot's network. The password is hidden after you save it. The settings are saved to `~/.almond/tracker/ultimate_wifi.json` (see the [file format](/cli/tracker#ultimate-wi-fi-file)).
-      </Step>
-      <Step title="Identify sides">
-        Turn on both trackers inside the mapped area and press **Identify trackers**. From a terminal, run [`axol tracker.identify --backend ultimate`](/cli/tracker#axol-trackeridentify). For each side, move only the rig it asks for. Setup is complete when both sides are saved.
-
-        To check the whole setup from a terminal without changing anything, run [`axol tracker.ultimate.check`](/cli/tracker#axol-trackerultimatecheck).
-      </Step>
-    </Steps>
-
-    <Warning>
-      The pyvut driver is unofficial and depends on the tracker firmware. Leave the quaternion order (`wxyz`) and up axis (z-up) at their defaults. Changing either one turns off the built-in tracker-to-gripper offset. Data collection is then blocked until you save a new measured offset or change the setting back. Never change them to correct a mount offset.
-    </Warning>
-
-    The standard flat-back mount has a built-in tracker-to-gripper offset, so there is nothing to measure.
-  </Tab>
 </Tabs>
 
 ## Validate Lighthouse tracking
@@ -187,7 +142,7 @@ An error that a base station's identity wasn't received doesn't mean the station
 
     If either controller loses tracking, both sides freeze. Fix the tracking, then release and press both grips again. Tracking never restarts on its own. **Reset** returns to the rest pose and also needs the gesture to start again.
   </Tab>
-  <Tab title="Lighthouse / Ultimate">
+  <Tab title="Lighthouse">
     A run waits until both trackers report a position and both triggers are sending readings. Then:
 
     1. Hold both rigs where the session should begin.
@@ -199,7 +154,7 @@ An error that a base station's identity wasn't received doesn't mean the station
 
     If a tracker loses its position or a trigger stops sending readings, both sides freeze. Fix the problem, then repeat the squeeze and release. Tracking never restarts on its own. **Reset** returns to the rest pose and also needs the gesture to start again.
 
-    A Quest headset can still connect to watch the video and status. Its controllers are ignored. By default, the 3D robot overlay is hidden in the headset for these sources.
+    A Quest headset can still connect to watch the video and status. Its controllers are ignored. By default, the 3D robot overlay is hidden in the headset with Lighthouse.
   </Tab>
 </Tabs>
 
@@ -210,7 +165,6 @@ When tracking starts, Axol works out where the rigs are relative to the robot. I
 | Source | Transform |
 |---|---|
 | Lighthouse (Tracker 3.0) | Built in for the standard flat-back mount: `[0, 0.035, 0.047, 0, 1, 0, 0]` for both sides. The tracker sits 47 mm behind and 35 mm above the gripper motor face. |
-| Ultimate | Built in for the standard flat-back mount: `[0, 0.046, 0.047, 0, 1, 0, 0]` for both sides. |
 | Quest 3 (Touch Plus) | Built in for `quest:meta-quest-touch-plus:grip`, mirrored between the left and right mounts. The grip point sits 62 mm behind and 45 mm above the gripper motor face. Used when no Quest value is saved. |
 | Other Quest controllers | Not built in. Measure the gripper position in each controller's grip frame, and save it for both sides under the controller's `quest:<profile>:grip` key. |
 
@@ -238,7 +192,7 @@ axol collect-data --mantis true --mantis_allow_uncalibrated true --repo_id myorg
 
 Check these with the real pose source:
 
-1. **Movement.** Left and right are on the correct sides. Motion has the right scale in every direction, wrist rotation follows, and the gripper lines up with the tracker. With Quest, watch the virtual arms in the headset. With Lighthouse or Ultimate, watch the robot view in the control panel.
+1. **Movement.** Left and right are on the correct sides. Motion has the right scale in every direction, wrist rotation follows, and the gripper lines up with the tracker. With Quest, watch the virtual arms in the headset. With Lighthouse, watch the robot view in the control panel.
 2. **Recovery.** Cover one tracker, or move it out of tracking, and check that both sides freeze. Restore tracking and check that nothing moves until you repeat the start gesture.
 
 A source that jumps, drifts, swaps sides or doesn't recover cleanly is not ready for collection. `axol teleop --sim --teleop.absolute_mode true` is only a demo of the mapping. Check the real source with Mantis selected, in a collection run.

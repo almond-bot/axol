@@ -36,7 +36,7 @@ beforeEach(() => {
   mocks.logs = { lines: [], status: null }
   const binding = { complete: true, left: "T20", right: "T21" }
   snapshot = {
-    bindings: { survive: binding, ultimate: binding },
+    bindings: { survive: binding },
     sources: {
       lighthouse: {
         binding,
@@ -57,7 +57,7 @@ beforeEach(() => {
         },
         validation: { status: "missing", valid: false, problems: [] },
       },
-      // Other tracker families are not rendered in these Lighthouse tests.
+      // Quest readiness is not rendered in these Lighthouse tests.
     } as unknown as TrackerBindingsSnapshot["sources"],
   }
   mocks.fetch.mockImplementation(async () => snapshot)

@@ -335,7 +335,7 @@ export function AxolVRClient({
     const canControlPose = webxrCanControlPose(expectedPoseSourceKindRef.current)
     const canRecord = webxrCanControlRecording(modeRef.current, expectedPoseSourceKindRef.current)
 
-    // Tracker-owned Lighthouse/Ultimate sessions keep the Quest connected for
+    // Tracker-owned Lighthouse sessions keep the Quest connected for
     // cameras and authoritative server HUD updates, but its A/X buttons must
     // not create a local countdown or confirmation flow.
     if (!canRecord) {
@@ -599,7 +599,7 @@ export function AxolVRClient({
       seq: nextPoseSequence(seqRef.current!),
       // One logical identity across USB, WebRTC, and network WebSocket. The
       // server de-dupes the shared sequence globally and can keep this Quest
-      // view-only when a Lighthouse/Ultimate bridge owns Mantis poses.
+      // view-only when a Lighthouse bridge owns Mantis poses.
       pose_source_id: poseSourceIdRef.current,
       pose_source_kind: "webxr",
       // Mount calibration is datum-specific. The host validates both the

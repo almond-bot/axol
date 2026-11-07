@@ -69,7 +69,7 @@ The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so 
 | `seq` | `int \| None` | Frame counter set by the producer. With `pose_source_id`, it drops duplicate copies of a frame that arrive over different transports. |
 | `t_host` | `float \| None` | When the poses were captured, on the host's `perf_counter` clock. The server fills it in from `t`. Mantis recordings align dataset rows to it. |
 | `pose_source_id` | `str \| None` | Stable ID of the producer, shared across its transports and reconnects. |
-| `pose_source_kind` | `"webxr" \| "tracker" \| None` | `webxr` for a Quest, `tracker` for a Lighthouse or Ultimate bridge. |
+| `pose_source_kind` | `"webxr" \| "tracker" \| None` | `webxr` for a Quest, `tracker` for a Lighthouse bridge. |
 | `l_pose_profile` / `r_pose_profile` | `str \| None` | WebXR input profile of each Quest controller, such as `oculus-touch-v3`. Quest calibration is stored per profile. |
 | `l_pose_space` / `r_pose_space` | `"grip" \| "target-ray" \| None` | Which WebXR pose each Quest controller reports. Production Mantis needs the calibrated `grip` pose. |
 
@@ -104,10 +104,10 @@ Every copy carries the same `pose_source_id` and `seq`, and the server handles e
 Only one producer controls the robot at a time. Other clients stay connected and still receive video, HUD state and the robot model, but the server ignores their frames and HUD controls.
 
 - **Managed Quest Mantis** sets `VRServerConfig.pose_source_kind="webxr"`.
-- **Managed Lighthouse or Ultimate Mantis** sets it to `"tracker"`, and gives the bridge and server a one-run `expected_pose_source_id`.
+- **Managed Lighthouse Mantis** sets it to `"tracker"`, and gives the bridge and server a one-run `expected_pose_source_id`.
 - **Without a pose source policy**, the first producer takes control. A tracker bridge can take over from a Quest. Once a tracker has control, the server doesn't fall back to a connected Quest if the bridge stops.
 
-A Lighthouse or Ultimate world isn't registered to the Quest's floor, so the headset hides the 3D robot overlay by default in those sessions.
+A Lighthouse world isn't registered to the Quest's floor, so the headset hides the 3D robot overlay by default in those sessions.
 
 The WebRTC data channel (`almond_axol.vr.control_channel`) uses the same ICE and TURN path as the camera video, so an operator outside your tailnet can drive through a relay. Set the TURN server with `AXOL_TURN_URL`, `AXOL_TURN_USERNAME` and `AXOL_TURN_PASSWORD`. On a LAN or plain tailnet, leave them unset. If the data channel fails or drops, the headset requests it again after a delay.
 
@@ -266,8 +266,8 @@ This path needs the GPU camera stack that the host installer sets up:
 | `port` | `8000` | WSS listen port. |
 | `certfile` | auto | Path to the TLS certificate. `None` uses the generated certificate. |
 | `keyfile` | auto | Path to the TLS private key. |
-| `pose_source_kind` | `None` | Which kind of producer may control the robot: `"webxr"` (Quest Mantis) or `"tracker"` (Lighthouse or Ultimate). Other clients stay connected as viewers. |
-| `expected_pose_source_id` | `None` | The one producer ID allowed to control the robot. Managed Lighthouse and Ultimate sessions set it to a one-run token. |
+| `pose_source_kind` | `None` | Which kind of producer may control the robot: `"webxr"` (Quest Mantis) or `"tracker"` (Lighthouse). Other clients stay connected as viewers. |
+| `expected_pose_source_id` | `None` | The one producer ID allowed to control the robot. Managed Lighthouse sessions set it to a one-run token. |
 | `interp_enabled` | `True` | Turns on the playout buffer, which uses the headset timestamp `t` to smooth uneven frame arrival. |
 | `interp_min_delay_s` | `0.0` | Shortest playout delay, in seconds. |
 | `interp_max_delay_s` | `0.15` | Longest playout delay, in seconds. The buffer adds delay only while frames arrive in bursts. |

@@ -91,11 +91,6 @@ _FORCE_GRACE_S = 5.0
 _RECORDER_PROC_NAME = "dataset-recorder"
 _FINALIZE_GRACE_S = 200.0
 
-# A managed Mantis bridge reports ready after both trackers and configured
-# trigger nodes have produced fresh, usable data. It does not wait for the
-# operation's VR server: its WebSocket loop reconnects until that server begins
-# listening.
-_BRIDGE_READY_TIMEOUT_S = 35.0
 _BRIDGE_STOP_TIMEOUT_S = 4.0
 
 # Cadence of the bus-stall watchdog while a hardware operation runs. A stall
@@ -1602,20 +1597,16 @@ class OperationRunner:
 
         config = load_tracker_config()
         source = str(getattr(cfg, "mantis_source", "lighthouse"))
-        backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
-        if backend is None:
+        if source != "lighthouse":
             raise RuntimeError(
                 f"Mantis source {source!r} does not use a tracker bridge"
             )
+        backend = "survive"
         select_tracker_backend(config, backend)
         # Lighthouse must receive fresh station identity broadcasts before it
         # reports ready. Give the child its full acquisition window plus spawn
-        # overhead; Ultimate retains its existing startup budget.
-        ready_timeout = (
-            LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
-            if backend == "survive"
-            else _BRIDGE_READY_TIMEOUT_S
-        )
+        # overhead.
+        ready_timeout = LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
         server = getattr(cfg, "vr_server", None)
         if server is None:
             teleop = getattr(cfg, "teleop_config", None)

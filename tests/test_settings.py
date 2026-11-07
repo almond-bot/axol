@@ -296,20 +296,40 @@ class DiagnosticSettingsTest(unittest.TestCase):
             store.update(
                 values={
                     "robot.gripper_max_speed": 3,
-                    "teleop.mantis_source": "ultimate",
+                    "teleop.mantis_source": "quest",
                 },
                 advanced={"vr_teleop.position_multiplier": 1.5},
             )
             values = store.snapshot()["values"]
             self.assertEqual(values["axol.left.gripper.max_speed"], 3)
             self.assertEqual(values["axol.right.gripper.max_speed"], 3)
-            self.assertEqual(values["mantis.source"], "ultimate")
+            self.assertEqual(values["mantis.source"], "quest")
             self.assertEqual(values["teleop.position_multiplier"], 1.5)
 
             store.update(values={"robot.gripper_max_speed": None})
             values = store.snapshot()["values"]
             self.assertNotIn("axol.left.gripper.max_speed", values)
             self.assertNotIn("axol.right.gripper.max_speed", values)
+
+    def test_mantis_source_rejects_and_drops_retired_ultimate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            store = SettingsStore(path)
+            with self.assertRaisesRegex(ValueError, "mantis.source"):
+                store.update(values={"mantis.source": "ultimate"})
+            self.assertNotIn("mantis.source", store.snapshot()["values"])
+
+            path.write_text(
+                json.dumps({"version": 2, "mantis": {"source": "ultimate"}})
+            )
+            for strict in (False, True):
+                with self.subTest(strict=strict):
+                    values = SettingsStore(path, strict=strict).snapshot()["values"]
+                    self.assertNotIn("mantis.source", values)
+                    merged = SettingsStore(path, strict=strict).merged_args(
+                        "collect-data", {}
+                    )
+                    self.assertNotIn("mantis_source", merged)
 
     def test_update_rejects_unknown_sections_and_curated_only_leaves(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -519,7 +519,7 @@ class VRTeleopCore:
         # lost side therefore freezes both arms and blocks re-engagement until
         # the core itself has consumed a fully released frame followed by a
         # fresh two-grip squeeze. Keeping this gate in the core also protects
-        # Quest/WebXR senders, not just the managed Lighthouse/Ultimate bridge.
+        # Quest/WebXR senders, not just the managed Lighthouse bridge.
         self._tracking_reengage_blocked: bool = False
         self._tracking_release_seen: bool = False
         self._at_rest: bool = True
@@ -3218,7 +3218,7 @@ class VRTeleopCore:
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,
-                # Lighthouse/Ultimate coordinates are unrelated to a
+                # Lighthouse coordinates are unrelated to a
                 # view-only Quest's local-floor origin/yaw unless the two
                 # installations were explicitly co-registered. Never render
                 # a plausible-looking but spatially false calibration overlay.

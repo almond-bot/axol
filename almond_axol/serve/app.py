@@ -2472,32 +2472,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- tracker setup files -------------------------------------------------
 
-    @app.get("/api/tracker/ultimate/wifi")
-    async def get_ultimate_wifi() -> dict[str, Any]:
-        """Non-secret Ultimate shared-map Wi-Fi configuration status."""
-        from .tracker_setup import ultimate_wifi_snapshot
-
-        return await asyncio.to_thread(ultimate_wifi_snapshot)
-
-    @app.put("/api/tracker/ultimate/wifi", response_model=None)
-    async def put_ultimate_wifi(request: Request) -> JSONResponse:
-        """Save shared-map Wi-Fi values without ever returning the password."""
-        from .tracker_setup import TrackerSetupError, save_ultimate_wifi
-
-        body, error = await redacted_json_body(request)
-        if error is not None:
-            return error
-        try:
-            result = await asyncio.to_thread(save_ultimate_wifi, body)
-        except TrackerSetupError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=400)
-        except OSError:
-            return JSONResponse(
-                {"error": "could not write the Ultimate Wi-Fi configuration"},
-                status_code=400,
-            )
-        return JSONResponse(result)
-
     @app.put("/api/tracker/lighthouse/quality", response_model=None)
     async def put_lighthouse_quality(request: Request) -> JSONResponse:
         """Choose the standard or strict Lighthouse tracking policy."""
@@ -2607,14 +2581,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         def inspect() -> dict[str, Any]:
             from ..cli.tracker_install import lighthouse_readiness
-            from ..cli.tracker_ultimate import (
-                is_ultimate_tracker_key,
-                ultimate_runtime_readiness,
-            )
             from ..mantis.calibration import (
                 DESIGN_TCP_TRANSFORMS,
                 INVALID_TRANSFORM_ENTRY,
-                STALE_TRANSFORM_ENTRY,
                 candidate_transform_for,
                 design_transform_for,
                 has_conflicting_transform_override,
@@ -2629,7 +2598,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 validation_snapshot,
             )
             from ..vr.server import get_last_quest_pose_datum
-            from .tracker_setup import TrackerSetupError, calibration_snapshot
 
             config = load_tracker_config()
             transform_entry_statuses: dict[tuple[str, str], str] = {}
@@ -2654,11 +2622,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         result[side] = "measured"
                     elif (
                         transform_entry_statuses.get((side, key))
-                        == STALE_TRANSFORM_ENTRY
-                    ):
-                        result[side] = "stale"
-                    elif (
-                        transform_entry_statuses.get((side, key))
                         == INVALID_TRANSFORM_ENTRY
                     ):
                         result[side] = "missing"
@@ -2678,37 +2641,24 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 return result
 
             resolved: dict[str, dict[str, Any]] = {}
-            for backend in ("survive", "ultimate"):
-                saved = config.bindings.get(backend, {})
-                left = saved.get("left")
-                right = saved.get("right")
-                if backend == config.backend:
-                    left = config.left or left
-                    right = config.right or right
-                resolved[backend] = {"left": left, "right": right}
-                bindings[backend] = {
-                    "complete": bool(
-                        left
-                        and right
-                        and left != right
-                        and (
-                            backend != "survive"
-                            or (
-                                is_lighthouse_serial(left)
-                                and is_lighthouse_serial(right)
-                            )
-                        )
-                        and (
-                            backend != "ultimate"
-                            or (
-                                is_ultimate_tracker_key(left)
-                                and is_ultimate_tracker_key(right)
-                            )
-                        )
-                    ),
-                    "left": left,
-                    "right": right,
-                }
+            saved = config.bindings.get("survive", {})
+            left = saved.get("left")
+            right = saved.get("right")
+            if config.backend == "survive":
+                left = config.left or left
+                right = config.right or right
+            resolved["survive"] = {"left": left, "right": right}
+            bindings["survive"] = {
+                "complete": bool(
+                    left
+                    and right
+                    and left != right
+                    and is_lighthouse_serial(left)
+                    and is_lighthouse_serial(right)
+                ),
+                "left": left,
+                "right": right,
+            }
 
             common_quest_keys = {
                 key
@@ -2793,30 +2743,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "expectedBaseStations": config.expected_base_stations,
                 "qualityMode": config.lighthouse_quality,
                 "validation": validation_snapshot(config),
-            }
-            ultimate = ultimate_runtime_readiness()
-            try:
-                ultimate_calibration = calibration_snapshot("ultimate")
-            except (OSError, TrackerSetupError):
-                # Readiness remains a diagnostic endpoint when an operator-
-                # editable calibration file is malformed. The production CLI
-                # preflight still fails closed because no transform loads.
-                ultimate_transforms = {"left": "missing", "right": "missing"}
-            else:
-                ultimate_transforms = {
-                    side: (
-                        "missing"
-                        if ultimate_calibration[side]["status"] == "unbound"
-                        else ultimate_calibration[side]["status"]
-                    )
-                    for side in ("left", "right")
-                }
-            source_status["ultimate"] = {
-                **ultimate,
-                "binding": bindings["ultimate"],
-                "transforms": ultimate_transforms,
-                "quatOrder": config.ultimate_quat_order,
-                "upAxis": config.ultimate_up_axis,
             }
             left_channel, right_channel = settings.mantis_can_channels()
             return {

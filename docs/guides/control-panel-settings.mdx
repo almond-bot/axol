@@ -63,7 +63,7 @@ You can set any field in these sections. The panel shows the common ones as cont
 | `lerobot_teleop` | LeRobot `teleop_config.id` and `teleop_config.calibration_dir`. | Data collection, DAgger |
 | `robot` | `left_channel` and `right_channel`, the arms' CAN interfaces. `"null"` turns an arm off. | Every operation, diagnostics dashboard |
 | `gravity` | `kd` and `rate_hz` of gravity compensation. | Gravity compensation, waypoints |
-| `mantis` | `source` (`lighthouse`, `ultimate` or `quest`), `quest_tracker_key`, and the Mantis CAN channels (`can_mantis_l` and `can_mantis_r` by default). | Mantis data collection and teleop |
+| `mantis` | `source` (`lighthouse` or `quest`), `quest_tracker_key`, and the Mantis CAN channels (`can_mantis_l` and `can_mantis_r` by default). | Mantis data collection and teleop |
 | `recording` | `fps`, `replay_fps`, `vcodec`, `root`, `push_to_hub`, `record_jelly` (the **Record Jelly** switch), `rerun_ip` and `rerun_port`. | Data collection, DAgger, run policy, replay |
 | `inference` | The [run policy](/operations/run-policy-config) settings, such as `device`, `server_host`, `server_port` and `episode_time_s`. | Run policy |
 | `system` | `hardware_profile` (`axol` or `mantis`, the device chosen in the panel) and `log_level`. | Every operation |

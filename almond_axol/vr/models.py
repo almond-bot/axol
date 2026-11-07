@@ -133,7 +133,7 @@ class VRFrame(BaseModel):
             headset rather than per socket. Tracker bridges use one id across
             reconnects. Optional for compatibility with older clients.
         pose_source_kind: ``"webxr"`` for Quest or ``"tracker"`` for a local
-            Lighthouse/Ultimate bridge. A managed Mantis server admits only
+            Lighthouse bridge. A managed Mantis server admits only
             its configured kind, allowing a Quest to display video/URDF state
             without its controller frames taking control.
         l_pose_profile: First (most preferred) WebXR input profile reported by

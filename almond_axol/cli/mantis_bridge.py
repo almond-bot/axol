@@ -2,9 +2,8 @@
 
 The control-panel runner owns this lifecycle itself. Direct ``collect-data``
 uses :func:`managed_mantis_bridge` so ``--mantis_source`` has the same meaning
-everywhere: Quest waits for WebXR, while Lighthouse and Ultimate start the
-selected local tracker backend automatically. Teleop never tracks (Mantis
-teleop is grippers-only). Both inherit the saved rig channel map (and, for a
+everywhere: Quest waits for WebXR, while Lighthouse starts the local tracker
+backend automatically. Teleop never tracks (Mantis teleop is grippers-only). Both inherit the saved rig channel map (and, for a
 Quest collection, the saved tracker key) from the robot's shared settings
 through :func:`almond_axol.cli.config.parse`'s ``settings_args`` fold.
 """
@@ -51,9 +50,7 @@ def require_mantis_tracker_readiness(source: str) -> None:
 
     The control panel displays these checks, but operations can also start via
     the direct CLI or REST API.  Keeping the authoritative gate here prevents
-    those paths from collecting with a stale libsurvive/pyvut build or, for
-    Ultimate, without the dongle, protected shared-map Wi-Fi config, and
-    operator HID access that the bridge needs.
+    those paths from collecting with a stale libsurvive build.
     """
     if source == "quest":
         return
@@ -70,39 +67,7 @@ def require_mantis_tracker_readiness(source: str) -> None:
             + (f": {details}" if details else "")
             + ". Run `axol tracker.install`, then retry."
         )
-    if source == "ultimate":
-        from .tracker_ultimate import ultimate_runtime_readiness
-
-        readiness = ultimate_runtime_readiness(cached=False)
-        problems: list[str] = []
-        if not readiness["installed"]:
-            problems.extend(str(issue) for issue in readiness.get("issues") or [])
-        if not readiness["dongleConnected"]:
-            problems.append("the Ultimate wireless dongle is not connected")
-        elif readiness["endpointStatus"] != "accessible":
-            problems.append(
-                f"Ultimate HID interface 0 is {readiness['endpointStatus']}"
-            )
-        if not readiness["operatorAccess"]:
-            problems.append("this operator cannot access the Ultimate dongle")
-        if readiness["wifiConfig"] != "valid":
-            problems.append(
-                "the shared-map Wi-Fi config is "
-                f"{readiness['wifiConfig']} (create a valid mode-0600 config)"
-            )
-        if not problems:
-            return
-        # Keep ordering useful but avoid repeating endpoint/access issues that
-        # can be reported by both the runtime's generic list and live checks.
-        details = "; ".join(dict.fromkeys(problems))
-        raise RuntimeError(
-            f"Ultimate tracking setup is incomplete: {details}. Run `axol "
-            "tracker.ultimate.install` if runtime support is missing, then "
-            "`axol tracker.ultimate.check`."
-        )
-    raise ValueError(
-        f"Mantis source must be quest, lighthouse, or ultimate; got {source!r}"
-    )
+    raise ValueError(f"Mantis source must be quest or lighthouse; got {source!r}")
 
 
 @contextlib.contextmanager
@@ -130,14 +95,12 @@ def managed_mantis_bridge(
             _rig_channel(right_channel, CAN_RIGHT, CAN_MANTIS_RIGHT),
         )
     )
-    backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
     if source == "quest":
         yield
         return
-    if backend is None:
-        raise ValueError(
-            f"Mantis source must be quest, lighthouse, or ultimate; got {source!r}"
-        )
+    if source != "lighthouse":
+        raise ValueError(f"Mantis source must be quest or lighthouse; got {source!r}")
+    backend = "survive"
     if (
         not isinstance(pose_source_id, str)
         or not pose_source_id.strip()

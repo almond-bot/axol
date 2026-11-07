@@ -48,13 +48,11 @@ from almond_axol.constants import CAN_BRINGUP_SCRIPT
 from almond_axol.mantis.calibration import MANTIS_TCP_TRANSFORM_FILE
 from almond_axol.serve.settings import SETTINGS_PATH
 from almond_axol.tracker.config import TRACKER_CONFIG_FILE
-from almond_axol.tracker.ultimate import ULTIMATE_WIFI_CONFIG_FILE
 from almond_axol.utils.certs import CERTFILE
 print(CAN_BRINGUP_SCRIPT)
 print(MANTIS_TCP_TRANSFORM_FILE)
 print(SETTINGS_PATH)
 print(TRACKER_CONFIG_FILE)
-print(ULTIMATE_WIFI_CONFIG_FILE)
 print(CERTFILE)
 """
         env = os.environ.copy()
@@ -73,7 +71,6 @@ print(CERTFILE)
                 "/srv/operator state/mantis/tcp_transform.json",
                 "/srv/operator state/settings.json",
                 "/srv/operator state/tracker/config.json",
-                "/srv/operator state/tracker/ultimate_wifi.json",
                 "/srv/operator state/vr/certs/cert.pem",
             ],
         )

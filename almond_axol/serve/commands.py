@@ -482,7 +482,7 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "Collect data",
         "Record teleoperation episodes with the ZED cameras. Mantis works with "
-        "Quest, Lighthouse or Ultimate tracking.",
+        "Quest or Lighthouse tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -918,8 +918,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tracker.identify",
         "tracker.identify",
         "Identify Mantis trackers",
-        "Bind the selected Lighthouse or Ultimate trackers to the left and "
-        "right Mantis with a guided motion capture.",
+        "Bind the Lighthouse trackers to the left and right Mantis with a "
+        "guided motion capture.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.tracker_identify"),
@@ -971,29 +971,6 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.tracker_lighthouse_calibrate"),
         requires_hardware=True,
-        uses_can_bus=False,
-    ),
-    "tracker.ultimate.install": CommandDef(
-        "tracker.ultimate.install",
-        "tracker.ultimate.install",
-        "Install Ultimate support",
-        "Install the pinned pyvut runtime, native HID libraries, and USB permissions.",
-        "Setup",
-        "argparse",
-        _argparse_loader("..cli.tracker_ultimate"),
-        requires_hardware=False,
-        uses_can_bus=False,
-    ),
-    "tracker.ultimate.check": CommandDef(
-        "tracker.ultimate.check",
-        "tracker.ultimate.check",
-        "Check Ultimate setup",
-        "Check the Ultimate runtime, dongle, permissions, Wi-Fi, and bindings "
-        "without opening the dongle or changing pairing state.",
-        "Setup",
-        "argparse",
-        _argparse_loader("..cli.tracker_ultimate"),
-        requires_hardware=False,
         uses_can_bus=False,
     ),
     "can.setup": CommandDef(

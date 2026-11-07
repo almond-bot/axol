@@ -233,7 +233,6 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
     from ..mantis.calibration import (
         INVALID_TRANSFORM_ENTRY,
         MANTIS_TCP_TRANSFORM_FILE,
-        STALE_TRANSFORM_ENTRY,
         design_transform_for,
         has_conflicting_transform_override,
         load_tcp_transforms,
@@ -320,11 +319,7 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
         authoritative = entries.get(key) if device_scoped else None
         blocked_override = (
             bool(document_errors)
-            or entry_statuses.get((side, key))
-            in {
-                STALE_TRANSFORM_ENTRY,
-                INVALID_TRANSFORM_ENTRY,
-            }
+            or entry_statuses.get((side, key)) == INVALID_TRANSFORM_ENTRY
             or has_conflicting_transform_override(
                 side,
                 key,
@@ -764,7 +759,7 @@ class CollectDataConfig:
     """Pose source for Mantis mode. Direct Mantis runs inherit the host's
     Settings → Mantis choice when saved; otherwise Lighthouse is the default.
     A config file or explicit CLI value wins. Quest connects through WebXR;
-    Lighthouse and Ultimate start the corresponding local tracker bridge."""
+    Lighthouse starts the local tracker bridge."""
     mantis_allow_uncalibrated: bool = False
     """Allow a Mantis dataset when either tracker→TCP transform is missing.
     Intended only for bring-up/calibration captures: the resulting Cartesian

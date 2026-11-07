@@ -163,7 +163,7 @@ AggregateFn = register_literal(
         "conservative",
     ]
 )
-MantisSource = register_literal(Literal["quest", "lighthouse", "ultimate"])
+MantisSource = register_literal(Literal["quest", "lighthouse"])
 
 
 # ----------------------------------------------------------------------

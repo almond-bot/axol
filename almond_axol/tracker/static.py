@@ -8,7 +8,7 @@ tracker hardware at all** against a generic VR server::
     axol tracker.bridge --backend static      # another; Enter to engage
 
 Managed Mantis sessions deliberately do not offer this backend: they own a
-Quest, Lighthouse, or Ultimate source for their whole lifecycle. Unlike the
+Quest or Lighthouse source for their whole lifecycle. Unlike the
 ``synthetic`` backend — which orbits the devices through small circles to
 exercise the bridge → IK → sim pipeline — this source never moves.
 

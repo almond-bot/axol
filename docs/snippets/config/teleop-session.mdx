@@ -35,7 +35,7 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}tracker_key</F> | `null` | *Mantis data collection, Quest.* Which saved calibration to use, e.g. `quest:oculus-touch-v3:grip`. Set from **Mantis settings** in the panel. |
 | <F>--{prefix}quest_controller_profile</F> | `null` | *Mantis data collection, Quest.* Expected controller profile. Filled from `tracker_key`. |
 | <F>--{prefix}quest_pose_space</F> | `null` | *Mantis data collection, Quest.* Expected pose datum, `grip` or `target-ray`. Filled from `tracker_key`. |
-| <F>--{prefix}urdf_viewer_world_aligned</F> | `null` | *Mantis data collection.* Whether the pose source shares the viewer headset's floor. `null` means `true` for Quest, `false` for Lighthouse/Ultimate. |
+| <F>--{prefix}urdf_viewer_world_aligned</F> | `null` | *Mantis data collection.* Whether the pose source shares the viewer headset's floor. `null` means `true` for Quest, `false` for Lighthouse. |
 
 <Note>
   **Mantis mode** (`--mantis`) forces `absolute_mode: true`, `hold_to_engage: false`, `ik_alpha: 1.0`, `pose_cutoff: 5.0`, and removes the speed and acceleration limits. Your values for these keys are ignored in Mantis mode.

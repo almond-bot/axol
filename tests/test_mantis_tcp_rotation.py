@@ -84,16 +84,15 @@ _R_WB = np.column_stack([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
 
 
 class VivePrimaryConstantTest(unittest.TestCase):
-    def test_factory_rotation_is_ry180_for_both_families_and_sides(self) -> None:
+    def test_factory_rotation_is_ry180_for_both_sides(self) -> None:
         expected = quat_xyzw_to_matrix(np.asarray(VIVE_TCP_ROTATION_QUAT))
         np.testing.assert_allclose(expected, np.diag([-1.0, 1.0, -1.0]), atol=1e-9)
-        for family in ("survive", "ultimate"):
-            for side in ("left", "right"):
-                self.assertEqual(
-                    DESIGN_TCP_TRANSFORMS[family][side][3:],
-                    list(VIVE_TCP_ROTATION_QUAT),
-                    (family, side),
-                )
+        for side in ("left", "right"):
+            self.assertEqual(
+                DESIGN_TCP_TRANSFORMS["survive"][side][3:],
+                list(VIVE_TCP_ROTATION_QUAT),
+                side,
+            )
         # The retired constant is Rx(+90°), kept only for the migration.
         legacy = quat_xyzw_to_matrix(np.asarray(LEGACY_VIVE_TCP_ROTATION_QUAT))
         np.testing.assert_allclose(legacy, _rot_x(math.pi / 2), atol=1e-6)
@@ -235,7 +234,7 @@ class WorkerReachFlagTest(unittest.TestCase):
 class ProvenanceTest(unittest.TestCase):
     def test_provenance_ids(self) -> None:
         survive = DESIGN_TCP_TRANSFORMS["survive"]
-        ultimate = DESIGN_TCP_TRANSFORMS["ultimate"]
+        quest = DESIGN_TCP_TRANSFORMS["quest:meta-quest-touch-plus:grip"]
         design = tcp_transform_provenance(
             survive["left"], survive["right"], source="lighthouse"
         )
@@ -244,20 +243,19 @@ class ProvenanceTest(unittest.TestCase):
         self.assertEqual(design["left"], survive["left"])
         # Each family has its own id, so a Vive dataset can never resume as a
         # Quest one (or across a constant change).
-        self.assertEqual(len(set(DESIGN_TCP_TRANSFORM_IDS.values())), 3)
+        self.assertEqual(len(set(DESIGN_TCP_TRANSFORM_IDS.values())), 2)
         self.assertEqual(set(DESIGN_TCP_TRANSFORM_IDS), set(DESIGN_TCP_TRANSFORMS))
         self.assertNotIn(
             LEGACY_DESIGN_TCP_TRANSFORM_ID, DESIGN_TCP_TRANSFORM_IDS.values()
         )
         mixed = tcp_transform_provenance(
-            survive["left"], ultimate["right"], source="lighthouse"
+            survive["left"], quest["right"], source="lighthouse"
         )
         self.assertEqual(
             mixed["id"],
             f"{DESIGN_TCP_TRANSFORM_IDS['survive']}+"
-            f"{DESIGN_TCP_TRANSFORM_IDS['ultimate']}",
+            f"{DESIGN_TCP_TRANSFORM_IDS['quest:meta-quest-touch-plus:grip']}",
         )
-        quest = DESIGN_TCP_TRANSFORMS["quest:meta-quest-touch-plus:grip"]
         self.assertEqual(
             tcp_transform_provenance(quest["left"], quest["right"], source="quest")[
                 "id"
