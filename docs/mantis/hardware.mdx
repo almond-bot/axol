@@ -133,7 +133,7 @@ Before you set up cameras or tracking, check that each trigger drives its own gr
    axol teleop --mantis
    ```
 
-2. Keep hands and objects clear of the grippers, and release both triggers. Each gripper opens fully to find its end stop.
+2. Keep hands and objects clear of the grippers, and release both triggers. Each gripper closes, then opens fully, to find its end stops.
 3. Squeeze each trigger. Its gripper should close as far as you squeeze.
 4. Press **Stop**, or **Ctrl-C** in the terminal, to turn both grippers off.
 
@@ -147,6 +147,10 @@ If a gripper follows its trigger but stays partly open at full squeeze, adjust t
 2. Lower **Left trigger full squeeze** or **Right trigger full squeeze** from its default of `1.0`. The range is `0.50` to `1.00`. If you know the trigger's reading at full squeeze, set it a little below the lowest reading. For example, for readings around `0.91` to `0.94`, set `0.90`. Otherwise, lower it in small steps.
 3. Save, then stop and start **Teleoperation** again.
 4. Squeeze each trigger fully and check that the gripper closes.
+
+#### If a gripper doesn't open fully
+
+Each gripper finds its end stops at the start of every run. If something blocks a jaw during that sweep, the gripper takes the blocked spot as its end stop. Empty the gripper, keep it clear, then stop and start **Teleoperation** again. If it still doesn't open fully, open and close the jaw by hand with the run stopped, and check for a tight spot.
 
 If the gripper closes before the trigger reaches the end of its travel, the value is too low. Raise it. If the gripper still doesn't close when the setting is right, check the gripper's jaws, linkage and motor calibration.
 
