@@ -305,6 +305,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         let (p_max, t_max) = proto::ma_mit_ranges(version, model.as_deref());
         check_direction(sock, iface, spec)?;
         check_max_torque(sock, iface, spec, version, model.as_deref())?;
+        check_sample_res(sock, iface, spec, model.as_deref())?;
 
         let Some((s1, _)) =
             txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_STATUS1), TIMEOUT)?
@@ -469,8 +470,10 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
 
 /// Read 0xC0 parameter `index`, or `None` when the motor doesn't answer.
 fn read_param(sock: &CanSock, id: u8, index: u8) -> io::Result<Option<f64>> {
-    Ok(txn::ma_request(sock, id, proto::ma_param_read(index), TIMEOUT)?
-        .and_then(|(d, _)| proto::ma_decode_param(&d, index)))
+    Ok(
+        txn::ma_request(sock, id, proto::ma_param_read(index), TIMEOUT)?
+            .and_then(|(d, _)| proto::ma_decode_param(&d, index)),
+    )
 }
 
 /// Refuse a motor that turns the reverse of the fleet: Exchange Phase 0
@@ -491,6 +494,35 @@ fn check_direction(sock: &CanSock, iface: &str, spec: &MotorSpec) -> io::Result<
          Direction is on. Zero this arm with `axol motor.set-zero-pos --guided`, \
          which turns it on, then try again.",
         spec.joint
+    )))
+}
+
+/// Refuse a motor whose CURRENT_SAMPLE_RES doesn't match its model (see
+/// `proto::ma_sample_res`): its torque would be scaled wrong while it reports
+/// the commanded torque. Never written here: a wrong value means the motor's
+/// settings were copied from another model, so a person checks it first.
+/// Models outside the table and an unanswered read pass.
+fn check_sample_res(
+    sock: &CanSock,
+    iface: &str,
+    spec: &MotorSpec,
+    model: Option<&str>,
+) -> io::Result<()> {
+    let Some(expected) = model.and_then(proto::ma_sample_res) else {
+        return Ok(());
+    };
+    let id = spec.motor_id;
+    let Some(configured) = read_param(sock, id, proto::MA_PARAM_CURRENT_SAMPLE_RES)? else {
+        return Ok(());
+    };
+    if (configured - expected).abs() < 1e-3 {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "{iface}: {} (0x{id:02X}) has its current sample resistor set to {} mOhm,          but an {} uses {expected}, so it would deliver the wrong torque. Its other          settings may have been copied from another motor too. Run `axol          motor.set-config --channel {iface} --id 0x{id:02X} --param CURRENT_SAMPLE_RES          --value {expected} --force-protected`, power-cycle Axol, then try again.",
+        spec.joint,
+        configured as f32,
+        model.unwrap_or_default()
     )))
 }
 

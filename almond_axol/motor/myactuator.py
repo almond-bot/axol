@@ -272,6 +272,27 @@ def _model_rated_torque(model: str | None) -> float | None:
     return None
 
 
+# The current-sense resistor (mOhm) each X series' drive is built with, which
+# CURRENT_SAMPLE_RES must match: every X8-P20 on Axol reads 2 and every
+# X6-P20 reads 3. The drive scales its measured current by the setting, so a
+# wrong value scales every torque it delivers while it still reports the
+# torque it was asked for: an X8 shoulder_2 set to an X6's 3 pushed 1.5x its
+# command and lifted the arm in gravity comp. Mirrors proto::ma_sample_res.
+_MA_SERIES_SAMPLE_RES: dict[int, float] = {
+    6: 3.0,
+    8: 2.0,
+}
+
+
+def _model_sample_res(model: str | None) -> float | None:
+    """The CURRENT_SAMPLE_RES (mOhm) a model's drive needs, else None."""
+    if model:
+        match = re.search(r"X(\d+)", model.strip().upper())
+        if match is not None:
+            return _MA_SERIES_SAMPLE_RES.get(int(match.group(1)))
+    return None
+
+
 def max_torque_matches(configured: float, rated: float) -> bool:
     """Whether a MAX_TORQUE setting is within tolerance of the model's rating."""
     return math.isfinite(configured) and abs(configured - rated) <= (
@@ -597,6 +618,32 @@ class MyActuatorMotor(MotorDriver):
         if problem is not None:
             raise MotorError(problem)
 
+    async def _check_sample_res(self) -> None:
+        """Refuse a motor whose CURRENT_SAMPLE_RES doesn't match its model.
+
+        Never written here: a wrong value means the motor's settings were
+        copied from another model, so a person checks it first. Models
+        outside ``_MA_SERIES_SAMPLE_RES`` and an unanswered read pass.
+        """
+        expected = _model_sample_res(self._model)
+        if expected is None:
+            return
+        try:
+            configured = await self._read_param(MyActuatorParam.CURRENT_SAMPLE_RES)
+        except MotorError:
+            return
+        if abs(configured - expected) < 1e-3:
+            return
+        raise MotorError(
+            f"Motor {self._motor_id:#04x} on {self._bus.channel} has its current "
+            f"sample resistor set to {configured:g} mOhm, but an {self._model} "
+            f"uses {expected:g}, so it would deliver the wrong torque. Its other "
+            f"settings may have been copied from another motor too. Run `axol "
+            f"motor.set-config --channel {self._bus.channel} --id "
+            f"{self._motor_id:#04x} --param CURRENT_SAMPLE_RES --value "
+            f"{expected:g} --force-protected`, power-cycle Axol, then try again."
+        )
+
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
     # ------------------------------------------------------------------ #
@@ -620,6 +667,7 @@ class MyActuatorMotor(MotorDriver):
             pass
         await self._check_direction()
         await self._check_torque_scale(fix=True)
+        await self._check_sample_res()
         await self._apply_low_voltage_threshold()
         # The joints have no brake, so there is nothing to release: the motor
         # takes torque on its first motion command. Read status 1 so a motor
@@ -635,6 +683,7 @@ class MyActuatorMotor(MotorDriver):
         await self._detect_capabilities()
         await self._check_direction()
         await self._check_torque_scale(fix=False)
+        await self._check_sample_res()
         running, error_bits = await self._running_state()
         if error_bits:
             raise MotorError(

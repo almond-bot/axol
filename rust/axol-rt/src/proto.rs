@@ -66,6 +66,20 @@ pub fn ma_rated_torque(model: &str) -> Option<f64> {
     }
 }
 
+/// The current-sense resistor (mOhm) an X-series motor's drive is built
+/// with, which its CURRENT_SAMPLE_RES setting must match: 2 on an X8, 3 on an
+/// X6. The drive scales its measured current by this setting, so a wrong
+/// value scales every torque it delivers while it still reports the torque
+/// it was asked for. `None` for models outside the table. Mirrors
+/// `_MA_SERIES_SAMPLE_RES` in the Python driver.
+pub fn ma_sample_res(model: &str) -> Option<f64> {
+    match model_series(model)? {
+        6 => Some(3.0),
+        8 => Some(2.0),
+        _ => None,
+    }
+}
+
 /// The numeric suffix after the series and gearing tokens (`RMD-X6-P20-50`
 /// gives 50), or `None` when the model has none.
 fn model_variant(model: &str) -> Option<u32> {
@@ -89,6 +103,8 @@ pub const MA_PARAM_CHANGE_DIRECTION: u8 = 0x0F;
 /// Exchange Phase 0 needs Change Motor Direction on. Mirrors
 /// `direction_flag_needed` in the Python driver.
 pub const MA_PARAM_EXCHANGE_PHASE: u8 = 0x10;
+/// Current sample resistor (mOhm), see [`ma_sample_res`].
+pub const MA_PARAM_CURRENT_SAMPLE_RES: u8 = 0x17;
 /// Commits every 0xC0 write since the last commit to ROM (empty payload).
 pub const MA_PARAM_SAVE: u8 = 0xC1;
 
@@ -444,6 +460,14 @@ pub fn mit_encode(p_des: f64, v_des: f64, kp: f64, kd: f64, t_ff: f64, r: &MitRa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_res_follows_the_series() {
+        assert_eq!(ma_sample_res("RMD-X8-P20-120"), Some(2.0));
+        assert_eq!(ma_sample_res("RMD-X6-P20-60"), Some(3.0));
+        assert_eq!(ma_sample_res("RMD-X6-P20-50"), Some(3.0));
+        assert_eq!(ma_sample_res("RMD-L-7015"), None);
+    }
 
     /// MAX_TORQUE (0x46) replies read off the fleet: 60 on an X6-P20 and 129
     /// on an X8-P20 running 2026042402, 1.5 on an X6-P20 running 2026052501.

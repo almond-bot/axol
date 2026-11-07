@@ -91,6 +91,8 @@ def _motor(firmware: int, **params: float) -> tuple[MyActuatorMotor, _FakeBus]:
     # Exchange Phase 1 is a motor that turns the fleet's way; the direction
     # tests pass 0 for one that turns the reverse.
     params.setdefault("EXCHANGE_PHASE", 1.0)
+    # The fake motor is an X6 unless a test changes bus.model.
+    params.setdefault("CURRENT_SAMPLE_RES", 3.0)
     values = {int(MyActuatorParam[k]): v for k, v in params.items()}
     bus = _FakeBus(0x01, firmware, values)
     return MyActuatorMotor(bus, 0x01, kt=1.0), bus  # type: ignore[arg-type]
@@ -205,6 +207,41 @@ class MyActuatorTorqueScaleTest(unittest.IsolatedAsyncioTestCase):
         motor, _ = _motor(_OLD_FW, MAX_TORQUE=1.5)
         await motor.enable()
         self.assertEqual(motor._t_max, 24.0)
+
+
+class MyActuatorSampleResTest(unittest.IsolatedAsyncioTestCase):
+    """CURRENT_SAMPLE_RES must match the model: 2 on an X8, 3 on an X6."""
+
+    async def test_each_series_passes_with_its_own_value(self) -> None:
+        for model, res in (("RMD-X6-P20-60", 3.0), ("RMD-X8-P20-120", 2.0)):
+            motor, bus = _motor(MYACTUATOR_FW_V44, CURRENT_SAMPLE_RES=res)
+            bus.model = model
+            bus.params[MyActuatorParam.MAX_TORQUE] = 60.0 if "X6" in model else 129.0
+            await motor.enable()
+            await motor.attach()
+
+    async def test_an_x8_with_an_x6_value_is_refused_and_not_written(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=129.0)
+        bus.model = "RMD-X8-P20-120"
+        for bring_up in (motor.enable, motor.attach):
+            with self.assertRaises(MotorError) as ctx:
+                await bring_up()
+            message = str(ctx.exception)
+            self.assertIn("current sample resistor set to 3 mOhm", message)
+            self.assertIn(
+                "--param CURRENT_SAMPLE_RES --value 2 --force-protected", message
+            )
+        self.assertNotIn(MyActuatorParam.CURRENT_SAMPLE_RES, [i for i, _ in bus.writes])
+
+    async def test_an_x6_with_an_x8_value_is_refused(self) -> None:
+        motor, _ = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=60.0, CURRENT_SAMPLE_RES=2.0)
+        with self.assertRaises(MotorError):
+            await motor.enable()
+
+    async def test_unknown_models_pass(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44, CURRENT_SAMPLE_RES=7.0)
+        bus.model = "RMD-L-7015"
+        await motor.enable()
 
 
 def _direction_writes(bus: _FakeBus) -> list[float]:
