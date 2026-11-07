@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import math
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from almond_axol.constants import Joint
 from almond_axol.motor import MotorError
 from almond_axol.robot import axol as axol_module
 from almond_axol.robot.axol import AxolHardware
 from almond_axol.robot.config import AxolConfig
+from almond_axol.robot.mantis import MantisGripperArm
 
 
 class _Jaw:
@@ -232,6 +234,59 @@ class GripperTypeTest(unittest.IsolatedAsyncioTestCase):
     def test_unknown_type_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "gripper must be one of"):
             AxolConfig(gripper="claw")
+
+
+def _mantis_with(jaw: _Jaw) -> MantisGripperArm:
+    bus = Mock()
+    bus.channel = "can_mantis_l"
+    with patch("almond_axol.robot.mantis.Motor", return_value=jaw):
+        return MantisGripperArm(bus, SimpleNamespace(max_speed=10.0, torque_limit=0.5))
+
+
+class MantisSweepTest(unittest.IsolatedAsyncioTestCase):
+    """The Mantis gripper runs the robot gripper's two-stop sweep."""
+
+    def setUp(self) -> None:
+        self.enterContext(patch.object(axol_module.asyncio, "sleep", AsyncMock()))
+
+    async def test_stiff_patch_is_not_taken_for_the_open_stop(self) -> None:
+        # The open-only sweep took a stiff patch on the way open for the
+        # open stop, so the gripper never opened past it.
+        lo, hi = -6.0, -6.0 + math.radians(290)
+        jaw = _Jaw(lo=lo, hi=hi, start=-1.5, stiff=(-2.6, -2.4), spike_nm=1.5)
+        arm = _mantis_with(jaw)
+        await arm._calibrate()
+        self.assertTrue(arm.is_calibrated)
+        self.assertAlmostEqual(arm._open_pos, lo, delta=0.01)
+        self.assertAlmostEqual(arm._closed_pos, hi, delta=0.01)
+        # Closes first, then finishes open.
+        self.assertEqual(jaw.position, lo)
+
+    async def test_measured_stroke_replaces_the_nominal_one(self) -> None:
+        jaw = _Jaw(lo=-6.0, hi=-6.0 + math.radians(240), start=-5.0)
+        arm = _mantis_with(jaw)
+        with self.assertLogs("almond_axol.robot.mantis", "WARNING") as logs:
+            await arm._calibrate()
+        self.assertIn("off the nominal", "\n".join(logs.output))
+        self.assertAlmostEqual(arm.gripper_travel, math.radians(240), delta=0.02)
+        self.assertAlmostEqual(arm._normalize(jaw.lo), 1.0, delta=0.01)
+        self.assertAlmostEqual(arm._normalize(jaw.hi), 0.0, delta=0.01)
+
+    async def test_jaw_stuck_on_the_open_stop_is_retried_harder(self) -> None:
+        lo, hi = -6.0, -6.0 + math.radians(290)
+        jaw = _Jaw(lo=lo, hi=hi, start=lo, stuck_nm=1.4)
+        arm = _mantis_with(jaw)
+        with self.assertLogs(axol_module._logger, "WARNING"):
+            await arm._calibrate()
+        self.assertAlmostEqual(arm._open_pos, lo, delta=0.01)
+        self.assertAlmostEqual(arm._closed_pos, hi, delta=0.01)
+
+    async def test_jammed_jaw_fails_uncalibrated(self) -> None:
+        jaw = _Jaw(lo=-3.0, hi=-2.9, start=-2.95)
+        arm = _mantis_with(jaw)
+        with self.assertRaisesRegex(MotorError, "can_mantis_l gripper.*apart"):
+            await arm._calibrate()
+        self.assertFalse(arm.is_calibrated)
 
 
 if __name__ == "__main__":

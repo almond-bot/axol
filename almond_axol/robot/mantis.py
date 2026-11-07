@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Callable
 
 import numpy as np
@@ -38,10 +39,11 @@ from ..constants import ARM_JOINTS, RT_TARGET_FIELDS
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ..settings import SHARED
 from .axol import (
+    _GRIPPER_STROKE_TOLERANCE,
     GRIPPER_TRAVEL,
     _await_all_hardware_actions,
     _validated_motion_target,
-    calibrate_gripper_open_stop,
+    measure_gripper_stops,
 )
 from .base import RobotBase, mark_hardware_cleanup_uncertain
 from .config import AxolConfig, PositionForceConfig
@@ -50,6 +52,9 @@ _logger = logging.getLogger(__name__)
 
 _N_ARM = len(ARM_JOINTS)
 _DEFAULT_GRIPPER_POSITION = 1.0
+# Both Mantis jaws close toward positive motor angles, like the stock
+# parallel gripper on the robot (``gripper_close_direction("parallel", ...)``).
+_CLOSE_DIRECTION = 1
 # ``open_fully`` accepts the jaws as "all the way open" from this normalised
 # position (1.0 is the calibrated hard-stop, which the motor holds against
 # with a torque cap, so feedback settles just short of it).
@@ -82,8 +87,8 @@ class MantisGripperArm:
         # paces the command/feedback cadence itself. ``None`` = classic
         # Python bus path (bring-up, calibration, pre-open, torque-off).
         self._command_sink: Callable[[list[tuple[float, ...]]], None] | None = None
-        # Raw motor radians of the open / closed hard-stops, found on enable()
-        # by the same torque-stop sweep the robot gripper uses.
+        # Raw motor radians of the open / closed hard-stops, measured on the
+        # first enable() by the same two-stop sweep the robot gripper uses.
         self._open_pos = 0.0
         self._closed_pos = GRIPPER_TRAVEL
         self._virtual_arm = np.zeros(_N_ARM, dtype=np.float32)
@@ -103,8 +108,8 @@ class MantisGripperArm:
 
         Same shape as :attr:`AxolArm.gripper_travel`, so diagnostics that
         cycle a gripper (``diagnostics.can.send``) can treat either rig alike.
-        The Mantis only sweeps to its open stop, so this is the nominal
-        ``GRIPPER_TRAVEL`` from there.
+        The nominal ``GRIPPER_TRAVEL`` until the first :meth:`enable` has
+        measured both stops.
         """
         return abs(self._open_pos - self._closed_pos)
 
@@ -113,10 +118,12 @@ class MantisGripperArm:
     async def enable(self) -> None:
         """Enable this gripper, calibrating only on its first activation.
 
-        Episode boundaries disable motor torque but deliberately retain the
-        measured hard-stop in memory.  Re-enabling for a later episode can
-        therefore return directly to POSITION_FORCE mode without sweeping the
-        jaws open a second time.
+        The first enable measures both hard stops like the robot gripper
+        (:func:`~almond_axol.robot.axol.measure_gripper_stops`): the jaw
+        closes onto its closed stop, then opens onto its open stop and stays
+        open. Episode boundaries disable motor torque but deliberately retain
+        the measured stops in memory, so re-enabling for a later episode
+        returns directly to POSITION_FORCE mode without sweeping again.
         """
         if self._enabled:
             return
@@ -133,9 +140,7 @@ class MantisGripperArm:
             self._disable_pending = True
             if not self._calibrated:
                 await self._motor.set_control_mode(ControlMode.IMPEDANCE)
-                self._open_pos = await calibrate_gripper_open_stop(self._motor)
-                self._closed_pos = self._open_pos + GRIPPER_TRAVEL
-                self._calibrated = True
+                await self._calibrate()
             await self._motor.set_control_mode(ControlMode.POSITION_FORCE)
             await self._send_gripper_target()
             self._enabled = True
@@ -151,6 +156,33 @@ class MantisGripperArm:
                 else:
                     self._disable_pending = False
             raise
+
+    async def _calibrate(self) -> None:
+        """Measure both hard stops and adopt them for the [0, 1] mapping.
+
+        A stroke off the nominal ``GRIPPER_TRAVEL`` (an object in the jaws,
+        a sticky stop) is accepted with a warning, as on the robot.
+        """
+        side = self.channel
+        open_pos, closed_pos = await measure_gripper_stops(
+            self._motor,
+            _CLOSE_DIRECTION,
+            side=side,
+            nominal_stroke=GRIPPER_TRAVEL,
+        )
+        travel = abs(closed_pos - open_pos)
+        if abs(travel - GRIPPER_TRAVEL) > _GRIPPER_STROKE_TOLERANCE:
+            _logger.warning(
+                "%s gripper measured a %.0f° stroke, off the nominal ~%.0f° — "
+                "an object in the jaws or a sticky stop? Empty the gripper and "
+                "restart to recalibrate if it misbehaves",
+                side,
+                math.degrees(travel),
+                math.degrees(GRIPPER_TRAVEL),
+            )
+        self._open_pos = open_pos
+        self._closed_pos = closed_pos
+        self._calibrated = True
 
     async def disable(self) -> None:
         """Close the command gate immediately, then disable motor torque."""

@@ -21,14 +21,19 @@ from almond_axol.robot.mantis import MantisGripperArm, MantisHardware
 
 
 class _FakeGripperMotor:
-    """A Damiao gripper stand-in: tracks commanded position, stops on a torque."""
+    """A Damiao gripper stand-in: a jaw between an open and a closed stop.
 
-    def __init__(self, *, start: float = 1.25, stop_after_steps: int = 2) -> None:
+    Under the calibration's impedance hold the shaft follows the target until
+    it meets a stop, and the torque is the hold's spring pushing into it.
+    """
+
+    def __init__(self, *, start: float = 1.25, open_stop: float = 1.0) -> None:
         self.position_value = start
+        self.open_stop = open_stop
+        self.closed_stop = open_stop + GRIPPER_TRAVEL
         self.has_position = False
         self.calls: list[object] = []
-        self._steps = 0
-        self._stop_after = stop_after_steps
+        self._torque = 0.0
 
     async def enable(self) -> None:
         self.calls.append("enable")
@@ -42,13 +47,15 @@ class _FakeGripperMotor:
     async def get_position(self) -> float:
         return self.position_value
 
-    async def set_impedance(self, target: float, *_: float) -> None:
+    async def set_impedance(
+        self, target: float, _v: float, kp: float, *_: float
+    ) -> None:
         self.calls.append("sweep")
-        self.position_value = target
-        self._steps += 1
+        self.position_value = min(max(target, self.open_stop), self.closed_stop)
+        self._torque = kp * (target - self.position_value)
 
     async def get_torque(self) -> float:
-        return 0.6 if self._steps >= self._stop_after else 0.1
+        return self._torque
 
     async def set_position_force(self, raw: float, speed: float, torque: float) -> None:
         self.calls.append(("pf", raw))
@@ -147,13 +154,14 @@ class MantisOpenGrippersTest(unittest.IsolatedAsyncioTestCase):
         for arm, motor in ((left, left_motor), (right, right_motor)):
             with self.subTest(motor=motor):
                 # deferred connect verifies torque-off, then: enable ->
-                # impedance sweep to the stop -> position mode at the open stop
-                # -> release.
+                # impedance sweeps to both stops -> position mode at the open
+                # stop -> release.
                 self.assertEqual(motor.calls[0], "disable")
                 self.assertEqual(motor.calls[1], "enable")
                 self.assertEqual(motor.calls[2], ("mode", ControlMode.IMPEDANCE))
-                sweeps = [c for c in motor.calls if c == "sweep"]
-                self.assertEqual(len(sweeps), 2)
+                self.assertIn("sweep", motor.calls)
+                self.assertAlmostEqual(arm._open_pos, motor.open_stop, delta=1e-9)
+                self.assertAlmostEqual(arm._closed_pos, motor.closed_stop, delta=1e-9)
                 self.assertIn(("mode", ControlMode.POSITION_FORCE), motor.calls)
                 pf = [c for c in motor.calls if isinstance(c, tuple) and c[0] == "pf"]
                 self.assertTrue(pf)
@@ -166,9 +174,12 @@ class MantisOpenGrippersTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(robot._shutdown_pending)
 
         # The first take's enable is now instant: no second calibration sweep.
+        sweeps = [motor.calls.count("sweep") for motor in (left_motor, right_motor)]
         await robot.enable_grippers()
-        for motor in (left_motor, right_motor):
-            self.assertEqual(len([c for c in motor.calls if c == "sweep"]), 2)
+        self.assertEqual(
+            [motor.calls.count("sweep") for motor in (left_motor, right_motor)],
+            sweeps,
+        )
         self.assertTrue(left.is_enabled and right.is_enabled)
 
     async def test_open_failure_releases_both_grippers_and_propagates(self) -> None:

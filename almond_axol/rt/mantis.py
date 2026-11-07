@@ -23,7 +23,7 @@ at its end:
   (:class:`~almond_axol.motor.bus.CanBus`, itself a Rust proxy) and, in
   deferred mode, verify torque-off; no core yet.
 * :meth:`enable_grippers` — bring the grippers up from Python on the quiet
-  bus (enable, one-time open-stop calibration, POSITION_FORCE), then hand
+  bus (enable, one-time end-stop calibration, POSITION_FORCE), then hand
   the interfaces to the core: close the proxies, ``arm``, wait for the core's
   feedback stream, and re-send the latched targets through the core.
 * :meth:`motion_control` — latches the virtual arm and, while armed, ships
@@ -249,7 +249,7 @@ class Mantis(RobotBase):
     async def enable_grippers(self) -> None:
         """Bring both grippers up and hand their buses to the realtime core.
 
-        Idempotent while armed. The first activation runs the open-stop
+        Idempotent while armed. The first activation runs the end-stop
         calibration sweep (Python, quiet bus); later takes return directly
         to POSITION_FORCE. Any failure force-disables both grippers before
         it propagates, with the core stopped and the proxies reopened.

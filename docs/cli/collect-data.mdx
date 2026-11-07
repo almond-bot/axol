@@ -119,7 +119,7 @@ Mantis has no arms to return. It turns off both gripper motors between takes, an
 
 - The grippers use the Mantis CAN channels saved in **Mantis settings** (default `can_mantis_l` and `can_mantis_r`).
 - The head stereo camera uses the `overhead` slot and can record both eyes along with both wrists.
-- At startup both grippers open fully once to calibrate, then release.
+- At startup both grippers close, then open fully, once to calibrate. Keep hands and objects clear of the jaws.
 - The gripper motors are off between takes. Starting a recording turns them on, and every save, discard, stop or error turns them off again.
 - Engage at the agreed start pose. That fixes the robot base for the session. Rows use the Cartesian end-effector schema.
 - Each row's pose, gripper position and grip command are matched to the tracker's capture time.

@@ -60,6 +60,18 @@ You don't need `can.setup` to drive Jelly, because [`axol teleop`](/cli/teleop) 
 
 If an adapter that was set up before stays silent, it keeps its previous name. If a dual-channel hub is silent, `can.setup` asks whether it is Axol or Mantis, or whether to skip it.
 
+## Mantis gripper motor IDs
+
+Each Mantis gripper motor must be on CAN ID `0x08`. `can.setup` checks the motor on each Mantis channel and fixes the ID for you:
+
+| What `can.setup` finds on a channel | What it does |
+|---|---|
+| One motor on ID `0x08` | Nothing |
+| One motor on ID `0x01` or `0x07` | Moves it to ID `0x08` and saves the change on the motor |
+| One motor on any other ID | Prints the [`motor.set-can-id`](/cli/motor-set-can-id) command that moves it |
+| More than one motor | Changes nothing. Disconnect the extra motor, then run `can.setup` again. |
+| No motor | Changes nothing. Power on the gripper, then run `can.setup` again. |
+
 ## If something goes wrong
 
 - **Secure Boot blocks the driver.** `can.setup` stops before it changes the driver. Sign and enroll the module, or use a newer kernel whose built-in `gs_usb` driver supports your adapters. See [`can.driver`](/cli/can-driver).

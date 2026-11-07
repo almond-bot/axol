@@ -16,7 +16,7 @@ from almond_axol.lerobot.teleop.teleop_vr import AxolVRTeleop
 from almond_axol.motor import ControlMode, Joint, MotorError
 from almond_axol.motor.damiao import _float_to_uint as damiao_float_to_uint
 from almond_axol.motor.myactuator import _float_to_uint as myactuator_float_to_uint
-from almond_axol.robot.axol import AxolArm, AxolHardware
+from almond_axol.robot.axol import GRIPPER_TRAVEL, AxolArm, AxolHardware
 from almond_axol.robot.base import (
     HardwareCleanupError,
     RobotBase,
@@ -575,7 +575,7 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         arm._config = SimpleNamespace(gripper="parcel")
 
         with (
-            patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
+            patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_SWEEP_STROKES", 0.003),
             patch("almond_axol.robot.axol._GRIPPER_CALIB_SETTLE", 0.0),
         ):
             task = asyncio.create_task(arm.enable())
@@ -702,10 +702,14 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
                 Mock(), SimpleNamespace(max_speed=10.0, torque_limit=0.5)
             )
 
+        # A sweep budget of 3 steps: 0.015 rad over the 290° nominal stroke.
         with (
-            patch("almond_axol.robot.axol._GRIPPER_CALIB_MAX_STEPS", 3),
+            patch(
+                "almond_axol.robot.axol._GRIPPER_CALIB_MAX_SWEEP_STROKES",
+                0.015 / GRIPPER_TRAVEL,
+            ),
             patch("almond_axol.robot.axol._GRIPPER_CALIB_SETTLE", 0.0),
-            self.assertRaisesRegex(MotorError, "no hard stop was detected"),
+            self.assertRaisesRegex(MotorError, "no hard stop met"),
         ):
             await arm.enable()
 
@@ -713,7 +717,8 @@ class MotionCommandSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(arm.is_calibrated)
         self.assertFalse(arm._disable_pending)
         motor.disable.assert_awaited_once_with()
-        self.assertEqual(motor.set_impedance.await_count, 3)
+        # Three closing steps, then the hold is unloaded at the shaft.
+        self.assertEqual(motor.set_impedance.await_count, 4)
         self.assertEqual(motor.get_torque.await_count, 3)
         motor.set_position_force.assert_not_awaited()
         self.assertEqual(

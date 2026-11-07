@@ -1194,6 +1194,23 @@ _DAMIAO_FEEDBACK_BASE = 0x10
 _PROBE_ATTEMPTS = 3
 _PROBE_WINDOW_S = 0.4
 
+# Mantis gripper CAN ID. Every Mantis consumer drives the gripper as
+# Joint.GRIPPER (ESC_ID 0x08, feedback on MST_ID 0x18). Damiao ships motors at
+# ESC_ID 0x01, and some grippers were built at 0x07 (Joint.WRIST_3's ID), so
+# can.setup moves a gripper found on either ID to 0x08 — but only when it is
+# the sole Damiao on its channel, so it can never re-ID the wrong motor.
+_MANTIS_GRIPPER_ID = 0x08
+_MANTIS_GRIPPER_FEEDBACK_ID = _DAMIAO_FEEDBACK_BASE + _MANTIS_GRIPPER_ID
+_MANTIS_GRIPPER_REMAP_IDS = frozenset({0x01, 0x07})
+# Every ESC_ID the sweep reads ESC_ID (register 8) from. Replies arrive on each
+# motor's MST_ID, whatever it is (a factory motor's may be 0x000), so the sweep
+# matches the register-read signature rather than the arbitration ID.
+_DAMIAO_SCAN_IDS = range(0x01, 0x80)
+_DAMIAO_REG_MST_ID = 7
+_DAMIAO_REG_ESC_ID = 8
+_DAMIAO_SCAN_PASSES = 2
+_DAMIAO_SCAN_WINDOW_S = 0.4
+
 # Dual-channel hub identity probes. The Mantis trigger is the strongest
 # discriminator because it does not exist on an Axol arm. Its firmware emits
 # a ``<fH`` core (normalised position + 12-bit raw ADC), optionally followed
@@ -1348,6 +1365,142 @@ def _probe_axol_shoulder(iface: str) -> bool:
             and data[0] == _MYACTUATOR_STATUS1
         ),
     )
+
+
+def _scan_damiao_motors(iface: str) -> dict[int, int] | None:
+    """``{ESC_ID: MST_ID}`` for every Damiao motor answering on ``iface``.
+
+    Read-only: each motor is asked for its ESC_ID register (0x33 read), which
+    enables or moves nothing. Returns None when the bus can't be opened or
+    its TX path is wedged, so silence is never mistaken for "no motors".
+    """
+    import asyncio
+
+    from ...motor import CanBus
+
+    async def run_scan() -> dict[int, int] | None:
+        found: dict[int, int] = {}
+        bus = CanBus(iface)
+
+        def on_message(message) -> None:  # noqa: ANN001
+            can_id = _standard_data_can_id(message.arbitration_id)
+            if can_id is None or can_id == _DAMIAO_CFG_ID:
+                return
+            data = bytes(message.data)
+            if len(data) != 8 or data[2] != 0x33 or data[3] != _DAMIAO_REG_ESC_ID:
+                return
+            esc_id = data[0] | (data[1] << 8)
+            # A real reply echoes the addressed ID and carries it as the value.
+            if (
+                esc_id in _DAMIAO_SCAN_IDS
+                and int.from_bytes(data[4:8], "little") == esc_id
+            ):
+                found[esc_id] = can_id
+
+        bus._add_listener(on_message)
+        try:
+            async with bus:
+                for _ in range(_DAMIAO_SCAN_PASSES):
+                    for mid in _DAMIAO_SCAN_IDS:
+                        request = bytes(
+                            [mid & 0xFF, mid >> 8, 0x33, _DAMIAO_REG_ESC_ID, 0, 0, 0, 0]
+                        )
+                        if not await bus._send(_DAMIAO_CFG_ID, request):
+                            return None
+                    await asyncio.sleep(_DAMIAO_SCAN_WINDOW_S)
+        except Exception:  # noqa: BLE001 - unavailable/wedged bus: unknown, not empty
+            return None
+        return found
+
+    return asyncio.run(run_scan())
+
+
+def _set_damiao_can_id(iface: str, esc_id: int, mst_id: int, new_id: int) -> None:
+    """Move the Damiao at ``esc_id`` to ``new_id`` (MST_ID ``0x10 + new_id``)."""
+    import asyncio
+
+    from ...motor import CanBus
+    from ...motor.damiao import DamiaoMotor
+
+    async def run() -> None:
+        async with CanBus(iface) as bus:
+            await DamiaoMotor(bus, esc_id, mst_id).set_can_id(new_id)
+            await asyncio.sleep(0.3)  # let the flash store finish
+
+    asyncio.run(run())
+
+
+def _normalize_mantis_gripper_id(side: str, iface: str) -> None:
+    """Move a lone Mantis gripper on ID 0x01 or 0x07 to ID 0x08."""
+    found = _scan_damiao_motors(iface)
+    if found is None:
+        print(f"  {iface}: could not check the {side} gripper's motor ID.")
+        return
+    if not found:
+        print(
+            f"  {iface}: no gripper motor answered. Power on the {side} gripper, "
+            "then run `axol can.setup` again to check its motor ID."
+        )
+        return
+    if len(found) > 1:
+        ids = ", ".join(f"{esc_id:#04x}" for esc_id in sorted(found))
+        print(
+            f"  WARNING: {iface} has {len(found)} motors (IDs {ids}). Each Mantis "
+            "channel needs one gripper motor, so no ID was changed. Disconnect "
+            "the extra motor, then run `axol can.setup` again."
+        )
+        return
+    ((esc_id, mst_id),) = found.items()
+    if esc_id == _MANTIS_GRIPPER_ID and mst_id == _MANTIS_GRIPPER_FEEDBACK_ID:
+        print(f"  {iface}: {side} gripper motor is on ID {_MANTIS_GRIPPER_ID:#04x}.")
+        return
+    if esc_id != _MANTIS_GRIPPER_ID and esc_id not in _MANTIS_GRIPPER_REMAP_IDS:
+        flag = "--l" if side == "left" else "--r"
+        print(
+            f"  WARNING: the {side} gripper motor on {iface} is on ID {esc_id:#04x}, "
+            f"not {_MANTIS_GRIPPER_ID:#04x}. Change it with `axol motor.set-can-id "
+            f"--target mantis {flag} --current-id {esc_id:#04x} "
+            f"--new-id {_MANTIS_GRIPPER_ID:#04x} --type damiao`."
+        )
+        return
+    print(
+        f"  {iface}: moving the {side} gripper motor from ID {esc_id:#04x} "
+        f"(feedback {mst_id:#05x}) to ID {_MANTIS_GRIPPER_ID:#04x} "
+        f"(feedback {_MANTIS_GRIPPER_FEEDBACK_ID:#05x})..."
+    )
+    try:
+        _set_damiao_can_id(iface, esc_id, mst_id, _MANTIS_GRIPPER_ID)
+    except Exception as exc:  # noqa: BLE001 - reported, then verified below
+        print(f"  WARNING: {iface}: changing the gripper motor ID failed: {exc}")
+    after = _scan_damiao_motors(iface)
+    if after == {_MANTIS_GRIPPER_ID: _MANTIS_GRIPPER_FEEDBACK_ID}:
+        print(
+            f"  {iface}: {side} gripper motor is now on ID {_MANTIS_GRIPPER_ID:#04x}."
+        )
+        return
+    seen = "nothing" if not after else ", ".join(f"{i:#04x}" for i in sorted(after))
+    print(
+        f"  WARNING: {iface}: the {side} gripper motor did not take ID "
+        f"{_MANTIS_GRIPPER_ID:#04x} (answering: {seen}). Power-cycle the gripper, "
+        "then run `axol can.setup` again."
+    )
+
+
+def _normalize_mantis_gripper_ids(profile: _Profile) -> None:
+    """Check each Mantis channel's gripper motor ID and fix a known wrong one.
+
+    Runs before the profile's bring-up verification, which probes the gripper
+    on ID 0x08 and would otherwise report a mis-IDed gripper as silent.
+    """
+    channels = [profile.left, profile.right]
+    try:
+        bring_up_interfaces(channels)
+    except RuntimeError as exc:
+        print(f"  Skipping the gripper motor ID check: {exc}")
+        return
+    print("Checking Mantis gripper motor IDs...")
+    for side, iface in zip(("left", "right"), channels, strict=True):
+        _normalize_mantis_gripper_id(side, iface)
 
 
 def _ifaces_for_serial(serial: str) -> list[str]:
@@ -2586,6 +2739,8 @@ def _configure_mantis(serial: str) -> None:
 
     Same dual-channel board as the arm hub: channel 0 -> left gripper,
     channel 1 -> right. No wheel/chest/RP1 handling on the rig profile.
+    A lone gripper motor on ID 0x01 or 0x07 is moved to 0x08 first (see
+    :func:`_normalize_mantis_gripper_ids`).
     """
     _remove_pre_mantis_config()
     _write_udev_rules(serial, profile=_MANTIS_PROFILE)
@@ -2593,6 +2748,7 @@ def _configure_mantis(serial: str) -> None:
     _write_hotplug_unit(_MANTIS_PROFILE)
     _reload_udev()
     _rename_interfaces(serial, profile=_MANTIS_PROFILE)
+    _normalize_mantis_gripper_ids(_MANTIS_PROFILE)
     _register_cron(_MANTIS_PROFILE)
     bring_up_can(_MANTIS_PROFILE)
 
