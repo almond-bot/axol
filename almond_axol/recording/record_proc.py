@@ -4216,6 +4216,10 @@ def _recorder_main(
                 before_finalize=dataset.clear_episode_buffer,
             )
         finally:
+            # A take still open at shutdown (EOF or shutdown mid-episode) left
+            # automatic collection off. The subprocess exits next anyway, but
+            # an in-process caller (the tests) must get its collector back.
+            gc_hold.end()
             uninstall_gc_log()
             with contextlib.suppress(Exception):
                 error_conn.close()
