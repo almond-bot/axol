@@ -983,6 +983,18 @@ class AxolArm:
         # configured ``JointConfig.torque_limit``: rides every tracked
         # command as its tau_cap field (see set_spring_caps). Empty = none.
         self._spring_caps: dict[Joint, float] = {}
+        # Realtime-core mode: the arm joints of the last command actually
+        # sent (joint frame, after the clip and the spring-cap back-off) and
+        # of the caller's command before the back-off. The core rejects a
+        # target stepping more than max_step_rad from the last one it took,
+        # and holds; a caller that keeps sending its target then never gets
+        # through, and the arm stays frozen. See _settle_sent_step.
+        self._last_sent_arm: np.ndarray | None = None
+        self._last_unbacked_arm: np.ndarray | None = None
+        # How far the back-off held each arm joint short of the caller's
+        # target when the caps were lifted (joint frame, rad), still applied
+        # to the command and worn away as the caller's target moves.
+        self._release_offset: np.ndarray | None = None
         self._kp_vector = np.array(
             [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
             dtype=np.float64,
@@ -1650,6 +1662,9 @@ class AxolArm:
             # Seed the max-step safety check from the measured pose so the
             # first motion_control cannot yank the joints that kept holding.
             self._last_q_commanded = q
+            self._last_sent_arm = None
+            self._last_unbacked_arm = None
+            self._release_offset = None
         if hold:
             # Servo on: command the measured pose once so "enabled" means
             # "holding" — without this, freshly brought-up joints stay limp
@@ -1953,6 +1968,26 @@ class AxolArm:
             value = float(cap)
             if math.isfinite(value) and value > 0.0:
                 clean[joint] = value
+        loosened = any(
+            joint not in clean or clean[joint] > cap
+            for joint, cap in self._spring_caps.items()
+        )
+        if (
+            loosened
+            and self._last_sent_arm is not None
+            and self._last_unbacked_arm is not None
+        ):
+            # Lifting the caps would hand the core the caller's target as is:
+            # with a box held that is the squeeze target, centimetres past
+            # where the arm stopped. That is a step the core rejects (and the
+            # arm then holds there for good), or, within max_step_rad, a
+            # lunge into the box at full stiffness. Keep the command where the
+            # back-off had it instead; the offset wears away as the caller's
+            # target moves (see motion_control).
+            offset = self._last_unbacked_arm - self._last_sent_arm
+            if self._release_offset is not None:
+                offset = offset + self._release_offset
+            self._release_offset = offset if np.any(np.abs(offset) > 1e-6) else None
         self._spring_caps = clean
 
     @property
@@ -2009,6 +2044,65 @@ class AxolArm:
         out = q_cmd.copy()
         out[:n_arm] = measured[:n_arm] + scale * run_ahead
         return out
+
+    def _shape_sink_command(self, clipped: np.ndarray) -> np.ndarray:
+        """The realtime-core command for the caller's clipped target.
+
+        Applies the spring-cap back-off (:meth:`_back_off_to_spring_caps`),
+        then any offset left from lifting the caps (see
+        :meth:`set_spring_caps`), worn away joint by joint by as much as the
+        caller's target moved since the last command, so a held target keeps
+        the arm where it stopped and a moving one takes over within its own
+        motion. Last, :meth:`_settle_sent_step` keeps the step from the last
+        sent command inside what the core accepts.
+        """
+        n_arm = len(ARM_JOINTS)
+        unbacked = clipped[:n_arm].astype(np.float64)
+        out = self._back_off_to_spring_caps(clipped) if self._spring_caps else clipped
+        offset = self._release_offset
+        if offset is not None:
+            prev = self._last_unbacked_arm
+            if prev is not None:
+                moved = np.abs(unbacked - prev)
+                offset = np.sign(offset) * np.maximum(np.abs(offset) - moved, 0.0)
+            if np.all(np.abs(offset) <= 1e-6):
+                self._release_offset = None
+            else:
+                self._release_offset = offset
+                out = out.copy()
+                out[:n_arm] = out[:n_arm] - offset
+                out[:n_arm] = np.clip(
+                    out[:n_arm], self._limits_lo[:n_arm], self._limits_hi[:n_arm]
+                )
+        self._last_unbacked_arm = unbacked
+        return self._settle_sent_step(out)
+
+    def _settle_sent_step(self, out: np.ndarray) -> np.ndarray:
+        """Keep the sent command's step within the core's ``max_step_rad``.
+
+        The caller's command is checked against the caller's previous one
+        (:meth:`motion_control`), but what reaches the core has been through
+        the back-off, whose pull can change faster than the caller's target.
+        The core measures each target against the last one it accepted and
+        rejects (holding the arm) a step over ``max_step_rad``; every later
+        target from a caller still at its own target is rejected too, so the
+        arm stays frozen. A sent step over 80 % of the limit is shortened
+        along the same joint-space line instead, and the next commands close
+        the rest.
+        """
+        prev = self._last_sent_arm
+        max_step = self._config.max_step_rad
+        if prev is None or not math.isfinite(max_step):
+            return out
+        n_arm = len(ARM_JOINTS)
+        step = out[:n_arm].astype(np.float64) - prev
+        worst = float(np.max(np.abs(step))) if np.all(np.isfinite(step)) else 0.0
+        limit = 0.8 * max_step
+        if worst <= limit:
+            return out
+        settled = out.copy()
+        settled[:n_arm] = prev + step * (limit / worst)
+        return settled
 
     def _extra_torque(self) -> np.ndarray:
         """:attr:`extra_torque`, validated (finite, 7 long) or zeros."""
@@ -2086,8 +2180,8 @@ class AxolArm:
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         sink_mode = self._command_sink is not None
-        if sink_mode and self._spring_caps:
-            clipped = self._back_off_to_spring_caps(clipped)
+        if sink_mode:
+            clipped = self._shape_sink_command(clipped)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s),
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
@@ -2239,6 +2333,7 @@ class AxolArm:
                 sink_cmds.append((0.0,) * RT_TARGET_FIELDS)
             self._command_sink(sink_cmds)
             self._last_q_commanded = requested
+            self._last_sent_arm = clipped[: len(ARM_JOINTS)].astype(np.float64)
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
@@ -2439,6 +2534,11 @@ class AxolArm:
                 else (0.0,) * RT_TARGET_FIELDS
             )
             self._command_sink(sink_cmds)
+            # The core now holds this snapshot, not a teleop command: the
+            # next motion_control starts the sent-command history afresh.
+            self._last_sent_arm = None
+            self._last_unbacked_arm = None
+            self._release_offset = None
             return
 
         tasks = [
@@ -2479,6 +2579,9 @@ class AxolArm:
         manual reposition.
         """
         self._last_q_commanded = None
+        self._last_sent_arm = None
+        self._last_unbacked_arm = None
+        self._release_offset = None
         n = len(list(Joint))
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)
