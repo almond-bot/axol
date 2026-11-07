@@ -157,6 +157,53 @@ class MyActuatorConfigTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MyActuatorModelTest(unittest.IsolatedAsyncioTestCase):
+    def _drop(self, bus: _FakeBus, keep) -> None:  # type: ignore[no-untyped-def]
+        real_send = bus._send
+
+        async def send(arbitration_id: int, data: bytes) -> None:
+            if keep(data):
+                await real_send(arbitration_id, data)
+
+        bus._send = send  # type: ignore[method-assign]
+
+    async def test_a_missing_third_block_keeps_the_series(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44)
+        self._drop(bus, lambda d: not (d[0] == 0xB5 and d[2] == 3))
+        self.assertEqual(await motor.get_model(), "RMD-X6-P20")
+        await motor.enable()
+        self.assertEqual(motor._t_max, 60.0)
+
+    async def test_a_missing_first_block_fails_the_read(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44)
+        self._drop(bus, lambda d: not (d[0] == 0xB5 and d[2] == 1))
+        with self.assertRaises(MotorError):
+            await motor.get_model()
+
+    async def test_enable_refuses_a_motor_that_wont_say_what_it_is(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=60.0)
+        self._drop(bus, lambda d: d[0] != 0xB2)
+        with mock.patch.object(myactuator, "_MA_DETECT_RETRY_S", 0.0):
+            with self.assertRaises(MotorError) as ctx:
+                await motor.enable()
+        self.assertIn("did not report its firmware and model", str(ctx.exception))
+        self.assertEqual(bus.writes, [])
+
+    async def test_enable_retries_a_motor_still_booting(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=60.0)
+        version_reads = 0
+
+        def keep(data: bytes) -> bool:
+            nonlocal version_reads
+            if data[0] == 0xB2:
+                version_reads += 1
+                return version_reads > 1
+            return True
+
+        self._drop(bus, keep)
+        with mock.patch.object(myactuator, "_MA_DETECT_RETRY_S", 0.0):
+            await motor.enable()
+        self.assertEqual(motor._t_max, 60.0)
+
     async def test_model_includes_the_variant_suffix(self) -> None:
         # Same series, another variant: only the third block tells them apart.
         motor, bus = _motor(MYACTUATOR_FW_ENCODER_524288)

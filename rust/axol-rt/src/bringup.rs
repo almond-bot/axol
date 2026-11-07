@@ -302,6 +302,15 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             )));
         }
         let model = read_ma_model(sock, id)?;
+        // On V4.4 the model sets the MIT torque range; without it the legacy
+        // 24 Nm range would scale an X6 or X8 several times wrong.
+        if model.is_none() && version.is_some_and(|v| v >= proto::MA_FW_V44) {
+            return Err(err(format!(
+                "{} (0x{id:02X}): no model reply. Check its power and CAN cable, \
+                 then try again.",
+                spec.joint
+            )));
+        }
         let (p_max, t_max) = proto::ma_mit_ranges(version, model.as_deref());
         check_direction(sock, iface, spec)?;
         check_max_torque(sock, iface, spec, version, model.as_deref())?;
@@ -582,14 +591,28 @@ fn check_max_torque(
     )))
 }
 
+/// Attempts per 0xB5 model block before it counts as unanswered.
+const MODEL_READ_TRIES: usize = 3;
+
 /// The full 0xB5 model string, up to 15 characters in three 5-character
 /// blocks (e.g. `RMD-X6-P20-60`; the last block holds the variant suffix).
 pub fn read_ma_model(sock: &CanSock, motor_id: u8) -> io::Result<Option<String>> {
     let mut raw = Vec::new();
     for block in [0x01u8, 0x02, 0x03] {
         let req = [proto::MA_READ_MODEL, 0x01, block, 0, 0, 0, 0, 0];
-        match txn::ma_request(sock, motor_id, req, TIMEOUT)? {
+        let mut reply = None;
+        for _ in 0..MODEL_READ_TRIES {
+            reply = txn::ma_request(sock, motor_id, req, TIMEOUT)?;
+            if reply.is_some() {
+                break;
+            }
+        }
+        match reply {
             Some((d, _)) => raw.extend_from_slice(&proto::ma_decode_model_block(&d)),
+            // The first two blocks hold the series every range and check
+            // depends on. A third block that never answers only loses the
+            // variant suffix, so keep the 10-character model.
+            None if block == 0x03 => break,
             None => return Ok(None),
         }
     }

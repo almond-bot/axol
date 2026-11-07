@@ -114,6 +114,12 @@ _MA_LOW_VOLTAGE_THRESHOLD_V = -2.0
 # burn a ROM write cycle on every enable().
 _MA_LOW_VOLTAGE_TOL_V = 0.05
 
+# Pause before enable() retries a capability read the motor didn't answer.
+_MA_DETECT_RETRY_S = 0.5
+
+# Attempts per 0xB5 model block before it counts as unanswered.
+_MA_MODEL_READ_TRIES = 3
+
 # Seconds to wait after a 0x76 system reset before the motor answers again.
 # Measured reboot time is ~1.12s; 2.0s leaves margin across motors/temperature.
 _MA_RESET_SETTLE_S = 2.0
@@ -424,13 +430,36 @@ class MyActuatorMotor(MotorDriver):
 
         The model is up to 15 characters, read 5 at a time by index 1-3. The
         last block carries the variant suffix (``-60`` / ``-50`` on an
-        X6-P20), which the first 10 characters leave out.
+        X6-P20), which the first 10 characters leave out. Each block is
+        retried; the first two must answer, since they hold the series every
+        range and check depends on. A third block that never answers leaves
+        the 10-character model (``"RMD-X6-P20"``), which still names the
+        series, rather than failing the whole read.
         """
         raw = b""
         for index in (0x01, 0x02, 0x03):
-            block = await self._request(
-                bytes([_MA_READ_MODEL, 0x01, index, 0, 0, 0, 0, 0])
-            )
+            block: bytes | None = None
+            for _ in range(_MA_MODEL_READ_TRIES):
+                try:
+                    block = await self._request(
+                        bytes([_MA_READ_MODEL, 0x01, index, 0, 0, 0, 0, 0])
+                    )
+                    break
+                except MotorError:
+                    continue
+            if block is None:
+                if index < 0x03:
+                    raise MotorError(
+                        f"MyActuator motor {self._motor_id:#04x} did not answer "
+                        f"model block {index}"
+                    )
+                _logger.warning(
+                    "Motor %#04x on %s: model block 3 did not answer, using %r",
+                    self._motor_id,
+                    self._bus.channel,
+                    raw.split(b"\x00", 1)[0].decode("ascii", errors="ignore"),
+                )
+                break
             raw += bytes(block[3:8])
         chars = raw.split(b"\x00", 1)[0]
         return chars.decode("ascii", errors="ignore").strip()
@@ -500,7 +529,7 @@ class MyActuatorMotor(MotorDriver):
         """Read firmware version + model once and configure MIT-command ranges.
 
         Cached after the first success; raises MotorError if the motor doesn't
-        answer (callers fall back to the conservative legacy ranges).
+        answer (enable() then refuses the motor).
         """
         if self._fw_version is not None:
             return
@@ -659,12 +688,22 @@ class MyActuatorMotor(MotorDriver):
 
     async def enable(self) -> None:
         # Detect firmware version + model so the MIT command and feedback decode
-        # use the ranges this motor's firmware actually implements. If the motor
-        # doesn't answer, keep the conservative legacy ranges set in __init__.
+        # use the ranges this motor's firmware actually implements, and so the
+        # Max Torque and current-sense checks below can run. A motor still
+        # booting gets one retry; one that won't say what it is isn't driven,
+        # as in axol-rt's prepare.
         try:
             await self._detect_capabilities()
         except MotorError:
-            pass
+            await asyncio.sleep(_MA_DETECT_RETRY_S)
+            try:
+                await self._detect_capabilities()
+            except MotorError as exc:
+                raise MotorError(
+                    f"Motor {self._motor_id:#04x} on {self._bus.channel} did not "
+                    f"report its firmware and model ({exc}). Check its power and "
+                    f"CAN cable, then try again."
+                ) from exc
         await self._check_direction()
         await self._check_torque_scale(fix=True)
         await self._check_sample_res()
