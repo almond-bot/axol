@@ -3,9 +3,9 @@ title: "Command configuration"
 description: "Set any field of the robot operation commands from flags, a config file or the shared settings file."
 ---
 
-Eight commands expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus): [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`collect-dagger`](/cli/collect-dagger), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy) and [`inference-server`](/cli/inference-server). You can set every field of their config from the command line or load the whole config from a file.
+Nine commands expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus): [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`jog`](/cli/jog), [`collect-data`](/cli/collect-data), [`collect-dagger`](/cli/collect-dagger), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy) and [`inference-server`](/cli/inference-server). You can set every field of their config from the command line or load the whole config from a file.
 
-This page covers the **syntax**. Each operation mode has a **Config Parameters** page listing every field with its default: [Teleoperation](/operations/teleop-config), [Gravity Compensation](/operations/gravity-comp-config), [Data Collection](/operations/data-collection-config), [Replay Dataset](/operations/replay-dataset-config), [Run Policy](/operations/run-policy-config), and [DAgger Collection](/operations/dagger-config). `waypoints` and `inference-server` list their flags on their own CLI pages.
+This page covers the **syntax**. Each operation mode has a **Config Parameters** page listing every field with its default: [Teleoperation](/operations/teleop-config), [Gravity Compensation](/operations/gravity-comp-config), [Data Collection](/operations/data-collection-config), [Replay Dataset](/operations/replay-dataset-config), [Run Policy](/operations/run-policy-config), and [DAgger Collection](/operations/dagger-config). `waypoints`, `jog` and `inference-server` list their flags on their own CLI pages.
 
 The other commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `provision`, `tune.*` and `serve`) use plain flags, and nothing on this page applies to them.
 

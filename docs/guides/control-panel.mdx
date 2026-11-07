@@ -3,7 +3,7 @@ title: "Web Control Panel"
 description: "Connect to Axol from a browser, set up cameras and settings, and run every operation without a terminal."
 ---
 
-The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
+The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, jogging, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
 
 The sidebar on the left switches between its pages. On a phone, open it with the **☰** button.
 
@@ -268,6 +268,7 @@ While the operation starts, its screen shows what it is doing and how far along 
 | **Teleoperation** | Axol, Mantis, or sim | Drive Axol from a Quest. With Jelly attached, the thumbsticks drive Jelly too. With Mantis selected, drive the rig grippers from their triggers. Turn on **sim** to drive a simulated Axol in the browser, and pick its version under **Sim robot**. See [Teleoperation](/operations/teleop#run-it). |
 | **Gravity compensation** | Axol | Hold the arms weightless so you can move them by hand. |
 | **Waypoints** | Axol or sim | Teach a path by hand and replay it. See [Waypoints](#waypoints). |
+| **Jog** | Axol, Jelly, or sim | Move a gripper to a pose you drag in 3D, jog it with buttons, and drive the lift and Jelly. See [Jog](#jog). |
 | **Collect data** | Axol or Mantis, and cameras | Record episodes into a LeRobot dataset. Pick an existing dataset under **repo id** to add to it. See [Data collection](/operations/data-collection#run-it). |
 | **Replay dataset** | Axol | Play a recorded episode on the arms, then return to rest. Turn on **loop** to repeat until **Stop**, and **interpolate** to smooth playback. |
 | **Run policy** | Axol and cameras | Run a LeRobot policy on the robot or on an [inference server](/cli/inference-server). Choose policy type `custom` to run [your own model](/operations/custom-policy), which needs no checkpoint path. |
@@ -284,6 +285,41 @@ While the operation starts, its screen shows what it is doing and how far along 
 3. Once you have two or more waypoints, press **Play** to replay the path as straight-line moves. **Stop playback** stops it.
 
 Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to preview a saved path in the browser. See [`waypoints`](/cli/waypoints).
+
+### Jog
+
+Use **Jog** to move Axol from the browser without a headset. Open **Jog** under **Drive** on the **Operations** page. Turn on **sim** to jog a simulated Axol, and pick its version under **Sim robot**.
+
+When jogging starts, the arms hold their pose. A 3D view of Axol sits beside a **Telemetry** panel that shows both arms' joints, the lift and the base. On the robot, the camera feeds play under the 3D view.
+
+The controls are in tabs:
+
+| Tab | What it does |
+|---|---|
+| **Arm move** | Pick **Left** or **Right**, drag the target in the 3D view, then press **Plan move**. An orange preview shows where the arm will go. Press **Execute** to move it, or **Stop move** to halt it. |
+| **Jog gripper** | Hold a button to move or turn the gripper along one axis. It stops when you let go. Choose **Robot** or **Gripper** axes, and a speed. |
+| **Lift** | Hold **Raise** or **Lower** to move Jelly's lift. Shown on Axol on Jelly. |
+| **Drive** | Hold the drive pad to drive Jelly, and **Turn left** or **Turn right** to turn in place. Shown on Axol on Jelly. |
+
+- In the 3D view, drag the arrows to move the target and the rings to turn it. Drag empty space to orbit, and scroll to zoom.
+- If the target is out of reach, the plan goes to the closest pose it can reach and shows how far off it is.
+- **Reset target** puts the target back on the gripper. **Go to rest** moves both arms to the rest pose.
+- Every plan avoids collisions between the arms and the body.
+
+**Keyboard and game controller.** Open the help button on the controls card for the full list. They work on every tab.
+
+| Input | Action |
+|---|---|
+| `W` `A` `S` `D`, or the left stick | Drive Jelly |
+| Left and right arrow keys, or the right stick | Turn Jelly in place |
+| Up and down arrow keys, or the D-pad up and down | Raise or lower the lift |
+| D-pad left and right | Choose the left or right arm |
+| Hold LT | Move the gripper: left stick across, right stick up and down |
+| Hold RT | Turn the gripper: left stick tilts, right stick turns |
+
+To use a game controller, plug it in, click the page and press any button on it. If the page says the controller isn't supported, move the switch on the back of a Logitech controller to the other letter (D on a Mac). Everything stops when you let go or leave the page.
+
+Press **Stop** to end the run. The arms move to the rest pose before the motors turn off. See [`jog`](/cli/jog) for the speed settings.
 
 ### Before you start
 
