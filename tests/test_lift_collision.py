@@ -157,6 +157,7 @@ class LiftClearanceTest(unittest.TestCase):
         worker._mink_backend = False
         worker._config = VRTeleopConfig()
         worker._lift_clear_t = None
+        worker._deck_plane = {}
         worker._rest_goal = None
         worker._rest_pose_left = self.rest[:7].copy()
         worker._rest_pose_right = self.rest[7:].copy()

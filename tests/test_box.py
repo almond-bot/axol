@@ -1157,15 +1157,16 @@ class StickControlTest(unittest.TestCase):
 
     def test_width_floor_follows_the_grasp(self) -> None:
         # The default floor is 0. The parcel gripper's contact faces are
-        # proud of its body in both grasps, so they close all the way; the
-        # stock gripper stops where its wrists would meet.
+        # proud of its body in the flush grasp, so they close all the way;
+        # straight, its open plates meet first (blade fronts ~124 mm apart).
+        # The stock gripper stops where its wrists would meet.
         self.assertEqual(VRTeleopConfig().box_width_min, 0.0)
         worker = _stick_worker()
         worker._config.box_width_min = 0.0
         worker._config.box_flush_deg = 39.0
         frame = _stick_frame(r_stick_y=1.0)
         for tool, grasp, floor in (
-            ("parcel", "straight", 0.0),
+            ("parcel", "straight", 0.124),
             ("parcel", "flush", 0.0),
             ("parallel", "straight", 0.077),
             ("parallel", "flush", 0.077),
@@ -1176,7 +1177,7 @@ class StickControlTest(unittest.TestCase):
             worker._integrate_sticks(frame, box, now=0.0)
             for i in range(1, 100):
                 worker._integrate_sticks(frame, box, now=0.1 * i)
-            self.assertAlmostEqual(box.width, floor, places=6, msg=(tool, grasp))
+            self.assertAlmostEqual(box.width, floor, places=3, msg=(tool, grasp))
 
     def test_tilt_seeds_the_next_engage(self) -> None:
         left, right = _pair(0.3)
@@ -1280,6 +1281,10 @@ def _box_worker(leader: str = "left") -> IKWorker:
     worker._box_leader = None
     worker._box_snap = None
     worker._box_rot = None
+    worker._held_tool = None
+    worker._deck_plane = {}
+    worker._stow = None
+    worker._arm_stow = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {}

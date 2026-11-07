@@ -844,6 +844,8 @@ def _discard_stall(bus: CanBus) -> None:
 class _FakeMotor:
     """A link-owned motor at the driver boundary: answers, or does not."""
 
+    motor_type = "damiao"
+
     def __init__(self, *, powered: bool = True) -> None:
         self.powered = powered
 

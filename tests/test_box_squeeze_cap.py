@@ -163,7 +163,10 @@ class ArmCommandTest(unittest.TestCase):
         arm._command_sink = sent.append
         arm.resolve_joint_offsets = AsyncMock()
         arm._joint_offsets = np.zeros(8, dtype=np.float32)
-        arm._last_q_commanded = None
+        # The robot is shared by the class: start each test from no caps and
+        # no command history.
+        arm.set_spring_caps(None)
+        arm.reset_command_state()
         return arm, sent
 
     def test_tuples_carry_the_caps(self) -> None:
@@ -223,6 +226,8 @@ class ArmCommandTest(unittest.TestCase):
         arm, sent = self._arm_with_sink()
         for i, j in enumerate(ARM_JOINTS):
             arm.motors[j]._position = float(measured[i])
+        # The positions read needs every motor's cache, the gripper's too.
+        arm.motors[Joint.GRIPPER]._position = 0.0
         arm._unverified_zeros = set()
         arm._unresolved_offsets = set()
         return arm, sent
