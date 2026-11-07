@@ -55,11 +55,31 @@ jobs:
             --reference-root "$reference_root/mink_reference" \
             --replay-fixture --write-fixture "$native_fixture"
           echo "AXOL_MINK_REFERENCE_FIXTURE=$native_fixture" >> "$GITHUB_ENV"
+      # The IK tests spend most of their time in XLA compiles. JAX keeps them in
+      # ~/.almond/jax-cache (almond_axol/kinematics/jax_cache.py), keyed by the
+      # graph and the jax version, so a stale entry is never reused. Restore the
+      # newest cache saved by main for this lock; only main saves, so PRs read
+      # it without each adding a copy.
+      - name: Restore JAX compilation cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.almond/jax-cache
+          key: jax-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            jax-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}-
       - name: Unit and integration tests
         env:
           OPENBLAS_NUM_THREADS: "1"
           OMP_NUM_THREADS: "1"
-        run: uv run --no-sync pytest --junitxml=pytest.xml
+        # One worker per vCPU. loadscope keeps each test class on one worker,
+        # so a class's setUpClass (an IK solver build) runs once.
+        run: uv run --no-sync pytest -n auto --dist loadscope --junitxml=pytest.xml
+      - name: Save JAX compilation cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.almond/jax-cache
+          key: jax-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('uv.lock') }}-${{ github.run_id }}
       - name: Build distributable packages
         run: |
           uv build

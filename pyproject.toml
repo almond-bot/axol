@@ -105,6 +105,7 @@ include = [
 dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.pytest.ini_options]
