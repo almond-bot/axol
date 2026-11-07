@@ -120,6 +120,15 @@ class MotorDriver(ABC):
         """Save the current shaft position as the encoder zero reference."""
         ...
 
+    async def set_direction_flag(self) -> bool:
+        """Set the motor's firmware direction flag if it needs it.
+
+        Only MyActuator motors have one (Change Motor Direction). Flipping it
+        moves the joint's zero, so call it before zeroing the joint. Returns
+        True when the flag was changed.
+        """
+        return False
+
     @abstractmethod
     async def get_position(self) -> float:
         """Return current shaft position in radians."""

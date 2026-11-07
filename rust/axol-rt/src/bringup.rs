@@ -267,7 +267,6 @@ pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<Vec<String>> {
             continue;
         }
         if spec.motor_id <= 5 {
-            set_direction_flag(sock, spec)?;
             sock.send(
                 proto::MA_REQ + spec.motor_id as u16,
                 &proto::ma_cmd(proto::MA_RESET),
@@ -294,9 +293,8 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         let id = spec.motor_id;
         let version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
             .map(|(d, _)| proto::ma_decode_version(&d));
-        // The firmware decides the MIT ranges and whether the motor needs
-        // Change Motor Direction, so a motor that won't say which it runs is
-        // not driven.
+        // The firmware decides the MIT ranges, so a motor that won't say
+        // which it runs is not driven.
         if version.is_none() {
             return Err(err(format!(
                 "{} (0x{id:02X}): no firmware version reply",
@@ -305,7 +303,7 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         }
         let model = read_ma_model(sock, id)?;
         let (p_max, t_max) = proto::ma_mit_ranges(version, model.as_deref());
-        check_direction(sock, iface, spec, version)?;
+        check_direction(sock, iface, spec)?;
         check_max_torque(sock, iface, spec, version, model.as_deref())?;
 
         let Some((s1, _)) =
@@ -469,59 +467,29 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
     Ok(motors)
 }
 
-/// Read Change Motor Direction, or `None` when the motor doesn't answer.
-fn read_direction_flag(sock: &CanSock, id: u8) -> io::Result<Option<f64>> {
-    let req = proto::ma_param_read(proto::MA_PARAM_CHANGE_DIRECTION);
-    Ok(txn::ma_request(sock, id, req, TIMEOUT)?
-        .and_then(|(d, _)| proto::ma_decode_param(&d, proto::MA_PARAM_CHANGE_DIRECTION)))
+/// Read 0xC0 parameter `index`, or `None` when the motor doesn't answer.
+fn read_param(sock: &CanSock, id: u8, index: u8) -> io::Result<Option<f64>> {
+    Ok(txn::ma_request(sock, id, proto::ma_param_read(index), TIMEOUT)?
+        .and_then(|(d, _)| proto::ma_decode_param(&d, index)))
 }
 
-/// Before [`prep`]'s reset of a cold motor: turn Change Motor Direction on
-/// and commit it to ROM if the firmware is [`proto::MA_FW_REVERSED`] or
-/// later, so the reset brings the motor up turning the fleet's way.
-/// [`check_direction`] refuses the motor later if this didn't take.
-fn set_direction_flag(sock: &CanSock, spec: &MotorSpec) -> io::Result<()> {
+/// Refuse a motor that turns the reverse of the fleet: Exchange Phase 0
+/// (see [`proto::MA_PARAM_EXCHANGE_PHASE`]) with Change Motor Direction off.
+/// Bring-up never writes the flag, because flipping it moves the motor's
+/// zero: guided zeroing turns it on and then re-zeroes the joint. A motor
+/// that answers neither read predates these parameters and passes.
+fn check_direction(sock: &CanSock, iface: &str, spec: &MotorSpec) -> io::Result<()> {
     let id = spec.motor_id;
-    let version = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
-        .map(|(d, _)| proto::ma_decode_version(&d));
-    if !version.is_some_and(|v| v >= proto::MA_FW_REVERSED) {
+    if read_param(sock, id, proto::MA_PARAM_CHANGE_DIRECTION)? != Some(0.0) {
         return Ok(());
     }
-    if read_direction_flag(sock, id)? == Some(1.0) {
-        return Ok(());
-    }
-    let write = proto::ma_param_write(proto::MA_PARAM_CHANGE_DIRECTION, 1.0);
-    txn::ma_request(sock, id, write, TIMEOUT)?;
-    txn::ma_request(sock, id, proto::ma_cmd(proto::MA_PARAM_SAVE), TIMEOUT)?;
-    eprintln!(
-        "{} (0x{id:02X}): turned Change Motor Direction on (firmware {})",
-        spec.joint,
-        version.unwrap_or(0)
-    );
-    Ok(())
-}
-
-/// Refuse a motor on [`proto::MA_FW_REVERSED`] firmware or later whose
-/// Change Motor Direction is off (or unreadable): it would turn the reverse
-/// of every other joint. [`prep`] sets the flag on cold motors.
-fn check_direction(
-    sock: &CanSock,
-    iface: &str,
-    spec: &MotorSpec,
-    version: Option<u32>,
-) -> io::Result<()> {
-    let Some(v) = version.filter(|&v| v >= proto::MA_FW_REVERSED) else {
-        return Ok(());
-    };
-    let id = spec.motor_id;
-    if read_direction_flag(sock, id)? == Some(1.0) {
+    if read_param(sock, id, proto::MA_PARAM_EXCHANGE_PHASE)? != Some(0.0) {
         return Ok(());
     }
     Err(io::Error::other(format!(
-        "{iface}: {} (0x{id:02X}) runs firmware {v}, which turns the wrong way \
-         until Change Motor Direction is on. Run `axol motor.set-config --channel \
-         {iface} --id 0x{id:02X} --param CHANGE_DIRECTION --value 1 --force-protected`, \
-         power-cycle Axol, then try again.",
+        "{iface}: {} (0x{id:02X}) turns the wrong way until Change Motor \
+         Direction is on. Zero this arm with `axol motor.set-zero-pos --guided`, \
+         which turns it on, then try again.",
         spec.joint
     )))
 }

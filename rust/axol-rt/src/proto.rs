@@ -39,13 +39,6 @@ pub const MA_P_MAX_LEGACY: f64 = 12.5;
 pub const MA_T_MAX_LEGACY: f64 = 24.0;
 pub const MA_P_MAX_V44: f64 = 12.566;
 
-/// First MyActuator firmware (VersionDate) that turns the reverse of the
-/// fleet with Change Motor Direction off: on Axol, shoulder_3 and elbow
-/// motors running 2026052501 count down where the earlier firmware counts
-/// up. Bring-up turns the flag on for them ([`MA_PARAM_CHANGE_DIRECTION`]).
-/// Mirrors `MYACTUATOR_FW_REVERSED` in the Python driver.
-pub const MA_FW_REVERSED: u32 = 2026052501;
-
 /// `(p_max, t_max)` this firmware scales MIT command/feedback against —
 /// mirrors `mit_ranges` in the Python driver. V4.4 widens `p_max` and uses
 /// the motor's rated max torque (from the 0xB5 model's X-series token).
@@ -90,6 +83,12 @@ pub const MA_PARAM_ACCESS: u8 = 0xC0;
 pub const MA_PARAM_MAX_TORQUE: u8 = 0x46;
 /// Change Motor Direction (Master Encoder dialog), 0.0 or 1.0.
 pub const MA_PARAM_CHANGE_DIRECTION: u8 = 0x0F;
+/// Exchange Phase (Master Encoder dialog), 0.0 or 1.0. Every MyActuator that
+/// turns the reverse of the fleet with Change Motor Direction off reports 0
+/// here, and every one that turns the fleet's way reports 1, so a motor with
+/// Exchange Phase 0 needs Change Motor Direction on. Mirrors
+/// `direction_flag_needed` in the Python driver.
+pub const MA_PARAM_EXCHANGE_PHASE: u8 = 0x10;
 /// Commits every 0xC0 write since the last commit to ROM (empty payload).
 pub const MA_PARAM_SAVE: u8 = 0xC1;
 

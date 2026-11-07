@@ -51,9 +51,9 @@ _ARM_TIMEOUT_S = 15.0
 #: it requires a core that stops on the arm hub's no-ACK report, because this
 #: package flashes hubs to the firmware that no longer backs up on an e-stop.
 #: 19 adds the optional ``tracking_profile mink`` line (Mink IK sessions).
-#: 20 changes no layout: it requires a core that turns Change Motor Direction
-#: on for MyActuators on ``MYACTUATOR_FW_REVERSED`` firmware and sets their
-#: MAX_TORQUE to the model's rating at bring-up.
+#: 20 changes no layout: it requires a core that refuses a MyActuator with
+#: Exchange Phase 0 and Change Motor Direction off, and sets MAX_TORQUE to the
+#: model's rating at bring-up.
 CONFIG_PROTO = 20
 
 

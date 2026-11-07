@@ -82,14 +82,16 @@ MYACTUATOR_FW_V44 = 2026042402
 # resolution as the motor reports it.
 MYACTUATOR_FW_ENCODER_524288 = 2026052501
 
-# First firmware whose positive direction is the reverse of the fleet's with
-# CHANGE_DIRECTION off: on Axol, the shoulder_3 and elbow X6-P20s running
-# 2026052501 count down where 2026042402 counts up (end-stop zeroing and
-# resting angles, checked against an Axol on 2026042402). These motors also
-# report EXCHANGE_PHASE 0 and a 131072-count rotor encoder, where every earlier
-# motor reports 1 and 16384. Bring-up turns CHANGE_DIRECTION on for them, so
-# the firmware itself turns the fleet's way. Mirrors MA_FW_REVERSED in axol-rt.
-MYACTUATOR_FW_REVERSED = 2026052501
+# Which MyActuators turn the reverse of the fleet with CHANGE_DIRECTION off:
+# taken to be the ones reporting EXCHANGE_PHASE 0. The shoulder_3 and elbow
+# X6-P20s on firmware 2026052501 count down where 2026042402 counts up
+# (end-stop zeroing and resting angles) and report 0, as does an elbow on
+# 2026051001 (direction not yet checked). Every motor turning the fleet's way
+# reports 1. Turning CHANGE_DIRECTION on reflects the
+# reading about the encoder's own zero, not the stored zero (an elbow at
+# -146.90 deg read +161.18 deg), so the joint must be re-zeroed after it:
+# guided zeroing sets the flag, and bring-up only refuses a motor without it.
+# Mirrors MA_PARAM_EXCHANGE_PHASE in axol-rt.
 
 # Index range worth sweeping in a raw dump. The vendor software never addresses
 # anything above 0x55, so this covers its whole parameter space.
@@ -221,8 +223,8 @@ MYACTUATOR_PARAMS: dict[MyActuatorParam, ParamSpec] = {
     MyActuatorParam.REDUCTION_RATIO: ParamSpec("", _PROT),
     # Master Encoder. Encoder calibration and commutation settings: a wrong
     # value can stop the motor from turning, so all are protected.
-    # CHANGE_DIRECTION is 0 or 1; bring-up sets it on MYACTUATOR_FW_REVERSED
-    # firmware.
+    # CHANGE_DIRECTION is 0 or 1; zeroing sets it on motors with
+    # EXCHANGE_PHASE 0.
     MyActuatorParam.POWERDOWN_SAVE_MULTITURN: ParamSpec("", _PROT),
     MyActuatorParam.POLE_PAIRS: ParamSpec("", _PROT),
     MyActuatorParam.SINGLE_TURN_RESOLUTION: ParamSpec("pulses", _PROT),

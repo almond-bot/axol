@@ -151,11 +151,15 @@ export const PARAM_UI: Record<string, ParamUi> = {
   POLE_PAIRS: { label: "Pole pairs" },
   SINGLE_TURN_RESOLUTION: { label: "Single-turn resolution" },
   CALIBRATION_CURRENT: { label: "Calibration current" },
-  EXCHANGE_PHASE: { label: "Exchange phase", kind: "toggle" },
+  EXCHANGE_PHASE: {
+    label: "Exchange phase",
+    kind: "toggle",
+    hint: "Set at the factory. A wrong value stops the motor from turning.",
+  },
   CHANGE_DIRECTION: {
     label: "Change motor direction",
     kind: "toggle",
-    hint: "Axol turns this on for motors on firmware 2026052501 and later when it enables them.",
+    hint: "Changing this moves the joint's zero. Guided zeroing sets it for you.",
   },
   ENCODER_CALIBRATION_VALUE: { label: "Encoder calibration value" },
   MOTOR_NUMBER: { label: "Motor number" },

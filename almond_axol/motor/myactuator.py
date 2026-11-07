@@ -21,7 +21,6 @@ import can
 from .bus import CanBus
 from .config import (
     MYACTUATOR_FW_ENCODER_524288,
-    MYACTUATOR_FW_REVERSED,
     MYACTUATOR_FW_V44,
     MYACTUATOR_PARAMS,
     PARAM_SWEEP_RANGE,
@@ -491,43 +490,65 @@ class MyActuatorMotor(MotorDriver):
         self._max_torque = _model_max_torque(model)
         self._p_max, self._t_max = mit_ranges(version, model)
 
-    async def _check_direction(self, *, fix: bool) -> None:
-        """Turn CHANGE_DIRECTION on for :data:`MYACTUATOR_FW_REVERSED` firmware.
+    async def _direction_flag_needed(self) -> bool:
+        """True when this motor turns the reverse of the fleet.
 
-        That firmware turns the reverse of the fleet with the flag off. With
-        ``fix`` (enable(), on a cold motor) the flag is written to ROM and the
-        motor reset so it takes effect, then read back. Without it (attach(),
-        on a motor already holding) an unset flag refuses: flipping the
-        direction under a live hold would drive the joint the wrong way. A
-        motor that doesn't answer the read refuses too, since its direction
-        is unknown.
+        That is EXCHANGE_PHASE 0 with CHANGE_DIRECTION off (see the note on
+        the rule in ``config.py``). A flag that is already on never counts,
+        whatever the phase reads. A motor that answers neither read predates
+        these parameters and turns the fleet's way.
         """
-        version = self._fw_version
-        if version is None or version < MYACTUATOR_FW_REVERSED:
+        try:
+            if await self._read_param(MyActuatorParam.CHANGE_DIRECTION) != 0.0:
+                return False
+            return await self._read_param(MyActuatorParam.EXCHANGE_PHASE) == 0.0
+        except MotorError:
+            return False
+
+    async def _check_direction(self) -> None:
+        """Refuse a motor that turns the reverse of the fleet.
+
+        Bring-up never sets CHANGE_DIRECTION itself: flipping it moves the
+        joint's zero, so the joint has to be re-zeroed afterwards, and
+        :meth:`set_direction_flag` (run by zeroing) does both in order.
+        """
+        if not await self._direction_flag_needed():
             return
-        flag = await self._read_param(MyActuatorParam.CHANGE_DIRECTION)
-        if flag == 1.0:
-            return
-        if fix:
-            await self._write_param(MyActuatorParam.CHANGE_DIRECTION, 1.0)
-            await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-            await asyncio.sleep(_MA_RESET_SETTLE_S)
-            flag = await self._read_param(MyActuatorParam.CHANGE_DIRECTION)
-            if flag == 1.0:
-                _logger.warning(
-                    "Motor %#04x on %s: turned Change Motor Direction on (firmware %d)",
-                    self._motor_id,
-                    self._bus.channel,
-                    version,
-                )
-                return
         raise MotorError(
-            f"Motor {self._motor_id:#04x} on {self._bus.channel} runs firmware "
-            f"{version}, which turns the wrong way until Change Motor Direction "
-            f"is on. Run `axol motor.set-config --channel {self._bus.channel} "
-            f"--id {self._motor_id:#04x} --param CHANGE_DIRECTION --value 1 "
-            f"--force-protected`, power-cycle Axol, then try again."
+            f"Motor {self._motor_id:#04x} on {self._bus.channel} turns the wrong "
+            f"way until Change Motor Direction is on. Zero this arm with "
+            f"`axol motor.set-zero-pos --guided`, which turns it on, then try "
+            f"again."
         )
+
+    async def set_direction_flag(self) -> bool:
+        """Turn CHANGE_DIRECTION on if this motor needs it, before zeroing.
+
+        Writes the flag to ROM, resets the motor so it takes effect and reads
+        it back. The motor's angle reading is reflected about the encoder's
+        own zero, not the stored one, so the caller must zero the joint
+        afterwards. Returns True when the flag was turned on.
+
+        Raises:
+            MotorError: If the flag doesn't read back on after the reset.
+        """
+        if not await self._direction_flag_needed():
+            return False
+        await self._write_param(MyActuatorParam.CHANGE_DIRECTION, 1.0)
+        await self.reset()
+        flag = await self._read_param(MyActuatorParam.CHANGE_DIRECTION)
+        if flag != 1.0:
+            raise MotorError(
+                f"Motor {self._motor_id:#04x} on {self._bus.channel}: Change "
+                f"Motor Direction reads {flag:g} after it was turned on. "
+                f"Power-cycle Axol, then zero the arm again."
+            )
+        _logger.warning(
+            "Motor %#04x on %s: turned Change Motor Direction on",
+            self._motor_id,
+            self._bus.channel,
+        )
+        return True
 
     async def _check_torque_scale(self, *, fix: bool) -> None:
         """Bring a V4.4 motor's MAX_TORQUE to its model's rating, or refuse it.
@@ -597,7 +618,7 @@ class MyActuatorMotor(MotorDriver):
             await self._detect_capabilities()
         except MotorError:
             pass
-        await self._check_direction(fix=True)
+        await self._check_direction()
         await self._check_torque_scale(fix=True)
         await self._apply_low_voltage_threshold()
         # The joints have no brake, so there is nothing to release: the motor
@@ -612,7 +633,7 @@ class MyActuatorMotor(MotorDriver):
         # is no 0x76 reset (that reboots the motor, killing torque for ~2 s)
         # — the whole point of attach is to leave torque untouched.
         await self._detect_capabilities()
-        await self._check_direction(fix=False)
+        await self._check_direction()
         await self._check_torque_scale(fix=False)
         running, error_bits = await self._running_state()
         if error_bits:
@@ -740,6 +761,9 @@ class MyActuatorMotor(MotorDriver):
         pass  # MyActuator has no clear-errors command
 
     async def set_zero_position(self) -> None:
+        # The flag reflects the reading about the encoder's own zero, so it
+        # has to be on before the zero is taken, never after.
+        await self.set_direction_flag()
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
         await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
         await asyncio.sleep(_MA_RESET_SETTLE_S)

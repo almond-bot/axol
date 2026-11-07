@@ -290,10 +290,10 @@ const HOLDOVER_MAX: f64 = 0.080;
 ///   tick spacing, see `filter::TrackingProfile`). A proto-18 core rejects
 ///   the line as an unknown directive; the bump makes that the proto
 ///   mismatch's "rebuild with `axol rt.install`" instead.
-/// - 20: no layout change — bring-up turns Change Motor Direction on for
-///   MyActuators running firmware `proto::MA_FW_REVERSED` or later, and sets
-///   MAX_TORQUE to the model's rating. A proto-19 core would drive those
-///   joints the wrong way, with their torque scaled 40x weak.
+/// - 20: no layout change — bring-up refuses a MyActuator with Exchange
+///   Phase 0 and Change Motor Direction off (it turns the wrong way), and
+///   sets MAX_TORQUE to the model's rating. A proto-19 core would drive
+///   those joints the wrong way, with their torque scaled 40x weak.
 const CONFIG_PROTO: u32 = 20;
 /// Rolling feedback loss at or above this many misses in the last 32 ticks
 /// (12.5% over 133 ms at 240 Hz) marks a joint *degraded*: its host damping

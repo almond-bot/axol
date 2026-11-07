@@ -11,7 +11,6 @@ import can
 from almond_axol.motor import myactuator
 from almond_axol.motor.config import (
     MYACTUATOR_FW_ENCODER_524288,
-    MYACTUATOR_FW_REVERSED,
     MYACTUATOR_FW_V44,
     MyActuatorParam,
 )
@@ -67,6 +66,8 @@ class _FakeBus:
             reply = bytes([0xB5, 0x01, data[2]]) + model[start : start + 5]
         elif cmd == 0x9A:  # status 1: 24 V, running, no faults
             reply = bytes([0x9A, 25, 0, 1, 0xF0, 0x00, 0, 0])
+        elif cmd == 0x64:  # write the current position as zero
+            reply = bytes(data)
         elif cmd == 0xC1:
             self.commits += 1
             reply = bytes(data)
@@ -87,6 +88,9 @@ class _FakeBus:
 
 
 def _motor(firmware: int, **params: float) -> tuple[MyActuatorMotor, _FakeBus]:
+    # Exchange Phase 1 is a motor that turns the fleet's way; the direction
+    # tests pass 0 for one that turns the reverse.
+    params.setdefault("EXCHANGE_PHASE", 1.0)
     values = {int(MyActuatorParam[k]): v for k, v in params.items()}
     bus = _FakeBus(0x01, firmware, values)
     return MyActuatorMotor(bus, 0x01, kt=1.0), bus  # type: ignore[arg-type]
@@ -170,17 +174,13 @@ class MyActuatorTorqueScaleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_enable_sets_a_low_max_torque_to_the_rating(self) -> None:
         # Firmware 2026052501 ships X6-P20s with MAX_TORQUE at 1.5.
-        motor, bus = _motor(
-            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5, CHANGE_DIRECTION=1.0
-        )
+        motor, bus = _motor(MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5)
         await motor.enable()
         self.assertIn((MyActuatorParam.MAX_TORQUE, 60.0), bus.writes)
         self.assertEqual(await motor.read_config(MyActuatorParam.MAX_TORQUE), 60.0)
 
     async def test_the_50_nm_variant_is_set_to_50(self) -> None:
-        motor, bus = _motor(
-            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=60.0, CHANGE_DIRECTION=1.0
-        )
+        motor, bus = _motor(MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=60.0)
         bus.model = "RMD-X6-P20-50"
         await motor.enable()
         self.assertEqual(await motor.read_config(MyActuatorParam.MAX_TORQUE), 50.0)
@@ -188,9 +188,7 @@ class MyActuatorTorqueScaleTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_refuses_a_low_max_torque(self) -> None:
         # A holding motor is not rescaled under its hold.
-        motor, bus = _motor(
-            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5, CHANGE_DIRECTION=1.0
-        )
+        motor, bus = _motor(MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=1.5)
         with self.assertRaises(MotorError) as ctx:
             await motor.attach()
         message = str(ctx.exception)
@@ -214,47 +212,84 @@ def _direction_writes(bus: _FakeBus) -> list[float]:
 
 
 class MyActuatorDirectionTest(unittest.IsolatedAsyncioTestCase):
-    """Firmware 2026052501 turns the reverse way until Change Motor Direction is on."""
+    """Exchange Phase 0 turns the reverse way until Change Motor Direction is on.
+
+    Bring-up only refuses such a motor: the flag moves the joint's zero, so
+    zeroing sets it, before it takes the zero.
+    """
 
     def setUp(self) -> None:
         patcher = mock.patch.object(myactuator, "_MA_RESET_SETTLE_S", 0.0)
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    async def test_enable_turns_the_flag_on_and_resets(self) -> None:
-        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
-        await motor.enable()
-        self.assertEqual(_direction_writes(bus), [1.0])
-        self.assertEqual(bus.resets, 1)
-        # Every value then goes over the wire as is.
-        bus.position_centideg = 14612
-        self.assertAlmostEqual(await motor.get_position(), 2.5502751, places=6)
-
-    async def test_flag_already_on_is_left_alone(self) -> None:
-        motor, bus = _motor(
-            MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0, CHANGE_DIRECTION=1.0
+    def _reversed(self, **params: float) -> tuple[MyActuatorMotor, _FakeBus]:
+        return _motor(
+            MYACTUATOR_FW_ENCODER_524288, MAX_TORQUE=60.0, EXCHANGE_PHASE=0.0, **params
         )
-        await motor.enable()
-        await motor.attach()
+
+    async def test_enable_and_attach_refuse_the_flag_off(self) -> None:
+        motor, bus = self._reversed()
+        for bring_up in (motor.enable, motor.attach):
+            with self.assertRaises(MotorError) as ctx:
+                await bring_up()
+            self.assertIn("axol motor.set-zero-pos --guided", str(ctx.exception))
         self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
 
-    async def test_earlier_firmware_is_not_touched(self) -> None:
-        for firmware in (_OLD_FW, MYACTUATOR_FW_V44):
-            motor, bus = _motor(firmware, MAX_TORQUE=60.0)
+    async def test_flag_on_enables_whatever_the_phase(self) -> None:
+        for phase in (0.0, 1.0):
+            motor, bus = self._reversed(CHANGE_DIRECTION=1.0)
+            bus.params[MyActuatorParam.EXCHANGE_PHASE] = phase
             await motor.enable()
+            await motor.attach()
             self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
 
-    async def test_attach_refuses_the_flag_off(self) -> None:
-        # A holding motor is not flipped under its hold.
-        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
-        with self.assertRaises(MotorError) as ctx:
-            await motor.attach()
-        self.assertIn("--param CHANGE_DIRECTION --value 1", str(ctx.exception))
+    async def test_phase_1_is_never_flipped(self) -> None:
+        for firmware in (_OLD_FW, MYACTUATOR_FW_V44, MYACTUATOR_FW_ENCODER_524288):
+            motor, bus = _motor(firmware, MAX_TORQUE=60.0)
+            self.assertFalse(await motor.set_direction_flag())
+            await motor.set_zero_position()
+            await motor.enable()
+            self.assertEqual(_direction_writes(bus), [])
+
+    async def test_zeroing_turns_the_flag_on_before_the_zero(self) -> None:
+        motor, bus = self._reversed()
+        await motor.set_zero_position()
+        self.assertEqual(_direction_writes(bus), [1.0])
+        commands = [data[0] for _, data in bus.sent]
+        flag_write = next(
+            i
+            for i, (_, data) in enumerate(bus.sent)
+            if data[0] == 0xC0
+            and data[2] == MyActuatorParam.CHANGE_DIRECTION
+            and data[3] == 0x00
+        )
+        # Write, commit, reset to apply, then the zero and its own reset.
+        self.assertLess(flag_write, commands.index(0xC1))
+        self.assertLess(commands.index(0xC1), commands.index(0x76))
+        self.assertLess(commands.index(0x76), commands.index(0x64))
+        self.assertEqual(bus.resets, 2)
+        await motor.enable()
+
+    async def test_flag_already_on_is_left_alone(self) -> None:
+        motor, bus = self._reversed(CHANGE_DIRECTION=1.0)
+        self.assertFalse(await motor.set_direction_flag())
         self.assertEqual((_direction_writes(bus), bus.resets), ([], 0))
 
+    async def test_a_motor_without_the_parameters_passes(self) -> None:
+        motor, bus = self._reversed()
+        real_send = bus._send
+
+        async def no_param_replies(arbitration_id: int, data: bytes) -> None:
+            if data[0] == 0xC0 and data[2] in (0x0F, 0x10):
+                return
+            await real_send(arbitration_id, data)
+
+        bus._send = no_param_replies  # type: ignore[method-assign]
+        self.assertFalse(await motor.set_direction_flag())
+
     async def test_a_flag_that_does_not_stick_refuses(self) -> None:
-        motor, bus = _motor(MYACTUATOR_FW_REVERSED, MAX_TORQUE=60.0)
-        bus.echo_override[MyActuatorParam.CHANGE_DIRECTION] = 0x0F
+        motor, bus = self._reversed()
         real_send = bus._send
 
         async def ignore_direction_writes(arbitration_id: int, data: bytes) -> None:
@@ -264,7 +299,8 @@ class MyActuatorDirectionTest(unittest.IsolatedAsyncioTestCase):
 
         bus._send = ignore_direction_writes  # type: ignore[method-assign]
         with self.assertRaises(MotorError):
-            await motor.enable()
+            await motor.set_zero_position()
+        self.assertNotIn(0x64, [data[0] for _, data in bus.sent])
 
 
 if __name__ == "__main__":
