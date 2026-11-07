@@ -135,7 +135,11 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 | Red | Unreachable or reporting a fault. Operations on that device can't start until you fix it. Sim teleop still works. |
 | Grey | Unknown, because a running operation is using the bus. |
 
-**If motor power is cut.** If you cut motor power during a run, for example at the power supply, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If a motor still answers with torque on, the panel shows **Re-check motors**. Cut motor power, then press it.
+**If motor power is cut.** If you cut motor power during a run, for example with the E-Stop, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If it can't confirm the motors are off yet, it shows a lock message:
+
+1. Release the E-Stop to turn motor power back on.
+2. Wait a few seconds. The panel unlocks on its own once every motor reads off.
+3. If the message stays, press **Re-check motors**. A motor it names still has torque on: press the E-Stop, wait a few seconds, then press **Re-check motors** again.
 
 **Mantis.** Press **Use for operations** on the Mantis card. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
 

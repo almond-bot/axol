@@ -1000,8 +1000,32 @@ export async function startOperation(
   )
 }
 
-export async function stopOperation(): Promise<SessionInfo> {
-  return json(await fetch(apiUrl("/api/op/stop"), { method: "POST" }))
+/** What a teleop Stop does with the arms: park them, or leave them holding. */
+export type StopArms = "rest" | "hold"
+
+export async function stopOperation(arms?: StopArms): Promise<SessionInfo> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      ...(arms
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ arms }) }
+        : {}),
+    })
+  )
+}
+
+/**
+ * Stop, unless teleop's arms are away from rest: then nothing stops and the
+ * answer is `{ needsChoice: true }`, so the panel can ask what the arms do.
+ */
+export async function stopOperationOrAsk(): Promise<SessionInfo | { needsChoice: true }> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ arms: "ask" }),
+    })
+  )
 }
 
 /**

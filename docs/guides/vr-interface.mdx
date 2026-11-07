@@ -43,6 +43,14 @@ The screens stay fixed in the room, where you were looking when the session star
 | Resize a screen | Hold both triggers on the same screen, then move your hands apart or together. |
 | Reset all screens | Press **B**. The screens move to where you are looking and go back to their default size. |
 
+## Robot model
+
+A small 3D model of Axol stands below the overhead camera screen. It shows where the arms, grippers and Jelly's lift are now, so you can check the robot's pose without looking away from the cameras.
+
+- You see the model from behind, so its left arm is on your left.
+- The model follows the robot whether or not arm tracking is engaged.
+- Move and resize the model like a camera screen, and press **B** to put it back.
+
 ## Controller bindings
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
@@ -54,22 +62,35 @@ The screens stay fixed in the room, where you were looking when the session star
 | 3 | Left trigger | Close the left gripper. With tracking disengaged, move or resize a camera screen. |
 | 4 | Right trigger | Close the right gripper. With tracking disengaged, move or resize a camera screen. |
 | 5 | X | Return the arms to the rest pose. Cancels a recording countdown. While recording, asks to discard the episode. |
-| 6 | A | Data collection only. Starts recording, or while recording, asks to save the episode. |
+| 6 | A | In teleop with the parcel gripper, tucks both arms in and freezes them. See [Tucking the arms](#arm-stow). In data collection, starts recording, or while recording, asks to save the episode. |
 | 7 | Y | Exit VR. The arms stop and hold their position. |
 | | B (right) | Reset the camera screens. |
 | | Left thumbstick | Drive [Jelly](#jelly) forward, back and sideways. |
 | | Right thumbstick, left or right | Turn Jelly. |
-| | Left thumbstick click, held | Lower Jelly's lift. |
-| | Right thumbstick click, held | Raise Jelly's lift. |
+| | Right thumbstick, forward or back | Raise or lower Jelly's lift. |
 | | Both thumbstick clicks together | Turn [box mode](#box-mode) on or off. Parcel gripper only. |
 
 ### Engage and freeze the arms
 
 - Press both grips together to start tracking.
 - Click one grip to freeze that arm. It holds its pose and its grip, so it can steady an object while the other arm works. Click the grip again to resume.
+- A resumed arm's gripper keeps its grip until you squeeze the trigger to the same point. From there it follows the trigger again, so letting the trigger out opens it.
 - A reset, a [contact stop](/operations/teleop) or a dropped link disengages both arms. Press both grips to engage again.
 
 With **Hold grips to engage** turned on in the control panel (`--teleop.hold_to_engage true`), each grip is a dead-man switch. Hold a grip to move its arm, and release it to freeze the arm. Either grip engages its own arm, including from rest. After a forced disengage, release a grip you are still holding before it engages again.
+
+<a id="arm-stow"></a>
+
+### Tucking the arms
+
+With the parcel gripper fitted, press **A** in teleop to tuck both arms in before you drive. It works while the arms move, while they are frozen and from rest.
+
+1. The two grippers move in together to the middle of the chest, below the shoulders, with the elbows tucked in against the robot.
+2. They keep their positions relative to each other the whole way, so a box squeezed between them stays squeezed with the same force.
+3. Each gripper stays as open or closed as it was when you pressed **A**.
+4. Once the arms settle, both arms freeze. Click a grip to move that arm again.
+
+Click a grip during the move to stop it, and both arms freeze where they are. In box mode, **A** stows the box instead. See [Stowing the box](#box-stow).
 
 ### If the link drops
 
@@ -79,7 +100,7 @@ The arms disengage after about half a second and hold their position if the head
 
 The command that starts the session sets the mode. You can't switch it in the headset.
 
-- [`axol teleop`](/cli/teleop): the HUD shows `Teleop` and **A** does nothing.
+- [`axol teleop`](/cli/teleop): the HUD shows `Teleop`. With the parcel gripper, **A** tucks the arms in (see [Tucking the arms](#arm-stow)). Otherwise it does nothing.
 - [`axol collect-data`](/cli/collect-data): the HUD shows `Data collection` and **A** records. See [Record episodes](#record-episodes).
 
 <a id="re-engaging"></a>
@@ -136,9 +157,11 @@ On engage, the arms first move into a parallel pair over about 1.5 s. They keep 
 | Right trigger | Close the right gripper, whichever hand leads. |
 | Right thumbstick, forward or back | Change the grip width. Forward is wider, back is narrower. |
 | Thumbstick click, quick tap | Switch between the straight and flush grasp. See [Grasps](#box-grasp). |
-| Thumbstick click, held | Move Jelly's lift, as outside box mode. |
+| Right thumbstick click, held | Raise Jelly's lift. |
+| Left thumbstick click, held | Lower Jelly's lift. |
 | Other thumbstick directions | Drive [Jelly](#jelly), as outside box mode. |
 | Both thumbstick clicks | Leave box mode. |
+| A | Stow the box against the chest, then freeze the pair. Works while leading or frozen, in teleop only. See [Stowing the box](#box-stow). |
 | X | Return to rest and leave box mode. |
 
 The width stick works only while a grip leads, and it never moves the pair. A tap is a click released within about 0.3 s, with the other stick not pressed. Hold a click longer and the lift starts moving, so one press never does both.
@@ -151,7 +174,7 @@ To clamp a box, lead the pair to it. Then pull the right thumbstick back until t
 
 | Grasp | How the grippers sit |
 |---|---|
-| `straight` (default) | Fingers point straight forward. The parcel gripper's folded plate lies flat on the box. |
+| `straight` (default) | Fingers point straight forward. The front of each fixed blade lies flat on the box, with the box in front of the grippers. It holds boxes about 12.5 cm wide and up. |
 | `flush` | Each gripper turns 39° inward about the front edge of its plate. The plate's chamfer and the tip of the fixed blade both touch the box. Release the triggers before you close the width. |
 
 Tap either thumbstick while leading to switch, or set **Box grasp** in [session settings](#session-settings). The arms move to the other grasp over about 1.5 s, and you can switch with a box already clamped. The **Box** button shows the current grasp, for example **Box: ON (straight)**. Set the flush angle with **Angled yaw** and the starting grasp with `--teleop.box_grasp`.
@@ -168,9 +191,24 @@ Each gripper turns whichever flat side is closer toward the box, so the wrist ne
 
 ### Driving with the box
 
-The thumbsticks drive [Jelly](#jelly) with the normal controls the whole time box mode is on, whether the pair is led or frozen. Only the right thumbstick's forward and back sets the width instead. You can carry a box across the room while you lead the pair.
+The thumbsticks drive [Jelly](#jelly) with the normal controls the whole time box mode is on, whether the pair is led or frozen. Two controls change: the right thumbstick's forward and back sets the width, and the thumbstick clicks run the lift. The right thumbstick follows whichever direction you push it furthest, so squeezing doesn't turn Jelly and turning doesn't change the width. You can carry a box across the room while you lead the pair.
 
-For a long drive, freeze the pair:
+<a id="box-stow"></a>
+
+### Stowing the box
+
+Stow the box before you drive. The arms then hold it close to the chest, with both arms mirrored and the elbows tucked in against the robot.
+
+1. Clamp the box.
+2. Press **A**. It works while a grip leads the pair and while the pair is frozen.
+3. The arms level the box, turn it to face forward and bring it to the middle of the chest, at **Box-mode stow height** below the shoulders (0.15 m by default). They bring it as close to the chest as they can while keeping the elbows tucked in.
+4. Once the arms settle, the pair freezes and holds the box. Your hands are free to drive.
+
+The grippers keep the grasp they had when you pressed **A**, even if you let go of the triggers. The stow takes a few seconds, and your hands don't move the box while it runs. If the box presses against the robot on the way in, the arms stop 1 cm short of it.
+
+Press a grip to stop the stow, or to lead the pair again afterwards. **A** stows the box in teleop only, because data collection uses A to record.
+
+For a long drive, you can also freeze the pair where it is:
 
 1. Clamp the box.
 2. Click the leading grip to freeze the pair. The arms hold the box where it is, with the grippers closed, whatever your hands do.
@@ -187,7 +225,7 @@ A pair you have tipped keeps its tilt when you freeze it, hand over the lead or 
 
 ### Elbows
 
-Set **Elbows out** in [session settings](#session-settings). It goes from 0° (hanging below the line from shoulder to wrist) to 90° (level), and starts at 30°. Bring the elbows in to pass a doorway, or out for a wide box.
+Set **Elbows out** in [session settings](#session-settings). It goes from 0° (hanging below the line from shoulder to wrist) to 90° (level), and starts at 0°. At 0°, the elbows go down and back beside the body when you pull a box in to the chest. Raise it for a wide box.
 
 If closing the width would bring an arm too close to the torso, the width stops closing. To turn off elbow control, pass `--teleop.box_elbow_weight 0`. The elbows then rest where they fall, and **Elbows out** does nothing.
 
@@ -203,6 +241,8 @@ The clamp gets harder the further you push the width past the box, by about 6 N 
 | **Squeeze cap** | 0 (off) | Caps the shoulder torque that squeezes the box. Leave it off unless you need it, because it also slows an arm moving toward the other and skews the pair. |
 
 With **Squeeze force** off, nothing limits the clamp. Past about 39 N per arm, the blade tip can lift and the plate's chamfer takes the whole load. Set **Squeeze force** to keep the clamp below that.
+
+The leading controller throbs once the clamp gets hard, and more strongly as you close further. See [Controller haptics](/operations/teleop#controller-haptics).
 
 While the grippers press, the **Box** button shows the clamp force and trim, for example **Box: ON (straight, 6 N, 2° in)**. The teleop log prints a `box clamp:` line every second.
 
@@ -233,7 +273,7 @@ You can change these settings during a session. Open them with the **Settings** 
 | **Haptics** | Turns the [controller vibration](/operations/teleop#controller-haptics) on or off. |
 | **Body ticks** | Ticks a controller, faster as its arm gets close to Axol's body. Off by default. |
 | **Haptic push** (Nm) | Unexpected joint torque at which a controller starts to rumble. 0 turns the rumble off. Real robot only. |
-| **Elbows out** (°) | Box mode. How far out the elbows are held, from 0 to 90. |
+| **Elbows out** (°) | Box mode. How far out the elbows are held, from 0 (tucked beside the body) to 90 (out level). |
 | **Squeeze lean** (×) | Box mode. How far each gripper tilts into the box as you squeeze. Real robot only. |
 | **Squeeze trim** (°) | Box mode. The most extra inward turn added while pressing. Real robot only. |
 | **Box lead hand** | Which controller leads the pair when box mode turns on. |
@@ -258,12 +298,13 @@ On Axol on Jelly, the thumbsticks drive the base, so you can move Axol without l
 |---|---|
 | Left thumbstick | Drive forward, back and sideways. |
 | Right thumbstick, left or right | Turn. |
-| Left thumbstick click, held | Lower the lift. |
-| Right thumbstick click, held | Raise the lift. |
+| Right thumbstick, forward or back | Raise or lower the lift. Forward raises it. |
 
 - Jelly moves only while you push a stick, and stops smoothly when you let go. This works whether or not arm tracking is engaged.
+- Each push of the right thumbstick does one thing. A push close to straight forward or back runs the lift, and Jelly doesn't turn. Any other push, diagonals included, turns Jelly, and the lift stays still. Let the stick return to center to switch.
+- The lift starts once the right thumbstick is about halfway forward or back.
 - Speed follows how far you push the stick. The first part of the travel is slow, for creeping up on a spot, and a full push is full speed. Set the curve with `--jelly.stick_expo` (default `0.6`, `0` is linear).
-- In box mode, the sticks still drive Jelly. The right thumbstick's forward and back sets the grip width instead, and a held click must last about 0.3 s before the lift moves. See [Driving with the box](#driving-with-the-box).
+- In box mode, the right thumbstick's forward and back sets the grip width. Hold a thumbstick click to run the lift instead: right raises it and left lowers it. See [Driving with the box](#driving-with-the-box).
 - If the headset link drops while you drive, Jelly stops. A parked Jelly keeps holding its position.
 - After several minutes of driving mostly one way, a parked Jelly brakes its wheels instead of holding them, and it can creep slowly on a slope. Power Jelly off and on to restore the full hold.
 - If a parked wheel turns fast or moves too far, Jelly turns its wheels off and stops parking until you restart the session.

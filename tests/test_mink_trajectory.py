@@ -181,6 +181,7 @@ def test_planning_failure_keeps_worker_alive_for_retry():
     worker = Mock(left_indices=list(range(7)), right_indices=list(range(7, 14)))
     zero = np.zeros(14, dtype=np.float32)
     worker.get_rest_q.return_value = zero
+    worker.rest_goal.return_value = zero
     worker.compute_path_trajectory.return_value = [zero]
     worker.compute_reset_trajectory.side_effect = [
         MinkPlanningError("blocked"),

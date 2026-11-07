@@ -36,6 +36,9 @@ from almond_axol.constants import ARM_JOINTS
 from almond_axol.robot.config import AxolConfig
 from almond_axol.robot.gravity import GravityCompensator
 from almond_axol.teleop.box import (
+    PARCEL_BLADE_FRONT_M,
+    PARCEL_BLADE_IN_M,
+    PARCEL_BLADE_REAR_M,
     PARCEL_EDGE_FWD_M,
     PARCEL_FACET_FWD_M,
     PARCEL_FACET_IN_M,
@@ -527,23 +530,26 @@ class ToolContactsTest(unittest.TestCase):
             parcel_tool(39.0).contacts(-1.0), pts * np.array([-1.0, -1.0, 1.0])
         )
 
-    def test_parcel_straight_is_the_plate_face(self) -> None:
+    def test_parcel_straight_is_the_blade_front(self) -> None:
         pts = np.asarray(parcel_tool(39.0, "straight").contacts())
         self.assertEqual(len(pts), 4)
-        # The folded plate's face, flat on the box: one plane, from beside
-        # the wrist to just past the hinge, about the mount.
-        np.testing.assert_allclose(pts[:, 0], PARCEL_PLATE_IN_M)
+        # The fixed blade's front face, flat on the box: one plane, across
+        # the mount axis from the box side, wholly ahead of the open plate.
+        np.testing.assert_allclose(pts[:, 0], PARCEL_BLADE_IN_M)
         fwd = -pts[:, 2]
-        self.assertLess(fwd.min(), -0.05)
-        self.assertGreater(fwd.max(), 0.05)
-        self.assertLess(abs(float(fwd.mean())), 0.005)
+        self.assertGreaterEqual(fwd.min(), PARCEL_BLADE_REAR_M - 1e-9)
+        self.assertAlmostEqual(float(fwd.max()), PARCEL_BLADE_FRONT_M)
+        self.assertGreater(float(fwd.min()), PARCEL_EDGE_FWD_M)
 
-    def test_both_grasps_share_the_foot_on_the_face_edge(self) -> None:
+    def test_each_grasp_has_its_own_foot(self) -> None:
         flush, straight = parcel_tool(39.0), parcel_tool(39.0, "straight")
-        for face in (1.0, -1.0):
-            np.testing.assert_array_equal(flush.foot(face), straight.foot(face))
         np.testing.assert_allclose(
             flush.foot(1.0), [PARCEL_PLATE_IN_M, 0.0, -PARCEL_EDGE_FWD_M], atol=1e-7
+        )
+        np.testing.assert_allclose(
+            straight.foot(1.0),
+            [PARCEL_BLADE_IN_M, 0.0, -PARCEL_BLADE_REAR_M],
+            atol=1e-7,
         )
 
     def test_urdf_tool_touches_at_the_mount(self) -> None:

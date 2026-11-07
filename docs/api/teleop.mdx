@@ -115,7 +115,7 @@ Joint velocities and accelerations are set in rad/s and rad/s². The defaults be
 | `box_width_speed` | `0.08` m/s | Rate at which the right thumbstick's forward and back changes the grip width at full deflection. |
 | `box_width_min` / `box_width_max` | `0` / `0.70` m | Limits on the grip width, measured between the contact faces. The minimum is raised where needed so the gripper bodies never touch. The parcel gripper's faces can close all the way together. |
 | `box_align_duration` | `1.5` s | Time to blend the grippers into the parallel pair when box mode engages or the grasp changes. |
-| `box_elbow_out` | `30`° | How far out the elbows are held, from `0` (straight down) to `90` (level). Live setting (**Elbows out**). |
+| `box_elbow_out` | `0`° | How far out the elbows are held, from `0` (tucked beside the body) to `90` (level). Live setting (**Elbows out**). |
 | `box_elbow_weight` | `10` | IK weight that holds the elbows at `box_elbow_out`. `0` turns it off, and `box_elbow_out` then does nothing. |
 | `box_wrist_torque` | `5` Nm | Cap on the spring torque of `wrist_2` and `wrist_3` in box mode, which keeps the wrist motors from overheating. `0` turns it off. |
 | `box_squeeze_force` | `0` N (off) | Cap on how hard each arm clamps the box. Live setting (**Squeeze force**). |

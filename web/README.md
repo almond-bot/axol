@@ -114,9 +114,9 @@ Each frame sends a JSON message over the WebSocket:
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
-  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — box-mode grip width while a grip leads (Jelly ignores it)
-  l_stick_click: boolean  // left thumbstick pressed in — lift down while held
-  r_stick_click: boolean  // right thumbstick pressed in — lift up while held (both together: box-mode toggle, sent as a `set` message; in box mode a quick tap toggles the grasp instead)
+  r_stick_y: number  // right thumbstick y, [-1, 1], pushed forward = -1 — Jelly lift (forward = up); in box mode, grip width while a grip leads
+  l_stick_click: boolean  // left thumbstick pressed in — in box mode, lift down while held
+  r_stick_click: boolean  // right thumbstick pressed in — in box mode, lift up while held (both together: box-mode toggle, sent as a `set` message; in box mode a quick tap toggles the grasp instead)
   pose_source_id: string       // stable logical Quest id shared by USB, WebRTC, network, and reconnects
   pose_source_kind: "webxr"    // managed server source policy; Lighthouse/Ultimate bridges use "tracker"
   seq:     number    // monotonic within pose_source_id (including page reloads); the same frame is sent over both USB and WiFi with one seq, and the server accepts the first transport copy exactly once

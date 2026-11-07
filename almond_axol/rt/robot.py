@@ -397,6 +397,9 @@ class Axol(RobotBase):
         profile = getattr(self, "_tracking_profile", "default")
         if profile != "default":
             lines.append(f"tracking_profile {profile}")
+        # The Damiao wrists' temperature limit (always sent, so the core runs
+        # exactly what this package configured).
+        lines.append(self._axol_config().wrist_thermal.config_line())
         trk_vel = self._TRACKER_HEADROOM * self._max_vel
         trk_acc = self._TRACKER_HEADROOM * self._max_accel
         for side, arm in self._arms():

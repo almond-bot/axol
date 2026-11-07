@@ -265,18 +265,22 @@ class HeldLoadTest(unittest.TestCase):
         )
         np.testing.assert_allclose(explained, _payload_torque(lowered, 2.0), atol=0.05)
 
-    def test_box_squeeze_is_explained_but_not_a_push_along_the_fingers(self) -> None:
+    def test_box_squeeze_is_fit_apart_from_the_weight_and_left_in(self) -> None:
         _, rot, _ = _GRAVITY.mount_jacobian(_CARRY_Q, is_left=True)
         a = self._regressor(_CARRY_Q, squeeze=True)
         held = HeldLoad(squeeze=True)
         squeeze = _tip_force_torque(_CARRY_Q, 12.0 * rot[:, 0])
-        load = squeeze + _payload_torque(_CARRY_Q, 1.0)
+        weight = _payload_torque(_CARRY_Q, 1.0)
+        # Only the box's weight is explained; the clamp stays in the cue.
         np.testing.assert_allclose(
-            held.explain(a, load, tol=3.0, learn=1.0), load, atol=1e-3
+            held.explain(a, squeeze + weight, tol=3.0, learn=1.0), weight, atol=1e-3
         )
+        self.assertAlmostEqual(held.mass, 1.0, places=2)
         poke = _tip_force_torque(_CARRY_Q, -30.0 * rot[:, 2])
         np.testing.assert_allclose(
-            held.explain(a, load + poke, tol=3.0, learn=0.0), load, atol=0.05
+            held.explain(a, squeeze + weight + poke, tol=3.0, learn=0.0),
+            weight,
+            atol=0.05,
         )
 
 
@@ -329,17 +333,35 @@ class HeldLoadHapticsTest(unittest.TestCase):
         _feed(core, robot, 0.1)
         self.assertNotIn("left", core.held_loads)
 
-    def test_box_mode_squeeze_does_not_rumble(self) -> None:
-        _, rot, _ = _GRAVITY.mount_jacobian(_CARRY_Q, is_left=True)
-        robot = _HoldingRobot(mass=1.0, push=15.0 * rot[:, 0])
-        self.assertGreater(self._force(robot, grip=1.0), 0.0)
-        core = _core(haptic_torque=4.0, gripper="parcel", box_mode=True)
+    def _box_force(self, robot, **config) -> float:
+        core = _core(gripper="parcel", box_mode=True, **config)
         core.left_enabled = core.right_enabled = True
         core._box_leader = "left"
         core.l_grip = 1.0
         _feed(core, robot, 1.0)
         self.assertTrue(core.held_loads["left"].squeeze)
-        self.assertEqual(core.haptic_levels()["left"]["force"], 0.0)
+        return core.haptic_levels()["left"]["force"]
+
+    def test_box_mode_carry_is_quiet_and_a_hard_squeeze_rumbles(self) -> None:
+        _, rot, _ = _GRAVITY.mount_jacobian(_CARRY_Q, is_left=True)
+        # A heavy box held with a light clamp: quiet.
+        light = _HoldingRobot(mass=2.0, push=2.0 * rot[:, 0])
+        self.assertEqual(self._box_force(light, haptic_torque=4.0), 0.0)
+        # Jogging the width in past the box: the clamp rumbles.
+        hard = _HoldingRobot(mass=2.0, push=25.0 * rot[:, 0])
+        self.assertGreater(self._box_force(hard, haptic_torque=4.0), 0.3)
+
+    def test_a_wrist_at_its_box_mode_cap_rumbles_full(self) -> None:
+        robot = _HoldingRobot(mass=0.0)
+        robot.residual = np.zeros(7)
+        robot.residual[5] = 5.0  # wrist_2 held at box_wrist_torque
+        self.assertEqual(
+            self._box_force(robot, haptic_torque=6.0, box_wrist_torque=5.0), 1.0
+        )
+        robot.residual[5] = 3.0  # below 80% of the cap
+        self.assertEqual(
+            self._box_force(robot, haptic_torque=6.0, box_wrist_torque=5.0), 0.0
+        )
 
 
 class SolverProximityTest(unittest.TestCase):

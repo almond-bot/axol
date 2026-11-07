@@ -30,7 +30,7 @@ The new calibration takes effect on this computer as soon as the run finishes. I
 
 ## After you change the end-effector or add cameras
 
-Gravity compensation needs to know how much the wrist weighs. The gripper and everything mounted on it count as one link, `wrist_3`. That includes wrist cameras, brackets, screws and a different gripper. The default `wrist_3` mass is 0.75&nbsp;kg, for the standard gripper with the Camera Kit wrist camera and its mount.
+Gravity compensation needs to know how much the wrist weighs. The gripper and everything mounted on it count as one link, `wrist_3`. That includes wrist cameras, brackets, screws and a different gripper. The default `wrist_3` mass is 0.75&nbsp;kg, for the standard gripper with the Camera Kit wrist camera and its mount. With the parcel gripper (**Gripper** set to `parcel`) the default is 0.6&nbsp;kg.
 
 The calibration measures where each link's weight sits, but it can't measure how heavy the link is. Enter the new mass before you calibrate. Otherwise the extra weight is spread over the wrong links, and the elbow and shoulders are compensated less accurately.
 

@@ -106,6 +106,10 @@ def _step_worker() -> IKWorker:
     worker._box = None
     worker._box_leader = None
     worker._box_snap = None
+    worker._held_tool = None
+    worker._deck_plane = {}
+    worker._stow = None
+    worker._arm_stow = None
     worker._freeze_since = {}
     worker._freeze_targets = {}
     worker._snap_ctrl = {

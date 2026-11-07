@@ -8,8 +8,8 @@ rest pose. When an arm has been left far from zero — folded over by hand
 while limp, collapsed onto the table, or reading a bad joint offset — that
 first move is large and unsupervised, so these flows check the measured pose
 first and refuse to start if any of :data:`START_POSE_CHECKED_JOINTS`
-(shoulder_1, shoulder_3 and the elbow) is more than
-:data:`START_POSE_TOLERANCE_DEG` from zero. shoulder_2 and the wrist joints
+(shoulder_1, shoulder_2 and the elbow) is more than
+:data:`START_POSE_TOLERANCE_DEG` from zero. shoulder_3 and the wrist joints
 are not capped and may start anywhere.
 
 The reference is zero rather than the configured rest pose on purpose: the
@@ -38,7 +38,7 @@ START_POSE_TOLERANCE_DEG = 25.0
 # The joints held to the start tolerance. Every other arm joint may start
 # anywhere.
 START_POSE_CHECKED_JOINTS: frozenset[Joint] = frozenset(
-    {Joint.SHOULDER_1, Joint.SHOULDER_3, Joint.ELBOW}
+    {Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.ELBOW}
 )
 
 ArmPair = tuple[Sequence[float] | None, Sequence[float] | None]

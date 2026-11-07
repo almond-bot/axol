@@ -13,7 +13,7 @@ Replay drives only the arms. It uses no cameras, teleop or policy server.
 
 With `--interpolate true`, the recorded actions are spread over commands at about 120 Hz for smoother motion. The episode's timing doesn't change.
 
-Replay refuses to start while `shoulder_1`, `shoulder_3` or `elbow` is more than 25° from zero, and names each joint that is out. See [Starting needs the arms near zero](/operations/teleop).
+Replay refuses to start while `shoulder_1`, `shoulder_2` or `elbow` is more than 25° from zero, and names each joint that is out. See [Starting needs the arms near zero](/operations/teleop).
 
 Pass `--loop true` to replay the episode over and over, returning to rest between takes, until you press `Ctrl+C` or **Stop** in the [control panel](/guides/control-panel). Either way, the arms return to rest before the command exits.
 
