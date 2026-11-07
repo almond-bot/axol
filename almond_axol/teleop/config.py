@@ -111,10 +111,14 @@ class VRTeleopConfig:
             Defaults to ``6.0`` (the return-to-rest contact stop).
         haptic_held_load: Keep what a gripper holds out of the rumble.
             ``True`` (default): while a gripper is closed, or box mode
-            clamps a box, its arm's torque residual is fit as a held weight
-            (and box mode's squeeze), so carrying a heavy object or box
-            stays quiet while pushing on something still rumbles. Works
-            with any gripper; opening it forgets the load. See
+            clamps a box, its arm's torque residual is fit as a held weight,
+            so carrying a heavy object or box stays quiet while pushing on
+            something still rumbles. In box mode the fit also models the
+            squeeze but leaves it in the rumble, so closing the grip width
+            onto a box rumbles once the clamp passes ``haptic_torque`` on a
+            joint. Box mode's capped joints (``box_wrist_torque``,
+            ``box_squeeze_torque``) start at 80% of their cap and are full
+            at it. Works with any gripper; opening it forgets the load. See
             :mod:`almond_axol.teleop.held_load`.
         park_to_zero: Shutdown park. ``True`` (default): when a hardware
             session stops (**Stop** in the control panel, ``Ctrl+C``), the
@@ -199,11 +203,13 @@ class VRTeleopConfig:
             back along the wrist on the box side at its open stop; box mode
             places its contact geometry
             (:class:`~almond_axol.teleop.box.ToolGeometry`): the straight
-            grasp presses the plate's face flat on the box, the angled grasp
-            rolls each gripper ``box_flush_deg`` inward about the plate's
-            front edge onto its chamfer facet, which then touches together
-            with the fixed blade's tip. The width is measured between the
-            contact faces in both.
+            grasp holds the box on the fixed blades' front faces, the box in
+            front of the gripper bodies (so it holds nothing narrower than
+            the open plates allow, ~12 cm), the angled grasp turns each
+            gripper ``box_flush_deg`` inward about the plate's front edge
+            onto its chamfer facet, which then touches together with the
+            fixed blade's tip. The width is measured between the contact
+            faces in both.
         box_flush_deg: Parcel gripper only: how far (degrees) box mode's
             angled (``"flush"``) grasp turns each gripper inward from the
             parallel grasp, about the folded plate's front edge. The
@@ -212,17 +218,19 @@ class VRTeleopConfig:
             stop in this grasp as everywhere else. Live-adjustable.
         box_grasp: Which of box mode's two grasps a session starts in.
             ``"straight"`` (the default): fingers straight forward (yaw 0),
-            the tool's flat face on the box — the parcel gripper's folded
-            plate, the stock gripper's closed fingers (width between the
-            mounts). ``"flush"``: for the parcel gripper, each gripper
+            the tool's flat face on the box — the parcel gripper's fixed
+            blade fronts, the box ahead of the gripper bodies; the stock
+            gripper's closed fingers (width between the mounts).
+            ``"flush"``: for the parcel gripper, each gripper
             turned ``box_flush_deg`` (39°) inward about the plate's front
             edge, the plate still at its stop and the width still measured
             between the contact faces. Toggled live while a grip is
             leading by a quick tap of either thumbstick (released within
             ~0.3 s; a longer hold runs the lift, and the both-sticks
             box-mode gesture never counts) or from the settings; the pair blends into the new grasp over
-            ``box_align_duration``, each gripper turning about that edge so
-            a box already held stays held. The tilt trim applies on top of
+            ``box_align_duration``, the box kept where it is and each
+            gripper moved onto the new grasp's contacts, so a box already
+            held stays held. The tilt trim applies on top of
             either.
         box_face_left / box_face_right: Which flat side of each gripper
             (the mount's ``"+x"`` or ``"-x"``) is turned toward the box.
@@ -256,11 +264,25 @@ class VRTeleopConfig:
         box_elbow_out: How far out the elbows are held in box mode, in
             degrees from straight down toward each arm's outboard side
             (``0`` hangs the elbows under the shoulder-wrist line, ``90``
-            holds them out level). The parallel, fingers-forward gripper
+            holds them out level). ``0`` (the default) keeps them tucked
+            beside the body: with the box pulled in to the chest the elbows
+            go down and back instead of flaring out sideways. The parallel, fingers-forward gripper
             poses of box mode leave each arm's elbow swivel free; an IK
             elbow hint steers it to this angle (at ``box_elbow_weight``).
             Live-adjustable from the settings panel and the headset menu
             (**Elbows out**).
+        box_stow_height: Box mode's stow (**A**, led or frozen): how far
+            below the shoulders (m) the stowed box's centre is held. The
+            stow squares the box level and facing forward, centres it
+            between the shoulders at this height and as close in front as
+            the arms reach, with the two arms mirror images of each other
+            and the elbows tucked toward the base, then freezes the pair for
+            driving (``IKWorker._start_stow``). The height is measured from
+            the shoulders, so it moves with Jelly's lift.
+        box_stow_reach: Closest the stow brings the box centre to the
+            shoulders' plane (m, forward of it); the plan moves it out until
+            the arms reach.
+        box_stow_speed: How fast (m/s) the stow moves the box.
         box_elbow_weight: IK weight on that elbow hint (compare the
             grippers' pose weights, which box mode raises to twice
             ``KinematicsConfig.pos_weight`` and four times ``ori_weight``).
@@ -604,8 +626,11 @@ class VRTeleopConfig:
     box_width_min: float = 0.0
     box_width_max: float = 0.70
     box_align_duration: float = 1.5
-    box_elbow_out: float = 30.0
+    box_elbow_out: float = 0.0
     box_elbow_weight: float = 10.0
+    box_stow_height: float = 0.15
+    box_stow_reach: float = 0.15
+    box_stow_speed: float = 0.12
     box_wrist_torque: float = 5.0
     box_squeeze_torque: float = 0.0
     box_squeeze_lean: float = 1.0

@@ -593,6 +593,9 @@ export function AxolVRClient({
       r_stick_y,
       l_stick_click,
       r_stick_click,
+      // A held: in box mode, stows the box against the chest. Data collection
+      // keeps A for recording, so it is sent only in plain teleop.
+      stow: aPressed && !canRecord,
       seq: nextPoseSequence(seqRef.current!),
       // One logical identity across USB, WebRTC, and network WebSocket. The
       // server de-dupes the shared sequence globally and can keep this Quest

@@ -58,6 +58,12 @@ CAN_RESET_SCRIPT: Path = Path("/etc/almond-axol/can/reset_adapter.sh")
 CAN_MANTIS_LEFT = "can_mantis_l"
 CAN_MANTIS_RIGHT = "can_mantis_r"
 
+# Hard ceiling (Nm) on gripper output torque. A configured torque_limit above
+# it is rejected, and every POSITION_FORCE command is clamped to it (Python
+# drivers here, the realtime core's GRIPPER_MAX_TORQUE in serve.rs), so no
+# setting, CLI flag or code path can squeeze harder.
+GRIPPER_MAX_TORQUE = 5.0
+
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
 # Fields per joint slot in a realtime-core command tuple — what an

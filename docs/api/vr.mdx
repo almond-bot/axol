@@ -49,11 +49,13 @@ async with VRServer() as vr:
 | `reset` | `bool` | A rising edge starts a return to rest. |
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION` or `RECORDING`, set by the headset. `SAVING` and `ERROR` are only pushed by the server. |
 | `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick (right is `+1`, forward is `-1`). Drives [Jelly](/guides/vr-interface#jelly)'s translation when one is configured. |
-| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Drives Jelly's rotation. |
-| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Used only in [box mode](/guides/vr-interface#box-mode) while a grip leads, where it sets the grip width. Jelly ignores it. |
-| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Left lowers Jelly's lift and right raises it. See the notes below for box mode. |
+| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Turns Jelly. |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Runs Jelly's lift: forward raises it and back lowers it. In [box mode](/guides/vr-interface#box-mode) it sets the grip width while a grip leads. |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Used in box mode. See the notes below. |
 
-In box mode, the thumbsticks drive Jelly as usual, led or frozen. While a grip leads the pair, a quick tap of either thumbstick click toggles the grasp (`box_grasp`). A tap is released within about 0.3 s, with the other stick up. A longer hold runs the lift.
+Each push of the right thumbstick either turns Jelly or runs the lift. The direction you push first decides which, until the stick returns to center.
+
+In box mode, the thumbsticks drive Jelly as usual, led or frozen. The right thumbstick's forward and back sets the grip width, so the clicks run the lift: hold the right click to raise it and the left click to lower it. While a grip leads the pair, a quick tap of either thumbstick click toggles the grasp (`box_grasp`). A tap is released within about 0.3 s, with the other stick up. A longer hold runs the lift.
 
 Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
 
@@ -166,7 +168,7 @@ The `joints` message has this shape:
 
 - Each level runs from `0` to `1`, and only an engaged arm has non-zero levels. In box mode the leading controller gets the stronger of the two arms, and the other controller gets zeros.
 - `near` is how close the arm is to the IK's arm/body collision boundary, from the solver's `collision_proximity()`. It is `0` unless `haptic_near` is on. It is `1` where the IK holds the arm off the body instead of following the target. A pose as clear as the rest pose reads `0`.
-- `force` is how far the arm's largest torque residual (measured minus modeled gravity, low-passed over about 80 ms) is past `haptic_torque`. It reaches `1` at 2.5 times `haptic_torque`. It is always `0` in sim.
+- `force` is how far the arm's largest torque residual (measured minus modeled gravity, low-passed over about 80 ms, less a held object's weight) is past `haptic_torque`. It reaches `1` at 2.5 times `haptic_torque`. A joint under a box-mode torque cap starts at 80% of its cap if that is lower, and reaches `1` at the cap. It is always `0` in sim.
 - `useAxolHaptics(wsRef)` in `@almond/axol-vr-client` plays them: `near` as ticks that speed up, and `force` as throbs that get stronger and faster with it, up to a steady rumble at `1`. The throbs take over from the ticks. It stops if the messages stop for 300 ms.
 
 The server also serves the robot model under `/urdf/` (`axol.urdf` and `meshes/*.stl`).

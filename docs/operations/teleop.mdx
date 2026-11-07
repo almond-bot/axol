@@ -138,18 +138,20 @@ A frozen arm's controller stays quiet.
 
 The throbs start when a joint meets 6 Nm of unexpected torque. They become a steady, full-strength rumble at 2.5 times that (15 Nm). If the controllers rumble during normal moves, raise **Haptic push torque** (`--teleop.haptic_torque`). Set `0` to turn the throbs off.
 
-The weight of what a gripper holds doesn't make its controller rumble, with either gripper. In box mode, the squeeze on the box doesn't either.
+The weight of what a gripper holds doesn't make its controller rumble, with either gripper.
 
 - Axol treats a gripper as holding something while you hold its trigger past halfway, or while box mode is on.
 - It learns the weight as you lift. Opening the gripper or leaving box mode clears it.
-- Pushing the held object down onto a surface, or pressing the box sideways into something, doesn't rumble, because Axol can't tell that push from extra weight or squeeze.
+- Pushing the held object down onto a surface doesn't rumble, because Axol can't tell that push from extra weight.
 - To feel the full load instead, turn off **Ignore held weight** (`--teleop.haptic_held_load false`).
+
+In box mode, the squeeze does rumble. As you close the grip width onto a box, the throbs start once a joint meets **Haptic push torque** and grow as you close further. A wrist that reaches its box-mode torque limit throbs at full strength. Back the width off until the throbs stop, or set **Squeeze force** to cap the clamp (see [Box mode](/guides/vr-interface#box-mode)).
 
 ## Safety behavior
 
 ### Starting
 
-Teleoperation, data collection, DAgger, run policy and replay refuse to start while any arm joint is more than 25° from zero. Zero is the pose the arms settle into when the motors are off. The error names each joint that is out of range. Move the arms back by hand, for example under `axol gravity-comp`, then start again.
+Teleoperation, data collection, DAgger, run policy and replay refuse to start while `shoulder_1`, `shoulder_2` or `elbow` on either arm is more than 25° from zero (the pose the arms settle into when the motors are off). `shoulder_3` and the wrist joints can start anywhere. The error names each joint that is out of range. Move the arms back by hand, for example under `axol gravity-comp`, then start again.
 
 Once the check passes, the arms move to zero and then out to the rest pose. `collect-dagger --start_from_current_pose` skips this check unless `--home_on_start` is also set.
 
@@ -171,6 +173,10 @@ You can also stop the arms when they push hard while you drive them. This check 
 
 When a joint pushes past the threshold for a moment, tracking disengages and the arms go limp in the same hold. Guide them clear, then press **X** to return to rest. This works on the real robot only.
 
+### Hot wrists
+
+When a wrist motor gets hot, Axol lowers that wrist's torque until it cools, then restores it. While it cools, the wrist gives way to what it pushes on. The session log shows `wrist_2 is hot` or `wrist_3 is hot`. Back off and let the arm rest. To change the temperatures, see **Wrist temperature limit** in the [config parameters](/operations/teleop-config).
+
 ### Losing the link
 
 If pose updates stop while the arms are engaged, the arms freeze in place after about half a second. This happens when you take off the headset, open the system menu, quit the VR app or lose the network. The arms hold that pose until you come back.
@@ -188,6 +194,16 @@ When you press **Stop** in the control panel or `Ctrl+C` on the CLI, the arms re
 
 Turn off **Park to zero on stop** to stop at the rest pose.
 
+If the arms are not at rest when you press **Stop** in the control panel, it asks what they should do:
+
+| Choice | What happens |
+|---|---|
+| **Go to rest** | The arms park as described above, then the motors turn off. |
+| **Hold position** | The arms stay where they are and the motors stay on. |
+| **Gravity comp** | The arms stay where they are, then [Gravity compensation](/operations/gravity-comp) starts so you can move them by hand. |
+
+Press **Keep running** to go back to teleop. `Ctrl+C` on the CLI always parks the arms.
+
 ### Driving Jelly
 
 On Axol on Jelly, the thumbsticks drive Jelly's base and lift. See [Jelly](/guides/vr-interface#jelly). Axol detects Jelly from the CAN devices that are attached.
@@ -195,6 +211,12 @@ On Axol on Jelly, the thumbsticks drive Jelly's base and lift. See [Jelly](/guid
 - To leave attached Jelly hardware out, turn off **Jelly wheels** or **Jelly lift** in the Robot tab, or pass [`--jelly.wheels false` or `--jelly.lift false`](/cli/teleop).
 - To drive only Jelly, turn off **Axol arms**, or run [`axol teleop --arms false`](/cli/teleop).
 - If teleop stops with `Nothing to drive.`, every part is switched off or not attached. The error names the switch to turn on.
+
+Lowering the lift brings Jelly's deck up toward the arms. Axol keeps the arms off it:
+
+- An arm that isn't tracking your hand moves up and forward out of the deck's way as the lift lowers. This includes arms at rest and frozen arms.
+- With the lift lowered, a return to rest (X) ends with the arms raised over the deck instead of hanging into it.
+- An engaged arm pressed down onto the deck stays at that height when you move it past the deck's edge. Raise your hand to raise the arm.
 
 ## Network tip
 

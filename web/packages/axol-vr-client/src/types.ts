@@ -65,17 +65,19 @@ export type AxolPoseData = {
   l_stick_y?: number
   /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
-  /** Right thumbstick y, [-1, 1], pushed forward = -1 — box-mode grip width (forward = wider; Jelly ignores it). */
+  /** Right thumbstick y, [-1, 1], pushed forward = -1 — Jelly lift (forward = up); in box mode the grip width instead (forward = wider). */
   r_stick_y?: number
-  /** Left thumbstick pressed in — lift down while held. */
+  /** Left thumbstick pressed in — in box mode, lift down while held. */
   l_stick_click?: boolean
   /**
-   * Right thumbstick pressed in — lift up while held (in box mode a quick
+   * Right thumbstick pressed in — in box mode, lift up while held (a quick
    * tap of either stick switches the grasp instead; only a hold runs the lift).
    * Both sticks clicked together toggle box mode (the headset sends the `set` message
    * itself, see `AxolVRClient.onBothStickClick`).
    */
   r_stick_click?: boolean
+  /** Right controller A held, in plain teleop only: the stow (box mode's, or tucking the arms with the parcel gripper). */
+  stow?: boolean
 }
 
 /** Re-engage behaviour (the `reengage` live setting): "clutch" — a re-engaging
@@ -119,9 +121,12 @@ export type AxolSettings = {
 
 /**
  * Live joint state the teleop server pushes ~20x/s as
- * `{"type":"joints","value":AxolJointState}` — drives the HUD's box-mode
- * readout. `q` maps URDF joint names (e.g. `left_s1_0`) to radians; grips are
- * normalised 0 (closed) – 1 (open). `pair` is the gripper-pair geometry from
+ * `{"type":"joints","value":AxolJointState}` — drives the headset's live
+ * robot model and the HUD's box-mode readout. `q` maps URDF joint names (e.g.
+ * `left_s1_0`) to radians; grips are normalised 0 (closed) – 1 (open). `urdf`
+ * names this Axol's model under the server's `/urdf` mount and `lift` is
+ * Jelly's lift height as a fraction of its travel (1 = fully raised; null
+ * without a lift); both are null from an older server. `pair` is the gripper-pair geometry from
  * the IK worker: `aligned` when the grippers already form the box-mode pair
  * (fingers forward, a flat face toward each other across a box-mode-sized gap
  * — a good moment to switch to box mode), `width` in metres, `grasp` the
@@ -137,6 +142,8 @@ export type AxolJointState = {
   l_grip: number
   r_grip: number
   engaged: boolean
+  urdf: string | null
+  lift: number | null
   pair: {
     aligned: boolean
     width: number

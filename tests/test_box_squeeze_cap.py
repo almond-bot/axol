@@ -163,7 +163,10 @@ class ArmCommandTest(unittest.TestCase):
         arm._command_sink = sent.append
         arm.resolve_joint_offsets = AsyncMock()
         arm._joint_offsets = np.zeros(8, dtype=np.float32)
-        arm._last_q_commanded = None
+        # The robot is shared by the class: start each test from no caps and
+        # no command history.
+        arm.set_spring_caps(None)
+        arm.reset_command_state()
         return arm, sent
 
     def test_tuples_carry_the_caps(self) -> None:
@@ -223,6 +226,8 @@ class ArmCommandTest(unittest.TestCase):
         arm, sent = self._arm_with_sink()
         for i, j in enumerate(ARM_JOINTS):
             arm.motors[j]._position = float(measured[i])
+        # The positions read needs every motor's cache, the gripper's too.
+        arm.motors[Joint.GRIPPER]._position = 0.0
         arm._unverified_zeros = set()
         arm._unresolved_offsets = set()
         return arm, sent
@@ -279,6 +284,32 @@ class ArmCommandTest(unittest.TestCase):
         self.assertAlmostEqual(sent[-1][1][0], 0.1, places=6)
         arm._unresolved_offsets = set()
 
+    def test_a_held_back_joint_does_not_trip_the_max_step_check(self) -> None:
+        """A wrist pressed hard (a box held) has its command backed off far
+        toward measured. The next command, still at the target, is a small
+        step from the caller's previous one and must be accepted: measured
+        against the backed-off command it read as a jump past max_step_rad,
+        was dropped, and so was every command after it (the arm froze)."""
+        measured = np.zeros(8, np.float32)
+        arm, sent = self._arm_at(measured)
+        arm.motors[Joint.GRIPPER]._position = 0.0  # a full feedback read
+        arm.set_spring_caps({Joint.WRIST_3: 5.0})
+        kp = arm._arm_config.wrist_3.kp
+        target = measured.copy()
+        target[6] = 1.3  # wrist_3 held 1.3 rad short of its target
+        self.assertGreater(kp * 1.3, 5.0)  # far past the cap
+        arm._last_q_commanded = target.copy()
+        asyncio.run(arm.motion_control(target))
+        backed_off = sent[-1][6][0]
+        self.assertLess(abs(backed_off), 1.3 - arm._config.max_step_rad)
+        target[6] = 1.31  # the next tick, the target barely moves
+        asyncio.run(arm.motion_control(target))
+        self.assertEqual(len(sent), 2)  # sent, not dropped
+        # A real jump in the caller's own commands is still refused.
+        target[6] = 1.31 + 2.0 * arm._config.max_step_rad
+        asyncio.run(arm.motion_control(target))
+        self.assertEqual(len(sent), 2)
+
     def test_robot_level_setter_reaches_both_arms(self) -> None:
         self.robot.set_spring_caps({Joint.SHOULDER_2: 3.0})
         self.assertEqual(self.robot.left.spring_caps, {Joint.SHOULDER_2: 3.0})
@@ -310,8 +341,8 @@ class WireTest(unittest.TestCase):
         from almond_axol.rt.robot import Axol
 
         # Proto 17 brought the 10-float target slot with the tau_cap field
-        # (18, 19 and 20 keep the layout).
-        self.assertEqual(CONFIG_PROTO, 20)
+        # (18 to 21 keep the layout).
+        self.assertEqual(CONFIG_PROTO, 21)
         for cls, robot in (
             (
                 Axol,

@@ -1225,7 +1225,11 @@ class AxolVRTeleop(Teleoperator):
                 self._q_out = out
             q = self._q_out
         if out is not None:
-            self._core.maybe_broadcast_joints(out, self.measured_robot)
+            self._core.maybe_broadcast_joints(
+                out,
+                self.measured_robot,
+                lift=self._jelly.lift_raised if self._jelly is not None else None,
+            )
             self._core.maybe_broadcast_haptics(self.measured_robot)
         # The core's output layout is fixed at (16,): left arm at [0:8], right
         # at [8:16], grips in slots 7/15. On the gripperless SKU the shorter
@@ -1386,11 +1390,13 @@ class AxolVRTeleop(Teleoperator):
         if self._jelly is not None:
             # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
             # force a stop so the base doesn't creep during return-to-rest (or
-            # park). Box mode leaves Jelly its sticks: its grip width is on the
-            # right stick's forward/back, which Jelly doesn't read, and a held
-            # click still runs the lift.
+            # park). Outside box mode the right stick's forward/back runs the
+            # lift; box mode takes it for the grip width, so there a held
+            # click runs the lift instead.
             self._jelly.apply_vr_frame(
-                sticks, resetting=self._core.is_resetting or self._core.is_parking
+                sticks,
+                resetting=self._core.is_resetting or self._core.is_parking,
+                box_mode=self._core.box_mode,
             )
 
         # Episode state transitions. Latch writes take _event_lock so they

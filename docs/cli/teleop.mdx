@@ -43,7 +43,7 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed` or the stick response curve `--jelly.stick_expo`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
 | `--axol.left_stiffness S` | Left arm stiffness, from `0` (fully hand-guidable) to `1` (default, the tuned production gains). A scalar (`0.8`) or one value per joint (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`). See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
-| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5). Use `right` for the right gripper. |
+| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5, at most 5). Use `right` for the right gripper. |
 | `--axol.gripper TYPE` | Fitted gripper: `parallel` (default, the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Control panel: **Gripper** on the Robot tab. |
 | `--axol.<side>.<joint>.<gain> VALUE` | Override a per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left` or `right`, `<joint>` is `shoulder_1` to `wrist_3`, and `<gain>` is `kp`, `kd` and so on. |
 | `--teleop.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand, which helps cover the arm's full reach. |
@@ -57,7 +57,7 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--teleop.haptics BOOL` | Vibrate each engaged arm's controller when the arm pushes on something (default: `true`). See [Controller haptics](/operations/teleop#controller-haptics). |
 | `--teleop.haptic_near BOOL` | Also tick the controller as its arm gets close to Axol's body (default: `false`). |
 | `--teleop.haptic_torque FLOAT` | Unexpected joint torque (Nm) at which a controller starts to rumble (default: `6.0`). `0` turns the push vibration off. |
-| `--teleop.haptic_held_load BOOL` | Keep the weight of a held object, and the squeeze in box mode, from making the controller rumble (default: `true`). |
+| `--teleop.haptic_held_load BOOL` | Keep the weight of a held object from making the controller rumble (default: `true`). The squeeze in box mode still rumbles. |
 | `--teleop.park_to_zero BOOL` | On **Stop** or `Ctrl+C`, move the arms from rest on to the all-zero pose before releasing the motors (default: `true`). See [Stopping parks the arms](/operations/teleop). |
 | `--teleop.reengage {clutch,ramp}` | What an arm does when you [re-engage](/guides/vr-interface#re-engaging) it (default: `clutch`). See [Engaging](#engaging). |
 | `--teleop.box_mode BOOL` | Start in [box mode](/guides/vr-interface#box-mode) (default: `false`). Parcel gripper only. See [Box mode settings](#box-mode-settings). |
@@ -151,7 +151,10 @@ To switch box mode on or off during a session, press the headset's **Box** butto
 | `--teleop.box_width_speed` | How fast the right thumbstick changes the width (default: `0.08` m/s). |
 | `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0` / `0.70` m). The gripper bodies raise the minimum where needed. The parcel gripper's faces can close all the way together. |
 | `--teleop.box_align_duration` | Time to blend into the pair when box mode engages (default: `1.5` s). |
-| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `30`). Live control: **Elbows out**. |
+| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `0`, tucked beside the body). Live control: **Elbows out**. |
+| `--teleop.box_stow_height` | How far below the shoulders **A** stows the box, in meters (default: `0.15`). |
+| `--teleop.box_stow_reach` | Closest the stow brings the box to the shoulders, in meters forward of them (default: `0.15`). The arms stop further out if they can't reach that close. |
+| `--teleop.box_stow_speed` | How fast the stow moves the box, in m/s (default: `0.12`). |
 | `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and **Elbows out** does nothing. |
 | `--teleop.box_squeeze_lean` | Lean each gripper into the box as you squeeze, so the face presses evenly from root to tip (default: `1`; `0` is off). Live control: **Squeeze lean**. |
 | `--teleop.box_squeeze_trim` | Largest extra inward turn, in degrees, added while squeezing to square each face to the box (default: `5`; `0` is off). Live control: **Squeeze trim**. |
@@ -177,7 +180,7 @@ The video runs in a separate process, so it doesn't slow the control loop. [`axo
 
 ## Jelly
 
-When Axol is on **Jelly** (an omni-wheel base with a telescoping lift), you can drive it from the headset thumbsticks. The left stick moves, the right stick turns, and the stick clicks run the lift. For the full controls see the [VR interface guide](/guides/vr-interface#jelly).
+When Axol is on **Jelly** (an omni-wheel base with a telescoping lift), you can drive it from the headset thumbsticks. The left stick moves. The right stick turns left and right, and runs the lift forward and back. For the full controls see the [VR interface guide](/guides/vr-interface#jelly).
 
 Teleop finds Jelly from the attached CAN devices:
 

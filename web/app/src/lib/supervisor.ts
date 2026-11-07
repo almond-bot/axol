@@ -424,6 +424,63 @@ export function motorFaultBlockers(
   return lines
 }
 
+/** What keeps a run from using the robot, from the robot link's status. */
+export interface RobotReadiness {
+  /** The "Before you start" lines; empty when nothing is in the way. */
+  blockers: string[]
+  /** The same problem in a few words, for an operation's tile; null when none. */
+  short: string | null
+}
+
+/**
+ * Whether the robot a run drives is there to drive: the link is up on the
+ * right device and its motors answer without faults. The operation's
+ * checklist and its tile both read this, so they always agree.
+ *
+ * `robotFree` runs (sim, arms off) never touch the Axol arms and skip the
+ * Axol checks. A Mantis run always needs its Mantis link.
+ */
+export function robotReadiness({
+  requiresRobot,
+  robotFree,
+  mantis,
+  robot,
+}: {
+  requiresRobot: boolean
+  robotFree: boolean
+  mantis: boolean
+  robot: RobotStatus | null
+}): RobotReadiness {
+  const clear: RobotReadiness = { blockers: [], short: null }
+  if (!requiresRobot) return clear
+  const linked = robot?.state === "connected"
+  const profile = robot?.profile ?? "axol"
+  if (mantis) {
+    if (!linked || profile !== "mantis") {
+      return {
+        blockers: [linked ? "Connect Mantis instead of Axol" : "Connect Mantis"],
+        short: "Connect Mantis",
+      }
+    }
+  } else {
+    if (robotFree) return clear
+    if (!linked || profile !== "axol") {
+      return {
+        blockers: [linked ? "Connect Axol instead of Mantis" : "Connect Axol"],
+        short: "Connect Axol",
+      }
+    }
+  }
+  const device = mantis ? "Mantis" : "Axol"
+  const faults = robot?.faults ?? []
+  const motors = robot?.motors ?? []
+  const blockers = motorFaultBlockers(faults, motors, device)
+  if (blockers.length === 0) return clear
+  const allDown =
+    motors.length > 0 && faults.filter((f) => f.problem === "unreachable").length === motors.length
+  return { blockers, short: allDown ? `Turn on ${device}` : "Check the motors" }
+}
+
 export async function fetchRobotStatus(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/status")))
 }
@@ -943,8 +1000,32 @@ export async function startOperation(
   )
 }
 
-export async function stopOperation(): Promise<SessionInfo> {
-  return json(await fetch(apiUrl("/api/op/stop"), { method: "POST" }))
+/** What a teleop Stop does with the arms: park them, or leave them holding. */
+export type StopArms = "rest" | "hold"
+
+export async function stopOperation(arms?: StopArms): Promise<SessionInfo> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      ...(arms
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ arms }) }
+        : {}),
+    })
+  )
+}
+
+/**
+ * Stop, unless teleop's arms are away from rest: then nothing stops and the
+ * answer is `{ needsChoice: true }`, so the panel can ask what the arms do.
+ */
+export async function stopOperationOrAsk(): Promise<SessionInfo | { needsChoice: true }> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ arms: "ask" }),
+    })
+  )
 }
 
 /**

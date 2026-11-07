@@ -39,6 +39,8 @@ export function useAxolJoints(
           l_grip: typeof v.l_grip === "number" ? v.l_grip : 1,
           r_grip: typeof v.r_grip === "number" ? v.r_grip : 1,
           engaged: !!v.engaged,
+          urdf: typeof v.urdf === "string" && v.urdf ? v.urdf : null,
+          lift: typeof v.lift === "number" && Number.isFinite(v.lift) ? v.lift : null,
           pair:
             pair && typeof pair === "object" && typeof pair.width === "number"
               ? {

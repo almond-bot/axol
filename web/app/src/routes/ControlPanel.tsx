@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
 import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -29,7 +38,9 @@ import {
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
+  isRobotFreeRun,
   isSimRun,
+  robotReadiness,
   jellyConnect,
   jellyDisconnect,
   loadLocalHardwareProfile,
@@ -48,6 +59,7 @@ import {
   startOperation,
   startUpdate,
   stopOperation,
+  stopOperationOrAsk,
   usbConnect,
   useSessionLogs,
   type CameraDevice,
@@ -134,6 +146,7 @@ import {
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { useStartupView } from "@/lib/operation-progress"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
+import { StopArmsDialog, type StopArmsChoice } from "@/components/stop-arms-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { MountChooser, MountRequired } from "@/components/settings/mount-required"
 import {
@@ -182,6 +195,9 @@ function parseControlPath(pathname: string): { view: ControlView | null; rest: s
 }
 
 const SIM_ROBOT_KEY = "axolSimRobot"
+
+// Jog's 3D view and controls, loaded only when Jog is open.
+const JogWorkspace = lazy(() => import("@/components/jog/jog-workspace"))
 
 /** How long to wait before asking a host that failed to send its settings again. */
 const SETTINGS_RETRY_MS = 3000
@@ -364,6 +380,8 @@ export default function ControlPanel() {
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
+  // Teleop's Stop asks what the arms do when they are away from rest.
+  const [stopChoiceOpen, setStopChoiceOpen] = useState(false)
   // The settings tab lives in the URL (/control/settings/<tab>) so it can be
   // linked and survives a reload; the last one seen reopens from the sidebar.
   const urlSettingsTab = view === "settings" ? pathRest : null
@@ -1951,14 +1969,56 @@ export default function ControlPanel() {
   async function handleStop() {
     const generation = connectionGenerationRef.current
     setBusy(true)
+    try {
+      // Teleop with the arms away from rest stops nothing yet: the operator
+      // picks what the arms do first (StopArmsDialog).
+      const stopped = await stopOperationOrAsk()
+      if (generation !== connectionGenerationRef.current) return
+      if ("needsChoice" in stopped) {
+        setStopChoiceOpen(true)
+        return
+      }
+      setSession(stopped)
+    } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
+      toast.error(String(e))
+    } finally {
+      if (generation === connectionGenerationRef.current) setBusy(false)
+    }
+  }
+
+  // Stop teleop the way the operator chose. Gravity comp leaves the motors
+  // holding, waits for teleop to exit, then starts gravity compensation, so
+  // the arms are never unpowered in between.
+  async function handleStopChoice(choice: StopArmsChoice) {
+    const generation = connectionGenerationRef.current
+    setStopChoiceOpen(false)
+    setBusy(true)
     // Reflect "Stopping…" immediately — the server stop returns right away and
-    // teardown runs in the background, so don't wait for the response/next poll
-    // to flip the button.
+    // teardown runs in the background.
     setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
-      const stopped = await stopOperation()
+      const stopped = await stopOperation(choice === "rest" ? "rest" : "hold")
       if (generation !== connectionGenerationRef.current) return
       setSession(stopped)
+      if (choice !== "gravity") return
+      const deadline = Date.now() + 60_000
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (generation !== connectionGenerationRef.current) return
+        const op = await fetchOpStatus()
+        if (generation !== connectionGenerationRef.current) return
+        if (op.session) setSession(op.session)
+        if (!op.running) break
+        if (Date.now() > deadline) {
+          toast.error("Teleop is still stopping. Start Gravity compensation when it ends.")
+          return
+        }
+      }
+      const started = await startOperation("gravity-comp", {})
+      if (generation !== connectionGenerationRef.current) return
+      setSession(started)
+      setPolicy(null)
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
@@ -2129,7 +2189,8 @@ export default function ControlPanel() {
         <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
           <p>
             The robot is locked because the last operation could not confirm that the motors are
-            off. Cut motor power with the E-Stop, then press Re-check motors.
+            off. Press the E-Stop, then release it. The robot unlocks on its own once the motors
+            read off.
           </p>
           <Button
             variant="outline"
@@ -2190,6 +2251,23 @@ export default function ControlPanel() {
     mantis: hardwareProfile === "mantis",
   }).map((entry) => {
     const hostMeta = operations.find((o) => o.id === entry.id) ?? null
+    // The same robot check as the operation's checklist, for its next run:
+    // a sim or arms-off run doesn't need Axol.
+    const opMantis = Boolean(hostMeta?.supportsMantis) && hardwareProfile === "mantis"
+    const robotProblem = hostMeta
+      ? robotReadiness({
+          requiresRobot: hostMeta.requiresRobot,
+          robotFree:
+            opMantis ||
+            isRobotFreeRun(
+              hostMeta,
+              settingsByOp[entry.id] ?? loadOpSettings(entry.id),
+              settingsSnap?.values ?? null
+            ),
+          mantis: opMantis,
+          robot,
+        }).short
+      : null
     return {
       entry,
       status: operationStatus({
@@ -2201,6 +2279,7 @@ export default function ControlPanel() {
         otherRunning: isLive && runningOp !== entry.id,
         needsMount,
         hasCameras: selectedHasCamera,
+        robotProblem,
       }),
     }
   })
@@ -2407,10 +2486,17 @@ export default function ControlPanel() {
       <AppShell
         title={page[view].title}
         back={routeOp ? "/control/operations" : undefined}
+        wide={routeOp === "jog"}
         description={page[view].description}
         actions={runningChip}
         notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
         badges={badges}
+        navTargets={
+          // While an operation runs, Operations opens it instead of the list.
+          isLive && runningOp
+            ? { "/control/operations": `/control/operations/${encodeURIComponent(runningOp)}` }
+            : undefined
+        }
         host={host}
       >
         {view === "overview" && (
@@ -2553,6 +2639,36 @@ export default function ControlPanel() {
               onStart={handleStart}
               onStop={handleStop}
               onEpisode={handleEpisode}
+              workspace={
+                opId === "jog" ? (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center gap-2 py-16 text-sm text-white/45">
+                        <Loader2 className="size-4 animate-spin" /> Loading Jog…
+                      </div>
+                    }
+                  >
+                    <JogWorkspace
+                      session={selectedLive ? effectiveStatus : null}
+                      sim={
+                        selectedLive
+                          ? String(effectiveStatus?.args?.sim) === "true"
+                          : isSimRun(meta, settings)
+                      }
+                      simRobot={simRobot}
+                      hostRobot={
+                        settingsSnap
+                          ? {
+                              model: settingsSnap.robotModel ?? "classic",
+                              gripper: parseGripper(settingsSnap.values["axol.gripper"]),
+                            }
+                          : null
+                      }
+                      video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
+                    />
+                  </Suspense>
+                ) : undefined
+              }
             />
 
             {lines.length > 0 && (
@@ -2698,6 +2814,13 @@ export default function ControlPanel() {
           </>
         )}
       </AppShell>
+
+      <StopArmsDialog
+        open={stopChoiceOpen}
+        busy={busy}
+        onChoose={(choice) => void handleStopChoice(choice)}
+        onCancel={() => setStopChoiceOpen(false)}
+      />
 
       <SetupDialog
         open={setupOpen}

@@ -811,6 +811,29 @@ _SOLVE_IK = ExportedJit(
 _SAFE_STEP = ExportedJit(_base_collision_safe_step, "safe_step")
 _COLLISION_DISTANCE = jax.jit(body_collision_distance)
 
+
+@jax.jit
+def _arm_shift_jacobian(
+    robot: pk.Robot,
+    robot_coll: ArmBodyCollision,
+    cfg: jax.Array,
+    link_shift: jax.Array,
+    arm_links: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Each pair's signed distance at ``cfg`` and its derivative with respect
+    to moving each arm as a rigid whole (``(num_pairs,)`` and
+    ``(num_pairs, 2, 3)``): ``arm_links`` is ``(2, num_links)``, 1 on the
+    links of the left and the right arm. The derivative of a pair is the
+    direction (torso frame) that takes that arm out of it."""
+
+    def distances(move: jax.Array) -> jax.Array:
+        shift = link_shift.at[:, :3].add(arm_links.T @ move)
+        return body_collision_distance(robot, robot_coll, cfg, shift)
+
+    zero = jnp.zeros((2, 3), dtype=cfg.dtype)
+    return distances(zero), jax.jacfwd(distances)(zero)
+
+
 # How far outside a pair's soft-cost activation the proximity cue starts
 # (see KinematicsSolver.collision_proximity). Capped per pair at its home
 # clearance, so a pose as clear as home never reads as near.
@@ -818,6 +841,11 @@ _PROXIMITY_LEAD = 0.02
 # Narrowest distance (m) over which a pair's proximity cue rises from 0 to 1
 # (see KinematicsSolver.set_proximity_reference).
 _PROXIMITY_SPAN_MIN = 0.01
+# Lift clearance (see lift_clear_step): how far (m) past the soft-cost
+# activation shell an arm is moved, and the most the deck may rise (m) per
+# step of lift_clear_pose's replay of the lift lowering.
+_LIFT_CLEAR_MARGIN = 0.003
+_LIFT_REPLAY_STEP = 0.01
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1021,37 @@ class KinematicsSolver:
                 )
                 for side in ("left", "right")
             }
+
+        # Lift contact (see lift_contact): the pairs between an arm and a
+        # body part the lift leaves behind (Jelly's deck, base and lower
+        # stage), and each arm's links.
+        self._lift_pairs = np.zeros(len(starts), dtype=bool)
+        self._lift_pair_side: dict[str, np.ndarray] = {}
+        self._lift_starts = np.asarray(starts, dtype=np.float32)
+        self._arm_links = jnp.zeros((2, len(self.robot.links.names)), jnp.float32)
+        if self.robot_coll is not None and self._lift_travel > 0.0:
+            moves = np.abs(np.asarray(self._lift_shift)).max(axis=1) > 1e-6
+            link_names = self.robot_coll.link_names
+            idx_i = np.asarray(self.robot_coll.active_idx_i)
+            idx_j = np.asarray(self.robot_coll.active_idx_j)
+            self._lift_pairs = moves[idx_i] | moves[idx_j]
+            for side in ("left", "right"):
+                on_side = np.array(
+                    [
+                        link_names[int(i)].startswith(f"{side}_")
+                        or link_names[int(j)].startswith(f"{side}_")
+                        for i, j in zip(idx_i, idx_j)
+                    ],
+                    dtype=bool,
+                )
+                self._lift_pair_side[side] = self._lift_pairs & on_side
+            self._arm_links = jnp.asarray(
+                [
+                    [n.startswith(f"{side}_") for n in self.robot.links.names]
+                    for side in ("left", "right")
+                ],
+                dtype=jnp.float32,
+            )
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -1374,6 +1433,7 @@ class KinematicsSolver:
         delta_scale: float = 1.0,
         elbow_weight: float | None = None,
         pose_weight_scale: tuple[float, float] = (1.0, 1.0),
+        posture_weight: float | None = None,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -1413,6 +1473,10 @@ class KinematicsSolver:
                 The other costs (manipulability, an elbow hint) settle where
                 they balance a small pose error; a caller that needs the
                 pose held to a fraction of a degree raises these.
+            posture_weight: Per-call weight on the posture attractor
+                (:meth:`set_posture_pose`), replacing
+                ``config.posture_weight`` for this solve. Box mode's stow
+                raises it to pull the arms into a planned pose.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -1497,7 +1561,7 @@ class KinematicsSolver:
             cfg.pos_weight * float(pose_weight_scale[0]),
             cfg.ori_weight * float(pose_weight_scale[1]),
             cfg.rest_weight,
-            cfg.posture_weight,
+            cfg.posture_weight if posture_weight is None else float(posture_weight),
             cfg.manipulability_weight,
             cfg.limit_weight,
             self._collision_starts,
@@ -1628,6 +1692,152 @@ class KinematicsSolver:
             for side, mask in self._proximity_side.items()
         }
 
+    @property
+    def has_lift_contact(self) -> bool:
+        """Whether :meth:`lift_contact` can report anything: a version with
+        a lift (the mobile Axol) and collision detection on."""
+        return bool(self._lift_pairs.any())
+
+    def lift_contact(self, q: np.ndarray) -> dict[str, tuple[float, np.ndarray]]:
+        """How far each arm is inside the parts the lift leaves behind.
+
+        Those parts are Jelly's deck, base and lower lift stage, placed by
+        the live lift height (:meth:`set_lift`). For each arm with a pair
+        inside its soft-cost activation shell at ``q``: ``(depth, normal)``,
+        the worst pair's depth inside the shell (m, positive) and the unit
+        direction (world frame) that moves the whole arm out of it, up for
+        the deck's top. Arms clear of them are left out, and so is
+        everything on a version without a lift or with collision
+        detection off.
+        """
+        if not self.has_lift_contact:
+            return {}
+        d, jac = _arm_shift_jacobian(
+            self.robot,
+            self.robot_coll,
+            jnp.asarray(self.to_pyroki_order(q), dtype=jnp.float32),
+            self._link_shift,
+            self._arm_links,
+        )
+        depth = self._lift_starts - np.asarray(d)
+        jac = np.asarray(jac)
+        out: dict[str, tuple[float, np.ndarray]] = {}
+        for k, side in enumerate(("left", "right")):
+            mask = self._lift_pair_side.get(side)
+            if mask is None or not mask.any():
+                continue
+            pairs = np.flatnonzero(mask)
+            worst = int(pairs[np.argmax(depth[pairs])])
+            if depth[worst] <= 0.0:
+                continue
+            normal = jac[worst, k].astype(np.float64)
+            norm = float(np.linalg.norm(normal))
+            if norm < 1e-6:
+                continue
+            out[side] = (float(depth[worst]), (normal / norm).astype(np.float32))
+        return out
+
+    def lift_clear_step(
+        self,
+        q: np.ndarray,
+        *,
+        max_step: float | None = None,
+        sides: tuple[str, ...] = ("left", "right"),
+        contact: dict[str, tuple[float, np.ndarray]] | None = None,
+    ) -> np.ndarray | None:
+        """One IK step that moves each arm in :meth:`lift_contact` out of it.
+
+        Each of ``sides`` in contact gets its gripper target moved out along
+        the contact normal (keeping its orientation) by its depth plus a few
+        millimetres, at most ``max_step`` (m); the other arm keeps its joints.
+        The arm reshapes as the solve finds best: with the posture
+        attractor at rest, hands hanging over the deck come up and forward
+        as it rises. ``contact`` is
+        :meth:`lift_contact` at ``q`` if the caller already has it. Returns
+        ``None`` when no arm of ``sides`` is in contact.
+        """
+        if contact is None:
+            contact = self.lift_contact(q)
+        moving = [side for side in sides if side in contact]
+        if not moving:
+            return None
+        left, right = self.fk(q)
+        poses = {"left": left, "right": right}
+        for side in moving:
+            depth, normal = contact[side]
+            step = depth + _LIFT_CLEAR_MARGIN
+            if max_step is not None:
+                step = min(step, max_step)
+            pos, rot = poses[side]
+            poses[side] = ((pos + normal * step).astype(np.float32), rot)
+        q_new = np.asarray(
+            self.ik(q, left_pose=poses["left"], right_pose=poses["right"]),
+            dtype=np.float32,
+        ).copy()
+        q = np.asarray(q, dtype=np.float32)
+        before = {"left": left[0], "right": right[0]}
+        after = dict(zip(("left", "right"), (pose[0] for pose in self.fk(q_new))))
+        for side, indices in (
+            ("left", self.left_indices),
+            ("right", self.right_indices),
+        ):
+            if side not in moving:
+                q_new[indices] = q[indices]
+                continue
+            # The collision cost adds its own push to the target's: keep the
+            # gripper's actual move within max_step.
+            travel = float(
+                np.linalg.norm(np.asarray(after[side]) - np.asarray(before[side]))
+            )
+            if max_step is not None and travel > max_step > 0.0:
+                q_new[indices] = q[indices] + (q_new[indices] - q[indices]) * (
+                    max_step / travel
+                )
+        return q_new
+
+    def lift_clear_pose(self, q: np.ndarray, iterations: int = 3) -> np.ndarray:
+        """``q`` moved clear of the parts the lift leaves behind, at the live
+        lift height.
+
+        Replays the lift lowering from fully raised to the live height in
+        small steps with :meth:`lift_clear_step` at each, so the arms end
+        where they would have been pushed had they held ``q`` while it
+        lowered. From deep inside the deck the way out is ambiguous; from
+        fully raised it never is. For the return-to-rest goal on the mobile
+        Axol. ``q`` itself when nothing is in contact at the live height.
+        The solver's posture attractor and step history are restored.
+        Takes about a second with the lift fully lowered.
+        """
+        q = np.asarray(q, dtype=np.float32)
+        if not self.lift_contact(q):
+            return q
+        lowered = self._lift_lowered
+        posture = self._posture_pose
+        q_prev = self._q_prev
+        guard = self._base_collision_guard_active
+        rise = float(np.max(np.abs(self._lift_shift))) * lowered
+        steps = max(1, int(np.ceil(rise / _LIFT_REPLAY_STEP)))
+        try:
+            # Held at q, the posture attractor keeps the upper arms down: the
+            # forearms come up and forward over the deck.
+            self.set_posture_pose(q)
+            for k in range(1, steps + 1):
+                self._lift_lowered = lowered * k / steps
+                self._link_shift = self._make_link_shift()
+                # Settle at the live height until the arms are clear.
+                for _ in range(iterations if k < steps else 10 * iterations):
+                    q_next = self.lift_clear_step(q)
+                    if q_next is None:
+                        break
+                    q = q_next
+        finally:
+            self._lift_lowered = lowered
+            self._link_shift = self._make_link_shift()
+            self._posture_pose = posture
+            self._q_prev = q_prev
+            self._base_collision_guard_active = guard
+        return q
+
     def _elbow_fade(
         self, ee_target: np.ndarray | None, shoulder_pos: np.ndarray
     ) -> float:
@@ -1674,4 +1884,6 @@ class KinematicsSolver:
             self.ik(**kwargs)
         # The haptic proximity check runs beside every teleop solve.
         self.collision_proximity(dummy_q)
+        # So does the lift contact check, on the mobile Axol.
+        self.lift_contact(dummy_q)
         _logger.info("IK solver ready.")

@@ -22,11 +22,16 @@ tool (the parallel or the parcel gripper, whatever its fingers carry):
 The residual is linear in those parameters (:func:`load_regressor`). Each
 sample is fit on its own first: when the fit explains the residual (a load
 like a held object or the squeeze, see :func:`plausible`), that fit is the
-held load right away, so lifting an object or tightening the squeeze stays
-quiet, and the sample also refines a slow estimate (an exponentially
-forgetting least-squares fit). When it doesn't — a push sideways or up from
-below, which no held weight produces — the slow estimate stands in, so the
-cue still feels the contact on top of what the gripper holds.
+held load right away, so lifting an object stays quiet, and the sample also
+refines a slow estimate (an exponentially forgetting least-squares fit).
+When it doesn't — a push sideways or up from below, which no held weight
+produces — the slow estimate stands in, so the cue still feels the contact
+on top of what the gripper holds.
+
+Only the weight is explained away. The squeeze is fit so that it doesn't
+leak into the weight estimate, then left in the residual: closing box mode's
+grip width onto a box is the arms pushing, and the cue reports it, rising as
+the clamp tightens.
 """
 
 from __future__ import annotations
@@ -63,6 +68,9 @@ _SQUEEZE_CONE = math.radians(50.0)
 _SQUEEZE_SLACK_N = 2.0
 # Largest squeeze (N) counted as a held load.
 _MAX_SQUEEZE_N = 80.0
+# Parameters of the held weight (``m`` and ``p``): the leading columns of
+# load_regressor, the part of the fit explain() takes out of the residual.
+_WEIGHT_PARAMS = 4
 # Ridge on the slow estimate's normal equations, relative to their scale:
 # keeps the unobservable part of ``p`` (along gravity) at zero.
 _RIDGE = 1e-6
@@ -124,14 +132,15 @@ class HeldLoad:
     def explain(
         self, a: np.ndarray, residual: np.ndarray, *, tol: float, learn: float
     ) -> np.ndarray:
-        """The part of ``residual`` (``(7,)``, Nm) the held load accounts for.
+        """The part of ``residual`` (``(7,)``, Nm) the held weight accounts for.
 
         ``a`` is :func:`load_regressor` at the current pose. A sample whose
         own fit leaves no joint more than ``tol`` (Nm) unexplained and is
         :func:`plausible` is the held load as it is; it also refines the slow
         estimate with weight ``learn`` (0 to 1: pass 0 while the arm moves
         fast and its dynamics would bias it). Any other sample gets the slow
-        estimate.
+        estimate. With ``squeeze`` the squeeze is part of the fit but not of
+        the result: only the weight is returned (see the module docstring).
         """
         theta, *_ = np.linalg.lstsq(a, residual, rcond=None)
         fit = a @ theta
@@ -143,7 +152,7 @@ class HeldLoad:
                 self.theta = np.linalg.solve(
                     self._ata + ridge * np.eye(self._ata.shape[0]), self._atr
                 )
-            return fit
+            return a[:, :_WEIGHT_PARAMS] @ theta[:_WEIGHT_PARAMS]
         if self.theta is None:
             return np.zeros_like(residual)
-        return a @ self.theta
+        return a[:, :_WEIGHT_PARAMS] @ self.theta[:_WEIGHT_PARAMS]

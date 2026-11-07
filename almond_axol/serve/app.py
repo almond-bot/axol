@@ -74,6 +74,9 @@ _logger = logging.getLogger(__name__)
 # Grace between acknowledging a host shutdown/restart and running it, so the
 # response reaches the panel before the server goes down with the host.
 _HOST_POWER_DELAY_S = 0.5
+# Least time (s) between automatic re-checks of a hardware-cleanup lockout,
+# run while the control panel polls /api/op/status.
+_LOCKOUT_RECHECK_S = 3.0
 
 
 class RunRequest(BaseModel):
@@ -124,6 +127,16 @@ class OpStartRequest(BaseModel):
     cameras: dict[str, Any] | None = None
 
 
+class JogPlanRequest(BaseModel):
+    arm: Literal["left", "right"]
+    position: list[float]
+    quaternion: list[float]
+
+
+class JogExecuteRequest(BaseModel):
+    id: int
+
+
 class RobotConnectRequest(BaseModel):
     """Optional CAN interface selection for a robot-link connect.
 
@@ -171,6 +184,18 @@ class SettingsUpdateRequest(BaseModel):
     # Pre-v2 panels kept the Advanced tree in its own map; still accepted and
     # merged into ``values`` under the canonical keys.
     advanced: dict[str, Any] | None = None
+
+
+class OpStopRequest(BaseModel):
+    """What a Stop does with the arms (teleop only).
+
+    ``ask``: when the arms are away from rest, stop nothing and answer
+    ``{"needsChoice": true}`` so the panel can ask the operator; otherwise
+    stop with the default park. ``rest`` parks the arms, ``hold`` leaves the
+    motors holding the arms where they are. Omitted: the default park.
+    """
+
+    arms: Literal["ask", "rest", "hold"] | None = None
 
 
 class EpisodeRequest(BaseModel):
@@ -2975,6 +3000,186 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         )
         return {"episode": summary}
 
+    # -- jogging (the Jog page drives the running ``jog`` operation) ---------
+
+    def _jog_session() -> Any:
+        from ..jog.session import active_session
+
+        return active_session()
+
+    def _jog_not_running() -> JSONResponse:
+        return JSONResponse(
+            {"error": "Jogging is not running. Start it from the Jog page."},
+            status_code=409,
+        )
+
+    @app.get("/api/jog/state")
+    async def jog_state() -> dict[str, Any]:
+        session = _jog_session()
+        return {"running": session is not None, **(session.state() if session else {})}
+
+    @app.post("/api/jog/plan", response_model=None)
+    async def jog_plan(req: JogPlanRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(
+                session.plan, req.arm, req.position, req.quaternion
+            )
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/execute", response_model=None)
+    async def jog_execute(req: JogExecuteRequest) -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return session.execute(req.id)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/rest", response_model=None)
+    async def jog_rest() -> dict[str, Any] | JSONResponse:
+        from ..jog.session import JogError
+
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        try:
+            return await asyncio.to_thread(session.go_to_rest)
+        except JogError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
+    @app.post("/api/jog/cancel", response_model=None)
+    async def jog_cancel() -> dict[str, Any] | JSONResponse:
+        session = _jog_session()
+        if session is None:
+            return _jog_not_running()
+        return {"stopped": session.cancel()}
+
+    @app.websocket("/api/jog/ws")
+    async def jog_ws(ws: WebSocket) -> None:
+        """Hold commands and previews in, jog state out.
+
+        The page sends ``{"type": "hold", "drive": [vx, vy, wz], "lift": d,
+        "arms": {"left": [x, y, z, roll, pitch, yaw]}, "armFrame": "torso",
+        "armSpeed": s}`` every 50 ms while it is connected, zeros included
+        (``arms``, ``armFrame`` and ``armSpeed`` are optional). Silence for
+        longer than the session's hold timeout stops the base, lift and
+        arms, as does closing the socket. State goes out at 20 Hz.
+
+        ``{"type": "preview", "seq": n, "arm": a, "position": p,
+        "quaternion": q}`` asks for the IK preview of a target; the answer
+        comes back as ``{"type": "preview", "seq": n, ...}``. The latest
+        request wins: one still waiting when a newer one arrives is dropped,
+        and a ``seq`` no newer than the last is ignored.
+        """
+        from ..jog.session import JogError
+
+        await ws.accept()
+        last_session: Any = None
+        source = f"ws-{id(ws):x}"
+        preview_wanted = asyncio.Event()
+        preview_request: dict[str, Any] | None = None
+        preview_seq = -math.inf
+
+        async def receive() -> None:
+            nonlocal last_session, preview_request, preview_seq
+            while True:
+                message = await ws.receive_json()
+                session = _jog_session()
+                if session is None or not isinstance(message, dict):
+                    continue
+                last_session = session
+                if message.get("type") == "hold":
+                    drive = message.get("drive") or [0.0, 0.0, 0.0]
+                    try:
+                        if not isinstance(drive, list) or len(drive) != 3:
+                            raise JogError("drive must be [vx, vy, wz]")
+                        session.hold(
+                            *drive,
+                            message.get("lift", 0),
+                            source=source,
+                            arms=message.get("arms"),
+                            frame=message.get("armFrame", "torso"),
+                            speed=message.get("armSpeed", 1.0),
+                        )
+                    except (JogError, TypeError) as exc:
+                        await ws.send_json({"type": "error", "error": str(exc)})
+                elif message.get("type") == "release":
+                    session.release(source)
+                elif message.get("type") == "preview":
+                    seq = message.get("seq")
+                    if (
+                        not isinstance(seq, (int, float))
+                        or isinstance(seq, bool)
+                        or not math.isfinite(seq)
+                        or seq <= preview_seq
+                    ):
+                        continue
+                    preview_seq = seq
+                    preview_request = message
+                    preview_wanted.set()
+
+        async def preview() -> None:
+            nonlocal preview_request
+            while True:
+                await preview_wanted.wait()
+                preview_wanted.clear()
+                request, preview_request = preview_request, None
+                session = _jog_session()
+                if request is None or session is None:
+                    continue
+                reply: dict[str, Any] = {"type": "preview", "seq": request["seq"]}
+                try:
+                    reply.update(
+                        await asyncio.to_thread(
+                            session.preview,
+                            request.get("arm"),
+                            request.get("position") or [],
+                            request.get("quaternion") or [],
+                        )
+                    )
+                except (JogError, TypeError) as exc:
+                    reply["error"] = str(exc)
+                except Exception:  # noqa: BLE001 - keep the socket's holds alive
+                    _logger.exception("jog: preview failed")
+                    reply["error"] = "The preview failed. Try moving the target again."
+                await ws.send_json(reply)
+
+        async def send() -> None:
+            while True:
+                session = _jog_session()
+                state = session.state() if session else {}
+                await ws.send_json(
+                    {"type": "state", "running": session is not None, **state}
+                )
+                await asyncio.sleep(0.05)
+
+        tasks = [
+            asyncio.create_task(receive()),
+            asyncio.create_task(send()),
+            asyncio.create_task(preview()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(BaseException):
+                    await task
+            # The page is gone: if it was driving, the base and lift stop now.
+            session = _jog_session()
+            for candidate in {id(s): s for s in (session, last_session) if s}.values():
+                candidate.disconnect(source)
+
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 
     @app.get("/api/urdf/{asset_path:path}", response_model=None)
@@ -3026,8 +3231,56 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- in-process operations (teleop / gravity / collect / policy) --------
 
+    # The hardware-cleanup lockout clears itself once the motors can be
+    # proven torque-free (the same probe as Re-check motors), checked at most
+    # every _LOCKOUT_RECHECK_S while the control panel polls the status: the
+    # operator only has to restore power after the E-Stop.
+    lockout_recheck = {"t": 0.0, "task": None}
+
+    async def _clear_lockout() -> str | None:
+        """Lift the lockout if the motors read torque-free: the refusal, else None.
+
+        The caller holds ``session_launch_reservation``.
+        """
+        if not runner.hardware_cleanup_lockout():
+            return "no hardware cleanup lockout is active"
+        if runner.is_running(ignore_cleanup_lockout=True):
+            return "An operation is still running. Stop it first."
+        refusal = await asyncio.to_thread(
+            prove_motors_torque_free, robot, runner.lockout_power_lost()
+        )
+        if refusal is not None:
+            return f"{refusal}; the lockout stands"
+        runner.clear_hardware_cleanup_lockout()
+        # The failed run borrowed the Jelly buses too and the lockout kept
+        # them ``busy``; with it lifted, hand them back to the idle links.
+        # A device that fails to reopen shows as ``error`` on its tile,
+        # where Connect can retry — the lockout itself is already proven.
+        try:
+            await asyncio.to_thread(jelly.reacquire)
+        except Exception as exc:  # noqa: BLE001 - devices left in error state
+            _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
+        return None
+
+    async def _auto_recheck_lockout() -> None:
+        if session_launch_reservation.locked():
+            return
+        async with session_launch_reservation:
+            if runner.hardware_cleanup_lockout() and await _clear_lockout() is None:
+                _logger.info("Motors read torque-free; the safety lockout is lifted")
+
     @app.get("/api/op/status")
     async def op_status() -> dict[str, Any]:
+        task = lockout_recheck["task"]
+        if (
+            runner.hardware_cleanup_lockout()
+            and (task is None or task.done())
+            and time.monotonic() - lockout_recheck["t"] >= _LOCKOUT_RECHECK_S
+        ):
+            lockout_recheck["t"] = time.monotonic()
+            lockout_recheck["task"] = asyncio.create_task(
+                _auto_recheck_lockout(), name="lockout-recheck"
+            )
         session = runner.current()
         return {
             "running": runner.is_running(),
@@ -3053,30 +3306,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         back (``busy``) exactly as it was before the probe.
         """
         async with session_launch_reservation:
-            if not runner.hardware_cleanup_lockout():
-                return JSONResponse(
-                    {"error": "no hardware cleanup lockout is active"},
-                    status_code=409,
-                )
-            if runner.is_running(ignore_cleanup_lockout=True):
-                return JSONResponse(
-                    {"error": "An operation is still running. Stop it first."},
-                    status_code=409,
-                )
-            refusal = await asyncio.to_thread(prove_motors_torque_free, robot)
+            refusal = await _clear_lockout()
             if refusal is not None:
-                return JSONResponse(
-                    {"error": f"{refusal}; the lockout stands"}, status_code=409
-                )
-            runner.clear_hardware_cleanup_lockout()
-            # The failed run borrowed the Jelly buses too and the lockout kept
-            # them ``busy``; with it lifted, hand them back to the idle links.
-            # A device that fails to reopen shows as ``error`` on its tile,
-            # where Connect can retry — the lockout itself is already proven.
-            try:
-                await asyncio.to_thread(jelly.reacquire)
-            except Exception as exc:  # noqa: BLE001 - devices left in error state
-                _logger.warning("Jelly reacquire after lockout clear failed: %s", exc)
+                return JSONResponse({"error": refusal}, status_code=409)
             return JSONResponse({"cleared": True})
 
     @app.post("/api/op/start")
@@ -3225,8 +3457,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse(session.to_dict())
 
     @app.post("/api/op/stop")
-    async def op_stop() -> JSONResponse:
-        session = await asyncio.to_thread(runner.stop)
+    async def op_stop(req: OpStopRequest | None = None) -> JSONResponse:
+        arms = req.arms if req is not None else None
+        if arms == "ask":
+            if runner.arms_need_stop_choice():
+                return JSONResponse({"needsChoice": True})
+            arms = None
+        session = await asyncio.to_thread(runner.stop, arms)
         if session is None:
             return JSONResponse({"error": "no operation running"}, status_code=404)
         return JSONResponse(session.to_dict())

@@ -9,7 +9,14 @@ export const F = ({ children }) => <code style={{ whiteSpace: "nowrap" }}>{child
 | <F>--{prefix}max_step_rad</F> | `0.5` | Largest joint move (rad) allowed between two consecutive commands. Bigger moves are dropped with a warning. `inf` disables. |
 | <F>--{prefix}controller</F> | `impedance` | Control law for the arms. `impedance` is compliant and runs at 240 Hz, and `position` hands each joint to its motor's own position loop at 400 Hz (see the notes below). |
 | <F>--{prefix}impedance_hz</F> | `240.0` | Command rate (Hz) of the MyActuator impedance joints: `240.0` or the experimental `480.0`. The gains were tuned at 240 Hz. |
-| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm). |
+| <F>--{prefix}wrist_thermal.enabled</F> | `true` | Lower a wrist's torque while it cools down when `wrist_2` or `wrist_3` gets hot. See the notes below. `false` turns it off. |
+| <F>--{prefix}wrist_thermal.coil_limit_c</F> | `75.0` | Motor coil temperature (°C) at which the wrist's torque starts to come down. The motor turns itself off at 100 °C. |
+| <F>--{prefix}wrist_thermal.coil_resume_c</F> | `65.0` | Coil temperature (°C) the wrist must cool to before its full torque comes back. |
+| <F>--{prefix}wrist_thermal.driver_limit_c</F> | `105.0` | Motor driver temperature (°C) at which the torque starts to come down. The driver turns itself off at 120 °C. |
+| <F>--{prefix}wrist_thermal.driver_resume_c</F> | `95.0` | Driver temperature (°C) the wrist must cool to before its full torque comes back. |
+| <F>--{prefix}wrist_thermal.cool_torque_nm</F> | `1.5` | Torque (Nm) the wrist is held to while it cools. The motor is rated for 3.5 Nm continuous. |
+| <F>--{prefix}wrist_thermal.ramp_s</F> | `0.25` | Seconds over which the torque comes down, and later comes back. |
+| <F>--{prefix}left.gripper.torque_limit</F> | `0.5` | Grip force: peak gripper torque (Nm), at most `5`. |
 | <F>--{prefix}left.gripper.max_speed</F> | `10.0` | Maximum gripper speed (rad/s). |
 | <F>--{prefix}left.elbow.kp</F> | per joint | Position stiffness of one joint at stiffness `1`, in `[0, 500]`. |
 | <F>--{prefix}left.elbow.kd</F> | per joint | Velocity damping in the motor firmware, in `[0, 5]`. |
@@ -64,6 +71,18 @@ Per-arm and per-joint flags are shown for `left` / `elbow`. Swap in `right`, or 
   **Impedance rates.** Impedance joints run at 240 Hz. An arm that mixes impedance joints with firmware-loop joints runs its core at 480 Hz, with each impedance joint on alternate ticks. Any other core rate with an impedance joint on the arm is refused. Under `impedance`, a `wire_mode` you set on a joint is kept.
 
   With `impedance_hz` at `480.0`, or any joint's own `impedance_hz` at `480.0`, the arm's core runs at 480 Hz. The 480 Hz joints are commanded every tick, and the other impedance joints, including the Damiao wrists, on alternate ticks. `tune.motion --impedance-hz 480` and `tune.motion --fast-impedance right.shoulder_1` set these for one run.
+</Accordion>
+
+<Accordion title="Wrist temperature limit">
+  The wrist motors (`wrist_2` and `wrist_3`) are rated for 3.5 Nm continuous. Held harder for long, for example pressing on something or squeezing a box, they heat up until the motor turns itself off and the wrist goes limp. The temperature limit prevents that:
+
+  1. When a wrist's coil reaches `coil_limit_c`, or its driver reaches `driver_limit_c`, its torque comes down to `cool_torque_nm` over `ramp_s`.
+  2. The torque stays low until both have cooled to their resume temperatures. Expect a few minutes.
+  3. Then the full torque comes back over `ramp_s`.
+
+  While a wrist cools it gives way to anything it pushes on, and it still holds the gripper up. The session log shows a warning when its torque comes down, and a second one if it keeps heating. If you see the second, let the arm rest.
+
+  The limit works on wrists running the default `mit` mode. A wrist on `pv` has no limit.
 </Accordion>
 
 <Accordion title="Firmware position loops (a4 and pv)">

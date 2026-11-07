@@ -29,6 +29,7 @@ mod safety;
 mod scan;
 mod serve;
 mod stall;
+mod thermal;
 mod timing;
 mod txn;
 

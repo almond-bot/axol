@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..constants import GRIPPER_MAX_TORQUE
 from ..tracker.trigger import validate_trigger_full_scale
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
@@ -197,6 +198,21 @@ SECTIONS: tuple[Section, ...] = (
 )
 
 _SECTIONS_BY_KEY: dict[str, Section] = {s.key: s for s in SECTIONS}
+
+
+def _validate_gripper_torque(key: str, value: Any) -> float:
+    """Reject a gripper torque limit that isn't a number in (0, max]."""
+    side = "Left" if ".left." in key else "Right"
+    try:
+        torque = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{side} gripper torque limit must be a number.") from None
+    if not 0 < torque <= GRIPPER_MAX_TORQUE:
+        raise ValueError(
+            f"{side} gripper torque limit must be above 0 and at most "
+            f"{GRIPPER_MAX_TORQUE:g} Nm."
+        )
+    return torque
 
 
 @dataclass(frozen=True)
@@ -451,13 +467,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="axol.left.gripper.torque_limit",
                 label="Left gripper torque limit (Nm)",
                 type="number",
-                help="Peak output torque of the left gripper.",
+                help="Peak output torque of the left gripper, up to 5 Nm.",
             ),
             SettingDef(
                 key="axol.right.gripper.torque_limit",
                 label="Right gripper torque limit (Nm)",
                 type="number",
-                help="Peak output torque of the right gripper.",
+                help="Peak output torque of the right gripper, up to 5 Nm.",
             ),
             SettingDef(
                 key="axol.left.gripper.max_speed",
@@ -734,9 +750,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Ignore held weight",
                 type="boolean",
                 help=(
-                    "Keeps the weight of what a gripper holds, and the squeeze on a "
-                    "box in box mode, from making its controller rumble. Pushing on "
-                    "something still rumbles."
+                    "Keeps the weight of what a gripper holds from making its "
+                    "controller rumble. Pushing on something still rumbles, and so "
+                    "does squeezing a box hard in box mode."
                 ),
             ),
             SettingDef(
@@ -798,10 +814,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="select",
                 options=("straight", "flush"),
                 help=(
-                    "The grasp box mode starts in. straight (the default) points the "
-                    "fingers forward and measures the width between the mounts. flush "
-                    "turns each gripper 39° inward about its contact face and measures "
-                    "the width between the faces. In the headset, click either "
+                    "The grasp box mode starts in. straight (the default) holds the "
+                    "box on the front of the fixed blades, in front of the grippers. "
+                    "flush turns each gripper 39° inward. In the headset, tap either "
                     "thumbstick while leading to switch."
                 ),
                 targets={
@@ -815,15 +830,30 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box-mode elbows out (°)",
                 type="number",
                 help=(
-                    "How far out box mode holds the elbows, from 0 (hanging straight "
-                    "down) to 90 (out level). This is the starting value. In the "
-                    "headset, push either thumbstick forward to move the elbows apart "
-                    "or back to bring them in, and the value you end with is saved "
-                    "here."
+                    "How far out box mode holds the elbows: 0 keeps them tucked beside "
+                    "the body, so they go back instead of out when you pull a box in, "
+                    "and 90 holds them out level. "
+                    "This is the starting value. Change it during a session with "
+                    "Elbows out in the headset's session settings."
                 ),
                 targets={
                     "teleop": ("teleop.box_elbow_out",),
                     "collect-data": (f"{_VRT}.box_elbow_out",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_stow_height",
+                ui=_parcel_only(),
+                label="Box-mode stow height (m)",
+                type="number",
+                help=(
+                    "How far below the shoulders the box is held when you press A "
+                    "to stow it. The arms square the box up, bring it in to the "
+                    "chest at this height, then hold it so you can drive."
+                ),
+                targets={
+                    "teleop": ("teleop.box_stow_height",),
+                    "collect-data": (f"{_VRT}.box_stow_height",),
                 },
             ),
             SettingDef(
@@ -1745,6 +1775,8 @@ class SettingsStore:
                         incoming[key] = validate_trigger_full_scale(value)
                     except (TypeError, ValueError) as exc:
                         raise ValueError(f"{key}: {exc}") from exc
+                if key.endswith("gripper.torque_limit") and value is not None:
+                    incoming[key] = _validate_gripper_torque(key, value)
             values = incoming
         with self._lock:
             if (

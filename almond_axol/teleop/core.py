@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import multiprocessing.connection
 import threading
 import time
@@ -49,6 +50,7 @@ from ..robot.control import ContactWatchdog
 from ..robot.gravity import GravityCompensator
 from ..settings import resolve_gripper, resolve_robot_model
 from .absolute_pose import AbsoluteCalibration
+from .box import right_stick_axis
 from .config import VRTeleopConfig
 from .filter import (
     AlphaSmoothFilter,
@@ -115,8 +117,8 @@ def measured_arms(robot: object) -> MeasuredArms | None:
 
 
 # Rate of the joint-state push (``{"type": "joints"}``) that drives the
-# headset HUD's box-mode readout (pair status). A ~200 B JSON message;
-# negligible next to the pose stream.
+# headset's live robot model and the HUD's box-mode readout (pair status). A
+# ~400 B JSON message; negligible next to the pose stream.
 JOINT_BROADCAST_HZ = 20.0
 
 # Haptics push (``{"type": "haptics"}``, see VRTeleopCore.maybe_broadcast_haptics):
@@ -129,6 +131,16 @@ HAPTICS_BROADCAST_HZ = 30.0
 _HAPTIC_TORQUE_TAU_S = 0.08
 _HAPTIC_TORQUE_FULL = 2.5
 _HAPTIC_NEAR_DEADBAND = 0.2
+# A joint under a spring-torque cap (box mode's wrists, see spring_caps) can
+# never push past the cap, so its cue starts at this fraction of the cap
+# (when that is below ``config.haptic_torque``) and is full at the cap: a
+# joint held at its cap, the one that heats up, rumbles at full strength.
+_HAPTIC_CAP_START = 0.8
+# Grip catch (see VRTeleopCore._follow_trigger): when an arm engages with its
+# trigger more open than its gripper's grasp by more than this (opening,
+# 0 closed to 1 open), the gripper keeps its grasp until the trigger is
+# squeezed back to within this of it.
+_GRIP_CATCH_TOL = 0.03
 # Held-load estimate (see HeldLoad): the commanded gripper opening (0 closed,
 # 1 open) below which a gripper counts as holding, the fraction of
 # ``config.haptic_torque`` a held-load fit may leave unexplained on a joint,
@@ -143,6 +155,9 @@ _HELD_SLOW_RAD_S = 1.0
 # Grace after ``box_align_duration`` for a deferred box-mode exit: the
 # worker's re-blend to the straight grasp starts a frame after the request.
 _BOX_EXIT_MARGIN_S = 0.25
+# How far (rad, any joint) a published target may sit from the pose the last
+# return to rest ended at and still count as at rest (see set_target).
+_AT_REST_TOL_RAD = 0.02
 # Box mode's stick clicks (see VRTeleopCore.box_stick_frame): a click
 # released sooner than this is a grasp tap; one held longer runs the lift.
 _BOX_TAP_S = 0.3
@@ -432,6 +447,12 @@ class VRTeleopCore:
         self.right_indices: list[int] = []
         self.l_grip: float = 0.0
         self.r_grip: float = 0.0
+        # Per gripper: waiting for its trigger to catch the grasp it held
+        # while its arm was frozen (see _follow_trigger).
+        self._grip_catch: dict[str, bool] = {"left": False, "right": False}
+        # Per gripper: whether its trigger has set its grasp yet this session
+        # (before that the grasp is only a seed, nothing to keep).
+        self._grip_driven: dict[str, bool] = {"left": False, "right": False}
 
         # Target playback segment: IK solutions arrive at the (irregular)
         # solve cadence, and tracking the newest one latest-wins makes the
@@ -469,6 +490,20 @@ class VRTeleopCore:
         self._prev_both: bool = False
         self._prev_l_lock: bool = False
         self._prev_r_lock: bool = False
+        # Box-mode stow (A while a grip leads, see _update_stow): the A held
+        # last frame, whether a stow is running (the worker moves the pair;
+        # it is frozen once the worker reports it done) and the one-frame
+        # request still to be sent to the worker.
+        self._prev_stow: bool = False
+        self._stowing: bool = False
+        # Plain teleop's stow (A outside box mode with the parcel gripper,
+        # see _update_arm_stow): asked of the worker on every frame while
+        # it runs (``arm_stow``). ``_stowing`` and ``_stow_pulse`` track it
+        # as they do the box-mode stow.
+        self._arm_stowing: bool = False
+        self._stow_pulse: bool = False
+        self._stow_leader: str | None = None
+        self._last_box_leader: str | None = None
         # Both-grips gate for the next engage. Set at startup, at rest, and by
         # every forced disengage (reset, stale stream, contact) so resuming is
         # always deliberate; cleared once engaged, so an operator who froze
@@ -488,6 +523,10 @@ class VRTeleopCore:
         self._tracking_reengage_blocked: bool = False
         self._tracking_release_seen: bool = False
         self._at_rest: bool = True
+        # The pose the last return to rest ended at. A target that leaves it
+        # (the arms stepping out of the way of Jelly's deck, say) clears
+        # ``_at_rest`` — see set_target.
+        self._rest_target: np.ndarray | None = None
         self._engage_time: float | None = None
 
         # Box mode (bimanual carry, see :mod:`.box`): one controller leads
@@ -1115,9 +1154,13 @@ class VRTeleopCore:
         the other stick up throughout — switches the grasp
         (``box_grasp``: straight / flush) while a grip leads the pair, and
         never reaches the lift; a **hold** past ``_BOX_TAP_S`` runs Jelly's
-        lift as outside box mode, from then until the release. Until a press
+        lift (right raises, left lowers), from then until the release. Box
+        mode's lift is on the clicks because the right stick's forward/back,
+        the lift outside box mode, is the grip width here. Until a press
         has lasted that long its click is cleared from the frame Jelly gets
-        (a copy; the sticks' axes are untouched). Both sticks pressed
+        (a copy). The right stick is also locked to the axis pushed
+        further (:func:`~almond_axol.teleop.box.right_stick_axis`), so
+        squeezing doesn't turn the base. Both sticks pressed
         together — the box-mode toggle gesture — are never a tap.
 
         Call once per received frame (VR thread), before Jelly; the same
@@ -1161,6 +1204,12 @@ class VRTeleopCore:
                 for side in ("l", "r")
                 if getattr(frame, f"{side}_stick_click", False) and not held[side]
             }
+            # The right stick is locked to its dominant axis: while
+            # forward/back (the grip width) outweighs left/right, Jelly
+            # doesn't turn (right_stick_axis).
+            stick_x, _ = right_stick_axis(frame.r_stick_x, frame.r_stick_y)
+            if stick_x != frame.r_stick_x:
+                masked["r_stick_x"] = stick_x
             if masked:
                 out = frame.model_copy(update=masked)
         self._sticks_in, self._sticks_out = frame, out
@@ -1210,6 +1259,11 @@ class VRTeleopCore:
         self._r_inhibit = True
         self._engage_time = None
         self._box_leader = None
+        if self._arm_stowing:
+            self._logger.info("Arm stow: cancelled")
+            self._arm_stowing = False
+            self._stowing = False
+            self._stow_pulse = False
         if self.config.absolute_mode:
             # A forced stop invalidates the absolute world→base anchor. This
             # covers explicit bad-tracking frames as well as a total WebXR
@@ -1473,9 +1527,14 @@ class VRTeleopCore:
 
         self._maybe_auto_engage(frame)
         if self.box_mode:
+            if self._arm_stowing:
+                self._cancel_arm_stow("Arm stow: cancelled (box mode on)")
             self._update_engage_box(frame)
+            self._update_stow(frame)
             # A grip that just froze the pair ends a deferred exit now.
             self._finish_box_exit()
+            return
+        if self._update_arm_stow(frame):
             return
 
         was_left = self.left_enabled
@@ -1538,10 +1597,40 @@ class VRTeleopCore:
 
         # Only track a gripper while its arm is engaged, so a frozen arm's
         # grasp (and a disengaged session) can't be actuated by the trigger.
-        if self.left_enabled:
-            self.l_grip = frame.l_grip
-        if self.right_enabled:
-            self.r_grip = frame.r_grip
+        self._follow_trigger("left", self.left_enabled, was_left, frame.l_grip)
+        self._follow_trigger("right", self.right_enabled, was_right, frame.r_grip)
+
+    def _follow_trigger(
+        self, side: str, engaged: bool, was_engaged: bool, value: float
+    ) -> None:
+        """Set ``side``'s gripper from its trigger while its arm is engaged.
+
+        An arm engaging with its trigger more open than its gripper's grasp
+        (the grip button clicked to re-engage a frozen arm holding something,
+        the trigger let go) would open the gripper at once and drop what it
+        holds. Instead the gripper keeps its grasp until the trigger is
+        squeezed back to it (within ``_GRIP_CATCH_TOL``) and follows it from
+        there: letting the trigger out then opens it. A trigger already at
+        or past the grasp takes over at once, as does the first engage of
+        the session (the grasp is only a seed until a trigger has set it).
+        """
+        value = float(value)
+        held = self.l_grip if side == "left" else self.r_grip
+        if engaged and not was_engaged:
+            self._grip_catch[side] = (
+                self._grip_driven[side] and value > held + _GRIP_CATCH_TOL
+            )
+        if not engaged:
+            return
+        if self._grip_catch[side]:
+            if value > held + _GRIP_CATCH_TOL:
+                return
+            self._grip_catch[side] = False
+        self._grip_driven[side] = True
+        if side == "left":
+            self.l_grip = value
+        else:
+            self.r_grip = value
 
     def _ack_lock_release(self, frame: object, l_lock: bool, r_lock: bool) -> None:
         """Acknowledge a managed tracker bridge's lock-release request.
@@ -1591,7 +1680,7 @@ class VRTeleopCore:
                     leader = "left"
                 elif leader is None:
                     leader = "right" if r_lock else "left"
-            else:
+            elif not self._stowing:
                 leader = None
         else:
             l_edge = l_lock and not self._prev_l_lock
@@ -1632,9 +1721,153 @@ class VRTeleopCore:
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
 
-        if enabled:
-            self.l_grip = float(frame.l_grip)
-            self.r_grip = float(frame.r_grip)
+        if not self._stowing:
+            # (A stow holds the grasp it started with.) Engaging the pair
+            # keeps each grasp until its trigger catches it.
+            self._follow_trigger("left", enabled, was_enabled, frame.l_grip)
+            self._follow_trigger("right", enabled, was_enabled, frame.r_grip)
+
+    def _update_stow(self, frame: object) -> None:
+        """Start the box-mode stow on an **A** press, led or frozen.
+
+        The stow (``IKWorker._start_stow``) brings the box in to the chest,
+        symmetric and level, ignoring the hands; once the worker reports it
+        done (:meth:`_finish_stow`) the pair freezes, as a click of the
+        leading grip would, so the grippers stay closed while Jelly drives.
+        Pressed with the pair frozen, it leads the pair again (with the hand
+        that led last) for the stow. The grippers hold the grasp they had at
+        the press throughout, whatever the triggers do. A grip press during
+        the stow (a freeze or a handover) cancels it.
+        """
+        pressed = bool(getattr(frame, "stow", False))
+        edge = pressed and not self._prev_stow
+        self._prev_stow = pressed
+        if self._box_leader is not None:
+            self._last_box_leader = self._box_leader
+        if edge and not self._stowing and self.box_mode:
+            if not self.teleop_enabled:
+                leader = self._last_box_leader or self.config.box_lead_hand
+                self._box_leader = leader
+                self.left_enabled = True
+                self.right_enabled = True
+                self._require_both_engage = False
+                self._logger.info("Teleop enabled (box stow, %s hand leads)", leader)
+                self._broadcast(True)
+            self._logger.info("Box stow: bringing the box in to the chest")
+            self._stowing = True
+            self._stow_pulse = True
+            self._stow_leader = self._box_leader
+            return
+        if not self._stowing:
+            return
+        if not (self.teleop_enabled and self._box_leader == self._stow_leader):
+            # A grip froze the pair or handed the lead over: the stow is off.
+            self._logger.info("Box stow: cancelled")
+            self._stowing = False
+            self._stow_pulse = False
+
+    def _update_arm_stow(self, frame: object) -> bool:
+        """Plain teleop's stow: **A** with the parcel gripper, outside box mode.
+
+        A press tucks both arms in as a pair, whatever each was doing
+        (tracking, frozen, at rest): the worker carries the two grippers in
+        together, each keeping its pose relative to the other, so a box
+        squeezed between them stays squeezed with the same force
+        (``IKWorker._step_arm_stow``). Both grippers keep their opening and
+        the hands are ignored until the worker reports it done
+        (:meth:`_finish_stow`), when both arms freeze. A grip press during it
+        cancels it, and both arms hold where they are. Returns whether the
+        stow took this frame (the caller then skips the per-arm engage
+        update).
+        """
+        pressed = bool(getattr(frame, "stow", False))
+        edge = pressed and not self._prev_stow
+        self._prev_stow = pressed
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        if self._arm_stowing:
+            if self.config.hold_to_engage:
+                grip = l_lock or r_lock
+            else:
+                grip = (l_lock and not self._prev_l_lock) or (
+                    r_lock and not self._prev_r_lock
+                )
+            self._prev_both = l_lock and r_lock
+            self._prev_l_lock = l_lock
+            self._prev_r_lock = r_lock
+            if grip:
+                self._cancel_arm_stow("Arm stow: cancelled; both arms frozen")
+                if self.config.hold_to_engage:
+                    # The grip that cancelled must be let go before it
+                    # engages its arm.
+                    self._l_inhibit = l_lock
+                    self._r_inhibit = r_lock
+            return True
+        if not (
+            edge
+            and getattr(self.config, "gripper", "parallel") == "parcel"
+            and self.q is not None
+        ):
+            return False
+        self._logger.info("Arm stow: tucking both arms in")
+        self._arm_stowing = True
+        self._stowing = True
+        self._stow_pulse = True
+        self._prev_both = l_lock and r_lock
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+        return True
+
+    def _cancel_arm_stow(self, message: str) -> None:
+        """Stop plain teleop's stow; both arms freeze where they are."""
+        self._logger.info(message)
+        self._arm_stowing = False
+        self._stowing = False
+        self._stow_pulse = False
+        self._freeze_both_arms()
+
+    def _freeze_both_arms(self) -> None:
+        """Freeze both arms (a single grip click resumes that arm)."""
+        was_enabled = self.teleop_enabled
+        self.left_enabled = False
+        self.right_enabled = False
+        self._require_both_engage = False
+        if was_enabled:
+            self._broadcast(False)
+
+    def _finish_stow(self, status: dict) -> None:
+        """Track the worker's stow: stop requesting it, freeze when done."""
+        if not self._stowing:
+            return
+        phase = status.get("stow")
+        if phase is not None:
+            # The worker has it (the request repeats until it does: a frame
+            # that re-snaps the pair can't start one).
+            self._stow_pulse = False
+        if phase == "done" and self._arm_stowing:
+            self._arm_stowing = False
+            self._stowing = False
+            self._freeze_both_arms()
+            self._logger.info(
+                "Arm stow: done, both arms frozen. Press a grip to move that arm."
+            )
+        elif phase == "done":
+            self._stowing = False
+            self._box_leader = None
+            self.left_enabled = False
+            self.right_enabled = False
+            self._require_both_engage = False
+            self._logger.info("Box stowed: pair frozen. Press a grip to lead again.")
+            self._broadcast(False)
+        elif phase is None and not self._stow_pulse:
+            self._logger.warning(
+                "%s stow: the IK worker dropped the stow",
+                "Arm" if self._arm_stowing else "Box",
+            )
+            self._stowing = False
+            if self._arm_stowing:
+                self._arm_stowing = False
+                self._freeze_both_arms()
 
     def _unpack_solution(self, result: object) -> object:
         """Split a worker frame response into the joint vector and side data.
@@ -1666,6 +1899,7 @@ class VRTeleopCore:
                     elbow = status.get("elbow")
                     if isinstance(elbow, (int, float)):
                         self._mirror_worker_field("box_elbow_out", float(elbow))
+                    self._finish_stow(status)
             return q
         return result
 
@@ -1797,6 +2031,15 @@ class VRTeleopCore:
         dur = min(max(gap, 2.0 / self.config.frequency), 0.04)
         self.q = q_new
         self._segment = (start, q_new, now, dur)
+        if (
+            self._at_rest
+            and self._rest_target is not None
+            and q_new.shape == self._rest_target.shape
+            and float(np.max(np.abs(q_new - self._rest_target))) > _AT_REST_TOL_RAD
+        ):
+            # Moved off the rest pose without engaging (Jelly's deck clearance
+            # does this as the lift lowers): a stop must park again.
+            self._at_rest = False
 
     def _eval_target(self, now: float) -> np.ndarray | None:
         """Render the interpolated raw target at time ``now`` (any thread)."""
@@ -1906,6 +2149,7 @@ class VRTeleopCore:
                 self.l_grip = l_grip
                 self.r_grip = r_grip
                 self._at_rest = True
+                self._rest_target = q.copy()
                 seed_l = np.append(q[self.left_indices], l_grip)
                 seed_r = np.append(q[self.right_indices], r_grip)
                 self.ema_left.reset(seed=seed_l)
@@ -2241,6 +2485,9 @@ class VRTeleopCore:
         last_dead_warn = 0.0
         sent_lift: float | None = None
         sent_grip: tuple[float, float] | None = None
+        # Set when the lift moves; cleared once an idle "clear" step (see
+        # _clear_lift_idle) leaves the arms where they are.
+        lift_clear_pending = False
 
         while not stop_event.is_set():
             # Paused (arms moved out-of-band, e.g. gravity comp): idle without
@@ -2264,6 +2511,7 @@ class VRTeleopCore:
                     try:
                         conn.send(("lift", float(raised)))
                         sent_lift = raised
+                        lift_clear_pending = True
                     except OSError:
                         pass  # the dead-process path below reports it
 
@@ -2381,6 +2629,9 @@ class VRTeleopCore:
                                 self.reset_interp.freeze_grippers(*self._park_grippers)
                             self._disengage_all()
                             self._at_rest = True
+                            self._rest_target = np.asarray(
+                                trajectory[-1], dtype=np.float32
+                            ).copy()
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
                     elif q_goal is not None:
                         raise ValueError(f"unexpected park planner reply: {result!r}")
@@ -2408,10 +2659,19 @@ class VRTeleopCore:
                 self._logger.exception("VR frame sampling failed; keeping last target")
                 self._pace(t0, ik_interval)
                 continue
-            if frame is None or frame is last_frame:
+            if frame is None or (frame is last_frame and not self._stowing):
+                # (While a stow runs the last frame is sent again: the worker
+                # moves the pair on every solve, even with the hand still.)
                 # No new frame (idle headset, or none connected): live
                 # settings still apply — the panel may be changing them.
                 self._apply_live_requests()
+                if (
+                    lift_clear_pending
+                    and not self.teleop_enabled
+                    and not self.config.absolute_mode
+                    and process_alive()
+                ):
+                    lift_clear_pending = self._clear_lift_idle(conn, stop_event)
                 if frame is not None:
                     # PoseInterpolator deliberately preserves object identity
                     # when the rendered pose is numerically unchanged, but
@@ -2486,6 +2746,8 @@ class VRTeleopCore:
                         ),
                         # The worker only ever sees the *effective* mode.
                         "reengage": self.reengage,
+                        "box_stow": self._stow_pulse and self.box_mode,
+                        "arm_stow": self._arm_stowing,
                     }
                 )
                 # Live config changes the worker's pickled config must
@@ -2547,6 +2809,37 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _clear_lift_idle(
+        self, conn: multiprocessing.connection.Connection, stop_event: threading.Event
+    ) -> bool:
+        """Move the arms out of the way of Jelly's deck with no frames arriving.
+
+        On the mobile Axol the deck rises toward the arms as the lift lowers.
+        While frames arrive, the IK worker moves arms that aren't tracking
+        out of its way on every solve. This covers the lift lowered from the
+        control panel with no headset streaming: one ``("clear",)`` step
+        (``IKWorker.clear_lift``). Returns whether the arms moved, so the
+        caller keeps stepping until they are clear.
+        """
+        try:
+            conn.send(("clear",))
+            reply = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
+        except Exception as e:  # noqa: BLE001 - keep the loop alive
+            self._logger.error("IK lift clearance dispatch error: %s", e)
+            return False
+        if not (
+            isinstance(reply, tuple)
+            and len(reply) == 3
+            and isinstance(reply[0], str)
+            and reply[0] == "cleared"
+        ):
+            self._logger.warning("Unexpected IK lift clearance reply: %r", reply)
+            return False
+        _, q, moved = reply
+        if moved:
+            self.set_target(q)
+        return bool(moved)
 
     def _handle_engage_rejection(self, base_msg: object) -> bool:
         """Disengage on an IK-worker ``{"rejected": reason}`` base message.
@@ -2636,15 +2929,21 @@ class VRTeleopCore:
             out_of_reach=previous.out_of_reach if previous is not None else (),
         )
 
-    def maybe_broadcast_joints(self, out: np.ndarray, robot: object) -> None:
+    def maybe_broadcast_joints(
+        self, out: np.ndarray, robot: object, lift: float | None = None
+    ) -> None:
         """Push the joint state and pair status to the headset, throttled.
 
         Throttled to :data:`JOINT_BROADCAST_HZ`; call from the control loop
         with the 16-DOF command ``out`` (see :meth:`compute_output`). Measured
         positions are preferred when ``robot`` exposes them (``AxolArm``
-        ``positions``), falling back to the command in sim. Both teleop
-        adapters (``axol teleop`` and collect-data) send it, so the HUD's box
-        readout works in each.
+        ``positions``), falling back to the command in sim. ``lift`` is
+        Jelly's lift height as a fraction of its travel (1 = fully raised,
+        :attr:`~almond_axol.robot.jelly.Jelly.lift_raised`), ``None`` without
+        one. The message also names this Axol's URDF (under the VR server's
+        ``/urdf`` mount), so the headset can draw the robot as it stands.
+        Both teleop adapters (``axol teleop`` and collect-data) send it, so
+        the headset's robot model and box readout work in each.
         """
         if self._broadcast_json is None:
             return
@@ -2685,6 +2984,12 @@ class VRTeleopCore:
                     "l_grip": round(float(left[7]), 3),
                     "r_grip": round(float(right[7]), 3),
                     "engaged": self.teleop_enabled,
+                    "urdf": self._urdf_file,
+                    "lift": (
+                        round(float(lift), 4)
+                        if lift is not None and math.isfinite(lift)
+                        else None
+                    ),
                     # Gripper-pair geometry from the IK worker: the headset
                     # shows "aligned" when the pair already sits in the
                     # box-mode grasp, i.e. a good moment to switch modes.
@@ -2729,9 +3034,11 @@ class VRTeleopCore:
         Each level is 0 to 1. ``near`` is how close that arm is to the IK
         collision boundary (:attr:`collision_near`), ``force`` how far its
         largest low-passed torque residual (measured minus model gravity,
-        less what its gripper holds: :attr:`held_loads`) is past
+        less the weight its gripper holds: :attr:`held_loads`) is past
         ``config.haptic_torque``, full at
-        ``_HAPTIC_TORQUE_FULL`` times it. Only an engaged arm plays, and
+        ``_HAPTIC_TORQUE_FULL`` times it. A joint under a spring cap
+        (:meth:`spring_caps`) starts at ``_HAPTIC_CAP_START`` of its cap if
+        that is lower and is full at the cap. Only an engaged arm plays, and
         nothing plays with ``config.haptics`` off or during a return to
         rest, and ``near`` stays 0 with ``config.haptic_near`` off. In
         box mode both arms follow the leading controller, so it
@@ -2741,7 +3048,7 @@ class VRTeleopCore:
         if not self.config.haptics or self.is_resetting:
             return levels
         near = self.collision_near or {}
-        start = float(self.config.haptic_torque)
+        start, full = self._haptic_torque_band()
         for side, engaged in (
             ("left", self.left_enabled),
             ("right", self.right_enabled),
@@ -2754,10 +3061,12 @@ class VRTeleopCore:
                 3,
             )
             push = self._push.get(side)
-            if start > 0.0 and push is not None and push.size:
-                peak = float(np.max(np.abs(push)))
-                force = (peak - start) / (start * (_HAPTIC_TORQUE_FULL - 1.0))
-                levels[side]["force"] = round(min(max(force, 0.0), 1.0), 3)
+            if start is not None and push is not None and push.size:
+                n = min(push.size, start.size)
+                force = (np.abs(push[:n]) - start[:n]) / (full[:n] - start[:n])
+                levels[side]["force"] = round(
+                    min(max(float(np.max(force)), 0.0), 1.0), 3
+                )
         if self.box_mode and self._box_leader in ("left", "right"):
             leader = self._box_leader
             other = "right" if leader == "left" else "left"
@@ -2767,6 +3076,21 @@ class VRTeleopCore:
             }
             levels[other] = {"near": 0.0, "force": 0.0}
         return levels
+
+    def _haptic_torque_band(self) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+        """Per arm joint, the push torque (Nm) where the force cue starts and
+        where it is full; ``(None, None)`` with the cue off
+        (``config.haptic_torque`` 0). See :meth:`haptic_levels`."""
+        torque = float(self.config.haptic_torque)
+        if torque <= 0.0:
+            return None, None
+        start = np.full(len(ARM_JOINTS), torque)
+        full = np.full(len(ARM_JOINTS), torque * _HAPTIC_TORQUE_FULL)
+        for joint, cap in (self.spring_caps() or {}).items():
+            i = ARM_JOINTS.index(joint)
+            start[i] = min(start[i], _HAPTIC_CAP_START * cap)
+            full[i] = max(min(full[i], cap), start[i] + 1e-3)
+        return start, full
 
     def _update_torque_lp(self, robot: object, now: float) -> None:
         """Feed one torque-residual sample into the haptics low-pass."""
@@ -2811,8 +3135,10 @@ class VRTeleopCore:
         """The part of one arm's low-passed ``residual`` its gripper's load explains.
 
         A gripper holds something while its command is closed, or while box
-        mode clamps the box between both grippers (which also squeezes it).
-        Opening the gripper, or leaving box mode, drops the estimate (see
+        mode clamps the box between both grippers. In box mode the fit also
+        models the squeeze, so it stays out of the weight estimate, but only
+        the weight is explained: the squeeze stays in the push cue. Opening
+        the gripper, or leaving box mode, drops the estimate (see
         :class:`~almond_axol.teleop.held_load.HeldLoad`). Zero while nothing
         is held, with ``config.haptic_held_load`` off, or without measured
         joint positions to evaluate the load at.

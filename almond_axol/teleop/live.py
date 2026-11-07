@@ -97,12 +97,11 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         type="select",
         options=("straight", "flush"),
         help=(
-            "straight: fingers straight forward (0°), the flat face on the "
-            "box. flush: the parcel gripper rolled inward by the Angled yaw "
-            "(39°) about its plate's front edge onto the chamfer facet and "
-            "the fixed tip, the plate at its stop. Width is between the "
-            "contact faces in both. Also switched by a quick tap of either "
-            "thumbstick while a grip leads; the pair blends over to it."
+            "straight: fingers point forward and the front of each fixed "
+            "blade holds the box, in front of the grippers. flush: each "
+            "gripper turns inward by the Angled yaw, and the plate's chamfer "
+            "and the blade tip hold the box. Tap either thumbstick while a "
+            "grip leads to switch."
         ),
     ),
     LiveSettingDef(
@@ -164,9 +163,8 @@ LIVE_SETTINGS: tuple[LiveSettingDef, ...] = (
         step=5.0,
         unit="°",
         help=(
-            "Box mode: how far out the elbows are held, in degrees from "
-            "hanging straight down under the shoulder-wrist line (0) to out "
-            "level (90)."
+            "Box mode: how far out the elbows are held. 0 keeps them tucked "
+            "beside the body and 90 holds them out level."
         ),
     ),
     LiveSettingDef(

@@ -47,6 +47,8 @@ describe("useAxolJoints", () => {
     expect(s.l_grip).toBe(0.5)
     expect(s.r_grip).toBe(1)
     expect(s.engaged).toBe(true)
+    expect(s.urdf).toBeNull()
+    expect(s.lift).toBeNull()
     expect(s.pair).toEqual({
       aligned: true,
       width: 0.3,
@@ -55,6 +57,17 @@ describe("useAxolJoints", () => {
       squeeze: 6,
       trim: null,
     })
+  })
+
+  it("reads the robot model and lift height", async () => {
+    const ws = new FakeSocket()
+    await act(async () => root.render(<Probe ws={ws} />))
+    ws.push({
+      type: "joints",
+      value: { q: {}, engaged: false, urdf: "axol_jelly.urdf", lift: 0.25, pair: null },
+    })
+    expect(ref!.current!.urdf).toBe("axol_jelly.urdf")
+    expect(ref!.current!.lift).toBe(0.25)
   })
 
   it("drops a pair without a width and ignores pushes without joints", async () => {
