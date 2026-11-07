@@ -19,7 +19,6 @@ from . import (
     tracker_lighthouse,
     tracker_lighthouse_calibrate,
     tracker_pair,
-    tracker_ultimate,
 )
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
@@ -159,7 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
     tracker_lighthouse.add_parser(subparsers)
     tracker_lighthouse_calibrate.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
-    tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)

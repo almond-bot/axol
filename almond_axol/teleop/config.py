@@ -542,8 +542,8 @@ class VRTeleopConfig:
         tcp_transform_right: Same for the right rig.
         tracker_key: Quest controller datum key (for example
             ``"quest:meta-quest-touch-plus:grip"``). Hardware sources always
-            resolve their distinct left/right ``survive:<id>`` or
-            ``ultimate:<mac>`` bindings from tracker config; one singular key
+            resolve their distinct left/right ``survive:<id>`` bindings from
+            tracker config; one singular key
             cannot safely identify both devices. ``None`` (default) selects a
             sole saved Quest profile when unambiguous.
         quest_controller_profile: Expected WebXR controller profile for a
@@ -558,7 +558,7 @@ class VRTeleopConfig:
             Quest transform key alongside ``quest_controller_profile``.
         urdf_viewer_world_aligned: Whether the active pose producer's world is
             registered to the viewer headset's local-floor world. ``None``
-            chooses True for Quest and False for Lighthouse/Ultimate. External
+            chooses True for Quest and False for Lighthouse. External
             tracker sessions keep the Quest video/HUD viewer useful but hide
             the spatial URDF overlay unless an operator explicitly asserts an
             out-of-band world registration.
@@ -717,10 +717,7 @@ def apply_mantis_teleop_profile(
     config.engage_max_vel = 1e6
     config.pose_cutoff = 5.0
     if config.urdf_viewer_world_aligned is None:
-        config.urdf_viewer_world_aligned = tracker_source not in (
-            "lighthouse",
-            "ultimate",
-        )
+        config.urdf_viewer_world_aligned = tracker_source != "lighthouse"
 
     if tracker_source == "quest" and config.tracker_key is not None:
         from ..mantis.calibration import parse_quest_tracker_key
@@ -748,7 +745,6 @@ def apply_mantis_teleop_profile(
             INVALID_TRANSFORM_ENTRY,
             LEGACY_TRACKER_KEY,
             MANTIS_TCP_TRANSFORM_FILE,
-            STALE_TRANSFORM_ENTRY,
             design_transform_for,
             has_conflicting_transform_override,
             load_tcp_transforms,
@@ -815,11 +811,7 @@ def apply_mantis_teleop_profile(
             scoped_quest_key = parse_quest_tracker_key(key)
             blocked_override = (
                 bool(document_errors)
-                or entry_statuses.get((side, key))
-                in {
-                    STALE_TRANSFORM_ENTRY,
-                    INVALID_TRANSFORM_ENTRY,
-                }
+                or entry_statuses.get((side, key)) == INVALID_TRANSFORM_ENTRY
                 or has_conflicting_transform_override(
                     side,
                     key,

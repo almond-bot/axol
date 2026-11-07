@@ -560,7 +560,6 @@ def migrate_mantis_tcp_rotation(
             vive_ids = {
                 LEGACY_DESIGN_TCP_TRANSFORM_ID,
                 DESIGN_TCP_TRANSFORM_IDS["survive"],
-                DESIGN_TCP_TRANSFORM_IDS["ultimate"],
             }
             if recorded_id in vive_ids:
                 raise ValueError(

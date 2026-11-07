@@ -16,7 +16,7 @@ Our product website, [almond.bot](https://almond.bot), is the source of truth fo
 | Owl Mount | [almond.bot/owl-mount](https://almond.bot/owl-mount) | A rigid T-slot column that bolts Axol to a table or fixture. |
 | Ox Cart | [almond.bot/ox-cart](https://almond.bot/ox-cart) | A height-adjustable cart with a manual crank lift and leveling casters. |
 | Jelly Mobile | [almond.bot/jelly-mobile](https://almond.bot/jelly-mobile) | A powered omni-wheel base with a battery and a telescoping lift. It is a base, not a robot. |
-| Mantis UMI | [almond.bot/mantis-umi](https://almond.bot/mantis-umi) | A pair of handheld grippers for collecting data without a robot, tracked by Quest controllers, Lighthouse or VIVE Ultimate trackers. |
+| Mantis UMI | [almond.bot/mantis-umi](https://almond.bot/mantis-umi) | A pair of handheld grippers for collecting data without a robot, tracked by Quest controllers or Lighthouse trackers. |
 | Camera Kit | [almond.bot/camera-kit](https://almond.bot/camera-kit) | Two ZED X One S wrist cameras and a ZED X Mini head camera, with mounts and GMSL2 cables. |
 | Compute | [almond.bot/compute](https://almond.bot/compute) | The onboard NVIDIA Jetson: Orin NX 16GB, AGX Orin 64GB or Thor 128GB. |
 | PSU | [almond.bot/psu](https://almond.bot/psu) | The 24 V power supply: Standard (desktop) or Industrial (with E-Stop and brake resistor). |

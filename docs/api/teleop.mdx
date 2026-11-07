@@ -159,13 +159,13 @@ The squeeze settings and `box_wrist_torque` work on hardware only. The IK worker
 | `absolute_mode` | `False` | Mantis mapping. Fits one fixed world-to-robot-base transform at the two-control engage gesture, then maps poses 1:1 in that frame. |
 | `base_height` | `None` | Robot base height in the tracker's world. `None` derives it from the two held start poses. |
 | `tcp_transform_left` / `tcp_transform_right` | `None` | Tracker-to-gripper transform `[x, y, z, qx, qy, qz, qw]`, in metres. |
-| `tracker_key` | `None` | Quest controller transform key, `quest:<WebXR-profile>:grip`. Lighthouse and Ultimate trackers ignore it. |
+| `tracker_key` | `None` | Quest controller transform key, `quest:<WebXR-profile>:grip`. Lighthouse trackers ignore it. |
 | `quest_controller_profile` / `quest_pose_space` | `None` | Expected Quest controller profile and pose space, normally derived from `tracker_key`. On a mismatch, that side stops tracking until you recover it. |
-| `urdf_viewer_world_aligned` | `None` | Whether the headset shows the robot overlay in the tracker's world. `None` means true for Quest and false for Lighthouse and Ultimate. |
+| `urdf_viewer_world_aligned` | `None` | Whether the headset shows the robot overlay in the tracker's world. `None` means true for Quest and false for Lighthouse. |
 
-A TCP transform must have seven finite numbers, a translation of at most 1 metre, and a nonzero quaternion. Production Mantis collection also requires it to match the active tracker's entry in `~/.almond/mantis/tcp_transform.json`, or a verified factory constant. Lighthouse and Ultimate trackers take their left and right bindings (`survive:<id>`, `ultimate:<mac>`) from the tracker config instead of `tracker_key`. A saved Ultimate entry stops counting if its pose convention changes.
+A TCP transform must have seven finite numbers, a translation of at most 1 metre, and a nonzero quaternion. Production Mantis collection also requires it to match the active tracker's entry in `~/.almond/mantis/tcp_transform.json`, or a verified factory constant. Lighthouse trackers take their left and right bindings (`survive:<id>`) from the tracker config instead of `tracker_key`.
 
-Set `urdf_viewer_world_aligned` to true for a Lighthouse or Ultimate tracker only after you have registered its origin and heading to the Quest's world.
+Set `urdf_viewer_world_aligned` to true for a Lighthouse tracker only after you have registered its origin and heading to the Quest's world.
 
 ## Engage behavior
 

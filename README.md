@@ -52,7 +52,7 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `tracker` | Lighthouse/Ultimate bridge dependencies | `tracker.bridge`, Mantis tracking |
+| `tracker` | Lighthouse bridge dependencies | `tracker.bridge`, Mantis tracking |
 
 ```bash
 uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
@@ -137,7 +137,7 @@ Each operation can be driven from the web control panel or the CLI:
 ### Mantis
 
 - [Mantis Hardware](https://docs.almond.bot/mantis/hardware) — handheld rigs for collecting demonstrations without moving the robot
-- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest, Lighthouse, or Ultimate tracking as the pose source
+- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest or Lighthouse tracking as the pose source
 
 ### Remote Teleop
 
@@ -197,7 +197,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
 - [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
-- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
+- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.breakaway`](https://docs.almond.bot/cli/tune-breakaway)

@@ -55,8 +55,8 @@ export PATH="/opt/axol/uv/tools/almond-axol/bin:$PATH"
 
 Use the in-place command above rather than rebuilding the Axol tool with
 `uv tool install --with`: a tool rebuild exactly reconciles dependencies and
-would prune separately managed packages such as the VIVE Ultimate runtime or a
-JetPack-compatible CUDA Torch build. The hosted environment already contains
+would prune separately managed packages such as a JetPack-compatible CUDA
+Torch build. The hosted environment already contains
 the compatible Axol SDK/LeRobot dependencies, so `--no-deps` also prevents a
 plugin install from changing that running environment. An Axol update
 reinstalls the tool environment, so re-apply the plugin install afterwards.

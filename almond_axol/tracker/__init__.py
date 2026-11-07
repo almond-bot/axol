@@ -9,7 +9,6 @@ collect-data run unchanged.
 
 Backends:
   - ``survive``   — Vive Tracker 3.0 via libsurvive (lighthouse tracking).
-  - ``ultimate``  — Vive Ultimate Tracker via the wireless dongle (pyvut).
   - ``synthetic`` — generated motion for end-to-end tests without hardware.
   - ``static``    — fixed poses for standalone bridge/protocol diagnostics.
 """
@@ -42,8 +41,8 @@ HARDWARE_FREE_BINDINGS: dict[str, tuple[str, str]] = {
 
 
 def create_source(config: TrackerConfig, *, setup: bool = False) -> TrackerSource:
-    """Instantiate the configured backend (imported lazily — the survive and
-    ultimate backends require optional system/pip dependencies)."""
+    """Instantiate the configured backend (imported lazily — the survive
+    backend requires optional system dependencies)."""
     if config.backend == "survive":
         from .survive import SurviveSource
 
@@ -54,18 +53,11 @@ def create_source(config: TrackerConfig, *, setup: bool = False) -> TrackerSourc
             enable_diagnostics=strict and not setup,
             strict=strict,
         )
-    if config.backend == "ultimate":
-        from .ultimate import UltimateSource
-
-        return UltimateSource(
-            quat_order=config.ultimate_quat_order,
-            up_axis=config.ultimate_up_axis,
-        )
     if config.backend == "synthetic":
         return SyntheticSource()
     if config.backend == "static":
         return StaticSource()
     raise ValueError(
         f"unknown tracker backend {config.backend!r} "
-        "(expected survive, ultimate, synthetic, or static)"
+        "(expected survive, synthetic, or static)"
     )

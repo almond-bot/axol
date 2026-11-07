@@ -1330,7 +1330,7 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
   )
 }
 
-export type TrackerBackend = "survive" | "ultimate"
+export type TrackerBackend = "survive"
 
 export interface TrackerBinding {
   complete: boolean
@@ -1338,7 +1338,7 @@ export interface TrackerBinding {
   right: string | null
 }
 
-export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing" | "stale"
+export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing"
 
 export interface TrackerTransformReadiness {
   left: TrackerTransformStatus
@@ -1443,30 +1443,9 @@ export interface LighthouseBaseStationSurvey {
   problems: string[]
 }
 
-export interface UltimateTrackerReadiness {
-  binding: TrackerBinding
-  installed: boolean
-  nativeDependencies: boolean
-  pythonHid: boolean
-  apiCompatible: boolean
-  pinnedPyvut: boolean
-  pinnedRef: string
-  logSuppression: boolean
-  udevReady: boolean
-  operatorAccess: boolean
-  dongleConnected: boolean
-  endpointStatus: "accessible" | "permission-denied" | "missing" | "unavailable"
-  wifiConfig: "valid" | "missing" | "invalid" | "permissions-warning"
-  quatOrder: "xyzw" | "wxyz"
-  upAxis: "y" | "z"
-  issues: string[]
-  transforms: TrackerTransformReadiness
-}
-
 export interface TrackerSourceReadiness {
   quest: QuestTrackerReadiness
   lighthouse: LighthouseTrackerReadiness
-  ultimate: UltimateTrackerReadiness
 }
 
 export interface TrackerBindingsSnapshot {
@@ -1481,47 +1460,7 @@ export async function fetchTrackerBindings(): Promise<TrackerBindingsSnapshot> {
   return json(await fetch(apiUrl("/api/tracker/bindings"), { cache: "no-store" }))
 }
 
-export type MantisTrackerSource = "quest" | "lighthouse" | "ultimate"
-
-export interface UltimateWifiConfig {
-  /** Host path is informational only; credential values never include the password. */
-  path: string
-  configured: boolean
-  status: "valid" | "missing" | "invalid" | "permissions-warning"
-  error: string | null
-  ssid: string
-  country: string
-  freq: number
-  passwordSet: boolean
-}
-
-export interface UltimateWifiUpdate {
-  ssid: string
-  country: string
-  freq: number
-  /** Omit to preserve the existing password. The host never returns it. */
-  pass?: string
-}
-
-export async function fetchUltimateWifiConfig(): Promise<UltimateWifiConfig> {
-  return json(
-    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
-      cache: "no-store",
-    })
-  )
-}
-
-export async function saveUltimateWifiConfig(
-  update: UltimateWifiUpdate
-): Promise<UltimateWifiConfig> {
-  return json(
-    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(update),
-    })
-  )
-}
+export type MantisTrackerSource = "quest" | "lighthouse"
 
 export type TrackerCalibrationStatus = TrackerTransformStatus | "unbound"
 
@@ -1532,19 +1471,15 @@ export interface TrackerCalibrationSide {
   overrideKeys?: string[]
   /** Content revisions guarding confirmation-gated removal against stale tabs. */
   overrideRevisions?: Record<string, string>
-  /** Measured and stale saved values are returned; factory/candidate values stay null. */
+  /** Measured saved values are returned; factory/candidate values stay null. */
   pos: [number, number, number] | null
   quat: [number, number, number, number] | null
-  /** Ultimate parser convention recorded with this measurement, when present. */
-  poseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
 }
 
 export interface TrackerCalibrationSnapshot {
   path: string
   source: MantisTrackerSource
   keys: { left: string | null; right: string | null }
-  /** Active Ultimate parser convention; absent/null for older hosts and other sources. */
-  activePoseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
   left: TrackerCalibrationSide
   right: TrackerCalibrationSide
 }
@@ -1990,8 +1925,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
     label: "Teleoperation",
-    description:
-      "Drive Axol from a VR headset. Mantis works with Quest, Lighthouse or Ultimate tracking.",
+    description: "Drive Axol from a VR headset. Mantis works with Quest or Lighthouse tracking.",
     fields: ["sim"],
     suggestedFields: [],
     strictFields: [],
@@ -2028,7 +1962,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect data",
     description:
-      "Record episodes with the ZED cameras. Mantis works with Quest, Lighthouse or Ultimate tracking.",
+      "Record episodes with the ZED cameras. Mantis works with Quest or Lighthouse tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
     strictFields: [],

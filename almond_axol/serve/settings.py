@@ -65,6 +65,8 @@ _logger = logging.getLogger(__name__)
 
 SETTINGS_PATH = almond_path("settings.json")
 SETTINGS_VERSION = 2
+# Pose sources Mantis data collection supports (``mantis.source``).
+MANTIS_SOURCES = ("lighthouse", "quest")
 
 # The built-in operations, whose dotted config paths the tables below spell
 # out. A registered operation joins the same tables through its
@@ -608,12 +610,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.source",
                 label="Mantis tracking",
                 type="select",
-                options=("lighthouse", "ultimate", "quest"),
+                options=MANTIS_SOURCES,
                 help=(
                     "How Mantis data collection tracks the rigs. Quest uses the "
-                    "headset's controllers, and Lighthouse and Ultimate use VIVE "
-                    "trackers. Mantis teleop doesn't track the rigs. The triggers "
-                    "drive the grippers."
+                    "headset's controllers, and Lighthouse uses VIVE trackers. "
+                    "Mantis teleop doesn't track the rigs. The triggers drive the "
+                    "grippers."
                 ),
                 targets={
                     "collect-data": ("mantis_source",),
@@ -1655,6 +1657,7 @@ class SettingsStore:
                     for key, value in flat.items():
                         for canonical in canonical_keys(key):
                             values[canonical] = value
+                self._repair_mantis_source(values)
                 if not self._strict:
                     self._repair_axol_channels(values)
                 return {"values": values, "cameras": raw.get("cameras")}
@@ -1665,6 +1668,24 @@ class SettingsStore:
                 raise
             _logger.exception("failed to load %s; starting empty", self._path)
         return {"values": {}, "cameras": None}
+
+    def _repair_mantis_source(self, values: dict[str, Any]) -> None:
+        """Drop a saved Mantis source that is not a supported option.
+
+        A file can still name a retired source (``ultimate``). Passing it on
+        would fail every collect-data config parse, so fall back to the
+        default source (logged, not rewritten until the next save).
+        """
+        source = values.get("mantis.source")
+        if source is None or source in MANTIS_SOURCES:
+            return
+        _logger.warning(
+            "ignoring Mantis tracking source %r saved in %s; using the default "
+            "until Settings → Mantis tracking is saved",
+            source,
+            self._path,
+        )
+        values.pop("mantis.source")
 
     def _repair_axol_channels(self, values: dict[str, Any]) -> None:
         """Drop a persisted Axol arm map that the store would refuse to save.
@@ -1777,6 +1798,14 @@ class SettingsStore:
                         raise ValueError(f"{key}: {exc}") from exc
                 if key.endswith("gripper.torque_limit") and value is not None:
                     incoming[key] = _validate_gripper_torque(key, value)
+                if (
+                    key == "mantis.source"
+                    and value is not None
+                    and value not in MANTIS_SOURCES
+                ):
+                    raise ValueError(
+                        f"{key} must be one of {', '.join(MANTIS_SOURCES)}"
+                    )
             values = incoming
         with self._lock:
             if (
@@ -1977,7 +2006,7 @@ class SettingsStore:
                 merged[f"{_ROBOT}.left_channel"] = left
                 merged[f"{_ROBOT}.right_channel"] = right
         # The curated Quest datum is intentionally source-scoped. Without
-        # this removal, switching the UI to Lighthouse/Ultimate would keep a
+        # this removal, switching the UI to Lighthouse would keep a
         # Quest key as an explicit override and prevent those tracker-specific
         # transforms from resolving. Request args below may still make an
         # intentional one-run override. (Teleop never receives tracking keys:

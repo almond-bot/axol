@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-from almond_axol.mantis.calibration import ULTIMATE_POSE_CONVENTION_FIELD
 from almond_axol.serve import app as app_module
 from almond_axol.serve import tracker_setup
 from almond_axol.serve.commands import COMMANDS, get_schema
@@ -19,7 +18,6 @@ from almond_axol.tracker.config import (
     load_tracker_config,
     save_tracker_config,
 )
-from almond_axol.tracker.ultimate import ultimate_wifi_config_error
 
 _IDENTITY = {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
 
@@ -29,128 +27,9 @@ def _keyed(key: str, entry: dict[str, list[float]] = _IDENTITY) -> dict[str, Any
 
 
 class TrackerSetupPersistenceTest(unittest.TestCase):
-    def test_wifi_first_save_is_restrictive_and_never_returns_password(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "tracker" / "ultimate_wifi.json"
-            with self.assertRaisesRegex(tracker_setup.TrackerSetupError, "first save"):
-                tracker_setup.save_ultimate_wifi(
-                    {"ssid": "AXOL", "country": "US", "freq": 5240}, path
-                )
-
-            secret = "not-for-an-api-response"
-            result = tracker_setup.save_ultimate_wifi(
-                {
-                    "ssid": "AXOL",
-                    "pass": secret,
-                    "country": "us",
-                    "freq": 5240,
-                },
-                path,
-            )
-            self.assertEqual(result["status"], "valid")
-            self.assertTrue(result["configured"])
-            self.assertTrue(result["passwordSet"])
-            self.assertNotIn("pass", result)
-            self.assertNotIn(secret, json.dumps(result))
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(json.loads(path.read_text())["pass"], secret)
-            self.assertEqual(json.loads(path.read_text())["country"], "US")
-
-    def test_wifi_omitted_password_preserves_existing_secret(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wifi.json"
-            tracker_setup.save_ultimate_wifi(
-                {
-                    "ssid": "old",
-                    "pass": "keep-me!",
-                    "country": "US",
-                    "freq": 5180,
-                },
-                path,
-            )
-            result = tracker_setup.save_ultimate_wifi(
-                {"ssid": "new", "country": "CA", "freq": 5200}, path
-            )
-            saved = json.loads(path.read_text())
-            self.assertEqual(saved["pass"], "keep-me!")
-            self.assertEqual(saved["ssid"], "new")
-            self.assertNotIn("keep-me!", json.dumps(result))
-
-    def test_wifi_rejects_unknown_fields_without_echoing_secret(self) -> None:
-        secret = "do-not-echo-this"
-        with self.assertRaises(tracker_setup.TrackerSetupError) as caught:
-            tracker_setup.save_ultimate_wifi(
-                {
-                    "ssid": "AXOL",
-                    "pass": secret,
-                    "country": "US",
-                    "freq": 5240,
-                    "unexpected": "value",
-                },
-                Path("unused"),
-            )
-        self.assertNotIn(secret, str(caught.exception))
-
-    def test_wifi_snapshot_reports_insecure_mode_without_secret(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wifi.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "ssid": "AXOL",
-                        "pass": "hidden!!",
-                        "country": "US",
-                        "freq": 5240,
-                    }
-                )
-            )
-            path.chmod(0o644)
-            result = tracker_setup.ultimate_wifi_snapshot(path)
-            self.assertEqual(result["status"], "permissions-warning")
-            self.assertFalse(result["configured"])
-            self.assertNotIn("hidden!!", json.dumps(result))
-
-    def test_wifi_rejects_values_that_cannot_be_valid_credentials(self) -> None:
-        baseline: dict[str, object] = {
-            "ssid": "AXOL",
-            "pass": "valid-password",
-            "country": "US",
-            "freq": 5240,
-        }
-        invalid = {
-            "oversized SSID": {"ssid": "x" * 33},
-            "control character": {"ssid": "AXOL\n"},
-            "short passphrase": {"pass": "short"},
-            "unknown country": {"country": "ZZ"},
-            "non-Wi-Fi frequency": {"freq": 1},
-        }
-        for label, replacement in invalid.items():
-            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
-                path = Path(temp) / "wifi.json"
-                payload = {**baseline, **replacement}
-                with self.assertRaises(tracker_setup.TrackerSetupError) as caught:
-                    tracker_setup.save_ultimate_wifi(payload, path)
-                self.assertFalse(path.exists())
-                self.assertNotIn(str(payload["pass"]), str(caught.exception))
-
-    def test_runtime_wifi_validation_uses_the_same_rules_as_the_editor(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wifi.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "ssid": "AXOL",
-                        "pass": "valid-password",
-                        "country": "ZZ",
-                        "freq": 1,
-                    }
-                )
-            )
-            self.assertIn("country", ultimate_wifi_config_error(path) or "")
-
     def test_atomic_writer_preserves_existing_operator_owner_when_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wifi.json"
+            path = Path(temp) / "tcp.json"
             path.write_text("{}")
             with patch.object(
                 tracker_setup, "secure_atomic_write_json"
@@ -166,10 +45,6 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 right="LHR-RIGHT",
                 bindings={
                     "survive": {"left": "LHR-LEFT", "right": "LHR-RIGHT"},
-                    "ultimate": {
-                        "left": "a:b:c:d:e:f",
-                        "right": "1:2:3:4:5:6",
-                    },
                 },
             ),
             path,
@@ -184,7 +59,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             original = {
                 "metadata": {"fixture": "bench-a"},
                 "left": {"survive:OTHER": dict(_IDENTITY)},
-                "right": {"ultimate:1:2:3:4:5:6": dict(_IDENTITY)},
+                "right": {"quest:meta-quest-touch-plus:grip": dict(_IDENTITY)},
             }
             calibration_path.write_text(json.dumps(original))
             with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
@@ -214,10 +89,6 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 saved["left"]["survive:OTHER"],
                 original["left"]["survive:OTHER"],
             )
-            self.assertNotIn(
-                ULTIMATE_POSE_CONVENTION_FIELD,
-                saved["left"]["survive:LHR-LEFT"],
-            )
             self.assertEqual(saved["right"], original["right"])
             self.assertEqual(calibration_path.stat().st_mode & 0o777, 0o600)
 
@@ -240,7 +111,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                         "quat": [0.0, 0.0, 0.0, 1.0],
                     },
                 },
-                "right": {"ultimate:1:2:3:4:5:6": dict(_IDENTITY)},
+                "right": {"quest:meta-quest-touch-plus:grip": dict(_IDENTITY)},
             }
             calibration_path.write_text(json.dumps(original))
 
@@ -353,7 +224,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                     old_key: dict(_IDENTITY),
                     quest_key: dict(_IDENTITY),
                 },
-                "right": {"ultimate:1:2:3:4:5:6": dict(_IDENTITY)},
+                "right": {"quest:meta-quest-touch-plus:grip": dict(_IDENTITY)},
             }
             calibration_path.write_text(json.dumps(original))
 
@@ -444,7 +315,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             saved = json.loads(calibration_path.read_text())
             self.assertEqual(saved["left"][active_key]["pos"], [0.1, 0.2, 0.3])
 
-    def test_calibration_resolves_ultimate_binding_and_quest_configured_key(
+    def test_calibration_resolves_lighthouse_binding_and_quest_configured_key(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -453,20 +324,17 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             calibration_path = root / "tcp.json"
             self._tracker_config(config_path)
             with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
-                ultimate = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
+                lighthouse = tracker_setup.calibration_snapshot(
+                    "lighthouse", path=calibration_path
                 )
                 self.assertEqual(
-                    ultimate["keys"],
-                    {
-                        "left": "ultimate:a:b:c:d:e:f",
-                        "right": "ultimate:1:2:3:4:5:6",
-                    },
+                    lighthouse["keys"],
+                    {"left": "survive:LHR-LEFT", "right": "survive:LHR-RIGHT"},
                 )
                 for side in ("left", "right"):
-                    self.assertEqual(ultimate[side]["status"], "factory")
-                    self.assertIsNone(ultimate[side]["pos"])
-                    self.assertIsNone(ultimate[side]["quat"])
+                    self.assertEqual(lighthouse[side]["status"], "factory")
+                    self.assertIsNone(lighthouse[side]["pos"])
+                    self.assertIsNone(lighthouse[side]["quat"])
 
                 with self.assertRaisesRegex(
                     tracker_setup.TrackerSetupError, "quest_tracker_key"
@@ -485,11 +353,6 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                 )
                 self.assertEqual(quest["right"]["key"], quest_key)
                 self.assertEqual(quest["right"]["status"], "measured")
-                saved = json.loads(calibration_path.read_text())
-                self.assertNotIn(
-                    ULTIMATE_POSE_CONVENTION_FIELD,
-                    saved["right"][quest_key],
-                )
 
     def test_malformed_exact_override_suppresses_factory_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -500,20 +363,20 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             calibration_path.write_text(
                 json.dumps(
                     {
-                        "left": {"ultimate:a:b:c:d:e:f": []},
-                        "right": {"ultimate:1:2:3:4:5:6": "invalid"},
+                        "left": {"survive:LHR-LEFT": []},
+                        "right": {"survive:LHR-RIGHT": "invalid"},
                     }
                 )
             )
             with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
                 snapshot = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
+                    "lighthouse", path=calibration_path
                 )
             self.assertEqual(snapshot["left"]["status"], "missing")
             self.assertEqual(snapshot["right"]["status"], "missing")
 
             mixed = dict(_IDENTITY)
-            mixed["ultimate:a:b:c:d:e:f"] = dict(_IDENTITY)
+            mixed["survive:LHR-LEFT"] = dict(_IDENTITY)
             calibration_path.write_text(
                 json.dumps(
                     {
@@ -524,12 +387,12 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             )
             with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
                 snapshot = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
+                    "lighthouse", path=calibration_path
                 )
             self.assertEqual(snapshot["left"]["status"], "missing")
             self.assertEqual(snapshot["right"]["status"], "missing")
 
-            for override_key in ("ultimate", "ultimate:previous-device"):
+            for override_key in ("survive", "survive:previous-device"):
                 with self.subTest(override_key=override_key):
                     calibration_path.write_text(
                         json.dumps(
@@ -543,7 +406,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                         tracker_setup, "TRACKER_CONFIG_FILE", config_path
                     ):
                         snapshot = tracker_setup.calibration_snapshot(
-                            "ultimate", path=calibration_path
+                            "lighthouse", path=calibration_path
                         )
                     self.assertEqual(snapshot["left"]["status"], "missing")
                     self.assertEqual(snapshot["right"]["status"], "missing")
@@ -558,100 +421,10 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
             )
             with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
                 snapshot = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
+                    "lighthouse", path=calibration_path
                 )
             self.assertEqual(snapshot["left"]["status"], "missing")
             self.assertEqual(snapshot["right"]["status"], "missing")
-
-    def test_ultimate_calibration_requires_explicit_convention_adoption(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            config_path = root / "tracker.json"
-            calibration_path = root / "tcp.json"
-            self._tracker_config(config_path)
-            keys = {
-                "left": "ultimate:a:b:c:d:e:f",
-                "right": "ultimate:1:2:3:4:5:6",
-            }
-            calibration_path.write_text(
-                json.dumps({side: {key: dict(_IDENTITY)} for side, key in keys.items()})
-            )
-
-            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
-                stale = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
-                )
-                self.assertEqual(
-                    stale["activePoseConvention"],
-                    {"quatOrder": "wxyz", "upAxis": "z"},
-                )
-                for side in ("left", "right"):
-                    self.assertEqual(stale[side]["status"], "stale")
-                    self.assertEqual(stale[side]["pos"], _IDENTITY["pos"])
-                    self.assertIsNone(stale[side]["poseConvention"])
-
-                adopted = tracker_setup.save_calibration(
-                    "ultimate",
-                    {"left": _keyed(keys["left"])},
-                    path=calibration_path,
-                )
-                self.assertEqual(adopted["left"]["status"], "measured")
-                self.assertEqual(adopted["right"]["status"], "stale")
-
-            saved = json.loads(calibration_path.read_text())
-            self.assertEqual(
-                saved["left"][keys["left"]][ULTIMATE_POSE_CONVENTION_FIELD],
-                {"quat_order": "wxyz", "up_axis": "z"},
-            )
-
-            config = TrackerConfig(
-                backend="ultimate",
-                left="a:b:c:d:e:f",
-                right="1:2:3:4:5:6",
-                bindings={"ultimate": {"left": "a:b:c:d:e:f", "right": "1:2:3:4:5:6"}},
-                ultimate_quat_order="wxyz",
-                ultimate_up_axis="y",
-            )
-            save_tracker_config(config, config_path)
-            with patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path):
-                mismatched = tracker_setup.calibration_snapshot(
-                    "ultimate", path=calibration_path
-                )
-                self.assertEqual(mismatched["left"]["status"], "stale")
-                self.assertEqual(
-                    mismatched["left"]["poseConvention"],
-                    {"quatOrder": "wxyz", "upAxis": "z"},
-                )
-                self.assertEqual(
-                    mismatched["activePoseConvention"],
-                    {"quatOrder": "wxyz", "upAxis": "y"},
-                )
-
-                resaved = tracker_setup.save_calibration(
-                    "ultimate",
-                    {"left": _keyed(keys["left"])},
-                    path=calibration_path,
-                )
-                self.assertEqual(resaved["left"]["status"], "measured")
-                self.assertEqual(
-                    resaved["left"]["poseConvention"],
-                    {"quatOrder": "wxyz", "upAxis": "y"},
-                )
-
-            config.ultimate_up_axis = "invalid"
-            save_tracker_config(config, config_path)
-            with (
-                patch.object(tracker_setup, "TRACKER_CONFIG_FILE", config_path),
-                self.assertRaisesRegex(
-                    tracker_setup.TrackerSetupError,
-                    "pose convention is invalid",
-                ),
-            ):
-                tracker_setup.save_calibration(
-                    "ultimate",
-                    {"left": _keyed(keys["left"])},
-                    path=calibration_path,
-                )
 
     def test_calibration_rejects_nonfinite_and_zero_quaternion(self) -> None:
         for entry in (
@@ -736,113 +509,6 @@ def _test_app(settings: _Settings) -> Any:
 
 
 class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
-    async def test_bindings_readiness_surfaces_stale_ultimate_convention(
-        self,
-    ) -> None:
-        app = _test_app(_Settings())
-        transport = httpx.ASGITransport(app=app)
-        config = TrackerConfig(
-            backend="ultimate",
-            left="a:b:c:d:e:f",
-            right="1:2:3:4:5:6",
-            bindings={
-                "ultimate": {
-                    "left": "a:b:c:d:e:f",
-                    "right": "1:2:3:4:5:6",
-                }
-            },
-        )
-        calibration = {
-            "left": {"status": "stale"},
-            "right": {"status": "measured"},
-        }
-        with (
-            patch(
-                "almond_axol.cli.tracker_install.lighthouse_readiness",
-                return_value={},
-            ),
-            patch(
-                "almond_axol.cli.tracker_ultimate.ultimate_runtime_readiness",
-                return_value={},
-            ),
-            patch("almond_axol.tracker.load_tracker_config", return_value=config),
-            patch(
-                "almond_axol.mantis.calibration.load_tcp_transforms",
-                return_value={},
-            ),
-            patch(
-                "almond_axol.vr.server.get_last_quest_pose_datum",
-                return_value=None,
-            ),
-            patch.object(
-                tracker_setup,
-                "calibration_snapshot",
-                return_value=calibration,
-            ),
-        ):
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://test"
-            ) as client:
-                response = await client.get("/api/tracker/bindings")
-
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(
-            response.json()["sources"]["ultimate"]["transforms"],
-            {"left": "stale", "right": "measured"},
-        )
-
-    async def test_wifi_api_never_echoes_password_and_preserves_it(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wifi.json"
-            app = _test_app(_Settings())
-            transport = httpx.ASGITransport(app=app)
-            with patch.object(tracker_setup, "ULTIMATE_WIFI_CONFIG_FILE", path):
-                async with httpx.AsyncClient(
-                    transport=transport, base_url="http://test"
-                ) as client:
-                    secret = "api-secret-value"
-                    response = await client.put(
-                        "/api/tracker/ultimate/wifi",
-                        json={
-                            "ssid": "AXOL",
-                            "pass": secret,
-                            "country": "US",
-                            "freq": 5240,
-                        },
-                    )
-                    self.assertEqual(response.status_code, 200)
-                    self.assertNotIn(secret, response.text)
-                    response = await client.put(
-                        "/api/tracker/ultimate/wifi",
-                        json={"ssid": "NEW", "country": "US", "freq": 5200},
-                    )
-                    self.assertEqual(response.status_code, 200)
-                    self.assertNotIn(secret, response.text)
-                    response = await client.get("/api/tracker/ultimate/wifi")
-                    self.assertEqual(response.status_code, 200)
-                    self.assertNotIn(secret, response.text)
-            self.assertEqual(json.loads(path.read_text())["pass"], secret)
-
-    async def test_wifi_api_validation_error_does_not_echo_body(self) -> None:
-        app = _test_app(_Settings())
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://test"
-        ) as client:
-            secret = "bad-request-secret"
-            response = await client.put(
-                "/api/tracker/ultimate/wifi",
-                json={
-                    "ssid": "AXOL",
-                    "pass": secret,
-                    "country": "US",
-                    "freq": 5240,
-                    "extra": True,
-                },
-            )
-        self.assertEqual(response.status_code, 400)
-        self.assertNotIn(secret, response.text)
-
     async def test_lighthouse_quality_api_saves_valid_modes_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.json"
@@ -925,11 +591,6 @@ class TrackerSetupApiTest(unittest.IsolatedAsyncioTestCase):
         ) as client:
             response = await client.get("/api/tracker/calibration/unknown")
         self.assertEqual(response.status_code, 400)
-
-    def test_ultimate_check_is_a_runnable_serve_command(self) -> None:
-        self.assertIn("tracker.ultimate.check", COMMANDS)
-        schema = get_schema("tracker.ultimate.check")
-        self.assertEqual(schema.nodes, [])
 
     def test_lighthouse_check_is_a_runnable_serve_command(self) -> None:
         self.assertIn("tracker.lighthouse.check", COMMANDS)

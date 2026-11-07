@@ -6,7 +6,7 @@ description: "Record teleoperation episodes with camera video to a LeRobot datas
 Data collection records teleoperation episodes and camera video into a [LeRobot](/api/lerobot) dataset you can train on. Start it from the web control panel or with `axol collect-data`.
 
 - **Axol** records joint positions by default. Turn on **Observe Cartesian** to record gripper poses instead.
-- **Mantis** records gripper poses from Quest, Lighthouse or Ultimate tracking.
+- **Mantis** records gripper poses from Quest or Lighthouse tracking.
 
 Run it on the computer that is wired to the hardware and has the ZED cameras attached, usually a ZED Box or Jetson. Images and actions then share one clock.
 
@@ -19,7 +19,7 @@ Run it on the computer that is wired to the hardware and has the ZED cameras att
   - Axol uses the overhead, left arm and right arm slots.
   - Mantis uses separate Head, Left Mantis and Right Mantis slots.
   - Both can record the stereo head camera and both wrist cameras together.
-- For Axol, and for Mantis with the Quest source, have a Meta Quest with the [TLS certificate authorized](/operations/teleop#authorize-the-tls-certificate). Mantis with Lighthouse or Ultimate needs no headset.
+- For Axol, and for Mantis with the Quest source, have a Meta Quest with the [TLS certificate authorized](/operations/teleop#authorize-the-tls-certificate). Mantis with Lighthouse needs no headset.
 
 <Tip>
   To list the connected cameras and their serial numbers, run:
@@ -109,7 +109,7 @@ Run it on the computer that is wired to the hardware and has the ZED cameras att
         Press **Start**.
 
         - **Quest**: open [axol.almond.bot](https://axol.almond.bot) and enter VR. Left and right come from the controllers.
-        - **Lighthouse or Ultimate**: power on both trackers inside the tracked area. Wait until both trackers report a pose and both triggers report in. No headset is needed.
+        - **Lighthouse**: power on both trackers inside the tracked area. Wait until both trackers report a pose and both triggers report in. No headset is needed.
       </Step>
 
       <Step title="Record with the source's controls">
@@ -117,7 +117,7 @@ Run it on the computer that is wired to the hardware and has the ZED cameras att
           <Tab title="Quest">
             Hold the rigs at the start pose and release both controller grips. Press both grips to align and engage. Then record with **A** and **X** as on Axol (see [Recording an episode](#recording-an-episode)), or with the panel's episode buttons.
           </Tab>
-          <Tab title="Lighthouse / Ultimate">
+          <Tab title="Lighthouse">
             Hold the rigs where the take should begin. **Squeeze both rig triggers together, then release both.** This aligns the rigs to the robot, engages tracking and starts the take. The grippers are powered only during a take.
 
             While recording, fully squeeze and release either trigger quickly:
@@ -156,7 +156,7 @@ Run it on the computer that is wired to the hardware and has the ZED cameras att
 
     The `overhead` slot is the head camera. It records both stereo eyes as `overhead_left` and `overhead_right`. Leave out any slots you don't use.
 
-    Set the source to `quest` or `ultimate` as needed. Don't start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
+    Set the source to `quest` for Quest tracking. Don't start a second `tracker.bridge`. See [`collect-data`](/cli/collect-data) and the [tracker reference](/cli/tracker).
   </Tab>
 </Tabs>
 

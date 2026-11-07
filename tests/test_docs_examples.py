@@ -958,34 +958,14 @@ def _load_json_example(block: Block, scratch: Path) -> None:
         if unknown:
             raise AssertionError(f"unknown tracker config keys {sorted(unknown)}")
         return
-    if isinstance(data, dict) and "ssid" in data:
-        # ~/.almond/tracker/ultimate_wifi.json
-        from almond_axol.tracker.ultimate import ultimate_wifi_values_error
-
-        error = ultimate_wifi_values_error(data)
-        if error is not None:
-            raise AssertionError(error)
-        return
     if isinstance(data, dict) and set(data) == {"left", "right"}:
         # ~/.almond/mantis/tcp_transform.json
         from almond_axol.mantis.calibration import load_tcp_transforms
 
-        tracker_config = scratch / "tracker-config.json"
-        tracker_config.write_text(
-            json.dumps(
-                {
-                    "backend": "survive",
-                    "ultimate_quat_order": "wxyz",
-                    "ultimate_up_axis": "z",
-                }
-            ),
-            encoding="utf-8",
-        )
         errors: list[str] = []
         statuses: dict[tuple[str, str], str] = {}
         transforms = load_tcp_transforms(
             path,
-            tracker_config_path=tracker_config,
             entry_statuses=statuses,
             document_errors=errors,
         )

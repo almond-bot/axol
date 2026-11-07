@@ -20,7 +20,7 @@ This command is configured through draccus. The robot and teleop settings live i
 | `--vcodec STR` | Dataset video codec (default: `h264` on Jetson, `auto` elsewhere). Accepts any LeRobot codec, e.g. `auto`, `h264` or `libsvtav1`. |
 | `--teleop_hz INT` | Motor command rate in Hz, separate from `--fps` for smooth control (default: 120) |
 | `--mantis true` | Record with Mantis instead of Axol. See [Recording with Mantis](#recording-with-mantis). |
-| `--mantis_source {quest,lighthouse,ultimate}` | Mantis pose source. Default: the **Tracking** choice saved in **Mantis settings**, or `lighthouse` if none is saved. |
+| `--mantis_source {quest,lighthouse}` | Mantis pose source. Default: the **Tracking** choice saved in **Mantis settings**, or `lighthouse` if none is saved. |
 | `--teleop_config.vr_teleop_config.reset_torque_threshold FLOAT` | Contact limit (Nm) for every return to rest (default: 6.0). `0` turns it off. See [After each episode](#after-each-episode). |
 | `--teleop_config.vr_teleop_config.reset_gravity_comp_kd FLOAT` | Damping (Nm·s/rad) while the arms hang limp after a contact stop (default: 0.25). Same as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
 | `--teleop_config.vr_teleop_config.teleop_torque_threshold FLOAT` | Contact limit (Nm) while you drive the arms during a take (default: `0`, off). The control panel suggests `16.0`. |
@@ -89,7 +89,7 @@ Axol and Quest-source Mantis episodes are driven from the Quest controllers. The
 | **A** | Start a take after a 3-second countdown. While recording, press **A** to ask **Save episode?**, then **A** again to save or **X** to keep recording. The headset shows `Saving` until the write completes. |
 | **X** | During the countdown, cancel it. Otherwise, reset the arms to the rest pose, including from a contact hold. While recording, press **X** to ask **Discard episode?**, then **X** again to discard or **A** to keep recording. |
 
-With a Lighthouse or Ultimate Mantis source, the rig triggers control the takes:
+With a Lighthouse Mantis source, the rig triggers control the takes:
 
 - **Start:** squeeze both triggers together and release them. The rigs engage at their current pose and recording starts.
 - **Save:** while recording, fully squeeze and release either trigger three times quickly. The saved take ends where the first squeeze began, so the clicks aren't recorded.
@@ -127,7 +127,7 @@ Mantis has no arms to return. It turns off both gripper motors between takes, an
 The pose source works like this:
 
 - **Quest** waits for the headset's WebXR session and uses **A** for episode control.
-- **Lighthouse** and **Ultimate** start and stop their tracker readers automatically, from the CLI and the control panel. Don't launch a second `tracker.bridge`.
+- **Lighthouse** starts and stops its tracker reader automatically, from the CLI and the control panel. Don't launch a second `tracker.bridge`.
 - Recording can't start until the tracker sends two fresh poses and the triggers report in.
 
 ## Starting and stopping

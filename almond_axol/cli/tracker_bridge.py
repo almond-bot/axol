@@ -49,7 +49,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     )
     parser.add_argument(
         "--backend",
-        choices=("survive", "ultimate", "synthetic", "static"),
+        choices=("survive", "synthetic", "static"),
         default=None,
         help="Tracker backend (default: the saved config, else survive). "
         "Use static only for a standalone fixed-pose protocol dry run.",
@@ -57,7 +57,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--left",
         default=None,
-        help="Left-side device key (Lighthouse tracker serial / Ultimate MAC); "
+        help="Left-side device key (Lighthouse tracker serial); "
         "overrides the saved binding.",
     )
     parser.add_argument(
