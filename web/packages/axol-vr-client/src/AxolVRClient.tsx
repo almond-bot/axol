@@ -6,6 +6,8 @@ import {
   stepBothStickClick,
   type BothStickClickState,
 } from "./bothStickClick"
+import { sendPose } from "./poseBackpressure"
+import type { PoseSink } from "./poseBackpressure"
 import { initialPoseSequence, nextPoseSequence } from "./poseSequence"
 import type { PoseSequence } from "./poseSequence"
 import { webxrCanControlPose, webxrCanControlRecording } from "./sessionAuthority"
@@ -14,10 +16,6 @@ import type { AxolMode, AxolPoseMode, AxolPoseSourceKind, ConfirmAction } from "
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
-
-// Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
-// the minimal shape AxolVRClient needs to ship a frame.
-type PoseSink = { send: (data: string) => void }
 
 const POSE_SOURCE_ID_KEY = "axol.webxr.pose-source-id.v2"
 // A current host replays pose_mode as soon as the signaling listener is
@@ -337,7 +335,7 @@ export function AxolVRClient({
     const canControlPose = webxrCanControlPose(expectedPoseSourceKindRef.current)
     const canRecord = webxrCanControlRecording(modeRef.current, expectedPoseSourceKindRef.current)
 
-    // Tracker-owned Lighthouse/Ultimate sessions keep the Quest connected for
+    // Tracker-owned Lighthouse sessions keep the Quest connected for
     // cameras and authoritative server HUD updates, but its A/X buttons must
     // not create a local countdown or confirmation flow.
     if (!canRecord) {
@@ -595,10 +593,13 @@ export function AxolVRClient({
       r_stick_y,
       l_stick_click,
       r_stick_click,
+      // A held: in box mode, stows the box against the chest. Data collection
+      // keeps A for recording, so it is sent only in plain teleop.
+      stow: aPressed && !canRecord,
       seq: nextPoseSequence(seqRef.current!),
       // One logical identity across USB, WebRTC, and network WebSocket. The
       // server de-dupes the shared sequence globally and can keep this Quest
-      // view-only when a Lighthouse/Ultimate bridge owns Mantis poses.
+      // view-only when a Lighthouse bridge owns Mantis poses.
       pose_source_id: poseSourceIdRef.current,
       pose_source_kind: "webxr",
       // Mount calibration is datum-specific. The host validates both the
@@ -613,9 +614,12 @@ export function AxolVRClient({
       // jittery/relayed link, so teleop stays smooth instead of stuttering.
       t: performance.now(),
     })
-    usbSink?.send(payload)
-    netSink?.send(payload)
-    if (netSink === wsRef.current) signalingPoseEstablishedRef.current = true
+    // A transport that is still backed up skips this frame (see
+    // poseBackpressure): queued poses only add latency. A reset is a one-frame
+    // pulse the next frame won't repeat, so it always goes out.
+    sendPose(usbSink, payload, reset)
+    const netSent = sendPose(netSink, payload, reset)
+    if (netSent && netSink === wsRef.current) signalingPoseEstablishedRef.current = true
 
     // Publish the HUD-only state (armed confirmation popup, record countdown)
     // to the server whenever it changes, so a dashboard can mirror what this

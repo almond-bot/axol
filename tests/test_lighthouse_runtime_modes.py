@@ -258,7 +258,7 @@ def test_native_failure_is_explicit_in_quality_for_operator_recovery() -> None:
     assert report["reasons"][0] == "survive-cli exited unexpectedly"
 
 
-@pytest.mark.parametrize("backend, timeout", [("survive", 120.0), ("ultimate", 25.0)])
+@pytest.mark.parametrize("backend, timeout", [("survive", 120.0), ("synthetic", 25.0)])
 def test_managed_bridge_selects_the_acquisition_budget_for_its_backend(
     backend: str, timeout: float
 ) -> None:

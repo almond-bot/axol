@@ -41,7 +41,7 @@ import logging
 import os
 
 from ...constants import CAN_BASE, CAN_CHEST
-from ...robot.jelly import DEFAULT_CHANNEL, WHEELS, Jelly, JellyConfig, deadzone
+from ...robot.jelly import DEFAULT_CHANNEL, WHEELS, Jelly, JellyConfig, stick_command
 from ...robot.lift import DOWN, STOP, UP
 
 # Logitech F310/F710 (XInput mode) under SDL/pygame.
@@ -113,7 +113,6 @@ def _status_line(jelly: Jelly, engaged: bool) -> str:
 async def _input_loop(
     pad,  # noqa: ANN001 — pygame typed lazily
     jelly: Jelly,
-    dz: float,
 ) -> None:
     """Poll the gamepad into ``jelly.set_command`` until B is pressed."""
     import pygame
@@ -130,9 +129,14 @@ async def _input_loop(
         vx = vy = wz = 0.0
         lift_dir = STOP
         if engaged:
-            vx = -deadzone(pad.get_axis(_AXIS_LY), dz)  # up = forward
-            vy = -deadzone(pad.get_axis(_AXIS_LX), dz)  # left = +
-            wz = -deadzone(pad.get_axis(_AXIS_RX), dz)  # left = CCW
+            # Same deadzone and response curve as the headset sticks.
+            vx, vy, wz = stick_command(
+                pad.get_axis(_AXIS_LX),
+                pad.get_axis(_AXIS_LY),
+                pad.get_axis(_AXIS_RX),
+                jelly.config.deadzone,
+                jelly.config.stick_expo,
+            )
             if pad.get_numhats() > _HAT_DPAD:
                 hat_y = pad.get_hat(_HAT_DPAD)[1]
                 lift_dir = UP if hat_y > 0 else DOWN if hat_y < 0 else STOP
@@ -151,6 +155,7 @@ async def _run(args: argparse.Namespace) -> None:
         turn_scale=args.turn_scale,
         slew=args.slew,
         deadzone=args.deadzone,
+        stick_expo=args.stick_expo,
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
         lift=not args.no_lift,
@@ -179,7 +184,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     print("Jelly enabled. Hold LB/RB to drive, D-pad for the lift, B to quit.")
     try:
-        await _input_loop(pad, jelly, args.deadzone)
+        await _input_loop(pad, jelly)
     finally:
         if imu_src is not None:
             imu_src.close()
@@ -215,6 +220,15 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=0.12,
         help="Stick deadzone as a fraction of full deflection (default: 0.12)",
+    )
+    parser.add_argument(
+        "--stick-expo",
+        type=float,
+        default=JellyConfig.stick_expo,
+        help=(
+            "Stick response curve, [0, 1]: 0 is linear, higher is finer near "
+            f"centre (default: {JellyConfig.stick_expo})"
+        ),
     )
     parser.add_argument(
         "--slew",

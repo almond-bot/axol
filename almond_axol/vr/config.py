@@ -40,10 +40,10 @@ class VRServerConfig:
             seconds late. ``<= 0`` disables the gate.
         pose_source_kind: Exclusive pose producer for this server. ``"webxr"``
             accepts Quest (plus legacy clients); ``"tracker"`` accepts only a
-            Lighthouse/Ultimate bridge while other sockets remain view-only.
+            Lighthouse bridge while other sockets remain view-only.
             ``None`` lets the first logical source claim the session.
         expected_pose_source_id: Exact logical producer ID accepted for pose
-            control. Managed Lighthouse/Ultimate runs set a fresh unguessable
+            control. Managed Lighthouse runs set a fresh unguessable
             value on both their server and bridge so an unrelated standalone
             bridge cannot claim the session. ``None`` accepts any ID allowed
             by ``pose_source_kind``.

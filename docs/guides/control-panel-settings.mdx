@@ -54,7 +54,7 @@ You can set any field in these sections. The panel shows the common ones as cont
 
 | Section | Contains | Used by |
 |---|---|---|
-| `axol` | Arm stiffness (`left_stiffness`, `right_stiffness`), `has_gripper`, `gripper` (`parallel` or `parcel`), per-joint gains and masses, and gripper limits such as `left.gripper.torque_limit`. | Every operation |
+| `axol` | Arm stiffness (`left_stiffness`, `right_stiffness`), `has_gripper`, `gripper` (`parallel` or `parcel`), per-joint gains and masses, and gripper limits such as `left.gripper.torque_limit` (at most 5 Nm). | Every operation |
 | `teleop` | `frequency`, `position_multiplier`, `rotation_multiplier`, `hold_to_engage`, `park_to_zero`, the rest pose (`rest_pose_left`, `rest_pose_right`) and the contact thresholds. | Teleop, data collection, DAgger. Some fields also apply to run policy and replay. |
 | `kinematics` | `mount` (`classic`, `standalone`, `ox_cart` or `owl`), `robot_model`, the IK weights and `max_joint_delta`. | Teleop, data collection, DAgger |
 | `jelly` | `wheels` and `lift` (the **Jelly wheels** and **Jelly lift** switches), `max_speed` and the other drive settings. | Teleop, data collection, DAgger |
@@ -63,8 +63,8 @@ You can set any field in these sections. The panel shows the common ones as cont
 | `lerobot_teleop` | LeRobot `teleop_config.id` and `teleop_config.calibration_dir`. | Data collection, DAgger |
 | `robot` | `left_channel` and `right_channel`, the arms' CAN interfaces. `"null"` turns an arm off. | Every operation, diagnostics dashboard |
 | `gravity` | `kd` and `rate_hz` of gravity compensation. | Gravity compensation, waypoints |
-| `mantis` | `source` (`lighthouse`, `ultimate` or `quest`), `quest_tracker_key`, and the Mantis CAN channels (`can_mantis_l` and `can_mantis_r` by default). | Mantis data collection and teleop |
-| `recording` | `fps`, `replay_fps`, `vcodec`, `root`, `push_to_hub`, `rerun_ip` and `rerun_port`. | Data collection, DAgger, run policy, replay |
+| `mantis` | `source` (`lighthouse` or `quest`), `quest_tracker_key`, and the Mantis CAN channels (`can_mantis_l` and `can_mantis_r` by default). | Mantis data collection and teleop |
+| `recording` | `fps`, `replay_fps`, `vcodec`, `root`, `push_to_hub`, `record_jelly` (the **Record Jelly** switch), `rerun_ip` and `rerun_port`. | Data collection, DAgger, run policy, replay |
 | `inference` | The [run policy](/operations/run-policy-config) settings, such as `device`, `server_host`, `server_port` and `episode_time_s`. | Run policy |
 | `system` | `hardware_profile` (`axol` or `mantis`, the device chosen in the panel) and `log_level`. | Every operation |
 | `cameras` | The camera layouts set in the panel. | Teleop, data collection, DAgger, run policy |

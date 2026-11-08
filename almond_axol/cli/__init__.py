@@ -12,13 +12,13 @@ from . import hub as hub_cmd
 from . import (
     mantis_latency,
     mantis_session,
+    mantis_update,
     tracker_bridge,
     tracker_identify,
     tracker_install,
     tracker_lighthouse,
     tracker_lighthouse_calibrate,
     tracker_pair,
-    tracker_ultimate,
 )
 from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
@@ -99,6 +99,7 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "waypoints",
         "Teach waypoints by hand, then replay them as straight-line moves.",
     ),
+    "jog": ("jog", "Jog the arms, lift and base from the control panel."),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "collect-dagger": (
         "collect_dagger",
@@ -159,12 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
     tracker_lighthouse.add_parser(subparsers)
     tracker_lighthouse_calibrate.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
-    tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     lift_update.add_parser(subparsers)
     safety_cmd.add_parser(subparsers)
     safety_update_cmd.add_parser(subparsers)
+    mantis_update.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)

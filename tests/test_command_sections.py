@@ -65,6 +65,7 @@ class DiagnosticsSectionsTest(unittest.TestCase):
                 "lift.goto",
                 "lift.update",
                 "safety.update",
+                "mantis.update",
             },
         )
 

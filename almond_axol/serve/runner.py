@@ -40,6 +40,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Collection
 from typing import Any
 
 from .. import progress
@@ -74,7 +75,8 @@ _STOP_GRACE_S = 6.0
 # The teleop and collect-data ops park the arms on Stop — rest, then zero
 # (``almond_axol.teleop.shutdown``) — before the torque comes off, and the
 # second leg needs the IK worker alive for its plan. Give those ops the two
-# park caps plus the hardware disconnect before any child is killed.
+# park caps plus the hardware disconnect before any child is killed. Jog
+# returns the arms to rest on Stop too.
 _PARK_STOP_GRACE_S = PARK_TIMEOUT_S + PARK_ZERO_TIMEOUT_S + 4.0
 _FORCE_GRACE_S = 5.0
 
@@ -89,11 +91,6 @@ _FORCE_GRACE_S = 5.0
 _RECORDER_PROC_NAME = "dataset-recorder"
 _FINALIZE_GRACE_S = 200.0
 
-# A managed Mantis bridge reports ready after both trackers and configured
-# trigger nodes have produced fresh, usable data. It does not wait for the
-# operation's VR server: its WebSocket loop reconnects until that server begins
-# listening.
-_BRIDGE_READY_TIMEOUT_S = 35.0
 _BRIDGE_STOP_TIMEOUT_S = 4.0
 
 # Cadence of the bus-stall watchdog while a hardware operation runs. A stall
@@ -220,7 +217,9 @@ def _forward_line(sink: Any, line: str) -> None:
         pass
 
 
-def prove_motors_torque_free(robot: Any) -> str | None:
+def prove_motors_torque_free(
+    robot: Any, power_lost: Collection[str] = ()
+) -> str | None:
     """Prove every motor is torque-free, or say why that could not be shown.
 
     Used when an operation could not confirm it disabled the motors. Rather
@@ -230,6 +229,21 @@ def prove_motors_torque_free(robot: Any) -> str | None:
     is unpowered). A motor that answers and is not disabled is holding torque
     nobody supervises; a motor with no reading (``reachable is None``) proves
     nothing. Both refuse.
+
+    A MyActuator motor never reads ``DISABLED`` (its status is only OK or an
+    error), so once powered again it could only pass by being unpowered at
+    the moment of the check: the operator had to hold the E-Stop in while
+    pressing Re-check. ``power_lost`` names the arm CAN channels that went
+    dead during the operation (no motor answering: the E-Stop cut motor
+    power). The two arms share the power supply the E-Stop cuts, and the
+    first dead bus stops the run before the other is seen dead, so one is
+    enough for both. An arm whose Damiao motors now read ``DISABLED`` (or
+    don't answer, at least one ``DISABLED``) was then power-cycled: the
+    operation had them enabled, its disable never got through, and the
+    lockout keeps anything else from enabling or disabling them. A motor
+    powers up torque-free, so that arm's MyActuator motors reading OK are
+    accepted too. A dead bus with the power still on (a cable pulled)
+    leaves its Damiao motors enabled, so that arm doesn't pass.
 
     Returns ``None`` on proof, otherwise the refusal reason. The probe only
     borrows the buses: the failed operation may still hold them, so on
@@ -256,6 +270,17 @@ def prove_motors_torque_free(robot: Any) -> str | None:
         for m in status["motors"]
         if m["reachable"] is not False and m["status"] != "DISABLED"
     ]
+    cycled = _power_cycled_arms(robot, status["motors"], power_lost)
+    live = [
+        m
+        for m in live
+        if not (
+            m["arm"] in cycled
+            and m.get("type") == "myactuator"
+            and m["reachable"] is True
+            and m["status"] == "OK"
+        )
+    ]
     if live:
         return refuse(
             "these motors still answer and are not disabled: "
@@ -266,6 +291,38 @@ def prove_motors_torque_free(robot: Any) -> str | None:
             )
         )
     return None
+
+
+def _power_cycled_arms(
+    robot: Any, motors: list[dict[str, Any]], power_lost: Collection[str]
+) -> set[str]:
+    """Arms shown power-cycled since the operation (see prove_motors_torque_free).
+
+    Only after a power loss on either arm's CAN channel (``power_lost``): an
+    arm counts when every Damiao motor on it reads ``DISABLED`` or doesn't
+    answer, at least one of them ``DISABLED`` (all silent proves nothing
+    about the rest of the arm).
+    """
+    try:
+        left, right = robot.channels()
+    except Exception:  # noqa: BLE001 - no channel map, no power-cycle proof
+        return set()
+    if not set(power_lost) & {left, right} - {None}:
+        return set()
+    cycled: set[str] = set()
+    for side, channel in (("left", left), ("right", right)):
+        if channel is None:
+            continue
+        damiao = [m for m in motors if m["arm"] == side and m.get("type") == "damiao"]
+        if (
+            damiao
+            and any(m["status"] == "DISABLED" for m in damiao)
+            and all(
+                m["status"] == "DISABLED" or m["reachable"] is False for m in damiao
+            )
+        ):
+            cycled.add(side)
+    return cycled
 
 
 class _StreamTee:
@@ -626,6 +683,11 @@ class OperationRunner:
         # the operator cuts motor power, typically), or the serve process
         # restarts.
         self._hardware_cleanup_uncertain = False
+        # CAN channels that went dead (motor power lost) during the current
+        # or last operation, and those that the lockout was set with: the
+        # probe accepts a power-cycled arm on them (prove_motors_torque_free).
+        self._run_power_lost: frozenset[str] = frozenset()
+        self._lockout_power_lost: frozenset[str] = frozenset()
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -680,6 +742,11 @@ class OperationRunner:
         """
         with self._lock:
             self._hardware_cleanup_uncertain = False
+            self._lockout_power_lost = frozenset()
+
+    def lockout_power_lost(self) -> frozenset[str]:
+        """The CAN channels that lost motor power in the run that locked out."""
+        return self._lockout_power_lost
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -699,6 +766,10 @@ class OperationRunner:
             if self.is_running():
                 raise RuntimeError("an operation is already running")
             session = Session(op_id, args)
+            # A Stop choice left over from an earlier run never applies here.
+            from ..teleop.shutdown import request_stop_choice
+
+            request_stop_choice(None)
             # The op runs on a worker thread; route subscriber wakeups back to
             # the server loop so the log WebSocket stays responsive.
             session.loop = loop
@@ -895,10 +966,10 @@ class OperationRunner:
         # Mantis teleop starts no VR server, so it has no headset to feed.
         if cmd.camera_mode == "teleop" and not grippers_only:
             try:
-                self._attach_cameras_to_teleop(cfg, cameras, session)
+                self._attach_cameras_to_teleop(cfg, cameras, session, op_id)
             except Exception as exc:  # noqa: BLE001
                 session.emit(
-                    f"[serve] teleop: camera streaming unavailable ({exc}); "
+                    f"[serve] {op_id}: camera streaming unavailable ({exc}); "
                     "continuing without cameras"
                 )
 
@@ -989,6 +1060,7 @@ class OperationRunner:
         # (an abandoned worker that never closed its bus), and stopping this
         # operation would not fix it.
         inherited = stalled_channels()
+        self._run_power_lost = frozenset()
         stalled_since: float | None = None
         while not stop_event.wait(_STALL_POLL_S):
             if self._session is not session or session.status not in (
@@ -1014,12 +1086,31 @@ class OperationRunner:
                 _logger.warning(
                     "motor power lost during %s; stopping", session.command_id
                 )
+                self._run_power_lost = frozenset(current - inherited)
                 self.stop()
                 self._mark_terminal(session, "error", error=STALL_STOP_ERROR)
                 return
 
-    def stop(self) -> Session | None:
+    def arms_need_stop_choice(self) -> bool:
+        """Whether a Stop now should first ask what to do with the arms.
+
+        True while a teleop session runs on hardware arms that are away from
+        rest (see ``almond_axol.teleop.shutdown.arms_away_from_rest``).
+        """
+        from ..teleop.shutdown import arms_away_from_rest
+
+        session = self._session
+        if session is None or session.command_id != "teleop":
+            return False
+        if session.status not in ("starting", "running") or self._stopping:
+            return False
+        return arms_away_from_rest()
+
+    def stop(self, arms: str | None = None) -> Session | None:
         """Begin stopping the current op and return immediately.
+
+        ``arms`` (teleop only): ``"rest"`` parks the arms (the default),
+        ``"hold"`` leaves the motors holding them where they are.
 
         Signals the op to unwind and hands off to a background watchdog that
         force-kills the op's child subprocesses if it doesn't exit within the
@@ -1034,8 +1125,14 @@ class OperationRunner:
             # Already finished (or finishing): nothing to stop, and we must not
             # flip a terminal session back to "stopping".
             return session
+        if arms is not None and session.command_id == "teleop":
+            from ..teleop.shutdown import request_stop_choice
+
+            request_stop_choice(arms)
         if not self._begin_stop(session):
             return session
+        if arms == "hold" and session.command_id == "teleop":
+            session.emit("[serve] the arms stay where they are; the motors stay on")
         thread = self._thread
         watchdog = threading.Thread(
             target=self._await_stop,
@@ -1087,7 +1184,7 @@ class OperationRunner:
             return
         grace = (
             _PARK_STOP_GRACE_S
-            if session.command_id in ("teleop", "collect-data")
+            if session.command_id in ("teleop", "collect-data", "jog")
             else _STOP_GRACE_S
         )
         thread.join(timeout=grace)
@@ -1423,7 +1520,11 @@ class OperationRunner:
         return merged
 
     def _attach_cameras_to_teleop(
-        self, cfg: Any, cameras: dict[str, Any] | None, session: Session
+        self,
+        cfg: Any,
+        cameras: dict[str, Any] | None,
+        session: Session,
+        op_id: str = "teleop",
     ) -> None:
         """Point teleop's headset video at the configured local ZED cameras.
 
@@ -1450,7 +1551,7 @@ class OperationRunner:
             if serial in detected and s_eyes is not None:
                 camera_eyes[slot] = s_eyes
         if not cam_map:
-            session.emit("[serve] teleop: streaming disabled (no cameras)")
+            session.emit(f"[serve] {op_id}: streaming disabled (no cameras)")
             return
         cfg.cameras = cam_map
         if camera_eyes:
@@ -1460,8 +1561,9 @@ class OperationRunner:
         stereo_slots = sorted(s for s in cam_map if cam_map[s] in detected)
         stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
         resolution_note = f" @ {stream_res}" if stream_res else ""
+        viewer = "the Jog page" if op_id == "jog" else "the headset"
         session.emit(
-            "[serve] teleop: streaming cameras to the headset "
+            f"[serve] {op_id}: streaming cameras to {viewer} "
             f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}"
         )
 
@@ -1495,20 +1597,16 @@ class OperationRunner:
 
         config = load_tracker_config()
         source = str(getattr(cfg, "mantis_source", "lighthouse"))
-        backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
-        if backend is None:
+        if source != "lighthouse":
             raise RuntimeError(
                 f"Mantis source {source!r} does not use a tracker bridge"
             )
+        backend = "survive"
         select_tracker_backend(config, backend)
         # Lighthouse must receive fresh station identity broadcasts before it
         # reports ready. Give the child its full acquisition window plus spawn
-        # overhead; Ultimate retains its existing startup budget.
-        ready_timeout = (
-            LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
-            if backend == "survive"
-            else _BRIDGE_READY_TIMEOUT_S
-        )
+        # overhead.
+        ready_timeout = LIGHTHOUSE_ACQUISITION_TIMEOUT_S + 15.0
         server = getattr(cfg, "vr_server", None)
         if server is None:
             teleop = getattr(cfg, "teleop_config", None)
@@ -1850,7 +1948,9 @@ class OperationRunner:
                 session.emit(
                     "[serve] hardware cleanup could not be verified; probing the motors"
                 )
-                refusal = prove_motors_torque_free(self._robot_link)
+                refusal = prove_motors_torque_free(
+                    self._robot_link, self._run_power_lost
+                )
             if refusal is None:
                 cleanup_uncertain = False
                 session.emit(
@@ -1859,6 +1959,7 @@ class OperationRunner:
             else:
                 with self._lock:
                     self._hardware_cleanup_uncertain = True
+                    self._lockout_power_lost = self._run_power_lost
                 message = (
                     f"{refusal}; robot ownership remains reserved. Cut motor "
                     "power, then use Re-check motors in the control panel "

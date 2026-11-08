@@ -1,5 +1,5 @@
 import { useState } from "react"
-import type { CanDiscoveryState } from "@/lib/supervisor"
+import type { CanDeviceInventory, CanDiscoveryState } from "@/lib/supervisor"
 
 /**
  * Hardware problems as an operator reads them. The host reports CAN
@@ -104,4 +104,15 @@ export function deviceErrorText(error: string | null | undefined, device: string
     return `${device} is in use. Stop the running operation or test first.`
   }
   return `Couldn't connect to ${device}.`
+}
+
+/**
+ * Whether Jelly is attached, from the CAN inventory: its wheel or lift bus
+ * exists. Independent of the Wheels and Lift switches in settings, which only
+ * say whether runs drive them. Null before the inventory arrives (or from a
+ * host without Jelly links).
+ */
+export function jellyPresentOnCan(devices: CanDeviceInventory | null | undefined): boolean | null {
+  if (!devices) return null
+  return Boolean(devices.wheels?.present || devices.lift?.present)
 }

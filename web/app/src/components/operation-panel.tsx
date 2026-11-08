@@ -1,4 +1,4 @@
-import { type RefObject, useEffect, useMemo, useRef, useState } from "react"
+import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from "react"
 import {
   AlertTriangle,
   ChevronRight,
@@ -22,7 +22,7 @@ import {
   isCustomPolicyRun,
   isRobotFreeRun,
   isSimRun,
-  motorFaultLabel,
+  robotReadiness,
   perRunFields,
   recordingCameraCount,
   type CameraSpec,
@@ -57,7 +57,7 @@ import { ElapsedTime, OperationIcon, StartupBar } from "@/components/operation-l
 import { useStartupView } from "@/lib/operation-progress"
 import type { CatalogEntry } from "@/lib/operation-catalog"
 
-const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse", "ultimate"])
+const MANTIS_TRACKER_SOURCES = new Set<MantisTrackerSource>(["quest", "lighthouse"])
 
 function isMantisTrackerSource(value: string): value is MantisTrackerSource {
   return MANTIS_TRACKER_SOURCES.has(value as MantisTrackerSource)
@@ -108,6 +108,7 @@ export function OperationPanel({
   onStart,
   onStop,
   onEpisode,
+  workspace,
 }: {
   /** How the app presents the operation: its icon and name. */
   entry: CatalogEntry
@@ -158,6 +159,9 @@ export function OperationPanel({
   onStart: () => void
   onStop: () => void
   onEpisode: (command: string) => void
+  /** The operation's own screen (Jog's 3D view and controls), shown
+   *  below the run details. */
+  workspace?: ReactNode
 }) {
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
@@ -353,12 +357,9 @@ export function OperationPanel({
   // the Axol connection/fault gates below; it is not a general hardware-free
   // signal.
   const robotFree = mantisMode || armsOff || isRobotFreeRun(meta, effectiveSettings, savedValues)
-  const robotOk = robot?.state === "connected"
-  const axolOk = robotOk && (robot?.profile ?? "axol") === "axol"
-  const mantisOk = robotOk && robot?.profile === "mantis"
   // `usesHeadset` also identifies operations that run the camera relay. The
   // relay is useful in the panel for every real teleop/collection run,
-  // including headset-free Lighthouse/Ultimate Mantis collection. Mantis
+  // including headset-free Lighthouse Mantis collection. Mantis
   // teleop is grippers-only: no VR server or cameras run, so no feeds; an
   // arms-off (Jelly-only) teleop relays no headset video either.
   const showFeeds = meta.usesHeadset && !isSim && !armsOff && !(mantisMode && meta.id === "teleop")
@@ -375,25 +376,14 @@ export function OperationPanel({
   if (!live && needsMount && !mantisMode && meta.requiresRobot && !robotFree) {
     blockers.push("Choose what Axol is mounted on")
   }
-  if (meta.requiresRobot && mantisMode && !mantisOk) {
-    blockers.push(
-      robotOk && robot?.profile !== "mantis" ? "Connect Mantis instead of Axol" : "Connect Mantis"
-    )
-  } else if (meta.requiresRobot && !robotFree && !axolOk) {
-    blockers.push(
-      robotOk && robot?.profile === "mantis" ? "Connect Axol instead of Mantis" : "Connect Axol"
-    )
-  }
-  // A faulted motor on the active hardware profile blocks the run (the server
-  // refuses it too). A Mantis run ignores stale Axol-arm faults while the Axol
-  // profile is showing, but once the Mantis link is selected its own gripper
-  // faults remain actionable.
-  const checkActiveProfileFaults = mantisMode ? mantisOk : !robotFree && axolOk
-  if (checkActiveProfileFaults) {
-    for (const f of robot?.faults ?? []) {
-      blockers.push(`Fix the motor fault on ${motorFaultLabel(f)}`)
-    }
-  }
+  blockers.push(
+    ...robotReadiness({
+      requiresRobot: meta.requiresRobot,
+      robotFree,
+      mantis: mantisMode,
+      robot,
+    }).blockers
+  )
   // Tracker setup gates a Mantis *collection* (the server refuses it too).
   // Mantis teleop never tracks — it drives the grippers from the rig
   // triggers over CAN — so tracker readiness is irrelevant to it.
@@ -430,24 +420,6 @@ export function OperationPanel({
       ) {
         trackerIssues.push("Validate Lighthouse tracking in Mantis settings")
       }
-    } else if (trackerSource === "ultimate") {
-      const status = currentTrackerReadiness.ultimate
-      if (!status.nativeDependencies) trackerIssues.push("Install the Ultimate HID libraries")
-      if (!status.pythonHid || !status.apiCompatible)
-        trackerIssues.push("Install Ultimate support in Mantis settings")
-      else if (!status.pinnedPyvut) trackerIssues.push("Repair Ultimate support in Mantis settings")
-      // An old pyvut that logs credentials is fixed by the same repair.
-      if (!status.logSuppression && !trackerIssues.some((i) => i.includes("Ultimate support")))
-        trackerIssues.push("Repair Ultimate support in Mantis settings")
-      if (!status.udevReady) trackerIssues.push("Install the Ultimate USB rule")
-      if (!status.operatorAccess) trackerIssues.push("Give this user access to the Ultimate dongle")
-      if (!status.dongleConnected) trackerIssues.push("Connect the Ultimate wireless dongle")
-      else if (status.endpointStatus !== "accessible")
-        trackerIssues.push("Reconnect the Ultimate dongle and close other apps that use it")
-      if (status.wifiConfig !== "valid")
-        trackerIssues.push("Fix the Ultimate Wi-Fi settings in Mantis settings")
-      if (!status.binding.complete)
-        trackerIssues.push("Identify the left and right Ultimate trackers")
     }
 
     const productionCollection = meta.id === "collect-data" && !settings.mantis_allow_uncalibrated
@@ -601,7 +573,7 @@ export function OperationPanel({
           {/* Sim has the browser viewer, an arms-off run has no video relay, and
               Mantis teleop is grippers-only (no cameras). Mantis collection
               still relays its configured camera feeds even when
-              Lighthouse/Ultimate make the headset unnecessary. */}
+              Lighthouse makes the headset unnecessary. */}
           {live && (meta.episodeControl || showFeeds || showSettings) && (
             <OperatorDeck
               label={meta.label}
@@ -621,7 +593,9 @@ export function OperationPanel({
             mantisSource={mantisSource}
             dataCollection={meta.id === "collect-data"}
             session={live ? session : null}
-            isSim={isSim}
+            // An operation with its own screen draws the sim robot there;
+            // only the others open the browser 3D viewer.
+            isSim={isSim && !workspace}
             host={host}
             viewerPort={viewerPort}
           />
@@ -697,6 +671,8 @@ export function OperationPanel({
               <ChevronRight className="size-4 shrink-0 text-white/25 group-hover:text-white/60" />
             </button>
           </Card>
+
+          {workspace}
         </>
       )}
     </div>
@@ -1383,10 +1359,6 @@ function EpisodeInputControl({
   )
 }
 
-function trackerLabelFor(source: string | null): string {
-  return source === "ultimate" ? "Ultimate" : "Lighthouse"
-}
-
 function RunningHints({
   usesHeadset,
   mantisMode,
@@ -1412,7 +1384,6 @@ function RunningHints({
   const grippersOnly = mantisMode && !dataCollection
   const questMantis = mantisMode && dataCollection && mantisSource === "quest"
   const managedMantis = mantisMode && dataCollection && !questMantis
-  const trackerLabel = trackerLabelFor(mantisSource)
   return (
     <div className="flex flex-col gap-3">
       {grippersOnly && (
@@ -1459,8 +1430,8 @@ function RunningHints({
       {managedMantis && (
         <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           <p>
-            This run uses {trackerLabel} tracking, with no headset. Turn on both trackers and keep
-            them in view. When both trackers and triggers are live, hold the rigs where you want to
+            This run uses Lighthouse tracking, with no headset. Turn on both trackers and keep them
+            in view. When both trackers and triggers are live, hold the rigs where you want to
             start. Squeeze both triggers, then release them to engage
             {dataCollection ? " and start a take" : ""}.
           </p>

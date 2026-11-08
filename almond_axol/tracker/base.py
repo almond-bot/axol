@@ -9,8 +9,7 @@ also needs the source-specific rigid tracker→gripper transform; without one,
 the single engage pose can align the rigs but cannot make later wrist motion
 mount-independent.
 
-Backends whose native world frame is z-up (libsurvive, and the Ultimate
-tracker's SLAM frame) convert through :func:`zup_to_yup_pos` /
+Backends whose native world frame is z-up (libsurvive) convert through :func:`zup_to_yup_pos` /
 :func:`zup_to_yup_quat`.
 """
 
@@ -170,8 +169,8 @@ class TrackerSource(abc.ABC):
     """A backend producing per-device 6-DOF poses in the y-up convention.
 
     Device keys are backend-native, stable identifiers (a libsurvive
-    tracker serial like ``LHR-E0FCD01B``, an Ultimate tracker MAC). The operator binds
-    them to the left/right rig sides once with ``axol tracker.identify``;
+    tracker serial like ``LHR-E0FCD01B``). The operator binds them to the
+    left/right rig sides once with ``axol tracker.identify``;
     the bridge then maps ``poses()[config.left]`` → ``l_ee`` etc.
     """
 

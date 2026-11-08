@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Mapping
 
-from ..constants import Joint
+from ..constants import GRIPPER_MAX_TORQUE, Joint
 from .bus import CanBus
 from .config import MotorParam, ParamSpec
 from .damiao import DamiaoMotor
@@ -134,7 +134,7 @@ class Motor:
         self._driver.set_feedback_callback(_cache_feedback)
 
     async def enable(self) -> None:
-        """Enable the motor and release the brake."""
+        """Enable the motor."""
         await self._driver.enable()
 
     async def attach(self, mode: ControlMode) -> None:
@@ -145,7 +145,7 @@ class Motor:
         it died mid-session). Re-reads the state needed for correct command
         scaling and verifies the motor is enabled, fault-free, and — where the
         hardware exposes a mode register (Damiao) — already in ``mode``. No
-        reset, brake, enable, or motion command is sent, so a motor holding
+        reset, enable, or motion command is sent, so a motor holding
         position keeps holding it throughout. In contrast,
         :meth:`set_control_mode` reboots MyActuator motors, dropping torque
         for ~2 s.
@@ -168,7 +168,7 @@ class Motor:
         self.mode = mode
 
     async def disable(self) -> None:
-        """Disable the motor and engage the brake."""
+        """Disable the motor (it goes limp)."""
         await self._driver.disable()
 
     async def is_holding(self) -> bool:
@@ -203,6 +203,18 @@ class Motor:
         # the await: the MyActuator driver sleeps out the ~2 s reboot before
         # returning, so no pre-reset frame can land later.
         self._position = None
+
+    async def set_direction_flag(self) -> bool:
+        """Set the motor's firmware direction flag if it needs it.
+
+        Call before zeroing the joint: the flag moves its zero. Returns True
+        when the flag was changed (the motor was reset to apply it).
+        """
+        changed = await self._driver.set_direction_flag()
+        if changed:
+            # The reset and the flipped reading both invalidate the cache.
+            self._position = None
+        return changed
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         """Set the active control mode.
@@ -250,7 +262,7 @@ class Motor:
     async def get_model(self) -> str | None:
         """Return the motor model string, or None if unsupported.
 
-        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``).
+        MyActuator: the model string read via 0xB5 (e.g. ``"RMD-X6-P20-60"``).
         Damiao: None — not exposed by the protocol.
         """
         return await self._driver.get_model()
@@ -514,13 +526,15 @@ class Motor:
         Args:
             position:   Target shaft position (rad)
             max_speed:  Maximum speed during the move (rad/s)
-            max_torque: Maximum output torque (Nm)
+            max_torque: Maximum output torque (Nm), clamped to
+                        ``GRIPPER_MAX_TORQUE``
         """
         if self.mode != ControlMode.POSITION_FORCE:
             raise RuntimeError(
                 f"{self.joint} is in mode {self.mode}, expected POSITION_FORCE. "
                 f"Call set_control_mode(ControlMode.POSITION_FORCE) first."
             )
+        max_torque = min(max_torque, GRIPPER_MAX_TORQUE)
         await self._driver.set_position_force(position, max_speed, max_torque)
 
     async def set_acceleration(

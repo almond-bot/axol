@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import queue
 import tempfile
 import threading
@@ -569,6 +570,8 @@ class EncoderShutdownTest(unittest.TestCase):
                 mock.call(("started",)),
             ],
         )
+        # The take left open at shutdown must not leave the collector off.
+        self.assertTrue(gc.isenabled())
 
 
 if __name__ == "__main__":

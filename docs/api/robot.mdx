@@ -401,7 +401,7 @@ Every joint defaults to `inf`, which leaves it uncapped. Box mode caps the wrist
 
 ### Grippers
 
-`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s). The gripper joint is fixed in the model, so the gripper's mass is included in `wrist_3.mass`.
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s). The gripper torque is capped at 5 Nm (`almond_axol.constants.GRIPPER_MAX_TORQUE`). A `torque_limit` above it raises `ValueError` when the config loads, and every gripper command is clamped to it. The gripper joint is fixed in the model, so the gripper's mass is included in `wrist_3.mass`.
 
 `AxolConfig.gripper` (below) sets which gripper is fitted: `"parallel"`, the stock two-finger gripper, or `"parcel"`, the hinged-plate parcel gripper. It sets which way each jaw's motor turns to close (`gripper_close_direction(gripper, is_left)`). Both parallel jaws close toward positive motor angles. The parcel gripper's right motor is mounted the other way round, so it closes toward negative angles.
 

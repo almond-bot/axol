@@ -117,6 +117,20 @@ describe("supervisor API client", () => {
     )
   })
 
+  it("sends the teleop stop choice for the arms", async () => {
+    await api.stopOperation()
+    await api.stopOperation("hold")
+    await api.stopOperationOrAsk()
+    const bodies = requests.map((item) => item.init?.body)
+    expect(bodies).toEqual([undefined, '{"arms":"hold"}', '{"arms":"ask"}'])
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => response({ needsChoice: true }))
+    )
+    expect(await api.stopOperationOrAsk()).toEqual({ needsChoice: true })
+  })
+
   it("surfaces server and invalid-host responses as useful errors", async () => {
     vi.stubGlobal(
       "fetch",

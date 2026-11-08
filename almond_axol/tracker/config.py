@@ -45,24 +45,14 @@ class TrackerConfig:
     """Backend selection and left/right device binding.
 
     Attributes:
-        backend: ``"survive"`` (Vive Tracker 3.0 via libsurvive),
-            ``"ultimate"`` (Vive Ultimate Tracker via the dongle), or
+        backend: ``"survive"`` (Vive Tracker 3.0 via libsurvive) or
             ``"synthetic"`` (generated motion for tests).
-        left:  Device key of the left-rig tracker (Lighthouse tracker serial /
-            Ultimate MAC), or ``None`` if unassigned.
+        left:  Device key of the left-rig tracker (Lighthouse tracker serial),
+            or ``None`` if unassigned.
         right: Device key of the right-rig tracker, or ``None``.
-        bindings: Per-backend device bindings. This lets the control panel
-            switch between Lighthouse and Ultimate without applying device
-            identifiers from one tracker system to the other. ``left`` and
-            ``right`` remain the active backend's binding for compatibility.
-        ultimate_quat_order: Component order of the quaternion in the
-            Ultimate dongle's pose reports (``"xyzw"`` or ``"wxyz"``).
-            The pinned pyvut runtime reports ``"wxyz"``.
-            Verify at bring-up: hold a tracker still and level; the
-            streamed orientation must be near-identity after conversion.
-        ultimate_up_axis: Up axis of the Ultimate tracker's SLAM world
-            frame (``"z"`` or ``"y"``). ``"z"`` converts through the z-up →
-            y-up basis change; ``"y"`` passes through. Verify at bring-up.
+        bindings: Per-backend device bindings, keyed by hardware backend.
+            ``left`` and ``right`` remain the active backend's binding for
+            compatibility.
         trigger_can_left:  SocketCAN interface of the left rig's trigger
             node, defaulting to the Mantis rig's left gripper bus — the
             only bus a trigger node ever sits on. Set it to ``None`` for a
@@ -93,8 +83,6 @@ class TrackerConfig:
     left: str | None = None
     right: str | None = None
     bindings: dict[str, dict[str, str | None]] = field(default_factory=dict)
-    ultimate_quat_order: str = "wxyz"
-    ultimate_up_axis: str = "z"
     trigger_can_left: str | None = CAN_MANTIS_LEFT
     trigger_can_right: str | None = CAN_MANTIS_RIGHT
     trigger_full_scale_left: float = 1.0
@@ -109,6 +97,10 @@ class TrackerConfig:
 # names the dongle slot in open order and can swap between runs, which bound
 # each rig to the other's tracker.
 _SURVIVE_CODENAME = re.compile(r"[A-Z]+[0-9]*")
+
+
+_RETIRED_BACKENDS = ("ultimate",)
+_RETIRED_FIELDS = ("ultimate_quat_order", "ultimate_up_axis")
 
 
 def _is_survive_codename(key: object) -> bool:
@@ -133,6 +125,26 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
         if data.get(key) in old_channels:
             data[key] = old_channels[data[key]]
             migrated = True
+
+    # Fields and bindings of the retired VIVE Ultimate backend: drop them and
+    # fall back to Lighthouse so the file only names supported trackers.
+    for key in _RETIRED_FIELDS:
+        if key in data:
+            del data[key]
+            migrated = True
+    bindings = data.get("bindings")
+    if isinstance(bindings, dict):
+        for backend in _RETIRED_BACKENDS:
+            if backend in bindings:
+                del bindings[backend]
+                migrated = True
+    if data.get("backend") in _RETIRED_BACKENDS:
+        survive = bindings.get("survive") if isinstance(bindings, dict) else None
+        survive = survive if isinstance(survive, dict) else {}
+        data["backend"] = "survive"
+        data["left"] = survive.get("left")
+        data["right"] = survive.get("right")
+        migrated = True
 
     known = {f for f in TrackerConfig.__dataclass_fields__}
     config = TrackerConfig(**{k: v for k, v in data.items() if k in known})
@@ -171,7 +183,7 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
             if _is_survive_codename(getattr(config, side)):
                 setattr(config, side, None)
                 migrated = True
-    if config.backend in {"survive", "ultimate"} and (
+    if config.backend == "survive" and (
         config.left is not None or config.right is not None
     ):
         binding = {"left": config.left, "right": config.right}
@@ -195,7 +207,7 @@ def save_tracker_config(
     config.trigger_full_scale_right = validate_trigger_full_scale(
         config.trigger_full_scale_right
     )
-    if config.backend in {"survive", "ultimate"}:
+    if config.backend == "survive":
         config.bindings[config.backend] = {
             "left": config.left,
             "right": config.right,

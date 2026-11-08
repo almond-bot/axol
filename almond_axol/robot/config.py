@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal, get_args
 
-from ..constants import ARM_JOINTS, Joint
+from ..constants import ARM_JOINTS, GRIPPER_MAX_TORQUE, Joint
 from ..motor.motor import _JOINT_CONFIG
 from .calibration import (
     CALIBRATION_PATH,
@@ -255,7 +255,7 @@ class JointConfig:
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
-                  ``*_w2``).
+                  ``*_w2``) and the Camera Kit wrist camera and mount.
         com:      Centre of mass of the same body, in the body's URDF link
                   frame (m).
         j_eff:    Effective scalar inertia (kg·m²) for acceleration
@@ -487,15 +487,27 @@ class PositionForceConfig:
     """Position-force control parameters.
 
     Attributes:
-        torque_limit: Peak output torque (Nm).
+        torque_limit: Peak output torque (Nm), at most ``GRIPPER_MAX_TORQUE``.
         max_speed:    Maximum joint speed (rad/s).
     """
 
     torque_limit: float
     max_speed: float
 
+    def __post_init__(self) -> None:
+        if not self.torque_limit <= GRIPPER_MAX_TORQUE:
+            raise ValueError(
+                f"Gripper torque limit {self.torque_limit} Nm is above the "
+                f"{GRIPPER_MAX_TORQUE:g} Nm maximum. Set it to "
+                f"{GRIPPER_MAX_TORQUE:g} or lower."
+            )
+
 
 GripperType = Literal["parallel", "parcel"]
+
+#: wrist_3's default mass (kg, gripper included) with the parcel gripper
+#: fitted, in place of the stock gripper's ``ArmConfig().wrist_3.mass``.
+PARCEL_WRIST_3_MASS = 0.6
 GRIPPER_TYPES: tuple[str, ...] = get_args(GripperType)
 
 
@@ -1313,6 +1325,83 @@ def _on_position_loops(arm: ArmConfig) -> ArmConfig:
 
 
 @dataclass
+class WristThermalConfig:
+    """Temperature limit for the Damiao wrists (``wrist_2`` and ``wrist_3``).
+
+    The DM-J4310 is rated for 3.5 Nm continuous. Held past that (leaning on a
+    box, pressing on something), its coil heats until the motor's own
+    over-temperature protection (``OT_VALUE``, 100 °C on Axol) or the
+    driver's 120 °C cutoff turns it off and the wrist goes limp. The
+    realtime core reads the coil and driver temperatures every Damiao
+    feedback frame carries and, once either reaches its limit, ramps that
+    wrist's spring-torque cap down over ``ramp_s`` to ``cool_torque_nm`` and
+    holds it there until both have cooled to their resume temperatures. The
+    cap then ramps back up over ``ramp_s`` and lifts. Gravity feedforward is
+    outside the cap, so the wrist still carries the gripper. Box mode's
+    ``box_wrist_torque`` and a joint's ``torque_limit`` still apply; the
+    lowest cap wins. Impedance (``wire_mode`` ``"mit"``) wrists only.
+
+    Attributes:
+        enabled:          ``False`` turns the limit off.
+        coil_limit_c:     Coil temperature (°C) that starts the cool-down.
+        coil_resume_c:    Coil temperature (°C) the cool-down waits for.
+        driver_limit_c:   Driver (MOSFET) temperature (°C) that starts it.
+        driver_resume_c:  Driver temperature (°C) the cool-down waits for.
+        cool_torque_nm:   Spring-torque cap (Nm) while cooling: well under
+                          the rated 3.5 Nm, so the motor sheds heat.
+        ramp_s:           Seconds over which the cap ramps down at the limit
+                          and back up after the cool-down.
+    """
+
+    enabled: bool = True
+    # A wrist stalled near its peak torque heats its coil ~5 °C/s: 85 °C and
+    # a 2 s ramp let it reach 95 °C before the cap was down, and the motor's
+    # own 100 °C cutoff soon after. 75 °C and 0.25 s leave ~25 °C of margin.
+    coil_limit_c: float = 75.0
+    coil_resume_c: float = 65.0
+    driver_limit_c: float = 105.0
+    driver_resume_c: float = 95.0
+    cool_torque_nm: float = 1.5
+    ramp_s: float = 0.25
+
+    def __post_init__(self) -> None:
+        values = (
+            self.coil_limit_c,
+            self.coil_resume_c,
+            self.driver_limit_c,
+            self.driver_resume_c,
+            self.cool_torque_nm,
+            self.ramp_s,
+        )
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError(f"wrist_thermal values must be finite, got {values}")
+        if self.coil_resume_c >= self.coil_limit_c:
+            raise ValueError(
+                f"wrist_thermal.coil_resume_c ({self.coil_resume_c:g}) must be "
+                f"below coil_limit_c ({self.coil_limit_c:g})"
+            )
+        if self.driver_resume_c >= self.driver_limit_c:
+            raise ValueError(
+                f"wrist_thermal.driver_resume_c ({self.driver_resume_c:g}) must be "
+                f"below driver_limit_c ({self.driver_limit_c:g})"
+            )
+        if self.cool_torque_nm <= 0.0:
+            raise ValueError("wrist_thermal.cool_torque_nm must be positive")
+        if self.ramp_s < 0.0:
+            raise ValueError("wrist_thermal.ramp_s must not be negative")
+
+    def config_line(self) -> str:
+        """The realtime core's ``thermal`` config line."""
+        if not self.enabled:
+            return "thermal off"
+        return (
+            f"thermal {self.coil_limit_c} {self.coil_resume_c} "
+            f"{self.driver_limit_c} {self.driver_resume_c} "
+            f"{self.cool_torque_nm} {self.ramp_s}"
+        )
+
+
+@dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
 
@@ -1387,6 +1476,8 @@ class AxolConfig:
                          on alternate ticks (``tune.motion --impedance-hz
                          480``) — an experiment: their gains, host damping
                          and feedforward were tuned at 240.
+        wrist_thermal:   Temperature limit for the Damiao wrists — see
+                         :class:`WristThermalConfig`. On by default.
     """
 
     left: ArmConfig = field(
@@ -1402,6 +1493,7 @@ class AxolConfig:
     right_stiffness: float | list[float] = 1.0
     controller: str = "impedance"
     impedance_hz: float = IMPEDANCE_LOOP_HZ
+    wrist_thermal: WristThermalConfig = field(default_factory=WristThermalConfig)
 
     @property
     def loop_hz(self) -> float:
@@ -1428,6 +1520,23 @@ class AxolConfig:
             raise ValueError(
                 f"gripper must be one of {list(GRIPPER_TYPES)}, got {self.gripper!r}"
             )
+        if self.gripper == "parcel" and self.has_gripper:
+            # wrist_3's mass lumps in the gripper. The coded default is the
+            # stock (parallel) gripper's; a wrist_3 still on it runs the
+            # parcel gripper's instead. Any other mass was set on purpose
+            # (panel, calibration.json, a flag) and is kept.
+            stock = ArmConfig().wrist_3.mass
+            for side in ("left", "right"):
+                arm = getattr(self, side)
+                if math.isclose(arm.wrist_3.mass, stock, abs_tol=1e-9):
+                    setattr(
+                        self,
+                        side,
+                        replace(
+                            arm,
+                            wrist_3=replace(arm.wrist_3, mass=PARCEL_WRIST_3_MASS),
+                        ),
+                    )
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.

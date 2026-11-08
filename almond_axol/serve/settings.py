@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..constants import GRIPPER_MAX_TORQUE
 from ..tracker.trigger import validate_trigger_full_scale
 from ..utils.can_channels import require_distinct_axol_channels, require_mantis_channels
 from ..utils.paths import almond_path
@@ -64,6 +65,8 @@ _logger = logging.getLogger(__name__)
 
 SETTINGS_PATH = almond_path("settings.json")
 SETTINGS_VERSION = 2
+# Pose sources Mantis data collection supports (``mantis.source``).
+MANTIS_SOURCES = ("lighthouse", "quest")
 
 # The built-in operations, whose dotted config paths the tables below spell
 # out. A registered operation joins the same tables through its
@@ -197,6 +200,21 @@ SECTIONS: tuple[Section, ...] = (
 )
 
 _SECTIONS_BY_KEY: dict[str, Section] = {s.key: s for s in SECTIONS}
+
+
+def _validate_gripper_torque(key: str, value: Any) -> float:
+    """Reject a gripper torque limit that isn't a number in (0, max]."""
+    side = "Left" if ".left." in key else "Right"
+    try:
+        torque = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{side} gripper torque limit must be a number.") from None
+    if not 0 < torque <= GRIPPER_MAX_TORQUE:
+        raise ValueError(
+            f"{side} gripper torque limit must be above 0 and at most "
+            f"{GRIPPER_MAX_TORQUE:g} Nm."
+        )
+    return torque
 
 
 @dataclass(frozen=True)
@@ -451,13 +469,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="axol.left.gripper.torque_limit",
                 label="Left gripper torque limit (Nm)",
                 type="number",
-                help="Peak output torque of the left gripper.",
+                help="Peak output torque of the left gripper, up to 5 Nm.",
             ),
             SettingDef(
                 key="axol.right.gripper.torque_limit",
                 label="Right gripper torque limit (Nm)",
                 type="number",
-                help="Peak output torque of the right gripper.",
+                help="Peak output torque of the right gripper, up to 5 Nm.",
             ),
             SettingDef(
                 key="axol.left.gripper.max_speed",
@@ -566,9 +584,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="boolean",
                 help=(
                     "Drive Jelly's wheels when they are attached. The left stick moves "
-                    "the base and the right stick turns it. Jelly's "
-                    "motion is never recorded or driven by a policy. Set speeds and "
-                    "heading hold in Jelly's Parameters tab."
+                    "the base and the right stick turns it. A policy never drives "
+                    "Jelly. To record the lift and wheels, turn on Record Jelly. Set "
+                    "speeds and heading hold in Jelly's Parameters tab."
                 ),
             ),
             SettingDef(
@@ -592,12 +610,12 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="mantis.source",
                 label="Mantis tracking",
                 type="select",
-                options=("lighthouse", "ultimate", "quest"),
+                options=MANTIS_SOURCES,
                 help=(
                     "How Mantis data collection tracks the rigs. Quest uses the "
-                    "headset's controllers, and Lighthouse and Ultimate use VIVE "
-                    "trackers. Mantis teleop doesn't track the rigs. The triggers "
-                    "drive the grippers."
+                    "headset's controllers, and Lighthouse uses VIVE trackers. "
+                    "Mantis teleop doesn't track the rigs. The triggers drive the "
+                    "grippers."
                 ),
                 targets={
                     "collect-data": ("mantis_source",),
@@ -701,6 +719,45 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 ),
             ),
             SettingDef(
+                key="teleop.haptics",
+                label="Controller haptics",
+                type="boolean",
+                help=(
+                    "Vibrates a Quest controller while its arm is engaged and pushes "
+                    "on something. Turn off for silent controllers."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_near",
+                label="Ticks near the body",
+                type="boolean",
+                help=(
+                    "Also ticks a controller, faster as its arm gets close to "
+                    "Axol's body."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_torque",
+                label="Haptic push torque (Nm)",
+                type="number",
+                help=(
+                    "How much unexpected joint torque (Nm) makes a controller start "
+                    "to rumble. The rumble is strongest at 2.5 times this value. "
+                    "Raise it if the controllers rumble during normal moves. Set 0 "
+                    "to turn the rumble off."
+                ),
+            ),
+            SettingDef(
+                key="teleop.haptic_held_load",
+                label="Ignore held weight",
+                type="boolean",
+                help=(
+                    "Keeps the weight of what a gripper holds from making its "
+                    "controller rumble. Pushing on something still rumbles, and so "
+                    "does squeezing a box hard in box mode."
+                ),
+            ),
+            SettingDef(
                 key="teleop.park_to_zero",
                 label="Park to zero on stop",
                 type="boolean",
@@ -724,11 +781,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box mode at startup",
                 type="boolean",
                 help=(
-                    "Start sessions in box mode. The grippers clamp a box between them "
-                    "like two flat hands, and one controller moves both arms while "
-                    "keeping them level. The thumbsticks set the clamp width while you "
-                    "lead, and drive the base while the arms are frozen. Toggle it "
-                    "from the headset menu or by clicking both thumbsticks, which "
+                    "Start sessions in box mode, where the grippers clamp a box like two "
+                    "flat hands and one controller moves and turns both arms. "
+                    "While you lead, push the right thumbstick forward or back to set the "
+                    "clamp width. The rest of the thumbsticks drive the base as usual. "
+                    "Toggle it from the headset menu or by clicking both thumbsticks, which "
                     "engages the arms right away."
                 ),
                 targets={
@@ -759,10 +816,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="select",
                 options=("straight", "flush"),
                 help=(
-                    "The grasp box mode starts in. straight (the default) points the "
-                    "fingers forward and measures the width between the mounts. flush "
-                    "turns each gripper 39° inward about its contact face and measures "
-                    "the width between the faces. In the headset, click either "
+                    "The grasp box mode starts in. straight (the default) holds the "
+                    "box on the front of the fixed blades, in front of the grippers. "
+                    "flush turns each gripper 39° inward. In the headset, tap either "
                     "thumbstick while leading to switch."
                 ),
                 targets={
@@ -776,15 +832,30 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Box-mode elbows out (°)",
                 type="number",
                 help=(
-                    "How far out box mode holds the elbows, from 0 (hanging straight "
-                    "down) to 90 (out level). This is the starting value. In the "
-                    "headset, push either thumbstick forward to move the elbows apart "
-                    "or back to bring them in, and the value you end with is saved "
-                    "here."
+                    "How far out box mode holds the elbows: 0 keeps them tucked beside "
+                    "the body, so they go back instead of out when you pull a box in, "
+                    "and 90 holds them out level. "
+                    "This is the starting value. Change it during a session with "
+                    "Elbows out in the headset's session settings."
                 ),
                 targets={
                     "teleop": ("teleop.box_elbow_out",),
                     "collect-data": (f"{_VRT}.box_elbow_out",),
+                },
+            ),
+            SettingDef(
+                key="teleop.box_stow_height",
+                ui=_parcel_only(),
+                label="Box-mode stow height (m)",
+                type="number",
+                help=(
+                    "How far below the shoulders the box is held when you press A "
+                    "to stow it. The arms square the box up, bring it in to the "
+                    "chest at this height, then hold it so you can drive."
+                ),
+                targets={
+                    "teleop": ("teleop.box_stow_height",),
+                    "collect-data": (f"{_VRT}.box_stow_height",),
                 },
             ),
             SettingDef(
@@ -1043,6 +1114,17 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "of the 7 joint angles. Must match between data collection "
                     "and running the policy."
                 ),
+            ),
+            SettingDef(
+                key="recording.record_jelly",
+                label="Record Jelly",
+                type="boolean",
+                help=(
+                    "Also record Jelly's lift height and wheel positions in each "
+                    "frame, for Axol on Jelly. Collect data won't start while "
+                    "Jelly's lift or wheels are off."
+                ),
+                targets={"collect-data": ("record_jelly",)},
             ),
             SettingDef(
                 key="recording.vcodec",
@@ -1575,6 +1657,7 @@ class SettingsStore:
                     for key, value in flat.items():
                         for canonical in canonical_keys(key):
                             values[canonical] = value
+                self._repair_mantis_source(values)
                 if not self._strict:
                     self._repair_axol_channels(values)
                 return {"values": values, "cameras": raw.get("cameras")}
@@ -1585,6 +1668,24 @@ class SettingsStore:
                 raise
             _logger.exception("failed to load %s; starting empty", self._path)
         return {"values": {}, "cameras": None}
+
+    def _repair_mantis_source(self, values: dict[str, Any]) -> None:
+        """Drop a saved Mantis source that is not a supported option.
+
+        A file can still name a retired source (``ultimate``). Passing it on
+        would fail every collect-data config parse, so fall back to the
+        default source (logged, not rewritten until the next save).
+        """
+        source = values.get("mantis.source")
+        if source is None or source in MANTIS_SOURCES:
+            return
+        _logger.warning(
+            "ignoring Mantis tracking source %r saved in %s; using the default "
+            "until Settings → Mantis tracking is saved",
+            source,
+            self._path,
+        )
+        values.pop("mantis.source")
 
     def _repair_axol_channels(self, values: dict[str, Any]) -> None:
         """Drop a persisted Axol arm map that the store would refuse to save.
@@ -1695,6 +1796,16 @@ class SettingsStore:
                         incoming[key] = validate_trigger_full_scale(value)
                     except (TypeError, ValueError) as exc:
                         raise ValueError(f"{key}: {exc}") from exc
+                if key.endswith("gripper.torque_limit") and value is not None:
+                    incoming[key] = _validate_gripper_torque(key, value)
+                if (
+                    key == "mantis.source"
+                    and value is not None
+                    and value not in MANTIS_SOURCES
+                ):
+                    raise ValueError(
+                        f"{key} must be one of {', '.join(MANTIS_SOURCES)}"
+                    )
             values = incoming
         with self._lock:
             if (
@@ -1895,7 +2006,7 @@ class SettingsStore:
                 merged[f"{_ROBOT}.left_channel"] = left
                 merged[f"{_ROBOT}.right_channel"] = right
         # The curated Quest datum is intentionally source-scoped. Without
-        # this removal, switching the UI to Lighthouse/Ultimate would keep a
+        # this removal, switching the UI to Lighthouse would keep a
         # Quest key as an explicit override and prevent those tracker-specific
         # transforms from resolving. Request args below may still make an
         # intentional one-run override. (Teleop never receives tracking keys:

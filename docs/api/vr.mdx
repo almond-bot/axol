@@ -49,11 +49,15 @@ async with VRServer() as vr:
 | `reset` | `bool` | A rising edge starts a return to rest. |
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION` or `RECORDING`, set by the headset. `SAVING` and `ERROR` are only pushed by the server. |
 | `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick (right is `+1`, forward is `-1`). Drives [Jelly](/guides/vr-interface#jelly)'s translation when one is configured. |
-| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Drives Jelly's rotation. |
-| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Used only in [box mode](/guides/vr-interface#box-mode), where it moves the elbows. |
-| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Left lowers Jelly's lift and right raises it. See the notes below for box mode. |
+| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right is `+1`). Turns Jelly. |
+| `r_stick_y` | `float [-1, 1]` | Right thumbstick y (forward is `-1`). Runs Jelly's lift: forward raises it and back lowers it. In [box mode](/guides/vr-interface#box-mode) it sets the grip width while a grip leads. |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press. Used in box mode. See the notes below. |
 
-In box mode, while a grip leads the pair, a single click of either thumbstick toggles the grasp (`box_grasp`). With the pair frozen, the thumbsticks drive Jelly as usual. Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
+Each push of the right thumbstick either turns Jelly or runs the lift. The direction you push first decides which, until the stick returns to center.
+
+In box mode, the thumbsticks drive Jelly as usual, led or frozen. The right thumbstick's forward and back sets the grip width, so the clicks run the lift: hold the right click to raise it and the left click to lower it. While a grip leads the pair, a quick tap of either thumbstick click toggles the grasp (`box_grasp`). A tap is released within about 0.3 s, with the other stick up. A longer hold runs the lift.
+
+Pressing both thumbsticks together, within about 0.35 s, toggles box mode. The headset sends that toggle as a `set` message, described under [Live session settings](#live-session-settings).
 
 The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so a client that leaves them out still works.
 
@@ -65,7 +69,7 @@ The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so 
 | `seq` | `int \| None` | Frame counter set by the producer. With `pose_source_id`, it drops duplicate copies of a frame that arrive over different transports. |
 | `t_host` | `float \| None` | When the poses were captured, on the host's `perf_counter` clock. The server fills it in from `t`. Mantis recordings align dataset rows to it. |
 | `pose_source_id` | `str \| None` | Stable ID of the producer, shared across its transports and reconnects. |
-| `pose_source_kind` | `"webxr" \| "tracker" \| None` | `webxr` for a Quest, `tracker` for a Lighthouse or Ultimate bridge. |
+| `pose_source_kind` | `"webxr" \| "tracker" \| None` | `webxr` for a Quest, `tracker` for a Lighthouse bridge. |
 | `l_pose_profile` / `r_pose_profile` | `str \| None` | WebXR input profile of each Quest controller, such as `oculus-touch-v3`. Quest calibration is stored per profile. |
 | `l_pose_space` / `r_pose_space` | `"grip" \| "target-ray" \| None` | Which WebXR pose each Quest controller reports. Production Mantis needs the calibrated `grip` pose. |
 
@@ -74,8 +78,8 @@ The stick, click and `l_tracked` / `r_tracked` fields have neutral defaults, so 
 | Field | Type | Description |
 |---|---|---|
 | `l_trigger_live` / `r_trigger_live` | `bool` | Whether each Mantis trigger node is still sending input. When it stops, the take fails its quality check. Defaults to `True`. |
-| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` or `failure` signal from a trigger gesture. The outcome is logged but not saved in the dataset. |
-| `episode_end_t_host` | `float \| None` | Host time at which a saved episode should end. The tracker bridge sets it to the start of the end gesture, so the trigger clicks are trimmed from the take. |
+| `episode_outcome` | `VREpisodeOutcome \| None` | One-frame `success` or `failure` signal from a trigger gesture or the rig's side button. The outcome is logged but not saved in the dataset. |
+| `episode_end_t_host` | `float \| None` | Host time at which a saved episode should end. The tracker bridge sets it to the start of the end gesture or button press, so the trigger clicks are trimmed from the take. |
 | `lock_release_id` | `int \| None` | Handshake ID for tracker bridges. The teleop core echoes it once it has handled a grip release. |
 
 ### Set by the server
@@ -100,10 +104,10 @@ Every copy carries the same `pose_source_id` and `seq`, and the server handles e
 Only one producer controls the robot at a time. Other clients stay connected and still receive video, HUD state and the robot model, but the server ignores their frames and HUD controls.
 
 - **Managed Quest Mantis** sets `VRServerConfig.pose_source_kind="webxr"`.
-- **Managed Lighthouse or Ultimate Mantis** sets it to `"tracker"`, and gives the bridge and server a one-run `expected_pose_source_id`.
+- **Managed Lighthouse Mantis** sets it to `"tracker"`, and gives the bridge and server a one-run `expected_pose_source_id`.
 - **Without a pose source policy**, the first producer takes control. A tracker bridge can take over from a Quest. Once a tracker has control, the server doesn't fall back to a connected Quest if the bridge stops.
 
-A Lighthouse or Ultimate world isn't registered to the Quest's floor, so the headset hides the 3D robot overlay by default in those sessions.
+A Lighthouse world isn't registered to the Quest's floor, so the headset hides the 3D robot overlay by default in those sessions.
 
 The WebRTC data channel (`almond_axol.vr.control_channel`) uses the same ICE and TURN path as the camera video, so an operator outside your tailnet can drive through a relay. Set the TURN server with `AXOL_TURN_URL`, `AXOL_TURN_USERNAME` and `AXOL_TURN_PASSWORD`. On a LAN or plain tailnet, leave them unset. If the data channel fails or drops, the headset requests it again after a delay.
 
@@ -121,6 +125,7 @@ The server pushes JSON messages to the headset over the same socket.
 | `{"type": "episode", "value": N}` | At each episode start | Shows **Episode N** on the HUD. |
 | `{"type": "tracking", "value": true \| false}` | When tracking engages or disengages | The headset lets you move and resize camera screens only while tracking is off. |
 | `{"type": "joints", "value": {...}}` | About 20 times a second | Arm joint state for the HUD. |
+| `{"type": "haptics", "value": {...}}` | About 30 times a second while a controller vibrates, then once with all zeros | Vibrates the controllers. See [Haptics](#haptics). |
 
 Send any of these with `VRServer.broadcast_text()`. `AxolVRTeleop.send_feedback_state(state)` sends the `state` message for any `VRState`.
 
@@ -147,6 +152,25 @@ The `joints` message has this shape:
   - `width` is the grip width in metres, between the contact faces.
   - `tilt` is the pair's inward tilt in degrees, and `grasp` is `"flush"` or `"straight"`.
 
+### Haptics
+
+`VRTeleopCore.maybe_broadcast_haptics()` sends each controller's vibration levels. Both teleop adapters call it from the control loop.
+
+```json
+{
+  "type": "haptics",
+  "value": {
+    "left": {"near": 0.0, "force": 0.0},
+    "right": {"near": 0.6, "force": 0.0}
+  }
+}
+```
+
+- Each level runs from `0` to `1`, and only an engaged arm has non-zero levels. In box mode the leading controller gets the stronger of the two arms, and the other controller gets zeros.
+- `near` is how close the arm is to the IK's arm/body collision boundary, from the solver's `collision_proximity()`. It is `0` unless `haptic_near` is on. It is `1` where the IK holds the arm off the body instead of following the target. A pose as clear as the rest pose reads `0`.
+- `force` is how far the arm's largest torque residual (measured minus modeled gravity, low-passed over about 80 ms, less a held object's weight) is past `haptic_torque`. It reaches `1` at 2.5 times `haptic_torque`. A joint under a box-mode torque cap starts at 80% of its cap if that is lower, and reaches `1` at the cap. It is always `0` in sim.
+- `useAxolHaptics(wsRef)` in `@almond/axol-vr-client` plays them: `near` as ticks that speed up, and `force` as throbs that get stronger and faster with it, up to a steady rumble at `1`. The throbs take over from the ticks. It stops if the messages stop for 300 ms.
+
 The server also serves the robot model under `/urdf/` (`axol.urdf` and `meshes/*.stl`).
 
 ### Live session settings
@@ -171,6 +195,9 @@ Some settings can change during a session from any client: the headset HUD, the 
 | `box_squeeze_torque` | **Squeeze cap** | number, Nm | Hard shoulder torque cap in box mode. Hardware only. |
 | `reengage` | **Re-engage** | `"clutch"` / `"ramp"` | Calls `VRTeleopCore.set_reengage()`. Applies at the next grip press. |
 | `hold_to_engage` | **Hold to engage** | boolean | Grips act as per-arm dead-man switches instead of toggles. |
+| `haptics` | **Haptics** | boolean | Turns the [controller haptics](#haptics) on or off. |
+| `haptic_near` | **Body ticks** | boolean | Adds the ticks near the body (`near`). Off by default. |
+| `haptic_torque` | **Haptic push** | number, Nm | Torque residual at which the rumble starts. Hardware only, so it is hidden in sim. |
 | `gripper_torque` | **Grip force** | number, Nm | Torque limit of both grippers. Hardware only, so it is hidden in sim. |
 | `position_multiplier` | **Reach scale** | number, × | Scale from hand motion to arm motion. |
 | `teleop_max_vel` | **Arm speed** | number, rev/s | Joint velocity cap while tracking. |
@@ -239,8 +266,8 @@ This path needs the GPU camera stack that the host installer sets up:
 | `port` | `8000` | WSS listen port. |
 | `certfile` | auto | Path to the TLS certificate. `None` uses the generated certificate. |
 | `keyfile` | auto | Path to the TLS private key. |
-| `pose_source_kind` | `None` | Which kind of producer may control the robot: `"webxr"` (Quest Mantis) or `"tracker"` (Lighthouse or Ultimate). Other clients stay connected as viewers. |
-| `expected_pose_source_id` | `None` | The one producer ID allowed to control the robot. Managed Lighthouse and Ultimate sessions set it to a one-run token. |
+| `pose_source_kind` | `None` | Which kind of producer may control the robot: `"webxr"` (Quest Mantis) or `"tracker"` (Lighthouse). Other clients stay connected as viewers. |
+| `expected_pose_source_id` | `None` | The one producer ID allowed to control the robot. Managed Lighthouse sessions set it to a one-run token. |
 | `interp_enabled` | `True` | Turns on the playout buffer, which uses the headset timestamp `t` to smooth uneven frame arrival. |
 | `interp_min_delay_s` | `0.0` | Shortest playout delay, in seconds. |
 | `interp_max_delay_s` | `0.15` | Longest playout delay, in seconds. The buffer adds delay only while frames arrive in bursts. |

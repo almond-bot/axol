@@ -548,7 +548,7 @@ export function SettingsSection({
                   <p className="max-w-prose text-xs leading-relaxed text-white/40">
                     A fully pressed trigger should close the gripper. If a trigger&apos;s reading
                     peaks below 1.00, enter its peak here (for example, 0.90). These values apply to
-                    Mantis teleop and to Lighthouse and Ultimate data collection.
+                    Mantis teleop and to Lighthouse data collection.
                   </p>
                 </div>
                 {mantisTriggerFields.length > 0 ? (

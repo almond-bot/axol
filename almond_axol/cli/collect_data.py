@@ -233,7 +233,6 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
     from ..mantis.calibration import (
         INVALID_TRANSFORM_ENTRY,
         MANTIS_TCP_TRANSFORM_FILE,
-        STALE_TRANSFORM_ENTRY,
         design_transform_for,
         has_conflicting_transform_override,
         load_tcp_transforms,
@@ -320,11 +319,7 @@ def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
         authoritative = entries.get(key) if device_scoped else None
         blocked_override = (
             bool(document_errors)
-            or entry_statuses.get((side, key))
-            in {
-                STALE_TRANSFORM_ENTRY,
-                INVALID_TRANSFORM_ENTRY,
-            }
+            or entry_statuses.get((side, key)) == INVALID_TRANSFORM_ENTRY
             or has_conflicting_transform_override(
                 side,
                 key,
@@ -764,7 +759,7 @@ class CollectDataConfig:
     """Pose source for Mantis mode. Direct Mantis runs inherit the host's
     Settings → Mantis choice when saved; otherwise Lighthouse is the default.
     A config file or explicit CLI value wins. Quest connects through WebXR;
-    Lighthouse and Ultimate start the corresponding local tracker bridge."""
+    Lighthouse starts the local tracker bridge."""
     mantis_allow_uncalibrated: bool = False
     """Allow a Mantis dataset when either tracker→TCP transform is missing.
     Intended only for bring-up/calibration captures: the resulting Cartesian
@@ -817,6 +812,10 @@ class CollectDataConfig:
     # episodes read poses from joint encoders and always pass. A tracking
     # fault under the strict Lighthouse policy is refused regardless.
     qa_gate: bool = True
+    # Also record Jelly's lift height and wheel positions, as the
+    # ``observation.jelly`` column (see almond_axol.recording.jelly_state).
+    # Needs Axol on Jelly with its wheels and lift on. Ignored with Mantis.
+    record_jelly: bool = False
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
@@ -1652,6 +1651,28 @@ def _run_session(
     else:
         trace_prefix = None
 
+    # Jelly's lift and wheels are recorded only on the robot: a Mantis rig
+    # has no Jelly. Check the hardware before anything opens.
+    # getattr: a downstream package may hand in a config without the field.
+    want_jelly = bool(getattr(cfg, "record_jelly", False))
+    record_jelly = want_jelly and not mantis_mode
+    if want_jelly and mantis_mode:
+        _logger.warning("Record Jelly is on but ignored: Mantis has no Jelly.")
+    jelly_extra_features: dict[str, dict[str, Any]] = {}
+    jelly_state: Any = None
+    if record_jelly:
+        from ..recording.jelly_state import jelly_config_problem, jelly_features
+        from ..robot.jelly import detect_jelly
+
+        jelly_cfg = (
+            detect_jelly(cfg.teleop_config.jelly)
+            if isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+            else None
+        )
+        if (problem := jelly_config_problem(jelly_cfg)) is not None:
+            raise ValueError(problem)
+        jelly_extra_features = jelly_features()
+
     robot = (
         MantisRobot(cfg.robot_config, defer_gripper_enable=True)
         if mantis_mode
@@ -1714,7 +1735,7 @@ def _run_session(
         resume_extras = (
             {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
             if mantis_mode
-            else None
+            else dict(jelly_extra_features) or None
         )
         expected_resume_features = dataset_features_for_robot(
             robot,
@@ -1890,10 +1911,14 @@ def _run_session(
         extra_features = (
             {"observation.pose_lag": RESUME_FILLABLE_FEATURES["observation.pose_lag"]}
             if mantis_mode
-            else None
+            else dict(jelly_extra_features) or None
         )
         features = dataset_features_for_robot(robot, extra_features=extra_features)
         obs_keys = list(robot.get_joint_observation().keys())
+        if record_jelly:
+            from ..recording.jelly_state import JELLY_KEYS
+
+            obs_keys += list(JELLY_KEYS)
         action_keys = list(robot.action_features.keys())
         if is_complete:
             # External relay readers expose the actual downscaled dataset
@@ -1922,6 +1947,15 @@ def _run_session(
         # hand the teleoperator the arms now that the robot is up.
         teleop.live_settings.set_robot(robot.axol)
         teleop.measured_robot = robot.axol
+        if record_jelly:
+            # Jelly is up with the teleop. Every recorded row needs a lift and
+            # wheel reading, so wait for the first of each now.
+            from ..recording.jelly_state import JellyStateReader
+
+            if teleop.jelly is None:
+                raise RuntimeError("Record Jelly is on, but Jelly did not start.")
+            jelly_state = JellyStateReader(teleop.jelly)
+            jelly_state.wait_ready()
         try:
             activity.start()
         except OSError as exc:
@@ -1987,7 +2021,7 @@ def _run_session(
         "push_to_hub": push_to_hub,
         "log_level": cfg.log_level,
         # Tracked (VR) poses carry measurement noise the robot's encoder FK
-        # doesn't — smooth only Mantis episodes (see record_proc._maybe_smooth_episode).
+        # doesn't — smooth only Mantis episodes (see record_proc._adjust_episode_rows).
         "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
         # Which tracker→gripper transforms the recorded poses were mapped
         # through (meta/axol.json). A later constant change is migrated from
@@ -2420,7 +2454,7 @@ def _run_session(
             last_robot_act = robot_act
             last_dataset_act = dataset_act
             if not mantis_mode:
-                recorder.publish(joint_obs, dataset_act, row_ts)
+                recorder.publish(_with_jelly(joint_obs), dataset_act, row_ts)
             elif (
                 last_tcp is not None
                 and pose_ts is not None
@@ -2501,7 +2535,14 @@ def _run_session(
             if mantis_mode:
                 _publish_mantis_boundary(joint_obs)
             else:
-                recorder.publish(joint_obs, last_dataset_act, t0)
+                recorder.publish(_with_jelly(joint_obs), last_dataset_act, t0)
+
+        def _with_jelly(observation: dict[str, Any]) -> dict[str, Any]:
+            # Record Jelly: the lift and wheel readings ride along with the
+            # arm state into the observation.jelly column.
+            if jelly_state is None:
+                return observation
+            return {**observation, **jelly_state.read()}
 
         def _publish_mantis_boundary(gripper_obs: dict[str, Any]) -> None:
             # Closing capture may still consume final camera exposures. Their
@@ -2678,6 +2719,12 @@ def _run_session(
             # tick watchdog so a stall is attributed, not just detected.
             take_gc.begin(collect=False)
             tick_watchdog.resume()
+            if jelly_state is not None:
+                # Record Jelly: restart the wheel angles near zero for this
+                # episode. Zero before capture opens, so no recorded row can
+                # pair with a reading from before the reset; the recorder then
+                # shifts the saved rows so the first one is exactly zero.
+                jelly_state.zero_wheels()
             # Arm recorder cutoffs before opening the shared-timestamp
             # dataset valves. Both calls can wait for transport boundaries,
             # so run them off-loop while normal teleop ticks continue

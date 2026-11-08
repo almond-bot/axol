@@ -16,6 +16,7 @@ import {
   issueCanInventoryPoll,
   newCanInventoryPollSequence,
   nextAutoConnectAttempt,
+  robotLinkReleasable,
   shouldStartCanDiscovery,
   voidCanInventoryPolls,
 } from "../src/lib/can-auto-connect.ts"
@@ -48,13 +49,29 @@ test("CAN discovery blocks auto-connect while pending, unidentified, or errored"
 
 test("CAN discovery starts only from a known, idle, releasable link snapshot", () => {
   const needed = discovery("needed")
-  assert.equal(shouldStartCanDiscovery(needed, "disconnected", true, true), true)
-  assert.equal(shouldStartCanDiscovery(needed, "error", true, true), true)
-  assert.equal(shouldStartCanDiscovery(needed, "connected", true, true), false)
-  assert.equal(shouldStartCanDiscovery(needed, "disconnected", false, true), false)
-  assert.equal(shouldStartCanDiscovery(needed, "disconnected", true, false), false)
+  const axolOnly = {
+    axol: presence("can_alm_axol_l", "can_alm_axol_r", true),
+    mantis: presence("can_alm_mantis_l", "can_alm_mantis_r", false),
+  }
+  const start = (state, profile = "axol", profiles = axolOnly, known = true, idle = true) =>
+    shouldStartCanDiscovery(needed, robotLinkReleasable(state, profile, profiles), known, idle)
+  assert.equal(start("disconnected"), true)
+  assert.equal(start("error"), true)
+  assert.equal(start("connected"), false)
+  assert.equal(start("busy", "mantis"), false)
+  assert.equal(start("disconnected", "axol", axolOnly, false), false)
+  assert.equal(start("disconnected", "axol", axolOnly, true, false), false)
+  // A link left connected to an unplugged Mantis must not hold discovery of
+  // the Axol that replaced it.
+  assert.equal(start("connected", "mantis"), true)
+  assert.equal(start("connected", "mantis", null), false)
   assert.equal(
-    shouldStartCanDiscovery(discovery("unidentified"), "disconnected", true, true),
+    shouldStartCanDiscovery(
+      discovery("unidentified"),
+      robotLinkReleasable("disconnected"),
+      true,
+      true
+    ),
     false
   )
 })

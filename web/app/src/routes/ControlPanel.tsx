@@ -1,8 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react"
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react"
 import { Link, Navigate, useLocation, useNavigate } from "react-router-dom"
 import { ArrowRight, Camera, CircleAlert, Loader2, Plug, RefreshCw, ScrollText } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { DEFAULT_CAMERAS, loadCachedCameras, persistCachedCameras } from "@/lib/camera-cache"
+import { isLiveSession, operationToFollow } from "@/lib/session-follow"
 import {
+  ApiRequestError,
   HARDWARE_PROFILE_ARG,
   HARDWARE_PROFILE_SETTING,
   parseAxolModel,
@@ -12,7 +24,6 @@ import {
   OPERATIONS,
   fetchDatasets,
   cameraCount,
-  cameraSerials,
   canDiscoveryRequestCanRetry,
   clearOperationLockout,
   detectCameras,
@@ -27,7 +38,9 @@ import {
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
+  isRobotFreeRun,
   isSimRun,
+  robotReadiness,
   jellyConnect,
   jellyDisconnect,
   loadLocalHardwareProfile,
@@ -46,6 +59,7 @@ import {
   startOperation,
   startUpdate,
   stopOperation,
+  stopOperationOrAsk,
   usbConnect,
   useSessionLogs,
   type CameraDevice,
@@ -86,6 +100,7 @@ import {
   issueCanInventoryPoll,
   newCanInventoryPollSequence,
   nextAutoConnectAttempt,
+  robotLinkReleasable,
   shouldStartCanDiscovery,
   voidCanInventoryPolls,
 } from "@/lib/can-auto-connect"
@@ -118,18 +133,20 @@ import {
 import { LogConsole } from "@/components/log-console"
 import { DatasetPreview } from "@/components/dataset-preview"
 import { DataCollectionOffer } from "@/components/data-collection-offer"
-import { RequestDataPage } from "@/components/request-data"
+import { RequestPage } from "@/components/request-data"
 import { requestSource } from "@/lib/data-collection"
 import {
   deviceErrorText,
   discoveryNeedsRecheck,
   discoveryNotice,
+  jellyPresentOnCan,
   nextRecheckDelay,
   useSettledDiscovery,
 } from "@/lib/hardware-status"
 import { showsDatasetPreview } from "@/lib/dataset-operations"
 import { useStartupView } from "@/lib/operation-progress"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
+import { StopArmsDialog, type StopArmsChoice } from "@/components/stop-arms-dialog"
 import { SettingsSection } from "@/components/settings/settings-section"
 import { MountChooser, MountRequired } from "@/components/settings/mount-required"
 import {
@@ -157,6 +174,7 @@ type ControlView =
   | "operations"
   | "datasets"
   | "request-data"
+  | "request-teleoperator"
   | "devices"
   | "settings"
   | "logs"
@@ -166,6 +184,7 @@ const CONTROL_VIEWS: Record<string, ControlView> = {
   operations: "operations",
   datasets: "datasets",
   "request-data": "request-data",
+  "request-teleoperator": "request-teleoperator",
   devices: "devices",
   settings: "settings",
   logs: "logs",
@@ -177,50 +196,13 @@ function parseControlPath(pathname: string): { view: ControlView | null; rest: s
   return { view: CONTROL_VIEWS[section] ?? null, rest: rest ? decodeURIComponent(rest) : null }
 }
 
-const DEFAULT_CAMERAS: CameraSpec = {
-  serials: { overhead: "", left_arm: "", right_arm: "" },
-  mantis_serials: { overhead: "", left_arm: "", right_arm: "" },
-  stream_resolution: "SVGA",
-  record_resolution: "SVGA",
-  stream: {},
-  record: {},
-}
-
-function loadCameras(): CameraSpec {
-  try {
-    const raw = localStorage.getItem("axolCameraSpec")
-    if (raw) {
-      const parsed = JSON.parse(raw)
-      const serials = { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) }
-      return {
-        ...DEFAULT_CAMERAS,
-        ...parsed,
-        serials,
-        mantis_serials: cameraSerials({ serials, mantis_serials: parsed.mantis_serials }, true),
-        // Migrate the legacy single `resolution` to the streaming resolution.
-        stream_resolution:
-          parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
-        record_resolution: parsed.record_resolution ?? DEFAULT_CAMERAS.record_resolution,
-        // Migrate the earlier per-eye maps to the per-branch participation maps.
-        stream: { ...(parsed.stream ?? parsed.stream_eyes ?? {}) },
-        record: { ...(parsed.record ?? parsed.record_eyes ?? {}) },
-      }
-    }
-  } catch {
-    // ignore malformed storage
-  }
-  return DEFAULT_CAMERAS
-}
-
-function persistLocalCameras(spec: CameraSpec) {
-  try {
-    localStorage.setItem("axolCameraSpec", JSON.stringify(spec))
-  } catch {
-    // ignore storage failures
-  }
-}
-
 const SIM_ROBOT_KEY = "axolSimRobot"
+
+// Jog's 3D view and controls, loaded only when Jog is open.
+const JogWorkspace = lazy(() => import("@/components/jog/jog-workspace"))
+
+/** How long to wait before asking a host that failed to send its settings again. */
+const SETTINGS_RETRY_MS = 3000
 
 /** The sim robot this browser last picked, if it is still a valid one. */
 function loadSimRobot(): SimRobot | null {
@@ -249,12 +231,9 @@ export default function ControlPanel() {
     if (!outcome || handledCheckoutRef.current === location.search) return
     handledCheckoutRef.current = location.search
     if (outcome === "paid") {
-      toast.success(
-        "Payment received. Almond will contact you by email to plan your Teleop Data Collection.",
-        12000
-      )
+      toast.success("Payment received. Almond will email you to schedule the work.", 12000)
     } else if (outcome === "cancelled") {
-      toast.info("Teleop Data Collection request cancelled. You weren't charged.")
+      toast.info("Request cancelled. You weren't charged.")
     }
     params.delete("data_collection")
     const search = params.toString()
@@ -349,10 +328,14 @@ export default function ControlPanel() {
   }, [])
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
-  const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  // The camera spec of the connected host. The host's settings are the source
+  // of truth; this browser's per-host copy fills in while they load.
+  const [cameras, setCameras] = useState<CameraSpec>(() => loadCachedCameras(serverHost))
+  // The host the camera spec belongs to, for this browser's per-host copy.
+  const cameraHostRef = useRef(serverHost)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
-  // until fetched. settingsError marks a host too old for the settings API —
-  // cameras then fall back to the legacy localStorage flow.
+  // until fetched. settingsError marks a host too old for the settings API
+  // (it answers 404); cameras then fall back to the legacy localStorage flow.
   const [settingsSnap, setSettingsSnap] = useState<SettingsSnapshot | null>(null)
   const [settingsError, setSettingsError] = useState<string | null>(null)
   // The system-wide device selection (Axol or Mantis) that every operation
@@ -399,6 +382,8 @@ export default function ControlPanel() {
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
+  // Teleop's Stop asks what the arms do when they are away from rest.
+  const [stopChoiceOpen, setStopChoiceOpen] = useState(false)
   // The settings tab lives in the URL (/control/settings/<tab>) so it can be
   // linked and survives a reload; the last one seen reopens from the sidebar.
   const urlSettingsTab = view === "settings" ? pathRest : null
@@ -418,6 +403,12 @@ export default function ControlPanel() {
   const [connectionGeneration, setConnectionGeneration] = useState(0)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
+  // The session on screen, read by the session poll to spot a run started
+  // from another browser.
+  const shownSessionIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    shownSessionIdRef.current = session?.id ?? null
+  }, [session?.id])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -439,49 +430,64 @@ export default function ControlPanel() {
     }
   }, [])
 
-  // Pull the shared settings from the serve host. A host whose stored camera
-  // spec is empty gets this browser's legacy localStorage spec migrated up
-  // once, so nobody has to re-enter serials after updating.
-  const loadSettings = useCallback(async (generation = connectionGenerationRef.current) => {
-    if (generation !== connectionGenerationRef.current) return
-    try {
-      const snap = await fetchSettings()
-      if (generation !== connectionGenerationRef.current) return
-      setSettingsError(null)
-      if (snap.cameras) {
-        setCameras(snap.cameras)
-        persistLocalCameras(snap.cameras)
-        setSettingsSnap(snap)
-      } else {
-        const local = loadCameras()
-        if (cameraCount(local) > 0) {
-          try {
-            if (generation !== connectionGenerationRef.current) return
-            await saveSettings({ cameras: local, camerasSet: true })
-            if (generation !== connectionGenerationRef.current) return
-            setSettingsSnap({ ...snap, cameras: local })
-          } catch {
-            if (generation !== connectionGenerationRef.current) return
-            setSettingsSnap(snap)
-          }
-        } else {
-          setSettingsSnap(snap)
-        }
-      }
-    } catch (e) {
-      if (generation !== connectionGenerationRef.current) return
-      // Old serve host without /api/settings: keep the localStorage camera
-      // flow; the settings dialog explains the needed update.
-      setSettingsSnap(null)
-      setSettingsError(String(e).replace(/^Error:\s*/, ""))
-    }
+  // Pull the shared settings from the serve host. Its camera spec is used as
+  // is: a host with none stored gets no cameras. This browser's spec is never
+  // written to a host on connect, since it may belong to another robot.
+  const settingsRetryRef = useRef<number | null>(null)
+  const cancelSettingsRetry = useCallback(() => {
+    if (settingsRetryRef.current !== null) window.clearTimeout(settingsRetryRef.current)
+    settingsRetryRef.current = null
   }, [])
+  useEffect(() => cancelSettingsRetry, [cancelSettingsRetry])
+  const loadSettings = useCallback(
+    async (generation = connectionGenerationRef.current): Promise<void> => {
+      if (generation !== connectionGenerationRef.current) return
+      cancelSettingsRetry()
+      const host = cameraHostRef.current
+      try {
+        const snap = await fetchSettings()
+        if (generation !== connectionGenerationRef.current) return
+        setSettingsError(null)
+        const hostCameras = snap.cameras ?? DEFAULT_CAMERAS
+        setCameras(hostCameras)
+        persistCachedCameras(host, hostCameras)
+        setSettingsSnap(snap)
+      } catch (e) {
+        if (generation !== connectionGenerationRef.current) return
+        // A host that answers 404 predates the settings store: it never held
+        // cameras, so it runs with this browser's copy (the settings dialog
+        // explains the update). Any other failure is a current host that did
+        // not answer, so only its own per-host copy may stand in.
+        const oldHost = e instanceof ApiRequestError && e.status === 404
+        setCameras(loadCachedCameras(host, { legacy: oldHost }))
+        setSettingsSnap(null)
+        if (oldHost) {
+          setSettingsError(String(e).replace(/^Error:\s*/, ""))
+          return
+        }
+        // A current host that did not answer is not treated as an old one:
+        // settings stay loading (and saves stay off) until a retry gets them.
+        setSettingsError(null)
+        settingsRetryRef.current = window.setTimeout(() => {
+          settingsRetryRef.current = null
+          void loadSettingsRef.current(generation)
+        }, SETTINGS_RETRY_MS)
+      }
+    },
+    [cancelSettingsRetry]
+  )
+  // The retry timer calls the latest loadSettings through this ref.
+  const loadSettingsRef = useRef(loadSettings)
+  useEffect(() => {
+    loadSettingsRef.current = loadSettings
+  }, [loadSettings])
 
   const loadServer = useCallback(
     async (host: string) => {
       const generation = ++connectionGenerationRef.current
       setConnectionGeneration(generation)
       setServerBase(host)
+      cameraHostRef.current = host
       setConn({ state: "loading" })
       // Hide all state owned by the previous host immediately. The generation
       // checks below also stop its in-flight responses from repopulating it.
@@ -517,6 +523,8 @@ export default function ControlPanel() {
       setPolicy(null)
       setBusy(false)
       setStartPhase(null)
+      cancelSettingsRetry()
+      setCameras(loadCachedCameras(host))
       setCameraDevices(null)
       setCameraDetectError(null)
       setCameraDetecting(false)
@@ -577,7 +585,7 @@ export default function ControlPanel() {
         })
         .catch(() => {})
     },
-    [refreshCameras, loadSettings]
+    [refreshCameras, loadSettings, cancelSettingsRetry]
   )
 
   useEffect(() => {
@@ -689,12 +697,17 @@ export default function ControlPanel() {
       fetchSessions()
         .then((sessions) => {
           if (!active) return
-          const liveSessions = sessions.filter(
-            (candidate) =>
-              candidate.status === "starting" ||
-              candidate.status === "running" ||
-              candidate.status === "stopping"
-          )
+          const liveSessions = sessions.filter(isLiveSession)
+          // Another browser may have started a run on this host: show it here
+          // too. Marking the runner busy hands it to the op-status poll, which
+          // then tracks it (episode controls, stop, lockout) like a local run.
+          const follow = operationToFollow(sessions, operationIds, shownSessionIdRef.current)
+          if (follow) {
+            shownSessionIdRef.current = follow.id
+            setSession(follow)
+            setSelectedOp(follow.command as OperationId)
+            setOpBusy(true)
+          }
           sessionInventoryKnownRef.current = true
           setSessionInventoryReady(true)
           setHardwareSessionBusy(liveSessions.length > 0)
@@ -963,8 +976,8 @@ export default function ControlPanel() {
     }
   }
 
-  // Persist a settings-dialog save: cameras also mirror to localStorage (the
-  // fallback for old hosts / offline), everything else goes to the serve host.
+  // Persist a settings-dialog save to the serve host. Cameras are also copied
+  // to this browser's per-host cache, the only store on hosts too old to have one.
   async function handleSettingsSave(
     patch: SettingsPatch,
     generation = connectionGenerationRef.current
@@ -982,7 +995,7 @@ export default function ControlPanel() {
       .map(([profile]) => profile)
     if (patch.cameras) {
       setCameras(patch.cameras)
-      persistLocalCameras(patch.cameras)
+      persistCachedCameras(cameraHostRef.current, patch.cameras)
     }
     if (settingsError) {
       // Old host: only the cameras section is editable, and it saved locally.
@@ -1085,12 +1098,17 @@ export default function ControlPanel() {
   // discovery report none: settled.)
   const canDiscoverySettled =
     canDiscovery == null || canDiscovery.status === "ready" || canDiscovery.status === "configured"
+  //
+  // Jelly's CAN interfaces being present is enough: Axol sits on Jelly even
+  // with its wheels and lift switched off in settings (which makes the host
+  // report the mount-derived model instead of "mobile").
   const needsMount =
     conn.state === "ok" &&
     canDiscoverySettled &&
     !settingsError &&
     hardwareProfile !== "mantis" &&
     settingsSnap?.robotModel !== "mobile" &&
+    jellyPresentOnCan(canDevices) !== true &&
     (settingsSnap?.schema ?? []).some((c) =>
       c.settings.some((f) => f.key === "kinematics.mount")
     ) &&
@@ -1109,9 +1127,7 @@ export default function ControlPanel() {
   // refetch whenever Jelly appears or goes, or discovery settles, so a Jelly
   // that comes up a moment after the panel connects turns the robot into
   // Axol on Jelly (and drops the "What is Axol mounted on?" pick) without a reload.
-  const jellyPresent = canDevices
-    ? Boolean(canDevices.wheels?.present || canDevices.lift?.present)
-    : null
+  const jellyPresent = jellyPresentOnCan(canDevices)
   const robotModelInputs = conn.state === "ok" ? `${jellyPresent}:${canDiscoverySettled}` : null
   const robotModelInputsRef = useRef<string | null>(null)
   useEffect(() => {
@@ -1387,10 +1403,11 @@ export default function ControlPanel() {
   // Hardware that is plugged in but silent is nearly always switched off, and
   // turning it on changes nothing the host can see. So check it again on its
   // own, backing off from 5 s to a minute, while nothing could be disturbed:
-  // the host idle and neither Axol nor Mantis connected (a check may briefly
-  // take an idle link down). With a link up, "Check again" does it by hand.
+  // the host idle and neither Axol nor Mantis connected, or the connected one
+  // unplugged (a check may briefly take an idle link down). With a link up to
+  // hardware that is still there, "Check again" does it by hand.
   const recheckDelayRef = useRef<number | null>(null)
-  const robotLinkFree = !robot || robot.state === "disconnected" || robot.state === "error"
+  const robotLinkFree = !robot || robotLinkReleasable(robot.state, robot.profile, canProfiles)
   const canRecheckOnItsOwn =
     conn.state === "ok" &&
     canDiscoveryNeedsRetry &&
@@ -1426,7 +1443,12 @@ export default function ControlPanel() {
     const idle = !hostBusy && !activeCommandSession && !robotBusy
     if (
       signature === null ||
-      !shouldStartCanDiscovery(canDiscovery, robot?.state, autoRobotPollStateKnown(), idle)
+      !shouldStartCanDiscovery(
+        canDiscovery,
+        robotLinkReleasable(robot?.state, robot?.profile, canProfiles),
+        autoRobotPollStateKnown(),
+        idle
+      )
     )
       return
 
@@ -1470,7 +1492,9 @@ export default function ControlPanel() {
     conn.state,
     currentCanServerEpoch,
     hostBusy,
+    canProfiles,
     installCanInventory,
+    robot?.profile,
     robot?.state,
     robotBusy,
     toast,
@@ -1947,14 +1971,56 @@ export default function ControlPanel() {
   async function handleStop() {
     const generation = connectionGenerationRef.current
     setBusy(true)
+    try {
+      // Teleop with the arms away from rest stops nothing yet: the operator
+      // picks what the arms do first (StopArmsDialog).
+      const stopped = await stopOperationOrAsk()
+      if (generation !== connectionGenerationRef.current) return
+      if ("needsChoice" in stopped) {
+        setStopChoiceOpen(true)
+        return
+      }
+      setSession(stopped)
+    } catch (e) {
+      if (generation !== connectionGenerationRef.current) return
+      toast.error(String(e))
+    } finally {
+      if (generation === connectionGenerationRef.current) setBusy(false)
+    }
+  }
+
+  // Stop teleop the way the operator chose. Gravity comp leaves the motors
+  // holding, waits for teleop to exit, then starts gravity compensation, so
+  // the arms are never unpowered in between.
+  async function handleStopChoice(choice: StopArmsChoice) {
+    const generation = connectionGenerationRef.current
+    setStopChoiceOpen(false)
+    setBusy(true)
     // Reflect "Stopping…" immediately — the server stop returns right away and
-    // teardown runs in the background, so don't wait for the response/next poll
-    // to flip the button.
+    // teardown runs in the background.
     setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
-      const stopped = await stopOperation()
+      const stopped = await stopOperation(choice === "rest" ? "rest" : "hold")
       if (generation !== connectionGenerationRef.current) return
       setSession(stopped)
+      if (choice !== "gravity") return
+      const deadline = Date.now() + 60_000
+      for (;;) {
+        await new Promise((r) => setTimeout(r, 500))
+        if (generation !== connectionGenerationRef.current) return
+        const op = await fetchOpStatus()
+        if (generation !== connectionGenerationRef.current) return
+        if (op.session) setSession(op.session)
+        if (!op.running) break
+        if (Date.now() > deadline) {
+          toast.error("Teleop is still stopping. Start Gravity compensation when it ends.")
+          return
+        }
+      }
+      const started = await startOperation("gravity-comp", {})
+      if (generation !== connectionGenerationRef.current) return
+      setSession(started)
+      setPolicy(null)
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
       toast.error(String(e))
@@ -2102,7 +2168,7 @@ export default function ControlPanel() {
 
   // Alerts that apply wherever the operator is: an update, a version skew, a
   // robot held after a failed shutdown, and hardware still to identify. Not on
-  // Request data, which works without the robot. The connection itself shows
+  // Request data or Request teleoperator, which work without the robot. The connection itself shows
   // in the header pill, and on the pages that need it.
   const notices = (
     <>
@@ -2125,7 +2191,8 @@ export default function ControlPanel() {
         <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80 sm:flex-row sm:items-center sm:justify-between">
           <p>
             The robot is locked because the last operation could not confirm that the motors are
-            off. Cut motor power with the E-Stop, then press Re-check motors.
+            off. Press the E-Stop, then release it. The robot unlocks on its own once the motors
+            read off.
           </p>
           <Button
             variant="outline"
@@ -2160,8 +2227,11 @@ export default function ControlPanel() {
     },
     "request-data": {
       title: "Request data",
-      description:
-        "With Teleop Data Collection, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training.",
+      description: "Get a LeRobot dataset of your task, recorded by Almond and ready for training.",
+    },
+    "request-teleoperator": {
+      title: "Request teleoperator",
+      description: "Have an Almond operator control your Axol remotely to finish a task for you.",
     },
     devices: {
       title: "Devices",
@@ -2183,6 +2253,23 @@ export default function ControlPanel() {
     mantis: hardwareProfile === "mantis",
   }).map((entry) => {
     const hostMeta = operations.find((o) => o.id === entry.id) ?? null
+    // The same robot check as the operation's checklist, for its next run:
+    // a sim or arms-off run doesn't need Axol.
+    const opMantis = Boolean(hostMeta?.supportsMantis) && hardwareProfile === "mantis"
+    const robotProblem = hostMeta
+      ? robotReadiness({
+          requiresRobot: hostMeta.requiresRobot,
+          robotFree:
+            opMantis ||
+            isRobotFreeRun(
+              hostMeta,
+              settingsByOp[entry.id] ?? loadOpSettings(entry.id),
+              settingsSnap?.values ?? null
+            ),
+          mantis: opMantis,
+          robot,
+        }).short
+      : null
     return {
       entry,
       status: operationStatus({
@@ -2194,6 +2281,7 @@ export default function ControlPanel() {
         otherRunning: isLive && runningOp !== entry.id,
         needsMount,
         hasCameras: selectedHasCamera,
+        robotProblem,
       }),
     }
   })
@@ -2382,7 +2470,7 @@ export default function ControlPanel() {
     if (blocker.includes("Mantis settings") || blocker.includes("Mantis trackers")) {
       return { label: "Open Mantis settings", onClick: () => openSettings("mantis-tracking") }
     }
-    if (blocker.startsWith("Fix the motor fault")) {
+    if (blocker.startsWith("Fix the motor fault") || blocker.includes("isn't answering")) {
       return { label: "Open Diagnostics", onClick: () => navigate("/diagnostics") }
     }
     return null
@@ -2400,10 +2488,17 @@ export default function ControlPanel() {
       <AppShell
         title={page[view].title}
         back={routeOp ? "/control/operations" : undefined}
+        wide={routeOp === "jog"}
         description={page[view].description}
         actions={runningChip}
-        notices={view === "request-data" ? undefined : notices}
+        notices={view === "request-data" || view === "request-teleoperator" ? undefined : notices}
         badges={badges}
+        navTargets={
+          // While an operation runs, Operations opens it instead of the list.
+          isLive && runningOp
+            ? { "/control/operations": `/control/operations/${encodeURIComponent(runningOp)}` }
+            : undefined
+        }
         host={host}
         safety={
           <SafetyControl
@@ -2553,6 +2648,36 @@ export default function ControlPanel() {
               onStart={handleStart}
               onStop={handleStop}
               onEpisode={handleEpisode}
+              workspace={
+                opId === "jog" ? (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center gap-2 py-16 text-sm text-white/45">
+                        <Loader2 className="size-4 animate-spin" /> Loading Jog…
+                      </div>
+                    }
+                  >
+                    <JogWorkspace
+                      session={selectedLive ? effectiveStatus : null}
+                      sim={
+                        selectedLive
+                          ? String(effectiveStatus?.args?.sim) === "true"
+                          : isSimRun(meta, settings)
+                      }
+                      simRobot={simRobot}
+                      hostRobot={
+                        settingsSnap
+                          ? {
+                              model: settingsSnap.robotModel ?? "classic",
+                              gripper: parseGripper(settingsSnap.values["axol.gripper"]),
+                            }
+                          : null
+                      }
+                      video={{ host: viewerHost, vrPort: hostInfo?.vrPort ?? 8000 }}
+                    />
+                  </Suspense>
+                ) : undefined
+              }
             />
 
             {lines.length > 0 && (
@@ -2601,9 +2726,14 @@ export default function ControlPanel() {
             </EmptyState>
           ))}
 
-        {view === "request-data" && (
-          <RequestDataPage
-            source={requestSource(new URLSearchParams(location.search).get("from"))}
+        {(view === "request-data" || view === "request-teleoperator") && (
+          <RequestPage
+            key={view}
+            service={view === "request-teleoperator" ? "task" : "dataset"}
+            source={requestSource(
+              new URLSearchParams(location.search).get("from"),
+              view === "request-teleoperator" ? "task" : "dataset"
+            )}
           />
         )}
 
@@ -2693,6 +2823,13 @@ export default function ControlPanel() {
           </>
         )}
       </AppShell>
+
+      <StopArmsDialog
+        open={stopChoiceOpen}
+        busy={busy}
+        onChoose={(choice) => void handleStopChoice(choice)}
+        onCancel={() => setStopChoiceOpen(false)}
+      />
 
       <SetupDialog
         open={setupOpen}

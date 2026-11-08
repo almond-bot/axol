@@ -41,6 +41,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/vr" element={<VrApp />} />
             <Route path="/control/*" element={<ControlPanel />} />
             <Route path="/diagnostics/*" element={<Diagnostics />} />
+            <Route path="/jog" element={<Navigate to="/control/operations/jog" replace />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

@@ -21,7 +21,6 @@ from almond_axol.lerobot.robot.config_mantis import MantisRobotConfig
 from almond_axol.lerobot.teleop.config_vr import AxolVRTeleopConfig
 from almond_axol.mantis.calibration import (
     LEGACY_TRACKER_KEY,
-    ULTIMATE_POSE_CONVENTION_FIELD,
     VIVE_TCP_ROTATION_QUAT,
     VIVE_TRACKER_CAD_ORIGINS_MM,
     candidate_transform_for,
@@ -66,10 +65,14 @@ class _Source:
 class _Trigger:
     def __init__(self, grip: float = 1.0) -> None:
         self.value = grip
+        self.pressed: bool | None = None
         self.stale = False
 
     def grip(self) -> float:
         return self.value
+
+    def button(self) -> bool | None:
+        return self.pressed
 
     def is_stale(self) -> bool:
         return self.stale
@@ -676,11 +679,11 @@ class MantisFlowTest(unittest.TestCase):
             left="left",
             right="right",
             controls=StopEventControls(threading.Event()),
-            pose_source_id="managed-ultimate-run",
+            pose_source_id="managed-lighthouse-run",
         )
 
         self.assertEqual(
-            bridge.compose_frame()["pose_source_id"], "managed-ultimate-run"
+            bridge.compose_frame()["pose_source_id"], "managed-lighthouse-run"
         )
 
     def test_bridge_never_marks_malformed_custom_source_pose_live(self) -> None:
@@ -878,16 +881,13 @@ class MantisFlowTest(unittest.TestCase):
 
     def test_source_binding_restore_is_backend_specific(self) -> None:
         config = TrackerConfig(
-            backend="survive",
-            bindings={
-                "survive": {"left": "T20", "right": "T21"},
-                "ultimate": {"left": "a:b:c:d:e:f", "right": "1:2:3:4:5:6"},
-            },
+            backend="synthetic",
+            bindings={"survive": {"left": "T20", "right": "T21"}},
         )
         select_tracker_backend(config, "survive")
         self.assertEqual((config.left, config.right), ("T20", "T21"))
-        select_tracker_backend(config, "ultimate")
-        self.assertEqual((config.left, config.right), ("a:b:c:d:e:f", "1:2:3:4:5:6"))
+        select_tracker_backend(config, "synthetic")
+        self.assertEqual((config.left, config.right), (None, None))
 
     def test_invalid_config_and_transform_files_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -918,84 +918,6 @@ class MantisFlowTest(unittest.TestCase):
             loaded = load_tcp_transforms(transform_path)
             self.assertNotIn("left", loaded)
             self.assertEqual(loaded["right"]["quest"][3:], [0.0, 0.0, 0.0, 1.0])
-
-    def test_ultimate_transform_requires_matching_pose_convention(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config_path = root / "tracker.json"
-            transform_path = root / "tcp.json"
-            config = TrackerConfig(
-                backend="ultimate",
-                left="a:b:c:d:e:f",
-                right="1:2:3:4:5:6",
-                ultimate_quat_order="wxyz",
-                ultimate_up_axis="z",
-            )
-            save_tracker_config(config, config_path)
-            entry = {
-                "pos": [0.0, 0.0465, -0.092],
-                "quat": [0.7071068, 0.0, 0.0, 0.7071068],
-            }
-            transform_path.write_text(
-                json.dumps(
-                    {
-                        "left": {
-                            "survive:T20": dict(entry),
-                            "ultimate:a:b:c:d:e:f": dict(entry),
-                        },
-                        "right": {
-                            "ultimate:1:2:3:4:5:6": {
-                                **entry,
-                                ULTIMATE_POSE_CONVENTION_FIELD: {
-                                    "quat_order": "wxyz",
-                                    "up_axis": "z",
-                                },
-                            }
-                        },
-                    }
-                )
-            )
-
-            loaded = load_tcp_transforms(
-                transform_path,
-                tracker_config_path=config_path,
-            )
-            self.assertIn("survive:T20", loaded["left"])
-            self.assertNotIn("ultimate:a:b:c:d:e:f", loaded["left"])
-            self.assertIn("ultimate:1:2:3:4:5:6", loaded["right"])
-
-            config.ultimate_up_axis = "y"
-            save_tracker_config(config, config_path)
-            loaded = load_tcp_transforms(
-                transform_path,
-                tracker_config_path=config_path,
-            )
-            self.assertNotIn("ultimate:1:2:3:4:5:6", loaded.get("right", {}))
-
-            config.ultimate_up_axis = "z"
-            config.ultimate_quat_order = "xyzw"
-            save_tracker_config(config, config_path)
-            loaded = load_tcp_transforms(
-                transform_path,
-                tracker_config_path=config_path,
-            )
-            self.assertNotIn("ultimate:1:2:3:4:5:6", loaded.get("right", {}))
-
-            # Malformed convention metadata is stale, not an exception that
-            # could turn a readiness inspection into an availability failure.
-            document = json.loads(transform_path.read_text())
-            document["left"]["ultimate:a:b:c:d:e:f"][ULTIMATE_POSE_CONVENTION_FIELD] = {
-                "quat_order": [],
-                "up_axis": "z",
-            }
-            transform_path.write_text(json.dumps(document))
-            self.assertNotIn(
-                "ultimate:a:b:c:d:e:f",
-                load_tcp_transforms(
-                    transform_path,
-                    tracker_config_path=config_path,
-                ).get("left", {}),
-            )
 
     def test_tcp_transform_validator_rejects_unsafe_values(self) -> None:
         unsafe = {
@@ -1133,227 +1055,67 @@ class MantisFlowTest(unittest.TestCase):
             _validate_mantis_calibration(config)
 
     def test_factory_vive_transforms_authorize_collection(self) -> None:
-        # Tracker origins in the gripper frame: 47 mm behind the motor face
-        # (+z) and 35 / 46 mm above it (-y).
+        # Tracker origin in the gripper frame: 47 mm behind the motor face
+        # (+z) and 35 mm above it (-y).
         self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["survive"], (0.0, -35.0, 47.0))
-        self.assertEqual(VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], (0.0, -46.0, 47.0))
-        with mock.patch(
-            "almond_axol.mantis.calibration.current_ultimate_pose_convention",
-            return_value=("wxyz", "z"),
+        survive = design_transform_for("left", "survive:T20")
+        self.assertIsNotNone(survive)
+        assert survive is not None
+        self.assertEqual(survive, [0.0, 0.035, 0.047, 0.0, 1.0, 0.0, 0.0])
+        self.assertEqual(design_transform_for("right", "survive:T21"), survive)
+        # The Vive factory value is the corrected Ry(180°) rotation, not the
+        # retired Rx(+90°) (which pitched every recorded gripper ~90°).
+        self.assertEqual(survive[3:], list(VIVE_TCP_ROTATION_QUAT))
+        np.testing.assert_allclose(
+            quat_xyzw_to_matrix(np.asarray(survive[3:])),
+            np.diag([-1.0, 1.0, -1.0]),
+            atol=1e-9,
+        )
+        self.assertIsNone(candidate_transform_for("left", "survive:T20"))
+
+        # The stored translation is the gripper origin in the tracker frame:
+        # inverting it must land the tracker back on its CAD origin in the
+        # gripper frame (behind and above the motor face).
+        rot = quat_xyzw_to_matrix(np.asarray(survive[3:]))
+        np.testing.assert_allclose(
+            -rot.T @ np.asarray(survive[:3]) * 1000.0,
+            VIVE_TRACKER_CAD_ORIGINS_MM["survive"],
+            atol=1e-6,
+        )
+
+        config = VRTeleopConfig()
+        keys = {"left": "survive:T20", "right": "survive:T21"}
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value={},
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
+            ),
         ):
-            survive = design_transform_for("left", "survive:T20")
-            self.assertIsNotNone(survive)
-            assert survive is not None
-            self.assertEqual(survive, [0.0, 0.035, 0.047, 0.0, 1.0, 0.0, 0.0])
-            ultimate = [0.0, 0.046, 0.047, 0.0, 1.0, 0.0, 0.0]
-            self.assertEqual(
-                design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
-                ultimate,
-            )
-            # Both Vive families ship the corrected Ry(180°) rotation, not the
-            # retired Rx(+90°) (which pitched every recorded gripper ~90°).
-            self.assertEqual(survive[3:], list(VIVE_TCP_ROTATION_QUAT))
-            self.assertEqual(ultimate[3:], list(VIVE_TCP_ROTATION_QUAT))
-            np.testing.assert_allclose(
-                quat_xyzw_to_matrix(np.asarray(survive[3:])),
-                np.diag([-1.0, 1.0, -1.0]),
-                atol=1e-9,
-            )
-            self.assertEqual(
-                design_transform_for("right", "ultimate:11:22:33:44:55:66"),
-                ultimate,
-            )
-            self.assertIsNone(candidate_transform_for("left", "survive:T20"))
-            self.assertIsNone(
-                candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff")
-            )
-            with mock.patch(
-                "almond_axol.mantis.calibration.current_ultimate_pose_convention",
-                return_value=("wxyz", "y"),
-            ):
-                self.assertIsNone(
-                    design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff")
-                )
+            apply_mantis_teleop_profile(config, tracker_source="lighthouse")
+        normalized_survive = validate_tcp_transform(survive)
+        self.assertEqual(config.tcp_transform_left, normalized_survive)
+        self.assertEqual(config.tcp_transform_right, normalized_survive)
 
-            # The stored translation is the gripper origin in the tracker
-            # frame: inverting it must land each tracker back on its CAD
-            # origin in the gripper frame (behind and above the motor face).
-            for family, transform in (("survive", survive), ("ultimate", ultimate)):
-                rot = quat_xyzw_to_matrix(np.asarray(transform[3:]))
-                np.testing.assert_allclose(
-                    -rot.T @ np.asarray(transform[:3]) * 1000.0,
-                    VIVE_TRACKER_CAD_ORIGINS_MM[family],
-                    atol=1e-6,
-                )
-
-            config = VRTeleopConfig()
-            with (
-                mock.patch(
-                    "almond_axol.mantis.calibration.load_tcp_transforms",
-                    return_value={},
-                ),
-                mock.patch(
-                    "almond_axol.mantis.calibration.tracker_key_for_side",
-                    return_value=("survive:T20", "test binding"),
-                ),
-            ):
-                apply_mantis_teleop_profile(config, tracker_source="lighthouse")
-            normalized_survive = validate_tcp_transform(survive)
-            self.assertEqual(config.tcp_transform_left, normalized_survive)
-            self.assertEqual(config.tcp_transform_right, normalized_survive)
-
-            ultimate_config = VRTeleopConfig()
-            with (
-                mock.patch(
-                    "almond_axol.mantis.calibration.load_tcp_transforms",
-                    return_value={},
-                ),
-                mock.patch(
-                    "almond_axol.mantis.calibration.tracker_key_for_side",
-                    return_value=(
-                        "ultimate:aa:bb:cc:dd:ee:ff",
-                        "test binding",
-                    ),
-                ),
-            ):
-                apply_mantis_teleop_profile(ultimate_config, tracker_source="ultimate")
-            normalized_ultimate = validate_tcp_transform(ultimate)
-            self.assertEqual(ultimate_config.tcp_transform_left, normalized_ultimate)
-            self.assertEqual(ultimate_config.tcp_transform_right, normalized_ultimate)
-
-            collection = SimpleNamespace(
-                mantis_allow_uncalibrated=False,
-                mantis_source="ultimate",
-                teleop_config=SimpleNamespace(vr_teleop_config=ultimate_config),
-            )
-            keys = {
-                "left": "ultimate:aa:bb:cc:dd:ee:ff",
-                "right": "ultimate:11:22:33:44:55:66",
-            }
-            with (
-                mock.patch(
-                    "almond_axol.mantis.calibration.tracker_key_for_side",
-                    side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
-                ),
-                mock.patch(
-                    "almond_axol.mantis.calibration.load_tcp_transforms",
-                    return_value={},
-                ),
-            ):
-                _validate_mantis_calibration(collection)
-
-    def test_ultimate_convention_change_invalidates_production_transform(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config_path = root / "tracker.json"
-            transform_path = root / "tcp.json"
-            tracker_config = TrackerConfig(
-                backend="ultimate",
-                left="a:b:c:d:e:f",
-                right="1:2:3:4:5:6",
-                ultimate_quat_order="wxyz",
-                ultimate_up_axis="z",
-            )
-            save_tracker_config(tracker_config, config_path)
-            transform = {
-                "pos": [0.0, 0.0465, -0.092],
-                "quat": [0.7071068, 0.0, 0.0, 0.7071068],
-                ULTIMATE_POSE_CONVENTION_FIELD: {
-                    "quat_order": "wxyz",
-                    "up_axis": "z",
-                },
-            }
-            transform_path.write_text(
-                json.dumps(
-                    {
-                        "left": {"ultimate:a:b:c:d:e:f": transform},
-                        "right": {"ultimate:1:2:3:4:5:6": transform},
-                    }
-                )
-            )
-
-            vrt = VRTeleopConfig()
-            collection = SimpleNamespace(
-                mantis_allow_uncalibrated=False,
-                mantis_source="ultimate",
-                teleop_config=SimpleNamespace(vr_teleop_config=vrt),
-            )
-            with (
-                mock.patch(
-                    "almond_axol.mantis.calibration.MANTIS_TCP_TRANSFORM_FILE",
-                    transform_path,
-                ),
-                mock.patch(
-                    "almond_axol.tracker.config.TRACKER_CONFIG_FILE",
-                    config_path,
-                ),
-            ):
-                apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
-                _validate_mantis_calibration(collection)
-
-                tracker_config.ultimate_up_axis = "y"
-                save_tracker_config(tracker_config, config_path)
-                with self.assertRaisesRegex(ValueError, "no verified"):
-                    _validate_mantis_calibration(collection)
-
-    def test_stale_ultimate_override_suppresses_factory_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config_path = root / "tracker.json"
-            transform_path = root / "tcp.json"
-            tracker_config = TrackerConfig(
-                backend="ultimate",
-                left="a:b:c:d:e:f",
-                right="1:2:3:4:5:6",
-                bindings={
-                    "ultimate": {
-                        "left": "a:b:c:d:e:f",
-                        "right": "1:2:3:4:5:6",
-                    }
-                },
-                ultimate_quat_order="wxyz",
-                ultimate_up_axis="z",
-            )
-            save_tracker_config(tracker_config, config_path)
-            # These valid-looking entries predate convention provenance. They
-            # must not be hidden by the standard-mount factory fallback: the
-            # unit may deliberately have a non-standard physical mount.
-            conventionless = {
-                "pos": [0.0, 0.0, 0.0],
-                "quat": [0.0, 0.0, 0.0, 1.0],
-            }
-            transform_path.write_text(
-                json.dumps(
-                    {
-                        "left": {"ultimate:a:b:c:d:e:f": conventionless},
-                        "right": {"ultimate:1:2:3:4:5:6": conventionless},
-                    }
-                )
-            )
-
-            vrt = VRTeleopConfig()
-            collection = SimpleNamespace(
-                mantis_allow_uncalibrated=False,
-                mantis_source="ultimate",
-                teleop_config=SimpleNamespace(vr_teleop_config=vrt),
-            )
-            with (
-                mock.patch(
-                    "almond_axol.mantis.calibration.MANTIS_TCP_TRANSFORM_FILE",
-                    transform_path,
-                ),
-                mock.patch(
-                    "almond_axol.tracker.config.TRACKER_CONFIG_FILE",
-                    config_path,
-                ),
-            ):
-                apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
-                self.assertIsNone(vrt.tcp_transform_left)
-                self.assertIsNone(vrt.tcp_transform_right)
-                with self.assertRaisesRegex(ValueError, "no verified"):
-                    _validate_mantis_calibration(collection)
+        collection = SimpleNamespace(
+            mantis_allow_uncalibrated=False,
+            mantis_source="lighthouse",
+            teleop_config=SimpleNamespace(vr_teleop_config=config),
+        )
+        with (
+            mock.patch(
+                "almond_axol.mantis.calibration.tracker_key_for_side",
+                side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
+            ),
+            mock.patch(
+                "almond_axol.mantis.calibration.load_tcp_transforms",
+                return_value={},
+            ),
+        ):
+            _validate_mantis_calibration(collection)
 
     def test_invalid_transform_file_suppresses_factory_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1362,13 +1124,13 @@ class MantisFlowTest(unittest.TestCase):
             transform_path = root / "tcp.json"
             save_tracker_config(
                 TrackerConfig(
-                    backend="ultimate",
-                    left="a:b:c:d:e:f",
-                    right="1:2:3:4:5:6",
+                    backend="survive",
+                    left="LHR-LEFT",
+                    right="LHR-RIGHT",
                     bindings={
-                        "ultimate": {
-                            "left": "a:b:c:d:e:f",
-                            "right": "1:2:3:4:5:6",
+                        "survive": {
+                            "left": "LHR-LEFT",
+                            "right": "LHR-RIGHT",
                         }
                     },
                 ),
@@ -1391,7 +1153,7 @@ class MantisFlowTest(unittest.TestCase):
                     vrt = VRTeleopConfig()
                     collection = SimpleNamespace(
                         mantis_allow_uncalibrated=False,
-                        mantis_source="ultimate",
+                        mantis_source="lighthouse",
                         teleop_config=SimpleNamespace(vr_teleop_config=vrt),
                     )
                     with (
@@ -1404,7 +1166,7 @@ class MantisFlowTest(unittest.TestCase):
                             config_path,
                         ),
                     ):
-                        apply_mantis_teleop_profile(vrt, tracker_source="ultimate")
+                        apply_mantis_teleop_profile(vrt, tracker_source="lighthouse")
                         self.assertIsNone(vrt.tcp_transform_left)
                         self.assertIsNone(vrt.tcp_transform_right)
                         with self.assertRaisesRegex(ValueError, "no verified"):
@@ -1424,10 +1186,10 @@ class MantisFlowTest(unittest.TestCase):
             ),
             mock.patch(
                 "almond_axol.mantis.calibration.tracker_key_for_side",
-                return_value=("ultimate:aa", "test binding"),
+                return_value=("survive:LHR-LEFT", "test binding"),
             ),
         ):
-            apply_mantis_teleop_profile(config, tracker_source="ultimate")
+            apply_mantis_teleop_profile(config, tracker_source="lighthouse")
         self.assertIsNone(config.tcp_transform_left)
         self.assertIsNone(config.tcp_transform_right)
 
@@ -1441,7 +1203,7 @@ class MantisFlowTest(unittest.TestCase):
             ),
             mock.patch(
                 "almond_axol.mantis.calibration.tracker_key_for_side",
-                return_value=("ultimate:aa", "test binding"),
+                return_value=("survive:LHR-LEFT", "test binding"),
             ),
         ):
             apply_mantis_teleop_profile(legacy_config)
@@ -1450,10 +1212,7 @@ class MantisFlowTest(unittest.TestCase):
 
     def test_factory_never_hides_unscoped_hardware_override(self) -> None:
         identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-        for source, family, exact_key in (
-            ("lighthouse", "survive", "survive:T20"),
-            ("ultimate", "ultimate", "ultimate:aa:bb:cc:dd:ee:ff"),
-        ):
+        for source, family, exact_key in (("lighthouse", "survive", "survive:T20"),):
             for saved_key in (family, f"{family}:previous-device"):
                 with self.subTest(source=source, saved_key=saved_key):
                     saved = {
@@ -1494,12 +1253,12 @@ class MantisFlowTest(unittest.TestCase):
 
     def test_keyed_measured_transform_is_applied(self) -> None:
         identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-        keys = {"left": "ultimate:left", "right": "ultimate:right"}
+        keys = {"left": "survive:left", "right": "survive:right"}
         saved = {
             "left": {keys["left"]: identity},
             "right": {keys["right"]: identity},
         }
-        config = VRTeleopConfig(tracker_key="ultimate:must-not-override-bindings")
+        config = VRTeleopConfig(tracker_key="survive:must-not-override-bindings")
         with (
             mock.patch(
                 "almond_axol.mantis.calibration.load_tcp_transforms",
@@ -1510,7 +1269,7 @@ class MantisFlowTest(unittest.TestCase):
                 side_effect=lambda side, **_kwargs: (keys[side], "test binding"),
             ),
         ):
-            apply_mantis_teleop_profile(config, tracker_source="ultimate")
+            apply_mantis_teleop_profile(config, tracker_source="lighthouse")
         self.assertEqual(config.tcp_transform_left, identity)
         self.assertEqual(config.tcp_transform_right, identity)
 
@@ -1636,7 +1395,7 @@ class MantisFlowTest(unittest.TestCase):
             "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
         ):
             apply_mantis_teleop_profile(
-                explicitly_registered, tracker_source="ultimate"
+                explicitly_registered, tracker_source="lighthouse"
             )
         self.assertTrue(explicitly_registered.urdf_viewer_world_aligned)
 

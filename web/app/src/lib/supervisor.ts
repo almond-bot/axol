@@ -388,6 +388,99 @@ export function motorFaultLabel(f: MotorFault): string {
   return `${f.arm[0].toUpperCase()} ${joint}: ${f.problem}${temp}`
 }
 
+/**
+ * The "Before you start" lines for a robot's motor faults, grouped so a
+ * powered-off robot reads as one problem instead of one line per motor:
+ * - every motor unreachable: one line to turn the device on;
+ * - every motor of one side unreachable: one line for that arm (or gripper);
+ * - anything else: one line per motor, with `motorFaultLabel`.
+ * `device` is "Axol" or "Mantis".
+ */
+export function motorFaultBlockers(
+  faults: MotorFault[],
+  motors: MotorHealth[],
+  device: "Axol" | "Mantis"
+): string[] {
+  if (faults.length === 0) return []
+  const unreachable = faults.filter((f) => f.problem === "unreachable")
+  if (motors.length > 0 && unreachable.length === motors.length) {
+    return [`${device} isn't answering. Turn on its power.`]
+  }
+  const part = device === "Mantis" ? "gripper" : "arm"
+  const deadSides = new Set<string>()
+  for (const side of new Set(motors.map((m) => m.arm))) {
+    const total = motors.filter((m) => m.arm === side).length
+    const down = unreachable.filter((f) => f.arm === side).length
+    if (total > 1 && down === total) deadSides.add(side)
+  }
+  const lines = [...deadSides].map(
+    (side) =>
+      `${side[0].toUpperCase()}${side.slice(1)} ${part} isn't answering. Check its power and cable.`
+  )
+  for (const f of faults) {
+    if (f.problem === "unreachable" && deadSides.has(f.arm)) continue
+    lines.push(`Fix the motor fault on ${motorFaultLabel(f)}`)
+  }
+  return lines
+}
+
+/** What keeps a run from using the robot, from the robot link's status. */
+export interface RobotReadiness {
+  /** The "Before you start" lines; empty when nothing is in the way. */
+  blockers: string[]
+  /** The same problem in a few words, for an operation's tile; null when none. */
+  short: string | null
+}
+
+/**
+ * Whether the robot a run drives is there to drive: the link is up on the
+ * right device and its motors answer without faults. The operation's
+ * checklist and its tile both read this, so they always agree.
+ *
+ * `robotFree` runs (sim, arms off) never touch the Axol arms and skip the
+ * Axol checks. A Mantis run always needs its Mantis link.
+ */
+export function robotReadiness({
+  requiresRobot,
+  robotFree,
+  mantis,
+  robot,
+}: {
+  requiresRobot: boolean
+  robotFree: boolean
+  mantis: boolean
+  robot: RobotStatus | null
+}): RobotReadiness {
+  const clear: RobotReadiness = { blockers: [], short: null }
+  if (!requiresRobot) return clear
+  const linked = robot?.state === "connected"
+  const profile = robot?.profile ?? "axol"
+  if (mantis) {
+    if (!linked || profile !== "mantis") {
+      return {
+        blockers: [linked ? "Connect Mantis instead of Axol" : "Connect Mantis"],
+        short: "Connect Mantis",
+      }
+    }
+  } else {
+    if (robotFree) return clear
+    if (!linked || profile !== "axol") {
+      return {
+        blockers: [linked ? "Connect Axol instead of Mantis" : "Connect Axol"],
+        short: "Connect Axol",
+      }
+    }
+  }
+  const device = mantis ? "Mantis" : "Axol"
+  const faults = robot?.faults ?? []
+  const motors = robot?.motors ?? []
+  const blockers = motorFaultBlockers(faults, motors, device)
+  if (blockers.length === 0) return clear
+  const allDown =
+    motors.length > 0 && faults.filter((f) => f.problem === "unreachable").length === motors.length
+  return { blockers, short: allDown ? `Turn on ${device}` : "Check the motors" }
+}
+
 export async function fetchRobotStatus(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/status")))
 }
@@ -676,7 +769,7 @@ export async function safetyPowerCycle(): Promise<SafetyLinkStatus> {
   return json(await fetch(apiUrl("/api/safety/power-cycle"), { method: "POST" }))
 }
 
-/** A firmware image the serve host validated and stored for `lift.update` or `safety.update`. */
+/** A firmware image the serve host validated and stored for `lift.update`, `safety.update` or `mantis.update`. */
 export interface FirmwareUpload {
   /** Host-side path, passed as the run's `--firmware` argument. */
   path: string
@@ -688,8 +781,8 @@ export interface FirmwareUpload {
 
 export type LiftFirmwareUpload = FirmwareUpload
 
-/** Which board a firmware file is for: the lift (jelly_legs) or the safety board. */
-export type FirmwareBoard = "lift" | "safety"
+/** Which board a firmware file is for: the lift (jelly_legs), the safety board or the Mantis trigger. */
+export type FirmwareBoard = "lift" | "safety" | "mantis"
 
 /** Upload a board's firmware.bin; the host rejects any other board's file. */
 export async function uploadFirmware(board: FirmwareBoard, file: Blob): Promise<FirmwareUpload> {
@@ -986,8 +1079,32 @@ export async function startOperation(
   )
 }
 
-export async function stopOperation(): Promise<SessionInfo> {
-  return json(await fetch(apiUrl("/api/op/stop"), { method: "POST" }))
+/** What a teleop Stop does with the arms: park them, or leave them holding. */
+export type StopArms = "rest" | "hold"
+
+export async function stopOperation(arms?: StopArms): Promise<SessionInfo> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      ...(arms
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ arms }) }
+        : {}),
+    })
+  )
+}
+
+/**
+ * Stop, unless teleop's arms are away from rest: then nothing stops and the
+ * answer is `{ needsChoice: true }`, so the panel can ask what the arms do.
+ */
+export async function stopOperationOrAsk(): Promise<SessionInfo | { needsChoice: true }> {
+  return json(
+    await fetch(apiUrl("/api/op/stop"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ arms: "ask" }),
+    })
+  )
 }
 
 /**
@@ -1292,7 +1409,7 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
   )
 }
 
-export type TrackerBackend = "survive" | "ultimate"
+export type TrackerBackend = "survive"
 
 export interface TrackerBinding {
   complete: boolean
@@ -1300,7 +1417,7 @@ export interface TrackerBinding {
   right: string | null
 }
 
-export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing" | "stale"
+export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing"
 
 export interface TrackerTransformReadiness {
   left: TrackerTransformStatus
@@ -1405,30 +1522,9 @@ export interface LighthouseBaseStationSurvey {
   problems: string[]
 }
 
-export interface UltimateTrackerReadiness {
-  binding: TrackerBinding
-  installed: boolean
-  nativeDependencies: boolean
-  pythonHid: boolean
-  apiCompatible: boolean
-  pinnedPyvut: boolean
-  pinnedRef: string
-  logSuppression: boolean
-  udevReady: boolean
-  operatorAccess: boolean
-  dongleConnected: boolean
-  endpointStatus: "accessible" | "permission-denied" | "missing" | "unavailable"
-  wifiConfig: "valid" | "missing" | "invalid" | "permissions-warning"
-  quatOrder: "xyzw" | "wxyz"
-  upAxis: "y" | "z"
-  issues: string[]
-  transforms: TrackerTransformReadiness
-}
-
 export interface TrackerSourceReadiness {
   quest: QuestTrackerReadiness
   lighthouse: LighthouseTrackerReadiness
-  ultimate: UltimateTrackerReadiness
 }
 
 export interface TrackerBindingsSnapshot {
@@ -1443,47 +1539,7 @@ export async function fetchTrackerBindings(): Promise<TrackerBindingsSnapshot> {
   return json(await fetch(apiUrl("/api/tracker/bindings"), { cache: "no-store" }))
 }
 
-export type MantisTrackerSource = "quest" | "lighthouse" | "ultimate"
-
-export interface UltimateWifiConfig {
-  /** Host path is informational only; credential values never include the password. */
-  path: string
-  configured: boolean
-  status: "valid" | "missing" | "invalid" | "permissions-warning"
-  error: string | null
-  ssid: string
-  country: string
-  freq: number
-  passwordSet: boolean
-}
-
-export interface UltimateWifiUpdate {
-  ssid: string
-  country: string
-  freq: number
-  /** Omit to preserve the existing password. The host never returns it. */
-  pass?: string
-}
-
-export async function fetchUltimateWifiConfig(): Promise<UltimateWifiConfig> {
-  return json(
-    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
-      cache: "no-store",
-    })
-  )
-}
-
-export async function saveUltimateWifiConfig(
-  update: UltimateWifiUpdate
-): Promise<UltimateWifiConfig> {
-  return json(
-    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(update),
-    })
-  )
-}
+export type MantisTrackerSource = "quest" | "lighthouse"
 
 export type TrackerCalibrationStatus = TrackerTransformStatus | "unbound"
 
@@ -1494,19 +1550,15 @@ export interface TrackerCalibrationSide {
   overrideKeys?: string[]
   /** Content revisions guarding confirmation-gated removal against stale tabs. */
   overrideRevisions?: Record<string, string>
-  /** Measured and stale saved values are returned; factory/candidate values stay null. */
+  /** Measured saved values are returned; factory/candidate values stay null. */
   pos: [number, number, number] | null
   quat: [number, number, number, number] | null
-  /** Ultimate parser convention recorded with this measurement, when present. */
-  poseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
 }
 
 export interface TrackerCalibrationSnapshot {
   path: string
   source: MantisTrackerSource
   keys: { left: string | null; right: string | null }
-  /** Active Ultimate parser convention; absent/null for older hosts and other sources. */
-  activePoseConvention?: { quatOrder: "xyzw" | "wxyz"; upAxis: "y" | "z" } | null
   left: TrackerCalibrationSide
   right: TrackerCalibrationSide
 }
@@ -1952,8 +2004,7 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
     label: "Teleoperation",
-    description:
-      "Drive Axol from a VR headset. Mantis works with Quest, Lighthouse or Ultimate tracking.",
+    description: "Drive Axol from a VR headset. Mantis works with Quest or Lighthouse tracking.",
     fields: ["sim"],
     suggestedFields: [],
     strictFields: [],
@@ -1990,7 +2041,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect data",
     description:
-      "Record episodes with the ZED cameras. Mantis works with Quest, Lighthouse or Ultimate tracking.",
+      "Record episodes with the ZED cameras. Mantis works with Quest or Lighthouse tracking.",
     fields: ["repo_id", "task"],
     suggestedFields: [],
     strictFields: [],

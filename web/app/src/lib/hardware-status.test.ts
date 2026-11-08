@@ -4,6 +4,7 @@ import {
   deviceErrorText,
   discoveryNeedsRecheck,
   discoveryNotice,
+  jellyPresentOnCan,
   nextRecheckDelay,
   settledDiscovery,
 } from "./hardware-status"
@@ -74,5 +75,20 @@ describe("deviceErrorText", () => {
     [null, "Couldn't connect to Axol."],
   ])("%s", (raw, text) => {
     expect(deviceErrorText(raw, "Axol")).toBe(text)
+  })
+})
+
+describe("jellyPresentOnCan", () => {
+  const device = (present: boolean) => ({ channel: "can_alm_axol_b", present, up: present })
+
+  it("follows the CAN interfaces, not the Wheels and Lift switches", () => {
+    expect(jellyPresentOnCan({ wheels: device(true), lift: device(false) })).toBe(true)
+    expect(jellyPresentOnCan({ wheels: device(false), lift: device(true) })).toBe(true)
+    expect(jellyPresentOnCan({ wheels: device(false), lift: device(false) })).toBe(false)
+  })
+
+  it("is unknown before the inventory arrives", () => {
+    expect(jellyPresentOnCan(null)).toBeNull()
+    expect(jellyPresentOnCan(undefined)).toBeNull()
   })
 })

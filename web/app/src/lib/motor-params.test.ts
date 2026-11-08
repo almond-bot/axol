@@ -42,6 +42,16 @@ describe("motor parameter presentation", () => {
     expect(paramUi("NEW_THING").label).toBe("NEW_THING")
   })
 
+  it("lists the master encoder settings with direction as a toggle", () => {
+    const sections = groupParams([param("CHANGE_DIRECTION"), param("POLE_PAIRS")])
+    expect(sections.map((s) => s.title)).toEqual(["Master encoder"])
+    expect(sections[0].params.map((p) => p.name)).toEqual(["POLE_PAIRS", "CHANGE_DIRECTION"])
+    expect(paramUi("CHANGE_DIRECTION")).toMatchObject({
+      label: "Change motor direction",
+      kind: "toggle",
+    })
+  })
+
   it("formats and parses values without losing whole numbers", () => {
     expect(formatParamValue(131072)).toBe("131072")
     expect(formatParamValue(24.8799991607666)).toBe("24.88")

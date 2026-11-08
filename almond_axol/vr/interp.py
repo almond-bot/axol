@@ -60,10 +60,15 @@ When the headset's uplink stalls (a starved Wi-Fi link carrying a fraction
 of the frames for seconds, then draining the backlog), every frame arrives
 late, the short-window clock offset follows the growing transit, and playout
 would perform the operator's motion seconds after it happened — after they
-had already stopped. Each frame's transit is therefore also compared with the
-minimum over a longer window (``_LAG_BASELINE_WINDOW_S``); a frame more than
-``max_lag_s`` behind it keeps its control state but is not played, so the
-arms hold through the stall and then follow the current pose.
+had already stopped. Each frame's transit is therefore also compared with an
+on-time baseline: the minimum over a longer window
+(``_LAG_BASELINE_WINDOW_S``), which may rise no faster than
+``_LAG_BASELINE_RISE_PER_S``. A frame more than ``max_lag_s`` behind it keeps
+its control state but is not played, so the arms hold through the stall and
+then follow the current pose. The rise limit catches a queue that grows
+slowly and never drains (a congested uplink whose sender keeps every frame):
+a plain windowed minimum would follow that growth and let playout fall
+further and further behind.
 
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
@@ -99,9 +104,17 @@ _HOLD_WARN_AFTER_S = 1.0
 # How far back the stream's normal transit (headset capture -> host arrival,
 # clock offset included) is remembered for judging a frame late. Longer than
 # the Wi-Fi stalls seen on stations (5-10 s) so a stall is still measured
-# against the latency before it; a lasting latency shift above ``max_lag_s``
-# is adopted as the new normal once this much time has passed.
+# against the latency before it.
 _LAG_BASELINE_WINDOW_S = 30.0
+
+# How fast the on-time baseline may rise once higher transit fills the whole
+# window (seconds of transit per second). Well above any drift between the
+# headset's and the host's clocks, but far below a backlog that keeps growing:
+# one that adds 1 s per minute is ~17x faster, so it trips the gate after
+# about half a minute instead of being adopted as the new normal. A lasting
+# jump above ``max_lag_s`` is adopted only gradually; a reconnect (or a pause
+# in the stream long enough to start a fresh timing domain) resets it.
+_LAG_BASELINE_RISE_PER_S = 1e-3
 
 
 class PoseInterpolator:
@@ -191,6 +204,10 @@ class PoseInterpolator:
         # _LAG_BASELINE_WINDOW_S: the transit of an on-time frame. Monotonic
         # deque, so the minimum is its head.
         self._lag_min: collections.deque[tuple[float, float]] = collections.deque()
+        # On-time baseline actually judged against: follows _lag_min's head
+        # down at once but up no faster than _LAG_BASELINE_RISE_PER_S.
+        # (local_recv_s, baseline_s), or None until the first stamped frame.
+        self._lag_base: tuple[float, float] | None = None
         # Late frames dropped from playout in the current / last late spell.
         self._late_frames = 0
         self._late_since: float | None = None
@@ -234,6 +251,7 @@ class PoseInterpolator:
             self._transits.clear()
             self._clock_offset = None
             self._lag_min.clear()
+            self._lag_base = None
             self._late_frames = 0
             self._late_since = None
             self._late_worst = 0.0
@@ -272,6 +290,7 @@ class PoseInterpolator:
                 self._transits.clear()
                 self._clock_offset = None
                 self._lag_min.clear()
+                self._lag_base = None
                 self._late_frames = 0
                 self._late_since = None
                 self._late_worst = 0.0
@@ -353,7 +372,15 @@ class PoseInterpolator:
         cutoff = local_recv - _LAG_BASELINE_WINDOW_S
         while q[0][0] < cutoff:
             q.popleft()
-        return transit - q[0][1]
+        window_min = q[0][1]
+        if self._lag_base is None:
+            base = window_min
+        else:
+            prev_t, prev_base = self._lag_base
+            rise = _LAG_BASELINE_RISE_PER_S * max(0.0, local_recv - prev_t)
+            base = min(window_min, prev_base + rise)
+        self._lag_base = (local_recv, base)
+        return transit - base
 
     def _accept(
         self, frame: VRFrame, local_recv: float, cap_t: float, transit: float
@@ -1057,6 +1084,7 @@ def _build_frame(
         r_stick_y=latest.r_stick_y,
         l_stick_click=latest.l_stick_click,
         r_stick_click=latest.r_stick_click,
+        stow=latest.stow,
     )
     motion = np.concatenate(
         [
@@ -1129,4 +1157,5 @@ def _same_control(a: VRFrame, b: VRFrame) -> bool:
         and a.r_stick_y == b.r_stick_y
         and a.l_stick_click == b.l_stick_click
         and a.r_stick_click == b.r_stick_click
+        and a.stow == b.stow
     )

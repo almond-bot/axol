@@ -1,0 +1,37 @@
+---
+title: "mantis.update"
+description: "Update the Mantis rigs' firmware over CAN."
+---
+
+Installs new firmware on both Mantis rigs over their CAN buses. You don't need a USB cable or to open a rig.
+
+```bash
+axol mantis.update                                    # show the running firmware
+axol mantis.update --firmware build/firmware.bin      # install on both rigs
+axol mantis.update --firmware firmware.bin --side left
+axol mantis.update --firmware firmware.bin --force    # reinstall the same build
+```
+
+Use the build's `firmware.bin` file, not the `.uf2` or `.elf`. Each rig takes a few seconds, left first, then right:
+
+1. The new firmware is copied to the rig while the current firmware keeps running. The rig accepts it only if the whole file arrived, its checksum matches, and it is Mantis firmware. Anything else is rejected and nothing changes.
+2. The rig restarts into the new firmware on trial.
+3. When the new firmware reports the expected build, the command confirms it and the update becomes permanent.
+
+If the new firmware is never confirmed, the rig goes back to the previous firmware within 15 s. This covers a crash, a hang, a power loss or a stopped command.
+
+- Keep both triggers released. Each rig learns its trigger's released position when it restarts.
+- Don't run it during teleoperation or data collection. The trigger stops sending readings while the rig restarts.
+- Press Ctrl-C, or **Stop** in the control panel, during the transfer to cancel it. Nothing is installed on that rig.
+- If a rig already runs that build, the command says so and skips it. Pass `--force` to install it again.
+- If one rig fails, the command still updates the other, then reports the failure.
+
+<Warning>
+  Each rig must already run Mantis firmware 0.2 or newer, installed once over USB with its partition table. See the Mantis firmware README in the circuits-py repo. Older firmware doesn't answer this command and must be updated over USB. Flashing a rig over SWD erases the partition table, so it then needs the USB install again before it can update over CAN.
+</Warning>
+
+<Note>
+  You can also update from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Helpers → Update Mantis firmware**, with Mantis selected. Choose the `firmware.bin` on your computer, and the dialog uploads it and shows its version and build date. Then press **Run** to install it.
+
+  The command uses the left and right buses in **Mantis settings → CAN** (`can_mantis_l` and `can_mantis_r` by default). Pass `--channel` to update one rig on a different interface.
+</Note>

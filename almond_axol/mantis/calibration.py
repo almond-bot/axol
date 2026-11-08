@@ -14,22 +14,16 @@ transform per rig side *and tracker identity*::
       "left": {
         "quest:meta-quest-touch-plus:grip":
                         {"pos": [x, y, z], "quat": [qx, qy, qz, qw]},
-        "survive:LHR-E0FCD01B":  {"pos": [...], "quat": [...]},
-        "ultimate:a:b:c:d:e:f": {
-          "pos": [...], "quat": [...],
-          "ultimate_pose_convention": {"quat_order": "wxyz", "up_axis": "z"}
-        }
+        "survive:LHR-E0FCD01B":  {"pos": [...], "quat": [...]}
       },
       "right": { ... }
     }
 
 The tracker key is the tracking backend plus its exact device-local datum:
 ``"quest:<WebXR-profile>:grip"`` for the headset path, or
-``"survive:<tracker serial>"`` / ``"ultimate:<mac>"`` for Vive backends (see
+``"survive:<tracker serial>"`` for Lighthouse (see
 :func:`tracker_key_for_side`). Hardware design defaults are keyed by backend
-family; Quest defaults must remain profile/pose-space scoped. Ultimate saved
-measurements additionally carry its quaternion-order/up-axis parser convention,
-because those settings define the bridge-reported tracker frame. Keying matters
+family; Quest defaults must remain profile/pose-space scoped. Keying matters
 because each tracker type can have both a different physical mount and a
 different device-local frame — a transform for one is silently wrong for
 another.
@@ -72,30 +66,21 @@ _PRE_MANTIS_TCP_TRANSFORM_FILE = almond_path("u" + "mi", "tcp_transform.json")
 # format surface on load. Never produced by a fresh calibration.
 LEGACY_TRACKER_KEY = "legacy"
 QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
-ULTIMATE_POSE_CONVENTION_FIELD = "ultimate_pose_convention"
-ULTIMATE_QUAT_ORDERS = frozenset({"xyzw", "wxyz"})
-ULTIMATE_UP_AXES = frozenset({"y", "z"})
-# Convention under which the approved Ultimate factory transform is expressed.
-# A different parser basis needs its own approved transform instead of silently
-# reusing these numbers in a differently reported tracker frame.
-ULTIMATE_FACTORY_POSE_CONVENTION = ("wxyz", "z")
 CURRENT_TRANSFORM_ENTRY = "current"
-STALE_TRANSFORM_ENTRY = "stale"
 INVALID_TRANSFORM_ENTRY = "invalid"
 
 # Where each tracker's reported origin sits on the standard Mantis mount, in
 # the gripper frame (the URDF ``*_gripper`` link: origin at the centre of the
 # gripper motor's mounting face, +x along the jaw travel, -z towards the
-# fingertips), in millimetres. From the rig CAD (2026-10): both Vive trackers
-# sit 47 mm behind the motor face (gripper +z) and above it (gripper -y), the
-# Ultimate's origin 11 mm higher than the Tracker 3.0's.
+# fingertips), in millimetres. From the rig CAD (2026-10): the Vive Tracker
+# 3.0 sits 47 mm behind the motor face (gripper +z) and 35 mm above it
+# (gripper -y).
 VIVE_TRACKER_CAD_ORIGINS_MM: dict[str, tuple[float, float, float]] = {
     "survive": (0.0, -35.0, 47.0),
-    "ultimate": (0.0, -46.0, 47.0),
 }
 
-# Tracker→gripper rotation for the flat-back Vive mounts (Tracker 3.0 and
-# Ultimate), as a unit quaternion ``[qx, qy, qz, qw]``: Ry(180°). Field
+# Tracker→gripper rotation for the flat-back Vive Tracker 3.0 mount, as a unit
+# quaternion ``[qx, qy, qz, qw]``: Ry(180°). Field
 # datasets recorded with the previous Rx(+90°) constant (axol <= 0.2.4)
 # replayed on Axol with every gripper pitched ~90° away from where the
 # operator held it; ``axol migrate-dataset --mantis-tcp-rotation`` repairs
@@ -178,7 +163,7 @@ def _tcp_transform_from_mount(
 # gripper axes expressed in tracker coordinates (equivalently, it maps
 # gripper-coordinate vectors into tracker coordinates).
 #
-# Vive (Tracker 3.0 and Ultimate, flat-back mount): the tracker sits flat on
+# Vive Tracker 3.0 (flat-back mount): the tracker sits flat on
 # top of the rig, behind the gripper motor (see
 # :data:`VIVE_TRACKER_CAD_ORIGINS_MM`). Rotation: Ry(180°)
 # (:data:`VIVE_TCP_ROTATION_QUAT`) — the bridge-reported tracker +z runs along
@@ -227,9 +212,6 @@ def _quest_tcp_transform(
 _SURVIVE_DESIGN_TCP_TRANSFORM = _tcp_transform_from_mount(
     VIVE_TRACKER_CAD_ORIGINS_MM["survive"], VIVE_TCP_ROTATION_QUAT
 )
-_ULTIMATE_DESIGN_TCP_TRANSFORM = _tcp_transform_from_mount(
-    VIVE_TRACKER_CAD_ORIGINS_MM["ultimate"], VIVE_TCP_ROTATION_QUAT
-)
 _QUEST_3_RIGHT_DESIGN_TCP_TRANSFORM = _quest_tcp_transform(
     _QUEST_3_GRIP_ORIGIN_MM, _QUEST_3_RIGHT_GRIP_IN_GRIPPER_QUAT
 )
@@ -243,10 +225,6 @@ DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
         "left": list(_SURVIVE_DESIGN_TCP_TRANSFORM),
         "right": list(_SURVIVE_DESIGN_TCP_TRANSFORM),
     },
-    "ultimate": {
-        "left": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
-        "right": list(_ULTIMATE_DESIGN_TCP_TRANSFORM),
-    },
     QUEST_3_TRACKER_KEY: {
         "left": list(_QUEST_3_LEFT_DESIGN_TCP_TRANSFORM),
         "right": list(_QUEST_3_RIGHT_DESIGN_TCP_TRANSFORM),
@@ -258,7 +236,6 @@ DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
 # dataset recorded under the old value refuses to resume under the new one.
 DESIGN_TCP_TRANSFORM_IDS: dict[str, str] = {
     "survive": "vive3-flat-back-v0.2.17",
-    "ultimate": "vive-ultimate-flat-back-v0.2.17",
     QUEST_3_TRACKER_KEY: "quest3-touch-plus-grip-v0.2.17",
 }
 
@@ -313,18 +290,12 @@ def validate_tcp_transform(transform: object) -> list[float]:
     return values
 
 
-def design_transform_for(
-    side: str,
-    tracker_key: str,
-    *,
-    tracker_config_path: Path | None = None,
-) -> list[float] | None:
+def design_transform_for(side: str, tracker_key: str) -> list[float] | None:
     """The rig's approved factory transform for ``side``, or ``None``.
 
     ``tracker_key`` is matched by backend family only (device identity does
     not change the design constant — every hardware tracker of one family
-    sits on the same mount). Ultimate's factory value is returned only under
-    the pose-parser convention for which it was approved. Returns
+    sits on the same mount). Returns
     ``[x, y, z, qx, qy, qz, qw]`` like a calibration entry.
     """
     family = tracker_key.split(":", 1)[0]
@@ -335,12 +306,6 @@ def design_transform_for(
     # datum, so their family default remains appropriate.
     lookup = tracker_key if family == "quest" else family
     if family == "quest" and parse_quest_tracker_key(tracker_key) is None:
-        return None
-    if (
-        family == "ultimate"
-        and current_ultimate_pose_convention(tracker_config_path)
-        != ULTIMATE_FACTORY_POSE_CONVENTION
-    ):
         return None
     return DESIGN_TCP_TRANSFORMS.get(lookup, {}).get(side)
 
@@ -472,7 +437,7 @@ def has_conflicting_transform_override(
                 for key in saved_keys
             )
         )
-    if family not in {"survive", "ultimate"}:
+    if family != "survive":
         return False
     for saved_key in saved_keys:
         same_family = saved_key == family or saved_key.startswith(f"{family}:")
@@ -540,11 +505,10 @@ def tracker_key_for_side(
     ``"quest"`` for the headset path (which has no tracker backend config at
     all), otherwise ``"<backend>"`` or ``"<backend>:<device>"`` from the
     saved tracker config (``~/.almond/tracker/config.json``, written by
-    ``axol tracker.identify``) — e.g. ``"survive:LHR-E0FCD01B"`` or
-    ``"ultimate:<mac>"``.
+    ``axol tracker.identify``) — e.g. ``"survive:LHR-E0FCD01B"``.
 
-    ``source`` is the selected Mantis source (``quest``, ``lighthouse``, or
-    ``ultimate``). Passing it is strongly preferred: a Quest headset and an
+    ``source`` is the selected Mantis source (``quest`` or ``lighthouse``).
+    Passing it is strongly preferred: a Quest headset and an
     ``axol tracker.bridge`` look identical to the VR server, and the tracker
     config may contain bindings for more than one backend. The historical
     file-existence inference remains only for callers that do not know the
@@ -568,11 +532,9 @@ def tracker_key_for_side(
     path = TRACKER_CONFIG_FILE if config_path is None else config_path
     if source == "quest":
         return "quest", "Quest WebXR source explicitly selected"
-    backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source or "")
+    backend = {"lighthouse": "survive"}.get(source or "")
     if source is not None and backend is None:
-        raise ValueError(
-            f"tracker source must be quest, lighthouse, or ultimate; got {source!r}"
-        )
+        raise ValueError(f"tracker source must be quest or lighthouse; got {source!r}")
     if not path.exists():
         if backend is not None:
             return backend, f"{source} source selected; no saved device binding"
@@ -602,7 +564,6 @@ def _is_legacy_side_entry(entry: object) -> bool:
 def load_tcp_transforms(
     path: Path | None = None,
     *,
-    tracker_config_path: Path | None = None,
     entry_statuses: dict[tuple[str, str], str] | None = None,
     document_errors: list[str] | None = None,
 ) -> dict[str, dict[str, list[float]]]:
@@ -611,12 +572,9 @@ def load_tcp_transforms(
     Entries in the legacy (per-side only) format are accepted under
     :data:`LEGACY_TRACKER_KEY` with a deprecation warning — they predate
     per-tracker keying, so which tracker they were measured with is unknown.
-    Ultimate entries are returned only when their saved pose convention exactly
-    matches the active tracker config; convention-less and mismatched entries
-    remain on disk for explicit adoption but are not authoritative. When
-    ``entry_statuses`` is supplied, it receives the classification of every
-    string-keyed entry so callers do not silently fall back to a factory value
-    over an exact stale or malformed per-device override. ``document_errors``
+    When ``entry_statuses`` is supplied, it receives the classification of
+    every string-keyed entry so callers do not silently fall back to a factory
+    value over an exact malformed per-device override. ``document_errors``
     receives a safe diagnostic when a present file cannot be trusted; only an
     actually absent file permits an unconditional factory fallback.
 
@@ -653,8 +611,6 @@ def load_tcp_transforms(
         return {}
     out: dict[str, dict[str, list[float]]] = {}
     legacy_seen = False
-    ultimate_convention_loaded = False
-    ultimate_convention: tuple[str, str] | None = None
     for side in ("left", "right"):
         if side not in data:
             continue
@@ -673,33 +629,11 @@ def load_tcp_transforms(
                 )
             continue
         for key, entry in side_entries.items():
-            if _is_ultimate_transform_key(key) and not ultimate_convention_loaded:
-                ultimate_convention = current_ultimate_pose_convention(
-                    tracker_config_path
-                )
-                ultimate_convention_loaded = True
-            flat, status = classify_tcp_transform_entry(
-                key,
-                entry,
-                ultimate_convention=ultimate_convention,
-            )
+            flat, status = classify_tcp_transform_entry(entry)
             if entry_statuses is not None and isinstance(key, str):
                 entry_statuses[(side, key)] = status
             if flat is not None and status == CURRENT_TRANSFORM_ENTRY:
                 out.setdefault(side, {})[key] = flat
-            elif flat is not None and status == STALE_TRANSFORM_ENTRY:
-                stored = ultimate_pose_convention_from_entry(entry)
-                _logger.warning(
-                    "%s %s calibration for %r is not authoritative: saved "
-                    "Ultimate pose convention %r does not match active %r. "
-                    "Bench-check and explicitly resave it under the active "
-                    "convention before production collection.",
-                    path,
-                    side,
-                    key,
-                    stored,
-                    ultimate_convention,
-                )
     if legacy_seen:
         _logger.warning(
             "%s holds calibration(s) in the legacy per-side format (no tracker "
@@ -730,90 +664,13 @@ def _flatten_entry(entry: object) -> list[float] | None:
         return None
 
 
-def _is_ultimate_transform_key(tracker_key: object) -> bool:
-    """Whether a saved transform key uses the Ultimate tracker-local frame."""
-    return isinstance(tracker_key, str) and (
-        tracker_key == "ultimate" or tracker_key.startswith("ultimate:")
-    )
+def classify_tcp_transform_entry(entry: object) -> tuple[list[float] | None, str]:
+    """Return a normalized transform and whether the entry is usable.
 
-
-def _normalize_ultimate_pose_convention(
-    quat_order: object, up_axis: object
-) -> tuple[str, str] | None:
-    if (
-        not isinstance(quat_order, str)
-        or quat_order not in ULTIMATE_QUAT_ORDERS
-        or not isinstance(up_axis, str)
-        or up_axis not in ULTIMATE_UP_AXES
-    ):
-        return None
-    return quat_order, up_axis
-
-
-def current_ultimate_pose_convention(
-    config_path: Path | None = None,
-) -> tuple[str, str] | None:
-    """Return the Ultimate parser convention active for tracker pose reports.
-
-    A tracker→TCP transform is expressed in the bridge-reported tracker-local
-    frame. Both of these settings change that frame, so they are calibration
-    provenance rather than incidental runtime options.
-    """
-    from ..tracker.config import TRACKER_CONFIG_FILE, load_tracker_config
-
-    path = TRACKER_CONFIG_FILE if config_path is None else config_path
-    config = load_tracker_config(path)
-    return _normalize_ultimate_pose_convention(
-        config.ultimate_quat_order,
-        config.ultimate_up_axis,
-    )
-
-
-def ultimate_pose_convention_metadata(
-    convention: tuple[str, str],
-) -> dict[str, str]:
-    """Serialize an already validated Ultimate convention for one entry."""
-    normalized = _normalize_ultimate_pose_convention(*convention)
-    if normalized is None:
-        raise ValueError(f"invalid Ultimate pose convention: {convention!r}")
-    quat_order, up_axis = normalized
-    return {"quat_order": quat_order, "up_axis": up_axis}
-
-
-def ultimate_pose_convention_from_entry(
-    entry: object,
-) -> tuple[str, str] | None:
-    """Parse exact Ultimate convention metadata from one calibration entry."""
-    if not isinstance(entry, dict):
-        return None
-    metadata = entry.get(ULTIMATE_POSE_CONVENTION_FIELD)
-    if not isinstance(metadata, dict) or set(metadata) != {"quat_order", "up_axis"}:
-        return None
-    return _normalize_ultimate_pose_convention(
-        metadata.get("quat_order"), metadata.get("up_axis")
-    )
-
-
-def classify_tcp_transform_entry(
-    tracker_key: object,
-    entry: object,
-    *,
-    ultimate_convention: tuple[str, str] | None,
-) -> tuple[list[float] | None, str]:
-    """Return a normalized transform and its authorization provenance state.
-
-    Quest and Lighthouse entries keep their existing keyed-file behavior.
-    Ultimate entries are current only when they record the exact quaternion
-    order and up-axis used to interpret the device pose. Older convention-less
-    entries remain readable for explicit operator adoption, but are stale and
-    therefore omitted by :func:`load_tcp_transforms`.
+    A well-formed entry is :data:`CURRENT_TRANSFORM_ENTRY`; a malformed one is
+    :data:`INVALID_TRANSFORM_ENTRY` and must suppress any factory fallback.
     """
     flat = _flatten_entry(entry)
     if flat is None:
         return None, INVALID_TRANSFORM_ENTRY
-    if not _is_ultimate_transform_key(tracker_key):
-        return flat, CURRENT_TRANSFORM_ENTRY
-    stored = ultimate_pose_convention_from_entry(entry)
-    if stored is None or ultimate_convention is None or stored != ultimate_convention:
-        return flat, STALE_TRANSFORM_ENTRY
     return flat, CURRENT_TRANSFORM_ENTRY

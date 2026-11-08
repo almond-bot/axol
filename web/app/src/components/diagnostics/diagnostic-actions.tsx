@@ -354,9 +354,9 @@ export function ActionDialog({
     () => allFields.find((f) => f.key === "joints" && !hidden.has("joints")),
     [allFields, hidden]
   )
-  // `--firmware` (lift.update, safety.update) is a file the operator picks on
-  // this machine: it is uploaded to the host first and the stored path
-  // becomes the arg.
+  // `--firmware` (lift.update, safety.update, mantis.update) is a file the
+  // operator picks on this machine: it is uploaded to the host first and the
+  // stored path becomes the arg.
   const firmwareField = useMemo(
     () => allFields.find((f) => f.key === "firmware" && !hidden.has("firmware")),
     [allFields, hidden]
@@ -469,7 +469,7 @@ export function ActionDialog({
 
         {firmwareField && (
           <FirmwareUploadField
-            board={spec.id === "safety.update" ? "safety" : "lift"}
+            board={FIRMWARE_BOARDS[spec.id] ?? "lift"}
             help={firmwareField.help}
             disabled={running || busy}
             onUploading={setUploading}
@@ -517,12 +517,19 @@ export function ActionDialog({
   )
 }
 
+/** The board each firmware-update command's `--firmware` file is for. */
+const FIRMWARE_BOARDS: Record<string, FirmwareBoard> = {
+  "lift.update": "lift",
+  "safety.update": "safety",
+  "mantis.update": "mantis",
+}
+
 /**
  * File picker for a command's `--firmware` argument: uploads the chosen file
  * to the serve host, which validates it (that board's firmware.bin, so the
- * lift's file is refused for the safety board and the other way round) and
- * stores it; the stored path is what the run receives. Clearing or a failed
- * upload leaves the argument unset (the command then only reports).
+ * lift's file is refused for the safety board or Mantis, and the other way
+ * round) and stores it; the stored path is what the run receives. Clearing or
+ * a failed upload leaves the argument unset (the command then only reports).
  */
 export function FirmwareUploadField({
   board = "lift",

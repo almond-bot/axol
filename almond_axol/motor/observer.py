@@ -56,7 +56,7 @@ from .damiao import (
     _DM_REG_VMAX,
     _DM_STATUS_MAP,
     DamiaoMotor,
-    _DamiaoStatus,
+    _decode_status,
 )
 from .damiao import _uint_to_float as _dm_uint_to_float
 from .motor import _JOINT_CONFIG, _MotorType
@@ -241,10 +241,7 @@ class _DamiaoDecoder:
         self.obs.velocity = _dm_uint_to_float(vel_int, -self.v_max, self.v_max, 12)
         self.obs.torque = _dm_uint_to_float(torq_int, -self.t_max, self.t_max, 12)
         self.obs.temperature = float(max(data[6], data[7]))  # max(t_mos, t_rotor)
-        try:
-            status = _DamiaoStatus(data[0] >> 4)
-        except ValueError:
-            status = _DamiaoStatus.DISABLED
+        status = _decode_status(data[0] >> 4)
         self.obs.status = _DM_STATUS_MAP.get(status, MotorStatus.UNKNOWN).name
         self.obs.fast_ts = ts
         self.obs.slow_ts = ts

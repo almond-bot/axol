@@ -11,6 +11,7 @@ import { fileURLToPath, URL } from "node:url"
 // /api (REST + WebSocket logs) there so the app can use same-origin URLs in
 // both dev and the production bundle served by the Python backend.
 const SUPERVISOR = process.env.AXOL_SERVE_URL ?? "http://localhost:8001"
+const PLAIN_HTTP = process.env.AXOL_DEV_PLAIN_HTTP === "1"
 
 /**
  * Git commit this bundle is built from, baked in so the control panel can
@@ -60,7 +61,10 @@ function buildVersion(): string | null {
 }
 
 export default defineConfig({
-  plugins: [react(), basicSsl(), tailwindcss()],
+  // Local browsers sometimes have HTTPS-only rules for localhost. Allow the
+  // dev server to be run explicitly over HTTP when a reachable LAN URL is
+  // needed; the default remains self-signed HTTPS.
+  plugins: [react(), ...(PLAIN_HTTP ? [] : [basicSsl()]), tailwindcss()],
   define: {
     __AXOL_BUILD_COMMIT__: JSON.stringify(buildCommit()),
     __AXOL_BUILD_VERSION__: JSON.stringify(buildVersion()),

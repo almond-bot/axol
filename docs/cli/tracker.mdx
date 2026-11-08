@@ -14,8 +14,6 @@ The `axol tracker.*` commands set up and check the trackers for [Mantis Tracking
 | [`tracker.lighthouse.check`](#axol-trackerlighthousecheck) | Check which base stations and trackers are reporting. | **Check base stations** |
 | [`tracker.lighthouse.validate`](#axol-trackerlighthousevalidate) | Check tracking quality with guided holds and a sweep. | **Validate tracking** |
 | [`tracker.lighthouse.calibrate`](#axol-trackerlighthousecalibrate) | Recalibrate the base stations, then validate. | **Recalibrate Lighthouse** |
-| [`tracker.ultimate.install`](#axol-trackerultimateinstall) | Install the VIVE Ultimate Tracker runtime and dongle udev rule. | **Install Ultimate support** |
-| [`tracker.ultimate.check`](#axol-trackerultimatecheck) | Check that the computer is ready for Ultimate trackers. | None (CLI only) |
 
 When you run `axol collect-data --mantis true` from the command line, it uses the tracking source, bindings and Quest calibration saved in the panel. It starts the bridge and runs the same readiness checks as the panel.
 
@@ -25,9 +23,8 @@ When you run `axol collect-data --mantis true` from the command line, it uses th
 - Collect DAgger and Run Policy don't support Mantis.
 
 ```bash
-# One-time per tracker family: bind physical trackers to sides.
+# One-time: bind physical trackers to sides.
 axol tracker.identify --backend survive
-axol tracker.identify --backend ultimate
 
 # One command owns both the operation and its bridge.
 axol collect-data --mantis true --repo_id myorg/bringup --task test \
@@ -40,8 +37,8 @@ Streams each tracker's pose and each side's trigger value to the VR server as `V
 
 | Flag | Description |
 |---|---|
-| `--backend {survive,ultimate,synthetic,static}` | Tracker backend. Default: the saved config, else `survive`. `synthetic` streams generated motion and `static` holds fixed poses, for tests without trackers. |
-| `--left KEY` / `--right KEY` | Override the saved binding: a Lighthouse serial such as `LHR-E0FCD01B`, or an Ultimate MAC address. |
+| `--backend {survive,synthetic,static}` | Tracker backend. Default: the saved config, else `survive`. `synthetic` streams generated motion and `static` holds fixed poses, for tests without trackers. |
+| `--left KEY` / `--right KEY` | Override the saved binding: a Lighthouse serial such as `LHR-E0FCD01B`. |
 | `--host HOST` | VR server host, the computer running teleop or collect-data. Default: `localhost`. |
 | `--port INT` | VR server port. Default: 8000. |
 | `--hz FLOAT` | Frame rate. Default: 120. |
@@ -71,11 +68,11 @@ Press **Enter** in the bridge terminal to engage. The simulated arms stay at the
 
 ## `axol tracker.identify`
 
-Finds the powered trackers, then asks you to move each rig in turn. The tracker that moves most is bound to that side. For Lighthouse, it first runs the same check as `tracker.lighthouse.check` and won't bind while two base stations share a channel. Lighthouse and Ultimate bindings are saved separately, so you can switch between them in the panel.
+Finds the powered trackers, then asks you to move each rig in turn. The tracker that moves most is bound to that side. For Lighthouse, it first runs the same check as `tracker.lighthouse.check` and won't bind while two base stations share a channel.
 
 | Flag | Description |
 |---|---|
-| `--backend {survive,ultimate,synthetic}` | Backend to use and save. Default: the saved config, else `survive`. |
+| `--backend {survive,synthetic}` | Backend to use and save. Default: the saved config, else `survive`. |
 
 Saves `~/.almond/tracker/config.json`:
 
@@ -85,11 +82,8 @@ Saves `~/.almond/tracker/config.json`:
   "left": "LHR-E0FCD01B",
   "right": "LHR-BDD65467",
   "bindings": {
-    "survive": {"left": "LHR-E0FCD01B", "right": "LHR-BDD65467"},
-    "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
+    "survive": {"left": "LHR-E0FCD01B", "right": "LHR-BDD65467"}
   },
-  "ultimate_quat_order": "wxyz",
-  "ultimate_up_axis": "z",
   "expected_base_stations": 2,
   "lighthouse_quality": "standard"
 }
@@ -205,59 +199,18 @@ If **Identify trackers** can't finish because tracking is unstable, you can reca
 
 Recalibrating changes the base station calibration, not the tracker-to-gripper transform. It doesn't change recordings you already made. Run the dynamic [acceptance checks](/mantis/tracking#acceptance) before your next collection.
 
-## `axol tracker.ultimate.install`
-
-```bash
-axol tracker.ultimate.install
-```
-
-Installs the VIVE Ultimate Tracker runtime: pyvut (commit `fcfcd33f4c1f16b0d84f5f741dc1319abdc7942a`), the `hid>=1.0.5` Python package (not the unrelated `hidapi`), the system HID libraries and a udev rule for dongle `0bb4:0350`. It is safe to run again. Don't replace it with `uv pip install` or a `chmod` of `/dev/hidraw*`. The Windows pairing and mapping steps you do first are on the [tracking page](/mantis/tracking).
-
-### Ultimate Wi-Fi file
-
-The panel's **Wi-Fi** step writes `ultimate_wifi.json`, the network settings for the trackers' shared map. To set it up by hand, create `~/.almond/tracker/ultimate_wifi.json` (or `$ALMOND_HOME/tracker/ultimate_wifi.json`) in this shape, then `chmod 600` it:
-
-```json
-{
-  "ssid": "YOUR_FALLBACK_TRACKER_SSID",
-  "pass": "YOUR_FALLBACK_TRACKER_PASSWORD",
-  "country": "US",
-  "freq": 5240
-}
-```
-
-All four fields are required. The trackers report the network they actually use, so `ssid`, `pass` and `freq` are only a fallback. Choose a `country` and `freq` that are valid where you work. The readiness check reports whether the file is valid, never the values in it.
-
-## `axol tracker.ultimate.check`
-
-```bash
-axol tracker.ultimate.check
-```
-
-Checks that the computer is ready for Ultimate trackers, the same way the panel does before an operation starts. It checks the installed packages, USB and HID access, bindings, pose settings and the Wi-Fi file. It fails if the Wi-Fi file is missing or insecure, or if your account can't open the HID device. It doesn't connect to the dongle or check live tracking. To check live poses, run `tracker.identify` again.
-
 ## Transform file
 
-`~/.almond/mantis/tcp_transform.json` holds measured tracker-to-gripper transforms for each side, keyed by the identified device. Axol has built-in factory values for the standard Tracker 3.0 and Ultimate mounts, and for Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`). It uses a factory value when no conflicting entry is saved. A saved entry overrides the factory value. Other Quest controllers have no factory value and need an entry for both sides.
+`~/.almond/mantis/tcp_transform.json` holds measured tracker-to-gripper transforms for each side, keyed by the identified device. Axol has built-in factory values for the standard Tracker 3.0 mount and for Quest 3 Touch Plus controllers (`quest:meta-quest-touch-plus:grip`). It uses a factory value when no conflicting entry is saved. A saved entry overrides the factory value. Other Quest controllers have no factory value and need an entry for both sides.
 
 ```json
 {
   "left": {
     "survive:LHR-E0FCD01B": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
-    "ultimate:AA:BB:CC:DD:EE:01": {
-      "pos": [0.0, 0.0, 0.0],
-      "quat": [0.0, 0.0, 0.0, 1.0],
-      "ultimate_pose_convention": {"quat_order": "wxyz", "up_axis": "z"}
-    },
     "quest:oculus-touch-v3:grip": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
   },
   "right": {
     "survive:LHR-87654321": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]},
-    "ultimate:AA:BB:CC:DD:EE:02": {
-      "pos": [0.0, 0.0, 0.0],
-      "quat": [0.0, 0.0, 0.0, 1.0],
-      "ultimate_pose_convention": {"quat_order": "wxyz", "up_axis": "z"}
-    },
     "quest:oculus-touch-v3:grip": {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
   }
 }
@@ -273,20 +226,18 @@ You can also write the file with `PUT /api/tracker/calibration/<source>`. The co
 Rules Axol applies when it loads the file:
 
 - **Quest** collection needs a `quest:<reported-profile>:grip` entry on both sides, or the built-in Quest 3 Touch Plus value. A bare `quest` key, a different controller profile, missing profile details or a `target-ray` entry is refused.
-- **Ultimate** entries need an `ultimate_pose_convention` that matches the active `ultimate_quat_order` and `ultimate_up_axis`. An entry without one, or with a different one, blocks the factory value for that side until you fix or remove it.
-- An unkeyed entry, a bare `survive` or `ultimate` key, or an entry for a tracker you no longer use also blocks the factory value for that side until you re-key or delete it.
+- An unkeyed entry, a bare `survive` key, or an entry for a tracker you no longer use also blocks the factory value for that side until you re-key or delete it.
 - Production `collect-data` needs a saved device entry or a factory value on both sides. Use `--mantis_allow_uncalibrated true` only for a calibration capture that won't be used for training.
 
-### Vive factory values
+### Tracker 3.0 factory value
 
-Both Vive tracker types sit flat on top of the rig, behind the gripper motor. Both use the rotation **`Ry(180°)`**, stored as the quaternion `[0, 1, 0, 0]`. The tracker's +z axis points along the gripper fingers (gripper −z), its +x axis along the gripper's −x, and the y axes match.
+The VIVE Tracker 3.0 sits flat on top of the rig, behind the gripper motor. It uses the rotation **`Ry(180°)`**, stored as the quaternion `[0, 1, 0, 0]`. The tracker's +z axis points along the gripper fingers (gripper −z), its +x axis along the gripper's −x, and the y axes match.
 
 Positions are given in the gripper frame, whose origin is the center of the gripper motor's mounting face:
 
 | Tracker | Tracker origin in the gripper frame | Stored value, both sides |
 |---|---|---|
 | Tracker 3.0 | `[0, −35, 47]` mm: 47 mm behind and 35 mm above the motor face | `[0, 0.035, 0.047, 0, 1, 0, 0]` |
-| Ultimate | `[0, −46, 47]` mm: 11 mm higher than the Tracker 3.0 | `[0, 0.046, 0.047, 0, 1, 0, 0]` |
 
 <Warning>
   Datasets recorded with `axol` 0.2.4 or older store gripper orientations rotated about 90° from how the rig was held, and Axol can't replay them. Repair them with [`axol migrate-dataset --mantis-tcp-rotation`](/cli/migrate-dataset#mantis-tracker-gripper-rotation). `collect-data` won't add episodes to a dataset that hasn't been repaired.
@@ -307,7 +258,7 @@ Other controllers need a measured entry.
 
 ### Deriving a missing constant
 
-If you have no transform for your source, such as a Quest controller other than the Touch Plus or an Ultimate with a non-standard pose setting:
+If you have no transform for your source, such as a Quest controller other than the Touch Plus or a Tracker 3.0 on a non-standard mount:
 
 1. Pass the [acceptance checks](/mantis/tracking#acceptance) for side, scale and recovery.
 2. Record a short capture with `--mantis_allow_uncalibrated true`.

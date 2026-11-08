@@ -28,6 +28,7 @@ import {
   formatSettingValue,
   nextSettingValue,
   useAxolControlChannel,
+  useAxolHaptics,
   useAxolJoints,
   useAxolPoseSocket,
   useAxolSettings,
@@ -40,6 +41,7 @@ import { configureTextBuilder } from "troika-three-text"
 import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { LiveRobot } from "@/components/live-robot"
 import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
 import { SuggestInput } from "@/components/suggest-input"
@@ -301,15 +303,16 @@ function PoseVisualizer({ poseMode }: { poseMode: AxolPoseMode }) {
 // All three feeds are shown at once: the overhead in the centre (true stereo
 // when the packed track streams) with the two wrist cams as bottom-corner
 // picture-in-picture panes (left wrist → bottom-left, right wrist →
-// bottom-right). There is no view picker — the operator tailors the layout
-// directly instead:
+// bottom-right). A small live model of the robot stands below the overhead,
+// between the wrist cams, with its back to the operator. There is no view
+// picker — the operator tailors the layout directly instead:
 //   - Move a screen: point a controller at it and hold the rear trigger, then
 //     move the controller; release to drop. Each screen remembers its spot.
 //   - Resize a screen: grab the *same* screen with both controllers' triggers
 //     and move your hands apart (bigger) or together (smaller).
 //   - Reset: press B (right controller) to re-anchor every screen to the
 //     current gaze and clear all moves + resizes. (The thumbstick clicks are
-//     reserved for the Jelly's lift.)
+//     reserved for box mode and the Jelly's lift.)
 //
 // The screens behave like TVs: they are world-anchored where the operator was
 // looking when the session started, so the head can move freely while the
@@ -318,8 +321,9 @@ function PoseVisualizer({ poseMode }: { poseMode: AxolPoseMode }) {
 // broadcasts its engage toggle over the WebSocket (`{"type": "tracking"}`),
 // covering grips, X/reset, and saving.
 
-// Which draggable screen a layer belongs to: the overhead or a wrist cam.
-type GrabSlot = "overhead" | "left" | "right"
+// Which draggable screen a layer belongs to: the overhead, a wrist cam, or
+// the live robot model.
+type GrabSlot = "overhead" | "left" | "right" | "robot"
 
 const FEED_DISTANCE = 1 // metres from the anchor point to the screens
 // Drop the feed slightly so its centre lands on the operator's natural gaze
@@ -332,6 +336,10 @@ const PIP_Y = -0.52 // vertical offset (lower corners)
 // Overhead plane width in metres (height derives from aspect). Kept to ~2× the
 // wrist PiP width so it reads as the primary feed without dominating the view.
 const OVERHEAD_WIDTH = PIP_WIDTH * 2
+// The live robot model: its floor below the overhead, between the wrist cams,
+// a little in front of the screens, with its top just under the overhead.
+const ROBOT_Y = -0.88
+const ROBOT_DISTANCE = 0.9
 // Per-screen resize limits, relative to each screen's default size.
 const MIN_SCALE = 0.3
 const MAX_SCALE = 4
@@ -343,6 +351,8 @@ const _grabTarget = new THREE.Vector3()
 const _dragDelta = new THREE.Vector3()
 const _yawFwd = new THREE.Vector3()
 const _yAxis = new THREE.Vector3(0, 1, 0)
+const _robotPos = new THREE.Vector3()
+const _robotYaw = new THREE.Quaternion()
 // Per-hand controller ray (origin + forward), refreshed each frame so both the
 // single-hand drag and the two-hand resize can read either hand's pointing ray.
 const _handRay = {
@@ -350,7 +360,15 @@ const _handRay = {
   right: { origin: new THREE.Vector3(), dir: new THREE.Vector3(), valid: false },
 }
 
-function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+function ImmersiveCameraFeed({
+  wsRef,
+  hostname,
+  jointsRef,
+}: {
+  wsRef: RefObject<WebSocket | null>
+  hostname: string
+  jointsRef: RefObject<AxolJointSample | null>
+}) {
   const { gl } = useThree()
   const session = useXR((s) => s.session)
   // Only negotiate video while the headset is presenting. `available` is null
@@ -364,6 +382,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const overheadMeshRef = useRef<THREE.Mesh>(null)
   const dualAMeshRef = useRef<THREE.Mesh>(null)
   const dualBMeshRef = useRef<THREE.Mesh>(null)
+  const robotGroupRef = useRef<THREE.Group>(null)
+  const robotHitRef = useRef<THREE.Mesh>(null)
   const spinnerRef = useRef<THREE.Group>(null)
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
@@ -540,7 +560,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     // Pressing B on the right controller (buttons[5]) re-anchors the screens
     // to the current gaze and clears every move + resize. The thumbstick
-    // clicks (buttons[3]) are reserved for the Jelly's lift.
+    // clicks (buttons[3]) are reserved for box mode and the Jelly's lift.
     const reanchorPressed = right?.gamepad?.buttons?.[5]?.pressed ?? false
     if (reanchorPressed && !reanchorPrevRef.current) {
       anchoredRef.current = false
@@ -612,6 +632,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     fitWidth(overheadMesh, overheadVideo, sbs, "overhead", OVERHEAD_WIDTH, 0, FEED_Y)
     fitWidth(aMesh, videos["left_arm"], false, "left", PIP_WIDTH, -PIP_X, PIP_Y)
     fitWidth(bMesh, videos["right_arm"], false, "right", PIP_WIDTH, PIP_X, PIP_Y)
+    const robotGroup = robotGroupRef.current
+    const robotHit = robotGroup?.visible ? robotHitRef.current : null
+    if (robotGroup) {
+      robotGroup.position.set(0, ROBOT_Y, -ROBOT_DISTANCE)
+      robotGroup.scale.setScalar(scalesRef.current["robot"] ?? 1)
+    }
 
     // Refresh each hand's pointing ray (origin + forward) in world space, so
     // both the single-hand drag and the two-hand resize can read either hand.
@@ -659,6 +685,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         if (overheadMesh) candidates.push([overheadMesh, "overhead"])
         if (aMesh) candidates.push([aMesh, "left"])
         if (bMesh) candidates.push([bMesh, "right"])
+        if (robotHit) candidates.push([robotHit, "robot"])
         _raycaster.set(_handRay[hand].origin, _handRay[hand].dir)
         const hits = _raycaster.intersectObjects(
           candidates.map((c) => c[0]),
@@ -740,6 +767,18 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     orient(overheadMesh, "overhead")
     orient(aMesh, "left")
     orient(bMesh, "right")
+    if (robotGroup) {
+      const off = dragOffsetsRef.current["robot"]
+      if (off) robotGroup.position.add(off)
+      // Turn the model's back to the operator, wherever it was dragged, so
+      // its left arm stays on their left.
+      robotGroup.getWorldPosition(_robotPos)
+      _robotYaw.setFromAxisAngle(
+        _yAxis,
+        Math.atan2(-(_robotPos.x - cam.position.x), -(_robotPos.z - cam.position.z))
+      )
+      robotGroup.quaternion.copy(group.quaternion).invert().multiply(_robotYaw)
+    }
   })
 
   // The screens mount/unmount with their videos: hiding a compositor media
@@ -771,6 +810,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   return (
     <>
       <group ref={groupRef}>
+        <LiveRobot
+          hostname={hostname}
+          jointsRef={jointsRef}
+          groupRef={robotGroupRef}
+          hitRef={robotHitRef}
+        />
         {/* Distinct renderOrders keep the compositing order deterministic
             where the PiPs overlap the overhead (higher composites on top; the
             WebGL projection layer with the HUD is always last, i.e. above). */}
@@ -836,6 +881,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 }
 
 const hudBg = { backgroundColor: "#000000", backgroundOpacity: 0.5, padding: 0.006 } as object
+
+/** Plays the server's haptics on the controllers (see useAxolHaptics). */
+function ControllerHaptics({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+  useAxolHaptics(wsRef)
+  return null
+}
 
 function XRHud({ children }: { children: ReactNode }) {
   const session = useXR((s) => s.session)
@@ -1290,9 +1341,9 @@ function HelpPanel({
       : boxMode
         ? [
             "[Grip]  Lead / freeze both arms",
-            "[Stick left/right]  Width",
-            "[Stick up/down]  Elbows",
-            "[Stick click]  Flush / straight",
+            "[Stick up/down]  Width",
+            "[Stick tap]  Flush / straight",
+            "[Stick hold]  Raise lift",
           ]
         : ["[Grip]  Engage / freeze arm", ...(boxAvailable ? ["[Both clicks]  Box mode"] : [])]),
   ].join("\n")
@@ -1305,10 +1356,8 @@ function HelpPanel({
           ...(boxMode
             ? [
                 "[Grip]  Lead / freeze both arms",
-                "[Stick left/right]  Width",
-                "[Stick up/down]  Elbows",
-                "[Stick click]  Flush / straight",
-                "[Frozen: sticks]  Drive Jelly",
+                "[Stick tap]  Flush / straight",
+                "[Stick hold]  Lower lift",
                 "[Both clicks]  Box mode",
               ]
             : [
@@ -1862,8 +1911,8 @@ export default function App() {
                           ...(boxMode
                             ? ([
                                 ["Grip", "Lead both arms"],
-                                ["Stick", "← → width, ↑ ↓ elbows"],
-                                ["Stick click", "Flush / straight grasp"],
+                                ["Stick tap", "Flush / straight grasp"],
+                                ["Stick hold", "Lower lift"],
                               ] as [string, string][])
                             : ([
                                 ["Grip", "Engage / freeze arm"],
@@ -1896,8 +1945,9 @@ export default function App() {
                     ...(boxMode
                       ? ([
                           ["Grip", "Lead both arms"],
-                          ["Stick", "← → width, ↑ ↓ elbows"],
-                          ["Stick click", "Flush / straight grasp"],
+                          ["Stick", "↑ ↓ grip width"],
+                          ["Stick tap", "Flush / straight grasp"],
+                          ["Stick hold", "Raise lift"],
                         ] as [string, string][])
                       : ([["Grip", "Engage / freeze arm"]] as [string, string][])),
                   ]}
@@ -1955,7 +2005,8 @@ export default function App() {
               onBothStickClick={handleBothStickClick}
               onExit={() => store.getState().session?.end()}
             />
-            <ImmersiveCameraFeed wsRef={wsRef} />
+            <ImmersiveCameraFeed wsRef={wsRef} hostname={hostname} jointsRef={jointsRef} />
+            <ControllerHaptics wsRef={wsRef} />
             <XRHud>
               <ExitButton />
               <HelpIcon

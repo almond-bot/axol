@@ -13,7 +13,7 @@ Each rig has:
 
 - The same **gripper** that Axol uses.
 - An analog **trigger** that opens and closes the gripper. The further you squeeze, the further the gripper closes.
-- A mount for a **pose tracker**: a Meta Quest controller, a VIVE Tracker 3.0 or a VIVE Ultimate Tracker.
+- A mount for a **pose tracker**: a Meta Quest controller or a VIVE Tracker 3.0.
 
 In the control panel, Mantis appears as its own device next to Axol, with its own card and settings. Mantis supports **Teleoperation** and **Data collection**. The other operations are for Axol only.
 
@@ -23,7 +23,7 @@ A Mantis kit has:
 
 - **2× Mantis rigs**, one left and one right.
 - **1× Mantis Hub**, which connects the rigs to the computer. **L** and **R** on its case mark the left and right rig cables. A USB cable connects the hub to the computer, such as a ZED Box.
-- **A pose source**: one of the three tracking systems in [Mantis Tracking](/mantis/tracking). These are Quest controllers, VIVE Tracker 3.0 with 1 to 4 SteamVR base stations, or VIVE Ultimate Trackers with their wireless dongle.
+- **A pose source**: one of the two tracking systems in [Mantis Tracking](/mantis/tracking). These are Quest controllers or VIVE Tracker 3.0 with 1 to 4 SteamVR base stations.
 - **Cameras**: up to two wrist ZED cameras and one head stereo camera. Data collection needs at least one camera.
 
 Mantis has no arms. In a recording, the arm joint positions are computed from the rig poses, as if Axol had made the motion. The gripper positions are real and come from the grippers' motors.
@@ -32,7 +32,7 @@ The trigger reads `0.0` when fully released (gripper open) and `1.0` when fully 
 
 ### Tracker mounts
 
-The kit includes the mount for the pose source you bought: Quest, Lighthouse (VIVE Tracker 3.0) or Ultimate. If you bought Mantis without a tracker, you can [print your own mount](#printing-your-own-mount).
+The kit includes the mount for the pose source you bought: Quest or Lighthouse (VIVE Tracker 3.0). If you bought Mantis without a tracker, you can [print your own mount](#printing-your-own-mount).
 
 <Frame>
   <img src="/assets/mantis_grasp.jpg" alt="A Mantis rig grasping a part, with a VIVE Tracker 3.0 on the flat-back mount and a wrist camera fitted" width="400" style={{ margin: "0 auto" }} />
@@ -42,11 +42,10 @@ The kit includes the mount for the pose source you bought: Quest, Lighthouse (VI
 |---|---|---|
 | **Meta Quest** controllers | The controller is fixed to the rig. | Built in for Quest 3 (Touch Plus) controllers. Other controllers must be measured (see [Mantis Tracking](/mantis/tracking#transforms)). |
 | **VIVE Tracker 3.0** (Lighthouse) | Flat-back mount in place of the controller. | Built in. Nothing to measure for the standard mount. |
-| **VIVE Ultimate Tracker** | Same flat-back mount and orientation as Tracker 3.0. | Built in. Nothing to measure for the standard mount. |
 
 #### Fastening a VIVE tracker to its mount
 
-Both VIVE trackers attach to the flat-back mount the same way. You need:
+To attach a VIVE Tracker 3.0 to the flat-back mount, you need:
 
 - **1× 1/4"-20 × 1/2" screw**. It goes up through the mount into the tracker's standard 1/4"-20 socket.
 - **1× mount pin** ([`mantis_mount_pin.stl`](https://downloads.almond.bot/resources/mantis_mount_pin.stl)), a 3D-printed pin 5 mm × 10 mm. It fits in the small hole next to the socket and stops the tracker from turning on the screw. If the tracker turns, the recorded gripper poses are wrong.
@@ -59,7 +58,6 @@ If you ordered Mantis without a tracker and use your own, 3D-print the mount for
 
 - Quest 3 controller mount, [left](https://downloads.almond.bot/resources/mantis_quest_3_mount_l.stl) and [right](https://downloads.almond.bot/resources/mantis_quest_3_mount_r.stl) (STL). The Touch controllers are mirror images, so print one of each.
 - [VIVE Tracker 3.0 mount](https://downloads.almond.bot/resources/mantis_vive_3_mount.step) (STEP)
-- [VIVE Ultimate Tracker mount](https://downloads.almond.bot/resources/mantis_vive_ultimate_mount.step) (STEP)
 
 Each mount attaches to the rig with **M3×8 screws** ([McMaster-Carr 97763A813](https://www.mcmaster.com/97763A813/)). For a VIVE tracker, also print the mount pin, and attach the tracker as in [Fastening a VIVE tracker to its mount](#fastening-a-vive-tracker-to-its-mount).
 
@@ -135,7 +133,7 @@ Before you set up cameras or tracking, check that each trigger drives its own gr
    axol teleop --mantis
    ```
 
-2. Keep hands and objects clear of the grippers, and release both triggers. Each gripper opens fully to find its end stop.
+2. Keep hands and objects clear of the grippers, and release both triggers. Each gripper closes, then opens fully, to find its end stops.
 3. Squeeze each trigger. Its gripper should close as far as you squeeze.
 4. Press **Stop**, or **Ctrl-C** in the terminal, to turn both grippers off.
 
@@ -150,11 +148,15 @@ If a gripper follows its trigger but stays partly open at full squeeze, adjust t
 3. Save, then stop and start **Teleoperation** again.
 4. Squeeze each trigger fully and check that the gripper closes.
 
+#### If a gripper doesn't open fully
+
+Each gripper finds its end stops at the start of every run. If something blocks a jaw during that sweep, the gripper takes the blocked spot as its end stop. Empty the gripper, keep it clear, then stop and start **Teleoperation** again. If it still doesn't open fully, open and close the jaw by hand with the run stopped, and check for a tight spot.
+
 If the gripper closes before the trigger reaches the end of its travel, the value is too low. Raise it. If the gripper still doesn't close when the setting is right, check the gripper's jaws, linkage and motor calibration.
 
 When both grippers close fully, record one short test take with **Collect data** before you record the rest.
 
-This setting applies to the rig triggers, used in Mantis teleoperation and in Lighthouse and Ultimate data collection. It does not apply to Quest controller triggers.
+This setting applies to the rig triggers, used in Mantis teleoperation and in Lighthouse data collection. It does not apply to Quest controller triggers.
 
 ### Mounting the cameras
 
@@ -168,11 +170,17 @@ Mantis can record two wrist cameras and the head stereo camera at the same time.
 
 You must turn on **Record** for at least one camera before you can collect data. The Mantis camera layout is saved separately from Axol's, so changing one doesn't change the other. In the dataset, the head camera is named `overhead`. See [Cameras](/guides/control-panel#cameras) for the stream and record controls.
 
+## Updating the firmware
+
+Each rig's trigger board can take new firmware over its CAN bus. Run [`axol mantis.update --firmware firmware.bin`](/cli/mantis-update), or use **Update Mantis firmware** under **Diagnostics → Helpers** with Mantis selected. Keep both triggers released while it runs, because each rig learns its trigger's released position when it restarts.
+
+The rigs need Mantis firmware 0.2 or newer, installed once over USB, before they can update over CAN.
+
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Mantis Tracking" icon="satellite-dish" href="/mantis/tracking">
-    Set up Quest, Lighthouse, or Ultimate tracking for the rigs.
+    Set up Quest or Lighthouse tracking for the rigs.
   </Card>
   <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
     Check the rig triggers and grippers before recording.

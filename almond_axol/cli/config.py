@@ -163,7 +163,7 @@ AggregateFn = register_literal(
         "conservative",
     ]
 )
-MantisSource = register_literal(Literal["quest", "lighthouse", "ultimate"])
+MantisSource = register_literal(Literal["quest", "lighthouse"])
 
 
 # ----------------------------------------------------------------------
@@ -391,7 +391,7 @@ _FIELD_HELP: dict[str, str] = {
         "Whether this robot has grippers. Set false for the gripperless SKU: "
         "gripper motors are never enabled and gripper commands are ignored."
     ),
-    "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
+    "torque_limit": "Peak gripper output torque (Nm), at most 5.",
     "max_speed": "Max gripper joint speed (rad/s).",
     "serial": "Serial number of the ZED camera to open (0 = slot unassigned).",
 }

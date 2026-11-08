@@ -49,6 +49,7 @@ describe("AppShell", () => {
       "Operations",
       "Datasets",
       "Request data",
+      "Request teleoperator",
       "Settings",
       "Diagnostics",
       "Logs",
@@ -91,5 +92,18 @@ describe("AppShell", () => {
     })
     expect(link("Tuning").getAttribute("aria-current")).toBe("page")
     expect(link("Live").getAttribute("aria-current")).toBeNull()
+  })
+
+  it("can point an item at another page and keep it current in its section", () => {
+    const navTargets = { "/control/operations": "/control/operations/jog" }
+    render("/control/operations", { navTargets })
+    expect(link("Operations").getAttribute("href")).toBe("/control/operations/jog")
+    expect(link("Operations").getAttribute("aria-current")).toBe("page")
+  })
+
+  it("leaves a redirected item unmarked outside its section", () => {
+    render("/control/devices", { navTargets: { "/control/operations": "/control/operations/jog" } })
+    expect(link("Operations").getAttribute("aria-current")).toBeNull()
+    expect(link("Devices").getAttribute("href")).toBe("/control/devices")
   })
 })

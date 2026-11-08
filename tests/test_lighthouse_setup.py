@@ -303,8 +303,7 @@ class CodenameBindingMigrationTest(unittest.TestCase):
             path = Path(tmp) / "config.json"
             path.write_text(
                 '{"backend": "survive", "left": "WM1", "right": "WM0", '
-                '"bindings": {"survive": {"left": "WM1", "right": "WM0"}, '
-                '"ultimate": {"left": "aa:bb", "right": "cc:dd"}}}'
+                '"bindings": {"survive": {"left": "WM1", "right": "WM0"}}}'
             )
             path.chmod(0o600)
 
@@ -315,9 +314,6 @@ class CodenameBindingMigrationTest(unittest.TestCase):
             self.assertIsNone(loaded.left)
             self.assertIsNone(loaded.right)
             self.assertEqual(loaded.bindings["survive"], {"left": None, "right": None})
-            self.assertEqual(
-                loaded.bindings["ultimate"], {"left": "aa:bb", "right": "cc:dd"}
-            )
 
     def test_serial_bindings_are_kept(self) -> None:
         from almond_axol.tracker.config import load_tracker_config
@@ -332,6 +328,43 @@ class CodenameBindingMigrationTest(unittest.TestCase):
             config = load_tracker_config(path)
 
         self.assertEqual((config.left, config.right), ("LHR-E0FCD01B", "LHR-BDD65467"))
+
+    def test_retired_ultimate_config_falls_back_to_lighthouse(self) -> None:
+        import json
+
+        from almond_axol.tracker.config import load_tracker_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "backend": "ultimate",
+                        "left": "aa:bb",
+                        "right": "cc:dd",
+                        "bindings": {
+                            "survive": {
+                                "left": "LHR-E0FCD01B",
+                                "right": "LHR-BDD65467",
+                            },
+                            "ultimate": {"left": "aa:bb", "right": "cc:dd"},
+                        },
+                        "ultimate_quat_order": "wxyz",
+                        "ultimate_up_axis": "z",
+                    }
+                )
+            )
+            path.chmod(0o600)
+            config = load_tracker_config(path)
+            saved = json.loads(path.read_text())
+
+        self.assertEqual(config.backend, "survive")
+        self.assertEqual((config.left, config.right), ("LHR-E0FCD01B", "LHR-BDD65467"))
+        self.assertEqual(set(config.bindings), {"survive"})
+        self.assertEqual(saved["backend"], "survive")
+        self.assertNotIn("ultimate", saved["bindings"])
+        self.assertNotIn("ultimate_quat_order", saved)
+        self.assertNotIn("ultimate_up_axis", saved)
 
 
 class _Crash:

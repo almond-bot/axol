@@ -130,6 +130,8 @@ def motor_faults(
             problem = "unreachable"
         elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
             problem = str(m["status"]).replace("_", " ").lower()
+            if problem == "unknown":
+                problem = "unknown fault"
         else:
             continue
         faults.append(
@@ -760,10 +762,14 @@ class RobotLink:
                 # owns the bus): unknown, reported as null rather than as a
                 # reachable/unreachable claim this link cannot make.
                 reachable = h.get("reachable")
+                motor = arm.motors.get(joint)
                 motors.append(
                     {
                         "arm": arm.side,
                         "joint": joint.name,
+                        # "myactuator" / "damiao" while the link has the motor
+                        # open, else None.
+                        "type": motor.motor_type if motor is not None else None,
                         "reachable": None if reachable is None else bool(reachable),
                         "status": h.get("status"),
                         "temperature": h.get("temperature"),

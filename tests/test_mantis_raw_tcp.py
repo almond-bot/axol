@@ -23,6 +23,16 @@ from almond_axol.teleop.worker import IKWorker
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
 
+def _recv_frame(conn):
+    """The next frame the core sends the worker, past its control messages
+    (``("grip", ...)``, ``("lift", ...)``)."""
+    while True:
+        assert conn.poll(2)
+        msg = conn.recv()
+        if not isinstance(msg, tuple):
+            return msg
+
+
 def _frame(
     offset: float = 0.0, *, locks: bool = False, stamp: float | None = None
 ) -> VRFrame:
@@ -165,8 +175,7 @@ def test_receive_callback_tracks_motion_during_half_second_ik_stall() -> None:
     )
     loop.start()
     try:
-        assert child.poll(2)
-        initial = child.recv()
+        initial = _recv_frame(child)
         child.send(
             (
                 "q",
@@ -181,8 +190,7 @@ def test_receive_callback_tracks_motion_during_half_second_ik_stall() -> None:
         next_frame = _frame(0.01)
         teleop._on_vr_frame(next_frame)
         latest[0] = next_frame
-        assert child.poll(2)
-        pending = child.recv()
+        pending = _recv_frame(child)
         # Keep the worker reply blocked for longer than the old 250 ms stale
         # QA limit, while real receive callbacks publish moving/rotating poses.
         deadline = time.perf_counter() + 0.55
@@ -279,8 +287,7 @@ def test_transient_fault_while_ik_waits_forces_release_even_when_frame_is_unchan
     )
     loop.start()
     try:
-        assert child.poll(2)
-        initial = child.recv()
+        initial = _recv_frame(child)
         child.send(
             (
                 "q",
@@ -296,8 +303,7 @@ def test_transient_fault_while_ik_waits_forces_release_even_when_frame_is_unchan
         # interpolator can return this same object for every stationary sample.
         unchanged = _frame()
         latest[0] = unchanged
-        assert child.poll(2)
-        pending = child.recv()
+        pending = _recv_frame(child)
         assert pending.l_lock and pending.r_lock
         core.note_raw_tcp_frame(unchanged.model_copy(update={"r_tracked": False}))
         core.note_raw_tcp_frame(unchanged)  # recovers before the solve returns
@@ -312,15 +318,13 @@ def test_transient_fault_while_ik_waits_forces_release_even_when_frame_is_unchan
             )
         )
         # Identity reuse must not suppress the forced-disengage low handshake.
-        assert child.poll(2)
-        released = child.recv()
+        released = _recv_frame(child)
         assert not released.l_lock and not released.r_lock
         assert not core.teleop_enabled
         assert core.last_tcp_snapshot is None
         child.send(("q", np.zeros(14), None, mapping.map_frame(released), None))
         latest[0] = _frame(locks=True)
-        assert child.poll(2)
-        reengaged = child.recv()
+        reengaged = _recv_frame(child)
         assert reengaged.l_lock and reengaged.r_lock
         solved.clear()
         child.send(

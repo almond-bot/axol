@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "almond-axol"
-version = "0.2.30"
+version = "0.2.39"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
@@ -79,10 +79,8 @@ lerobot = [
 ]
 sim = ["viser>=1.0.24,<1.1"]
 # Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS
-# client; pyvut imports the `hid` package (not the similarly named `hidapi`).
-# libsurvive is installed by `axol provision`; the pinned reverse-engineered
-# pyvut runtime is an explicit `axol tracker.ultimate.install` action.
-tracker = ["websockets>=12,<16", "hid>=1.0.5,<2"]
+# client; libsurvive is installed by `axol provision`.
+tracker = ["websockets>=12,<16"]
 
 [project.scripts]
 axol = "almond_axol.cli:main"
@@ -107,6 +105,7 @@ include = [
 dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
+    "pytest-xdist>=3.6",
 ]
 
 [tool.pytest.ini_options]

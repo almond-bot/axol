@@ -16,6 +16,9 @@ Note: each motor's encoder zero is calibrated at one of the joint's
 mechanical END STOPS, not at the robot's rest position. ``AxolArm`` adds a
 per-joint offset so the public API stays in joint frame (``0`` = rest).
 
+MyActuator motors that need Change Motor Direction get it turned on before
+they are zeroed, because turning it on moves the zero.
+
 Examples:
     axol motor.set-zero-pos --l --id 0x01
     axol motor.set-zero-pos --r --id 0x06
@@ -268,11 +271,9 @@ async def _calibrate_joint(
 
     # Prompts are self-contained (they name the joint) since the dashboard
     # shows them on a Continue button without the surrounding log context.
+    instruction = f"{joint.name}: move to the END STOP at {target_deg:+.1f}°"
     while True:
-        if not _prompt(
-            f"{joint.name}: move to the END STOP at {target_deg:+.1f}°",
-            web_prompts,
-        ):
+        if not _prompt(instruction, web_prompts):
             return False
         p_end = await motor.get_position()
         print(f"     end:   {_fmt(p_end)}")
@@ -285,27 +286,24 @@ async def _calibrate_joint(
             continue
 
         if (1 if delta > 0 else -1) != expected_sign:
-            # Wrong direction: rather than restart, send the user to the
-            # correct end stop and zero there on the next Enter.
-            print(
-                f"    ✗ wrong direction (expected {direction}) — move all the way"
-                f" to the OTHER end stop at {target_deg:+.1f}°."
+            # Either the joint went to the other end stop or its motor turns
+            # the wrong way, and the reading can't tell which. Only ever zero
+            # on a move in the expected direction, so a reversed motor is
+            # never zeroed at the wrong stop.
+            print(f"    ✗ moved the wrong way (expected {direction} motion).")
+            instruction = (
+                f"{joint.name} moved the wrong way. Move it to the END STOP at "
+                f"{target_deg:+.1f}°. If it is already there, its motor turns "
+                "the wrong way, so skip this joint and contact Almond support"
             )
-            if not _prompt(
-                f"{joint.name}: wrong direction — move all the way to the OTHER "
-                f"end stop at {target_deg:+.1f}°, then zero",
-                web_prompts,
-            ):
-                return False
-            p_end = await motor.get_position()
-            print(f"     end:   {_fmt(p_end)}")
-        else:
-            mag_diff = abs(abs(delta) - abs(target_rad))
-            if mag_diff > _MAGNITUDE_WARN_RAD:
-                print(
-                    f"    ⚠  moved {math.degrees(abs(delta)):.1f}°, expected"
-                    f" ~{abs(target_deg):.1f}° — make sure you're against the stop."
-                )
+            continue
+
+        mag_diff = abs(abs(delta) - abs(target_rad))
+        if mag_diff > _MAGNITUDE_WARN_RAD:
+            print(
+                f"    ⚠  moved {math.degrees(abs(delta)):.1f}°, expected"
+                f" ~{abs(target_deg):.1f}° — make sure you're against the stop."
+            )
 
         # Right direction → zero immediately, no extra confirmation.
         await motor.set_zero_position()
@@ -327,6 +325,13 @@ async def _run_guided(args: argparse.Namespace) -> None:
 
     async with CanBus(channel) as bus:
         motors = {joint: Motor(bus, joint) for joint in joints}
+
+        # Motors that turn the wrong way get their direction flag before the
+        # start reference: the flag moves the reading, and the direction
+        # check below relies on it.
+        for joint in joints:
+            if await motors[joint].set_direction_flag():
+                print(f"  {joint.name:<12} turned Change Motor Direction on")
 
         # Capture an in-range start reference for every selected joint up
         # front, so the operator positions the arm once rather than once per

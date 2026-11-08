@@ -67,7 +67,7 @@ class MotorDriver(ABC):
 
     @abstractmethod
     async def enable(self) -> None:
-        """Enable the motor and release the brake."""
+        """Enable the motor."""
         ...
 
     @abstractmethod
@@ -78,7 +78,7 @@ class MotorDriver(ABC):
         process left the motor enabled and holding (e.g. it died mid-session).
         Re-reads whatever state the driver needs for correct command scaling
         (limit registers, firmware capabilities) and verifies the motor is
-        enabled and fault-free — but sends no reset, brake, enable, or motion
+        enabled and fault-free — but sends no reset, enable, or motion
         command, so a motor that is holding position keeps holding it
         throughout.
 
@@ -90,7 +90,7 @@ class MotorDriver(ABC):
 
     @abstractmethod
     async def disable(self) -> None:
-        """Disable the motor and engage the brake."""
+        """Disable the motor (it goes limp)."""
         ...
 
     @abstractmethod
@@ -119,6 +119,15 @@ class MotorDriver(ABC):
     async def set_zero_position(self) -> None:
         """Save the current shaft position as the encoder zero reference."""
         ...
+
+    async def set_direction_flag(self) -> bool:
+        """Set the motor's firmware direction flag if it needs it.
+
+        Only MyActuator motors have one (Change Motor Direction). Flipping it
+        moves the joint's zero, so call it before zeroing the joint. Returns
+        True when the flag was changed.
+        """
+        return False
 
     @abstractmethod
     async def get_position(self) -> float:
@@ -396,7 +405,7 @@ class MotorDriver(ABC):
     async def get_model(self) -> str | None:
         """Return the motor model string, or None if unsupported.
 
-        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``), whose
+        MyActuator: the model string read via 0xB5 (e.g. ``"RMD-X6-P20-60"``), whose
         series determines the motor's rated max torque.
         Damiao: None — not exposed by the protocol.
         """

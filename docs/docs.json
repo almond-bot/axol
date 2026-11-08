@@ -129,6 +129,7 @@
                   "cli/teleop",
                   "cli/gravity-comp",
                   "cli/waypoints",
+                  "cli/jog",
                   "cli/collect-data",
                   "cli/collect-dagger",
                   "cli/replay-dataset",
@@ -193,6 +194,12 @@
                   "cli/zed-driver",
                   "cli/gst-install",
                   "cli/gst-build-zed"
+                ]
+              },
+              {
+                "group": "Mantis",
+                "pages": [
+                  "cli/mantis-update"
                 ]
               },
               {

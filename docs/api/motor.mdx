@@ -35,14 +35,14 @@ asyncio.run(main())
 
 | Method | Description |
 |---|---|
-| `enable()` / `disable()` | Enable the motor, or disable it and engage the brake. On a Damiao motor, `disable()` also clears a `LOST_COMM` fault (see below). |
+| `enable()` / `disable()` | Enable the motor, or disable it. A disabled motor has no torque. On a Damiao motor, `disable()` also clears a `LOST_COMM` fault (see below). |
 | `attach(mode)` | Reconnect to a motor that is already enabled, without changing its torque. Checks with reads only that it is enabled, fault-free and in `mode`. |
 | `is_holding()` | `True` if the motor is enabled and holding torque. Read-only (see below for how each motor family reports it). |
 | `clear_errors()` | Clear latched error flags |
 | `set_zero_position()` | Save the current position as the encoder zero, in flash. Set it at a mechanical end stop, not the rest pose. |
 | `set_control_mode(mode)` | Set the `ControlMode`, which mode-specific commands require. **MyActuator motors reboot to switch, with torque off for about 2 s**, so never call it on a motor holding a load. |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
-| `get_model()` | Motor model string, e.g. `"X8S2V"` (`None` for Damiao) |
+| `get_model()` | Motor model string, e.g. `"RMD-X6-P20-60"` (`None` for Damiao) |
 | `get_firmware_version()` | Firmware VersionDate `int`, e.g. `2026042402` (`None` for Damiao) |
 | `get_position()` | Shaft position (rad); raises if telemetry is active |
 | `get_velocity()` | Shaft velocity (rad/s) |
@@ -104,9 +104,13 @@ The same methods are on `Motor`:
 
 ## `MotorStatus` values
 
-`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `CALIBRATION_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `UNKNOWN`
+`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `CALIBRATION_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `OUTPUT_SHAFT_CALIBRATION_ERROR`†, `SENSOR_ERROR`†, `MOTOR_ENCODER_CALIBRATION_ERROR`†, `UNKNOWN`
 
 \* MyActuator only
+
+† Damiao only
+
+`UNKNOWN` is a fault. The motor reported a status code that Axol doesn't recognize. The control panel lists it as an *unknown fault*.
 
 ## Joint to driver mapping
 

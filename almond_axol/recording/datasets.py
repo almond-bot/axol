@@ -264,8 +264,8 @@ def require_dataset_resume_schema(
             "does not match this recording run ("
             + "; ".join(problems)
             + "). Start a new dataset with a different repo_id, or restore the "
-            "exact robot mode, gripper capability, cameras, and resolution used "
-            "to create it."
+            "exact robot mode, gripper capability, Record Jelly setting, cameras, "
+            "and resolution used to create it."
         )
 
 

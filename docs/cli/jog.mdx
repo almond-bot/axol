@@ -1,0 +1,26 @@
+---
+title: "jog"
+description: "Move the grippers, the lift and Jelly from the control panel's Jog screen."
+---
+
+Jog Axol from the [control panel](/guides/control-panel#jog). The arms hold their pose until you plan and execute a move, or hold a jog button. The lift and Jelly move only while you hold their controls. When the run stops, the arms move to the rest pose before the motors turn off.
+
+Start and stop Jog from the control panel. The panel connects the Jog screen to the run, so a run started from a terminal has no screen to drive it. The flags below set the run's speeds and arms.
+
+With `--sim`, nothing touches the hardware. The lift and Jelly are simulated with the same speeds and ramps as the real ones.
+
+This command is configured through draccus (see [Command configuration](/cli/configuration)). Arm gains and stiffness are on the nested `axol` config, the same settings gravity compensation uses. The lift and Jelly use the shared `jelly` settings, the same as teleop.
+
+| Flag | Description |
+|---|---|
+| `--sim BOOL` | Jog a simulated Axol instead of the robot. Default `false` |
+| `--arm_speed FLOAT` | Average speed (rad/s) of the joint that moves furthest in a planned move. Default 0.6 |
+| `--min_duration FLOAT` | Shortest planned move, in seconds. Default 1.0 |
+| `--gripper_speed FLOAT` | Gripper jog speed (m/s) at full speed. Default 0.06 |
+| `--gripper_turn_speed FLOAT` | Gripper jog turn rate (rad/s) at full speed. Default 0.5 |
+| `--joint_speed FLOAT` | Fastest any arm joint turns while you jog a gripper (rad/s). Default 1.0 |
+| `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
+| `--rate_hz FLOAT` | Control loop rate in Hz (default: 125) |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file. Flags override it. |
+| `--settings_path PATH` / `--no_settings` | Read another [shared settings file](/cli/configuration#the-shared-settings-file), or ignore it. By default `~/.almond/settings.json` applies, beneath `--config_path` and the flags. |

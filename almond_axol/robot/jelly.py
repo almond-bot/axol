@@ -107,9 +107,31 @@ _YAW_TRACE_HZ = 10.0
 # rail, so the battery estimate holds its resting value while driving.
 _WHEEL_LOAD_RAD_S = 0.5
 
+# Rust core status packet: b"U", 10 doubles and a flag byte, then optionally
+# a wheel sample: 4 positions, 4 measured speeds and its time (an older core
+# omits it).
+_STATUS_SIZE = 1 + 10 * 8 + 1
+_STATUS_SIZE_WITH_WHEELS = _STATUS_SIZE + 9 * 8
+
 # Seconds of driving with the IMU requested but no yaw sample ever fed
 # before Jelly says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
+
+
+@dataclass(frozen=True)
+class WheelSample:
+    """One reading of Jelly's four wheels (ids 1-4), from the Rust core.
+
+    ``positions`` are measured angles in rad, continuous across the
+    feedback's ±PMAX fold and zero at the session's first reading.
+    ``velocities`` are the measured speeds in rad/s. ``at`` is when the
+    wheels answered, on the :func:`time.monotonic` clock, or 0 when they
+    haven't answered a full round yet.
+    """
+
+    positions: tuple[float, float, float, float]
+    velocities: tuple[float, float, float, float]
+    at: float
 
 
 @dataclass(frozen=True)
@@ -143,6 +165,91 @@ def deadzone(value: float, threshold: float) -> float:
         return 0.0
     scaled = (abs(value) - threshold) / (1.0 - threshold)
     return scaled if value > 0 else -scaled
+
+
+def stick_curve(value: float, expo: float) -> float:
+    """Shape a deadzoned stick axis ([-1, 1]) for fine control near centre.
+
+    The usual RC "expo": a blend ``(1 - expo) * x + expo * x**3`` of the
+    linear response and a cubic, so small deflections give a fraction of
+    the speed a linear map would while full deflection still gives full
+    speed. ``expo`` 0 is linear; it is clamped to [0, 1] (above 1 the
+    curve would turn back on itself).
+    """
+    e = min(max(float(expo), 0.0), 1.0)
+    return (1.0 - e) * value + e * value**3
+
+
+def stick_command(
+    lx: float, ly: float, rx: float, deadzone_: float, expo: float
+) -> tuple[float, float, float]:
+    """Normalized ``(vx, vy, wz)`` from raw thumbstick axes.
+
+    ``lx`` / ``ly`` / ``rx``: the left stick's x and y and the right
+    stick's x, gamepad convention (+x right, +y pulled back). Each axis is
+    deadzoned (:func:`deadzone`), then shaped by :func:`stick_curve` — the
+    translation by its *magnitude*, so a diagonal keeps its heading, and the
+    rotation on its own. Shared by every stick frontend (the headset's
+    :meth:`Jelly.apply_vr_frame`, the gamepad drive tool) so they feel the
+    same.
+    """
+    # +x right, +y pulled back → body frame +x forward, +y left, +wz CCW.
+    vx = -deadzone(ly, deadzone_)
+    vy = -deadzone(lx, deadzone_)
+    wz = -deadzone(rx, deadzone_)
+    mag = math.hypot(vx, vy)
+    if mag > 0.0:
+        k = stick_curve(min(mag, 1.0), expo) / mag
+        vx, vy = vx * k, vy * k
+    return vx, vy, stick_curve(wz, expo)
+
+
+# Outside box mode the right stick's forward/back runs the lift, once pushed
+# at least this far (fraction of full deflection). The lift has one jog speed,
+# so a half push is a deliberate request rather than a drift off centre.
+LIFT_STICK_THRESHOLD = 0.5
+
+# RightStickLock: a push's job is chosen once the stick is this far out
+# (fraction of full deflection), not at the deadzone's edge, where a thumb
+# heading sideways often still reads more forward/back than sideways. The lift
+# takes only a push within this angle (deg) of straight forward/back; every
+# other push turns.
+STICK_DECIDE_RADIUS = 0.35
+LIFT_STICK_MAX_ANGLE_DEG = 30.0
+_LIFT_STICK_SLOPE = math.tan(math.radians(90.0 - LIFT_STICK_MAX_ANGLE_DEG))
+
+
+class RightStickLock:
+    """Lock the headset's right stick to one job per push: turn or lift.
+
+    The right stick turns Jelly (left/right) and runs the lift (forward/back).
+    A push rarely stays on one axis, so its job is chosen once, when the
+    stick first reaches :data:`STICK_DECIDE_RADIUS`, and kept until the stick
+    returns to centre: a push for the lift never turns the base, and a turn
+    never bumps the lift. Only a push within :data:`LIFT_STICK_MAX_ANGLE_DEG`
+    of straight forward/back is a lift; a diagonal turns. Until the push has
+    a job it does nothing. :meth:`block` makes the stick do nothing until it
+    next centres, for a push that started while the stick meant something
+    else (box mode's grip width, a reset).
+    """
+
+    def __init__(self) -> None:
+        self.axis: str | None = None  # None (centred), "turn", "lift", "blocked"
+
+    def update(self, rx: float, ry: float, deadzone_: float) -> str | None:
+        """The job this frame's push does: ``"turn"``, ``"lift"`` or ``None``."""
+        if abs(rx) < deadzone_ and abs(ry) < deadzone_:
+            self.axis = None
+        elif self.axis is None and math.hypot(rx, ry) >= max(
+            STICK_DECIDE_RADIUS, deadzone_
+        ):
+            self.axis = "lift" if abs(ry) >= _LIFT_STICK_SLOPE * abs(rx) else "turn"
+        return None if self.axis == "blocked" else self.axis
+
+    def block(self, rx: float, ry: float, deadzone_: float) -> None:
+        """Ignore the current push, if any, until the stick centres."""
+        centred = abs(rx) < deadzone_ and abs(ry) < deadzone_
+        self.axis = None if centred else "blocked"
 
 
 def mix(
@@ -212,6 +319,13 @@ class JellyConfig:
                          For diagnosing drift; off in normal operation.
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
+        stick_expo:      Stick response curve, in [0, 1] (see
+                         :func:`stick_curve`): ``0`` maps deflection to speed
+                         linearly; higher keeps more of the stick's travel for
+                         slow, fine moves, with full deflection still full
+                         speed. The default ``0.6`` gives ~11% speed at a
+                         quarter of the stick's travel past the deadzone and
+                         ~28% at half (linear: 25% / 50%).
         hold_kp:         Stiffness (Nm/rad) of the position hold; 0 makes
                          every park the braking-only hold (see the module docs).
         hold_kd:         Damping (Nm·s/rad) of both park holds; 0 disables
@@ -263,6 +377,7 @@ class JellyConfig:
     yaw_hold_max: float = 0.3
     yaw_log: bool = False
     deadzone: float = 0.15
+    stick_expo: float = 0.6
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
@@ -468,6 +583,8 @@ class Jelly:
         # handed over twice (a poller re-reading the server's latest frame,
         # say) must not count as a fresh command.
         self._last_vr_frame: object | None = None
+        # Turn-or-lift lock on the headset's right stick (VR thread only).
+        self._right_stick = RightStickLock()
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
         # written from any thread; None until a sensor feeds one. The counter
@@ -479,6 +596,9 @@ class Jelly:
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        # The latest wheel reading, replaced whole so a reader on another
+        # thread never sees a mix of two. None until the Rust core reports one.
+        self.wheel_sample: WheelSample | None = None
         self.yaw_correction: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
@@ -802,20 +922,35 @@ class Jelly:
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
 
-    def apply_vr_frame(self, frame, resetting: bool = False) -> None:  # noqa: ANN001
+    def apply_vr_frame(  # noqa: ANN001
+        self, frame, resetting: bool = False, box_mode: bool = False
+    ) -> None:
         """Map a headset :class:`~almond_axol.vr.models.VRFrame` to a command.
 
         The single source of truth for the VR control mapping, shared by
         plain teleop (``VRTeleop``) and data collection (``AxolVRTeleop``) so
         the two flows cannot drift apart. Stick deflection is the deadman:
-        Jelly moves only while a stick is pushed past its deadzone (or a
-        stick click holds the lift), independent of the arm engage toggle.
+        Jelly moves only while a stick is pushed past its deadzone,
+        independent of the arm engage toggle.
+
+        - Left stick: translate.
+        - Right stick, outside box mode: left/right turns, forward/back runs
+          the lift (forward raises, past :data:`LIFT_STICK_THRESHOLD`).
+          Each push does one or the other (:class:`RightStickLock`), so a
+          push for the lift never turns the base. The stick clicks don't
+          touch the lift.
+        - Right stick, in box mode: left/right turns; forward/back is the
+          grip width (the IK worker reads it), so the lift runs on held
+          stick clicks instead (right raises, left lowers), already split
+          from grasp taps by
+          :meth:`~almond_axol.teleop.core.VRTeleopCore.box_stick_frame`.
 
         Args:
             frame:     The incoming VR frame (only its stick fields are read).
             resetting: True while the arms replay a reset trajectory (or the
                        frame itself carries a reset) — forces a stop so the
                        base doesn't creep during the return to rest.
+            box_mode:  True while the teleop session is in box mode.
 
         Thread-safe (only latches the target); staleness is handled by the
         command task, so a dead frame stream times out to a full stop. Only a
@@ -828,21 +963,41 @@ class Jelly:
         if frame is self._last_vr_frame:
             return
         self._last_vr_frame = frame
+        dz = self._config.deadzone
+        rx = float(getattr(frame, "r_stick_x", 0.0))
+        ry = float(getattr(frame, "r_stick_y", 0.0))
         if resetting or frame.reset:
+            self._right_stick.block(rx, ry, dz)
             self.set_command(0.0, 0.0, 0.0, STOP)
             return
-        dz = self._config.deadzone
-        # WebXR sticks: +x right, +y pulled back → body frame +x forward,
-        # +y left, +wz CCW.
-        vx = -deadzone(frame.l_stick_y, dz)
-        vy = -deadzone(frame.l_stick_x, dz)
-        wz = -deadzone(frame.r_stick_x, dz)
-        if frame.r_stick_click and not frame.l_stick_click:
-            lift = UP
-        elif frame.l_stick_click and not frame.r_stick_click:
-            lift = DOWN
+        if box_mode:
+            # A push begun on the width stick must not carry over into the
+            # lift when box mode ends: wait for the stick to centre first.
+            self._right_stick.block(rx, ry, dz)
+            if frame.r_stick_click and not frame.l_stick_click:
+                lift = UP
+            elif frame.l_stick_click and not frame.r_stick_click:
+                lift = DOWN
+            else:
+                lift = STOP
         else:
+            axis = self._right_stick.update(rx, ry, dz)
             lift = STOP
+            if axis == "lift":
+                # Pushed forward reads negative (gamepad convention).
+                if ry <= -LIFT_STICK_THRESHOLD:
+                    lift = UP
+                elif ry >= LIFT_STICK_THRESHOLD:
+                    lift = DOWN
+            if axis != "turn":
+                rx = 0.0
+        vx, vy, wz = stick_command(
+            frame.l_stick_x,
+            frame.l_stick_y,
+            rx,
+            dz,
+            self._config.stick_expo,
+        )
         self.set_command(vx, vy, wz, lift)
 
     def feed_yaw_rate(self, rate: float) -> None:
@@ -893,10 +1048,18 @@ class Jelly:
                     )
                     self._ready.set()
                     continue
-                if payload[:1] != b"U" or len(payload) != 82:
+                if payload[:1] != b"U" or len(payload) not in (
+                    _STATUS_SIZE,
+                    _STATUS_SIZE_WITH_WHEELS,
+                ):
                     _logger.warning("Jelly Rust core sent an invalid status packet")
                     continue
-                *values, flags = struct.unpack("<10dB", payload[1:])
+                *values, flags = struct.unpack("<10dB", payload[1:_STATUS_SIZE])
+                if len(payload) == _STATUS_SIZE_WITH_WHEELS:
+                    wheels = struct.unpack("<9d", payload[_STATUS_SIZE:])
+                    self.wheel_sample = WheelSample(
+                        positions=wheels[0:4], velocities=wheels[4:8], at=wheels[8]
+                    )
                 self.body_cmd = tuple(values[:3])
                 self.wheel_speeds = list(values[3:7])
                 self.yaw_correction = values[7]

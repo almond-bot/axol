@@ -13,20 +13,24 @@
      the jaw). With every body joint at zero the torso root (link root) is
      the world origin, so poses match the classic axol.urdf. IK
      (almond_axol.kinematics.model) freezes every joint but the arms' and
-     collides capsule-friendly pieces, the custom ik_collision elements,
-     instead of each part's collision hull; importers ignore them. IK keeps
-     the arms clear of the shoulder bar (s1), the head-camera mount (head),
-     the lift column's top plate (lift_plate) and its three sections (base,
-     lift_stage, jelly), and the deck as strips (deck_*). IK freezes the
-     base and lift at zero, the lift fully raised, and moves the parts the
-     lift leaves behind (the deck and the lower column) up to the arms by
-     the live lift height. Physics: arm joints carry AxolConfig's measured
-     friction as <dynamics friction> (Coulomb, N·m) and damping (viscous,
-     N·m·s/rad), per arm, and the motors' impedance gains as <drive
-     stiffness> (kp, N·m/rad) and damping (kd, N·m·s/rad): a custom element
-     no importer reads, so set them as each joint's position-drive gains
-     after import. Arm masses and CoMs are AxolConfig's tuned gravity-comp
-     values (the wrist-3 body is split so the jaw and plate carry their
+     collides the custom ik_collision elements instead of each part's
+     collision hull; importers ignore them. IK keeps the arms clear of the
+     shoulder bar (s1), the head-camera mount (head), the lift column's top
+     plate (lift_plate) and its three sections (base, lift_stage, jelly),
+     and the deck (deck). It freezes the base and lift at zero, the lift
+     fully raised, and moves the parts the lift leaves behind (the deck and
+     the lower column) up to the arms by the live lift height. Each body
+     part is a box or capsule fitted to it, against a capsule fitted to each
+     arm part (ik_collision cylinders are capsules: the radius, and the
+     straight section's length along the origin's z). IK freezes the plate,
+     so each gripper's collides as one body over its whole swing
+     (left_fingers / right_fingers). Physics: arm joints carry AxolConfig's
+     measured friction as <dynamics friction> (Coulomb, N·m) and damping
+     (viscous, N·m·s/rad), per arm, and the motors' impedance gains as
+     <drive stiffness> (kp, N·m/rad) and damping (kd, N·m·s/rad): a custom
+     element no importer reads, so set them as each joint's position-drive
+     gains after import. Arm masses and CoMs are AxolConfig's tuned gravity-
+     comp values (the wrist-3 body is split so the jaw and plate carry their
      share while the assembly's total mass and CoM stay as tuned); every
      other mass is an ESTIMATE (Body.masses in the generator) - replace with
      measured values. Inertia tensors assume uniform density over each
@@ -63,9 +67,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 0.118 -0.245" rpy="-3.14159 0 -1.5708" />
             <geometry>
-                <mesh filename="meshes/jelly/base__column_top_collision.stl" scale="1 1 1" />
+                <box size="0.08201 0.15801 0.31201" />
             </geometry>
         </ik_collision>
     </link>
@@ -91,9 +95,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-0.00198029 -0.00136563 -0.175982" rpy="-0.00936883 -0.0181383 -0.00936883" />
             <geometry>
-                <mesh filename="meshes/jelly/left_e1_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06453" length="0.27545" />
             </geometry>
         </ik_collision>
     </link>
@@ -119,9 +123,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-0.0281785 -4.0046e-06 -0.0576358" rpy="-3.13825 -0.0445592 -3.13825" />
             <geometry>
-                <mesh filename="meshes/jelly/left_e2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06637" length="0.09688" />
             </geometry>
         </ik_collision>
     </link>
@@ -147,9 +151,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-0.00344502 -0.00279991 -0.0438092" rpy="3.12011 -0.0186363 3.12011" />
             <geometry>
-                <mesh filename="meshes/jelly_parcel/left_gripper_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04658" length="0.12897" />
             </geometry>
         </ik_collision>
     </link>
@@ -175,9 +179,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0.0656105 8.32354e-06 0.00186376" rpy="-0.0100399 -1.50482 -0.0100399" />
             <geometry>
-                <mesh filename="meshes/jelly/left_s2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.07564" length="0.01378" />
             </geometry>
         </ik_collision>
     </link>
@@ -203,9 +207,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-2.20386e-05 0.0109618 -0.0204603" rpy="0.580477 0.446155 -0.580477" />
             <geometry>
-                <mesh filename="meshes/jelly/left_s3_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06149" length="0.06156" />
             </geometry>
         </ik_collision>
     </link>
@@ -231,9 +235,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-2.58026e-08 -0.000461647 -0.0773534" rpy="-2.94857e-05 -4.26337e-07 -2.94857e-05" />
             <geometry>
-                <mesh filename="meshes/jelly/left_w0_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04664" length="0.11282" />
             </geometry>
         </ik_collision>
     </link>
@@ -259,9 +263,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="5.52772e-06 0.0290055 -0.028488" rpy="3.14144 -0.00020709 3.14144" />
             <geometry>
-                <mesh filename="meshes/jelly/left_w1_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04253" length="0.05489" />
             </geometry>
         </ik_collision>
     </link>
@@ -287,9 +291,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-0.0416084 -3.59006e-08 -0.0222637" rpy="-1.73741e-06 -1.21918 -1.73741e-06" />
             <geometry>
-                <mesh filename="meshes/jelly_parcel/left_w2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.03559" length="0.04708" />
             </geometry>
         </ik_collision>
     </link>
@@ -315,9 +319,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0.00198029 -0.00136563 -0.175982" rpy="-0.00936883 0.0181383 0.00936883" />
             <geometry>
-                <mesh filename="meshes/jelly/right_e1_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06453" length="0.27545" />
             </geometry>
         </ik_collision>
     </link>
@@ -343,9 +347,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0.0281785 -4.0046e-06 -0.0576358" rpy="-3.13825 0.0445592 3.13825" />
             <geometry>
-                <mesh filename="meshes/jelly/right_e2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06637" length="0.09688" />
             </geometry>
         </ik_collision>
     </link>
@@ -371,9 +375,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0.00344504 -0.00279982 -0.0438092" rpy="3.12011 0.0186362 -3.12011" />
             <geometry>
-                <mesh filename="meshes/jelly_parcel/right_gripper_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04658" length="0.12897" />
             </geometry>
         </ik_collision>
     </link>
@@ -399,9 +403,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-0.0656105 8.32354e-06 0.00186376" rpy="-0.0100399 1.50482 0.0100399" />
             <geometry>
-                <mesh filename="meshes/jelly/right_s2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.07564" length="0.01378" />
             </geometry>
         </ik_collision>
     </link>
@@ -427,9 +431,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="2.20386e-05 0.0109618 -0.0204603" rpy="0.580477 -0.446155 0.580477" />
             <geometry>
-                <mesh filename="meshes/jelly/right_s3_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.06149" length="0.06156" />
             </geometry>
         </ik_collision>
     </link>
@@ -455,9 +459,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="-2.70277e-08 0.000461647 -0.0773534" rpy="2.94857e-05 -4.26259e-07 2.94857e-05" />
             <geometry>
-                <mesh filename="meshes/jelly/right_w0_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04664" length="0.11282" />
             </geometry>
         </ik_collision>
     </link>
@@ -483,9 +487,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="5.52906e-06 -0.0290055 -0.028488" rpy="-3.14144 -0.00020709 -3.14144" />
             <geometry>
-                <mesh filename="meshes/jelly/right_w1_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.04253" length="0.05489" />
             </geometry>
         </ik_collision>
     </link>
@@ -511,9 +515,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0.0416084 1.09295e-07 -0.0222637" rpy="-4.30726e-06 1.21918 4.30726e-06" />
             <geometry>
-                <mesh filename="meshes/jelly_parcel/right_w2_collision.stl" scale="1 1 1" />
+                <cylinder radius="0.03559" length="0.04708" />
             </geometry>
         </ik_collision>
     </link>
@@ -540,9 +544,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 0.009 0.064" rpy="3.14159 1.5708 0" />
             <geometry>
-                <mesh filename="meshes/jelly/s1_collision.stl" scale="1 1 1" />
+                <box size="0.11801 0.12401 0.27001" />
             </geometry>
         </ik_collision>
     </link>
@@ -754,9 +758,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 -0.043705 0.130206" rpy="3.14159 -1.19646 1.5708" />
             <geometry>
-                <mesh filename="meshes/jelly_parcel/head_collision.stl" scale="1 1 1" />
+                <box size="0.05326 0.09401 0.15265" />
             </geometry>
         </ik_collision>
     </link>
@@ -778,9 +782,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 0.064 -0.063" rpy="-1.5708 1.5708 0" />
             <geometry>
-                <mesh filename="meshes/jelly/lift_plate_collision.stl" scale="1 1 1" />
+                <box size="0.02 0.15801 0.19001" />
             </geometry>
         </ik_collision>
     </link>
@@ -791,9 +795,9 @@
     </joint>
     <link name="left_fingers">
         <ik_collision>
-            <origin xyz="-0.0428946 8.74236e-05 -0.0423479" rpy="0 0 0" />
+            <origin xyz="-0.0408176 0.0075956 -0.0495701" rpy="-0.00601186 -0.298954 -0.00601186" />
             <geometry>
-                <cylinder radius="0.07202" length="0.10973" />
+                <cylinder radius="0.07049" length="0.07747" />
             </geometry>
         </ik_collision>
     </link>
@@ -804,9 +808,9 @@
     </joint>
     <link name="right_fingers">
         <ik_collision>
-            <origin xyz="0.0428985 8.36941e-05 -0.0423476" rpy="0 0 0" />
+            <origin xyz="0.0409933 0.00744277 -0.0488856" rpy="3.12595 -0.352132 3.12595" />
             <geometry>
-                <cylinder radius="0.07202" length="0.10974" />
+                <cylinder radius="0.07047" length="0.07753" />
             </geometry>
         </ik_collision>
     </link>
@@ -843,9 +847,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 0 0.409" rpy="-3.14159 0 -3.14159" />
             <geometry>
-                <mesh filename="meshes/jelly/jelly__column_stub_collision.stl" scale="1 1 1" />
+                <box size="0.082 0.146 0.352" />
             </geometry>
         </ik_collision>
     </link>
@@ -871,9 +875,9 @@
             </geometry>
         </collision>
         <ik_collision>
-            <origin xyz="0 0 0" rpy="0 0 0" />
+            <origin xyz="0 0 0.757" rpy="-3.14159 0 -3.14159" />
             <geometry>
-                <mesh filename="meshes/jelly/lift_stage__column_mid_collision.stl" scale="1 1 1" />
+                <box size="0.078 0.14201 0.34801" />
             </geometry>
         </ik_collision>
     </link>
@@ -1021,44 +1025,18 @@
         <parent link="head" />
         <child link="head_camera_right_optical" />
     </joint>
-    <link name="deck_0">
+    <link name="deck">
         <ik_collision>
-            <origin xyz="-0.202001 -1.40516e-07 0.130265" rpy="-1.5707963267948966 0 0" />
+            <origin xyz="0 0 0.13" rpy="-0.00414936 1.5708 0" />
             <geometry>
-                <cylinder radius="0.14516" length="0.606" />
+                <box size="0.21 0.60801 0.60801" />
             </geometry>
         </ik_collision>
     </link>
-    <joint name="deck_0_0" type="fixed">
+    <joint name="deck_0" type="fixed">
         <origin xyz="0 0 0" rpy="0 0 0" />
         <parent link="jelly" />
-        <child link="deck_0" />
-    </joint>
-    <link name="deck_1">
-        <ik_collision>
-            <origin xyz="-1.40789e-07 -1.40516e-07 0.130265" rpy="-1.5707963267948966 0 0" />
-            <geometry>
-                <cylinder radius="0.14516" length="0.606" />
-            </geometry>
-        </ik_collision>
-    </link>
-    <joint name="deck_1_0" type="fixed">
-        <origin xyz="0 0 0" rpy="0 0 0" />
-        <parent link="jelly" />
-        <child link="deck_1" />
-    </joint>
-    <link name="deck_2">
-        <ik_collision>
-            <origin xyz="0.202 -1.40516e-07 0.130265" rpy="-1.5707963267948966 0 0" />
-            <geometry>
-                <cylinder radius="0.14516" length="0.606" />
-            </geometry>
-        </ik_collision>
-    </link>
-    <joint name="deck_2_0" type="fixed">
-        <origin xyz="0 0 0" rpy="0 0 0" />
-        <parent link="jelly" />
-        <child link="deck_2" />
+        <child link="deck" />
     </joint>
     <link name="world" />
     <link name="floor" />

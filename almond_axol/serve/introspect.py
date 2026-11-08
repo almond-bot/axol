@@ -35,7 +35,7 @@ from ..cli import config as _config  # noqa: F401
 # in run-policy and collect-dagger.
 _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
-    "mantis_source": ["quest", "lighthouse", "ultimate"],
+    "mantis_source": ["quest", "lighthouse"],
     "dataset_resolution": ["SVGA", "HD1080", "HD1200"],
     "eyes": ["both", "left", "right"],
     "controller": ["impedance", "position"],

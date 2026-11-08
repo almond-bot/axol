@@ -15,7 +15,7 @@ The position spring then has to carry the missing torque, so the joint sags unde
 
 The joint sweeps back and forth at a constant speed, as in [`tune.friction`](/cli/tune-friction). Averaging the forward and backward torques cancels friction, which leaves gravity. The tool fits the difference from the current model as a shift in the link's center of mass.
 
-- The link's mass stays at its CAD value. For a custom gripper much heavier than stock, set its mass first with [`tune.factory --mass`](/cli/tune-factory#custom-end-effectors).
+- The link's mass doesn't change. If you add a camera or a heavier gripper to the wrist, set the new `wrist_3` mass first. See [After you change the end-effector or add cameras](/guides/axol-calibration#after-you-change-the-end-effector-or-add-cameras).
 - One joint's sweep can't see every direction of the center of mass equally well. Directions it can't see stay at their current value.
 - A fitted shift of more than 60 mm is rejected as bad data.
 

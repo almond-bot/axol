@@ -2684,15 +2684,22 @@ def trim_episode_after(
     return removed
 
 
-def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
-    """Zero-phase low-pass the buffered episode's EE pose track before save.
+def _adjust_episode_rows(dataset: "LeRobotDataset", config: dict) -> None:
+    """Last edits to the buffered episode's rows before save.
 
-    Active only when the recorder config carries a positive ``smooth_ee_hz``
-    cutoff — collect-data sets it for Mantis sessions, where the pose track comes
+    Starts Record Jelly's wheel angles at zero on the first row (see
+    :func:`~almond_axol.recording.jelly_state.zero_episode_wheels`), then
+    zero-phase low-pass filters the EE pose track.
+
+    The smoothing is active only when the recorder config carries a positive
+    ``smooth_ee_hz`` cutoff — collect-data sets it for Mantis sessions, where the pose track comes
     from the VR tracker and carries broadband measurement noise on the order
     of the per-frame motion. On-robot sessions (encoder FK) leave it unset.
     See :func:`almond_axol.mantis.smoothing.smooth_episode_ee_poses`.
     """
+    from .jelly_state import zero_episode_wheels
+
+    zero_episode_wheels(dataset.writer.episode_buffer)
     cutoff_hz = float(config.get("smooth_ee_hz") or 0.0)
     if cutoff_hz <= 0.0:
         return
@@ -3499,7 +3506,7 @@ class InProcessRecorder:
                 "with its rows; episode discarded."
             )
         try:
-            _maybe_smooth_episode(self._dataset, self._config)
+            _adjust_episode_rows(self._dataset, self._config)
             _prepare_streaming_episode(self._dataset)
         except Exception:
             self._dataset.clear_episode_buffer()
@@ -4097,7 +4104,7 @@ def _recorder_main(
                         # streaming video. Finalize/cache all supported mux
                         # results first so an EOS/count failure cannot leave
                         # orphan row data.
-                        _maybe_smooth_episode(dataset, config)
+                        _adjust_episode_rows(dataset, config)
                         _prepare_streaming_episode(dataset)
                     except Exception as exc:  # safe: row commit has not begun
                         _logger.error("recorder video prepare failed: %s", exc)
@@ -4209,6 +4216,10 @@ def _recorder_main(
                 before_finalize=dataset.clear_episode_buffer,
             )
         finally:
+            # A take still open at shutdown (EOF or shutdown mid-episode) left
+            # automatic collection off. The subprocess exits next anyway, but
+            # an in-process caller (the tests) must get its collector back.
+            gc_hold.end()
             uninstall_gc_log()
             with contextlib.suppress(Exception):
                 error_conn.close()

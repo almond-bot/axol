@@ -1058,7 +1058,7 @@ class VRServer:
             return False
         source_id, source_kind = source
         # A Quest remains a useful video/URDF viewer during a managed
-        # Lighthouse/Ultimate run. Its pose frames stay view-only, but its
+        # Lighthouse run. Its pose frames stay view-only, but its
         # controller datum is still setup information worth surfacing.
         if source_kind == "webxr":
             _remember_quest_pose_datum(
@@ -1445,7 +1445,7 @@ class VRServer:
         # values before it renders its controls.
         announcements.extend(list(self._announce.items()))
         # The WebXR client uses this to suppress local record controls when a
-        # Lighthouse/Ultimate bridge owns poses. Announce null as well so a
+        # Lighthouse bridge owns poses. Announce null as well so a
         # current client can distinguish unrestricted policy from an older
         # server that does not expose this contract.
         announcements.append(("pose_source_kind", self._expected_pose_source_kind))

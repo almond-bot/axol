@@ -320,6 +320,18 @@ def _waypoints_run() -> Callable[..., Any]:
     return _run
 
 
+def _jog() -> type:
+    from ..cli.jog import JogCmdConfig
+
+    return JogCmdConfig
+
+
+def _jog_run() -> Callable[..., Any]:
+    from ..cli.jog import _run
+
+    return _run
+
+
 def _waypoints_control() -> Callable[..., Any]:
     from ..cli.waypoints import _QueueWaypointControl
 
@@ -444,12 +456,33 @@ COMMANDS: dict[str, CommandDef] = {
             "speed_scale": {"widget": "slider", "min": 0.1, "max": 1.0, "step": 0.05}
         },
     ),
+    "jog": CommandDef(
+        "jog",
+        "jog",
+        "Jog",
+        "Move a gripper to a pose you drag in 3D, raise or lower the lift, and "
+        "drive Jelly, all from the Jog page. Turn on sim to jog a simulated Axol.",
+        "Operate",
+        "draccus",
+        _jog,
+        sim_capable=True,
+        entrypoint=_jog_run,
+        sim_flag="sim",
+        # The Jog page shows the cameras' live video, streamed like teleop's
+        # (from the camera settings' stream branch).
+        camera_mode="teleop",
+        streams_video=True,
+        # Arm gains and channels are the robot's shared settings, the same
+        # ones gravity compensation and waypoints use.
+        settings_like="gravity-comp",
+        per_run_fields=("sim",),
+    ),
     "collect-data": CommandDef(
         "collect-data",
         "collect-data",
         "Collect data",
         "Record teleoperation episodes with the ZED cameras. Mantis works with "
-        "Quest, Lighthouse or Ultimate tracking.",
+        "Quest or Lighthouse tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -813,6 +846,21 @@ COMMANDS: dict[str, CommandDef] = {
         hardware_profiles=("axol",),
         section="helper",
     ),
+    "mantis.update": CommandDef(
+        "mantis.update",
+        "mantis.update",
+        "Update Mantis firmware",
+        "Install a Mantis firmware file (.bin) on both rigs over CAN, in a few "
+        "seconds each. Keep the triggers released. If the new firmware doesn't "
+        "start correctly, the rig goes back to the old one. Without a file, it "
+        "shows the running firmware version.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.mantis_update"),
+        requires_hardware=True,
+        hardware_profiles=("mantis",),
+        section="helper",
+    ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",
@@ -887,8 +935,8 @@ COMMANDS: dict[str, CommandDef] = {
         "tracker.identify",
         "tracker.identify",
         "Identify Mantis trackers",
-        "Bind the selected Lighthouse or Ultimate trackers to the left and "
-        "right Mantis with a guided motion capture.",
+        "Bind the Lighthouse trackers to the left and right Mantis with a "
+        "guided motion capture.",
         "Setup",
         "argparse",
         _argparse_loader("..cli.tracker_identify"),
@@ -940,29 +988,6 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.tracker_lighthouse_calibrate"),
         requires_hardware=True,
-        uses_can_bus=False,
-    ),
-    "tracker.ultimate.install": CommandDef(
-        "tracker.ultimate.install",
-        "tracker.ultimate.install",
-        "Install Ultimate support",
-        "Install the pinned pyvut runtime, native HID libraries, and USB permissions.",
-        "Setup",
-        "argparse",
-        _argparse_loader("..cli.tracker_ultimate"),
-        requires_hardware=False,
-        uses_can_bus=False,
-    ),
-    "tracker.ultimate.check": CommandDef(
-        "tracker.ultimate.check",
-        "tracker.ultimate.check",
-        "Check Ultimate setup",
-        "Check the Ultimate runtime, dongle, permissions, Wi-Fi, and bindings "
-        "without opening the dongle or changing pairing state.",
-        "Setup",
-        "argparse",
-        _argparse_loader("..cli.tracker_ultimate"),
-        requires_hardware=False,
         uses_can_bus=False,
     ),
     "can.setup": CommandDef(

@@ -793,7 +793,9 @@ class RecorderLifecycleIntegrityTest(unittest.TestCase):
             _pq_writer=None,
             _close_writer=Mock(),
         )
-        writer = SimpleNamespace(close_writer=Mock(), _latest_episode=object())
+        writer = SimpleNamespace(
+            close_writer=Mock(), _latest_episode=object(), episode_buffer={}
+        )
         dataset = SimpleNamespace(
             root=root,
             meta=meta,

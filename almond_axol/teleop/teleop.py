@@ -62,7 +62,13 @@ from .config import VRTeleopConfig, adopt_robot_gripper
 from .core import VRTeleopCore, measured_arms, wait_for_ik_ready
 from .live import LiveSettings
 from .recorder import make as _recorder_make
-from .shutdown import OUTCOME_MESSAGES, abort_on_sigint, park_arms
+from .shutdown import (
+    OUTCOME_MESSAGES,
+    abort_on_sigint,
+    park_arms,
+    register_arms_probe,
+    take_stop_choice,
+)
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -502,10 +508,17 @@ class VRTeleop:
         cleanup_failures: list[tuple[str, BaseException]] = []
         hardware_failures: list[tuple[str, BaseException]] = []
 
-        # Park before anything is torn down: the return-to-rest is planned by
-        # the IK worker and played by the IK dispatch thread, both of which the
-        # shutdown below stops.
-        await self._park_arms()
+        # What the operator chose for the arms at Stop (the control panel
+        # asks when they are away from rest): park them, or leave every motor
+        # holding its last command. Ctrl+C and the CLI always park.
+        hold = take_stop_choice() == "hold" and self._can_hold_on_stop()
+        if hold:
+            _logger.info("Leaving the arms holding where they are; the motors stay on.")
+        else:
+            # Park before anything is torn down: the return-to-rest is planned
+            # by the IK worker and played by the IK dispatch thread, both of
+            # which the shutdown below stops.
+            await self._park_arms()
 
         # Stop new work first, then turn the hardware off before waiting on
         # background workers.  A wedged IK reader must not delay torque-off.
@@ -521,7 +534,10 @@ class VRTeleop:
                 _logger.exception("Jelly disable failed")
                 hardware_failures.append(("jelly", exc))
         try:
-            await self._robot.disable()
+            if hold:
+                await self._robot.disconnect()  # type: ignore[attr-defined]
+            else:
+                await self._robot.disable()
         except BaseException as exc:
             _logger.exception("robot disable failed")
             hardware_failures.append(("robot", exc))
@@ -800,6 +816,27 @@ class VRTeleop:
             right_arm.positions if right_arm is not None else None,
         )
 
+    def _can_hold_on_stop(self) -> bool:
+        """True when the robot can be released with its motors still holding.
+
+        Hardware only (the Sim target has nothing to hold), through the
+        robot's ``disconnect()``: it closes the buses and leaves each motor
+        on its last command, so the arms stay where they are.
+        """
+        return self._guard_supported() and callable(
+            getattr(self._robot, "disconnect", None)
+        )
+
+    def _arms_away_from_rest(self) -> bool:
+        """Whether stopping now would park the arms (the control panel's prompt).
+
+        True on hardware while a return to rest is playing or the arms have
+        left the rest pose. Read from the server thread; plain flag reads.
+        """
+        if not self._can_hold_on_stop():
+            return False
+        return bool(self._core.is_resetting or not self._core.at_rest)
+
     async def _park_arms(self) -> None:
         """Park the arms — rest, then zero — before the torque comes off.
 
@@ -940,6 +977,8 @@ class VRTeleop:
             # Diagnostics must never prevent the robot's control loop from
             # starting (read-only home, full disk, etc.).
             _logger.warning("could not publish teleop timing boundary: %s", exc)
+        # Lets the control panel ask what to do with the arms at Stop.
+        register_arms_probe(self._arms_away_from_rest)
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         progress.ready()
         # Track an absolute deadline so late wakeups are corrected in the next
@@ -1105,6 +1144,7 @@ class VRTeleop:
                 self._robot_recorder(False)
             if set_caps is not None and caps_applied:
                 set_caps(None)
+            register_arms_probe(None)
             activity.stop()
             diag.stop()
             tegra.stop()
@@ -1129,7 +1169,12 @@ class VRTeleop:
         out = self._core.compute_output()
         if out is None:
             return None, None
-        self._core.maybe_broadcast_joints(out, self._robot)
+        self._core.maybe_broadcast_joints(
+            out,
+            self._robot,
+            lift=self._jelly.lift_raised if self._jelly is not None else None,
+        )
+        self._core.maybe_broadcast_haptics(self._robot)
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:
@@ -1174,17 +1219,20 @@ class VRTeleop:
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
         self._core.note_tracking_quality(frame)
+        # Box mode splits the stick clicks into grasp taps and lift holds
+        # (see VRTeleopCore.box_stick_frame); taps work without Jelly too.
+        sticks = self._core.box_stick_frame(frame)
         if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
-            # creep while the arms replay their return-to-rest trajectory;
-            # while a box-mode leader owns the sticks (grip width / tilt)
-            # Jelly is held stopped the same way (frozen pair: sticks drive).
+            # creep while the arms replay their return-to-rest trajectory (or
+            # park). Outside box mode the right stick's forward/back runs the
+            # lift; box mode takes it for the grip width, so there a held
+            # click runs the lift instead.
             self._jelly.apply_vr_frame(
-                frame,
-                resetting=self._core.is_resetting
-                or self._core.is_parking
-                or self._core.pair_owns_sticks,
+                sticks,
+                resetting=self._core.is_resetting or self._core.is_parking,
+                box_mode=self._core.box_mode,
             )
 
     # ------------------------------------------------------------------

@@ -15,6 +15,7 @@ import os
 import signal
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -35,9 +36,10 @@ from .box import (
     choose_faces,
     contact_width,
     elbow_swivel_hint,
-    joint_force_limit,
+    ideal_gripper_poses,
     pair_aligned,
     parcel_tool,
+    right_stick_axis,
     rodrigues,
     rotation_angle,
     smoothstep,
@@ -45,8 +47,8 @@ from .box import (
     squeeze_lean,
     swivel_step,
     tip_inward_sign,
+    tipped_frame_holds,
     toe_out_sides,
-    twist_about,
 )
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
@@ -124,6 +126,148 @@ _SNAP_STABLE_RATIO = 0.5  # offset growth/size below this = shift, else motion
 # authorise a large jump.
 _STICK_DEADZONE = 0.15
 _STICK_MAX_DT_S = 0.1
+# Box mode keeps each elbow bent at least this far forward of straight
+# (rad, see IKWorker._keep_elbows_bent); ARM_JOINTS index of the elbow.
+_ELBOW_BENT_RAD = 0.05
+_ELBOW_INDEX = 3
+
+# Box-mode stow (see IKWorker._start_stow). The stowed pose is planned
+# once, offline, for the left arm and mirrored onto the right (the arms are
+# exact mirror images: q_right = -q_left), so the stow ends symmetric from
+# any start. The plan swings each elbow _STOW_ELBOW_DEG about its
+# shoulder-wrist line (negative: inboard of straight down, toward the base;
+# the arm/base collision model holds it off the body) over
+# up to _STOW_PLAN_ITERS solves per candidate (stopping once no joint moves
+# more than _STOW_PLAN_SETTLED_RAD in a solve: the angled grasp's elbow
+# takes ~80 to swing in, the straight grasp's far fewer), trying box distances from
+# box_stow_reach outward in _STOW_PLAN_STEP_M steps (up to _STOW_PLAN_SPAN_M
+# further) and taking the first whose grippers land within
+# _STOW_PLAN_POS_TOL_M of their slots with the elbows no more than
+# _STOW_ELBOW_OUT_MAX_M outboard of the shoulders (a small box held right
+# against the chest pushes the elbows back into the base, which spreads
+# them, so it stows a little further out); failing that, the best of the
+# rest (in reach first, then the tighter elbows).
+_STOW_ELBOW_DEG = -30.0
+_STOW_PLAN_ITERS = 200
+_STOW_PLAN_MIN_ITERS = 10
+_STOW_PLAN_SETTLED_RAD = 1e-3
+_STOW_PLAN_STEP_M = 0.025
+_STOW_PLAN_SPAN_M = 0.20
+_STOW_PLAN_POS_TOL_M = 0.008
+_STOW_ELBOW_OUT_MAX_M = 0.02
+# The move carries the box on a straight line while the arms' posture and
+# elbows blend into the planned pose; it lasts long enough for the box to
+# move at box_stow_speed, turn at _STOW_TURN_RAD_S and every joint to move
+# at _STOW_JOINT_RAD_S, and at least _STOW_MIN_S.
+_STOW_TURN_RAD_S = math.radians(60.0)
+_STOW_JOINT_RAD_S = 0.8
+_STOW_MIN_S = 1.0
+# The move stops short when the box is pressed against something (the
+# chest, on hardware): the measured box (the midpoint of the measured
+# grippers, so a squeeze on a clamped box cancels out) trails the commanded
+# one (the midpoint of the solved grippers, so a target the IK can't reach
+# isn't a stall) along the move by _STOW_STALL_M more than when the move
+# began, and it has moved less than _STOW_STALL_STILL_M along the move in the
+# last _STOW_STALL_WINDOW_S (an arm that lags at speed is still moving). The
+# box then stops _STOW_BACKOFF_M short of the measured one. A move shorter
+# than _STOW_STALL_MIN_MOVE_M is not watched.
+_STOW_STALL_M = 0.03
+_STOW_STALL_STILL_M = 0.005
+_STOW_STALL_WINDOW_S = 0.5
+_STOW_STALL_MIN_MOVE_M = 0.05
+_STOW_BACKOFF_M = 0.01
+# After the move the arms step onto the planned pose in joint space (at up to
+# _STOW_SETTLE_RAD_S, see _settle_stow) and it is held until they are on it —
+# no joint moves more than _STOW_STILL_RAD per solve and every joint is within
+# _STOW_ARRIVED_RAD of the plan — after at least
+# _STOW_HOLD_MIN_S and at most _STOW_HOLD_MAX_S. The frozen pair is never
+# solved again, so a stow reported done mid-swing would keep the flare.
+_STOW_STILL_RAD = 2e-3
+_STOW_ARRIVED_RAD = 1e-3
+_STOW_SETTLE_RAD_S = 0.3
+_STOW_HOLD_MIN_S = 0.5
+_STOW_HOLD_MAX_S = 3.0
+# Plain teleop's stow (see IKWorker._step_arm_stow) carries the two grippers
+# in as a rigid pair: the pair's midpoint is tried _ARM_STOW_REACH_M in front
+# of the shoulders and then further out, in _STOW_PLAN_STEP_M steps up to
+# _ARM_STOW_SPAN_M further (box mode's stow places the box centre, which the
+# straight grasp holds ahead of the grippers; this places the grippers).
+# A candidate counts as reached when both grippers land within
+# _ARM_STOW_POS_TOL_M of their targets: a miss changes how far each runs
+# into a box squeezed between them, and so the squeeze. Each height's
+# search stops after _ARM_STOW_PLAN_PATIENCE candidates in a row that do no
+# better (a pair held too wide to tuck the elbows in at any distance), and
+# a height none reach is tried again _ARM_STOW_DROP_M lower (see
+# IKWorker._plan_arm_stow).
+_ARM_STOW_REACH_M = 0.10
+_ARM_STOW_SPAN_M = 0.30
+_ARM_STOW_POS_TOL_M = 0.003
+_ARM_STOW_PLAN_PATIENCE = 3
+_ARM_STOW_DROP_M = 0.05
+
+
+@dataclass
+class _DeckPlane:
+    """An arm's hold on the height of Jelly's deck's top (see
+    :meth:`IKWorker._hold_lift_plane`)."""
+
+    # The solved gripper height (m, world) while it was on the top.
+    z: float
+    # The target's height then, after any raise.
+    hand_z: float
+    # How far the target has been raised since (m).
+    raised: float = 0.0
+    # When the arm last touched the deck.
+    t: float = 0.0
+
+
+@dataclass
+class _ArmStow:
+    """Plain teleop's stow in progress (see :meth:`IKWorker._step_arm_stow`)."""
+
+    # The pair frame (midpoint between the grippers; y along the line from
+    # the right gripper to the left, z as near world up as that allows) at
+    # the press, and where it goes.
+    start: tuple[np.ndarray, np.ndarray]
+    goal: tuple[np.ndarray, np.ndarray]
+    # Each gripper's pose in the pair frame, kept for the whole stow.
+    rel: dict[str, tuple[np.ndarray, np.ndarray]]
+    q_start: np.ndarray
+    # The planned stowed joints (None without an elbow model: Mink).
+    q_goal: np.ndarray | None
+    elbows_start: dict[str, np.ndarray]
+    elbows_goal: dict[str, np.ndarray]
+    t0: float
+    duration: float
+    phase: str = "move"  # "move" -> "hold" -> "done"
+    alpha: float = 0.0
+    hold_t0: float = 0.0
+
+
+@dataclass
+class _Stow:
+    """One box-mode stow in progress (see :meth:`IKWorker._start_stow`)."""
+
+    start: tuple[np.ndarray, np.ndarray]
+    goal: tuple[np.ndarray, np.ndarray]
+    q_start: np.ndarray
+    # The planned stowed joints (None once a stall cut the move short).
+    q_goal: np.ndarray | None
+    elbows_start: dict[str, np.ndarray]
+    elbows_goal: dict[str, np.ndarray]
+    t0: float
+    duration: float
+    phase: str = "move"  # "move" -> "hold" -> "done"
+    alpha: float = 0.0
+    hold_t0: float = 0.0
+    stall_base: float | None = None
+    # The measured box's progress along the move when it began.
+    stall_p0: float = 0.0
+    # (time, measured box progress along the move) over the last
+    # _STOW_STALL_WINDOW_S of the move.
+    stall_trace: list[tuple[float, float]] = field(default_factory=list)
+
+
 # Squeeze lean (see IKWorker._squeeze_lean): low-pass time constant on the
 # measured clamp depth. The depth is a difference of two positions, so it
 # carries the encoders' noise and the servo lag of a move; a fifth of a
@@ -146,19 +290,6 @@ _TRIM_STILL_SPEED = 0.03
 _TRIM_STILL_S = 0.3
 # While the grippers press, a line of clamp diagnostics this often (s).
 _CLAMP_LOG_PERIOD_S = 1.0
-# Share of a torque-capped joint's cap the even clamp may use (see
-# joint_force_limit): the rest is left for what else that joint carries —
-# the squeeze trim's extra yaw, a held box's weight, the pair's own moves.
-_JOINT_CAP_MARGIN = 0.8
-# The robot's up (FLU +z), for box-frame rotations.
-_UP = np.array((0.0, 0.0, 1.0), dtype=np.float32)
-# The room's up in the frame the controller rotations are held in. Those
-# come out of ``_vr_to_flu_np``, which permutes the VR world's axes so that
-# the clutch mapping (``_relative_target_np``) reads controller-local deltas
-# — it does *not* turn the world frame into FLU: the VR world's +y (up) stays
-# the second axis. Anything that looks at a controller's rotation in world
-# terms (box mode's turn about vertical) must use this axis, not ``_UP``.
-_CTRL_UP = np.array((0.0, 1.0, 0.0), dtype=np.float32)
 
 # Gripper-pair status (see IKWorker.pair_status): reported to the core every
 # this many solved frames (~10 Hz at the 120 Hz cadence), and the tolerance
@@ -167,10 +298,40 @@ _CTRL_UP = np.array((0.0, 1.0, 0.0), dtype=np.float32)
 _STATUS_EVERY_N = 12
 _ALIGNED_TOL_DEG = 25.0
 
+# Collision proximity for the headset's haptics (see
+# IKWorker.collision_proximity): reported every this many solved frames
+# (~30 Hz at the 120 Hz cadence) while either arm is engaged.
+_PROXIMITY_EVERY_N = 4
+
 # Re-engage ramp (config.reengage == "ramp", see IKWorker.step): the blend from
 # the arm's pose at the grip to the controller-implied target is paced by the
 # configured linear speed and, for the rotational part, by this angular rate.
 _RAMP_ANG_SPEED = 0.6  # rad/s
+
+# Lift clearance on the mobile Axol (see IKWorker.clear_lift): the fastest
+# (m/s) an arm that isn't tracking is moved out of the way of Jelly's deck as
+# the lift lowers. The deck rises at twice the lift's speed.
+_LIFT_CLEAR_SPEED = 0.2
+# An engaged arm held up by Jelly's deck keeps its height (see
+# IKWorker._hold_lift_plane): the smallest height (m) its target is raised
+# by (below it the gap is the solve's own lag), and how far up (the
+# vertical component of the contact normal) the deck must push the arm
+# for it to count. The lower column's sides push sideways and don't.
+_LIFT_PLANE_MIN_M = 0.002
+_LIFT_PLANE_MIN_UP = 0.2
+# An arm held on the deck's top (a contact pushing at least _LIFT_PLANE_TOP_UP
+# up) remembers that height. Off the top (round the edge and past it) the
+# deck no longer holds it up, and the solve's pull toward its posture would
+# let it sag below its target (a dip of up to ~1.5 cm in sim). Its target
+# is raised by _LIFT_PLANE_GAIN of the sag each solve until it is back at
+# the remembered height (and, once clear, lowered again by as much of that
+# raise as left it above it). The hold lets go once the hand moves up or down
+# _LIFT_PLANE_RELEASE_M from where it was when the arm left the top, or
+# _LIFT_PLANE_HOLD_S after the arm last touched the deck.
+_LIFT_PLANE_TOP_UP = 0.98
+_LIFT_PLANE_GAIN = 0.2
+_LIFT_PLANE_RELEASE_M = 0.01
+_LIFT_PLANE_HOLD_S = 1.0
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -182,13 +343,52 @@ def _dz(v: float) -> float:
     return 0.0 if abs(v) < _STICK_DEADZONE else float(v)
 
 
+def _pair_frame(
+    left: tuple[np.ndarray, np.ndarray], right: tuple[np.ndarray, np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]:
+    """The frame of a gripper pair: ``(center, rot)`` (float64).
+
+    Centred between the two grippers, its y axis along the line from the
+    right gripper to the left, its z axis as near world up as that allows
+    and x = y × z (forward, for a pair held in front). The plain-teleop stow
+    (:meth:`IKWorker._step_arm_stow`) carries the grippers in this frame.
+    """
+    pl = np.asarray(left[0], np.float64)
+    pr = np.asarray(right[0], np.float64)
+    center = 0.5 * (pl + pr)
+    y = pl - pr
+    norm = float(np.linalg.norm(y))
+    y = y / norm if norm > 1e-6 else np.array((0.0, 1.0, 0.0))
+    up = np.array((0.0, 0.0, 1.0)) - y[2] * y
+    if float(np.linalg.norm(up)) < 1e-6:  # the pair stands vertically
+        up = np.array((1.0, 0.0, 0.0)) - y[0] * y
+    up = up / float(np.linalg.norm(up))
+    x = np.cross(y, up)
+    return center, np.column_stack((x, y, up))
+
+
+def _pair_targets(
+    frame: tuple[np.ndarray, np.ndarray],
+    rel: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> dict[str, Pose]:
+    """Each gripper's world pose for the pair ``frame`` and its ``rel`` pose."""
+    center = np.asarray(frame[0], np.float64)
+    rot = np.asarray(frame[1], np.float64)
+    return {
+        side: (
+            (center + rot @ np.asarray(pos, np.float64)).astype(np.float32),
+            (rot @ np.asarray(r, np.float64)).astype(np.float32),
+        )
+        for side, (pos, r) in rel.items()
+    }
+
+
 # Clearance (m) kept between the two grippers' bodies when the width is
-# closed with nothing between them (see ToolGeometry.min_width).
+# closed with nothing between them (see ToolGeometry.min_width). The stock
+# gripper's bodies are its wrists. The parcel gripper's are its open plates
+# (straight grasp), which may close onto each other.
 _BODY_CLEARANCE_M = 0.01
-# Range (degrees from straight down) the sticks jog ``box_elbow_out`` over:
-# elbows hanging under the shoulder-wrist line to held out level.
-_ELBOW_OUT_MIN = 0.0
-_ELBOW_OUT_MAX = 90.0
+_PARCEL_BODY_CLEARANCE_M = 0.0
 # Longest step (m) along its swivel an elbow hint asks for (swivel_step): the
 # swivel is a curve, and a longer step's chord leaves it.
 _ELBOW_HINT_STEP_M = 0.03
@@ -198,19 +398,6 @@ _ELBOW_HINT_STEP_M = 0.03
 # manipulability cost and the elbow hint settle against a pose error that
 # size (0.3-0.5° tip-out in the angled grasp); these hold it under 0.05°.
 _BOX_POSE_WEIGHT_SCALE = (2.0, 4.0)
-
-
-def _dominant_axis(x: float, y: float) -> tuple[float, float]:
-    """Keep only the larger of a thumbstick's two axes (deadzoned).
-
-    ``x`` is the grip width and ``y`` the elbows; a thumb pushed mostly
-    forward with a little sideways in it should not creep the width (or the
-    other way round), so the smaller axis is zeroed. Ties go to ``x``.
-    """
-    x, y = _dz(x), _dz(y)
-    if abs(x) >= abs(y):
-        return x, 0.0
-    return 0.0, y
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -312,41 +499,36 @@ def _relative_target_np(
     return new_t.astype(np.float32), (rot_snap_fk @ R_delta).astype(np.float32)
 
 
+# Controller axes → box-frame axes for box mode's turn (see _box_turn). The
+# controller rotations out of ``_vr_to_flu_np`` hold the controller's own
+# axes as (back, up, left); the box frame is (forward, left, up).
+_CTRL_TO_BOX = np.array(
+    ((-1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), dtype=np.float32
+)
+
+
+def _box_turn(
+    rot_curr: np.ndarray, rot_snap_ctrl: np.ndarray, rotation_multiplier: float = 1.0
+) -> np.ndarray:
+    """The controller's turn since its snap, in the box frame's own axes.
+
+    The controller-local rotation delta (what :func:`_relative_target_np`
+    reads too), re-expressed as if the controller had been held like the
+    box frame at the snap — pointing forward, upright — so turning the hand
+    about its own vertical yaws the pair, about its left/right axis pitches
+    it and about its pointing axis rolls it, wherever the operator stands
+    and however the grippers were posed at the engage. Apply it on the
+    right of the box rotation (``box.rot @ turn``).
+    ``rotation_multiplier`` scales the angle.
+    """
+    local = np.asarray(rot_snap_ctrl, np.float32).T @ np.asarray(rot_curr, np.float32)
+    turn = _CTRL_TO_BOX @ local @ _CTRL_TO_BOX.T
+    return _scale_rotation_np(turn, rotation_multiplier).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # IKWorker
 # ---------------------------------------------------------------------------
-
-
-def box_joint_caps(
-    robot_config: object, config: VRTeleopConfig
-) -> dict[str, np.ndarray]:
-    """Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order, inf = none).
-
-    The configured ``JointConfig.torque_limit`` tightened by box mode's
-    session wrist cap (``config.box_wrist_torque`` on ``BOX_WRIST_JOINTS``,
-    what ``VRTeleopCore.spring_caps`` has the robot apply). The squeeze lean
-    holds the clamp under the force at which these saturate
-    (:func:`joint_force_limit`).
-    """
-    from ..constants import ARM_JOINTS
-    from .core import BOX_WRIST_JOINTS
-
-    wrist_cap = float(getattr(config, "box_wrist_torque", 0.0))
-    out: dict[str, np.ndarray] = {}
-    for side in ("left", "right"):
-        caps = np.array(
-            [
-                getattr(getattr(robot_config, side), j.value).torque_limit
-                for j in ARM_JOINTS
-            ],
-            dtype=np.float64,
-        )
-        if wrist_cap > 0.0:
-            for j in BOX_WRIST_JOINTS:
-                i = ARM_JOINTS.index(j)
-                caps[i] = min(caps[i], wrist_cap)
-        out[side] = caps
-    return out
 
 
 class IKWorker:
@@ -474,9 +656,19 @@ class IKWorker:
         # Wall time of the previous solve, for scaling the solver's per-call
         # step clamp by the actual solve cadence (see delta_scale in step()).
         self._last_solve_t: float | None = None
+        # Lift clearance (see clear_lift): time of the previous step, and the
+        # lift-safe rest goal with the lift height it was computed for.
+        self._lift_clear_t: float | None = None
+        # Per engaged arm held on Jelly's deck's top: the height it is held
+        # at (see _hold_lift_plane).
+        self._deck_plane: dict[str, _DeckPlane] = {}
+        self._rest_goal: tuple[float, np.ndarray] | None = None
         # Box mode (bimanual carry, see .box): the pair's state from the engage
         # snap and which controller leads it. None while not in box tracking.
         self._box: BoxState | None = None
+        # The grasp the pair still holds the box in after a grasp switch,
+        # until the re-snap reads the box off it (see set_config).
+        self._held_tool: ToolGeometry | None = None
         self._box_leader: str | None = None
         # The leader's anchor for the pair — its controller pose and its
         # gripper's FK at the box engage — kept apart from the per-arm snaps
@@ -486,6 +678,16 @@ class IKWorker:
         self._box_snap: (
             tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None
         ) = None
+        # The pair's box rotation as last commanded (the snap's turned by the
+        # leader, so possibly tipped). Kept across a freeze, a handover and a
+        # grasp switch so their re-snap holds a tipped box at its tilt
+        # (snap_box's ``rot``) instead of levelling it; dropped once the
+        # session leaves box tracking or the arms are moved by something else.
+        self._box_rot: np.ndarray | None = None
+        # The box-mode stow in progress, if any (see _start_stow).
+        self._stow: _Stow | None = None
+        # Plain teleop's stow in progress, if any (see _step_arm_stow).
+        self._arm_stow: _ArmStow | None = None
         # Squeeze lean (see _squeeze_lean): the arms' measured joint positions
         # and joint stiffness as last reported by the core (``("meas", ...)``,
         # hardware only — the sim reports none), the low-passed clamp depth
@@ -511,18 +713,10 @@ class IKWorker:
         # gravity compensation runs on); built up front so the first clamp
         # doesn't stall a solve. None if it can't be built (no lean then).
         self._lean_model = None
-        # Each arm's spring-torque caps in box mode (Nm, ARM_JOINTS order;
-        # inf for none): the configured torque_limit, tightened by the
-        # session's box_wrist_torque on the wrists (what the core caps them
-        # at in box mode). The clamp is held under the force at which they
-        # saturate.
-        self._joint_caps: dict[str, np.ndarray] | None = None
         try:
-            from ..robot.config import AxolConfig
             from ..robot.gravity import GravityCompensator
 
             self._lean_model = GravityCompensator()
-            self._joint_caps = box_joint_caps(AxolConfig(), config)
         except Exception:  # noqa: BLE001 - the lean is optional
             _logger.exception("arm model unavailable; box mode's squeeze lean is off")
 
@@ -552,6 +746,10 @@ class IKWorker:
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
+        # The haptics' collision proximity reads the rest pose as clear.
+        set_reference = getattr(self._solver, "set_proximity_reference", None)
+        if callable(set_reference):
+            set_reference(self.get_rest_q())
 
         # Teleop flight recorder (--teleop.record, arriving here via
         # the pickled config, see .recorder): taps the solve path at every
@@ -719,6 +917,12 @@ class IKWorker:
             left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
             right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
+        if getattr(frame, "arm_stow", False) and frame.box_leader is None:
+            return self._step_arm_stow(q_current)
+        if getattr(self, "_arm_stow", None) is not None:
+            # Done (the core froze both arms) or cancelled (a grip).
+            self._end_arm_stow(q_current)
+
         if not (l_lock or r_lock):
             # Snap poses are deliberately kept: in "ramp" re-engage mode they
             # are the session anchor the next grip ramps the arm back to
@@ -731,7 +935,8 @@ class IKWorker:
             self._box = None
             self._box_leader = None
             self._box_snap = None
-            return q_current
+            self._stow = None
+            return self.clear_lift(q_current)
 
         if frame.box_leader is not None:
             return self._step_box(
@@ -741,6 +946,7 @@ class IKWorker:
                 lp,
                 rp,
             )
+        self._box_rot = None
         if self._box is not None:
             # Box tracking ended without a lock-less frame in between (mode
             # switched while engaged): the per-arm path below re-engages each
@@ -1027,6 +1233,20 @@ class IKWorker:
                 posture[indices] = q_current[indices]
             if not getattr(self, "_mink_backend", False):
                 self._solver.set_posture_pose(posture)
+        if self._has_lift_contact():
+            # An arm re-anchored above already has a fresh mapping.
+            fresh = {side for side, *_rest in reanchor}
+            q_new = self._lift_contact_per_arm(
+                q_new,
+                {
+                    side: pose
+                    for side, pose in (
+                        ("left", (tl_pos, tl_rot)),
+                        ("right", (tr_pos, tr_rot)),
+                    )
+                    if side not in fresh
+                },
+            )
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -1223,7 +1443,7 @@ class IKWorker:
     def path_goal(self, name: str) -> np.ndarray:
         """Full (N,) joint vector for a named path goal (see :data:`PATH_GOALS`)."""
         if name == "rest":
-            return self.get_rest_q()
+            return self.rest_goal()
         if name == "zero":
             return np.zeros(self._solver.num_joints, dtype=np.float32)
         raise ValueError(f"unknown path goal {name!r} (expected one of {PATH_GOALS})")
@@ -1272,16 +1492,205 @@ class IKWorker:
             _logger.warning("Ignoring live update %s=%r (bad value)", key, value)
             return
         if key == "box_grasp" and coerced != current and self._box is not None:
-            # Switch grasps under a live pair the same way a stick click does:
-            # re-snap, so the arms blend into the new configuration.
+            # Switch grasps under a live pair: re-snap, so the arms blend
+            # into the new configuration. The two grasps touch the box at
+            # different points, so the box is read off the grasp it is held
+            # in (see snap_box's held_tool).
+            self._held_tool = self._box.tool
             self._box = None
         setattr(self._config, key, coerced)
+
+    def set_gripper(self, left: float, right: float) -> None:
+        """The commanded gripper openings (``("grip", left, right)``
+        message, 0 = closed, 1 = open): where the collision checks put the
+        fingers (see :meth:`KinematicsSolver.set_gripper`). The Mink model
+        has no sliding fingers: ignored there."""
+        if not self._mink_backend:
+            self._solver.set_gripper(left, right)
 
     def set_lift(self, raised: float) -> None:
         """The live lift height (``("lift", raised)`` message): where the
         collision checks put the deck and lower column (see
-        :meth:`KinematicsSolver.set_lift`)."""
-        self._solver.set_lift(raised)
+        :meth:`KinematicsSolver.set_lift`). The Mink model has no lift:
+        ignored there."""
+        if not self._mink_backend:
+            self._solver.set_lift(raised)
+
+    def _has_lift_contact(self) -> bool:
+        """Whether the solver models a lift (the mobile Axol on the JAX
+        backend, collision detection on): see :meth:`clear_lift`."""
+        return (
+            not getattr(self, "_mink_backend", False)
+            and getattr(self._solver, "has_lift_contact", False) is True
+        )
+
+    def rest_goal(self) -> np.ndarray:
+        """The return-to-rest goal: the rest pose, moved clear of Jelly's
+        deck at the live lift height.
+
+        With the lift lowered far enough that the hanging arms would sit in
+        the deck, the arms come up and forward over it instead
+        (:meth:`KinematicsSolver.lift_clear_pose`). The rest pose itself
+        everywhere else. Cached per lift height.
+        """
+        rest = self.get_rest_q()
+        if not self._has_lift_contact():
+            return rest
+        lowered = float(self._solver.lift_lowered)
+        cached = self._rest_goal
+        if cached is not None and abs(cached[0] - lowered) < 1e-4:
+            return cached[1].copy()
+        goal = np.asarray(self._solver.lift_clear_pose(rest), dtype=np.float32)
+        self._rest_goal = (lowered, goal)
+        if not np.array_equal(goal, rest):
+            _logger.info(
+                "Rest pose raised over Jelly's deck (lift lowered %.0f mm)",
+                1e3 * lowered,
+            )
+        return goal.copy()
+
+    def clear_lift(
+        self, q: np.ndarray, sides: tuple[str, ...] = ("left", "right")
+    ) -> np.ndarray:
+        """``q`` with each of ``sides`` moved a step out of Jelly's deck.
+
+        On the mobile Axol the deck and lower lift stage rise toward the arms
+        as the lift lowers. An arm that isn't tracking (disengaged, or frozen
+        while the other tracks) is moved out of their way, at up to
+        ``_LIFT_CLEAR_SPEED`` (see :meth:`KinematicsSolver.lift_clear_step`).
+        ``q`` unchanged when no arm is in their way, and everywhere but the
+        mobile Axol.
+        """
+        if not self._has_lift_contact():
+            return q
+        now = time.perf_counter()
+        nominal = 1.0 / float(self._config.ik_frequency)
+        dt = nominal if self._lift_clear_t is None else now - self._lift_clear_t
+        self._lift_clear_t = now
+        dt = min(max(dt, nominal), 4.0 * nominal)
+        q_new = self._solver.lift_clear_step(
+            q, max_step=_LIFT_CLEAR_SPEED * dt, sides=sides
+        )
+        return q if q_new is None else np.asarray(q_new, dtype=np.float32)
+
+    def _lift_contact_per_arm(
+        self, q_new: np.ndarray, targets: dict[str, Pose]
+    ) -> np.ndarray:
+        """Per-arm teleop's handling of Jelly's deck after a solve.
+
+        An engaged arm held up by the deck has its clutch anchor raised to
+        the height it is held at (:meth:`_hold_lift_plane`). A frozen arm the
+        deck rises into is moved out of its way (:meth:`clear_lift`), and its
+        hold pose follows it.
+        """
+        contact = self._solver.lift_contact(q_new)
+        engaged = {side: targets[side] for side in targets if self._active[side]}
+        for side, shift in self._hold_lift_plane(q_new, engaged, contact).items():
+            pos, rot = self._snap_fk[side]
+            self._snap_fk[side] = (pos + shift, rot)
+        if not contact:
+            return q_new
+        frozen = tuple(
+            side
+            for side in ("left", "right")
+            if not self._active[side] and side in contact
+        )
+        if frozen:
+            q_new = self.clear_lift(q_new, frozen)
+            left, right = self._solver.fk(q_new)
+            for side in frozen:
+                self._hold_fk[side] = left if side == "left" else right
+        return q_new
+
+    def _hold_lift_plane(
+        self,
+        q_new: np.ndarray,
+        targets: dict[str, Pose],
+        contact: dict[str, tuple[float, np.ndarray]],
+        shared: bool = False,
+    ) -> dict[str, np.ndarray]:
+        """How far to raise each engaged arm's target held up by Jelly's deck.
+
+        While the collision cost holds an arm up off the deck, its target
+        sits under the arm, inside the deck. Left there, it drops the arm to
+        it the moment the arm clears the deck's edge. So per side in
+        ``targets`` whose contact pushes the arm up, the target is raised to
+        the height of the solved gripper (FK of ``q_new``). Pressing further
+        down is given up the same way; raising the hand raises the arm at
+        once. Horizontal motion is left alone, so pushing into the deck's
+        edge still slides the arm up over it.
+
+        That alone still lets the arm sag as it leaves the top: the deck held
+        it up against the solve's pull toward its posture, and the target
+        sits only where the arm was. So an arm on the top remembers its
+        height (``_deck_plane``), and round the edge and past it its target
+        is raised by ``_LIFT_PLANE_GAIN`` of any sag below that height each
+        solve (clear of the deck, lowered the same way while above it, by no
+        more than it was raised), until the hand moves up or down ``_LIFT_PLANE_RELEASE_M`` or
+        ``_LIFT_PLANE_HOLD_S`` after the arm last touched the deck.
+
+        Returns the shifts (world frame, vertical); those under
+        ``_LIFT_PLANE_MIN_M`` (raise to the solved height) are left out.
+        ``shared``: both targets move by the largest shift (box mode, which
+        raises the box centre), so each hold counts that one.
+        """
+        planes = self._deck_plane
+        for side in [side for side in planes if side not in targets]:
+            del planes[side]
+        if not contact and not planes:
+            return {}
+        now = time.perf_counter()
+        left, right = self._solver.fk(q_new)
+        solved = {"left": left, "right": right}
+        raises: dict[str, float] = {}
+        on_top: dict[str, float] = {}
+        for side, target in targets.items():
+            z = float(solved[side][0][2])
+            z_target = float(target[0][2])
+            up = float(contact[side][1][2]) if side in contact else None
+            raise_by = 0.0
+            if up is not None and up >= _LIFT_PLANE_MIN_UP:
+                below = z - z_target
+                if below > _LIFT_PLANE_MIN_M:
+                    raise_by = below
+            plane = planes.get(side)
+            if up is not None and up >= _LIFT_PLANE_TOP_UP:
+                planes[side] = _DeckPlane(z=z, hand_z=z_target, t=now)
+                on_top[side] = z_target
+            elif plane is not None:
+                if up is not None:
+                    plane.t = now
+                hand = z_target - plane.raised - plane.hand_z
+                if (
+                    abs(hand) > _LIFT_PLANE_RELEASE_M
+                    or now - plane.t > _LIFT_PLANE_HOLD_S
+                ):
+                    del planes[side]
+                else:
+                    sag = plane.z - z
+                    if sag > _LIFT_PLANE_MIN_M:
+                        raise_by = max(raise_by, _LIFT_PLANE_GAIN * sag)
+                    elif up is None and sag < -_LIFT_PLANE_MIN_M:
+                        # Clear of the deck and above its height: give back
+                        # what the edge made the hold overshoot, no more.
+                        raise_by = max(_LIFT_PLANE_GAIN * sag, -plane.raised)
+            if raise_by != 0.0:
+                raises[side] = raise_by
+        if shared and raises:
+            top = max(raises.values())
+            raises = dict.fromkeys(raises, top)
+            applied = dict.fromkeys(targets, top)
+        else:
+            applied = raises
+        for side, plane in planes.items():
+            if side in on_top:
+                plane.hand_z = on_top[side] + applied.get(side, 0.0)
+            else:
+                plane.raised += applied.get(side, 0.0)
+        return {
+            side: np.array((0.0, 0.0, v), dtype=np.float32)
+            for side, v in raises.items()
+        }
 
     def pair_status(self, q: np.ndarray) -> dict:
         """Geometry of the gripper pair at ``q`` for the headset's cues.
@@ -1338,7 +1747,29 @@ class IKWorker:
             "squeeze": round(self._lean_force, 1),
             "trim": round(self.squeeze_trim_deg, 1),
             "trims": [round(v, 1) for v in self.squeeze_trims_deg.values()],
+            "stow": (
+                stow.phase
+                if (
+                    stow := getattr(self, "_stow", None)
+                    or getattr(self, "_arm_stow", None)
+                )
+                else None
+            ),
         }
+
+    def collision_proximity(self, q: np.ndarray) -> dict[str, float] | None:
+        """Per-arm closeness to the IK collision boundary at ``q``, 0 to 1.
+
+        See :meth:`~almond_axol.kinematics.solver.KinematicsSolver.collision_proximity`.
+        ``None`` when the solver has no collision model (detection off).
+        """
+        proximity = getattr(self._solver, "collision_proximity", None)
+        if proximity is None:
+            return None
+        levels = proximity(q)
+        if not isinstance(levels, dict):
+            return None
+        return {side: round(float(v), 3) for side, v in levels.items()}
 
     def _box_grasp(self) -> str:
         """The current box-mode grasp, ``"straight"`` or ``"flush"`` (``config.box_grasp``)."""
@@ -1349,10 +1780,11 @@ class IKWorker:
         """The box-mode contact geometry for the current grasp and tool.
 
         The fitted gripper's (``config.gripper``) in the current grasp: for
-        the parcel gripper, its plate's face in ``"straight"`` and its
-        facet and tip, turned ``box_flush_deg`` inward, in ``"flush"``
-        (:func:`parcel_tool`) — the same foot in both, so a grasp switch
-        turns each gripper about it. Box mode only runs with the parcel
+        the parcel gripper, its fixed blade's front face in ``"straight"``
+        and its plate's facet and the blade's tip, turned ``box_flush_deg``
+        inward, in ``"flush"`` (:func:`parcel_tool`). A grasp switch keeps
+        the box and moves each gripper onto the new grasp's contacts (see
+        :meth:`set_config`). Box mode only runs with the parcel
         gripper; anything else gets the trivial :data:`URDF_TOOL` (the
         mounts themselves, the same in both grasps).
         """
@@ -1368,18 +1800,19 @@ class IKWorker:
 
         ``config.box_width_min`` — the operator's floor between the contact
         faces — or, if larger, the width at which the fitted tool's bodies
-        would come within ``_BODY_CLEARANCE_M`` of each other in the
-        current grasp (:meth:`ToolGeometry.min_width`). The parcel
-        gripper's contact faces are proud of everything else on it in both
-        grasps, so they may close to the operator's floor; the stock
-        gripper's face is modelled on the mount axis and its wrists meet
-        first, at ~77 mm.
+        would come within a clearance of each other in the current grasp
+        (:meth:`ToolGeometry.min_width`). The parcel gripper's straight
+        grasp closes until its open plates meet (``_PARCEL_BODY_CLEARANCE_M``,
+        ~124 mm between the blade fronts); its flush grasp's contacts are
+        proud of everything else, so they may close to the operator's floor
+        (``0`` by default: the faces together). The stock gripper's face is
+        modelled on the mount axis and its wrists meet first, kept
+        ``_BODY_CLEARANCE_M`` apart (~77 mm).
         """
         cfg = self._config
-        return max(
-            float(cfg.box_width_min),
-            self._box_tool().min_width(_BODY_CLEARANCE_M),
-        )
+        parcel = getattr(cfg, "gripper", "parallel") == "parcel"
+        clearance = _PARCEL_BODY_CLEARANCE_M if parcel else _BODY_CLEARANCE_M
+        return max(float(cfg.box_width_min), self._box_tool().min_width(clearance))
 
     def note_measured(
         self,
@@ -1416,6 +1849,7 @@ class IKWorker:
         targets: dict[str, Pose],
         q_current: np.ndarray,
         now: float,
+        rot: np.ndarray | None = None,
     ) -> dict[str, Pose]:
         """Lean the gripper targets so the clamp presses evenly on the contacts.
 
@@ -1424,9 +1858,9 @@ class IKWorker:
         run-ahead into the clamp. A plain lateral run-ahead, though, is a
         force at the gripper *mount* plus the moment it takes to hold the
         mount's orientation against the arm's stiffness coupling — and the
-        parcel gripper touches the box with its plate's face along the
-        wrist, or its chamfer facet and the fixed blade's tip 7 cm further
-        on, so that moment can only be carried by the contacts loading
+        parcel gripper touches the box with its fixed blade's front face,
+        7.5 to 12.5 cm ahead of the mount, or its chamfer facet and the
+        blade's tip 7 cm apart, so that moment can only be carried by the contacts loading
         unevenly: the facet digs in as the tip lifts, the pinch. :func:`squeeze_lean` gives, from the
         arm's Jacobian at the commanded pose and its joint stiffness, the
         target offset (a yaw of about a degree per centimetre of depth, a
@@ -1449,14 +1883,9 @@ class IKWorker:
         this replaces did exactly that and cost the pair its alignment).
         With ``config.box_squeeze_force`` > 0 the depth is capped at that
         force's, the targets pulled back out along the normals to hold it
-        — the same on both arms, so the pair stays a pair. The arms' own
-        torque caps set a second, automatic cap (:func:`joint_force_limit`,
-        ``_JOINT_CAP_MARGIN`` of it, the lower arm's for both): ``wrist_2``
-        holds the moment that keeps the tip pressed and saturates first,
-        at ~39 N of even clamp at box mode's 5 Nm wrist cap
-        (``box_wrist_torque``), and squeezing past that only
-        unloads the tip onto the facet — so the clamp stops there, both
-        contacts pressed, however far the width is jogged.
+        — the same on both arms, so the pair stays a pair. Otherwise (the
+        default) nothing holds the depth back: the clamp keeps tightening
+        as far as the operator jogs the width in.
 
         The model's lean is open loop, and the arm is not quite the model:
         gear backlash, the wrist's own compliance, and the gripper flexing
@@ -1485,7 +1914,9 @@ class IKWorker:
         Off (targets returned as they are) without a measurement (the
         sim, or none reported for ``_LEAN_RESET_S``) or a pair still
         blending into alignment; the model's lean also needs the arm model
-        and a nonzero lean scale or force cap.
+        and a nonzero lean scale or force cap. ``rot`` is the pair's box
+        frame this frame (the snap's ``box.rot`` turned by the leader);
+        omitted, the snap's.
         """
         cfg = self._config
         scale = float(getattr(cfg, "box_squeeze_lean", 0.0))
@@ -1508,9 +1939,10 @@ class IKWorker:
         if not np.all(np.isfinite(q_meas)):
             return targets
         measured = dict(zip(("left", "right"), self._solver.fk(q_meas)))
-        lateral = np.asarray(box.rot[:, 1], dtype=np.float64)
+        frame = np.asarray(box.rot if rot is None else rot, dtype=np.float64)
+        lateral = frame[:, 1]
         normals = {"left": -lateral, "right": lateral}
-        up = np.asarray(box.rot[:, 2], dtype=np.float64)
+        up = frame[:, 2]
         depths = {
             side: float(
                 (
@@ -1583,18 +2015,6 @@ class IKWorker:
                 self._lean_model = None
                 return self._apply_trim(targets, normals, up)
             models[side] = (rot_cmd, jac, np.asarray(tool.contacts(box.face[side])))
-        joint_limit = math.inf
-        caps = getattr(self, "_joint_caps", None)
-        if caps is not None:
-            for side, (rot_cmd, jac, pts) in models.items():
-                joint_limit = min(
-                    joint_limit,
-                    _JOINT_CAP_MARGIN
-                    * joint_force_limit(jac, rot_cmd, normals[side], pts, caps[side]),
-                )
-        force_cap = cap if cap > 0.0 else math.inf
-        limited = joint_limit < force_cap
-        force_cap = min(force_cap, joint_limit)
         for side in ("left", "right"):
             pos, rot = targets[side]
             rot_cmd, jac, pts = models[side]
@@ -1605,7 +2025,7 @@ class IKWorker:
                 normals[side],
                 pts,
                 depth,
-                force_cap if math.isfinite(force_cap) else 0.0,
+                cap if cap > 0.0 else 0.0,
             )
             forces.append(lean.force)
             per_side_force[side] = lean.force
@@ -1618,9 +2038,7 @@ class IKWorker:
                 new_rot = (rodrigues(axis, angle) @ rot).astype(np.float32)
             out[side] = (new_pos, new_rot)
         self._lean_force = 0.5 * sum(forces)
-        self._log_clamp(
-            now, depths, per_side_force, toe, still, joint_limit if limited else None
-        )
+        self._log_clamp(now, depths, per_side_force, toe, still)
         return self._apply_trim(out, normals, up)
 
     def _pair_still(self, targets: dict[str, Pose], now: float) -> bool:
@@ -1653,7 +2071,6 @@ class IKWorker:
         forces: dict[str, float],
         toe: dict[str, float],
         still: bool,
-        joint_limit: float | None = None,
     ) -> None:
         """Rate-limited clamp diagnostics while the grippers press."""
         if now - self._clamp_log_t < _CLAMP_LOG_PERIOD_S:
@@ -1661,7 +2078,7 @@ class IKWorker:
         self._clamp_log_t = now
         _logger.info(
             "box clamp: depth L %.1f / R %.1f mm, force L %.1f / R %.1f N, "
-            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s%s",
+            "toe-out L %+.2f / R %+.2f°, trim L %+.2f / R %+.2f°%s",
             depths["left"] * 1e3,
             depths["right"] * 1e3,
             forces.get("left", 0.0),
@@ -1671,9 +2088,6 @@ class IKWorker:
             math.degrees(self._lean_trim["left"]),
             math.degrees(self._lean_trim["right"]),
             "" if still else " (pair moving: trims held)",
-            ""
-            if joint_limit is None
-            else f" (held at the wrists' even-clamp limit, {joint_limit:.0f} N)",
         )
 
     def _apply_trim(
@@ -1724,8 +2138,12 @@ class IKWorker:
         self._ramp = {}
         self._clear_freeze()
         self._box = None
+        self._held_tool = None
+        self._deck_plane = {}
+        self._arm_stow = None
         self._box_leader = None
         self._box_snap = None
+        self._box_rot = None
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
@@ -1783,14 +2201,14 @@ class IKWorker:
         faces) over ``box_align_duration``. Afterwards the leader hand
         drives the pair through the usual per-arm clutch mapping
         (:func:`_relative_target_np`, so moving the hand feels exactly like
-        normal teleop) with two of its six degrees of freedom dropped: the
-        pair follows the hand's translation and its turn about the room's
-        vertical (:func:`twist_about`, applied about the pair's centre so a
-        wrist turn lines the pair up with a box on the table without moving
-        it), and stays level whatever the hand's pitch and roll. The thumbsticks set
-        the grip width (see :meth:`_integrate_sticks`), and
-        a single stick click switches between the flush and straight grasps
-        (:meth:`_stick_click_toggle`), re-running the blend.
+        normal teleop) in all six degrees of freedom: the pair follows the
+        hand's translation, and the hand's rotation since the snap — yaw,
+        pitch and roll, in the box frame's axes (:func:`_box_turn`) — turns
+        the whole pair about its centre, so a wrist turn lines the pair up
+        with (or tips) a box without moving it. The right thumbstick's forward/back sets the
+        grip width (see :meth:`_integrate_sticks`); the rest of the sticks
+        drive Jelly as outside box mode, and the grasp is switched from the
+        settings (``box_grasp``), re-running the blend.
         """
         leader = frame.box_leader
         assert leader in ("left", "right")
@@ -1803,8 +2221,16 @@ class IKWorker:
         if self._box is None or not engaged or self._box_leader != leader:
             # Engage snap, or the leading hand changed: (re)anchor to the
             # live pose. A handover mid-align simply restarts the blend from
-            # wherever the grippers are, so nothing jumps.
+            # wherever the grippers are, so nothing jumps. A re-snap within
+            # box mode (handover, freeze and lead again, grasp switch) keeps
+            # the pair's last frame while the grippers still sit in it, so a
+            # tipped box stays tipped; a fresh engage squares the pair level.
             l_fk, r_fk = self._solver.fk(q_current)
+            keep = self._box_rot
+            if keep is not None and not tipped_frame_holds(
+                l_fk, r_fk, keep, _ALIGNED_TOL_DEG
+            ):
+                keep = None
             self._box = snap_box(
                 l_fk,
                 r_fk,
@@ -1815,9 +2241,14 @@ class IKWorker:
                 tilt=math.radians(cfg.box_grip_tilt),
                 tool=self._box_tool(),
                 faces=self._box_faces(),
+                rot=keep,
+                held_tool=self._held_tool,
             )
+            self._held_tool = None
+            self._deck_plane = {}
             self._box_leader = leader
             self._box_snap = (ctrl[leader], l_fk if leader == "left" else r_fk)
+            self._stow = None
             self._ramp = {}
             self._active = {"left": True, "right": True}
             self._hold_fk = {}
@@ -1825,21 +2256,9 @@ class IKWorker:
             self._clear_freeze()
             self._solver.set_posture_pose(q_current)
             self._last_solve_t = None
-            # A stick already held at the snap can't be the start of a grasp
-            # toggle (see _stick_click_toggle).
-            self._box.click_prev = (
-                bool(frame.l_stick_click),
-                bool(frame.r_stick_click),
-            )
             return q_current
 
         box = self._box
-        if self._stick_click_toggle(frame, box):
-            # Grasp switched: drop the pair state so the next frame re-snaps
-            # from FK and blends the arms into the new configuration (the
-            # leader re-anchors too, so nothing jumps). This frame holds.
-            self._box = None
-            return q_current
         ctrl_pos, ctrl_rot = ctrl[leader]
         assert self._box_snap is not None
         (snap_ctrl_pos, snap_ctrl_rot), snap_fk = self._box_snap
@@ -1851,29 +2270,34 @@ class IKWorker:
             *snap_fk,
             position_multiplier=cfg.position_multiplier,
         )
-        # Position and heading only: the box centre is carried along with
-        # the leader gripper's translation since the snap, and the pair is
-        # turned about that centre by how far the hand has turned about the
-        # room's up axis since the snap (taken from the controller's own
-        # world-frame rotation, not from the clutch-mapped gripper rotation,
-        # so it is a yaw whatever the gripper was doing at the snap). The
-        # controller frame's up is the VR world's +y (_CTRL_UP): the poses
-        # out of _vr_to_flu_np are not in FLU, and twisting about FLU +z
-        # there would read the hand's *pitch* as the turn. The turn is a
-        # right-handed angle about up in either frame, so it applies to the
-        # box frame about the robot's +z unchanged. The hand's pitch and roll
-        # never reach the grippers, so the pair stays level with the fingers
-        # straight out.
+        # The box centre is carried along with the leader gripper's
+        # translation since the snap, and the pair is turned about that
+        # centre by the hand's full rotation since the snap — yaw, pitch and
+        # roll — read in the box frame's own axes (_box_turn), not through
+        # the leader gripper's clutch mapping: that one is relative to the
+        # gripper's pose at the snap, before the align blend, so a gripper
+        # that engaged pointing down would turn a hand's yaw into a roll of
+        # the box.
         snap_pos = snap_fk[0]
         center = (lead_pos + (box.center - snap_pos)).astype(np.float32)
-        yaw = (
-            twist_about(ctrl_rot @ snap_ctrl_rot.T, _CTRL_UP) * cfg.rotation_multiplier
-        )
-        rot = (rodrigues(_UP, yaw) @ box.rot).astype(np.float32) if yaw else box.rot
+        turn = _box_turn(ctrl_rot, snap_ctrl_rot, cfg.rotation_multiplier)
+        rot = (box.rot @ turn).astype(np.float32)
+        self._box_rot = rot
         self._integrate_sticks(frame, box, now)
+        if getattr(frame, "box_stow", False) and getattr(self, "_stow", None) is None:
+            self._stow = self._start_stow(box, center, rot, q_current, now)
+        stow = getattr(self, "_stow", None)
+        if stow is not None:
+            # The stow drives the pair; the leading hand is ignored.
+            center, rot = self._stow_pose(stow, now)
+            self._box_rot = rot
         targets = box_targets(box, center, rot, now)
-        targets = self._squeeze_lean(box, targets, q_current, now)
-        elbows = self._box_elbow_hints(q_current, targets)
+        targets = self._squeeze_lean(box, targets, q_current, now, rot)
+        elbows = (
+            self._stow_elbows(stow)
+            if stow is not None
+            else self._box_elbow_hints(q_current, targets)
+        )
         # The posture attractor follows q for the whole of box mode. Pinned at
         # the engage pose (normal teleop's behaviour) it balances the pose
         # cost well short of the target — posture_weight 5 against pos_weight
@@ -1884,7 +2308,9 @@ class IKWorker:
         # doesn't need one: rest damping holds it where it is, the arm/torso
         # collision model keeps it off the base, and the optional elbow hint
         # (box_elbow_weight > 0) steers it explicitly.
-        self._solver.set_posture_pose(q_current)
+        # A stow instead pulls the posture into its planned pose, so the
+        # arms arrive there, symmetric, whatever they started from.
+        self._solver.set_posture_pose(self._stow_posture(stow, q_current))
 
         delta_scale = 1.0
         if self._last_solve_t is not None:
@@ -1905,6 +2331,20 @@ class IKWorker:
         )
         solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         q_new = np.asarray(q_new, dtype=np.float32).copy()
+        self._keep_elbows_bent(q_new, q_current)
+        if stow is not None:
+            self._settle_stow(stow, q_new, q_current, delta_scale)
+            self._advance_stow(stow, q_new, q_current, targets, now)
+        if self._has_lift_contact():
+            # Held up by Jelly's deck, the pair keeps the height it is held
+            # at (see _hold_lift_plane): the box centre rises with the arm
+            # held furthest above its target, so the pair stays a pair.
+            shifts = self._hold_lift_plane(
+                q_new, targets, self._solver.lift_contact(q_new), shared=True
+            )
+            if shifts:
+                shift = max(shifts.values(), key=lambda v: float(np.linalg.norm(v)))
+                box.center = (box.center + shift).astype(np.float32)
         if self._rec is not None:
             self._rec.record(
                 raw_l=np.array(
@@ -1930,6 +2370,686 @@ class IKWorker:
                 solve_ms=solve_ms,
             )
         return q_new
+
+    def _keep_elbows_bent(self, q_new: np.ndarray, q_current: np.ndarray) -> None:
+        """Keep box mode's elbows from bending backwards (in place).
+
+        Each elbow can hyperextend a little past straight (the URDF allows
+        about 24°). Led out of reach, the box-mode solve stretches an arm
+        through straight into that backwards branch, and once there no box
+        motion toward the body brings it back: with the gripper held, the
+        arm would have to pass through straight again, at full reach. The
+        stow then can't fold that arm into its plan. So in box mode an
+        elbow may not move further past ``_ELBOW_BENT_RAD`` from straight
+        toward the backwards side; one already past it may only come back.
+        """
+        left = getattr(self._solver, "left_indices", None)
+        right = getattr(self._solver, "right_indices", None)
+        if getattr(self, "_mink_backend", False) or left is None or right is None:
+            return
+        for indices, sign in ((left, 1.0), (right, -1.0)):
+            i = indices[_ELBOW_INDEX]
+            # Bent forward is +sign; "sign * q" < _ELBOW_BENT_RAD is backwards.
+            floor = min(float(sign * q_current[i]), _ELBOW_BENT_RAD)
+            if sign * q_new[i] < floor:
+                q_new[i] = sign * floor
+
+    def _start_stow(
+        self,
+        box: BoxState,
+        center: np.ndarray,
+        rot: np.ndarray,
+        q: np.ndarray,
+        now: float,
+    ) -> _Stow:
+        """Begin the box-mode stow from the pair's pose this frame.
+
+        The stow (**A**) brings the box in to the chest: level, facing
+        straight forward, centred between the shoulders,
+        ``config.box_stow_height`` below them and as close in front as the
+        arms reach (:meth:`_plan_stow`), with the elbows tucked in toward
+        the base and the two arms mirror images of each other. The box moves
+        there on a straight line while the arms' posture and elbows blend
+        into the planned pose (:meth:`_stow_posture`,
+        :meth:`_stow_elbows`), then the pose is held until the arms settle
+        (:meth:`_advance_stow`). The core then freezes the pair for driving.
+        """
+        cfg = self._config
+        t_plan = time.perf_counter()
+        goal_center, q_goal = self._plan_stow(box, q)
+        goal_rot = np.eye(3, dtype=np.float32)
+        q = np.asarray(q, dtype=np.float32)
+        speed = max(float(cfg.box_stow_speed), 1e-3)
+        distance = float(np.linalg.norm(goal_center - np.asarray(center, np.float32)))
+        turn = rotation_angle(np.asarray(rot, np.float32), goal_rot)
+        joints = 0.0 if q_goal is None else float(np.max(np.abs(q_goal - q)))
+        duration = max(
+            distance / speed,
+            turn / _STOW_TURN_RAD_S,
+            joints / _STOW_JOINT_RAD_S,
+            _STOW_MIN_S,
+        )
+        el0 = self._solver.elbow_positions(q)
+        el1 = el0 if q_goal is None else self._solver.elbow_positions(q_goal)
+        _logger.info(
+            "Box stow: planned in %.1f s (box %.0f mm wide, %.0f mm ahead of "
+            "the shoulders, elbows %+.0f mm outboard); moving it in (%.1f s)",
+            time.perf_counter() - t_plan,
+            box.width * 1000.0,
+            (float(goal_center[0]) - float(self._shoulder_mid()[0])) * 1000.0,
+            (self._stow_elbow_out(q_goal) if q_goal is not None else float("nan"))
+            * 1000.0,
+            duration,
+        )
+        return _Stow(
+            start=(
+                np.asarray(center, np.float32).copy(),
+                np.asarray(rot, np.float32).copy(),
+            ),
+            goal=(goal_center, goal_rot),
+            q_start=q.copy(),
+            q_goal=q_goal,
+            elbows_start={"left": np.asarray(el0[0]), "right": np.asarray(el0[1])},
+            elbows_goal={"left": np.asarray(el1[0]), "right": np.asarray(el1[1])},
+            # The plan blocked this solve for a while: the move starts now.
+            t0=now + (time.perf_counter() - t_plan),
+            duration=duration,
+        )
+
+    def _plan_stow(
+        self, box: BoxState, q: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """The stowed box centre and joints: ``(center, q)``.
+
+        Tries box centres ``box_stow_reach`` in front of the shoulders and
+        then further out (see ``_STOW_PLAN_*``), and returns the first the
+        arms reach with the grippers in their slots; failing every one, the
+        closest miss. Each candidate is solved for the left arm from the
+        rest pose (warm-started from the previous candidate), with its elbow
+        swung ``_STOW_ELBOW_DEG`` toward the base, and mirrored onto the
+        right arm. The solver's posture, step history and collision-guard
+        state are restored afterwards.
+        """
+        cfg = self._config
+        solver = self._solver
+        mid = self._shoulder_mid()
+        rot = np.eye(3, dtype=np.float32)
+        if getattr(self, "_mink_backend", False):
+            # Mink has no elbow model to plan with: the box goes straight
+            # in, the arms following it as they would a led box.
+            center = np.array(
+                (
+                    float(mid[0]) + float(cfg.box_stow_reach),
+                    mid[1],
+                    mid[2] - float(cfg.box_stow_height),
+                ),
+                dtype=np.float32,
+            )
+            return center, None
+        grip_rel, feet = box.grip_rel(), box.feet()
+        saved = (
+            getattr(solver, "_posture_pose", None),
+            getattr(solver, "_q_prev", None),
+            getattr(solver, "_base_collision_guard_active", None),
+        )
+        best: tuple[tuple[bool, bool, float], float, np.ndarray, np.ndarray] | None = (
+            None
+        )
+        seed = self.get_rest_q()
+        x0 = float(mid[0]) + float(cfg.box_stow_reach)
+        n = int(round(_STOW_PLAN_SPAN_M / _STOW_PLAN_STEP_M)) + 1
+        try:
+            for k in range(n):
+                center = np.array(
+                    (
+                        x0 + k * _STOW_PLAN_STEP_M,
+                        mid[1],
+                        mid[2] - float(cfg.box_stow_height),
+                    ),
+                    dtype=np.float32,
+                )
+                targets = ideal_gripper_poses(center, rot, box.width, grip_rel, feet)
+                seed, miss = self._solve_stow_arms(seed, targets)
+                out = self._stow_elbow_out(seed)
+                reached = miss <= _STOW_PLAN_POS_TOL_M
+                tucked = out <= _STOW_ELBOW_OUT_MAX_M
+                key = (not reached, not tucked, miss + max(out, 0.0))
+                if best is None or key < best[0]:
+                    best = (key, miss, center, seed.copy())
+                if reached and tucked:
+                    break
+        finally:
+            for name, value in zip(
+                ("_posture_pose", "_q_prev", "_base_collision_guard_active"), saved
+            ):
+                if value is not None:
+                    setattr(solver, name, value)
+        assert best is not None
+        _key, miss, center, q_goal = best
+        if miss > _STOW_PLAN_POS_TOL_M:
+            _logger.warning(
+                "Box stow: the arms can't reach the stowed box exactly "
+                "(grippers %.0f mm off); stowing as close as they get",
+                miss * 1000.0,
+            )
+        return center, q_goal
+
+    def _step_arm_stow(self, q_current: np.ndarray) -> np.ndarray:
+        """One solve of plain teleop's stow (**A** with the parcel gripper).
+
+        Started on the first frame the core asks for it (``frame.arm_stow``),
+        from the arms' joints then, whatever each arm was doing (tracking,
+        frozen or at rest). The two grippers move in as a rigid pair: each
+        keeps its pose in the pair frame (:func:`_pair_frame`) at the press,
+        so a box squeezed between them stays squeezed by the same amount
+        (each arm's command runs the same distance into it, so each presses
+        with the same force), and the pair ends level along the lateral
+        line, facing forward, in front of the chest with the elbows tucked
+        (:meth:`_plan_arm_stow`). The move lasts as the box-mode stow's
+        does and the pose is then held until the arms are still. The hands
+        are ignored throughout. The core freezes both arms once the status
+        reports ``"done"`` and stops asking; the next frame ends it
+        (:meth:`_end_arm_stow`).
+        """
+        now = time.perf_counter()
+        stow = self._arm_stow
+        if stow is None:
+            stow = self._arm_stow = self._start_arm_stow(q_current, now)
+        if stow.phase == "move":
+            u = (now - stow.t0) / stow.duration
+            stow.alpha = smoothstep(min(max(u, 0.0), 1.0))
+            if u >= 1.0:
+                stow.phase = "hold"
+                stow.hold_t0 = now
+            frame_pose = blend_pose(stow.start, stow.goal, stow.alpha)
+        else:
+            frame_pose = stow.goal
+        targets = _pair_targets(frame_pose, stow.rel)
+        a = stow.alpha if stow.phase == "move" else 1.0
+        elbows = None
+        if stow.q_goal is not None:
+            self._solver.set_posture_pose(
+                ((1.0 - a) * stow.q_start + a * stow.q_goal).astype(np.float32)
+            )
+            elbows = {
+                side: (
+                    (1.0 - a) * stow.elbows_start[side] + a * stow.elbows_goal[side]
+                ).astype(np.float32)
+                for side in ("left", "right")
+            }
+        delta_scale = 1.0
+        if self._last_solve_t is not None:
+            delta_scale = float(
+                np.clip(
+                    (now - self._last_solve_t) * self._config.ik_frequency, 1.0, 4.0
+                )
+            )
+        self._last_solve_t = now
+        q_new = np.asarray(
+            self._solver.ik(
+                q_current,
+                left_pose=targets["left"],
+                right_pose=targets["right"],
+                left_elbow_pos=elbows["left"] if elbows else None,
+                right_elbow_pos=elbows["right"] if elbows else None,
+                delta_scale=delta_scale,
+                elbow_weight=(float(self._config.box_elbow_weight) or 10.0)
+                if elbows
+                else None,
+                pose_weight_scale=_BOX_POSE_WEIGHT_SCALE,
+            ),
+            dtype=np.float32,
+        ).copy()
+        if stow.phase == "hold":
+            held = now - stow.hold_t0
+            still = (
+                float(np.max(np.abs(q_new - np.asarray(q_current)))) < _STOW_STILL_RAD
+            )
+            if held >= _STOW_HOLD_MAX_S or (held >= _STOW_HOLD_MIN_S and still):
+                if stow.phase != "done":
+                    _logger.info("Arm stow: done")
+                stow.phase = "done"
+        return q_new
+
+    def _start_arm_stow(self, q: np.ndarray, now: float) -> _ArmStow:
+        """Plan plain teleop's stow from the arms' joints ``q``."""
+        t_plan = time.perf_counter()
+        q = np.asarray(q, dtype=np.float32)
+        left, right = self._solver.fk(q)
+        start = _pair_frame(left, right)
+        center0, rot0 = start
+        rel = {
+            side: (
+                (rot0.T @ (np.asarray(pose[0], np.float64) - center0)).astype(
+                    np.float32
+                ),
+                (rot0.T @ np.asarray(pose[1], np.float64)).astype(np.float32),
+            )
+            for side, pose in (("left", left), ("right", right))
+        }
+        # Level and facing forward; arms crossed over keep their lateral
+        # line's sense (a half turn), rather than swapping sides.
+        goal_rot = np.eye(3, dtype=np.float32)
+        if float(rot0[1, 1]) < 0.0:
+            goal_rot = np.diag((-1.0, -1.0, 1.0)).astype(np.float32)
+        goal_center, q_goal = self._plan_arm_stow(rel, goal_rot, q, float(center0[2]))
+        speed = max(float(self._config.box_stow_speed), 1e-3)
+        distance = float(np.linalg.norm(goal_center - center0))
+        turn = rotation_angle(rot0.astype(np.float32), goal_rot)
+        joints = 0.0 if q_goal is None else float(np.max(np.abs(q_goal - q)))
+        duration = max(
+            distance / speed,
+            turn / _STOW_TURN_RAD_S,
+            joints / _STOW_JOINT_RAD_S,
+            _STOW_MIN_S,
+        )
+        el0 = self._solver.elbow_positions(q)
+        el1 = el0 if q_goal is None else self._solver.elbow_positions(q_goal)
+        sep = float(np.linalg.norm(rel["left"][0] - rel["right"][0]))
+        _logger.info(
+            "Arm stow: planned in %.1f s (grippers %.0f mm apart, %.0f mm ahead "
+            "of the shoulders, elbows %+.0f mm outboard); moving in (%.1f s)",
+            time.perf_counter() - t_plan,
+            sep * 1000.0,
+            (float(goal_center[0]) - float(self._shoulder_mid()[0])) * 1000.0,
+            (self._arm_stow_elbow_out(q_goal) if q_goal is not None else float("nan"))
+            * 1000.0,
+            duration,
+        )
+        return _ArmStow(
+            start=(center0.astype(np.float32), rot0.astype(np.float32)),
+            goal=(goal_center, goal_rot),
+            rel=rel,
+            q_start=q.copy(),
+            q_goal=q_goal,
+            elbows_start={"left": np.asarray(el0[0]), "right": np.asarray(el0[1])},
+            elbows_goal={"left": np.asarray(el1[0]), "right": np.asarray(el1[1])},
+            # The plan blocked this solve for a while: the move starts now.
+            t0=now + (time.perf_counter() - t_plan),
+            duration=duration,
+        )
+
+    def _plan_arm_stow(
+        self,
+        rel: dict[str, tuple[np.ndarray, np.ndarray]],
+        rot: np.ndarray,
+        q: np.ndarray,
+        start_z: float,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """The stowed pair midpoint and joints for plain teleop's stow.
+
+        As :meth:`_plan_stow`, for the grippers' own pair: midpoints from
+        ``_ARM_STOW_REACH_M`` in front of the shoulders outward, at
+        ``box_stow_height`` below them, and the first both arms reach
+        (within ``_ARM_STOW_POS_TOL_M``) with their elbows tucked
+        (``_STOW_ELBOW_OUT_MAX_M``). A grasp the arms can't lift that high
+        (the elbow folds into the shoulder first) is tried
+        ``_ARM_STOW_DROP_M`` lower at a time, down to the height the pair is
+        at (``start_z``). Each row stops once ``_ARM_STOW_PLAN_PATIENCE``
+        candidates in a row do no better, and the first row with a reached
+        candidate is the last. Failing all, the best of them (in reach
+        first: the squeeze matters more than the elbows). The grippers
+        needn't be mirror images, so each arm is solved with its own elbow
+        hint (:meth:`_solve_arm_stow`).
+        """
+        cfg = self._config
+        solver = self._solver
+        mid = self._shoulder_mid()
+        top = float(mid[2]) - float(cfg.box_stow_height)
+        if getattr(self, "_mink_backend", False):
+            center = np.array(
+                (float(mid[0]) + _ARM_STOW_REACH_M, mid[1], top), dtype=np.float32
+            )
+            return center, None
+        heights = [top]
+        while heights[-1] - _ARM_STOW_DROP_M > start_z:
+            heights.append(heights[-1] - _ARM_STOW_DROP_M)
+        if start_z < heights[-1] - 1e-3:
+            heights.append(start_z)
+        saved = (
+            getattr(solver, "_posture_pose", None),
+            getattr(solver, "_q_prev", None),
+            getattr(solver, "_base_collision_guard_active", None),
+        )
+        best: tuple[tuple[bool, bool, float], float, np.ndarray, np.ndarray] | None = (
+            None
+        )
+        x0 = float(mid[0]) + _ARM_STOW_REACH_M
+        n = int(round(_ARM_STOW_SPAN_M / _STOW_PLAN_STEP_M)) + 1
+        try:
+            for height in heights:
+                seed = np.asarray(q, dtype=np.float32).copy()
+                row_best: tuple[bool, bool, float] | None = None
+                stale = 0
+                done = False
+                for k in range(n):
+                    center = np.array(
+                        (x0 + k * _STOW_PLAN_STEP_M, mid[1], height), dtype=np.float32
+                    )
+                    targets = _pair_targets((center, rot), rel)
+                    seed, miss = self._solve_arm_stow(seed, targets)
+                    out = self._arm_stow_elbow_out(seed)
+                    reached = miss <= _ARM_STOW_POS_TOL_M
+                    tucked = out <= _STOW_ELBOW_OUT_MAX_M
+                    key = (not reached, not tucked, miss + max(out, 0.0))
+                    if best is None or key < best[0]:
+                        best = (key, miss, center, seed.copy())
+                    if row_best is None or key < row_best:
+                        row_best = key
+                        stale = 0
+                    else:
+                        stale += 1
+                    if reached and tucked:
+                        done = True
+                        break
+                    if stale >= _ARM_STOW_PLAN_PATIENCE:
+                        break
+                if done or (best is not None and not best[0][0]):
+                    break
+        finally:
+            for name, value in zip(
+                ("_posture_pose", "_q_prev", "_base_collision_guard_active"), saved
+            ):
+                if value is not None:
+                    setattr(solver, name, value)
+        assert best is not None
+        _key, miss, center, q_goal = best
+        if miss > _ARM_STOW_POS_TOL_M:
+            _logger.warning(
+                "Arm stow: the arms can't reach the stowed pose exactly "
+                "(grippers %.0f mm off); stowing as close as they get",
+                miss * 1000.0,
+            )
+        return center, q_goal
+
+    def _solve_arm_stow(
+        self, seed: np.ndarray, targets: dict[str, Pose]
+    ) -> tuple[np.ndarray, float]:
+        """Solve both arms onto ``targets``, elbows tucked: ``(q, worst miss)``.
+
+        Each arm's elbow is swung ``_STOW_ELBOW_DEG`` about its own
+        shoulder-wrist line, iterated until no joint moves more than
+        ``_STOW_PLAN_SETTLED_RAD`` (see :meth:`_solve_stow_arms`).
+        """
+        solver = self._solver
+        q = np.asarray(seed, dtype=np.float32).copy()
+        angle = math.radians(_STOW_ELBOW_DEG)
+        for k in range(_STOW_PLAN_ITERS):
+            q_prev = q
+            swivel = solver.elbow_swivel(q)
+            hints: dict[str, np.ndarray] = {}
+            for side, sign in (("left", 1.0), ("right", -1.0)):
+                arm = swivel[side]
+                pos, rot = targets[side]
+                wrist = np.asarray(pos, np.float64) + np.asarray(
+                    rot, np.float64
+                ) @ np.asarray(arm.wrist_in_mount, np.float64)
+                hints[side] = elbow_swivel_hint(
+                    arm.shoulder, arm.elbow, wrist, sign, angle
+                ).astype(np.float32)
+            solver.set_posture_pose(q)
+            q = np.asarray(
+                solver.ik(
+                    q,
+                    left_pose=targets["left"],
+                    right_pose=targets["right"],
+                    left_elbow_pos=hints["left"],
+                    right_elbow_pos=hints["right"],
+                    delta_scale=4.0,
+                    elbow_weight=float(self._config.box_elbow_weight) or 10.0,
+                    pose_weight_scale=_BOX_POSE_WEIGHT_SCALE,
+                ),
+                dtype=np.float32,
+            ).copy()
+            settled = float(np.max(np.abs(q - q_prev))) < _STOW_PLAN_SETTLED_RAD
+            if settled and k + 1 >= _STOW_PLAN_MIN_ITERS:
+                break
+        fk = dict(zip(("left", "right"), solver.fk(q)))
+        miss = max(
+            float(np.linalg.norm(np.asarray(fk[s][0]) - np.asarray(targets[s][0])))
+            for s in ("left", "right")
+        )
+        return q, miss
+
+    def _arm_stow_elbow_out(self, q: np.ndarray) -> float:
+        """How far (m) the further-out elbow sits outboard of its shoulder."""
+        swivel = self._solver.elbow_swivel(q)
+        left, right = swivel["left"], swivel["right"]
+        return max(
+            float(left.elbow[1] - left.shoulder[1]),
+            float(right.shoulder[1] - right.elbow[1]),
+        )
+
+    def _end_arm_stow(self, q_current: np.ndarray) -> None:
+        """End plain teleop's stow: both arms hold where they are.
+
+        The core froze both arms (done) or a grip cancelled the stow; either
+        way the next engage snaps that arm afresh from here.
+        """
+        if self._arm_stow is not None and self._arm_stow.phase != "done":
+            _logger.info("Arm stow: cancelled; both arms hold where they are")
+        self._arm_stow = None
+        self._active = {"left": False, "right": False}
+        self._ramp = {}
+        left, right = self._solver.fk(q_current)
+        self._hold_fk = {"left": left, "right": right}
+        self._hold_elbow_fk = {}
+        if self._use_elbow:
+            el = self._solver.elbow_positions(q_current)
+            self._hold_elbow_fk = {"left": el[0], "right": el[1]}
+        self._clear_freeze()
+        self._solver.set_posture_pose(np.asarray(q_current, dtype=np.float32).copy())
+        self._last_solve_t = None
+
+    def _shoulder_mid(self) -> np.ndarray:
+        """The midpoint between the two shoulders (the stow's reference)."""
+        shoulders = self._solver.shoulder_positions
+        return (
+            np.asarray(shoulders["left"], np.float64)
+            + np.asarray(shoulders["right"], np.float64)
+        ) * 0.5
+
+    def _stow_elbow_out(self, q: np.ndarray) -> float:
+        """How far (m) the left elbow sits outboard of its shoulder at ``q``.
+
+        The stow plans mirrored arms, so the left one speaks for both.
+        """
+        arm = self._solver.elbow_swivel(q)["left"]
+        return float(arm.elbow[1] - arm.shoulder[1])
+
+    def _solve_stow_arms(
+        self, seed: np.ndarray, targets: dict[str, Pose]
+    ) -> tuple[np.ndarray, float]:
+        """Solve the stowed pose for ``targets``: ``(q, worst gripper miss)``.
+
+        The left arm is solved with its elbow swung toward the base and the
+        right arm is its mirror image (``q_right = -q_left``). A tool whose
+        mirrored right gripper doesn't land in its own slot (the miss says
+        so) falls back to the closest of the two.
+        """
+        solver = self._solver
+        li, ri = solver.left_indices, solver.right_indices
+        q = np.asarray(seed, dtype=np.float32).copy()
+        angle = math.radians(_STOW_ELBOW_DEG)
+        pos, rot = targets["left"]
+        for k in range(_STOW_PLAN_ITERS):
+            q_prev = q
+            arm = solver.elbow_swivel(q)["left"]
+            wrist = np.asarray(pos, np.float64) + np.asarray(
+                rot, np.float64
+            ) @ np.asarray(arm.wrist_in_mount, np.float64)
+            hint = elbow_swivel_hint(arm.shoulder, arm.elbow, wrist, 1.0, angle)
+            solver.set_posture_pose(q)
+            # Both arms, the right against the mirrored hint: the solver's
+            # two-arm graph is the one already compiled (its warm-up), so the
+            # first stow doesn't stall on a compile.
+            q = np.asarray(
+                solver.ik(
+                    q,
+                    left_pose=targets["left"],
+                    right_pose=targets["right"],
+                    left_elbow_pos=hint,
+                    right_elbow_pos=(hint * np.array((1.0, -1.0, 1.0))).astype(
+                        np.float32
+                    ),
+                    delta_scale=4.0,
+                    elbow_weight=float(self._config.box_elbow_weight) or 10.0,
+                    pose_weight_scale=_BOX_POSE_WEIGHT_SCALE,
+                ),
+                dtype=np.float32,
+            ).copy()
+            q[ri] = -q[li]
+            settled = float(np.max(np.abs(q[li] - q_prev[li]))) < _STOW_PLAN_SETTLED_RAD
+            if settled and k + 1 >= _STOW_PLAN_MIN_ITERS:
+                break
+        fk = dict(zip(("left", "right"), solver.fk(q)))
+        miss = max(
+            float(np.linalg.norm(np.asarray(fk[s][0]) - np.asarray(targets[s][0])))
+            for s in ("left", "right")
+        )
+        return q, miss
+
+    def _stow_pose(self, stow: _Stow, now: float) -> tuple[np.ndarray, np.ndarray]:
+        """The box pose the stow commands this frame (see :meth:`_start_stow`)."""
+        if stow.phase == "move":
+            u = (now - stow.t0) / stow.duration
+            stow.alpha = smoothstep(min(max(u, 0.0), 1.0))
+            if u >= 1.0:
+                stow.phase = "hold"
+                stow.hold_t0 = now
+            return blend_pose(stow.start, stow.goal, stow.alpha)
+        return stow.goal
+
+    def _stow_posture(self, stow: _Stow | None, q_current: np.ndarray) -> np.ndarray:
+        """The posture the solve is pulled toward (``q_current`` outside a stow)."""
+        if stow is None or stow.q_goal is None:
+            return q_current
+        a = stow.alpha if stow.phase == "move" else 1.0
+        return ((1.0 - a) * stow.q_start + a * stow.q_goal).astype(np.float32)
+
+    def _stow_elbows(self, stow: _Stow) -> dict[str, np.ndarray] | None:
+        """Elbow hints during a stow: blending into the planned pose's elbows."""
+        if self._config.box_elbow_weight <= 0.0 or stow.q_goal is None:
+            return None
+        a = stow.alpha if stow.phase == "move" else 1.0
+        return {
+            side: (
+                (1.0 - a) * stow.elbows_start[side] + a * stow.elbows_goal[side]
+            ).astype(np.float32)
+            for side in ("left", "right")
+        }
+
+    def _settle_stow(
+        self,
+        stow: _Stow,
+        q_new: np.ndarray,
+        q_current: np.ndarray,
+        delta_scale: float,
+    ) -> None:
+        """Once the box is in place, step the arms onto the planned pose.
+
+        The live solve settles near the plan but not on it: the arm/base
+        clearance cost nudges the elbows a centimetre or two outboard of
+        where the plan put them. The plan already holds the grippers in
+        their slots, so for the hold the arms move to it in joint space, at
+        up to ``_STOW_SETTLE_RAD_S``, in place of the solve. Not after a
+        stall (no plan to settle onto). It keeps holding the plan once the
+        stow is done, until the core (which reads the phase off the status a
+        few times a second) freezes the pair.
+        """
+        if stow.phase not in ("hold", "done") or stow.q_goal is None:
+            return
+        step = _STOW_SETTLE_RAD_S * delta_scale / float(self._config.ik_frequency)
+        cur = np.asarray(q_current, dtype=np.float32)
+        for idx in (self._solver.left_indices, self._solver.right_indices):
+            q_new[idx] = cur[idx] + np.clip(stow.q_goal[idx] - cur[idx], -step, step)
+
+    def _advance_stow(
+        self,
+        stow: _Stow,
+        q_new: np.ndarray,
+        q_current: np.ndarray,
+        targets: dict[str, Pose],
+        now: float,
+    ) -> None:
+        """Watch for a stall during the move; finish once the arms settle."""
+        if stow.phase == "move":
+            q_meas = self._measured_q(q_current)
+            if q_meas is None:
+                return
+            start = np.asarray(stow.start[0], np.float64)
+            path = np.asarray(stow.goal[0], np.float64) - start
+            length = float(np.linalg.norm(path))
+            if length < _STOW_STALL_MIN_MOVE_M:
+                return
+            along = path / length
+            (ml, _), (mr, _) = self._solver.fk(q_meas)
+            (cl, _), (cr, _) = self._solver.fk(q_new)
+            meas = 0.5 * (np.asarray(ml, np.float64) + np.asarray(mr, np.float64))
+            cmd = 0.5 * (np.asarray(cl, np.float64) + np.asarray(cr, np.float64))
+            progress = float(np.dot(meas - start, along))
+            trail = float(np.dot(cmd - start, along)) - progress
+            if stow.stall_base is None:
+                stow.stall_base = trail
+                stow.stall_p0 = progress
+            trace = stow.stall_trace
+            trace.append((now, progress))
+            while len(trace) > 2 and now - trace[1][0] >= _STOW_STALL_WINDOW_S:
+                trace.pop(0)
+            still = (
+                now - trace[0][0] >= _STOW_STALL_WINDOW_S
+                and progress - trace[0][1] < _STOW_STALL_STILL_M
+            )
+            if trail - stow.stall_base > _STOW_STALL_M and still:
+                # Pressed against something: stop short of it and hold.
+                _, rot = blend_pose(stow.start, stow.goal, stow.alpha)
+                moved = progress - stow.stall_p0
+                stop = max(moved - _STOW_BACKOFF_M, 0.0)
+                center = (start + stop * along).astype(np.float32)
+                stow.goal = (center, rot)
+                stow.q_goal = None
+                stow.phase = "hold"
+                stow.hold_t0 = now
+                _logger.info(
+                    "Box stow: pressed against something %.0f mm into the "
+                    "%.0f mm move; holding there",
+                    moved * 1000.0,
+                    length * 1000.0,
+                )
+            return
+        if stow.phase == "hold":
+            held = now - stow.hold_t0
+            still = (
+                float(np.max(np.abs(q_new - np.asarray(q_current)))) < _STOW_STILL_RAD
+            )
+            arrived = stow.q_goal is None or (
+                float(np.max(np.abs(q_new - stow.q_goal))) < _STOW_ARRIVED_RAD
+            )
+            if held >= _STOW_HOLD_MAX_S or (
+                held >= _STOW_HOLD_MIN_S and still and arrived
+            ):
+                stow.phase = "done"
+                if arrived:
+                    _logger.info("Box stow: done")
+                else:
+                    _logger.warning(
+                        "Box stow: done, but the arms stopped short of the "
+                        "planned pose (%.2f rad off)",
+                        float(np.max(np.abs(q_new - stow.q_goal))),
+                    )
+
+    def _measured_q(self, q_current: np.ndarray) -> np.ndarray | None:
+        """The arms' measured joints as a full ``q`` (``None`` if not reported)."""
+        meas = self._measured
+        if meas is None or time.perf_counter() - self._measured_t > _LEAN_RESET_S:
+            return None
+        pos_l, pos_r = meas[0], meas[1]
+        q_meas = np.asarray(q_current, dtype=np.float32).copy()
+        for i, gi in enumerate(self.left_indices):
+            q_meas[gi] = pos_l[i]
+        for i, gi in enumerate(self.right_indices):
+            q_meas[gi] = pos_r[i]
+        return q_meas if np.all(np.isfinite(q_meas)) else None
 
     def _box_elbow_hints(
         self, q_current: np.ndarray, targets: dict[str, Pose]
@@ -1972,61 +3092,19 @@ class IKWorker:
             )
         return hints
 
-    def _stick_click_toggle(self, frame: VRFrame, box: BoxState) -> bool:
-        """Flip ``config.box_grasp`` on a single stick click; True if it flipped.
-
-        A click *and release* of either thumbstick while a grip leads toggles
-        between the ``"flush"`` and ``"straight"`` grasps. It fires on the
-        release, not the press, so that the both-sticks gesture (which the
-        headset turns into a box-mode toggle) can't also switch the grasp on
-        its way through: a press is *armed* only if the other stick is up,
-        and disarmed the moment both are down. A stick already held when
-        the pair snapped isn't armed either (``click_prev`` is seeded at the
-        snap).
-        """
-        now_l, now_r = bool(frame.l_stick_click), bool(frame.r_stick_click)
-        prev_l, prev_r = box.click_prev
-        box.click_prev = (now_l, now_r)
-        if now_l and now_r:
-            box.click_armed = False
-            return False
-        if (now_l and not prev_l) or (now_r and not prev_r):
-            # Rising edge with the other stick up: candidate toggle.
-            box.click_armed = True
-            return False
-        released = (prev_l and not now_l) or (prev_r and not now_r)
-        if released and box.click_armed and not (now_l or now_r):
-            box.click_armed = False
-            new = "straight" if self._box_grasp() == "flush" else "flush"
-            self._config.box_grasp = new
-            _logger.info("Box grasp: %s (stick click)", new)
-            return True
-        return False
-
     def _integrate_sticks(self, frame: VRFrame, box: BoxState, now: float) -> None:
-        """Accumulate this frame's thumbstick input into ``box`` / the config.
+        """Accumulate this frame's thumbstick input into the grip width.
 
-        Box mode's sticks do two things, and both sticks do the same, so it
-        doesn't matter which hand leads: left/right sets the **width**
-        between the grippers (push right = wider, clamped to
-        ``box_width_min``..``box_width_max`` — the floor raised, if need
-        be, to where the grippers' bodies would meet in this grasp,
-        :meth:`_box_width_min`), and forward/back sets how far
-        out the **elbows** are held (push forward = further apart, back =
-        tucked in): it jogs ``config.box_elbow_out`` at ``box_elbow_speed``
-        within 0..90° from straight down, the angle the IK's elbow hint
-        (:meth:`_box_elbow_hints`) steers each arm's free swivel to. The
-        grippers' yaw is the grasp's (``straight`` 0°, ``flush`` the tool's
-        flush tilt) plus the fixed ``config.box_grip_tilt`` trim, not a
-        live control. Only a stick's dominant axis counts, so a thumb
-        pushing "left" with a little forward in it still changes only the
-        width (see :func:`_dominant_axis`); with both sticks deflected their
-        inputs add, capped at full deflection. Stick clicks are not
-        modifiers (a single click toggles the grasp,
-        :meth:`_stick_click_toggle`); the pair's position is the leader
-        hand's job, not the sticks'. The elbow angle lives in the config so
-        it outlasts the pair (the next engage keeps it) and reaches the
-        core / settings panel through :meth:`pair_status`.
+        Box mode takes one stick axis, the one Jelly leaves free: the
+        right stick's forward/back sets the **width** between the grippers
+        (push forward = wider, pull back = narrower, at
+        ``box_width_speed``), clamped to ``box_width_min``..``box_width_max``
+        — the floor raised, if need be, to where the grippers' bodies would
+        meet in this grasp (:meth:`_box_width_min`). Everything else on the
+        sticks — the left stick, the right stick's left/right, the stick
+        clicks — drives Jelly's wheels and lift exactly as outside box
+        mode, so the base moves while a grip leads the pair. The pair's
+        position and rotation are the leader hand's job, not the sticks'.
         """
         cfg = self._config
         dt = (
@@ -2037,30 +3115,18 @@ class IKWorker:
         box.stick_t = now
         if dt <= 0.0:
             return
-
-        lx, ly = _dominant_axis(frame.l_stick_x, frame.l_stick_y)
-        rx, ry = _dominant_axis(frame.r_stick_x, frame.r_stick_y)
-        if not (lx or rx or ly or ry):
-            return
-
-        x = float(np.clip(lx + rx, -1.0, 1.0))
-        width_rate = x * cfg.box_width_speed  # push right = wider
+        # The raw stick axis reads negative pushed forward (WebXR gamepad
+        # convention, as Jelly's drive reads it too): forward = wider.
+        # Only while forward/back outweighs left/right: a sideways push
+        # turns Jelly, and must not change the width (right_stick_axis).
+        _, stick_y = right_stick_axis(frame.r_stick_x, frame.r_stick_y)
+        width_rate = -_dz(stick_y) * cfg.box_width_speed
         if width_rate:
             box.width = float(
                 np.clip(
                     box.width + dt * width_rate,
                     self._box_width_min(),
                     cfg.box_width_max,
-                )
-            )
-        # The raw stick axis reads negative pushed forward (WebXR gamepad
-        # convention, as Jelly's drive reads it too): forward = elbows out.
-        y = -float(np.clip(ly + ry, -1.0, 1.0))
-        elbow_rate = y * cfg.box_elbow_speed
-        if elbow_rate:
-            cfg.box_elbow_out = float(
-                np.clip(
-                    cfg.box_elbow_out + dt * elbow_rate, _ELBOW_OUT_MIN, _ELBOW_OUT_MAX
                 )
             )
 
@@ -2610,6 +3676,7 @@ class IKWorker:
         """
         self._snap_ctrl[side] = (ctrl_pos, ctrl_rot)
         self._snap_fk[side] = ee_pose
+        getattr(self, "_deck_plane", {}).pop(side, None)
         self._snap_elbow_ctrl[side] = ctrl_e
         if elbow_pos is not None:
             self._snap_elbow_fk[side] = elbow_pos
@@ -2708,14 +3775,22 @@ def run_ik_worker(
 
     Message protocol (after the ``("ready", …)`` handshake):
 
-    - ``VRFrame``                      → ``(q, status)`` (one solve step;
-      ``status`` is :meth:`IKWorker.pair_status` every
-      ``_STATUS_EVERY_N`` frames, else ``None``)
+    - ``VRFrame``                      → ``(q, status, near)`` (one solve
+      step; ``status`` is :meth:`IKWorker.pair_status` every
+      ``_STATUS_EVERY_N`` frames, else ``None``; ``near`` is
+      :meth:`IKWorker.collision_proximity` every ``_PROXIMITY_EVERY_N``
+      frames while an arm is engaged, else ``None``)
     - ``("set", key, value)``          → *(no reply)* — live update of one
       :class:`VRTeleopConfig` field on this process's copy of the config
       (``VRTeleopCore.set_live``).
     - ``("meas", left, right, kp_l, kp_r)`` → (no reply; see IKWorker.note_measured)
-    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("clear",)``                   → ``("cleared", q, moved)`` — one
+      :meth:`IKWorker.clear_lift` step on the worker's joint vector while
+      the arms aren't tracking and no frames arrive (the lift lowered from
+      the control panel); ``moved`` is whether it changed.
+    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``;
+      ``q_rest`` is :meth:`IKWorker.rest_goal` (the rest pose, clear of
+      Jelly's deck at the live lift height)
     - ``("reset", q_current, goal)``   → ``("reset_traj", goal, traj)`` —
       an explicit joint target for the second (zero) leg of a guarded park.
     - ``("reset_path", q_current, goals)`` → ``("reset_traj", last, traj)`` —
@@ -2745,6 +3820,16 @@ def run_ik_worker(
     # emits a several-page traceback while racing the parent's ownership
     # checks. SIGTERM/SIGKILL retain their defaults for the bounded fallback.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    # A spawned child starts with no logging set up, so only warnings would
+    # reach stderr (the parent's log), bare. Route this module's info lines
+    # (box stow plans and stops) there too, in the parent's format.
+    if not logging.getLogger().handlers and not _logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        _logger.addHandler(handler)
+        _logger.setLevel(logging.INFO)
+        _logger.propagate = False
 
     configure_ik_process(getattr(kinematics_config, "backend", "jax"))
 
@@ -2810,6 +3895,13 @@ def run_ik_worker(
                 worker.set_config(str(msg[1]), msg[2])
             elif isinstance(msg, tuple) and msg[0] == "lift":
                 worker.set_lift(float(msg[1]))
+            elif isinstance(msg, tuple) and msg[0] == "grip":
+                worker.set_gripper(float(msg[1]), float(msg[2]))
+            elif isinstance(msg, tuple) and msg[0] == "clear":
+                q_clear = worker.clear_lift(q)
+                moved = not np.array_equal(q_clear, q)
+                q = np.asarray(q_clear, dtype=np.float32).copy()
+                conn.send(("cleared", q.copy(), moved))
             elif isinstance(msg, tuple) and msg[0] == "meas":
                 worker.note_measured(msg[1], msg[2], msg[3], msg[4])
             elif isinstance(msg, tuple) and msg[0] == "reset":
@@ -2822,7 +3914,7 @@ def run_ik_worker(
                     q_target = (
                         np.asarray(msg[2], dtype=np.float32)
                         if len(msg) == 3
-                        else q_rest
+                        else worker.rest_goal()
                     )
                     if (
                         q_current.shape != q_rest.shape
@@ -2906,12 +3998,19 @@ def run_ik_worker(
                 else:
                     # Relative-mode replies pair the joint solution with the
                     # gripper-pair status (box-mode "aligned" cue), refreshed
-                    # every _STATUS_EVERY_N frames and None in between.
+                    # every _STATUS_EVERY_N frames and None in between, and
+                    # the collision proximity the headset's haptics play.
                     frames += 1
                     status = (
                         worker.pair_status(q) if frames % _STATUS_EVERY_N == 0 else None
                     )
-                    conn.send((q.copy(), status))
+                    near = (
+                        worker.collision_proximity(q)
+                        if (msg.l_lock or msg.r_lock)
+                        and frames % _PROXIMITY_EVERY_N == 0
+                        else None
+                    )
+                    conn.send((q.copy(), status, near))
         except (EOFError, KeyboardInterrupt, OSError):
             # OSError covers ConnectionResetError/BrokenPipeError when the
             # parent end closes abruptly (parent crash, or a shutdown that

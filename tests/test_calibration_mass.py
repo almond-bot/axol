@@ -169,3 +169,26 @@ class MergeCloudDocumentTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParcelWristMassTest(unittest.TestCase):
+    """The parcel gripper's wrist_3 defaults to its own mass."""
+
+    def test_parcel_gripper_defaults_to_its_own_mass(self) -> None:
+        from almond_axol.robot.config import PARCEL_WRIST_3_MASS, AxolConfig
+
+        cfg = AxolConfig(gripper="parcel")
+        self.assertEqual(PARCEL_WRIST_3_MASS, 0.6)
+        self.assertEqual(cfg.left.wrist_3.mass, 0.6)
+        self.assertEqual(cfg.right.wrist_3.mass, 0.6)
+        self.assertEqual(cfg.resolved().left.wrist_3.mass, 0.6)
+        self.assertEqual(AxolConfig().left.wrist_3.mass, 0.75)
+
+    def test_a_set_mass_is_kept(self) -> None:
+        from almond_axol.robot.config import AxolConfig
+
+        left = AxolConfig().left
+        left.wrist_3.mass = 0.9
+        cfg = AxolConfig(gripper="parcel", left=left)
+        self.assertEqual(cfg.left.wrist_3.mass, 0.9)
+        self.assertEqual(cfg.right.wrist_3.mass, 0.6)

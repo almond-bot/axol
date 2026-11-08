@@ -146,8 +146,8 @@ async def run_grippers_only(
         )
 
         print(
-            "Calibrating the grippers against their open stops (both jaws move "
-            "fully open — keep hands and objects clear) ..."
+            "Calibrating the grippers. Each jaw closes, then opens fully. Keep "
+            "hands and objects clear of the jaws ..."
         )
         progress.step("grippers")
         await robot.enable_grippers()

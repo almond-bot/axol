@@ -52,7 +52,7 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from PyPI, pinned to 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `tracker` | Lighthouse/Ultimate bridge dependencies | `tracker.bridge`, Mantis tracking |
+| `tracker` | Lighthouse bridge dependencies | `tracker.bridge`, Mantis tracking |
 
 ```bash
 uv sync --extra lerobot --extra sim --extra tracker   # hosted feature set
@@ -137,7 +137,7 @@ Each operation can be driven from the web control panel or the CLI:
 ### Mantis
 
 - [Mantis Hardware](https://docs.almond.bot/mantis/hardware) — handheld rigs for collecting demonstrations without moving the robot
-- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest, Lighthouse, or Ultimate tracking as the pose source
+- [Mantis Tracking](https://docs.almond.bot/mantis/tracking) — set up Quest or Lighthouse tracking as the pose source
 
 ### Remote Teleop
 
@@ -157,7 +157,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `jog`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -169,6 +169,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`lift.update`](https://docs.almond.bot/cli/lift-update)
 - [`safety.status` / `safety.stop` / `safety.start`](https://docs.almond.bot/cli/safety) — software E-Stop on a Jelly with a safety board
 - [`safety.update`](https://docs.almond.bot/cli/safety-update) — update the safety board's firmware over CAN
+- [`mantis.update`](https://docs.almond.bot/cli/mantis-update) — Mantis rig firmware over CAN
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)
@@ -198,7 +199,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
 - [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
-- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station / Ultimate checks
+- [`tracker.*`](https://docs.almond.bot/cli/tracker) — Mantis tracker setup: bridge, identify, pair, install, and base-station checks
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.breakaway`](https://docs.almond.bot/cli/tune-breakaway)
@@ -214,6 +215,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
 - [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
 - [`waypoints`](https://docs.almond.bot/cli/waypoints)
+- [`jog`](https://docs.almond.bot/cli/jog)
 
 ### Python API
 

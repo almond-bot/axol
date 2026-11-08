@@ -2202,5 +2202,126 @@ class RenameInterfacesTest(unittest.TestCase):
         write_rules.assert_not_called()
 
 
+class _FakeDamiaoBus:
+    """A CAN bus with Damiao motors that answer 0x33 register reads.
+
+    ``motors`` maps each ESC_ID to its MST_ID. ``set_can_id`` writes go
+    through the same table, so a re-ID shows up in the next scan.
+    """
+
+    def __init__(self, motors: dict[int, int]) -> None:
+        self.motors = motors
+        self.listeners = []
+        self.sent: list[tuple[int, bytes]] = []
+
+    def __call__(self, _iface: str) -> _FakeDamiaoBus:
+        return self
+
+    async def __aenter__(self) -> _FakeDamiaoBus:
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+    def _add_listener(self, listener) -> None:
+        self.listeners.append(listener)
+
+    async def _send(self, can_id: int, data: bytes) -> bool:
+        self.sent.append((can_id, bytes(data)))
+        if can_id != 0x7FF:
+            return True
+        esc_id = data[0] | (data[1] << 8)
+        if esc_id not in self.motors:
+            return True
+        cmd, rid = data[2], data[3]
+        if cmd == 0x55 and rid == 8:
+            self.motors[int.from_bytes(data[4:8], "little")] = self.motors.pop(esc_id)
+        elif cmd == 0x55 and rid == 7:
+            self.motors[esc_id] = int.from_bytes(data[4:8], "little")
+        elif cmd == 0x33 and rid == 8:
+            reply = bytes(data[:4]) + esc_id.to_bytes(4, "little")
+            message = SimpleNamespace(arbitration_id=self.motors[esc_id], data=reply)
+            for listener in list(self.listeners):
+                listener(message)
+        return True
+
+
+class MantisGripperIdTest(unittest.TestCase):
+    def run_check(self, motors: dict[int, int]) -> tuple[_FakeDamiaoBus, str]:
+        bus = _FakeDamiaoBus(motors)
+        out = io.StringIO()
+        with (
+            patch("almond_axol.motor.CanBus", bus),
+            patch.object(setup, "_DAMIAO_SCAN_WINDOW_S", 0.0),
+            redirect_stdout(out),
+        ):
+            setup._normalize_mantis_gripper_id("left", "can_mantis_l")
+        return bus, out.getvalue()
+
+    def writes(self, bus: _FakeDamiaoBus) -> list[bytes]:
+        return [data for _id, data in bus.sent if data[2] in (0x55, 0xAA)]
+
+    def test_lone_motor_on_7_moves_to_8(self) -> None:
+        bus, out = self.run_check({0x07: 0x17})
+        self.assertEqual(bus.motors, {0x08: 0x18})
+        self.assertIn("now on ID 0x08", out)
+        self.assertEqual(self.writes(bus)[-1][2], 0xAA)  # saved to flash
+
+    def test_factory_motor_on_1_moves_to_8(self) -> None:
+        bus, out = self.run_check({0x01: 0x00})
+        self.assertEqual(bus.motors, {0x08: 0x18})
+        self.assertIn("now on ID 0x08", out)
+
+    def test_motor_on_8_with_wrong_feedback_id_is_fixed(self) -> None:
+        bus, _out = self.run_check({0x08: 0x00})
+        self.assertEqual(bus.motors, {0x08: 0x18})
+
+    def test_correct_motor_is_left_alone(self) -> None:
+        bus, out = self.run_check({0x08: 0x18})
+        self.assertEqual(self.writes(bus), [])
+        self.assertIn("is on ID 0x08", out)
+
+    def test_two_motors_change_nothing(self) -> None:
+        for motors in ({0x01: 0x11, 0x07: 0x17}, {0x07: 0x17, 0x08: 0x18}):
+            with self.subTest(motors=motors):
+                bus, out = self.run_check(dict(motors))
+                self.assertEqual(bus.motors, motors)
+                self.assertEqual(self.writes(bus), [])
+                self.assertIn("2 motors", out)
+
+    def test_other_id_prints_the_fix_command(self) -> None:
+        bus, out = self.run_check({0x03: 0x13})
+        self.assertEqual(bus.motors, {0x03: 0x13})
+        self.assertEqual(self.writes(bus), [])
+        self.assertIn("motor.set-can-id --target mantis --l --current-id 0x03", out)
+
+    def test_no_motor_changes_nothing(self) -> None:
+        bus, out = self.run_check({})
+        self.assertEqual(self.writes(bus), [])
+        self.assertIn("no gripper motor answered", out)
+
+    def test_configure_mantis_checks_ids_before_bring_up(self) -> None:
+        calls = []
+        with (
+            patch.object(setup, "_remove_pre_mantis_config"),
+            patch.object(setup, "_write_udev_rules"),
+            patch.object(setup, "_write_cron_script"),
+            patch.object(setup, "_write_hotplug_unit"),
+            patch.object(setup, "_reload_udev"),
+            patch.object(setup, "_rename_interfaces"),
+            patch.object(setup, "_register_cron"),
+            patch.object(
+                setup,
+                "_normalize_mantis_gripper_ids",
+                side_effect=lambda _p: calls.append("ids"),
+            ),
+            patch.object(
+                setup, "bring_up_can", side_effect=lambda _p: calls.append("up")
+            ),
+        ):
+            setup._configure_mantis("MANTIS")
+        self.assertEqual(calls, ["ids", "up"])
+
+
 if __name__ == "__main__":
     unittest.main()

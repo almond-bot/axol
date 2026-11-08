@@ -78,8 +78,8 @@ LIMITS: dict[Joint, tuple[float, float]] = {
 # placeholder: the real stroke is measured between the two hard stops by
 # ``AxolArm._calibrate_gripper()`` at enable time, and it seeds the
 # pre-calibration gripper range and bounds the calibration sweep. The Mantis
-# (:mod:`almond_axol.robot.mantis`) has no closed stop to sweep to and uses it
-# as the stroke from its calibrated open stop.
+# (:mod:`almond_axol.robot.mantis`) carries the same gripper and measures its
+# stroke the same way.
 GRIPPER_TRAVEL = math.radians(290)
 # Nominal stroke of each ``AxolConfig.gripper`` type (rad). The two are far
 # enough apart that a measured stroke tells them apart: calibration refuses a
@@ -126,23 +126,6 @@ _GRIPPER_BREAKAWAY_THRESHOLDS = (_GRIPPER_TORQUE_THRESHOLD, 1.0, 1.5)
 # Two stops closer together than this are not a gripper stroke (jammed jaw,
 # or a sweep that stalled on an obstruction).
 _GRIPPER_MIN_TRAVEL = math.radians(30)
-# Open-stop-only sweep (calibrate_gripper_open_stop, the Mantis): headroom
-# beyond the nominal travel. Torque only builds once the jaw
-# is against the open stop and the impedance target keeps moving past it, so
-# a gripper that starts at the closed stop needs budget *after* covering
-# GRIPPER_TRAVEL or the sweep ends with the jaws open but no stop detected.
-# Also absorbs unit-to-unit travel variation (~0.035 rad measured). Costs
-# ~60 ms in the no-stop failure case and nothing on success (the loop exits
-# at the torque threshold).
-_GRIPPER_CALIB_OVERTRAVEL = 0.3  # rad
-_GRIPPER_CALIB_MAX_STEPS = math.ceil(
-    (GRIPPER_TRAVEL + _GRIPPER_CALIB_OVERTRAVEL) / _GRIPPER_CALIB_STEP
-)
-# A sweep that moved at least this fraction of GRIPPER_TRAVEL without meeting
-# the torque threshold ran out of jaw, not out of budget: the fingers are not
-# coupled to the motor. Anything shorter stalled against something.
-_GRIPPER_CALIB_FULL_TRAVEL_FRACTION = 0.9
-
 # Impedance gains used only during gripper end-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
@@ -445,66 +428,161 @@ def _load_gripper_calibration(is_left: bool) -> tuple[float, float]:
         ) from exc
 
 
-async def calibrate_gripper_open_stop(motor: Motor) -> float:
-    """Find a gripper's open hard-stop and return its raw motor position (rad).
+async def unload_gripper_target(motor: Motor) -> None:
+    """Re-target the calibration impedance hold at the shaft's actual position.
 
-    Steps the motor incrementally toward open until the torque magnitude
-    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop). The sweep
-    budget is the full expected travel plus ``_GRIPPER_CALIB_OVERTRAVEL`` so a
-    gripper starting at the closed stop still has room to press into the open
-    one. Exhausting that budget without observing the stop fails calibration
-    rather than treating an arbitrary final encoder reading as the open
-    position. Shared by :class:`AxolArm` and the Mantis
-    (:mod:`almond_axol.robot.mantis`), whose grippers are the same Damiao unit.
+    Called before a failed sweep raises, so the motor is not left leaning
+    on whatever it stalled against with the wound-up target.
+    """
+    current = await motor.get_position()
+    await motor.set_impedance(current, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0)
 
-    Must be called with the motor already enabled and in IMPEDANCE mode.
+
+async def seek_gripper_stop(
+    motor: Motor,
+    direction: int,
+    threshold: float = _GRIPPER_TORQUE_THRESHOLD,
+    *,
+    side: str,
+    nominal_stroke: float,
+) -> float:
+    """Step a gripper in ``direction`` (±1) until it stalls on a hard stop.
+
+    Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
+    and reads the motor torque; the stop is reached once the torque
+    pushing *along* the sweep exceeds ``threshold`` (Nm) with
+    the shaft no longer following the target (``_GRIPPER_STALL_READS``
+    reads in a row advancing under ``_GRIPPER_STALL_FRACTION`` of a
+    step) — a torque spike on a jaw still moving is not a stop. The
+    signed test matters for the second sweep of a calibration, which
+    starts pressed against the stop the first one found: that torque
+    points the other way and must not end the sweep early — nor does
+    the hold braking the jaw as it springs off that stop ahead of the
+    target, which reads against the sweep too.
+
+    Shared by :class:`AxolArm` and the Mantis
+    (:mod:`almond_axol.robot.mantis`), whose grippers are the same Damiao
+    unit. ``side`` only labels errors; ``nominal_stroke`` (rad) bounds the
+    sweep at ``_GRIPPER_CALIB_MAX_SWEEP_STROKES`` times it.
+
+    Returns:
+        The measured shaft position at the stop (raw motor rad).
 
     Raises:
-        MotorError: If the full calibration sweep completes without detecting
-            the open hard-stop torque threshold. The message distinguishes a
-            motor that covered the whole travel range unopposed (fingers not
-            coupled to the shaft) from one that stalled short of it
-            (obstruction or slipping coupling).
+        MotorError: If torque builds up *against* the sweep while the
+            shaft lags the target (the motor reports pushing opposite to
+            its commanded motion — an inverted torque sign), or no stop
+            is met within the sweep budget.
     """
-    start = await motor.get_position()
-    target = start
-    stop_found = False
-    last_torque = 0.0
-    for _ in range(_GRIPPER_CALIB_MAX_STEPS):
-        target -= _GRIPPER_CALIB_STEP
+    target = await motor.get_position()
+    pressed_at: float | None = None
+    stalled = 0
+    against = 0
+    max_sweep = _GRIPPER_CALIB_MAX_SWEEP_STROKES * nominal_stroke
+
+    for _ in range(math.ceil(max_sweep / _GRIPPER_CALIB_STEP)):
+        target += direction * _GRIPPER_CALIB_STEP
         await motor.set_impedance(
             target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
         )
         await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
-        last_torque = await motor.get_torque()
-        if abs(last_torque) >= _GRIPPER_TORQUE_THRESHOLD:
-            stop_found = True
-            break
-    final = await motor.get_position()
-    if not stop_found:
-        commanded_travel = _GRIPPER_CALIB_MAX_STEPS * _GRIPPER_CALIB_STEP
-        travelled = start - final
-        if travelled >= _GRIPPER_CALIB_FULL_TRAVEL_FRACTION * GRIPPER_TRAVEL:
-            hint = (
-                "The motor moved through the whole open/close range without "
-                "meeting resistance — check that the fingers are fitted and "
-                "coupled to the motor shaft"
+        torque = await motor.get_torque()
+        along = torque * direction
+        if along >= threshold:
+            against = 0
+            position = await motor.get_position()
+            if pressed_at is not None and (
+                (position - pressed_at) * direction
+                < _GRIPPER_STALL_FRACTION * _GRIPPER_CALIB_STEP
+            ):
+                stalled += 1
+                if stalled >= _GRIPPER_STALL_READS:
+                    return position
+            else:
+                stalled = 0
+            pressed_at = position
+            continue
+        pressed_at = None
+        stalled = 0
+        if along > -_GRIPPER_CALIB_TORQUE_ABORT:
+            against = 0
+            continue
+        lag = (target - await motor.get_position()) * direction
+        if lag < 0.5 * _GRIPPER_CALIB_TORQUE_ABORT / _GRIPPER_CALIB_KP:
+            against = 0
+            continue
+        against += 1
+        if against >= _GRIPPER_STALL_READS:
+            await unload_gripper_target(motor)
+            raise MotorError(
+                f"{side} gripper calibration: torque {torque:+.2f} Nm builds "
+                f"up against the sweep (direction {direction:+d}) — the motor "
+                f"reports pushing opposite to its commanded motion while the "
+                f"shaft lags {math.degrees(lag):.1f}° behind it — its torque "
+                f"sign looks inverted, or the jaw is held back"
             )
-        else:
-            hint = (
-                "The motor stopped short of the full range without reaching "
-                "the torque threshold — check for an obstruction between the "
-                "jaws or a slipping coupling"
-            )
-        raise MotorError(
-            "Gripper open-stop calibration failed: no hard stop was detected "
-            f"during the {commanded_travel:.3f} rad sweep (motor moved "
-            f"{travelled:.3f} rad of the {GRIPPER_TRAVEL:.3f} rad range; last "
-            f"torque {last_torque:.3f} Nm, required "
-            f"{_GRIPPER_TORQUE_THRESHOLD:.3f} Nm). {hint}; the gripper remains "
-            "uncalibrated"
+
+    await unload_gripper_target(motor)
+    raise MotorError(
+        f"{side} gripper calibration: no hard stop met within "
+        f"{math.degrees(max_sweep):.0f}° sweeping in direction "
+        f"{direction:+d} — is the gripper attached and the jaw free to move?"
+    )
+
+
+async def measure_gripper_stops(
+    motor: Motor, close_direction: int, *, side: str, nominal_stroke: float
+) -> tuple[float, float]:
+    """Measure a gripper's open and closed hard stops; leave the jaw open.
+
+    Sweeps the jaw closed first (toward ``close_direction``, ±1) until it
+    stalls on the closed stop, then back the other way until it stalls on
+    the open stop (:func:`seek_gripper_stop`), so the gripper finishes
+    open. A pair closer than ``_GRIPPER_MIN_TRAVEL`` (a jaw stuck on the
+    stop it rests on) is retried at each of ``_GRIPPER_BREAKAWAY_THRESHOLDS``.
+
+    Must be called with the motor already enabled and in IMPEDANCE mode.
+
+    Returns:
+        ``(open_pos, close_pos)`` in raw motor rad.
+
+    Raises:
+        MotorError: If a stop is not found (see :func:`seek_gripper_stop`)
+            or the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``
+            at every threshold.
+    """
+    for threshold in _GRIPPER_BREAKAWAY_THRESHOLDS:
+        close_pos = await seek_gripper_stop(
+            motor, close_direction, threshold, side=side, nominal_stroke=nominal_stroke
         )
-    return final
+        open_pos = await seek_gripper_stop(
+            motor, -close_direction, threshold, side=side, nominal_stroke=nominal_stroke
+        )
+        travel = abs(open_pos - close_pos)
+        if travel >= _GRIPPER_MIN_TRAVEL:
+            break
+        _logger.warning(
+            "%s gripper calibration: stops only %.1f° apart at %.1f Nm — "
+            "the jaw may be stuck on the stop it rests on",
+            side,
+            math.degrees(travel),
+            threshold,
+        )
+    else:
+        raise MotorError(
+            f"{side} gripper calibration: stops only {math.degrees(travel):.1f}° "
+            f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) up to "
+            f"{_GRIPPER_BREAKAWAY_THRESHOLDS[-1]:.1f} Nm — the jaw is jammed or "
+            f"met an obstruction"
+        )
+    _logger.info(
+        "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",
+        side,
+        close_pos,
+        open_pos,
+        math.degrees(travel),
+    )
+    return open_pos, close_pos
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
@@ -983,6 +1061,18 @@ class AxolArm:
         # configured ``JointConfig.torque_limit``: rides every tracked
         # command as its tau_cap field (see set_spring_caps). Empty = none.
         self._spring_caps: dict[Joint, float] = {}
+        # Realtime-core mode: the arm joints of the last command actually
+        # sent (joint frame, after the clip and the spring-cap back-off) and
+        # of the caller's command before the back-off. The core rejects a
+        # target stepping more than max_step_rad from the last one it took,
+        # and holds; a caller that keeps sending its target then never gets
+        # through, and the arm stays frozen. See _settle_sent_step.
+        self._last_sent_arm: np.ndarray | None = None
+        self._last_unbacked_arm: np.ndarray | None = None
+        # How far the back-off held each arm joint short of the caller's
+        # target when the caps were lifted (joint frame, rad), still applied
+        # to the command and worn away as the caller's target moves.
+        self._release_offset: np.ndarray | None = None
         self._kp_vector = np.array(
             [float(getattr(self._arm_config, j.value).kp) for j in ARM_JOINTS],
             dtype=np.float64,
@@ -1314,154 +1404,44 @@ class AxolArm:
     async def _seek_gripper_stop(
         self, direction: int, threshold: float = _GRIPPER_TORQUE_THRESHOLD
     ) -> float:
-        """Step the gripper in ``direction`` (±1) until it stalls on a hard stop.
-
-        Each step nudges the impedance target ``_GRIPPER_CALIB_STEP`` further
-        and reads the motor torque; the stop is reached once the torque
-        pushing *along* the sweep exceeds ``threshold`` (Nm) with
-        the shaft no longer following the target (``_GRIPPER_STALL_READS``
-        reads in a row advancing under ``_GRIPPER_STALL_FRACTION`` of a
-        step) — a torque spike on a jaw still moving is not a stop. The
-        signed test matters for the second sweep of a calibration, which
-        starts pressed against the stop the first one found: that torque
-        points the other way and must not end the sweep early — nor does
-        the hold braking the jaw as it springs off that stop ahead of the
-        target, which reads against the sweep too.
-
-        Returns:
-            The measured shaft position at the stop (raw motor rad).
-
-        Raises:
-            MotorError: If torque builds up *against* the sweep while the
-                shaft lags the target (the motor reports pushing opposite to
-                its commanded motion — an inverted torque sign), or no stop
-                is met within ``_GRIPPER_CALIB_MAX_SWEEP_STROKES`` times the
-                configured type's nominal stroke.
-        """
-        motor = self.motors[Joint.GRIPPER]
-        side = "left" if self._is_left else "right"
-        target = await motor.get_position()
-        pressed_at: float | None = None
-        stalled = 0
-        against = 0
-        max_sweep = (
-            _GRIPPER_CALIB_MAX_SWEEP_STROKES
-            * _GRIPPER_NOMINAL_STROKE[self._config.gripper]
-        )
-
-        for _ in range(math.ceil(max_sweep / _GRIPPER_CALIB_STEP)):
-            target += direction * _GRIPPER_CALIB_STEP
-            await motor.set_impedance(
-                target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
-            )
-            await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
-            torque = await motor.get_torque()
-            along = torque * direction
-            if along >= threshold:
-                against = 0
-                position = await motor.get_position()
-                if pressed_at is not None and (
-                    (position - pressed_at) * direction
-                    < _GRIPPER_STALL_FRACTION * _GRIPPER_CALIB_STEP
-                ):
-                    stalled += 1
-                    if stalled >= _GRIPPER_STALL_READS:
-                        return position
-                else:
-                    stalled = 0
-                pressed_at = position
-                continue
-            pressed_at = None
-            stalled = 0
-            if along > -_GRIPPER_CALIB_TORQUE_ABORT:
-                against = 0
-                continue
-            lag = (target - await motor.get_position()) * direction
-            if lag < 0.5 * _GRIPPER_CALIB_TORQUE_ABORT / _GRIPPER_CALIB_KP:
-                against = 0
-                continue
-            against += 1
-            if against >= _GRIPPER_STALL_READS:
-                await self._unload_gripper_target()
-                raise MotorError(
-                    f"{side} gripper calibration: torque {torque:+.2f} Nm builds "
-                    f"up against the sweep (direction {direction:+d}) — the motor "
-                    f"reports pushing opposite to its commanded motion while the "
-                    f"shaft lags {math.degrees(lag):.1f}° behind it — its torque "
-                    f"sign looks inverted, or the jaw is held back"
-                )
-
-        await self._unload_gripper_target()
-        raise MotorError(
-            f"{side} gripper calibration: no hard stop met within "
-            f"{math.degrees(max_sweep):.0f}° sweeping in direction "
-            f"{direction:+d} — is the gripper attached and the jaw free to move?"
+        """Sweep this arm's gripper to a hard stop (see :func:`seek_gripper_stop`)."""
+        return await seek_gripper_stop(
+            self.motors[Joint.GRIPPER],
+            direction,
+            threshold,
+            side="left" if self._is_left else "right",
+            nominal_stroke=_GRIPPER_NOMINAL_STROKE[self._config.gripper],
         )
 
     async def _unload_gripper_target(self) -> None:
-        """Re-target the calibration impedance hold at the shaft's actual position.
-
-        Called before a failed sweep raises, so the motor is not left leaning
-        on whatever it stalled against with the wound-up target.
-        """
-        motor = self.motors[Joint.GRIPPER]
-        current = await motor.get_position()
-        await motor.set_impedance(
-            current, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
-        )
+        """Re-target the calibration hold at the shaft (see :func:`unload_gripper_target`)."""
+        await unload_gripper_target(self.motors[Joint.GRIPPER])
 
     async def _calibrate_gripper(self) -> None:
         """Measure both gripper hard stops and leave the jaw open.
 
-        Sweeps the jaw closed first (in the fitted gripper's close direction,
-        :func:`~almond_axol.robot.config.gripper_close_direction`) until it
-        stalls on the closed stop, then back the other way until it stalls on
-        the open stop, so the gripper finishes open. The stroke is whatever
-        the two stops measure, checked only for which ``AxolConfig.gripper``
-        type it looks like (:meth:`_check_gripper_stroke`). Adopts the pair
-        for the [0, 1] normalisation and raw clipping (see
-        :meth:`_set_gripper_range`) and persists it so a later reconnecting
-        :meth:`enable` can restore it without moving the gripper.
+        Runs :func:`measure_gripper_stops` in the fitted gripper's close
+        direction (:func:`~almond_axol.robot.config.gripper_close_direction`),
+        checks the stroke for which ``AxolConfig.gripper`` type it looks like
+        (:meth:`_check_gripper_stroke`), adopts the pair for the [0, 1]
+        normalisation and raw clipping (see :meth:`_set_gripper_range`) and
+        persists it so a later reconnecting :meth:`enable` can restore it
+        without moving the gripper.
 
         Must be called with the gripper motor already enabled and in IMPEDANCE mode.
 
         Raises:
-            MotorError: If a stop is not found (see :meth:`_seek_gripper_stop`),
-                the two stops are closer together than ``_GRIPPER_MIN_TRAVEL``,
+            MotorError: If calibration fails (see :func:`measure_gripper_stops`)
                 or the stroke is the other gripper type's.
         """
-        close_direction = self._close_direction
-        side = "left" if self._is_left else "right"
-
-        for threshold in _GRIPPER_BREAKAWAY_THRESHOLDS:
-            close_pos = await self._seek_gripper_stop(close_direction, threshold)
-            open_pos = await self._seek_gripper_stop(-close_direction, threshold)
-            travel = abs(open_pos - close_pos)
-            if travel >= _GRIPPER_MIN_TRAVEL:
-                break
-            _logger.warning(
-                "%s gripper calibration: stops only %.1f° apart at %.1f Nm — "
-                "the jaw may be stuck on the stop it rests on",
-                side,
-                math.degrees(travel),
-                threshold,
-            )
-        else:
-            raise MotorError(
-                f"{side} gripper calibration: stops only {math.degrees(travel):.1f}° "
-                f"apart (closed {close_pos:.3f} rad, open {open_pos:.3f} rad) up to "
-                f"{_GRIPPER_BREAKAWAY_THRESHOLDS[-1]:.1f} Nm — the jaw is jammed or "
-                f"met an obstruction"
-            )
-        _logger.info(
-            "%s gripper calibrated: closed %.3f rad, open %.3f rad (stroke %.1f°)",
-            side,
-            close_pos,
-            open_pos,
-            math.degrees(travel),
+        open_pos, close_pos = await measure_gripper_stops(
+            self.motors[Joint.GRIPPER],
+            self._close_direction,
+            side="left" if self._is_left else "right",
+            nominal_stroke=_GRIPPER_NOMINAL_STROKE[self._config.gripper],
         )
         try:
-            self._check_gripper_stroke(travel)
+            self._check_gripper_stroke(abs(open_pos - close_pos))
         except MotorError:
             await self._unload_gripper_target()
             raise
@@ -1650,6 +1630,9 @@ class AxolArm:
             # Seed the max-step safety check from the measured pose so the
             # first motion_control cannot yank the joints that kept holding.
             self._last_q_commanded = q
+            self._last_sent_arm = None
+            self._last_unbacked_arm = None
+            self._release_offset = None
         if hold:
             # Servo on: command the measured pose once so "enabled" means
             # "holding" — without this, freshly brought-up joints stay limp
@@ -1696,7 +1679,7 @@ class AxolArm:
         self._set_gripper_range(open_pos, close_pos)
 
     async def disable(self) -> None:
-        """Disable all motors and engage brakes."""
+        """Disable all motors (the arms go limp)."""
         results = await asyncio.gather(
             *(m.disable() for m in self.motors.values()), return_exceptions=True
         )
@@ -1953,6 +1936,26 @@ class AxolArm:
             value = float(cap)
             if math.isfinite(value) and value > 0.0:
                 clean[joint] = value
+        loosened = any(
+            joint not in clean or clean[joint] > cap
+            for joint, cap in self._spring_caps.items()
+        )
+        if (
+            loosened
+            and self._last_sent_arm is not None
+            and self._last_unbacked_arm is not None
+        ):
+            # Lifting the caps would hand the core the caller's target as is:
+            # with a box held that is the squeeze target, centimetres past
+            # where the arm stopped. That is a step the core rejects (and the
+            # arm then holds there for good), or, within max_step_rad, a
+            # lunge into the box at full stiffness. Keep the command where the
+            # back-off had it instead; the offset wears away as the caller's
+            # target moves (see motion_control).
+            offset = self._last_unbacked_arm - self._last_sent_arm
+            if self._release_offset is not None:
+                offset = offset + self._release_offset
+            self._release_offset = offset if np.any(np.abs(offset) > 1e-6) else None
         self._spring_caps = clean
 
     @property
@@ -2010,6 +2013,65 @@ class AxolArm:
         out[:n_arm] = measured[:n_arm] + scale * run_ahead
         return out
 
+    def _shape_sink_command(self, clipped: np.ndarray) -> np.ndarray:
+        """The realtime-core command for the caller's clipped target.
+
+        Applies the spring-cap back-off (:meth:`_back_off_to_spring_caps`),
+        then any offset left from lifting the caps (see
+        :meth:`set_spring_caps`), worn away joint by joint by as much as the
+        caller's target moved since the last command, so a held target keeps
+        the arm where it stopped and a moving one takes over within its own
+        motion. Last, :meth:`_settle_sent_step` keeps the step from the last
+        sent command inside what the core accepts.
+        """
+        n_arm = len(ARM_JOINTS)
+        unbacked = clipped[:n_arm].astype(np.float64)
+        out = self._back_off_to_spring_caps(clipped) if self._spring_caps else clipped
+        offset = self._release_offset
+        if offset is not None:
+            prev = self._last_unbacked_arm
+            if prev is not None:
+                moved = np.abs(unbacked - prev)
+                offset = np.sign(offset) * np.maximum(np.abs(offset) - moved, 0.0)
+            if np.all(np.abs(offset) <= 1e-6):
+                self._release_offset = None
+            else:
+                self._release_offset = offset
+                out = out.copy()
+                out[:n_arm] = out[:n_arm] - offset
+                out[:n_arm] = np.clip(
+                    out[:n_arm], self._limits_lo[:n_arm], self._limits_hi[:n_arm]
+                )
+        self._last_unbacked_arm = unbacked
+        return self._settle_sent_step(out)
+
+    def _settle_sent_step(self, out: np.ndarray) -> np.ndarray:
+        """Keep the sent command's step within the core's ``max_step_rad``.
+
+        The caller's command is checked against the caller's previous one
+        (:meth:`motion_control`), but what reaches the core has been through
+        the back-off, whose pull can change faster than the caller's target.
+        The core measures each target against the last one it accepted and
+        rejects (holding the arm) a step over ``max_step_rad``; every later
+        target from a caller still at its own target is rejected too, so the
+        arm stays frozen. A sent step over 80 % of the limit is shortened
+        along the same joint-space line instead, and the next commands close
+        the rest.
+        """
+        prev = self._last_sent_arm
+        max_step = self._config.max_step_rad
+        if prev is None or not math.isfinite(max_step):
+            return out
+        n_arm = len(ARM_JOINTS)
+        step = out[:n_arm].astype(np.float64) - prev
+        worst = float(np.max(np.abs(step))) if np.all(np.isfinite(step)) else 0.0
+        limit = 0.8 * max_step
+        if worst <= limit:
+            return out
+        settled = out.copy()
+        settled[:n_arm] = prev + step * (limit / worst)
+        return settled
+
     def _extra_torque(self) -> np.ndarray:
         """:attr:`extra_torque`, validated (finite, 7 long) or zeros."""
         extra = self.extra_torque
@@ -2045,6 +2107,14 @@ class AxolArm:
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
         # Deltas are frame-invariant (constant offset), so compute in joint frame.
+        # The reference is the caller's last accepted command as given, before
+        # the joint-limit clip and the spring-cap back-off below: those pull
+        # the sent command toward the measured pose while a capped joint is
+        # pressed (a box held in box mode), by up to the whole run-ahead.
+        # Measured against the backed-off command, the caller's next command
+        # (still at its target) read as a jump of that run-ahead, was dropped,
+        # and every one after it too, since a dropped command leaves the
+        # reference where it was: the arm froze until teleop restarted.
         max_step = self._config.max_step_rad
         if self._last_q_commanded is not None and max_step < float("inf"):
             gripper_i = self._gripper_i
@@ -2069,6 +2139,7 @@ class AxolArm:
                 )
                 return
 
+        requested = q.copy()
         gripper_i = self._gripper_i
         if self._has_gripper:
             q[gripper_i] = self._gripper_to_raw(float(q[gripper_i]))
@@ -2077,8 +2148,8 @@ class AxolArm:
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         sink_mode = self._command_sink is not None
-        if sink_mode and self._spring_caps:
-            clipped = self._back_off_to_spring_caps(clipped)
+        if sink_mode:
+            clipped = self._shape_sink_command(clipped)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s),
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
@@ -2229,7 +2300,8 @@ class AxolArm:
             else:
                 sink_cmds.append((0.0,) * RT_TARGET_FIELDS)
             self._command_sink(sink_cmds)
-            self._last_q_commanded = clipped
+            self._last_q_commanded = requested
+            self._last_sent_arm = clipped[: len(ARM_JOINTS)].astype(np.float64)
             return
 
         arm_cmds: list[tuple[float, float, float, float, float]] = []
@@ -2318,7 +2390,7 @@ class AxolArm:
                 )
             )
         await _await_all_hardware_actions(*tasks)
-        self._last_q_commanded = clipped
+        self._last_q_commanded = requested
 
     async def gravity_compensate(
         self,
@@ -2430,6 +2502,11 @@ class AxolArm:
                 else (0.0,) * RT_TARGET_FIELDS
             )
             self._command_sink(sink_cmds)
+            # The core now holds this snapshot, not a teleop command: the
+            # next motion_control starts the sent-command history afresh.
+            self._last_sent_arm = None
+            self._last_unbacked_arm = None
+            self._release_offset = None
             return
 
         tasks = [
@@ -2470,6 +2547,9 @@ class AxolArm:
         manual reposition.
         """
         self._last_q_commanded = None
+        self._last_sent_arm = None
+        self._last_unbacked_arm = None
+        self._release_offset = None
         n = len(list(Joint))
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)

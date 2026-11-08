@@ -3,7 +3,7 @@ title: "Web Control Panel"
 description: "Connect to Axol from a browser, set up cameras and settings, and run every operation without a terminal."
 ---
 
-The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
+The **web control panel** is a browser page for running Axol. Use it to connect to the robot, assign cameras, change settings, and run teleoperation, gravity compensation, jogging, data collection, dataset replay and policies. It is served by [`axol serve`](/cli/serve).
 
 The sidebar on the left switches between its pages. On a phone, open it with the **☰** button.
 
@@ -13,7 +13,8 @@ The sidebar on the left switches between its pages. On a phone, open it with the
 | **Devices** | The Host Computer, Axol, Mantis and Jelly, and what Axol is mounted on. |
 | **Operations** | Every operation. Open one, fill in its fields and press **Start**. |
 | **Datasets** | Watch recorded episodes, check their robot data and fix their task text. |
-| **Request data** | Pay Almond to collect training data for your task. |
+| **Request teleoperator** | Pay Almond to finish a one-off task on your Axol remotely. |
+| **Request data** | Pay Almond to collect a training dataset of your task. |
 | **Settings** | Settings shared by every operation and every browser. |
 | **Diagnostics** | Motor telemetry, tests and tuning. See [Diagnostics dashboard](/guides/diagnostics-dashboard). |
 | **Logs** | The output of the latest operation. |
@@ -65,6 +66,8 @@ The **Devices** page has a card each for the **Host Computer**, **Axol**, **Mant
   Closing the browser tab, or disconnecting from the host, does **not** stop anything. The robot connection and any running operation keep going in `axol serve`. Press **Stop** to end an operation.
 </Warning>
 
+Every browser connected to the same host sees the same running operation. An operation started from another browser or a phone shows up within a couple of seconds, and you can stop it from here.
+
 ### Host Computer
 
 The **Host Computer** is the computer running `axol serve`. Press **Connect** on its card and enter the host's IP address (port `8001` is assumed). Click the field to pick from the last five hosts this browser connected to. If the host doesn't answer within a few seconds, the dialog says it can't reach the host.
@@ -108,7 +111,7 @@ When Jelly is attached, Axol uses **Axol on Jelly** automatically. This applies 
 
 You can preview any card by hovering it. You can pick one only while Axol is connected.
 
-Until a version is saved, **Set up** on the **Overview** shows the mount cards with a **Save** button. The **Devices** page shows the same cards under **What is Axol mounted on?**. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it.
+Until a version is saved, **Set up** on the **Overview** shows the mount cards with a **Save** button. The **Devices** page shows the same cards under **What is Axol mounted on?**. Runs that drive the arms list *Choose what Axol is mounted on* under [Before you start](#before-you-start). Sim runs and runs with the arms off don't need it. While Jelly's wheel or lift adapter is plugged in, the panel doesn't ask what Axol is mounted on.
 
 On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Robot**), the panel uses the parcel gripper's model. To force a version, set `kinematics.robot_model` under **General settings → Advanced → Kinematics**, or pass `--kinematics.robot_model` on the CLI.
 
@@ -117,6 +120,8 @@ On Axol on Jelly with the parcel gripper (**Gripper** in **Axol settings → Rob
 The panel finds the CAN adapters plugged into the host and connects the selected device automatically. On a new hub, it first identifies each adapter (Axol arm, Mantis rig, Jelly wheels or Jelly lift) and names it, the same way [`axol can.setup`](/cli/can-setup) does.
 
 If the automatic connection fails twice, press **Connect** on the card. After you press **Disconnect**, the panel doesn't reconnect that hardware automatically until you press **Connect** or change the selection.
+
+**Switching between Axol and Mantis.** Unplug one and plug in the other. The panel sees that the connected device is gone, identifies the new one and connects it. You don't need to press **Disconnect** first.
 
 **If hardware is plugged in but not answering.** The **Overview** and **Devices** say *Hardware is plugged in but not answering*. This usually means its power is off. Turn it on: the panel checks again on its own and connects it. While Axol or Mantis is connected, press **Check again** instead. If it still doesn't connect, run `axol can.setup` in a terminal.
 
@@ -130,7 +135,11 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 | Red | Unreachable or reporting a fault. Operations on that device can't start until you fix it. Sim teleop still works. |
 | Grey | Unknown, because a running operation is using the bus. |
 
-**If motor power is cut.** If you cut motor power during a run, for example at the power supply, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If a motor still answers with torque on, the panel shows **Re-check motors**. Cut motor power, then press it.
+**If motor power is cut.** If you cut motor power during a run, for example with the E-Stop, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If it can't confirm the motors are off yet, it shows a lock message:
+
+1. Release the E-Stop to turn motor power back on.
+2. Wait a few seconds. The panel unlocks on its own once every motor reads off.
+3. If the message stays, press **Re-check motors**. A motor it names still has torque on: press the E-Stop, wait a few seconds, then press **Re-check motors** again.
 
 **Mantis.** Press **Use for operations** on the Mantis card. See [Mantis Hardware](/mantis/hardware) for the rigs and hub.
 
@@ -170,7 +179,7 @@ Settings that apply to every run live on the **Settings** page. Switch between *
 |---|---|
 | **Cameras** | Camera previews and the Axol camera layout. See [Cameras](#cameras). |
 | **Robot** | **Mount** ([Axol version](#axol-version)), arm stiffness, CAN channels, gripper type and limits, gravity-comp damping and rate, the contact stops, and the **Axol arms** switch. |
-| **Teleop & VR** | Teleop rate, position and rotation multipliers, **Hold grips to engage** and **Park to zero on stop**. |
+| **Teleop & VR** | Teleop rate, position and rotation multipliers, **Hold grips to engage**, [controller haptics](/operations/teleop#controller-haptics) and **Park to zero on stop**. |
 | **Rest pose** | A 3D editor with a slider per joint. The arms start from and return to this pose in teleop and data collection. |
 | **Kinematics** | The **IK solver** (`jax` by default, or `mink`, see [Mink IK](/operations/mink)) and its main weights. |
 
@@ -182,7 +191,7 @@ Settings that apply to every run live on the **Settings** page. Switch between *
 
 | Tab | What's in it |
 |---|---|
-| **Tracking** | The pose source (Quest, Lighthouse or Ultimate) and its setup steps. See [Mantis Tracking](/mantis/tracking). |
+| **Tracking** | The pose source (Quest or Lighthouse) and its setup steps. See [Mantis Tracking](/mantis/tracking). |
 | **Triggers** | **Left trigger full squeeze** and **Right trigger full squeeze**, which scale each trigger to a full close (default `1.0`). See [Testing the triggers and grippers](/mantis/hardware#testing-the-triggers-and-grippers). |
 | **Cameras** | The Head, Left Mantis and Right Mantis camera layout, kept separate from Axol's. |
 | **CAN** | The left and right Mantis CAN interfaces (`can_mantis_l` and `can_mantis_r` by default). Swap the two values to swap sides without moving cables. |
@@ -212,7 +221,7 @@ Recording fps above 60 raises the cameras' capture rate to match. The ZED X supp
 
 ### Cameras
 
-Data collection and policies need ZED cameras on the host. Assign Axol's cameras under **Axol settings → Cameras** (overhead, left arm, right arm). Assign Mantis cameras under **Mantis settings → Cameras** (Head, Left Mantis, Right Mantis). The two layouts are saved separately.
+Data collection and policies need ZED cameras on the host. Assign Axol's cameras under **Axol settings → Cameras** (overhead, left arm, right arm). Assign Mantis cameras under **Mantis settings → Cameras** (Head, Left Mantis, Right Mantis). The two layouts are saved separately. Camera assignments are saved on the host, so each robot keeps its own. A host with no cameras assigned shows none until you assign them.
 
 Each panel lists the cameras plugged into the host, with serial number, type (stereo ZED X or mono ZED X One), model and a preview frame. Use the preview to tell which camera is which.
 
@@ -269,6 +278,7 @@ While the operation starts, its screen shows what it is doing and how far along 
 | **Teleoperation** | Axol, Mantis, or sim | Drive Axol from a Quest. With Jelly attached, the thumbsticks drive Jelly too. With Mantis selected, drive the rig grippers from their triggers. Turn on **sim** to drive a simulated Axol in the browser, and pick its version under **Sim robot**. See [Teleoperation](/operations/teleop#run-it). |
 | **Gravity compensation** | Axol | Hold the arms weightless so you can move them by hand. |
 | **Waypoints** | Axol or sim | Teach a path by hand and replay it. See [Waypoints](#waypoints). |
+| **Jog** | Axol, Jelly, or sim | Move a gripper to a pose you drag in 3D, jog it with buttons, and drive the lift and Jelly. See [Jog](#jog). |
 | **Collect data** | Axol or Mantis, and cameras | Record episodes into a LeRobot dataset. Pick an existing dataset under **repo id** to add to it. See [Data collection](/operations/data-collection#run-it). |
 | **Replay dataset** | Axol | Play a recorded episode on the arms, then return to rest. Turn on **loop** to repeat until **Stop**, and **interpolate** to smooth playback. |
 | **Run policy** | Axol and cameras | Run a LeRobot policy on the robot or on an [inference server](/cli/inference-server). Choose policy type `custom` to run [your own model](/operations/custom-policy), which needs no checkpoint path. |
@@ -286,13 +296,50 @@ While the operation starts, its screen shows what it is doing and how far along 
 
 Lower the **Speed scale** slider to try a new path slowly. Turn on **sim** to preview a saved path in the browser. See [`waypoints`](/cli/waypoints).
 
+### Jog
+
+Use **Jog** to move Axol from the browser without a headset. Open **Jog** under **Drive** on the **Operations** page. Turn on **sim** to jog a simulated Axol, and pick its version under **Sim robot**.
+
+When jogging starts, the arms hold their pose. A 3D view of Axol sits beside a **Telemetry** panel that shows both arms' joints, the lift and the base. On the robot, the camera feeds play under the 3D view.
+
+The controls are in tabs:
+
+| Tab | What it does |
+|---|---|
+| **Arm move** | Pick **Left** or **Right**, drag the target in the 3D view, then press **Plan move**. An orange preview shows where the arm will go. Press **Execute** to move it, or **Stop move** to halt it. |
+| **Jog gripper** | Hold a button to move or turn the gripper along one axis. It stops when you let go. Choose **Robot** or **Gripper** axes, and a speed. |
+| **Lift** | Hold **Raise** or **Lower** to move Jelly's lift. Shown on Axol on Jelly. |
+| **Drive** | Hold the drive pad to drive Jelly, and **Turn left** or **Turn right** to turn in place. Shown on Axol on Jelly. |
+
+- In the 3D view, drag the arrows to move the target and the rings to turn it. Drag empty space to orbit, and scroll to zoom.
+- If the target is out of reach, the plan goes to the closest pose it can reach and shows how far off it is.
+- **Reset target** puts the target back on the gripper. **Go to rest** moves both arms to the rest pose.
+- Every plan avoids collisions between the arms and the body.
+
+**Keyboard and game controller.** Open the help button on the controls card for the full list. They work on every tab.
+
+| Input | Action |
+|---|---|
+| `W` `A` `S` `D`, or the left stick | Drive Jelly |
+| Left and right arrow keys, or the right stick | Turn Jelly in place |
+| Up and down arrow keys, or the D-pad up and down | Raise or lower the lift |
+| D-pad left and right | Choose the left or right arm |
+| Hold LT | Move the gripper: left stick across, right stick up and down |
+| Hold RT | Turn the gripper: left stick tilts, right stick turns |
+
+To use a game controller, plug it in, click the page and press any button on it. If the page says the controller isn't supported, move the switch on the back of a Logitech controller to the other letter (D on a Mac). Everything stops when you let go or leave the page.
+
+Press **Stop** to end the run. The arms move to the rest pose before the motors turn off. See [`jog`](/cli/jog) for the speed settings.
+
 ### Before you start
 
 **Start** stays disabled until the operation has what it needs. A **Before you start** list says what is missing, with a button that opens the place to fix it, for example:
 
 - *Connect Axol*
 - *Choose what Axol is mounted on* (see [Axol version](#axol-version))
-- *Fix motor fault*, followed by the motor and the fault
+- *Axol isn't answering. Turn on its power.* when no motor answers
+- *Left arm isn't answering. Check its power and cable.* when no motor on one arm answers
+- *Fix the motor fault on*, followed by the motor and the fault
 - *Assign a camera and enable Record in Axol settings → Cameras*
 - *Identify left + right Lighthouse trackers*
 
@@ -343,7 +390,7 @@ These match the `s` and `r` keys and the Enter prompts of [`run-policy`](/cli/ru
 
 If a take ends without being saved, the box shows the reason in red until the next take starts.
 
-With Axol or Mantis on Quest, the VR controllers also work, and whichever input comes first wins. With Mantis on Lighthouse or Ultimate, no headset is needed:
+With Axol or Mantis on Quest, the VR controllers also work, and whichever input comes first wins. With Mantis on Lighthouse, no headset is needed:
 
 - Squeeze and release both rig triggers together to engage tracking and start a take. **Start recording** works only after the rig is engaged.
 - While recording, press either trigger three times to save, or four times to discard.
@@ -369,18 +416,32 @@ Under the videos, **Robot data** shows what the episode recorded, so you can che
 
 Gripper poses are in the robot's frame, at the gripper mount. For a joint episode, the panel works them out from the recorded joints. The 3D view uses the Axol version set under **Axol settings → Robot**.
 
-## Request data
+## Request teleoperator
 
-With **Teleop Data Collection**, Almond collects labeled data for your task and delivers it in LeRobot format, ready for training. Open **Request data** in the sidebar. The **Overview**, **Teleoperation** and **Collect data** pages also have a card that leads there.
+Have an Almond operator control your Axol remotely to finish a one-off task for you. Open **Request teleoperator** in the sidebar. The **Overview** and **Teleoperation** pages also have a card that leads there.
 
-1. Enter the hours of usable data you want. The form shows the hourly price and the total.
+1. Under **Hours of credit**, enter the hours you expect the task to take. The form shows the hourly price and the total.
 2. Describe the task: what the robot should do, with which objects, and what counts as done.
 3. Optionally, add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
-4. Press **Continue to payment** and pay on Stripe's checkout page.
+4. Press **Buy credit** and pay on Stripe's checkout page.
 
-You pay for the hours you request. If Almond delivers fewer usable hours, Almond refunds the difference. After you pay, Almond contacts you by email to plan the collection.
+You pay for the credit up front. Almond bills the session by the minute and refunds any credit you don't use. After you pay, Almond emails you to schedule the session.
 
-The request needs an internet connection on the computer running the browser. To hide the card, press **×** on it. **Request data** stays in the sidebar.
+## Request data
+
+Get a LeRobot dataset of your task, ready for training. Open **Request data** in the sidebar. The **Collect data** page also has a card that leads there.
+
+1. Choose how Almond collects the data under **How Almond collects it**:
+   - **Almond's Axol**: Almond builds your setup and records the task with teleop on its own Axol.
+   - **Your Axol**: an Almond operator controls your Axol remotely and records the task in your space.
+2. Enter the hours of usable data you want. The form shows the hourly price for the method you chose, and the total.
+3. Describe the task: what the robot should do, with which objects, and what counts as done.
+4. Optionally, add an example of the task: a link to a video, or a Hugging Face dataset of sample episodes.
+5. Press **Continue to payment** and pay on Stripe's checkout page.
+
+You pay per hour of usable data, however long recording takes. After you pay, Almond emails you to plan the collection.
+
+Both requests need an internet connection on the computer running the browser. To hide a card, press **×** on it. **Request teleoperator** and **Request data** stay in the sidebar.
 
 ## Next steps
 

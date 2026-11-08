@@ -333,6 +333,28 @@ class JellyRustWireTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(jelly.parked)
         self.assertTrue(jelly.linked)
         self.assertFalse(jelly.wheel_fault)
+        # An older core sends no wheel sample.
+        self.assertIsNone(jelly.wheel_sample)
+
+    async def test_status_packet_carries_the_wheel_sample(self) -> None:
+        jelly = Jelly(JellyConfig(lift=False, channel=None))
+        jelly._reader = reader = asyncio.StreamReader()
+        payload = (
+            b"U"
+            + struct.pack("<10dB", *([0.0] * 10), 8)
+            + struct.pack("<4d", 1.5, -2.0, 401.0, 0.25)
+            + struct.pack("<4d", 3.0, -3.0, 0.0, 0.5)
+            + struct.pack("<d", 1234.5)
+        )
+        reader.feed_data(struct.pack("<I", len(payload)) + payload)
+        reader.feed_eof()
+        await jelly._rust_reader_loop()
+        self.assertTrue(jelly.linked)
+        sample = jelly.wheel_sample
+        assert sample is not None
+        self.assertEqual(sample.positions, (1.5, -2.0, 401.0, 0.25))
+        self.assertEqual(sample.velocities, (3.0, -3.0, 0.0, 0.5))
+        self.assertEqual(sample.at, 1234.5)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,12 @@
                 <mesh filename="package://assembly/meshes/Base.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="0 0 -0.46" rpy="-3.14159 0 1.5708" />
+            <geometry>
+                <box size="0.122 0.262 0.80201" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_e1">
         <inertial>
@@ -43,6 +49,12 @@
                 <mesh filename="package://assembly/meshes/Left_E1.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-1.5841e-08 -0.00238305 -0.179523" rpy="-0.0149687 -0.000224223 -0.0149687" />
+            <geometry>
+                <cylinder radius="0.06332" length="0.31839" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_e2">
         <inertial>
@@ -65,6 +77,12 @@
                 <mesh filename="package://assembly/meshes/Left_E2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-0.0245317 -1.09047e-08 -0.0561492" rpy="3.14159 -0.353954 3.14159" />
+            <geometry>
+                <cylinder radius="0.07363" length="0.07256" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_gripper">
         <inertial>
@@ -87,6 +105,12 @@
                 <mesh filename="package://assembly/meshes/Left_Gripper.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-3.67203e-06 -8.45337e-07 -0.0614857" rpy="3.59521e-05 0.000133296 -3.59521e-05" />
+            <geometry>
+                <cylinder radius="0.04406" length="0.10233" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_s2">
         <inertial>
@@ -109,6 +133,12 @@
                 <mesh filename="package://assembly/meshes/Left_S2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="0.0599865 0 0" rpy="0 1.5708 0" />
+            <geometry>
+                <cylinder radius="0.07719" length="0.01582" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_s3">
         <inertial>
@@ -131,6 +161,12 @@
                 <mesh filename="package://assembly/meshes/Left_S3.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-1.01624e-08 0.00960659 -0.026405" rpy="0.517391 0.329826 -0.517391" />
+            <geometry>
+                <cylinder radius="0.06285" length="0.06085" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_w0">
         <inertial>
@@ -153,6 +189,12 @@
                 <mesh filename="package://assembly/meshes/Left_W0.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-5.06676e-07 -1.70909e-09 -0.0724766" rpy="3.14159 -0.000108398 3.14159" />
+            <geometry>
+                <cylinder radius="0.04913" length="0.12189" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_w1">
         <inertial>
@@ -175,6 +217,12 @@
                 <mesh filename="package://assembly/meshes/Left_W1.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="1.41639e-06 0.0285014 -0.0284996" rpy="0.000193384 4.97846e-05 -0.000193384" />
+            <geometry>
+                <cylinder radius="0.04131" length="0.057" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="left_w2">
         <inertial>
@@ -197,6 +245,12 @@
                 <mesh filename="package://assembly/meshes/Left_W2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-0.0285025 -2.90519e-06 -0.00856191" rpy="-0.000111242 1.57069 0.000111242" />
+            <geometry>
+                <cylinder radius="0.04066" length="0.03877" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_e1">
         <inertial>
@@ -219,6 +273,12 @@
                 <mesh filename="package://assembly/meshes/Right_E1.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="1.5841e-08 -0.00238305 -0.179523" rpy="-0.0149687 0.000224223 0.0149687" />
+            <geometry>
+                <cylinder radius="0.06332" length="0.31839" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_e2">
         <inertial>
@@ -241,6 +301,12 @@
                 <mesh filename="package://assembly/meshes/Right_E2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="0.0245317 -1.09047e-08 -0.0561492" rpy="3.14159 0.353954 -3.14159" />
+            <geometry>
+                <cylinder radius="0.07363" length="0.07256" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_gripper">
         <inertial>
@@ -263,6 +329,12 @@
                 <mesh filename="package://assembly/meshes/Right_Gripper.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="3.67203e-06 -7.6969e-07 -0.0614857" rpy="3.59528e-05 -0.000133296 3.59528e-05" />
+            <geometry>
+                <cylinder radius="0.04406" length="0.10233" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_s2">
         <inertial>
@@ -285,6 +357,12 @@
                 <mesh filename="package://assembly/meshes/Right_S2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-0.0599865 0 0" rpy="-3.14159 -1.57079 -3.14159" />
+            <geometry>
+                <cylinder radius="0.07719" length="0.01582" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_s3">
         <inertial>
@@ -307,6 +385,12 @@
                 <mesh filename="package://assembly/meshes/Right_S3.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="1.01624e-08 0.00960659 -0.026405" rpy="0.517391 -0.329826 0.517391" />
+            <geometry>
+                <cylinder radius="0.06285" length="0.06085" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_w0">
         <inertial>
@@ -329,6 +413,12 @@
                 <mesh filename="package://assembly/meshes/Right_W0.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="-5.06676e-07 1.70774e-09 -0.0724766" rpy="-3.14159 -0.000108398 -3.14159" />
+            <geometry>
+                <cylinder radius="0.04913" length="0.12189" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_w1">
         <inertial>
@@ -351,6 +441,12 @@
                 <mesh filename="package://assembly/meshes/Right_W1.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="1.4164e-06 -0.0285014 -0.0284996" rpy="-0.000193384 4.97841e-05 0.000193384" />
+            <geometry>
+                <cylinder radius="0.04131" length="0.057" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="right_w2">
         <inertial>
@@ -373,6 +469,12 @@
                 <mesh filename="package://assembly/meshes/Right_W2.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="0.0285025 -2.82955e-06 -0.00856191" rpy="-0.000108588 -1.57069 -0.000108588" />
+            <geometry>
+                <cylinder radius="0.04066" length="0.03877" />
+            </geometry>
+        </ik_collision>
     </link>
     <link name="root" />
     <link name="s1">
@@ -396,6 +498,12 @@
                 <mesh filename="package://assembly/meshes/S1.stl" scale="1 1 1" />
             </geometry>
         </collision>
+        <ik_collision>
+            <origin xyz="0 0 0.06" rpy="1.5708 0 1.5708" />
+            <geometry>
+                <box size="0.122 0.122 0.262" />
+            </geometry>
+        </ik_collision>
     </link>
     <joint name="base_0" type="fixed">
         <origin xyz="-2.79001e-17 6.93889e-18 -0.06" rpy="0 -1.06752e-16 0" />

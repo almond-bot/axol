@@ -20,18 +20,20 @@ This command is configured through draccus. The robot and teleop settings live i
 | `--vcodec STR` | Dataset video codec (default: `h264` on Jetson, `auto` elsewhere). Accepts any LeRobot codec, e.g. `auto`, `h264` or `libsvtav1`. |
 | `--teleop_hz INT` | Motor command rate in Hz, separate from `--fps` for smooth control (default: 120) |
 | `--mantis true` | Record with Mantis instead of Axol. See [Recording with Mantis](#recording-with-mantis). |
-| `--mantis_source {quest,lighthouse,ultimate}` | Mantis pose source. Default: the **Tracking** choice saved in **Mantis settings**, or `lighthouse` if none is saved. |
+| `--mantis_source {quest,lighthouse}` | Mantis pose source. Default: the **Tracking** choice saved in **Mantis settings**, or `lighthouse` if none is saved. |
 | `--teleop_config.vr_teleop_config.reset_torque_threshold FLOAT` | Contact limit (Nm) for every return to rest (default: 6.0). `0` turns it off. See [After each episode](#after-each-episode). |
 | `--teleop_config.vr_teleop_config.reset_gravity_comp_kd FLOAT` | Damping (Nm·s/rad) while the arms hang limp after a contact stop (default: 0.25). Same as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
 | `--teleop_config.vr_teleop_config.teleop_torque_threshold FLOAT` | Contact limit (Nm) while you drive the arms during a take (default: `0`, off). The control panel suggests `16.0`. |
+| `--teleop_config.vr_teleop_config.haptics BOOL`, `--teleop_config.vr_teleop_config.haptic_near BOOL`, `--teleop_config.vr_teleop_config.haptic_torque FLOAT`, `--teleop_config.vr_teleop_config.haptic_held_load BOOL` | [Controller haptics](/operations/teleop#controller-haptics) on or off (default: `true`), the ticks near the body (default: `false`), the torque (Nm) at which the rumble starts (default: `6.0`), and whether a held object's weight is kept out of the rumble (default: `true`). |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
+| `--record_jelly true` | Also record Jelly's lift height and wheel positions (default: `false`). Needs Axol on Jelly. See [Record Jelly](/operations/data-collection#record-jelly). |
 | `--push_to_hub true` | Push to HuggingFace Hub when done. Log in first. See [Upload to the HuggingFace Hub](/operations/data-collection#upload-to-the-huggingface-hub). |
 | `--robot_config.cameras DICT` | Camera slots (`overhead`, `left_arm`, `right_arm`) and each ZED camera's serial number, as one inline value: `--robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"`. At least one camera must record. |
 | ↳ `record` / `stream` (per camera) | `record` (default `true`) writes the camera to the dataset. `stream` (default `true`) sends it to the headset. A camera with both off is dropped. |
 | ↳ `stereo` (auto-detected) | Stereo ZED X cameras are detected from their serial number. See [Stereo cameras](#stereo-cameras). |
 | ↳ `eyes` / `stream_eyes` (per stereo camera) | `eyes` picks which eyes are recorded (`both`, `left` or `right`). `stream_eyes` picks which are streamed to the headset (default `null`, same as `eyes`). |
 | `--robot_config.video_backend {auto,gst,sdk}` | Camera capture backend (default: `auto`). `auto` uses the GStreamer pipeline (`gst`) when it's installed, and the ZED SDK (`sdk`) otherwise. |
-| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5). `<side>` is `left` or `right`. |
+| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper (default: 0.5, at most 5). `<side>` is `left` or `right`. |
 | `--robot_config.axol_config.left_stiffness S` | Left arm stiffness, from `0` (hand-guidable) to `1` (default, the tuned production gains). A scalar or one value per joint. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--teleop_config.vr_teleop_config.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand. |
 | `--teleop_config.vr_teleop_config.rotation_multiplier FLOAT` | Scale hand rotation by this factor (default: `1.0`). At `2.0` the gripper turns twice as far as your wrist. |
@@ -87,13 +89,15 @@ Axol and Quest-source Mantis episodes are driven from the Quest controllers. The
 | **A** | Start a take after a 3-second countdown. While recording, press **A** to ask **Save episode?**, then **A** again to save or **X** to keep recording. The headset shows `Saving` until the write completes. |
 | **X** | During the countdown, cancel it. Otherwise, reset the arms to the rest pose, including from a contact hold. While recording, press **X** to ask **Discard episode?**, then **X** again to discard or **A** to keep recording. |
 
-With a Lighthouse or Ultimate Mantis source, the rig triggers control the takes:
+With a Lighthouse Mantis source, the rig triggers control the takes:
 
 - **Start:** squeeze both triggers together and release them. The rigs engage at their current pose and recording starts.
 - **Save:** while recording, fully squeeze and release either trigger three times quickly. The saved take ends where the first squeeze began, so the clicks aren't recorded.
 - **Discard:** squeeze four times quickly. A triple press waits a moment in case a fourth press follows.
 
 A triple press while idle is ignored. Quest Mantis uses **A** instead.
+
+The side button on either rig is a one-handed alternative. A short press starts a take, or saves it while recording. Hold it for 1 second to discard the take.
 
 When you launch collection from the [control panel](/guides/control-panel#episode-controls), it also shows buttons to start, save and discard a take and to end a contact hold. You can run a session with the headset off. The controllers stay live, and whichever input arrives first ends the take.
 
@@ -115,7 +119,7 @@ Mantis has no arms to return. It turns off both gripper motors between takes, an
 
 - The grippers use the Mantis CAN channels saved in **Mantis settings** (default `can_mantis_l` and `can_mantis_r`).
 - The head stereo camera uses the `overhead` slot and can record both eyes along with both wrists.
-- At startup both grippers open fully once to calibrate, then release.
+- At startup both grippers close, then open fully, once to calibrate. Keep hands and objects clear of the jaws.
 - The gripper motors are off between takes. Starting a recording turns them on, and every save, discard, stop or error turns them off again.
 - Engage at the agreed start pose. That fixes the robot base for the session. Rows use the Cartesian end-effector schema.
 - Each row's pose, gripper position and grip command are matched to the tracker's capture time.
@@ -123,12 +127,12 @@ Mantis has no arms to return. It turns off both gripper motors between takes, an
 The pose source works like this:
 
 - **Quest** waits for the headset's WebXR session and uses **A** for episode control.
-- **Lighthouse** and **Ultimate** start and stop their tracker readers automatically, from the CLI and the control panel. Don't launch a second `tracker.bridge`.
+- **Lighthouse** starts and stops its tracker reader automatically, from the CLI and the control panel. Don't launch a second `tracker.bridge`.
 - Recording can't start until the tracker sends two fresh poses and the triggers report in.
 
 ## Starting and stopping
 
-**Starting needs the arms near zero.** On Axol, collect-data refuses to start while any arm joint is more than 25° from zero, the arms' natural resting pose. It names each joint that is out. Move them back by hand, for example under [`axol gravity-comp`](/cli/gravity-comp), and start again. The first move then goes through zero on its way to the rest pose. See [Starting needs the arms near zero](/operations/teleop).
+**Starting needs the arms near zero.** On Axol, collect-data refuses to start while `shoulder_1`, `shoulder_2` or `elbow` is more than 25° from zero, the arms' natural resting pose. It names each joint that is out. Move them back by hand, for example under [`axol gravity-comp`](/cli/gravity-comp), and start again. The first move then goes through zero on its way to the rest pose. See [Starting needs the arms near zero](/operations/teleop).
 
 **Stopping parks the arms.** When you end a session with `Ctrl+C` or **Stop** in the control panel:
 

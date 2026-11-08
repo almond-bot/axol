@@ -50,6 +50,20 @@ class JointsBroadcastTest(unittest.TestCase):
         self.assertEqual(set(msg["value"]["q"].values()), {0.5, -0.5})
         self.assertEqual(msg["value"]["l_grip"], 0.5)
 
+    def test_names_the_urdf_and_carries_the_lift(self) -> None:
+        sent: list = []
+        core = _core(sent)
+        core.maybe_broadcast_joints(np.zeros(16), object(), lift=0.4)
+        value = sent[0]["value"]
+        self.assertEqual(value["lift"], 0.4)
+        self.assertTrue(value["urdf"].endswith(".urdf"))
+
+    def test_no_lift_is_null(self) -> None:
+        for lift in (None, float("nan")):
+            sent: list = []
+            _core(sent).maybe_broadcast_joints(np.zeros(16), object(), lift=lift)
+            self.assertIsNone(sent[0]["value"]["lift"])
+
     def test_falls_back_to_the_command_without_measured_arms(self) -> None:
         sent: list = []
         _core(sent).maybe_broadcast_joints(np.full(16, 0.25), object())

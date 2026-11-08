@@ -29,7 +29,6 @@ import { startDiagnosticsRun } from "@/lib/telemetry"
 import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
-import { UltimateWifiPanel } from "./ultimate-wifi-panel"
 
 type SetupCommand =
   | "tracker.install"
@@ -38,10 +37,8 @@ type SetupCommand =
   | "tracker.lighthouse.validate"
   | "tracker.lighthouse.calibrate"
   | "tracker.identify"
-  | "tracker.ultimate.install"
-  | "tracker.ultimate.check"
 
-type StepKey = "runtime" | "stations" | "headset" | "dongle" | "wifi" | "identify" | "validation"
+type StepKey = "runtime" | "stations" | "headset" | "identify" | "validation"
 
 interface FlowStep {
   key: StepKey
@@ -54,9 +51,7 @@ interface FlowStep {
 }
 
 function backendFor(source: string): TrackerBackend | null {
-  if (source === "lighthouse") return "survive"
-  if (source === "ultimate") return "ultimate"
-  return null
+  return source === "lighthouse" ? "survive" : null
 }
 
 function trackerSessionBackend(session: SessionInfo): TrackerBackend | null {
@@ -68,15 +63,8 @@ function trackerSessionBackend(session: SessionInfo): TrackerBackend | null {
     session.command === "tracker.lighthouse.calibrate"
   )
     return "survive"
-  if (
-    session.command === "tracker.ultimate.install" ||
-    session.command === "tracker.ultimate.check"
-  )
-    return "ultimate"
   if (session.command === "tracker.identify") {
-    return session.args.backend === "survive" || session.args.backend === "ultimate"
-      ? session.args.backend
-      : null
+    return session.args.backend === "survive" ? "survive" : null
   }
   return null
 }
@@ -85,7 +73,6 @@ function trackerSessionBackend(session: SessionInfo): TrackerBackend | null {
 function stepForCommand(command: string | undefined): StepKey | null {
   switch (command) {
     case "tracker.install":
-    case "tracker.ultimate.install":
       return "runtime"
     case "tracker.pair":
     case "tracker.lighthouse.check":
@@ -95,10 +82,6 @@ function stepForCommand(command: string | undefined): StepKey | null {
       return "validation"
     case "tracker.identify":
       return "identify"
-    case "tracker.ultimate.check":
-      // The optional host check is launched from the CLI / Diagnostics now;
-      // while it runs, hold the flow on the step it validates.
-      return "dongle"
     default:
       return null
   }
@@ -179,7 +162,6 @@ export function TrackerBindingPanel({
   const activeSession =
     selectedSession && trackerSessionBackend(selectedSession) !== null ? selectedSession : null
   const sessionBackend = activeSession ? trackerSessionBackend(activeSession) : null
-  const displayedBackend = sessionBackend ?? backend
   const { lines, status } = useSessionLogs(activeSession?.id ?? null)
   const completionRef = useRef<string | null>(null)
 
@@ -241,12 +223,11 @@ export function TrackerBindingPanel({
     !(dismissed && dismissed.id === activeSession?.id && dismissed.promptIndex === prompt.index)
       ? prompt.text
       : null
-  const checkingUltimate = activeSession?.command === "tracker.ultimate.check"
   const checkingLighthouse = activeSession?.command === "tracker.lighthouse.check"
   const validatingLighthouse =
     activeSession?.command === "tracker.lighthouse.validate" ||
     activeSession?.command === "tracker.lighthouse.calibrate"
-  const checking = checkingUltimate || checkingLighthouse
+  const checking = checkingLighthouse
   const transcriptLimit = checking || validatingLighthouse ? 24 : 6
   const transcript = currentLines
     .filter((line) => line.trim() && !line.startsWith("[serve]") && !line.startsWith("[prompt] "))
@@ -262,19 +243,14 @@ export function TrackerBindingPanel({
   const terminal = current?.status === "exited" || current?.status === "error"
   const succeeded = terminal && current?.status === "exited" && (current.exitCode ?? 0) === 0
   const pairing = activeSession?.command === "tracker.pair"
-  const installing =
-    activeSession?.command === "tracker.install" ||
-    activeSession?.command === "tracker.ultimate.install"
+  const installing = activeSession?.command === "tracker.install"
   const sessionStep = stepForCommand(activeSession?.command)
 
   useEffect(() => {
     if (!terminal || !activeSession || completionRef.current === activeSession.id) return
     completionRef.current = activeSession.id
     const paired = activeSession.command === "tracker.pair"
-    const installed =
-      activeSession.command === "tracker.install" ||
-      activeSession.command === "tracker.ultimate.install"
-    const checkedUltimate = activeSession.command === "tracker.ultimate.check"
+    const installed = activeSession.command === "tracker.install"
     const checkedLighthouse = activeSession.command === "tracker.lighthouse.check"
     const validatedLighthouse =
       activeSession.command === "tracker.lighthouse.validate" ||
@@ -294,15 +270,11 @@ export function TrackerBindingPanel({
           ? "Lighthouse check finished. Review the tracking quality result."
           : checkedLighthouse
             ? "Base stations are on separate channels and both trackers are reporting."
-            : checkedUltimate
-              ? "Ultimate setup is ready."
-              : installed
-                ? displayedBackend === "ultimate"
-                  ? "Ultimate tracking support installed."
-                  : "Lighthouse tracking support installed."
-                : paired
-                  ? "Lighthouse tracker paired."
-                  : "Tracker sides saved."
+            : installed
+              ? "Lighthouse tracking support installed."
+              : paired
+                ? "Lighthouse tracker paired."
+                : "Tracker sides saved."
       )
     } else {
       toast.error(
@@ -310,13 +282,11 @@ export function TrackerBindingPanel({
           ? "Lighthouse validation failed. Review the results before recording."
           : checkedLighthouse
             ? "The base station check found problems. See the results in this step."
-            : checkedUltimate
-              ? "The Ultimate check found problems. See the results in this step."
-              : installed
-                ? "Tracking support failed to install. See the status in this step."
-                : paired
-                  ? "Tracker pairing failed. See the status in this step."
-                  : "Identifying the trackers failed. See the status in this step."
+            : installed
+              ? "Tracking support failed to install. See the status in this step."
+              : paired
+                ? "Tracker pairing failed. See the status in this step."
+                : "Identifying the trackers failed. See the status in this step."
       )
     }
     // Persist the terminal status for same-source feedback, but release an old
@@ -328,7 +298,7 @@ export function TrackerBindingPanel({
         return sessionBackend === backend ? (current ?? activeSession) : null
       })
     })
-  }, [terminal, activeSession, displayedBackend, current, toast, sessionBackend, backend])
+  }, [terminal, activeSession, current, toast, sessionBackend, backend])
 
   // Each run gets a fresh session id, so the completion guard needs no reset.
   async function launch(command: SetupCommand, args: Record<string, unknown> = {}) {
@@ -371,8 +341,7 @@ export function TrackerBindingPanel({
     }
   }
 
-  const label =
-    source === "quest" ? "Quest / WebXR" : source === "ultimate" ? "VIVE Ultimate" : "Lighthouse"
+  const label = source === "quest" ? "Quest / WebXR" : "Lighthouse"
   const actionsLocked = busy || blockedReason !== null || running
   const canAct = !actionsLocked && (sessionBackend === null || sessionBackend === backend)
   const expectedStationCount =
@@ -460,16 +429,14 @@ export function TrackerBindingPanel({
               <p className="flex items-center gap-2 text-sm text-white/60">
                 <Loader2 className="size-4 animate-spin" />
                 {installing
-                  ? `Installing ${displayedBackend === "ultimate" ? "Ultimate" : "Lighthouse"} tracking support…`
-                  : checkingUltimate
-                    ? "Checking Ultimate setup…"
-                    : checkingLighthouse
-                      ? "Looking for base stations and trackers…"
-                      : validatingLighthouse
-                        ? "Preparing the Lighthouse tracking check…"
-                        : pairing
-                          ? "Pairing…"
-                          : "Waiting for both trackers…"}
+                  ? "Installing Lighthouse tracking support…"
+                  : checkingLighthouse
+                    ? "Looking for base stations and trackers…"
+                    : validatingLighthouse
+                      ? "Preparing the Lighthouse tracking check…"
+                      : pairing
+                        ? "Pairing…"
+                        : "Waiting for both trackers…"}
               </p>
             )}
             <Button
@@ -485,17 +452,15 @@ export function TrackerBindingPanel({
         ) : (
           <p className={succeeded ? "text-xs text-emerald-300/80" : "text-xs text-red-300/80"}>
             {succeeded
-              ? checkingUltimate
-                ? "Ultimate setup passed."
-                : validatingLighthouse
-                  ? "Check finished. Review the result above before recording."
-                  : checkingLighthouse
-                    ? "Each base station is on its own channel and both trackers are reporting."
-                    : installing
-                      ? "Tracking support installed."
-                      : pairing
-                        ? "Tracker paired. Repeat for the other tracker if needed."
-                        : "Sides saved."
+              ? validatingLighthouse
+                ? "Check finished. Review the result above before recording."
+                : checkingLighthouse
+                  ? "Each base station is on its own channel and both trackers are reporting."
+                  : installing
+                    ? "Tracking support installed."
+                    : pairing
+                      ? "Tracker paired. Repeat for the other tracker if needed."
+                      : "Sides saved."
               : (current?.error ??
                 [...transcript].reverse().find((line) => /^\s*FAIL\b/.test(line)) ??
                 (activeLine?.startsWith("Saved to ") ? null : activeLine) ??
@@ -670,150 +635,6 @@ export function TrackerBindingPanel({
           </StepBody>
         ),
       },
-    ]
-  } else if (source === "ultimate") {
-    const u = readiness.ultimate
-    const partiallyPresent = u.pythonHid || u.apiCompatible || u.pinnedPyvut || u.udevReady
-    const dongleDone = u.operatorAccess && u.dongleConnected && u.endpointStatus === "accessible"
-    const identifyBlocker = !u.installed
-      ? "install Ultimate support"
-      : u.wifiConfig !== "valid"
-        ? "save the trackers' Wi-Fi settings"
-        : !u.dongleConnected
-          ? "connect the paired HTC wireless dongle"
-          : !u.operatorAccess
-            ? "give this user access to the dongle"
-            : u.endpointStatus !== "accessible"
-              ? "reconnect the dongle and close any other program using it"
-              : null
-    steps = [
-      {
-        key: "runtime",
-        title: "Software",
-        done: u.installed,
-        pending: "Install Ultimate support on this host",
-        body: (
-          <StepBody>
-            <div className="flex flex-wrap gap-1.5">
-              <ReadinessBadge tone={u.pinnedPyvut ? "ready" : "error"}>
-                {u.pinnedPyvut
-                  ? `Version ${u.pinnedRef.slice(0, 12)}`
-                  : "Unsupported pyvut version"}
-              </ReadinessBadge>
-              <ReadinessBadge tone={u.nativeDependencies && u.pythonHid ? "ready" : "error"}>
-                {u.nativeDependencies && u.pythonHid
-                  ? "HID libraries ready"
-                  : "HID libraries missing"}
-              </ReadinessBadge>
-              <ReadinessBadge tone={u.udevReady ? "ready" : "error"}>
-                {u.udevReady ? "USB rule ready" : "USB rule missing"}
-              </ReadinessBadge>
-            </div>
-            {u.issues.length > 0 && (
-              <p className="text-[11px] leading-relaxed text-red-300/75">
-                {u.issues.slice(0, 3).join(" · ")}
-              </p>
-            )}
-            {!u.installed && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="self-start"
-                onClick={() => launch("tracker.ultimate.install")}
-                disabled={!canAct}
-              >
-                {busy ? <Loader2 className="animate-spin" /> : <Download />}
-                {partiallyPresent ? "Repair Ultimate support" : "Install Ultimate support"}
-              </Button>
-            )}
-            {progressFor("runtime")}
-          </StepBody>
-        ),
-      },
-      {
-        key: "dongle",
-        title: "Dongle",
-        done: dongleDone,
-        pending: !u.dongleConnected
-          ? "Connect the paired HTC wireless dongle"
-          : !u.operatorAccess
-            ? "Give this user access to the dongle, then log in again"
-            : "Reconnect the dongle and close any other program using it",
-        body: (
-          <StepBody>
-            <ol className="flex flex-col gap-2">
-              <SetupStep number={1}>
-                On a Windows PC with SteamVR (null driver), VIVE Streaming Hub and the VIVE Ultimate
-                Tracker service, pair both trackers with the wireless dongle.
-              </SetupStep>
-              <SetupStep number={2}>
-                Map the whole work area from low and standing heights. Check that both trackers find
-                their place on the map. The map is saved on the trackers.
-              </SetupStep>
-              <SetupStep number={3}>Connect the dongle to this host.</SetupStep>
-            </ol>
-            <div className="flex flex-wrap gap-3">
-              <ExternalSetupLink href="https://business.vive.com/us/support/ultimate-tracker/category_howto/pairing-ultimate-tracker-with-the-dongle.html">
-                HTC pairing guide
-              </ExternalSetupLink>
-              <ExternalSetupLink href="https://business.vive.com/eu/support/ultimate-tracker/category_howto/creating-a-tracking-map.html">
-                HTC tracking-map guide
-              </ExternalSetupLink>
-            </div>
-            <div className="flex flex-wrap gap-1.5">
-              <ReadinessBadge tone={u.dongleConnected ? "ready" : "warning"}>
-                {u.dongleConnected ? "Dongle detected" : "Dongle not detected"}
-              </ReadinessBadge>
-              <ReadinessBadge tone={u.operatorAccess ? "ready" : "error"}>
-                {u.operatorAccess ? "USB access ready" : "USB access missing"}
-              </ReadinessBadge>
-              <ReadinessBadge
-                tone={
-                  u.endpointStatus === "accessible"
-                    ? "ready"
-                    : u.dongleConnected
-                      ? "error"
-                      : "neutral"
-                }
-              >
-                {u.endpointStatus === "accessible"
-                  ? "Dongle accessible"
-                  : u.endpointStatus === "permission-denied"
-                    ? "Dongle access denied"
-                    : u.endpointStatus === "missing"
-                      ? "Dongle interface missing"
-                      : "Dongle unavailable"}
-              </ReadinessBadge>
-            </div>
-            {!u.operatorAccess && (
-              <div className="flex flex-col gap-2 rounded-md border border-amber-400/20 bg-amber-400/[0.04] p-2.5">
-                <p className="text-[11px] leading-relaxed text-amber-200/75">
-                  To open the dongle, the user that runs Axol must be in the <code>dialout</code>{" "}
-                  group. Run this command in a terminal on the Host Computer. Then log out and back
-                  in (or restart), and reconnect the dongle. This step turns green when it&apos;s
-                  done.
-                </p>
-                <CopyableCommand command={'sudo usermod -aG dialout "$USER"'} />
-              </div>
-            )}
-          </StepBody>
-        ),
-      },
-      {
-        key: "wifi",
-        title: "Wi-Fi",
-        done: u.wifiConfig === "valid",
-        pending:
-          u.wifiConfig === "permissions-warning"
-            ? "Save the Wi-Fi settings again to fix the file permissions"
-            : "Save the trackers' Wi-Fi settings",
-        body: (
-          <StepBody>
-            <UltimateWifiPanel />
-          </StepBody>
-        ),
-      },
-      identifyStep("ultimate", identifyBlocker, u.installed),
     ]
   } else {
     const l = readiness.lighthouse
@@ -994,10 +815,7 @@ export function TrackerBindingPanel({
   }
   if (running && sessionBackend !== backend) {
     notices.push(
-      <Notice key="other">
-        {sessionBackend === "ultimate" ? "Ultimate" : "Lighthouse"} setup is still running. Finish
-        or stop it first.
-      </Notice>
+      <Notice key="other">Lighthouse setup is still running. Finish or stop it first.</Notice>
     )
   }
 

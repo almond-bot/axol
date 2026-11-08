@@ -260,13 +260,21 @@ def _in_bootloader(port: str, sysfs: Path) -> bool:
     return _usb_ids(_usb_device(port, sysfs)) == (BOOT_VID, BOOT_PID)
 
 
-def _bootloader_disk(port: str, sysfs: Path) -> str | None:
-    """The block device the bootrom at ``port`` exposes (its partition if any)."""
+def _bootloader_disk(port: str, sysfs: Path, *, whole_disk: bool = False) -> str | None:
+    """The FAT partition the bootrom at ``port`` exposes.
+
+    The disk shows up in sysfs before the kernel has read its partition
+    table, so a bare disk is not an answer yet: mounting ``/dev/sda`` in that
+    window fails (no FAT at sector 0, it is the MBR) and strands the hub in
+    its bootloader. ``whole_disk`` accepts the bare disk, for a bootrom that
+    presents one without a partition table.
+    """
     device = _usb_device(port, sysfs)
     for block in sorted(glob.glob(f"{device}/{port}:*/host*/target*/*/block/*")):
         name = os.path.basename(block)
-        part = Path(block) / f"{name}1"
-        return f"/dev/{name}1" if part.exists() else f"/dev/{name}"
+        if (Path(block) / f"{name}1").exists():
+            return f"/dev/{name}1"
+        return f"/dev/{name}" if whole_disk else None
     return None
 
 
@@ -284,9 +292,16 @@ def _copy_uf2(disk: str, image: Path) -> None:
     own_mount = None
     if not mounted:
         own_mount = tempfile.mkdtemp(prefix="axol-hub-uf2-")
-        result = subprocess.run(
-            ["mount", disk, own_mount], capture_output=True, text=True
-        )
+        # The device node can trail its sysfs entry by a moment, so a mount
+        # that fails right as the disk appears is retried before giving up.
+        deadline = time.monotonic() + 5
+        while True:
+            result = subprocess.run(
+                ["mount", disk, own_mount], capture_output=True, text=True
+            )
+            if result.returncode == 0 or time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
         if result.returncode != 0:
             os.rmdir(own_mount)
             raise HubFirmwareError(
@@ -340,9 +355,14 @@ def flash(port: str, *, image: Path = FIRMWARE_PATH, sysfs: Path = _SYSFS) -> in
                 ) from exc
             # Otherwise the hub most likely rebooted before the status stage.
         _wait_for(lambda: _in_bootloader(port, sysfs), 10, "the hub's bootloader")
-    disk = _wait_for(
-        lambda: _bootloader_disk(port, sysfs), 15, "the bootloader's USB disk"
-    )
+    try:
+        disk = _wait_for(
+            lambda: _bootloader_disk(port, sysfs), 15, "the bootloader's USB disk"
+        )
+    except HubFirmwareError:
+        disk = _bootloader_disk(port, sysfs, whole_disk=True)
+        if disk is None:
+            raise
     _copy_uf2(disk, image)
     try:
         hub = _wait_for(lambda: _hub_at(device), 20, "the hub to restart")

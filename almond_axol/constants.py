@@ -58,6 +58,12 @@ CAN_RESET_SCRIPT: Path = Path("/etc/almond-axol/can/reset_adapter.sh")
 CAN_MANTIS_LEFT = "can_mantis_l"
 CAN_MANTIS_RIGHT = "can_mantis_r"
 
+# Hard ceiling (Nm) on gripper output torque. A configured torque_limit above
+# it is rejected, and every POSITION_FORCE command is clamped to it (Python
+# drivers here, the realtime core's GRIPPER_MAX_TORQUE in serve.rs), so no
+# setting, CLI flag or code path can squeeze harder.
+GRIPPER_MAX_TORQUE = 5.0
+
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
 # Fields per joint slot in a realtime-core command tuple — what an
@@ -147,22 +153,21 @@ _URDF_FILES: dict[AxolModel, str] = {
 # of the parallel gripper and its wrist camera.
 _PARCEL_URDF = "axol_jelly_parcel.urdf"
 
-# Static body links the arms must not collide into, per version. pyroki fits
-# one capsule per link, so the body is split into capsule-friendly pieces
-# (the IK collision set, <ik_collision>): the shoulder bar, the head-camera
-# mount, the lift column's top plate and each of its sections. (IK keeps the
-# lifts fully raised, where the Jelly deck and the Ox cart's caster frame
-# are out of reach — see the URDFs' headers.)
+# Static body links the arms must not collide into, per version: the shoulder
+# bar, the head-camera mount, the lift column's top plate and each of its
+# sections, each with its own IK collision shapes (<ik_collision>; see
+# almond_axol.kinematics.collision). (IK keeps the lifts fully raised, where
+# the Ox cart's caster frame is out of reach — see the URDFs' headers.)
 _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
     AxolModel.CLASSIC: ("base", "s1"),
     AxolModel.STANDALONE: ("s1", "head"),
     # The lift column (base) and its top plate; the caster frame is out of
     # reach with the lift raised.
     AxolModel.OX_CART: ("base", "s1", "lift_plate", "head"),
-    # The mount's column (base) and its foot plate as six strips.
-    AxolModel.OWL: ("base", "s1", "head", *(f"foot_{i}" for i in range(6))),
-    # The lift column's sections and top plate, and the deck as three strips
-    # (in reach with the lift lowered).
+    # The mount's column (base) and its foot plate.
+    AxolModel.OWL: ("base", "s1", "head", "foot"),
+    # The lift column's sections and top plate, and the deck (in reach with
+    # the lift lowered).
     AxolModel.MOBILE: (
         "base",
         "s1",
@@ -170,7 +175,7 @@ _TORSO_LINKS: dict[AxolModel, tuple[str, ...]] = {
         "head",
         "lift_stage",
         "jelly",
-        *(f"deck_{i}" for i in range(3)),
+        "deck",
     ),
 }
 
@@ -190,24 +195,20 @@ def urdf_path(
     links carry per-part contact hulls (``<collision>``), masses and drive
     gains. IK loads it through :func:`almond_axol.kinematics.model.ik_urdf`,
     which freezes the joints it does not solve and collides the
-    capsule-friendly ``<ik_collision>`` pieces instead.
+    fitted ``<ik_collision>`` boxes and capsules instead.
     """
     if gripper == "parcel" and AxolModel(model) is AxolModel.MOBILE:
         return URDF_DIR / _PARCEL_URDF
     return URDF_DIR / _URDF_FILES[AxolModel(model)]
 
 
-# The Owl mount's foot plate sits under the upper arms' path, behind them:
-# its strip capsules overlap the upper arms' (fat) capsules at the arms'
-# ordinary poses even though the parts clear by ~5 cm, so it is kept off
-# the hard upper-arm guard (built for the upper arm swinging into the torso
-# cross-body); the soft collision cost still keeps the arms off it. The
-# Jelly deck's strips likewise: the deck rises toward the arms as the lift
-# lowers, and a hard stop there would pin an arm the lift brought down next
-# to it rather than let the soft cost ease it away.
-_UPPER_ARM_GUARD_EXEMPT = frozenset(
-    (*(f"foot_{i}" for i in range(6)), *(f"deck_{i}" for i in range(3)))
-)
+# The Owl mount's foot plate sits under the upper arms' path, behind them,
+# not where an upper arm swings into the torso cross-body (what the hard
+# upper-arm guard is for), so it is kept off the guard; the soft collision
+# cost still keeps the arms off it. The Jelly deck likewise: it rises toward
+# the arms as the lift lowers, and a hard stop there would pin an arm the
+# lift brought down next to it rather than let the soft cost ease it away.
+_UPPER_ARM_GUARD_EXEMPT = frozenset(("foot", "deck"))
 
 
 def upper_arm_guard_links(

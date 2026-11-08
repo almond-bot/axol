@@ -40,10 +40,10 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--jelly.lift BOOL` | Run Jelly's lift when its CAN bus is attached (default: `true`). Control panel: **Jelly lift**. |
 | `--jelly.lift_channel <ch\|null>` | CAN interface for the lift. Default `null` uses `can_alm_axol_c` if it exists, otherwise the wheel bus `can_alm_axol_b`. |
 | `--jelly.imu BOOL` | Use the carrier board's IMU to hold Jelly's heading while driving straight (default: `false`). |
-| `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
+| `--jelly.<field> VALUE` | Any other Jelly setting, such as `--jelly.max_speed` or the stick response curve `--jelly.stick_expo`. The full set is the `JellyConfig` dataclass, also shown under **Advanced** in the [control panel](/guides/control-panel#settings). |
 | `--axol.left_stiffness S` | Left arm stiffness, from `0` (fully hand-guidable) to `1` (default, the tuned production gains). A scalar (`0.8`) or one value per joint (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`). See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
-| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5). Use `right` for the right gripper. |
+| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper (default: 0.5, at most 5). Use `right` for the right gripper. |
 | `--axol.gripper TYPE` | Fitted gripper: `parallel` (default, the stock two-finger gripper) or `parcel` (the hinged-plate parcel gripper). Control panel: **Gripper** on the Robot tab. |
 | `--axol.<side>.<joint>.<gain> VALUE` | Override a per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left` or `right`, `<joint>` is `shoulder_1` to `wrist_3`, and `<gain>` is `kp`, `kd` and so on. |
 | `--teleop.position_multiplier FLOAT` | Scale hand position by this factor (default: `1.0`). At `2.0` the arm moves twice as far as your hand, which helps cover the arm's full reach. |
@@ -54,6 +54,10 @@ The table below lists the common flags. Every field of the nested `axol`, `teleo
 | `--teleop.reset_gravity_comp_kd FLOAT` | Damping (Nm·s/rad) while the arms hang limp after a contact stop (default: 0.25). Same as [`gravity-comp`](/cli/gravity-comp) `--kd`. |
 | `--teleop.teleop_torque_threshold FLOAT` | Contact limit (Nm) while you drive the arms (default: `0`, off). The control panel suggests `16.0`. |
 | `--teleop.hold_to_engage BOOL` | `true` makes each grip a hold-to-move switch for its arm (default: `false`, toggle). See [Engaging](#engaging). |
+| `--teleop.haptics BOOL` | Vibrate each engaged arm's controller when the arm pushes on something (default: `true`). See [Controller haptics](/operations/teleop#controller-haptics). |
+| `--teleop.haptic_near BOOL` | Also tick the controller as its arm gets close to Axol's body (default: `false`). |
+| `--teleop.haptic_torque FLOAT` | Unexpected joint torque (Nm) at which a controller starts to rumble (default: `6.0`). `0` turns the push vibration off. |
+| `--teleop.haptic_held_load BOOL` | Keep the weight of a held object from making the controller rumble (default: `true`). The squeeze in box mode still rumbles. |
 | `--teleop.park_to_zero BOOL` | On **Stop** or `Ctrl+C`, move the arms from rest on to the all-zero pose before releasing the motors (default: `true`). See [Stopping parks the arms](/operations/teleop). |
 | `--teleop.reengage {clutch,ramp}` | What an arm does when you [re-engage](/guides/vr-interface#re-engaging) it (default: `clutch`). See [Engaging](#engaging). |
 | `--teleop.box_mode BOOL` | Start in [box mode](/guides/vr-interface#box-mode) (default: `false`). Parcel gripper only. See [Box mode settings](#box-mode-settings). |
@@ -133,27 +137,29 @@ Raise a limit if normal moves trip it. Set it to `0` to turn the watchdog off.
 
 [Box mode](/guides/vr-interface#box-mode) needs the parcel gripper (`--axol.gripper parcel`). With the parallel gripper, box mode and its settings don't exist, and `--teleop.box_mode` is ignored with a warning.
 
-In box mode the grippers clamp a box between their flat faces, like two hands. One grip drives both arms as a pair, by position and by heading about the vertical. The other grip takes over the lead. While a grip leads, the thumbsticks set the grip width. Freeze the pair and the thumbsticks drive Jelly again (see [Driving with the box](/guides/vr-interface#driving-with-the-box)).
+In box mode the grippers clamp a box between their flat faces, like two hands. One grip drives both arms as a pair, by position and rotation. The other grip takes over the lead. While a grip leads, the right thumbstick's forward and back sets the grip width. The rest of the thumbsticks drive Jelly as usual, led or frozen (see [Driving with the box](/guides/vr-interface#driving-with-the-box)).
 
 To switch box mode on or off during a session, press the headset's **Box** button, click both thumbsticks together, or use the control panel's **Session settings** card. The switch engages right away.
 
 | Flag | Description |
 |---|---|
 | `--teleop.box_lead_hand` | Hand that leads when box mode turns on: `right` (default) or `left`. |
-| `--teleop.box_grasp` | `straight` (default, fingers point straight forward) or `flush` (each gripper turned inward onto the plate's chamfer). Click either stick while leading to switch. |
+| `--teleop.box_grasp` | `straight` (default, fingers point straight forward) or `flush` (each gripper turned inward onto the plate's chamfer). Tap either stick click while leading to switch. Hold the click to run the lift instead. |
 | `--teleop.box_flush_deg` | How far the flush grasp turns each gripper inward (default: `39`°). |
 | `--teleop.box_face_left` / `box_face_right` | Which side of each gripper faces the box: `auto` (default), `+x` or `-x`. |
 | `--teleop.box_grip_tilt` | Fixed inward yaw trim in degrees (default: `0`). A calibration value, not a live control. |
-| `--teleop.box_width_speed` | How fast the thumbsticks change the width (default: `0.08` m/s). |
-| `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0.02` / `0.70` m). The gripper bodies raise the minimum. The straight grasp stops at about 77 mm. |
+| `--teleop.box_width_speed` | How fast the right thumbstick changes the width (default: `0.08` m/s). |
+| `--teleop.box_width_min` / `box_width_max` | Width limits between the two contact faces (defaults: `0` / `0.70` m). The gripper bodies raise the minimum where needed. The parcel gripper's faces can close all the way together. |
 | `--teleop.box_align_duration` | Time to blend into the pair when box mode engages (default: `1.5` s). |
-| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `30`). Push either thumbstick forward or back to adjust it live. |
-| `--teleop.box_elbow_speed` | How fast the thumbsticks move the elbows (default: `30`°/s). |
-| `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and the thumbsticks don't move the elbows. |
+| `--teleop.box_elbow_out` | How far out the elbows are held, in degrees from straight down (default: `0`, tucked beside the body). Live control: **Elbows out**. |
+| `--teleop.box_stow_height` | How far below the shoulders **A** stows the box, in meters (default: `0.15`). |
+| `--teleop.box_stow_reach` | Closest the stow brings the box to the shoulders, in meters forward of them (default: `0.15`). The arms stop further out if they can't reach that close. |
+| `--teleop.box_stow_speed` | How fast the stow moves the box, in m/s (default: `0.12`). |
+| `--teleop.box_elbow_weight` | Strength of the elbow hint (default: `10`). `0` turns it off, and **Elbows out** does nothing. |
 | `--teleop.box_squeeze_lean` | Lean each gripper into the box as you squeeze, so the face presses evenly from root to tip (default: `1`; `0` is off). Live control: **Squeeze lean**. |
 | `--teleop.box_squeeze_trim` | Largest extra inward turn, in degrees, added while squeezing to square each face to the box (default: `5`; `0` is off). Live control: **Squeeze trim**. |
-| `--teleop.box_squeeze_force` | Clamp force cap per arm, in N (default: `0`, off). Live control: **Squeeze force**. |
-| `--teleop.box_wrist_torque` | Torque cap (Nm) on `wrist_2` and `wrist_3` in box mode (default: `5`; `0` is off). It also sets the automatic clamp force limit, about 39 N a side. |
+| `--teleop.box_squeeze_force` | Clamp force cap per arm, in N (default: `0`, off). With it off, nothing limits the clamp. Live control: **Squeeze force**. |
+| `--teleop.box_wrist_torque` | Torque cap (Nm) on `wrist_2` and `wrist_3` in box mode (default: `5`; `0` is off). It doesn't stop the width closing. Past about 39 N a side, the tip can unload onto the facet. |
 | `--teleop.box_squeeze_torque` | Torque cap (Nm) on the squeezing shoulder joints, `shoulder_2` and `shoulder_3` (default: `0`, off). It also slows the arms moving toward each other. Live control: **Squeeze cap**. |
 
 The wrist and shoulder torque caps work on hardware only.
@@ -174,7 +180,7 @@ The video runs in a separate process, so it doesn't slow the control loop. [`axo
 
 ## Jelly
 
-When Axol is on **Jelly** (an omni-wheel base with a telescoping lift), you can drive it from the headset thumbsticks. The left stick moves, the right stick turns, and the stick clicks run the lift. For the full controls see the [VR interface guide](/guides/vr-interface#jelly).
+When Axol is on **Jelly** (an omni-wheel base with a telescoping lift), you can drive it from the headset thumbsticks. The left stick moves. The right stick turns left and right, and runs the lift forward and back. For the full controls see the [VR interface guide](/guides/vr-interface#jelly).
 
 Teleop finds Jelly from the attached CAN devices:
 
@@ -182,9 +188,11 @@ Teleop finds Jelly from the attached CAN devices:
 - It runs the lift when its bus exists (`can_alm_axol_c`, or the shared wheel bus). If the lift bus is down at start, the lift is disabled with a warning and the wheels still drive.
 - [`can.setup`](/cli/can-setup) and the control panel's CAN discovery set these names. Teleop brings Jelly's CAN up on start, so you don't need [`can.enable`](/cli/can-enable).
 
-To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift false` (the control panel's **Jelly wheels** and **Jelly lift** switches). Jelly motion is never recorded into a dataset, and a policy never drives it.
+To leave attached hardware off, pass `--jelly.wheels false` or `--jelly.lift false` (the control panel's **Jelly wheels** and **Jelly lift** switches). A policy never drives Jelly. Data collection records Jelly only with [Record Jelly](/operations/data-collection#record-jelly) on.
 
 `--arms false` drives only Jelly. Teleop doesn't start the arms or open the Axol hub's CAN bus, so the arms don't need to be connected. Teleop does the same, with a warning, when the arms' CAN interfaces are missing and Jelly's are present.
+
+If the switches leave nothing to drive, teleop stops with an error that starts with `Nothing to drive.` It lists each switch and whether its hardware is attached. When a switch is off but its hardware is attached, the error names that switch and its flag. Turn it on, then start teleop again.
 
 <Note>
   This command takes its config through draccus. Field names use underscores, nested fields are separated by dots, `None` is `null`, and lists use `[a,b,c]`. See [Command configuration](/cli/configuration).

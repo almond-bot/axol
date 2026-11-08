@@ -181,6 +181,9 @@ class GuidedRunTest(unittest.IsolatedAsyncioTestCase):
             async def get_position(self) -> float:
                 return 0.0
 
+            async def set_direction_flag(self) -> bool:
+                return False
+
         async def calibrate(motor, joint, *args):  # noqa: ANN001, ANN002, ANN202
             return joint != Joint.WRIST_3  # WRIST_3 skipped by the operator
 
