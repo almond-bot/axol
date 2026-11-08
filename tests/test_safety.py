@@ -87,7 +87,13 @@ class FakeFirmware:
         elif op == 0x02:
             self.sw_enable, self.cause = True, 0
         elif op == 0x03:
-            if self.estop_ok and not self.latched and not self.rstart_polls:
+            # Firmware 0.5+ also refuses below 18 V (the supply_ok bit)
+            if (
+                self.estop_ok
+                and not self.latched
+                and not self.rstart_polls
+                and self.supply_mv >= 18000
+            ):
                 self.sw_enable, self.cause = True, 0
                 self.faults &= ~0x40
                 self.rstart_polls = 2
@@ -307,10 +313,25 @@ class RemoteStartTest(BoardTestCase):
         with self.assertRaisesRegex(SafetyError, "green on-switch"):
             await self.board.remote_start(timeout=0.3)
 
-    async def test_low_battery_is_named(self) -> None:
+    async def test_low_battery_refused_without_sending(self) -> None:
         self.fw.latched = False
-        self.fw.start_latches = False
         self.fw.supply_mv = 15000
+        with self.assertRaisesRegex(SafetyError, "too low"):
+            await self.board.remote_start()
+        self.assertNotIn(0x03, self.fw.received)
+
+    async def test_low_battery_after_the_check_is_named(self) -> None:
+        # The battery sags between the status check and the start: the board
+        # refuses the start itself (firmware 0.5), and the reason is the same.
+        self.fw.latched = False
+        orig = self.fw.handle
+
+        def sag_on_start(data: bytes) -> list[tuple[int, bytes]]:
+            if data[0] == 0x03:
+                self.fw.supply_mv = 15000
+            return orig(data)
+
+        self.fw.handle = sag_on_start  # type: ignore[method-assign]
         with self.assertRaisesRegex(SafetyError, "too low"):
             await self.board.remote_start(timeout=0.3)
 

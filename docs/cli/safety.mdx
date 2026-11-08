@@ -17,7 +17,7 @@ axol safety.power-cycle       # switch power off and back on to restart the moto
 |---|---|
 | `safety.status` | Prints whether power is on, the E-Stop is pressed, or a software stop is in force. It also prints the battery and output voltage and any fault. |
 | `safety.stop` | Cuts power to Axol and waits for the safety board to confirm. The arms drop. Power stays off until a start. |
-| `safety.start` | Switches power back on. It fails with the reason when the E-Stop is pressed or power does not come on. |
+| `safety.start` | Switches power back on. It fails with the reason when the E-Stop is pressed, the battery is low, or power does not come on. |
 | `safety.power-cycle` | Switches power off for a few seconds, then back on. This restarts every motor on Axol, which clears motor faults. The arms drop while power is off. It refuses to start when the E-Stop is pressed or the battery is low. |
 
 `--channel` picks the CAN interface. By default the commands use the lift's bus: `can_alm_axol_c` when it exists, otherwise `can_alm_axol_b`.

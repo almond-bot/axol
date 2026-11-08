@@ -386,13 +386,20 @@ class SafetyBoard:
 
         Clears a software stop and closes the latch. Returns at once when
         power is already on. Raises :class:`SafetyError` with the reason when
-        the board refuses (E-Stop pressed) or power does not come on.
+        the board refuses (E-Stop pressed, battery low) or power does not
+        come on.
         """
         status = await self.request_status()
         if status.output_on:
             return status
-        if status.estop_pressed or status.latched or status.update_locked:
-            # The board refuses a remote start in all three cases. Latched
+        if (
+            status.estop_pressed
+            or status.latched
+            or status.update_locked
+            or not status.supply_ok
+        ):
+            # The board refuses a remote start in all four cases (the supply
+            # check from firmware 0.5; older firmware tries and fails). Latched
             # with no output is a relay fault (or the green switch held down).
             raise SafetyError(explain_start_failure(status))
         await self._send(_OP_REMOTE_START)
