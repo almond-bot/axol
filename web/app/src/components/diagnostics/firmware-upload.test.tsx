@@ -34,7 +34,7 @@ describe("FirmwareUploadField", () => {
     vi.unstubAllGlobals()
   })
 
-  async function pick(file: File, board: "lift" | "mantis" = "lift") {
+  async function pick(file: File, board: "lift" | "safety" | "mantis" = "lift") {
     act(() => {
       root.render(
         <FirmwareUploadField
@@ -76,6 +76,27 @@ describe("FirmwareUploadField", () => {
     )
     expect(onUploading.mock.calls).toEqual([[true], [false]])
     expect(container.textContent).toContain("firmware 0.9")
+  })
+
+  it("sends a safety board file to the safety endpoint", async () => {
+    const fetchMock = vi.fn(async () =>
+      response({
+        path: "/home/axol/.almond/safety-firmware/almond_safety-0.3-abc.bin",
+        version: "0.3",
+        built: "Oct 28 2026 22:19:11",
+        buildId: "0xa42b2ef8",
+        size: 47352,
+      })
+    )
+    vi.stubGlobal("fetch", fetchMock)
+
+    await pick(new File([new Uint8Array([1, 2, 3])], "firmware.bin"), "safety")
+
+    const [url] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(url).toBe("https://robot.local:8001/api/safety/firmware")
+    expect(onChange).toHaveBeenLastCalledWith(
+      "/home/axol/.almond/safety-firmware/almond_safety-0.3-abc.bin"
+    )
   })
 
   it("sends a Mantis file to the Mantis endpoint", async () => {

@@ -16,6 +16,8 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { AppShell, PageSection } from "@/components/app-shell"
+import { SafetyControl } from "@/components/safety-control"
+import { motorFaultLabels } from "@/lib/safety-view"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
@@ -59,6 +61,7 @@ import {
   fetchCommands,
   fetchJellyStatus,
   fetchRobotStatus,
+  fetchSafetyStatus,
   fetchSessions,
   flattenFields,
   JELLY_DEVICE_LABELS,
@@ -977,9 +980,30 @@ export default function Diagnostics() {
     () => diagCommands.filter((c) => (c.section ?? "test") === "test"),
     [diagCommands]
   )
+  // The safety board helper only makes sense on a Jelly that has one.
+  const [safetyDetected, setSafetyDetected] = useState(false)
+  useEffect(() => {
+    if (!serverOk) return
+    let active = true
+    const check = () =>
+      fetchSafetyStatus()
+        .then((s) => {
+          if (active) setSafetyDetected(s.detected)
+        })
+        .catch(() => {})
+    void check()
+    const timer = setInterval(check, 5000)
+    return () => {
+      active = false
+      clearInterval(timer)
+    }
+  }, [serverOk])
   const helperCommands = useMemo(
-    () => diagCommands.filter((c) => c.section === "helper"),
-    [diagCommands]
+    () =>
+      diagCommands.filter(
+        (c) => c.section === "helper" && (c.id !== "safety.update" || safetyDetected)
+      ),
+    [diagCommands, safetyDetected]
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
@@ -1095,7 +1119,8 @@ export default function Diagnostics() {
           description:
             "Zero each selected joint of one arm against an end stop. Wrist 2 and " +
             "wrist 3 can use either end stop. Each step shows instructions and waits " +
-            "for Continue.",
+            "for Continue. On Jelly with a safety board, after the last joint it asks you " +
+            "to press Power-cycle Axol so the new wrist zeros take effect.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },
@@ -1189,6 +1214,7 @@ export default function Diagnostics() {
         title={tab === "" ? "Diagnostics" : `Diagnostics: ${tabLabel}`}
         wide
         actions={<Badge variant={stateBadge.variant}>{stateBadge.text}</Badge>}
+        safety={<SafetyControl enabled={serverOk} motorFaults={motorFaultLabels(robot, jelly)} />}
         host={{
           dot: serverOk ? "ok" : "err",
           label: serverOk ? storedHost || "Connected" : "Can't reach the robot",

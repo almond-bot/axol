@@ -1,0 +1,38 @@
+---
+title: "safety.update"
+description: "Update the safety board's firmware over CAN on a Jelly with a safety board."
+---
+
+Installs new firmware on Jelly's safety board over the lift's CAN bus. You don't need a USB cable.
+
+```bash
+axol safety.update                                  # show the running firmware
+axol safety.update --firmware build/firmware.bin    # install a build
+axol safety.update --firmware firmware.bin --force  # reinstall the same build
+```
+
+Use the build's `firmware.bin` file, not the `.uf2` or `.elf`. The update takes a few seconds:
+
+1. The command cuts power to Axol, like **Cut power**. The arms drop. The board takes an update only with power off.
+2. The new firmware is copied to the board while the current firmware keeps running. The board accepts it only if the whole file arrived, its checksum matches, and it is safety board firmware. Anything else is rejected and nothing changes.
+3. The board restarts into the new firmware on trial, with power locked off.
+4. When the new firmware reports the expected build, the command confirms it and the update becomes permanent.
+
+If the new firmware is never confirmed, the board goes back to the previous firmware within 15 s. This covers a crash, a hang, a power loss or a stopped command.
+
+- Power stays off after the update. Press **Restore power** or the green on-switch, or run `axol safety.start`.
+- Until the update finishes, nothing switches power on, not even the green on-switch.
+- Press Ctrl-C, or **Stop** in the control panel, during the transfer to cancel it. Nothing is installed.
+- If the board already runs that build, the command says so and does nothing. Pass `--force` to install it again.
+
+The lift board shares this bus. Each board answers only to its own messages and rejects the other's firmware, so updating one never changes the other.
+
+<Warning>
+  The board must already run safety board firmware 0.3 or newer, installed once over USB with its partition table. See the Almond Safety firmware README in the circuits-py repo. Older firmware doesn't answer this command and must be updated over USB.
+</Warning>
+
+<Note>
+  You can also update from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Helpers → Update safety board firmware**. Choose the `firmware.bin` on your computer, and the dialog uploads it and shows its version and build date. Then press **Run** to install it.
+
+  The command uses the lift's bus: `can_alm_axol_c` when it exists, otherwise `can_alm_axol_b`. Pass `--channel` to use a different interface.
+</Note>

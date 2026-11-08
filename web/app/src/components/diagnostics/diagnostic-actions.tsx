@@ -15,6 +15,7 @@ import {
   type FormValue,
 } from "@/lib/supervisor"
 import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetry"
+import { parsePrompt } from "@/lib/prompt"
 
 // Flags handled by the dashboard itself, never shown in a dialog:
 // - web_prompts: forced on so hands-on steps drive a Continue button.
@@ -144,6 +145,7 @@ export function ActiveRunPanel({
   onContinue: () => void
   onStop: () => void
 }) {
+  const parsed = prompt ? parsePrompt(prompt) : null
   return (
     <Card
       className={cn(
@@ -158,18 +160,18 @@ export function ActiveRunPanel({
           <Elapsed since={since} />
         </span>
       </div>
-      {prompt ? (
+      {parsed ? (
         <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-2.5">
           <span className="flex items-start gap-1.5 text-xs leading-relaxed text-amber-100/90">
             <Hand className="mt-0.5 size-3.5 shrink-0 text-amber-300" />
-            {prompt}
+            {parsed.text}
           </span>
           <Button
             size="sm"
             className="self-start bg-amber-400 text-black hover:bg-amber-300"
             onClick={onContinue}
           >
-            Continue <ArrowRight />
+            {parsed.button} <ArrowRight />
           </Button>
         </div>
       ) : (
@@ -352,9 +354,9 @@ export function ActionDialog({
     () => allFields.find((f) => f.key === "joints" && !hidden.has("joints")),
     [allFields, hidden]
   )
-  // `--firmware` (lift.update, mantis.update) is a file the operator picks on
-  // this machine: it is uploaded to the host first and the stored path
-  // becomes the arg.
+  // `--firmware` (lift.update, safety.update, mantis.update) is a file the
+  // operator picks on this machine: it is uploaded to the host first and the
+  // stored path becomes the arg.
   const firmwareField = useMemo(
     () => allFields.find((f) => f.key === "firmware" && !hidden.has("firmware")),
     [allFields, hidden]
@@ -518,15 +520,16 @@ export function ActionDialog({
 /** The board each firmware-update command's `--firmware` file is for. */
 const FIRMWARE_BOARDS: Record<string, FirmwareBoard> = {
   "lift.update": "lift",
+  "safety.update": "safety",
   "mantis.update": "mantis",
 }
 
 /**
  * File picker for a command's `--firmware` argument: uploads the chosen file
  * to the serve host, which validates it (that board's firmware.bin, so the
- * lift's file is refused for Mantis and the other way round) and stores it;
- * the stored path is what the run receives. Clearing or a failed upload
- * leaves the argument unset (the command then only reports).
+ * lift's file is refused for the safety board or Mantis, and the other way
+ * round) and stores it; the stored path is what the run receives. Clearing or
+ * a failed upload leaves the argument unset (the command then only reports).
  */
 export function FirmwareUploadField({
   board = "lift",
