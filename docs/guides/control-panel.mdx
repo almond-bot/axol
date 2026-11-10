@@ -146,6 +146,8 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 | Red | Unreachable or reporting a fault. Operations on that device can't start until you fix it. Sim teleop still works. |
 | Grey | Unknown, because a running operation is using the bus. |
 
+When you switch Axol off, its squares turn red. Switch it back on and they turn green within a few seconds. You don't need to press **Disconnect** and **Connect**.
+
 **If motor power is cut.** If you cut motor power during a run, for example with the E-Stop, the run stops with `motor power lost`. Usually the panel then releases the robot without any action from you. If it can't confirm the motors are off yet, it shows a lock message:
 
 1. Release the E-Stop to turn motor power back on.
@@ -161,6 +163,8 @@ To change which CAN interface each side uses, go to **Axol settings → Robot** 
 ### Jelly
 
 The **Jelly** card has one **Connect** button. It connects the wheels and the lift, whichever are plugged in. **Disconnect** drops both. A row each for the wheels and the lift shows its status. Jelly is driven together with Axol, so it isn't part of the device choice.
+
+When you switch Jelly off, the wheels and the lift show as not answering. Switch it back on and they reconnect within a few seconds.
 
 While the lift is connected, the card shows the battery charge and pack voltage. The icon is green above 25%, amber at 25% and below, red at 10% and below, and blue while charging.
 

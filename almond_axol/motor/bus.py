@@ -119,13 +119,22 @@ class CanBus:
     passive :class:`~almond_axol.motor.BusObserver`) out of that process-wide
     record: it cannot stall, and opening or closing it must not clear a stall
     the channel's actual owner reported.
+
+    ``quiet=True`` logs the bus's lifecycle (proxy start/close, a dead-bus
+    report) at debug level. It is for short-lived probes that are expected to
+    find the bus dead, such as the control panel checking every few seconds
+    whether a powered-off robot is back.
     """
 
     _publishes_stall = True
+    _quiet = False
 
-    def __init__(self, channel: str, *, publishes_stall: bool = True) -> None:
+    def __init__(
+        self, channel: str, *, publishes_stall: bool = True, quiet: bool = False
+    ) -> None:
         self._channel = channel
         self._publishes_stall = publishes_stall
+        self._quiet = quiet
         # A fresh bus has observed no stall. Without this reset a bus that was
         # abandoned open on a dead event loop (a failed teardown that kept the
         # lockout's buses) leaves its channel flagged for the rest of the
@@ -146,6 +155,12 @@ class CanBus:
         # Lifecycle, so a send on an unusable bus can say *why* it is
         # unusable: never started, still starting, closed, or proxy died.
         self._state = "unopened"
+
+    def _log_info(self, msg: str, *args: object) -> None:
+        (_logger.debug if self._quiet else _logger.info)(msg, *args)
+
+    def _log_warning(self, msg: str, *args: object) -> None:
+        (_logger.debug if self._quiet else _logger.warning)(msg, *args)
 
     @property
     def channel(self) -> str:
@@ -189,7 +204,7 @@ class CanBus:
             return
         self._stalled = True
         self._publish_stall(True)
-        _logger.warning(
+        self._log_warning(
             "CAN %s: %s — the motors are most likely unpowered (e-stop?); "
             "commands stay off until the bus is reopened",
             self._channel,
@@ -247,7 +262,7 @@ class CanBus:
             raise can.CanInitializationError(
                 f"could not start axol-rt proxy for {self._channel}: {exc}"
             ) from exc
-        _logger.info(
+        self._log_info(
             "starting axol-rt proxy for %s (pid %d, %s)",
             self._channel,
             self._proc.pid,
@@ -291,7 +306,7 @@ class CanBus:
             await self.close()
             raise can.CanInitializationError(reason)
         self._state = "open"
-        _logger.info("axol-rt proxy for %s ready", self._channel)
+        self._log_info("axol-rt proxy for %s ready", self._channel)
 
     def _unavailable_reason(self) -> str:
         """Explain why the bus cannot send right now, by lifecycle state."""
@@ -377,7 +392,7 @@ class CanBus:
         if not died_before_close:
             self._closed_reason = None
         if was_open:
-            _logger.info("axol-rt proxy for %s closed", self._channel)
+            self._log_info("axol-rt proxy for %s closed", self._channel)
         if external_cancel is not None:
             raise external_cancel
 
@@ -658,7 +673,7 @@ class CanBus:
             if self._state != "closed":
                 # Unexpected: the proxy went away under a live bus (not a
                 # close() we initiated). Say so now, not at the next send.
-                _logger.warning("%s", self._closed_reason)
+                self._log_warning("%s", self._closed_reason)
             self._ready.set()
         except asyncio.CancelledError:
             raise

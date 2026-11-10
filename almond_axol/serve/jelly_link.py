@@ -26,6 +26,10 @@ that opens the Jelly buses starts, :meth:`JellyLink.release` closes every
 connected device (marking it ``busy``) and :meth:`JellyLink.reacquire`
 reopens them when the task ends — the same handover the arm link performs.
 
+A connected device whose bus dies (Jelly switched off) keeps its state and
+reports the device unreachable; its ping loop then probes the bus every
+:data:`_REOPEN_INTERVAL_S` and reopens it once the device answers again.
+
 The link runs on its own asyncio event loop in a daemon thread so the CAN
 reader loops never touch uvicorn's loop.
 """
@@ -79,6 +83,15 @@ _PING_TIMEOUT_S = 0.5
 _LIFT_FRESH_S = 3.0
 # Same for the power frame (GET_POWER polled every second).
 _POWER_FRESH_S = 3.0
+
+# How often a connected device whose bus died checks whether Jelly answers
+# again, and how long one check waits for an answer. The bus dies when Jelly is
+# switched off: the frames nobody acknowledges back up until the proxy declares
+# the bus stalled and exits (or the adapter goes away with the power). Without
+# a reopen the tile stays unreachable after power returns until the operator
+# disconnects and reconnects.
+_REOPEN_INTERVAL_S = 2.0
+_PROBE_TIMEOUT_S = 0.5
 
 # Damiao feedback (MST) ID = 0x10 + motor ID, the factory convention Jelly's
 # wheels follow (see ``almond_axol.motor.motor.make_driver``).
@@ -146,6 +159,40 @@ class _WheelsDevice:
             for wheel in WHEELS
         }
         self._locks = {wheel.motor_id: asyncio.Lock() for wheel in WHEELS}
+
+    @property
+    def bus_dead(self) -> bool:
+        """True when the bus was opened and its proxy has since died."""
+        return self._bus is not None and not self._bus.is_open
+
+    async def probe(self) -> bool:
+        """True when any wheel answers a status read on a short-lived bus."""
+        try:
+            async with CanBus(
+                wheels_channel(), publishes_stall=False, quiet=True
+            ) as bus:
+                for wheel in WHEELS:
+                    if not bus.is_open:
+                        return False
+                    motor = DamiaoMotor(
+                        bus,
+                        wheel.motor_id,
+                        feedback_id=_DAMIAO_FEEDBACK_BASE + wheel.motor_id,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            motor.get_error_code(), timeout=_PROBE_TIMEOUT_S
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - silence means "not back yet"
+                        continue
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - interface gone, proxy failed
+            _logger.debug("Jelly wheels probe failed: %s", exc)
+        return False
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -251,6 +298,35 @@ class _LiftDevice:
         await self._bus._send(_ID_CMD, bytes([_OP_SET_RATE, 0x00, 0x00]))
         await self._bus._send(_ID_CMD, bytes([_OP_GET_STATUS]))
         await self._bus._send(_ID_CMD, bytes([_OP_GET_POWER]))
+
+    @property
+    def bus_dead(self) -> bool:
+        """True when the bus was opened and its proxy has since died."""
+        return self._bus is not None and not self._bus.is_open
+
+    async def probe(self) -> bool:
+        """True when the jelly_legs board answers GET_STATUS on a short-lived bus."""
+        answered = asyncio.Event()
+
+        def on_message(msg) -> None:  # noqa: ANN001 - can.Message, typed lazily
+            if msg.arbitration_id == _ID_STATUS and len(msg.data) >= 6:
+                answered.set()
+
+        try:
+            bus = CanBus(lift_channel(), publishes_stall=False, quiet=True)
+            bus._add_listener(on_message)
+            async with bus:
+                # Quiet the broadcast first, as open() does: a board that has
+                # just booted starts it on the first frame it sees.
+                await bus._send(_ID_CMD, bytes([_OP_SET_RATE, 0x00, 0x00]))
+                await bus._send(_ID_CMD, bytes([_OP_GET_STATUS]))
+                await asyncio.wait_for(answered.wait(), timeout=_PROBE_TIMEOUT_S)
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - silence, interface gone
+            _logger.debug("Jelly lift probe failed: %s", exc)
+        return False
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -553,18 +629,64 @@ class JellyLink:
                 link.bus_may_be_open = False
 
     async def _ping_loop(self, link: _DeviceLink) -> None:
+        lost = False
         while True:
             start = self._loop.time()
+            interval = _PING_INTERVAL_S
             try:
-                await link.device.ping()
-                with self._lock:
-                    link.last_ping = time.time()
+                if link.device.bus_dead:
+                    interval = _REOPEN_INTERVAL_S
+                    if not lost:
+                        lost = True
+                        _logger.warning(
+                            "Jelly %s: CAN bus %s stopped (Jelly switched off?); "
+                            "reconnecting when it answers again",
+                            link.name,
+                            link.device.channel,
+                        )
+                    if await self._reopen_if_answering(link):
+                        lost = False
+                        _logger.info(
+                            "Jelly %s: CAN bus %s reconnected",
+                            link.name,
+                            link.device.channel,
+                        )
+                else:
+                    await link.device.ping()
+                    with self._lock:
+                        link.last_ping = time.time()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
                 _logger.debug("Jelly %s ping error: %s", link.name, exc)
             elapsed = self._loop.time() - start
-            await asyncio.sleep(max(0.0, _PING_INTERVAL_S - elapsed))
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+    async def _reopen_if_answering(self, link: _DeviceLink) -> bool:
+        """Reopen a dead bus once its interface is up and the device answers.
+
+        A queue still holding frames means nothing on the wire acknowledges
+        them yet (Jelly is still off), so no probe is queued behind them.
+        Returns True when the bus was reopened.
+        """
+        from ..cli.can.setup import iface_up, tx_backlog
+
+        channel = wheels_channel() if link.name == "wheels" else lift_channel()
+        if not iface_up(channel):
+            return False
+        if await asyncio.to_thread(tx_backlog, channel):
+            return False
+        if not await link.device.probe():
+            return False
+        async with self._lifecycle_lock:
+            with self._lock:
+                connected = link.state == STATE_CONNECTED
+            # A disconnect or a release meanwhile closed this bus on purpose.
+            if not connected or not link.device.bus_dead:
+                return False
+            await link.device.close()
+            await link.device.open()
+        return True
 
     # -- CAN bring-up -------------------------------------------------------
 
