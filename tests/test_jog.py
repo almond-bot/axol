@@ -30,6 +30,7 @@ from almond_axol.jog.sim import (
     body_velocity,
 )
 from almond_axol.robot.jelly import JellyConfig
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 DT = 0.02  # Jelly's 50 Hz command period
 

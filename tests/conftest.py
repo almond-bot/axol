@@ -5,44 +5,13 @@ from collections.abc import Callable
 import pytest
 
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
+from tests.safety_isolation import NoSafetyBoard
 
 
 @pytest.fixture(autouse=True)
 def _isolated_libsurvive_config(tmp_path, monkeypatch) -> None:
     """Keep survive-cli launches in tests from creating ~/.config/libsurvive."""
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
-
-
-class _NoSafetyBoard:
-    """Inert stand-in for ``serve.safety_link.SafetyLink``: a Jelly without one."""
-
-    def status(self) -> dict[str, object]:
-        return {
-            "channel": "",
-            "connected": False,
-            "paused": False,
-            "detected": False,
-            "reachable": False,
-            "ageSeconds": None,
-            "status": None,
-            "error": None,
-        }
-
-    def stop(self) -> dict[str, object]:
-        from almond_axol.robot.safety import SafetyError
-
-        raise SafetyError("This Jelly has no safety board.")
-
-    start = stop
-
-    def pause(self) -> None:
-        pass
-
-    def resume(self) -> None:
-        pass
-
-    def shutdown(self) -> None:
-        pass
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +25,7 @@ def _no_live_safety_link(monkeypatch) -> None:
     """
     from almond_axol.serve import app as app_module
 
-    monkeypatch.setattr(app_module, "SafetyLink", _NoSafetyBoard)
+    monkeypatch.setattr(app_module, "SafetyLink", NoSafetyBoard)
 
 
 @pytest.fixture

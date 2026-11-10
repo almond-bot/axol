@@ -22,6 +22,7 @@ from almond_axol.robot.mantis_firmware import (
     parse_image,
 )
 from almond_axol.serve.commands import COMMANDS
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_lift_firmware import FakeBoard, _image, _no_sleep
 from tests.test_serve_session_reservation import _Manager, _Runner, _test_app
 

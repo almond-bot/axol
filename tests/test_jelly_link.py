@@ -39,6 +39,7 @@ from almond_axol.serve.robot_link import (
     STATE_ERROR,
 )
 from almond_axol.serve.runner import OperationRunner
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import (
     _hub_state,
     _Jelly,

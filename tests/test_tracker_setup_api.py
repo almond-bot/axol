@@ -18,6 +18,7 @@ from almond_axol.tracker.config import (
     load_tracker_config,
     save_tracker_config,
 )
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 _IDENTITY = {"pos": [0.0, 0.0, 0.0], "quat": [0.0, 0.0, 0.0, 1.0]}
 

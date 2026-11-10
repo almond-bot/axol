@@ -11,6 +11,7 @@ from almond_axol.serve import app as app_module
 from almond_axol.serve.commands import _format_value, build_argv, command_specs
 from almond_axol.serve.introspect import build_argparse_schema, build_schema
 from almond_axol.serve.settings import SettingsStore
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 
 @dataclass

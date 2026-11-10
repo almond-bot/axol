@@ -62,7 +62,7 @@ Some Jelly builds include a safety board. On those, you can also cut power from 
 - The green on-switch always switches power back on, even after a software stop.
 - Nothing switches power on while the E-Stop is pressed. Release it first.
 - A motor fault clears only when the motor restarts. **Power-cycle motors** switches power off for a few seconds and back on. Support the arms first, because they drop. Stop any running operation before you power-cycle.
-- After guided zeroing (**Set zero position → Guided**), Axol restarts its wrist motors on its own so the new zeros take effect. Support the arms when the step asks.
+- Guided zeroing (**Set zero position → Guided**) ends with a power cycle so the new wrist zeros take effect. Support both arms, then press **Power-cycle Axol**.
 - A stop during a power cycle keeps power off.
 
 <Warning>

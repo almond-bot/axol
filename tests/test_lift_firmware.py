@@ -23,6 +23,7 @@ from almond_axol.robot.lift_firmware import (
     LiftFirmwareUpdater,
 )
 from almond_axol.serve.commands import COMMANDS
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import _Manager, _Runner, _test_app
 
 
