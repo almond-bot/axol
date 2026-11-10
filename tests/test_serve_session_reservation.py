@@ -1841,11 +1841,12 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             link._arms = [arm]
             link._ping_task = None
             link._sample_task = None
-            # The observer publish/watch loops are exercised elsewhere;
+            # The publish and watch loops are exercised elsewhere;
             # finished placeholders keep _open_and_start from spawning them.
             link._publish_task = asyncio.get_running_loop().create_future()
             link._publish_task.set_result(None)
             link._observer_watch_task = link._publish_task
+            link._command_watch_task = link._publish_task
             link._sync_task = None
             link._last_ping = time.time()
             link._loop = asyncio.get_running_loop()
@@ -1882,6 +1883,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
             link._sync_task = None
             link._publish_task = None
             link._observer_watch_task = None
+            link._command_watch_task = None
             link._lifecycle_lock = asyncio.Lock()
             link._arms = [arm]
 
@@ -1911,6 +1913,7 @@ class OperationRunnerOwnershipTest(unittest.TestCase):
         link._sync_task = None
         link._publish_task = None
         link._observer_watch_task = None
+        link._command_watch_task = None
         link._lifecycle_lock = asyncio.Lock()
         link._arms = [failed, healthy]
 

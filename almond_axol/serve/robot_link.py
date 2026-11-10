@@ -93,6 +93,15 @@ _EXTERNAL_CMD_FRESH_S = 1.0
 # drop re-enumerates it) and tries to reopen it once the interface is back up.
 _OBSERVER_REOPEN_INTERVAL_S = 1.0
 
+# How often a connected link whose command bus died checks whether the motors
+# answer again, and the per-motor timeout of that check. The bus dies when the
+# robot is switched off: the first unanswered ping makes the proxy report a
+# dead bus and exit (see ``CanBus.stalled``). Without a reopen, the panel shows
+# every motor unreachable after power returns until the operator disconnects
+# and reconnects.
+_COMMAND_REOPEN_INTERVAL_S = 2.0
+_COMMAND_PROBE_TIMEOUT_S = 0.3
+
 # State machine surfaced to the UI.
 #   disconnected -> connecting -> connected
 #   connected    -> busy (a task owns the bus)  -> connected
@@ -273,6 +282,46 @@ class _ArmLink:
         self._bus = None
         self._motors = {}
         self._locks = {}
+
+    @property
+    def bus_dead(self) -> bool:
+        """True when the command bus was opened and its proxy has since died.
+
+        The proxy exits on a dead-bus report (the motors lost power) or when
+        its interface goes away. A bus that was never opened, or was closed on
+        purpose (released to a task), is not dead.
+        """
+        return self._bus is not None and not self._bus.is_open
+
+    async def probe(self, joints: list[Joint]) -> bool:
+        """True when any motor in ``joints`` answers a status read.
+
+        Uses a short-lived bus of its own, the same check ``can.setup`` runs
+        after bring-up. It sends one read at a time and stops at the first
+        answer, or as soon as the proxy reports the bus dead (the hub firmware
+        reports the first unanswered frame), so a powered-off arm costs one
+        frame per check.
+        """
+        try:
+            async with CanBus(self.channel, publishes_stall=False, quiet=True) as bus:
+                for joint in joints:
+                    if not bus.is_open:
+                        return False
+                    try:
+                        await asyncio.wait_for(
+                            Motor(bus, joint).get_error_code(),
+                            timeout=_COMMAND_PROBE_TIMEOUT_S,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - silence means "not back yet"
+                        continue
+                    return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - interface gone, proxy failed
+            _logger.debug("probe of %s failed: %s", self.channel, exc)
+        return False
 
     async def open_observer(self, joints: list[Joint]) -> None:
         """Start the passive observer socket.
@@ -514,6 +563,9 @@ class RobotLink:
         # Reopens an observer whose proxy died under it; same lifetime as the
         # publish loop it keeps fed.
         self._observer_watch_task: asyncio.Task[Any] | None = None
+        # Reopens a command bus whose proxy died while the link was connected
+        # (the robot was switched off), once a motor answers again.
+        self._command_watch_task: asyncio.Task[Any] | None = None
         # One-shot best-effort observer range sync, fired on connect/reacquire.
         self._sync_task: asyncio.Task[Any] | None = None
         # A caller-side Future timeout only requests cancellation; the loop
@@ -899,6 +951,10 @@ class RobotLink:
                 self._observer_watch_task = asyncio.ensure_future(
                     self._observer_watch_loop()
                 )
+            if self._command_watch_task is None or self._command_watch_task.done():
+                self._command_watch_task = asyncio.ensure_future(
+                    self._command_watch_loop()
+                )
             # Range sync happens off the connect path: with the motors powered
             # off, each read runs into its timeout, and 16 motors of that would
             # stall connect for many seconds.
@@ -976,6 +1032,8 @@ class RobotLink:
             self._publish_task = None
             await self._cancel(self._observer_watch_task, failures)
             self._observer_watch_task = None
+            await self._cancel(self._command_watch_task, failures)
+            self._command_watch_task = None
             for arm in self._arms:
                 await arm.close_observer()
             if not failures:
@@ -1140,6 +1198,81 @@ class RobotLink:
                         continue
                 lost.discard(arm.channel)
                 _logger.info("passive observer for %s reopened", arm.channel)
+
+    async def _command_watch_loop(self) -> None:
+        """Reopen a command bus that died while the link was connected.
+
+        Switching the robot off kills the link's command bus: the first ping
+        nothing answers makes the proxy report a dead bus and exit, and an
+        arm hub that loses power takes its interface with it. Every motor then
+        reads unreachable, which is right while the power is off, but nothing
+        brought the bus back once it returned. This checks every
+        :data:`_COMMAND_REOPEN_INTERVAL_S`: when the interface is up and a
+        motor answers a probe, it opens a fresh bus and the ping loop picks it
+        up on its next sweep.
+
+        Only while ``connected``: in ``busy`` the buses are closed on purpose
+        and belong to a task. A queue still holding frames means nothing on the
+        wire is acknowledging them yet, so the probe waits for it to drain
+        rather than queue more behind it.
+        """
+        from ..cli.can.setup import iface_up, tx_backlog
+
+        lost: set[str] = set()
+        while True:
+            await asyncio.sleep(_COMMAND_REOPEN_INTERVAL_S)
+            with self._lock:
+                connected = self._state == STATE_CONNECTED
+            if not connected:
+                continue
+            for arm in self._arms:
+                if not arm.bus_dead:
+                    lost.discard(arm.channel)
+                    continue
+                if arm.channel not in lost:
+                    lost.add(arm.channel)
+                    _logger.warning(
+                        "%s arm: CAN bus %s stopped (robot switched off?); "
+                        "reconnecting when the motors answer again",
+                        arm.side,
+                        arm.channel,
+                    )
+                if not iface_up(arm.channel):
+                    continue
+                if await asyncio.to_thread(tx_backlog, arm.channel):
+                    continue
+                joints = self._joints()
+                # Fresh command traffic from another process (``axol teleop``
+                # from a terminal) already shows the motors are powered, and a
+                # probe would only add reads to its bus.
+                driven = arm.observer is not None and bool(
+                    arm.observer.commanded_joints(_EXTERNAL_CMD_FRESH_S)
+                )
+                if not driven and not await arm.probe(joints):
+                    continue
+                async with self._lifecycle_lock:
+                    with self._lock:
+                        connected = self._state == STATE_CONNECTED
+                    # A disconnect or a release meanwhile closed this bus on
+                    # purpose; leave it to whoever owns it now.
+                    if not connected or not arm.bus_dead:
+                        continue
+                    try:
+                        await arm.close()
+                        await arm.open(joints)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - retried next tick
+                        _logger.debug("reopening %s failed: %s", arm.channel, exc)
+                        continue
+                    # The motors may have been off at connect, leaving the
+                    # observer on its default decode ranges.
+                    if self._sync_task is None or self._sync_task.done():
+                        self._sync_task = asyncio.ensure_future(
+                            self._sync_observer_ranges()
+                        )
+                lost.discard(arm.channel)
+                _logger.info("%s arm: CAN bus %s reconnected", arm.side, arm.channel)
 
     # -- CAN bring-up -------------------------------------------------------
 
