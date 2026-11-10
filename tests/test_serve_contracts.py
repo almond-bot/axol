@@ -115,6 +115,16 @@ def test_fastapi_read_only_routes_without_hardware(tmp_path: Path) -> None:
         assert client.post("/api/op/start", json={"op": "missing"}).status_code == 400
         assert client.post("/api/run", json={"command": "missing"}).status_code == 400
         assert client.get("/api/sessions/missing/log").status_code == 404
+        # A dev checkout is not updatable, with or without a channel switch;
+        # an unknown channel never reaches the updater.
+        for body in (None, {"channel": "main"}):
+            refused = client.post("/api/update/start", json=body)
+            assert refused.status_code == 409
+            assert refused.json() == {"error": "not a release install"}
+        assert (
+            client.post("/api/update/start", json={"channel": "beta"}).status_code
+            == 422
+        )
         assert (
             client.get("/assets/bundle.js")
             .headers["cache-control"]

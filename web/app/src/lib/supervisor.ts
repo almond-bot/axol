@@ -220,17 +220,32 @@ export async function fetchInfo(): Promise<ServerInfo> {
 
 export type UpdateState = "idle" | "updating" | "error"
 
+/**
+ * Where the robot software comes from: the latest release (PyPI, the
+ * installer's default) or the head of the main branch.
+ */
+export type UpdateChannel = "release" | "main"
+
 /** Current step while an update is applying; null when not updating. */
 export type UpdatePhase = "upgrading" | "provisioning" | "restarting" | "rebooting"
 
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
   enabled: boolean
+  /** The channel the install follows. Absent on older hosts (release only). */
+  channel?: UpdateChannel
   /** Installed release version, e.g. "0.1.2". */
   version: string | null
+  /** Installed git commit; null for a PyPI release install. Absent on older hosts. */
+  commit?: string | null
   /** Latest release version (highest vX.Y.Z tag), or null until first resolved/offline. */
   remoteVersion: string | null
-  /** A release with a higher version than the installed one exists. */
+  /** Head commit of main, or null until first resolved/offline. Absent on older hosts. */
+  remoteCommit?: string | null
+  /**
+   * Newer code exists on the installed channel: a higher release version, or
+   * (on main) a different head commit.
+   */
   updateAvailable: boolean
   /** Safe to restart now (no op running). */
   idle: boolean
@@ -258,9 +273,19 @@ export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
   return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
 }
 
-/** Trigger the on-demand upgrade; the server restarts onto new code when idle. */
-export async function startUpdate(): Promise<{ started: boolean }> {
-  return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
+/**
+ * Trigger the on-demand upgrade; the server restarts onto new code when idle.
+ * Pass `channel` to switch between the latest release and main.
+ */
+export async function startUpdate(channel?: UpdateChannel): Promise<{ started: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/update/start"), {
+      method: "POST",
+      ...(channel
+        ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channel }) }
+        : {}),
+    })
+  )
 }
 
 /**

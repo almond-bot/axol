@@ -188,6 +188,16 @@ class SettingsUpdateRequest(BaseModel):
     advanced: dict[str, Any] | None = None
 
 
+class UpdateStartRequest(BaseModel):
+    """Which update to apply.
+
+    ``channel`` switches the install to the latest release or to the main
+    branch; omitted, the update stays on the installed channel.
+    """
+
+    channel: Literal["release", "main"] | None = None
+
+
 class OpStopRequest(BaseModel):
     """What a Stop does with the arms (teleop only).
 
@@ -1392,9 +1402,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         return await updater.status(force=refresh)
 
     @app.post("/api/update/start")
-    async def update_start() -> JSONResponse:
-        """Apply a user-initiated upgrade; the server restarts onto new code."""
-        started, reason = updater.start()
+    async def update_start(req: UpdateStartRequest | None = None) -> JSONResponse:
+        """Apply a user-initiated upgrade; the server restarts onto new code.
+
+        An empty body updates within the installed channel; ``channel``
+        switches between the latest release and main.
+        """
+        started, reason = updater.start(req.channel if req is not None else None)
         if not started:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
