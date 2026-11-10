@@ -7,14 +7,15 @@ Changes a motor's CAN ID and saves it to the motor's flash. You need the motor's
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
+| `--l` / `--r` | Select the left or right side. Required unless you pass `--channel` |
 | `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
-| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
+| `--channel IFACE` | Use this SocketCAN interface, such as `can0`. On its own, it reaches a motor outside the arms, such as on a test stand |
 | `--current-id ID` | Current CAN ID, hex or decimal (required) |
 | `--new-id ID` | New CAN ID, hex or decimal (required) |
 | `--type {myactuator,damiao}` | Motor type (required) |
 
 ```bash
 axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+axol motor.set-can-id --channel can0 --current-id 0x01 --new-id 0x03 --type damiao   # motor on a test stand
 axol motor.set-can-id --target mantis --l --current-id 0x01 --new-id 0x08 --type damiao
 ```

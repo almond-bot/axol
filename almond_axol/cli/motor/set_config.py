@@ -41,7 +41,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    add_side_and_channel_arguments(p)
+    add_side_and_channel_arguments(p, channel_replaces_side=True)
     p.add_argument(
         "--id",
         required=True,

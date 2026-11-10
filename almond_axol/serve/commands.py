@@ -377,6 +377,24 @@ def _run_policy_control() -> Callable[..., Any]:
 # -- argparse add_parser loaders --------------------------------------------
 
 
+def _can_bus_suggestions() -> list[dict[str, Any]]:
+    """The host's CAN interfaces, each alone and, with several, all together."""
+    from .app import _list_can_interfaces
+
+    interfaces = _list_can_interfaces()
+    rows: list[dict[str, Any]] = [
+        {"value": i["name"], "label": None if i["up"] else "down"} for i in interfaces
+    ]
+    if len(interfaces) > 1:
+        rows.append(
+            {
+                "value": ",".join(i["name"] for i in interfaces),
+                "label": f"all {len(interfaces)}",
+            }
+        )
+    return rows
+
+
 def _argparse_loader(module: str, attr: str = "add_parser") -> Callable[[], Any]:
     def load() -> Any:
         import importlib
@@ -613,6 +631,25 @@ COMMANDS: dict[str, CommandDef] = {
         uses_can_bus=False,
         section="test",
         uses_cameras=True,
+    ),
+    "motor.burn-in": CommandDef(
+        "motor.burn-in",
+        "motor.burn-in",
+        "Motor burn-in",
+        "Set the IDs and zeros of loose motors on a test stand, then turn each one "
+        "a full turn both ways for hours. Only run it on motors that can spin "
+        "freely, never on an assembled arm.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.motor.burn_in"),
+        requires_hardware=True,
+        field_suggestions={"buses": _can_bus_suggestions},
+        # Not gated on the arm-motor fault survey: the stand holds loose motors
+        # in no arm layout (and none at all when the assign step starts), and
+        # the burn-in reports each motor's faults itself.
+        drives_motors=False,
+        hardware_profiles=("axol",),
+        section="test",
     ),
     "tune.pid": CommandDef(
         "tune.pid",

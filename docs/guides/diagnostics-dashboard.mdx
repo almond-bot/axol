@@ -50,6 +50,8 @@ The buttons above the motor cards run these commands:
 | **Edit parameter** | Reads or writes one configuration parameter ([`motor.set-config`](/cli/motor-set-config)). |
 | **Flash firmware** | Installs motor firmware from a `.bin` file on the Host Computer ([`motor.flash`](/cli/motor-flash)). Axol only. |
 
+In these tools, **Bus** picks the motor's arm. For a motor on a test stand, pick its CAN interface, such as `can0`, instead. Guided zeroing always works on an arm.
+
 Mantis grippers calibrate themselves, so Mantis has no zeroing. To restore a saved configuration file, run [`motor.restore-config`](/cli/motor-restore-config) in a terminal.
 
 ## Choose CAN adapters
@@ -121,6 +123,7 @@ Each test is a card. Click it, set the options in the dialog, and press **Run**.
 | **ROM enable** ([`diag.rom-enable`](/cli/diag-rom-enable)) | Moves every joint through its full range of motion for two hours. On Axol you can pick which joints to test, and the rest hold their home position. On Mantis it tests the grippers only. |
 | **Lift cycle** ([`diag.lift-cycle`](/cli/diag-lift-cycle)) | Runs the lift up and down on a mounted Axol. Axol only. |
 | **ZED cable check** ([`diag.zed-cable`](/cli/diag-zed-cable)) | Checks a ZED X One camera's cable by capturing frames. It doesn't move the arms, and motor telemetry keeps streaming. |
+| **Motor burn-in** ([`motor.burn-in`](/cli/motor-burn-in)) | Sets the IDs and zeros of loose motors on a test stand, then turns each one a full turn both ways for hours. Pick the CAN interface the motors are on. Never run it on an assembled arm. |
 
 The card shows the run's state, the elapsed time and the latest output line. You get a notification when it finishes, and the full log is kept in [Run history](#run-history). The ROM and lift tests take over the CAN bus while they run. They drive the arms with the same controller as teleop.
 

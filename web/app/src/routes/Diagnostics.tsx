@@ -27,6 +27,7 @@ import {
   ActiveRunPanel,
   DiagnosticActions,
   type ActionMode,
+  type BusOption,
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
 import { ControlHealth } from "@/components/diagnostics/control-health"
@@ -76,6 +77,7 @@ import {
   useSessionLogs,
   type CanDeviceInventory,
   type CanDiscoveryState,
+  type CanInterface,
   type CanInterfaceInventory,
   type CanProfileInventory,
   type CommandSpec,
@@ -244,7 +246,10 @@ export default function Diagnostics() {
   const [jellyBusy, setJellyBusy] = useState<Partial<Record<JellyDevice, boolean>>>({})
   const autoJellyAttemptsRef = useRef(new Set<string>())
   const manualJellyOverrideRef = useRef(new Set<JellyDevice>())
+  // Every CAN interface on the host, for the per-motor tools' bus picker.
+  const [canInterfaces, setCanInterfaces] = useState<CanInterface[]>([])
   const installCanInventory = useCallback((inventory: CanInterfaceInventory) => {
+    setCanInterfaces(inventory.interfaces ?? [])
     const instanceId = inventory.serverInstanceId ?? null
     canServerInstanceIdRef.current = instanceId
     setCanServerInstanceId(instanceId)
@@ -486,7 +491,9 @@ export default function Diagnostics() {
         if (channels.right && channels.right !== defaults.right) out.right_channel = channels.right
         if (!channels.right && keys.has("no_right")) out.no_right = true
       }
-      if (keys.has("channel") && keys.has("arm")) {
+      // A per-motor tool pointed at another interface (a test stand) already
+      // carries --channel and no arm: leave it alone.
+      if (keys.has("channel") && keys.has("arm") && args.arm && !args.channel) {
         const side: "left" | "right" = args.arm === "right" ? "right" : "left"
         const chan = channels[side]
         if (chan && chan !== defaults[side]) out.channel = chan
@@ -1116,6 +1123,7 @@ export default function Diagnostics() {
         {
           key: "guided",
           label: "Guided",
+          armOnly: true,
           description:
             "Zero each selected joint of one arm against an end stop. Wrist 2 and " +
             "wrist 3 can use either end stop. Each step shows instructions and waits " +
@@ -1183,6 +1191,35 @@ export default function Diagnostics() {
     robot?.profile === "mantis"
       ? MOTOR_TOOLS.filter((tool) => !["zero", "flash"].includes(tool.key))
       : MOTOR_TOOLS
+  // The per-motor tools' bus picker: each arm with an adapter, then every other
+  // CAN interface on the host (a motor on a test stand, say).
+  const motorBusOptions = useMemo<BusOption[]>(() => {
+    const channels = robot?.channels
+    const profile = robot?.profile ?? "axol"
+    const arms: { side: ArmSide; label: string }[] = [
+      { side: "left", label: "Left arm" },
+      { side: "right", label: "Right arm" },
+    ]
+    const options: BusOption[] = arms
+      .filter(({ side }) => !channels || channels[side])
+      .map(({ side, label }) => {
+        const iface = channels?.[side] ?? HARDWARE_DEFAULTS[profile][side]
+        return { value: side, label: `${label} (${iface})` }
+      })
+    const armIfaces = new Set<string>([
+      ...Object.values(HARDWARE_DEFAULTS).flatMap((d) => [d.left, d.right]),
+      ...(channels?.left ? [channels.left] : []),
+      ...(channels?.right ? [channels.right] : []),
+    ])
+    for (const iface of canInterfaces) {
+      if (armIfaces.has(iface.name)) continue
+      options.push({
+        value: `iface:${iface.name}`,
+        label: iface.up ? iface.name : `${iface.name} (down)`,
+      })
+    }
+    return options
+  }, [robot, canInterfaces])
   const [motorTool, setMotorTool] = useState<string | null>(null)
   const openTool = MOTOR_TOOLS.find((t) => t.key === motorTool) ?? null
   const openToolSpec = openTool ? canCommand(openTool.command) : null
@@ -1604,6 +1641,7 @@ export default function Diagnostics() {
           title={openTool.label}
           description={openTool.description}
           modes={openTool.modes}
+          busOptions={motorBusOptions}
           pickerJoints={openTool.pickerJoints}
           // The adapter mapping decides the interface (injected at launch);
           // a single-arm config also decides the arm. The tool's own presets

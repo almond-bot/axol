@@ -9,9 +9,9 @@ Run it first when a motor misbehaves, so you have a record of its configuration.
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
+| `--l` / `--r` | Select the left or right side. Required unless you pass `--channel` |
 | `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`) |
-| `--channel IFACE` | Use this SocketCAN interface instead of the default, such as `can0` |
+| `--channel IFACE` | Use this SocketCAN interface, such as `can0`. On its own, it reaches a motor outside the arms, such as on a test stand |
 | `--id ID` | Motor CAN ID, hex or decimal. Omit to dump IDs 1 to 8 on Axol, or ID 8 on Mantis |
 | `--type {myactuator,damiao}` | Motor type. Inferred from the ID if omitted |
 | `--out FILE` | Save a JSON snapshot for `motor.restore-config` |
