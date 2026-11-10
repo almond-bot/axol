@@ -56,7 +56,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     # Mantis grippers self-calibrate against their hard stops when enabled and
     # have no operator-set joint zero.
-    add_side_and_channel_arguments(p, supports_mantis=False)
+    add_side_and_channel_arguments(p, supports_mantis=False, channel_replaces_side=True)
     p.add_argument(
         "--id",
         type=lambda x: int(x, 0),
@@ -312,6 +312,8 @@ async def _calibrate_joint(
 
 
 async def _run_guided(args: argparse.Namespace) -> None:
+    if not (args.l or args.r):
+        raise SystemExit("error: --guided zeroes a whole arm. Pick it with --l or --r.")
     is_left = args.l
     channel = resolve_channel(args)
     side = "LEFT" if is_left else "RIGHT"

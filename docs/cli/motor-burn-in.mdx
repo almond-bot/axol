@@ -1,0 +1,82 @@
+---
+title: "motor.burn-in"
+description: "Assign IDs to a rig of motors, zero them and run a long full-turn test."
+---
+
+Tests loose MyActuator and Damiao motors on a test stand. Mount each motor so its output turns freely. Never run it on an assembled arm.
+
+Name the CAN interface the motors are on with `--buses`, such as `can0` on a Raspberry Pi with a CAN adapter. To test several buses at the same time, separate their interfaces with commas. Each bus holds its own set of `--count` motors.
+
+It runs three steps in order on each bus:
+
+| Step | What happens |
+|---|---|
+| `assign` | You connect the motors one at a time. The rig finds each new motor on whatever ID it has, from 1 to 16. A new motor is on ID 1. The first motor moves to ID 9, the next ones get IDs 2 to 7, and at the end the first motor moves back to ID 1. |
+| `zero` | Each motor saves where it sits now as its zero. Damiao motors use the new zero only after a power cycle, so the step asks you for one. |
+| `cycle` | Every motor turns +360°, back to 0°, -360° and back to 0°. This repeats for 8 hours. The buses run at the same time. |
+
+A motor fails when it reports a fault, gets hotter than `--max-temp`, stops answering or doesn't reach a target in time. The rig switches that motor off and keeps testing the others. At the end every motor returns to 0° and switches off, and a table shows each motor's result.
+
+Every move is logged to a CSV file in `~/.almond/burn-in/`. The command exits with status `1` if any motor failed.
+
+## Before you start
+
+1. Run [`axol rt.install`](/cli/rt-install) on the Pi.
+2. Bring up the CAN interfaces at 1 Mbit/s. With the Axol hub, run [`axol can.setup`](/cli/can-setup). With another adapter, run `sudo ip link set can0 up type can bitrate 1000000`.
+3. Disconnect every motor from the buses. The assign step checks that a bus is empty before you connect its first motor.
+
+## Run it
+
+```bash
+axol motor.burn-in --buses can0
+axol motor.burn-in --buses can_alm_axol_l,can_alm_axol_r   # two buses at the same time
+```
+
+When asked, connect the next motor and press Enter. With several buses, each prompt names the bus to connect it to. Leave the motors you already connected in place. Press Ctrl-C at any time to stop and switch every motor off.
+
+You can also run it from the control panel. Open **Diagnostics**, then the **Motor burn-in** card under **Tests**. Pick the bus from the list of CAN interfaces on the host, or type several separated by commas. Press **Continue** at each prompt.
+
+To run some steps again, pass `--steps`. For example, restart the test without assigning IDs again:
+
+```bash
+axol motor.burn-in --buses can0 --steps cycle
+axol motor.burn-in --buses can0 --steps cycle --cycles 1   # one quick cycle to check the rig
+```
+
+| Flag | Description |
+|---|---|
+| `--buses IFACES` | CAN interface the motors are on, such as `can0`. Separate several with commas. Required |
+| `--steps STEPS` | Comma-separated steps to run: `assign`, `zero`, `cycle` (default: all three) |
+| `--count N` | Number of motors on each bus (default: `7`) |
+| `--park-id ID` | ID the first motor uses while you connect the others (default: `9`). It must be above `--count` |
+| `--hours H` | Length of the cycle step (default: `8`) |
+| `--cycles N` | Stop after this many cycles, even if time is left |
+| `--speed DEG` | Turning speed in degrees per second (default: `90`) |
+| `--dwell S` | Seconds to wait at each target (default: `0.5`) |
+| `--tolerance DEG` | How close to the target counts as arrived, and to zero after zeroing (default: `2`) |
+| `--kp`, `--kd` | Stiffness and damping the motors follow the turn with (default: `40` and `1`) |
+| `--rate HZ` | Commands per second to each motor (default: `200`) |
+| `--max-temp C` | Temperature in °C that fails a motor (default: `70`) |
+| `--log PATH` | Write the CSV log here instead |
+
+## If a step stops
+
+- **Motors still answer before the first motor.** The step lists them. Disconnect them and press Enter, or skip the assign step with `--steps zero,cycle`.
+- **No new motor answers.** Check the motor's power and CAN cable. A motor with the same type and ID as one already connected can't be found. Set its ID on its own with [`axol motor.set-can-id`](/cli/motor-set-can-id), then connect it again.
+- **More than one new motor answers.** Disconnect all but one, then press Enter.
+- **A motor doesn't read zero after zeroing.** Power-cycle the motors and run `--steps zero,cycle`.
+- **A Damiao motor's position range is too small.** Set its `PMAX` to `12.5` with [`axol motor.set-config`](/cli/motor-set-config).
+
+The zero step uses the same rules as arm zeroing. A MyActuator motor that turns the reverse of the fleet gets **Change Motor Direction** turned on before its zero is saved.
+
+## Log columns
+
+| Column | Meaning |
+|---|---|
+| `time`, `elapsed_s` | Clock time, and seconds since the cycle step started |
+| `cycle`, `target_deg` | Cycle number and the target of this move |
+| `bus`, `motor_id`, `type` | The motor. `bus` is the CAN interface, and empty when you test one bus |
+| `result` | `ok`, or why the motor failed |
+| `move_s`, `error_deg` | Seconds the move took, and how far from the target the motor stopped |
+| `track_deg` | The furthest the motor fell behind during the move |
+| `temperature_c`, `voltage_v`, `status` | Readings taken at the end of the move |

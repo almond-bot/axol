@@ -9,8 +9,8 @@ Power the arm but leave it idle. Nothing else may talk to the motor while the fl
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
-| `--channel IFACE` | Use this SocketCAN interface instead of the arm's Axol Hub interface, such as `can0` |
+| `--l` / `--r` | Select the left or right arm. Required unless you pass `--channel` |
+| `--channel IFACE` | Use this SocketCAN interface, such as `can0`. On its own, it reaches a motor outside the arms, such as on a test stand |
 | `firmware` | Path to the firmware image (`.bin`, positional, required). The file name can be at most 120 bytes |
 | `--id ID` | CAN ID of the motor to flash, hex or decimal (required) |
 | `--frame-delay SECONDS` | Pause between CAN frames. Raise it if the adapter's TX queue overruns (default: `0`) |

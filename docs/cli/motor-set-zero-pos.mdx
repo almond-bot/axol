@@ -11,8 +11,8 @@ Sets a motor's zero to its current position and saves it to the motor's flash. U
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
-| `--channel IFACE` | Use this SocketCAN interface instead of the arm's Axol Hub interface, such as `can0` |
+| `--l` / `--r` | Select the left or right arm. Required unless you pass `--channel`. `--guided` always needs one |
+| `--channel IFACE` | Use this SocketCAN interface, such as `can0`. On its own, it reaches a motor outside the arms, such as on a test stand |
 | `--id ID` | CAN ID of the motor to zero, hex or decimal (required unless `--guided`) |
 | `--type {myactuator,damiao}` | Motor type. Inferred from `--id` if omitted |
 | `--guided` | Walk through the arm joints and zero each one at an end stop |
