@@ -4,6 +4,8 @@ import { deviceErrorText } from "@/lib/hardware-status"
 import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
 import { BatteryIndicator, WheelGrid } from "@/components/jelly-status"
+import { SoftwareChannel } from "@/components/software-channel"
+import { shortCommit } from "@/lib/update-view"
 import {
   jellyBattery,
   jellyDeviceView,
@@ -23,6 +25,9 @@ import {
   type JellyStatus,
   type MotorHealth,
   type RobotStatus,
+  type UpdateChannel,
+  type UpdatePhase,
+  type UpdateStatus,
 } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -194,13 +199,18 @@ function SelectedBadge({ saving }: { saving: boolean }) {
  *
  * The host tile also carries the host power controls (restart / shut down,
  * each behind a confirmation) — the Disconnect button only drops this
- * browser's view and never touches the machine.
+ * browser's view and never touches the machine — and, on a host that can
+ * update itself, the software channel (latest release or main).
  */
 export function ConnectionsBar({
   conn,
   host,
   hostName,
   version,
+  update,
+  updating = false,
+  updatePhase = null,
+  onSwitchChannel,
   onOpenSetup,
   onHostDisconnect,
   opRunning = false,
@@ -228,6 +238,13 @@ export function ConnectionsBar({
   hostName?: string
   /** Installed release version of the serve host, e.g. "0.1.2". */
   version?: string | null
+  /** The host's update status; the channel switch shows when it can update itself. */
+  update?: UpdateStatus | null
+  /** An update or channel switch is applying. */
+  updating?: boolean
+  updatePhase?: UpdatePhase | null
+  /** Reinstalls the host software from the other channel. */
+  onSwitchChannel?: (channel: UpdateChannel) => void
   onOpenSetup: () => void
   onHostDisconnect: () => void
   /** An operation or session is in flight — the server would refuse a power
@@ -575,7 +592,27 @@ export function ConnectionsBar({
         {online && (host || version) ? (
           <div className="flex flex-col gap-2">
             {host && <Detail label="Address">{host}</Detail>}
-            {version && <Detail label="Software">Axol v{version}</Detail>}
+            {version && (
+              <Detail label="Software">
+                Axol v{version}
+                {update?.channel === "main" && (
+                  <span className="text-white/45"> (main, {shortCommit(update.commit)})</span>
+                )}
+              </Detail>
+            )}
+            {update?.enabled && update.channel && onSwitchChannel && (
+              <div className="flex min-w-0 items-center justify-between gap-4 text-sm">
+                <span className="shrink-0 text-white/45">Channel</span>
+                <SoftwareChannel
+                  update={update}
+                  updating={updating}
+                  phase={updatePhase}
+                  opRunning={opRunning}
+                  hostInstalling={hostInstalling}
+                  onSwitch={onSwitchChannel}
+                />
+              </div>
+            )}
           </div>
         ) : undefined}
       </DeviceCard>

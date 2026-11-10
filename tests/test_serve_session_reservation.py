@@ -1115,9 +1115,8 @@ class SessionReservationApiTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
             for queue in manager.queues:
                 queue.put_nowait(None)
-            # The watcher hops through three worker threads (both reacquires,
-            # then finalize), so wait on the clock, not a count of loop turns:
-            # a loaded CI runner can take longer than a few turns.
+            # The watcher may hop through worker threads, so a fixed number
+            # of event-loop ticks is not enough on a loaded CI runner.
             deadline = asyncio.get_running_loop().time() + 5.0
             while not finalize.called:
                 if asyncio.get_running_loop().time() > deadline:

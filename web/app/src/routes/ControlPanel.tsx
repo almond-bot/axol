@@ -82,6 +82,7 @@ import {
   type SessionInfo,
   type SettingsPatch,
   type SettingsSnapshot,
+  type UpdateChannel,
   type UpdatePhase,
   type UpdateStatus,
   type UsbStatus,
@@ -191,6 +192,11 @@ const CONTROL_VIEWS: Record<string, ControlView> = {
 }
 
 /** `/control/settings/cameras` → `{ view: "settings", rest: "cameras" }`. */
+/** The code a backend runs, as far as its update status tells: channel, version and commit. */
+function updateIdentity(u: UpdateStatus): string {
+  return [u.channel ?? "release", u.version ?? "", u.commit ?? ""].join("|")
+}
+
 function parseControlPath(pathname: string): { view: ControlView | null; rest: string | null } {
   const [section = "", rest] = pathname.replace(/^\/control\/?/, "").split("/")
   return { view: CONTROL_VIEWS[section] ?? null, rest: rest ? decodeURIComponent(rest) : null }
@@ -1755,12 +1761,22 @@ export default function ControlPanel() {
     }
   }, [conn.state, updating, isLive])
 
+  // What the backend was running when the current update began, so the watcher
+  // can tell when a restarted backend is on new code. A version alone can't:
+  // switching channels or updating on main can keep the same version.
+  const updateIdentityRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!updating) updateIdentityRef.current = null
+    else if (updateIdentityRef.current === null && update)
+      updateIdentityRef.current = updateIdentity(update)
+  }, [updating, update])
+
   // Drive an in-flight update to completion on ANY connected computer: advance
   // the phase, surface a failure, and hard-reload once the backend is back on
-  // the target release (the hosted front-end is on Vercel, so a reload also
-  // pulls the latest UI and reconnects to the restarted server). Keys off the
-  // server's "updating" state rather than a local click, so a second computer
-  // that opens the panel mid-update behaves like the initiator. Replaces the
+  // new code (the hosted front-end is on Vercel, so a reload also pulls the
+  // latest UI and reconnects to the restarted server). Keys off the server's
+  // "updating" state rather than a local click, so a second computer that
+  // opens the panel mid-update behaves like the initiator. Replaces the
   // per-click watch loop handleUpdate used to run itself.
   useEffect(() => {
     if (conn.state !== "ok" || !updating) return
@@ -1801,8 +1817,17 @@ export default function ControlPanel() {
         }
         // Reflect the server's current step so the banner shows progress.
         if (u.phase) setUpdatePhase(u.phase)
-        // Back on the new release — done.
-        if (target && u.version === target) window.location.reload()
+        // Back on new code — done. A restarted backend no longer reports
+        // "updating"; it is on new code when its version, channel or commit
+        // differs from when the update began (a channel switch or an update
+        // on main can keep the version). Without that snapshot, fall back to
+        // the target release.
+        if (u.state !== "updating") {
+          const before = updateIdentityRef.current
+          const landed =
+            before !== null ? updateIdentity(u) !== before : target !== null && u.version === target
+          if (landed) window.location.reload()
+        }
       } catch {
         // Server stopped responding: it exited to relaunch (or is briefly
         // unreachable). Show "restarting" (unless the host said it is
@@ -2064,14 +2089,16 @@ export default function ControlPanel() {
   // relaunches it); the update-watcher effect — which runs on any computer while
   // the server reports an update in flight — then advances the phase and
   // hard-reloads once the backend is back on the new release.
-  async function handleUpdate() {
-    if (!update?.remoteVersion) return
+  //
+  // With `channel`, switch the host to the latest release or to main instead.
+  async function handleUpdate(channel?: UpdateChannel) {
+    if (!channel && !update?.updateAvailable) return
     const generation = connectionGenerationRef.current
     setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {
-      await startUpdate()
+      await startUpdate(channel)
       if (generation !== connectionGenerationRef.current) return
     } catch (e) {
       if (generation !== connectionGenerationRef.current) return
@@ -2179,7 +2206,7 @@ export default function ControlPanel() {
           phase={updatePhase}
           blocked={hostBusy}
           busyReason={updateBusyReason}
-          onUpdate={handleUpdate}
+          onUpdate={() => void handleUpdate()}
         />
       )}
 
@@ -2549,6 +2576,10 @@ export default function ControlPanel() {
               host={serverHost}
               hostName={hostInfo?.hostname}
               version={update?.version ?? hostInfo?.version ?? null}
+              update={update}
+              updating={updating}
+              updatePhase={updatePhase}
+              onSwitchChannel={(channel) => void handleUpdate(channel)}
               onOpenSetup={() => setSetupOpen(true)}
               onHostDisconnect={hostDisconnectClick}
               opRunning={hostBusy}

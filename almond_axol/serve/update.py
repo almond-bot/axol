@@ -20,6 +20,21 @@ the operator apply the update on demand:
   hard-reloads. Hosts originally installed from GitHub (pre-PyPI releases)
   migrate to the PyPI artifact on their next update through the same path.
 
+Installs follow one of two channels, chosen in the control panel:
+
+- ``release`` (the default; what the hosted installer sets up): PyPI, pinned to
+  the newest release tag, as described above.
+- ``main``: a git install of the repository's ``main`` branch
+  (``almond-axol[...] @ git+<repo>@main``). The channel is read back from the
+  PEP 610 ``requested_revision`` uv records for it, so there is no extra state
+  to keep in sync. On this channel an update is offered whenever the branch
+  head differs from the installed commit (resolved by the same read-only
+  ``git ls-remote`` that finds the release tags), and ``axol provision`` builds
+  ``axol-rt`` from that commit (see :mod:`almond_axol.rt.install`).
+
+``start(channel=...)`` with the other channel switches: the same reinstall,
+provision and restart, onto the latest release or onto main's head.
+
 Because the reinstall rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
 onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
@@ -92,6 +107,9 @@ _PYTHON_VERSION = "3.13"
 # so the release check falls back to this; git installs keep using their own
 # origin URL so forks still see their own releases.
 _REPO_URL = "https://github.com/almond-bot/axol"
+# The branch the ``main`` channel tracks.
+_MAIN_BRANCH = "main"
+CHANNELS = ("release", "main")
 # Release tags look like ``v0.1.2``: a leading "v" plus dotted integers.
 # Anything else (pre-release suffixes, arbitrary tags) is ignored by the
 # updater, so cutting a release is what makes installs see an update.
@@ -163,6 +181,28 @@ def installed_origin() -> tuple[str, str] | None:
     if url.startswith("git+"):
         url = url[len("git+") :]
     return url, commit
+
+
+def installed_channel() -> str:
+    """``"main"`` for a git install tracking the main branch, else ``"release"``.
+
+    uv records the revision a git requirement asked for as PEP 610
+    ``vcs_info.requested_revision`` (``git+<url>@main`` records ``"main"``),
+    so a main-channel install identifies itself. PyPI installs, tag-pinned git
+    installs and dev checkouts all report ``"release"``.
+    """
+    try:
+        raw = distribution(_PACKAGE).read_text("direct_url.json")
+    except PackageNotFoundError:
+        return "release"
+    if not raw:
+        return "release"
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return "release"
+    vcs = data.get("vcs_info") or {}
+    return "main" if vcs.get("requested_revision") == _MAIN_BRANCH else "release"
 
 
 def installed_from_index() -> bool:
@@ -333,6 +373,7 @@ class SelfUpdater:
     def __init__(self, is_idle: Callable[[], bool]) -> None:
         self._is_idle = is_idle
         self._origin = installed_origin()
+        self._channel = installed_channel()
         self._version = installed_version()
         self._commit = installed_commit()
         # Cached newest release (tag + parsed-out version) and when it was last
@@ -341,6 +382,9 @@ class SelfUpdater:
         # rather than on every poll.
         self._remote_tag: str | None = None
         self._remote_version: str | None = None
+        # Head commit of the main branch, resolved by the same ls-remote; what
+        # a main-channel install compares itself against.
+        self._remote_commit: str | None = None
         self._remote_checked_at = 0.0
         self._remote_task: asyncio.Task[None] | None = None
         # Update lifecycle surfaced to the UI: "idle" | "updating" | "error".
@@ -384,6 +428,11 @@ class SelfUpdater:
         return self._commit
 
     @property
+    def channel(self) -> str:
+        """The update channel this install follows (see :func:`installed_channel`)."""
+        return self._channel
+
+    @property
     def release_install(self) -> bool:
         """Whether this backend is a release install (PyPI or tag-pinned git).
 
@@ -414,8 +463,20 @@ class SelfUpdater:
         self._ensure_provision_once()
 
     def _update_available(self) -> bool:
-        """A release tag with a strictly higher version than the install exists."""
-        if not self.enabled or self._version is None or self._remote_version is None:
+        """Newer code exists on this install's channel.
+
+        On ``release``: a release tag with a strictly higher version. On
+        ``main``: the branch head is a different commit than the install.
+        """
+        if not self.enabled:
+            return False
+        if self._channel == "main":
+            return (
+                self._remote_commit is not None
+                and self._commit is not None
+                and self._remote_commit != self._commit
+            )
+        if self._version is None or self._remote_version is None:
             return False
         current = parse_version(self._version)
         latest = parse_version(self._remote_version)
@@ -448,8 +509,11 @@ class SelfUpdater:
             self._schedule_remote_refresh()
         return {
             "enabled": self.enabled,
+            "channel": self._channel,
             "version": self._version,
+            "commit": self._commit,
             "remoteVersion": self._remote_version,
+            "remoteCommit": self._remote_commit,
             "updateAvailable": self._update_available(),
             "idle": self._is_idle(),
             "state": self._state,
@@ -459,29 +523,37 @@ class SelfUpdater:
             "installing": self.installing,
         }
 
-    def start(self) -> tuple[bool, str | None]:
+    def start(self, channel: str | None = None) -> tuple[bool, str | None]:
         """Begin a user-initiated upgrade; returns ``(started, reason)``.
 
-        Refuses (``started=False`` with a human-readable reason) for a dev
-        checkout, when no newer release is known, when an update is already
-        running, or when an operation is running. The UI disables the button in
-        those cases, but guard here too. On success the reinstall + provision
-        run in the background and the process exits when idle so systemd
-        relaunches the new code.
+        ``channel`` (``"release"`` or ``"main"``) switches the install to that
+        channel; ``None`` or the current channel updates within it. Refuses
+        (``started=False`` with a human-readable reason) for a dev checkout,
+        for an unknown channel, when there is nothing newer to install, when
+        an update is already running, or when an operation is running. The UI
+        disables the button in those cases, but guard here too. On success the
+        reinstall + provision run in the background and the process exits when
+        idle so systemd relaunches the new code.
         """
         if not self.enabled:
             return False, "not a release install"
+        target = channel or self._channel
+        if target not in CHANNELS:
+            return False, f"unknown channel {target!r}"
         if self._state == "updating" or (
             self._update_task is not None and not self._update_task.done()
         ):
             return False, "an update is already in progress"
-        if not self._update_available():
+        switching = target != self._channel
+        if not switching and not self._update_available():
             return False, "no update available"
+        if switching and target == "release" and self._remote_tag is None:
+            return False, "the latest release is not known yet; check the network"
         if not self._is_idle():
             return False, "server is busy; stop the running operation first"
         self._state = "updating"
         self._error = None
-        self._update_task = asyncio.create_task(self._run_update())
+        self._update_task = asyncio.create_task(self._run_update(target))
         return True, None
 
     def _schedule_remote_refresh(self) -> None:
@@ -511,28 +583,39 @@ class SelfUpdater:
         if not self.release_install:
             self._remote_checked_at = time.monotonic()
             return
-        # Git installs check their own origin (forks see their own releases);
-        # index installs carry no repository metadata, so use the canonical repo.
-        url = self._origin[0] if self._origin is not None else _REPO_URL
-        latest = await self._resolve_latest_release(url)
+        url = self._repo_url()
+        refs = await self._ls_remote(url, "refs/tags/v*", f"refs/heads/{_MAIN_BRANCH}")
         self._remote_checked_at = time.monotonic()
+        if refs is None:
+            return
+        latest = self._latest_release(refs)
         if latest is not None:
             self._remote_tag, self._remote_version = latest
+        head = next(
+            (sha for sha, ref in refs if ref == f"refs/heads/{_MAIN_BRANCH}"), None
+        )
+        if head is not None:
+            self._remote_commit = head
 
-    async def _resolve_latest_release(self, url: str) -> tuple[str, str] | None:
-        """``(tag, version)`` of the highest release tag, via ``git ls-remote --tags``.
+    def _repo_url(self) -> str:
+        """Where releases and main live for this install.
 
-        Read-only and cheap, so it drives the polled "update available"
-        indicator without touching the install. ``None`` on any failure
-        (offline, no release tags yet); the caller keeps the last known value.
+        Git installs use their own origin (forks see their own releases and
+        main); index installs carry no repository metadata, so use the
+        canonical repo.
         """
+        return self._origin[0] if self._origin is not None else _REPO_URL
+
+    async def _ls_remote(
+        self, url: str, *patterns: str
+    ) -> list[tuple[str, str]] | None:
+        """``(sha, ref)`` pairs from a read-only ``git ls-remote``; ``None`` on failure."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "git",
                 "ls-remote",
-                "--tags",
                 url,
-                "refs/tags/v*",
+                *patterns,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -542,14 +625,33 @@ class SelfUpdater:
             return None
         if proc.returncode != 0:
             return None
-        best: tuple[tuple[int, ...], str] | None = None
+        refs: list[tuple[str, str]] = []
         for line in out.decode("utf-8", "replace").splitlines():
             parts = line.split()
-            if len(parts) != 2 or not parts[1].startswith("refs/tags/"):
+            if len(parts) == 2:
+                refs.append((parts[0], parts[1]))
+        return refs
+
+    async def _resolve_latest_release(self, url: str) -> tuple[str, str] | None:
+        """``(tag, version)`` of the highest release tag, via ``git ls-remote``.
+
+        Read-only and cheap, so it drives the polled "update available"
+        indicator without touching the install. ``None`` on any failure
+        (offline, no release tags yet); the caller keeps the last known value.
+        """
+        refs = await self._ls_remote(url, "refs/tags/v*")
+        return None if refs is None else self._latest_release(refs)
+
+    @staticmethod
+    def _latest_release(refs: list[tuple[str, str]]) -> tuple[str, str] | None:
+        """``(tag, version)`` of the highest ``vX.Y.Z`` tag among ``refs``."""
+        best: tuple[tuple[int, ...], str] | None = None
+        for _sha, ref in refs:
+            if not ref.startswith("refs/tags/"):
                 continue
             # Annotated tags are also listed peeled as "<tag>^{}"; the tag name
             # is the same either way, so just strip the marker.
-            tag = parts[1][len("refs/tags/") :].removesuffix("^{}")
+            tag = ref[len("refs/tags/") :].removesuffix("^{}")
             version = parse_version(tag)
             if version is None:
                 continue
@@ -566,27 +668,42 @@ class SelfUpdater:
         self._state = "error"
         self._phase = None
 
-    async def _run_update(self) -> None:
+    async def _run_update(self, channel: str | None = None) -> None:
         # The destructive part of the flow, run only on an explicit request.
-        # The tag-pinned `uv tool install --force` rewrites the whole tool env
-        # (pruning pyzed/PyGObject), so it must not overlap an `axol provision`
+        # The `uv tool install --force` rewrites the whole tool env (pruning
+        # pyzed/PyGObject), so it must not overlap an `axol provision`
         # installing them into that same env (a concurrent startup heal). Both
         # take ``_env_lock``; we release it before the post-upgrade
         # `_provision()` below, which re-acquires it (the lock is not reentrant).
+        channel = channel or self._channel
         try:
-            if not self.release_install or self._remote_tag is None:
+            if not self.release_install:
                 self._fail("no release to install")
                 return
-            # Snapshot the release being installed: a background status poll
-            # could refresh the cached remote mid-update.
-            tag, target_version = self._remote_tag, self._remote_version
-            # Reinstall pinned to the newest release's version, from PyPI (the
-            # release workflow publishes every release there; GitHub tags stay
-            # the source of truth for what the newest release *is*). `uv tool
-            # upgrade` cannot be used here: it re-resolves the originally
-            # requested version, so it would never move to a new release. The
-            # requirement mirrors the hosted installer's.
-            requirement = f"{_PACKAGE}[{_EXTRAS}]=={target_version or tag.lstrip('v')}"
+            if channel == "main":
+                # The branch, not a pinned commit: uv records the requested
+                # revision, which is how the next start knows it is on main.
+                target = f"{_MAIN_BRANCH} ({(self._remote_commit or 'head')[:7]})"
+                requirement = (
+                    f"{_PACKAGE}[{_EXTRAS}] @ git+{self._repo_url()}@{_MAIN_BRANCH}"
+                )
+            else:
+                if self._remote_tag is None:
+                    self._fail("no release to install")
+                    return
+                # Snapshot the release being installed: a background status
+                # poll could refresh the cached remote mid-update.
+                tag, target_version = self._remote_tag, self._remote_version
+                target = tag
+                # Reinstall pinned to the newest release's version, from PyPI
+                # (the release workflow publishes every release there; GitHub
+                # tags stay the source of truth for what the newest release
+                # *is*). `uv tool upgrade` cannot be used here: it re-resolves
+                # the originally requested version, so it would never move to
+                # a new release. The requirement mirrors the hosted installer's.
+                requirement = (
+                    f"{_PACKAGE}[{_EXTRAS}]=={target_version or tag.lstrip('v')}"
+                )
             self._phase = "upgrading"
             async with self._env_lock:
                 try:
@@ -598,6 +715,11 @@ class SelfUpdater:
                             "--python",
                             _PYTHON_VERSION,
                             "--force",
+                            # Always reinstall the package itself: moving
+                            # between main and a release of the same version
+                            # must not count as already satisfied.
+                            "--reinstall-package",
+                            _PACKAGE,
                             requirement,
                         ],
                         name="uv-tool-install",
@@ -627,18 +749,18 @@ class SelfUpdater:
 
             self._reboot_reasons = reboot.pending()
 
-            # The install succeeded, so the target tag is what's on disk now.
+            # The install succeeded, so the target is what's on disk now.
             # Deliberately don't re-read the installed version through
             # importlib.metadata here: its path caches can still serve this
             # process the pre-install metadata, which would make a real upgrade
-            # look like a no-op and skip the restart. `start()` only runs when
-            # the release is strictly newer, so a successful install always
+            # look like a no-op and skip the restart. `start()` only runs for
+            # newer code or a channel switch, so a successful install always
             # warrants the restart.
             _logger.info(
-                "self-update: installed %s (v%s -> v%s); restarting when idle",
-                tag,
+                "self-update: installed %s (from %s v%s); restarting when idle",
+                target,
+                self._channel,
                 self._version,
-                target_version,
             )
             self._phase = "restarting"
             self._restart_pending = True

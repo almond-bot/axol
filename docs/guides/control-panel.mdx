@@ -94,6 +94,17 @@ When a newer [release](https://github.com/almond-bot/axol/releases) is available
 
 If a required step fails, the error names it. Press **Update** to try again. Optional steps, such as Lighthouse tracking, show a warning instead of stopping the update. Each step's full output is in `/var/log/almond-axol/` on the host.
 
+#### Channel
+
+The **Channel** switch on the Host Computer card picks where the software comes from:
+
+| Channel | What it installs | When the banner offers **Update** |
+|---|---|---|
+| **Release** | The latest release. This is the default. | A newer release is out. |
+| **Main** | The newest code on the `main` branch, including changes that are not in a release yet. It has had less testing. | New changes land on `main`. The banner links to them. |
+
+Click the other channel, then confirm. The host installs that software and restarts, which can take several minutes. Stop any running operation first. On **Main**, the **Software** line shows the installed commit. Running the install command again puts the host back on **Release**.
+
 The banner also warns when the panel and the host run different versions. This happens with an old browser tab or an outdated local UI build. Update the host, or rebuild the local UI.
 
 #### Axol version

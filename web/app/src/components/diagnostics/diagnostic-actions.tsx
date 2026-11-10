@@ -2,10 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { ArrowRight, Hand, Loader2, Play, Square, Upload, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
+import { Label } from "@/components/ui/label"
 import { CuratedForm } from "@/components/config-form"
+import type { FieldSuggestion } from "@/components/suggest-input"
 import { cn } from "@/lib/utils"
 import {
   computeArgs,
+  fetchFieldSuggestions,
   flattenFields,
   missingRequired,
   uploadFirmware,
@@ -289,7 +292,22 @@ export interface ActionMode {
   description?: string
   presetArgs?: Record<string, FormValue>
   hideKeys?: string[]
+  /** This mode works on a whole arm, so the bus picker offers only the arms. */
+  armOnly?: boolean
 }
+
+/**
+ * One choice in a per-motor tool's bus picker: an arm (sent as `--l`/`--r`,
+ * its interface injected from the adapter mapping) or any CAN interface on
+ * the host (sent as `--channel`), for a motor on a test stand.
+ */
+export interface BusOption {
+  /** "left" / "right" for an arm, or "iface:<name>" for an interface. */
+  value: string
+  label: string
+}
+
+const IFACE_PREFIX = "iface:"
 
 /**
  * Parameter dialog for a catalog command. `presetArgs` are merged into the
@@ -305,6 +323,7 @@ export function ActionDialog({
   presetArgs,
   hideKeys,
   modes,
+  busOptions,
   pickerJoints,
   running,
   blocked,
@@ -320,6 +339,11 @@ export function ActionDialog({
   presetArgs?: Record<string, FormValue>
   hideKeys?: string[]
   modes?: ActionMode[]
+  /**
+   * Replace the Arm field with a Bus picker: the arms plus other CAN
+   * interfaces. A preset `arm` becomes the picker's default.
+   */
+  busOptions?: BusOption[]
   /** Restrict the `--joints` picker's choices (default: every joint). */
   pickerJoints?: readonly JointName[]
   running: boolean
@@ -335,21 +359,32 @@ export function ActionDialog({
   const [modeKey, setModeKey] = useState(modes?.[0]?.key ?? null)
   const mode = modes?.find((m) => m.key === modeKey) ?? null
 
-  const effectivePresets = useMemo(
-    () => ({ ...(presetArgs ?? {}), ...(mode?.presetArgs ?? {}) }),
-    [presetArgs, mode]
-  )
+  const allFields = useMemo(() => flattenFields(spec.schema), [spec])
+  const busMode = busOptions != null && !mode?.armOnly && allFields.some((f) => f.key === "arm")
+  const [bus, setBus] = useState("")
+  const presetArm = presetArgs?.arm != null ? String(presetArgs.arm) : ""
+  const busValue = bus || presetArm
+
+  const effectivePresets = useMemo(() => {
+    const merged: Record<string, FormValue> = {
+      ...(presetArgs ?? {}),
+      ...(mode?.presetArgs ?? {}),
+    }
+    // The bus picker decides the arm (or replaces it with an interface).
+    if (busMode) delete merged.arm
+    return merged
+  }, [presetArgs, mode, busMode])
   const hidden = useMemo(
     () =>
       new Set([
         ...HIDDEN_FLAGS,
         ...(hideKeys ?? []),
         ...(mode?.hideKeys ?? []),
+        ...(busMode ? ["arm", "channel"] : []),
         ...Object.keys(effectivePresets),
       ]),
-    [hideKeys, mode, effectivePresets]
+    [hideKeys, mode, busMode, effectivePresets]
   )
-  const allFields = useMemo(() => flattenFields(spec.schema), [spec])
   const jointsField = useMemo(
     () => allFields.find((f) => f.key === "joints" && !hidden.has("joints")),
     [allFields, hidden]
@@ -365,6 +400,24 @@ export function ActionDialog({
     () => allFields.filter((f) => !hidden.has(f.key) && f.key !== "joints" && f.key !== "firmware"),
     [allFields, hidden]
   )
+  // Server-side pick lists for this command's fields (motor.burn-in's CAN
+  // interfaces, say), fetched when the dialog opens. Typing stays free-form.
+  const [suggestions, setSuggestions] = useState<Record<string, FieldSuggestion[]>>({})
+  useEffect(() => {
+    let active = true
+    for (const key of spec.suggestedFields ?? []) {
+      fetchFieldSuggestions(spec.id, key)
+        .then(({ suggestions: rows }) => {
+          if (!active) return
+          const list = rows.map((r) => ({ value: r.value, label: r.label ?? undefined }))
+          setSuggestions((prev) => ({ ...prev, [key]: list }))
+        })
+        .catch(() => {})
+    }
+    return () => {
+      active = false
+    }
+  }, [spec.id, spec.suggestedFields])
   const [uploading, setUploading] = useState(false)
   const hasWebPrompts = allFields.some((f) => f.key === "web_prompts")
 
@@ -384,6 +437,7 @@ export function ActionDialog({
       ...(firmwareField ? [firmwareField] : []),
     ]
     const miss = missingRequired(formFields, overrides)
+    if (busMode && !busValue) miss.unshift("Bus")
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
@@ -394,6 +448,10 @@ export function ActionDialog({
       args.joints = pickerJoints.map((j) => j.toLowerCase()).join(",")
     }
     if (hasWebPrompts) args.web_prompts = true
+    if (busMode) {
+      if (busValue.startsWith(IFACE_PREFIX)) args.channel = busValue.slice(IFACE_PREFIX.length)
+      else args.arm = busValue
+    }
     Object.assign(args, effectivePresets)
     onLaunch(args)
   }
@@ -458,6 +516,32 @@ export function ActionDialog({
           <p className="text-xs text-red-300">Required: {missing.join(", ")}</p>
         )}
 
+        {busMode && (
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <Label htmlFor="cfg-bus">Bus</Label>
+              <span className="text-xs text-[#eff483]">*</span>
+            </div>
+            <select
+              id="cfg-bus"
+              value={busValue}
+              disabled={running || busy}
+              onChange={(e) => setBus(e.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
+            >
+              <option value="">Select…</option>
+              {(busOptions ?? []).map((o) => (
+                <option key={o.value} value={o.value} className="bg-[#1a1a1a]">
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-white/40">
+              Pick an arm, or another CAN interface for a motor on a test stand.
+            </p>
+          </div>
+        )}
+
         {jointsField && (
           <JointPicker
             value={overrides.joints}
@@ -480,6 +564,7 @@ export function ActionDialog({
         {fields.length > 0 && (
           <CuratedForm
             fields={fields}
+            suggestions={suggestions}
             overrides={overrides}
             disabled={running || busy}
             onChange={(key, value) => setOverride(key, value)}

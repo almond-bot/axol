@@ -166,6 +166,7 @@
                   "cli/motor-health",
                   "cli/motor-set-can-id",
                   "cli/motor-set-zero-pos",
+                  "cli/motor-burn-in",
                   "cli/motor-dump-config",
                   "cli/motor-set-config",
                   "cli/motor-restore-config",

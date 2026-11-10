@@ -116,8 +116,16 @@ def test_git_helper_and_checkout_commit(monkeypatch, tmp_path: Path) -> None:
     assert update.installed_commit() == f"deadbeef-dirty.{digest}"
 
 
-def _updater(monkeypatch, *, idle: bool = True, index: bool = True):
-    monkeypatch.setattr(update, "installed_origin", lambda: None)
+def _updater(
+    monkeypatch,
+    *,
+    idle: bool = True,
+    index: bool = True,
+    channel: str = "release",
+    origin: tuple[str, str] | None = None,
+):
+    monkeypatch.setattr(update, "installed_origin", lambda: origin)
+    monkeypatch.setattr(update, "installed_channel", lambda: channel)
     monkeypatch.setattr(update, "installed_from_index", lambda: index)
     monkeypatch.setattr(update, "installed_version", lambda: "1.0.0")
     monkeypatch.setattr(update, "installed_commit", lambda: "commit")
@@ -218,6 +226,7 @@ def test_successful_update_and_provision(monkeypatch) -> None:
         monkeypatch.setattr(update.os, "_exit", exits.append)
         await updater._run_update()
         assert commands[0][-1] == "almond-axol[lerobot,sim]==2.0.0"
+        assert commands[0][-3:-1] == ("--reinstall-package", "almond-axol")
         # The post-reinstall provision is strict: the realtime core must be
         # current before the service restarts onto the new code.
         assert commands[1] == ("/bin/axol", "provision", "--no-reboot", "--require-rt")
@@ -562,5 +571,122 @@ def test_restart_waits_for_an_install_in_progress(monkeypatch) -> None:
         assert not updater.installing
         await updater.status()
         assert exits == [0]
+
+    asyncio.run(exercise())
+
+
+def test_installed_channel_reads_the_requested_revision(monkeypatch) -> None:
+    def install(revision: str | None) -> str:
+        vcs: dict[str, str] = {"vcs": "git", "commit_id": "abc123"}
+        if revision is not None:
+            vcs["requested_revision"] = revision
+        return json.dumps({"url": "https://example.test/axol", "vcs_info": vcs})
+
+    for direct_url, channel in [
+        (install("main"), "main"),
+        (install("v1.2.3"), "release"),
+        (install(None), "release"),
+        (None, "release"),
+        ("not json", "release"),
+    ]:
+        monkeypatch.setattr(
+            update, "distribution", lambda name, raw=direct_url: _Dist(raw)
+        )
+        assert update.installed_channel() == channel
+
+    def missing(name):
+        raise update.PackageNotFoundError(name)
+
+    monkeypatch.setattr(update, "distribution", missing)
+    assert update.installed_channel() == "release"
+
+
+def test_main_channel_offers_an_update_when_the_branch_moves(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(
+            monkeypatch,
+            index=False,
+            channel="main",
+            origin=("https://example.test/axol", "commit"),
+        )
+        spawned: list[tuple[str, ...]] = []
+        head = b"commit"
+
+        async def spawn(*args, **kwargs):
+            spawned.append(args)
+            return _AsyncProc(
+                b"t1 refs/tags/v1.0.0\n" + head + b" refs/heads/main\n", **kwargs
+            )
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        status = await updater.status(force=True)
+        # One ls-remote answers both the release tags and main's head.
+        assert spawned == [
+            (
+                "git",
+                "ls-remote",
+                "https://example.test/axol",
+                "refs/tags/v*",
+                "refs/heads/main",
+            )
+        ]
+        assert status["channel"] == "main"
+        assert status["remoteCommit"] == "commit"
+        assert status["updateAvailable"] is False
+        assert updater.start() == (False, "no update available")
+
+        head = b"newer"
+        status = await updater.status(force=True)
+        assert status["remoteCommit"] == "newer"
+        assert status["updateAvailable"] is True
+
+    asyncio.run(exercise())
+
+
+def test_switching_channels(monkeypatch) -> None:
+    async def exercise() -> None:
+        updater = _updater(monkeypatch)
+        commands: list[tuple[str, ...]] = []
+
+        async def spawn(*args, **kwargs):
+            commands.append(args)
+            return _AsyncProc(b"done", **kwargs)
+
+        monkeypatch.setattr(update.asyncio, "create_subprocess_exec", spawn)
+        exits: list[int] = []
+        monkeypatch.setattr(update.os, "_exit", exits.append)
+
+        assert updater.start("beta") == (False, "unknown channel 'beta'")
+        # A switch to main needs no newer release.
+        assert updater.start("main") == (True, None)
+        assert updater._update_task is not None
+        await updater._update_task
+        assert commands[0][-1] == (
+            "almond-axol[lerobot,sim] @ git+https://github.com/almond-bot/axol@main"
+        )
+        assert commands[1][1:] == ("provision", "--no-reboot", "--require-rt")
+        assert exits == [0]
+
+        # Back to release: needs the latest release tag, not a newer version.
+        on_main = _updater(
+            monkeypatch,
+            index=False,
+            channel="main",
+            origin=("https://example.test/axol", "commit"),
+        )
+        assert on_main.start("release") == (
+            False,
+            "the latest release is not known yet; check the network",
+        )
+        on_main._remote_tag = "v1.0.0"
+        on_main._remote_version = "1.0.0"
+        commands.clear()
+        assert on_main.start("release") == (True, None)
+        assert on_main._update_task is not None
+        await on_main._update_task
+        assert commands[0][-1] == "almond-axol[lerobot,sim]==1.0.0"
+
+        disabled = _updater(monkeypatch, index=False)
+        assert disabled.start("main") == (False, "not a release install")
 
     asyncio.run(exercise())

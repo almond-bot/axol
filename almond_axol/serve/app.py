@@ -188,6 +188,16 @@ class SettingsUpdateRequest(BaseModel):
     advanced: dict[str, Any] | None = None
 
 
+class UpdateStartRequest(BaseModel):
+    """Which update to apply.
+
+    ``channel`` switches the install to the latest release or to the main
+    branch; omitted, the update stays on the installed channel.
+    """
+
+    channel: Literal["release", "main"] | None = None
+
+
 class OpStopRequest(BaseModel):
     """What a Stop does with the arms (teleop only).
 
@@ -427,6 +437,34 @@ def _prepare_two_side_motor_args(
     if selected == 0:
         return f"{command_label} must select at least one connected side."
     return None
+
+
+# Per-motor tools that also serve a motor outside the arms, on a test stand:
+# with --channel naming a bus that no arm uses, they skip the arm survey.
+_OFF_ARM_MOTOR_COMMANDS = frozenset({"motor.set-zero-pos"})
+
+
+def _off_arm_motor_launch(
+    command_id: str, args: dict[str, Any], status: dict[str, Any]
+) -> bool:
+    """A single-motor launch on a CAN interface that belongs to no arm.
+
+    Guided zeroing walks a whole arm, so it never qualifies. A channel that
+    any arm uses, or one of the hub's arm interface names, keeps the arm
+    survey and fault gate, so this can never skip them for arm hardware.
+    """
+    if command_id not in _OFF_ARM_MOTOR_COMMANDS or args.get("guided"):
+        return False
+    if str(args.get("arm") or "").strip():
+        return False
+    channel = str(args.get("channel") or "").strip()
+    if not channel:
+        return False
+    reported = status.get("channels")
+    arm_channels = {CAN_LEFT, CAN_RIGHT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT}
+    if isinstance(reported, dict):
+        arm_channels |= {str(v) for v in reported.values() if v}
+    return channel not in arm_channels
 
 
 def _prepare_motor_launch_args(
@@ -1392,9 +1430,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         return await updater.status(force=refresh)
 
     @app.post("/api/update/start")
-    async def update_start() -> JSONResponse:
-        """Apply a user-initiated upgrade; the server restarts onto new code."""
-        started, reason = updater.start()
+    async def update_start(req: UpdateStartRequest | None = None) -> JSONResponse:
+        """Apply a user-initiated upgrade; the server restarts onto new code.
+
+        An empty body updates within the installed channel; ``channel``
+        switches between the latest release and main.
+        """
+        started, reason = updater.start(req.channel if req is not None else None)
         if not started:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
@@ -2007,7 +2049,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     },
                     status_code=409,
                 )
-            if command.drives_motors:
+            if command.drives_motors and not _off_arm_motor_launch(
+                command_id, launch_args, robot.status()
+            ):
                 status = robot.status()
                 if status.get("profile") != profile:
                     return JSONResponse(
