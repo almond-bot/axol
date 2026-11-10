@@ -72,4 +72,29 @@ describe("UpdateBanner", () => {
     renderBanner(true, null)
     expect(button().textContent).toBe("Updating…")
   })
+
+  it("shows the commit jump and a compare link on main", () => {
+    act(() =>
+      root.render(
+        <UpdateBanner
+          update={{
+            ...status,
+            state: "idle",
+            channel: "main",
+            commit: "1111111aaaa",
+            remoteCommit: "2222222bbbb",
+          }}
+          updating={false}
+          phase={null}
+          blocked={false}
+          onUpdate={() => {}}
+        />
+      )
+    )
+    expect(container.textContent).toContain("New changes are available on main")
+    expect(container.textContent).toContain("main 1111111 \u2192 2222222")
+    const link = container.querySelector("a") as HTMLAnchorElement
+    expect(link.textContent).toBe("View changes")
+    expect(link.href).toBe("https://github.com/almond-bot/axol/compare/1111111aaaa...2222222bbbb")
+  })
 })
