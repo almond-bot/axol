@@ -15,6 +15,7 @@ from almond_axol.cli.can import setup
 from almond_axol.serve import app as app_module
 from almond_axol.serve.manager import Session
 from almond_axol.serve.settings import SettingsStore
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import (
     _Manager,
     _Robot,

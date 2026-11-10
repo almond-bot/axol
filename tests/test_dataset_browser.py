@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
+
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 pd = pytest.importorskip("pandas")

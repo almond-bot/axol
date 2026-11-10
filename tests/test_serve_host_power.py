@@ -11,6 +11,7 @@ from unittest.mock import patch
 import httpx
 
 from almond_axol.serve import app as app_module
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import _Manager, _Runner, _test_app
 
 

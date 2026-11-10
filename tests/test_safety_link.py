@@ -11,6 +11,7 @@ from almond_axol.robot.safety import SafetyError, decode_status
 from almond_axol.serve import app as app_module
 from almond_axol.serve import safety_link as link_module
 from almond_axol.serve.safety_link import SafetyLink
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 from tests.test_serve_session_reservation import _Manager, _Runner, _test_app
 
 _ON = decode_status(bytes([0x8F, 0, 0, 0x02, 0x20, 0x67, 0x90, 0x65]))

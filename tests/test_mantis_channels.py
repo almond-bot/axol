@@ -20,6 +20,7 @@ from almond_axol.serve.runner import (
 )
 from almond_axol.serve.settings import SettingsStore, advanced_schema
 from almond_axol.utils.can_channels import require_mantis_channels
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 
 def _real_tmp() -> str:

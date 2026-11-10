@@ -15,6 +15,7 @@ from almond_axol.serve.commands import (
     command_specs,
     field_suggestions,
 )
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 try:
     from .test_serve_session_reservation import _Manager, _Runner, _test_app

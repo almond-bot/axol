@@ -63,10 +63,10 @@ from .commands import (
     safety_flags,
 )
 from .jelly_link import JELLY_DEVICES, JellyLink, device_presence
-from .safety_link import SafetyLink
 from .manager import Session, SessionManager
 from .robot_link import STATE_ERROR, RobotLink, scoped_motor_faults
 from .runner import OperationRunner, prove_motors_torque_free
+from .safety_link import SafetyLink
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater

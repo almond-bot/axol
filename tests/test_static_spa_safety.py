@@ -9,6 +9,7 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from almond_axol.serve.app import create_app
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 
 async def _raw_asgi_get(app: Any, path: str) -> tuple[int, bytes]:

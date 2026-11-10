@@ -41,6 +41,7 @@ from almond_axol.serve.runner import (
     OperationRunner,
     prove_motors_torque_free,
 )
+from tests.safety_isolation import setUpModule, tearDownModule  # noqa: F401
 
 # The serve API doubles (settings store, session manager, updater) already exist
 # for the reservation tests; reuse them rather than growing a second set.
