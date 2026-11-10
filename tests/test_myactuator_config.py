@@ -257,10 +257,15 @@ class MyActuatorTorqueScaleTest(unittest.IsolatedAsyncioTestCase):
 
 
 class MyActuatorSampleResTest(unittest.IsolatedAsyncioTestCase):
-    """CURRENT_SAMPLE_RES must match the model: 2 on an X8, 3 on an X6."""
+    """CURRENT_SAMPLE_RES must match the model: 2 on an X8, 1 on an X8-P20-150,
+    3 on an X6."""
 
     async def test_each_series_passes_with_its_own_value(self) -> None:
-        for model, res in (("RMD-X6-P20-60", 3.0), ("RMD-X8-P20-120", 2.0)):
+        for model, res in (
+            ("RMD-X6-P20-60", 3.0),
+            ("RMD-X8-P20-120", 2.0),
+            ("RMD-X8-P20-150", 1.0),
+        ):
             motor, bus = _motor(MYACTUATOR_FW_V44, CURRENT_SAMPLE_RES=res)
             bus.model = model
             bus.params[MyActuatorParam.MAX_TORQUE] = 60.0 if "X6" in model else 129.0
@@ -279,6 +284,23 @@ class MyActuatorSampleResTest(unittest.IsolatedAsyncioTestCase):
                 "--param CURRENT_SAMPLE_RES --value 2 --force-protected", message
             )
         self.assertNotIn(MyActuatorParam.CURRENT_SAMPLE_RES, [i for i, _ in bus.writes])
+
+    async def test_an_x8_p20_150_with_the_x8_p20_120_value_is_refused(self) -> None:
+        motor, bus = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=129.0, CURRENT_SAMPLE_RES=2.0)
+        bus.model = "RMD-X8-P20-150"
+        with self.assertRaises(MotorError) as ctx:
+            await motor.enable()
+        self.assertIn(
+            "--param CURRENT_SAMPLE_RES --value 1 --force-protected", str(ctx.exception)
+        )
+
+    async def test_an_x8_p20_150_read_without_its_suffix_is_refused(self) -> None:
+        # The -150 at 1 mOhm, but only "RMD-X8-P20" came back: the series
+        # value applies, so the motor is refused rather than driven.
+        motor, bus = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=129.0, CURRENT_SAMPLE_RES=1.0)
+        bus.model = "RMD-X8-P20"
+        with self.assertRaises(MotorError):
+            await motor.enable()
 
     async def test_an_x6_with_an_x8_value_is_refused(self) -> None:
         motor, _ = _motor(MYACTUATOR_FW_V44, MAX_TORQUE=60.0, CURRENT_SAMPLE_RES=2.0)

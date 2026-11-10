@@ -71,9 +71,18 @@ pub fn ma_rated_torque(model: &str) -> Option<f64> {
 /// X6. The drive scales its measured current by this setting, so a wrong
 /// value scales every torque it delivers while it still reports the torque
 /// it was asked for. `None` for models outside the table. Mirrors
-/// `_MA_SERIES_SAMPLE_RES` in the Python driver.
+/// `_model_sample_res` in the Python driver.
+///
+/// The RMD-X8-P20-150 ships at 1 where every X8-P20-120 reads 2, so that
+/// variant is taken to use a 1 mOhm resistor (see `_MA_VARIANT_SAMPLE_RES`).
+/// A model read without its suffix gets the series value, so a -150 read as
+/// `RMD-X8-P20` is refused rather than driven.
 pub fn ma_sample_res(model: &str) -> Option<f64> {
-    match model_series(model)? {
+    let series = model_series(model)?;
+    if series == 8 && model_variant(model) == Some(150) {
+        return Some(1.0);
+    }
+    match series {
         6 => Some(3.0),
         8 => Some(2.0),
         _ => None,
@@ -462,8 +471,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sample_res_follows_the_series() {
+    fn sample_res_follows_the_series_and_variant() {
         assert_eq!(ma_sample_res("RMD-X8-P20-120"), Some(2.0));
+        assert_eq!(ma_sample_res("RMD-X8-P20-150"), Some(1.0));
+        assert_eq!(ma_sample_res("RMD-X8-P20"), Some(2.0));
         assert_eq!(ma_sample_res("RMD-X6-P20-60"), Some(3.0));
         assert_eq!(ma_sample_res("RMD-X6-P20-50"), Some(3.0));
         assert_eq!(ma_sample_res("RMD-L-7015"), None);
