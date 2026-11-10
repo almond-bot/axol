@@ -95,7 +95,7 @@ export const PARAM_UI: Record<string, ParamUi> = {
   STALL_TIME_LIMIT: { label: "Stall time limit" },
   CURRENT_SAMPLE_RES: {
     label: "Current sample resistor",
-    hint: "Must match the motor: 2 on an X8, 3 on an X6.",
+    hint: "Must match the motor: 2 on an X8-P20-120, 1 on an X8-P20-150, 3 on an X6.",
   },
   ENCODER2_ABNORMAL_VALUE: { label: "Encoder 2 abnormal value" },
   ENCODER2_ABNORMAL_SPEED: { label: "Encoder 2 abnormal speed" },

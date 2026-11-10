@@ -289,13 +289,34 @@ _MA_SERIES_SAMPLE_RES: dict[int, float] = {
     8: 2.0,
 }
 
+# Variants whose drive differs from their series, keyed by (series, model
+# suffix) as in _MA_VARIANT_MAX_TORQUE. The RMD-X8-P20-150 (firmware
+# 2026083101, factory-dated 2026-09) ships at 1 where every X8-P20-120 reads 2,
+# with the -120's current ratings, KT_OUT and MAX_TORQUE otherwise unchanged.
+# All four seen arrived that way, so 1 is taken as the drive's resistor.
+# Pending a gravity-comp check: if it is really 2, the arm sags at half torque
+# (the safe side of the mistake), and this entry goes.
+_MA_VARIANT_SAMPLE_RES: dict[tuple[int, int], float] = {
+    (8, 150): 1.0,
+}
+
 
 def _model_sample_res(model: str | None) -> float | None:
-    """The CURRENT_SAMPLE_RES (mOhm) a model's drive needs, else None."""
+    """The CURRENT_SAMPLE_RES (mOhm) a model's drive needs, else None.
+
+    A model missing its suffix (the third 0xB5 block unanswered) gets its
+    series value, so an X8-P20-150 read as "RMD-X8-P20" is refused rather
+    than driven.
+    """
     if model:
-        match = re.search(r"X(\d+)", model.strip().upper())
+        match = re.search(r"X(\d+)(?:-[^-]*-(\d+))?", model.strip().upper())
         if match is not None:
-            return _MA_SERIES_SAMPLE_RES.get(int(match.group(1)))
+            series = int(match.group(1))
+            if match.group(2) is not None:
+                variant = _MA_VARIANT_SAMPLE_RES.get((series, int(match.group(2))))
+                if variant is not None:
+                    return variant
+            return _MA_SERIES_SAMPLE_RES.get(series)
     return None
 
 
@@ -652,7 +673,7 @@ class MyActuatorMotor(MotorDriver):
 
         Never written here: a wrong value means the motor's settings were
         copied from another model, so a person checks it first. Models
-        outside ``_MA_SERIES_SAMPLE_RES`` and an unanswered read pass.
+        outside ``_model_sample_res`` and an unanswered read pass.
         """
         expected = _model_sample_res(self._model)
         if expected is None:
